@@ -1,0 +1,56 @@
+{
+  "rules": [
+    {
+      "id": "thanks",
+      "patterns": ["\\b(?:thanks|thank\\s+you|ty)\\b"],
+      "responses": ["You're welcome!", "Anytime!"]
+    },
+    {
+      "id": "farewell",
+      "patterns": ["\\b(?:bye|goodbye|see\\s+you|cya|good\\s*night)\\b"],
+      "responses": ["See you around!", "Take care!"]
+    },
+    {
+      "id": "encouragement",
+      "patterns": ["\\b(?:good\\s+luck|gl|have\\s+fun)\\b"],
+      "responses": ["Thanks! You too.", "Thank you! Have fun too."]
+    },
+    {
+      "id": "congratulations",
+      "patterns": ["\\b(?:congrats|congratulations|well\\s+done|gg)\\b"],
+      "responses": ["Thanks!", "Thank you! :)"]
+    },
+    {
+      "id": "apology",
+      "patterns": ["\\b(?:sorry|my\\s+bad|oops)\\b"],
+      "responses": ["No worries!", "It's all good!"]
+    },
+    {
+      "id": "having_fun",
+      "patterns": ["\\b(?:are\\s+you\\s+having\\s+fun|having\\s+fun)\\b"],
+      "responses": ["Yeah! It's been quite an adventure."]
+    },
+    {
+      "id": "opinion",
+      "patterns": [
+        "\\b(?:do\\s+you\\s+(?:like|love|enjoy)|what\\s+do\\s+you\\s+think\\s+(?:of|about))\\b"
+      ],
+      "responses": ["I'm still figuring that one out!", "Maybe—I'm keeping an open mind!"]
+    },
+    {
+      "id": "favorite",
+      "patterns": ["\\bwhat(?:'s|\\s+is)\\s+your\\s+favo(?:u)?rite\\b"],
+      "responses": ["I don't know yet—I'm still exploring."]
+    },
+    {
+      "id": "positive_acknowledgement",
+      "patterns": ["\\b(?:that's|that\\s+is)\\s+(?:nice|cool|neat|great)\\b"],
+      "responses": ["Yeah! :)", "Definitely!"]
+    },
+    {
+      "id": "whats_up",
+      "patterns": ["\\b(?:what(?:'s|\\s+is)\\s+up|sup)\\b"],
+      "responses": ["Just training and exploring!", "Not much—I'm out adventuring!"]
+    }
+  ]
+}

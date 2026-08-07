@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Atrinik Operator</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">HEADLESS CONTROL PLANE</p>
+      <h1>Atrinik <span>Operator</span></h1>
+    </div>
+    <div class="connection"><i id="connection-dot"></i><span id="connection">Connecting</span></div>
+    <div class="identity"><strong id="character">No character</strong><small id="location">Waiting for map</small></div>
+  </header>
+
+  <main>
+    <section class="hero-grid">
+      <article class="panel map-panel">
+        <div class="panel-title"><div><p class="eyebrow">TACTICAL VIEW</p><h2 id="map-name">No map loaded</h2></div><code id="coords">0, 0</code></div>
+        <div id="map" class="map" aria-label="Game map"></div>
+        <div class="legend"><span><i class="swatch player"></i>You</span><span><i class="swatch enemy"></i>Enemy</span><span><i class="swatch friend"></i>Friendly</span><span>Click a tile to move</span></div>
+      </article>
+
+      <aside class="side-stack">
+        <article class="panel stats-panel">
+          <div class="panel-title"><div><p class="eyebrow">VITALS & BUILD</p><h2>Character</h2></div><b class="level">LV <span id="level">—</span></b></div>
+          <div id="vitals"></div>
+          <div id="stats" class="stat-grid"></div>
+          <div id="skills" class="skills"></div>
+        </article>
+        <article class="panel task-panel">
+          <div class="panel-title"><div><p class="eyebrow">AUTOMATION</p><h2>Current task</h2></div><button class="danger small" id="stop-task">Stop</button></div>
+          <div id="task" class="task-state">Idle</div>
+          <details open><summary>Quest</summary>
+            <div class="form-row"><select id="quest-select"></select><button id="run-quest">Run</button></div>
+            <button class="wide secondary" id="run-all">Run all 16 formal quests</button>
+          </details>
+          <details><summary>Farm</summary>
+            <select id="farm-spot"><option value="">Choose a known farm spot…</option></select>
+            <p id="farm-spot-hint" class="muted"></p>
+            <input id="farm-zone" placeholder="Exact /map/path (optional)">
+            <div class="form-row"><input id="farm-target" placeholder="Target name"><input id="farm-item" placeholder="Item name"></div>
+            <div class="form-row"><input id="farm-skill" placeholder="Finishing skill, e.g. wizardry spells"><input id="farm-spell" placeholder="Finishing/primary spell, e.g. cause light wounds"></div>
+            <p class="muted">With a finishing skill set, normal combat is used above 20% target HP and the selected skill is reserved for the killing blow.</p>
+            <div class="form-row"><input id="farm-quantity" type="number" value="1" min="1" title="Quantity"><input id="farm-level" type="number" value="0" min="0" title="Until level"><button id="run-farm">Farm</button></div>
+          </details>
+          <details><summary>Navigate</summary>
+            <select id="nav-spot"><option value="">Choose a known destination…</option></select>
+            <p id="nav-spot-hint" class="muted"></p>
+            <input id="nav-map" placeholder="Exact /map/path">
+            <div class="form-row"><input id="nav-x" type="number" placeholder="X"><input id="nav-y" type="number" placeholder="Y"><button id="run-nav">Go</button></div>
+          </details>
+        </article>
+      </aside>
+    </section>
+
+    <nav class="tabs" aria-label="Dashboard sections">
+      <button class="active" data-tab="inventory">Inventory</button>
+      <button data-tab="activity">Bot activity</button>
+      <button data-tab="farmspots">Farm spots</button>
+      <button data-tab="navspots">Navigation</button>
+      <button data-tab="quests">Quest planner</button>
+      <button data-tab="chat">Chat & dialogue</button>
+      <button data-tab="economy">Economy & storage</button>
+    </nav>
+
+    <section id="inventory-tab" class="tab-page active panel">
+      <div class="panel-title"><div><p class="eyebrow">LIVE INVENTORY</p><h2>Items</h2></div><span id="inventory-summary"></span></div>
+      <div class="table-wrap"><table><thead><tr><th></th><th>Item</th><th>Qty</th><th>Weight</th><th>Condition</th><th>Flags</th><th>Actions</th></tr></thead><tbody id="inventory"></tbody></table></div>
+      <div class="panel-title nearby-title"><div><p class="eyebrow">UNDERFOOT</p><h2>Nearby ground and shop items</h2></div><span id="ground-summary"></span></div>
+      <div id="ground-items" class="ground-items muted">Nothing underfoot.</div>
+    </section>
+
+    <section id="activity-tab" class="tab-page panel">
+      <div class="panel-title"><div><p class="eyebrow">AUTOMATION TRACE</p><h2>Bot orders and decisions</h2></div><div class="spot-filters"><select id="activity-mode"><option value="decisions">Persistent decisions</option><option value="orders">Recent raw orders</option></select><span id="activity-summary"></span></div></div>
+      <p class="muted">Newest first. Decisions survive restarts for long-horizon diagnosis; raw orders retain the short movement, facing, healing and combat trace.</p>
+      <div id="activity" class="activity-list"></div>
+    </section>
+
+    <section id="farmspots-tab" class="tab-page panel">
+      <div class="panel-title"><div><p class="eyebrow">REPOSITORY-DERIVED ROUTES</p><h2>Known farm spots</h2></div><div class="spot-filters"><input id="spot-level" type="number" min="1" max="115" placeholder="Level"><select id="spot-category"><option value="">All types</option><option value="xp">XP zones</option><option value="boss">Boss / loot</option></select></div></div>
+      <p class="muted">Levels refer primarily to the combat skill being trained. Enemy color is the immediate safety and XP-efficiency check.</p>
+      <div id="farm-spots" class="farm-list"></div>
+    </section>
+
+    <section id="navspots-tab" class="tab-page panel">
+      <div class="panel-title"><div><p class="eyebrow">AUTHORED WORLD DESTINATIONS</p><h2>Known navigation spots</h2></div><div class="spot-filters"><input id="nav-search" placeholder="Search"><select id="nav-category"><option value="">All types</option><option value="town">Towns</option><option value="service">Services</option><option value="transport">Transport</option><option value="quest">Quest hubs</option><option value="dungeon">Dungeons</option><option value="boss">Bosses</option></select></div></div>
+      <p class="muted">Map-only entries stop upon entering the destination map. Coordinates are used only where a verified walkable arrival square is known.</p>
+      <div id="navigation-spots" class="farm-list"></div>
+    </section>
+
+    <section id="quests-tab" class="tab-page panel">
+      <div class="panel-title"><div><p class="eyebrow">SERVER QUEST JOURNAL</p><h2>Quest journal</h2></div><button class="secondary small" id="refresh-quests">Refresh journal (Q)</button></div>
+      <p class="muted">This section shows the incomplete and completed quests returned by the server, equivalent to pressing Q in the graphical client.</p>
+      <div id="quest-journal" class="quest-list"></div>
+      <div class="panel-title planner-title"><div><p class="eyebrow">AUTHORED PROGRESSION</p><h2>Quest planner</h2></div></div>
+      <p class="muted">Suggested levels come from the repository-derived route in WORLD_CONTENT_REPORT.md, not hard server gates.</p>
+      <div id="quests" class="quest-list"></div>
+    </section>
+
+    <section id="chat-tab" class="tab-page panel chat-layout">
+      <div>
+        <div class="panel-title"><div><p class="eyebrow">SERVER MESSAGES</p><h2>In-game chat</h2></div></div>
+        <div id="messages" class="messages"></div>
+        <form id="chat-form" class="form-row"><input id="chat-input" autocomplete="off" placeholder="Say something in game"><button>Send</button></form>
+        <form id="command-form" class="form-row"><input id="command-input" autocomplete="off" placeholder="Raw player command or /talk command"><button class="secondary">Execute</button></form>
+      </div>
+      <aside><p class="eyebrow">ACTIVE DIALOGUE</p><div id="dialogue" class="dialogue muted">No dialogue open.</div></aside>
+    </section>
+
+    <section id="economy-tab" class="tab-page panel economy-grid">
+      <div><p class="eyebrow">SELLING</p><h2>Shop-floor sales</h2>
+        <textarea id="junk-patterns" rows="4" placeholder="Junk regex patterns, one per line"></textarea>
+        <div class="form-row"><button id="sell-selected">Sell selected inventory items</button><button class="secondary" id="sell-junk">Sell matching junk</button></div>
+        <p class="muted">Stand on an actual shop floor first. The bot waits for payment confirmation and recovers items dropped on an ordinary floor. Applied and locked items are always protected.</p>
+      </div>
+      <div><p class="eyebrow">BANK</p><h2>Money deposit</h2>
+        <p id="wealth" class="muted">Carried: — · Bank: unknown · Spendable: —</p>
+        <p id="conditions" class="muted">Depletion: —</p>
+        <input id="banker" placeholder="Nearby banker NPC name"><input id="bank-amount" value="all" placeholder="Amount or all"><button class="wide" id="bank">Deposit money</button>
+      </div>
+      <div><p class="eyebrow">OWNED STORAGE</p><h2>Container deposit</h2>
+        <input id="container" placeholder="Visible/open container name"><textarea id="deposit-patterns" rows="4" placeholder="Item regex patterns, one per line"></textarea><button class="wide" id="deposit">Deposit matching items</button>
+      </div>
+    </section>
+  </main>
+  <div id="toast" role="status"></div>
+  <script>
+    window.addEventListener("error", function (event) {
+      var status = document.getElementById("connection");
+      if (status) status.textContent = "Dashboard script error: " + event.message;
+    });
+    window.addEventListener("unhandledrejection", function (event) {
+      var status = document.getElementById("connection");
+      if (status) status.textContent = "Dashboard error: " + event.reason;
+    });
+  </script>
+  <script src="/app.js?v=8"></script>
+</body>
+</html>
