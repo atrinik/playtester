@@ -11,7 +11,7 @@ if (ATRINIK_PATHFINDING_SOURCE_DIR)
         "${CMAKE_CURRENT_BINARY_DIR}/pathfinding")
 else ()
     FetchContent_Declare(atrinik_pathfinding
-        URL "https://github.com/atrinik/libatrinik/releases/download/v1.1.5/libatrinik-1.1.5.tar.gz"
+        URL "https://github.com/atrinik/legacy-libatrinik/releases/download/v1.1.5/libatrinik-1.1.5.tar.gz"
         URL_HASH "SHA256=3c07b178cc236881f52272df6e38bc2d4186943b782e4cee34b2e733da9c8f9a"
         DOWNLOAD_EXTRACT_TIMESTAMP false
         SOURCE_SUBDIR pathfinding)

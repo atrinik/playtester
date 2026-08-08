@@ -27,9 +27,11 @@ package containing the native extension takes precedence over the source-only
 package in the repository root.
 
 Without `ATRINIK_PATHFINDING_SOURCE_DIR`, CMake downloads the immutable,
-checksum-pinned libatrinik v1.1.5 source release. The Python package depends on
-the checksum-pinned `atrinik-protocol` v1.0.9 release wheel rather than copying
-wire identifiers.
+checksum-pinned libatrinik v1.1.5 source from its archived Classic release. The
+Python package depends on the checksum-pinned `atrinik-protocol` v1.0.9 wheel
+from the archived Classic protocol release rather than copying wire
+identifiers. New protocol consumers should use releases from the replacement
+`atrinik/protocol` repository once a compatible binding is available there.
 
 World-graph compilation requires the `tools` directory of a compatible Atrinik
 content checkout on `PYTHONPATH`. Build its runtime assets with
