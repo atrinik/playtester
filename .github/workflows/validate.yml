@@ -13,25 +13,60 @@ jobs:
   validate:
     name: Playtester validation
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 25
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Validate repository seed
+      - name: Check out content dependency
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: atrinik/content
+          ref: 96073eeff1854fc29347fdafd32e622394f24c07
+          path: build/dependencies/content
+          persist-credentials: false
+
+      - name: Install protocol dependency
+        run: >-
+          python3 -m pip install
+          'atrinik-protocol @
+          https://github.com/atrinik/legacy-protocol/releases/download/v1.0.9/atrinik_protocol-1.0.9-py3-none-any.whl#sha256=78954264fa49ac8736dbfc7a72669f619e0202e6ae15445a0b0839aa8f30eb8a'
+
+      - name: Build and test playtester
+        env:
+          ATRINIK_RUNTIME_CONTENT: ${{ github.workspace }}/build/content-runtime
+          PYTHONPATH: ${{ github.workspace }}/build/playtester/python:${{ github.workspace }}/build/dependencies/content/tools
+        run: |
+          cmake -S . -B build/playtester -G Ninja -DBUILD_TESTING=ON
+          cmake --build build/playtester --parallel
+          ctest --test-dir build/playtester --output-on-failure
+          python3 build/dependencies/content/tools/build_runtime.py \
+            --source build/dependencies/content \
+            --source-commit 96073eeff1854fc29347fdafd32e622394f24c07 \
+            --output build/content-runtime
+          cd build/playtester
+          python3 -m unittest -v atrinik_bot.test_bot
+
+      - name: Build and inspect wheel
+        env:
+          PYTHONPATH: ${{ github.workspace }}/build/installed:${{ github.workspace }}/build/dependencies/content/tools
+        run: |
+          python3 -m pip wheel --no-deps --wheel-dir build/dist .
+          unzip -l build/dist/*.whl | grep -q 'licenses/THIRD_PARTY_NOTICES.md'
+          python3 -m pip install --no-deps --target build/installed build/dist/*.whl
+          python3 -m atrinik_bot --help
+
+      - name: Validate repository boundaries
         shell: bash
         run: |
+          python3 -W error -m compileall -q -f .
           empty_tree=$(git hash-object -t tree /dev/null)
           git diff --check "${empty_tree}" HEAD
           test -s LICENSE
-          test -s README.md
           test -s PROVENANCE.md
-          test -s SECURITY.md
+          test -s THIRD_PARTY_NOTICES.md
+          test -s dependencies.lock.json
           if git ls-files | grep -E '(^|/)(credentials\.sh|.*\.sqlite3|runtime_state.*|.*:Zone\.Identifier)$'; then
             echo "mutable or secret-bearing file is tracked" >&2
-            exit 1
-          fi
-          if git ls-files | grep '^atrinik_bot/'; then
-            echo "held prototype source was imported without updating the provenance gate" >&2
             exit 1
           fi

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(atrinik-bot-pathfinding VERSION 0.1.0 LANGUAGES C)
+project(atrinik-playtester-pathfinding VERSION 0.1.0 LANGUAGES C)
 
 include(FetchContent)
 find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter Development.Module)

@@ -3,21 +3,19 @@
 Use a Conventional Commits pull-request title:
 `type(optional-scope)!: concise description`.
 
-Until the provenance hold in [PROVENANCE.md](PROVENANCE.md) is resolved, do not
-copy, translate, decompile, or mechanically recreate implementation from
-`atrinik/tools/atrinik_bot`, its bytecode, secret-bearing snapshots, or other
-historical artifacts. Work from documented public behavior and newly authored
-tests, or submit a separately reviewed provenance/license decision first.
+Playtester behavior must use ordinary player capabilities, keep transport
+details behind a narrow interface, consume versioned protocol/content inputs,
+and keep credentials and mutable state outside the source tree. Update
+`dependencies.lock.json` and `THIRD_PARTY_NOTICES.md` together when a pinned
+input or license boundary changes.
 
-New implementation must act through ordinary player capabilities, keep
-transport details behind a narrow interface, use versioned content/protocol
-inputs, and keep credentials and mutable state outside the source tree.
-
-Before submitting a change, run:
+Before submitting a change, build the strict native adapter, run CTest and the
+complete content-aware Python suite described in [README.md](README.md), then
+run:
 
 ```sh
+python3 -W error -m compileall -q -f .
 git diff --check
 ```
 
-Add language- and component-specific validation as implementation lands. Keep
-the required `Playtester validation` job stable when expanding CI.
+Keep the required `Playtester validation` job name stable when expanding CI.

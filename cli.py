@@ -20,7 +20,7 @@ from .autoplay import AutoplayTask
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="atrinik-bot")
+    p = argparse.ArgumentParser(prog="atrinik-playtester")
     p.add_argument("--host", default="host.docker.internal")
     p.add_argument("--port", type=int, default=1728)
     p.add_argument("--transport", choices=("auto", "tcp", "quic"),

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "inputs": {
+    "content": {
+      "repository": "atrinik/content",
+      "revision": "96073eeff1854fc29347fdafd32e622394f24c07",
+      "release": "v1.8.0",
+      "license": "LicenseRef-Atrinik-Content",
+      "disposition": "external tooling and runtime input; not distributed"
+    },
+    "pathfinding": {
+      "repository": "atrinik/legacy-libatrinik",
+      "release": "v1.1.5",
+      "archive": "libatrinik-1.1.5.tar.gz",
+      "sha256": "3c07b178cc236881f52272df6e38bc2d4186943b782e4cee34b2e733da9c8f9a",
+      "license": "GPL-2.0-or-later",
+      "disposition": "external source linked into the native extension"
+    },
+    "protocol": {
+      "repository": "atrinik/legacy-protocol",
+      "release": "v1.0.9",
+      "artifact": "atrinik_protocol-1.0.9-py3-none-any.whl",
+      "sha256": "78954264fa49ac8736dbfc7a72669f619e0202e6ae15445a0b0839aa8f30eb8a",
+      "license": "MIT",
+      "disposition": "external runtime dependency; not vendored"
+    }
+  }
+}

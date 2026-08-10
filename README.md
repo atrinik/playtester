@@ -1,50 +1,91 @@
-# Atrinik bot
+# Atrinik playtester
 
-`atrinik_bot` is a Python 3.11+ headless gameplay client and automation engine.
-Its world model and safety policy remain Python-owned, while local-grid,
-component, and indexed world-graph searches use libatrinik's dependency-light
-native pathfinding core through the `_pathfinding` extension.
+Atrinik playtester is an autonomous, headless end-to-end player for Atrinik.
+It connects through ordinary player protocols, observes live game state, and
+runs navigation, quest, combat, equipment, economy, and survival policies
+without privileged server access.
 
-Build and test the native extension against a sibling libatrinik checkout:
+The product goal is one reproducible unattended campaign from a new account
+and character through a versioned full-game completion contract. The initial
+golden path is tracked by [issue #1](https://github.com/atrinik/playtester/issues/1):
+complete all 16 formal quests, reach level 115, defeat Zechna, verify every
+outcome from authoritative game state, and emit a machine-readable result.
+
+## Current capability
+
+The migrated implementation provides direct Classic TCP and QUIC transports,
+account and character setup, a live world model, content-derived navigation,
+16 formal quest executors, adaptive farming through level 115, persistent
+memory, and a loopback operator dashboard.
+
+The current `autoplay` command completes the introductory flow and then levels;
+the all-quest runner remains separate, and Zechna is not yet an automated
+completion gate. The roadmap issues track the work needed to turn these pieces
+into the single start-to-finish campaign described above.
+
+## Build and test
+
+Requirements are Python 3.11+, CMake 3.21+, Ninja, and a C17 compiler. The
+native adapter uses the checksum-pinned Classic libatrinik pathfinding release.
 
 ```sh
-cmake -S atrinik_bot -B build/atrinik-bot -G Ninja \
-  -DATRINIK_PATHFINDING_SOURCE_DIR=/path/to/libatrinik \
-  -DBUILD_TESTING=ON
-cmake --build build/atrinik-bot
-ctest --test-dir build/atrinik-bot --output-on-failure
-(cd build/atrinik-bot && \
-  PYTHONPATH="$PWD/python:/path/to/content/tools" \
-  ATRINIK_RUNTIME_CONTENT=/path/to/collected/content \
-  python3 -m unittest -v atrinik_bot.test_bot)
-(cd build/atrinik-bot && \
-  PYTHONPATH="$PWD/python" \
-  python3 -m atrinik_bot.benchmark_pathfinding --repeats 20)
+cmake -S . -B build/playtester -G Ninja -DBUILD_TESTING=ON
+cmake --build build/playtester --parallel
+ctest --test-dir build/playtester --output-on-failure
 ```
 
-Run the Python commands from the build directory as shown so the assembled
-package containing the native extension takes precedence over the source-only
-package in the repository root.
+The complete Python suite additionally needs the `tools` directory and a
+collected runtime from the exact content revision recorded in
+[`dependencies.lock.json`](dependencies.lock.json):
 
-Without `ATRINIK_PATHFINDING_SOURCE_DIR`, CMake downloads the immutable,
-checksum-pinned libatrinik v1.1.5 source from its archived Classic release. The
-Python package depends on the checksum-pinned `atrinik-protocol` v1.0.9 wheel
-from the archived Classic protocol release rather than copying wire
-identifiers. New protocol consumers should use releases from the replacement
-`atrinik/protocol` repository once a compatible binding is available there.
+```sh
+python3 /path/to/content/tools/build_runtime.py \
+  --source /path/to/content \
+  --source-commit 96073eeff1854fc29347fdafd32e622394f24c07 \
+  --output build/content-runtime
 
-World-graph compilation requires the `tools` directory of a compatible Atrinik
-content checkout on `PYTHONPATH`. Build its runtime assets with
-`python3 tools/build_runtime.py --output build/runtime`, then pass that output
-through `--runtime-content` or `ATRINIK_RUNTIME_CONTENT`. To read a server
-checkout's current experience table in the dashboard, set
-`ATRINIK_SERVER_SOURCE` to the server root; otherwise the bundled early-level
-table is used. Store bot memory outside the source tree with `--runtime-state`
-or `ATRINIK_BOT_RUNTIME_STATE`.
+(cd build/playtester && \
+  PYTHONPATH="$PWD/python:/path/to/content/tools" \
+  ATRINIK_RUNTIME_CONTENT=/path/to/playtester/build/content-runtime \
+  python3 -m unittest -v atrinik_bot.test_bot)
+```
 
-The operator dashboard intentionally binds only to a loopback address and
-rejects cross-origin control requests. Use an authenticated local tunnel when
-remote operation is required instead of exposing the HTTP control port.
+Run commands from the build directory so the assembled `atrinik_bot` package,
+including its native extension, takes precedence over the source files at the
+repository root.
 
-Runtime databases, state, credentials, logs, caches, and downloaded
-dependencies must remain untracked.
+## Run
+
+Install the package or invoke the assembled package. Credentials and mutable
+state belong outside the source tree and should be supplied through environment
+variables or a private launcher:
+
+```sh
+ATRINIK_BOT_ACCOUNT=playtester-account \
+ATRINIK_BOT_PASSWORD='replace-me' \
+ATRINIK_BOT_CHARACTER=Playtester \
+ATRINIK_BOT_RUNTIME_STATE=/private/state/playtester.sqlite3 \
+ATRINIK_RUNTIME_CONTENT=/path/to/collected/content \
+atrinik-playtester autoplay
+```
+
+Use `atrinik-playtester --help` for transport, registration, character,
+dashboard, navigation, quest, farming, banking, selling, and storage options.
+The dashboard binds to loopback and rejects cross-origin control requests; use
+an authenticated local tunnel instead of exposing it directly.
+
+## Dependency and content boundaries
+
+The playtester source is independent of its external protocol, pathfinding,
+and game-content inputs. Their immutable coordinates and licenses are recorded
+in [`dependencies.lock.json`](dependencies.lock.json) and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). In particular, a wheel or
+binary linked with GPL libatrinik pathfinding is not an MIT-only artifact and
+must satisfy the GPL's corresponding-source and notice requirements.
+
+## License and provenance
+
+The playtester source is available under the [MIT License](LICENSE), copyright
+2026 Zoey Rose. The direct sole-authorship attestation, MIT grant, retained
+history mapping, and excluded material are recorded in
+[`PROVENANCE.md`](PROVENANCE.md).

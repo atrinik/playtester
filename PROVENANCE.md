@@ -1,31 +1,50 @@
-# Provenance status
+# Provenance
 
-No implementation from `atrinik/tools/atrinik_bot` has been imported into this
-repository. The initial repository files are new MIT-licensed project,
-security, contribution, and validation scaffolding.
+## Imported implementation
 
-## Held source boundary
+`atrinik_bot/` was extracted from `atrinik/tools` at revision
+`b0f27045a0491fd9d3f36d8ac63159c713a6c601`. The exact imported subtree is
+`62ddc45bfbfb5e1a63a8333b0b501b57a61e50bb`.
 
-- Candidate source: `atrinik/tools`, path `atrinik_bot/`
-- Audited source revision: `b0f27045a0491fd9d3f36d8ac63159c713a6c601`
-- Candidate subtree: `62ddc45bfbfb5e1a63a8333b0b501b57a61e50bb`
-- Tracked bot commits: `55d2ce6f8d09a52d3ce4b25447d187900213179c`
-  and `72f0bf821fb149ed4d2212cae520de6644db44b6`
-- Extraction record: `https://github.com/atrinik/tools/issues/19`
-- Provenance policy reviewed at `atrinik/atrinik` revision
-  `28e2ac6424b2fad5ccd3f78f361610a5daa220cf`
+The retained source changes and their destination equivalents are:
 
-The tracked source repository is complete and attributes those commits to
-Zoey Rose. Retained development evidence also proves that the implementation
-existed before the first tracked bulk import, but its earlier source history
-could not be recovered. A direct current authorship attestation corroborates
-ownership but does not reconstruct the missing history or resolve embedded
-and linked GPL material. The reviewed policy explicitly fails closed on those
-conditions.
+| `atrinik/tools` commit | `atrinik/playtester` commit |
+| --- | --- |
+| `55d2ce6f8d09a52d3ce4b25447d187900213179c` | `f4c8145aeff476fcd9195d97d2307b78534ec3a5` |
+| `72f0bf821fb149ed4d2212cae520de6644db44b6` | `6d239437cacb9e3769b180cedecc3642712c4750` |
 
-The held source must not enter this repository unless a reviewed provenance
-decision admits an exact, separable boundary and all dependency/derived-data
-licenses are resolved. Independent implementation from documented behavior is
-the default alternative. Secret-bearing historical snapshots, credentials,
-databases, runtime state, logs, caches, and downloaded dependencies are never
-eligible migration inputs.
+GitHub verifies both source commits and associates their author, Zoey Rose
+<3865595+zoeyrose@users.noreply.github.com>, with `zoeyrose` account ID
+`3865595`.
+
+The subtree first appears in the retained repository as a bulk import.
+Development history before that import could not be recovered. This record
+discloses that gap and does not claim that it was reconstructed.
+
+## Direct MIT grant
+
+On 2026-08-10, Zoey Rose stated that all code and project-authored supporting
+material in `atrinik/tools/atrinik_bot` was solely developed by her and
+expressly granted permission to relicense it under the MIT License. The grant
+is recorded in [atrinik/tools#19](https://github.com/atrinik/tools/issues/19#issuecomment-5234746983).
+
+That current, path-specific grant is the basis for distributing the imported
+source under MIT. It is corroborated by the Zoey Rose historical grant in
+`atrinik/atrinik` at revision
+`28e2ac6424b2fad5ccd3f78f361610a5daa220cf`. Earlier GPL grants remain valid;
+the MIT grant adds another permitted license and does not revoke them.
+
+Only `atrinik_bot/` was imported. Credentials, databases, runtime state, logs,
+caches, downloaded dependencies, secret-bearing historical snapshots, and
+unrelated `atrinik/tools` files were excluded.
+
+## External-material review
+
+No third-party source or game-content files are vendored in the imported
+subtree. Protocol values, object and quest names, map paths, coordinates, and
+gameplay observations are compatibility facts used by the playtester; they do
+not relicense the Atrinik implementation or content from which behavior was
+observed.
+
+External libraries, content tooling, and game data retain their own licenses
+as recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
