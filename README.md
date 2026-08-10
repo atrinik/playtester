@@ -85,7 +85,9 @@ must satisfy the GPL's corresponding-source and notice requirements.
 
 ## License and provenance
 
-The playtester source is available under the [MIT License](LICENSE), copyright
-2026 Zoey Rose. The direct sole-authorship attestation, MIT grant, retained
-history mapping, and excluded material are recorded in
-[`PROVENANCE.md`](PROVENANCE.md).
+The playtester source is distributed under the [MIT License](LICENSE). The
+imported `atrinik_bot` project code was generated and iteratively developed by
+OpenAI Codex under Zoey Rose's direct supervision and steering, then reviewed
+and accepted by her. Zoey directs its MIT release and grants all rights she
+holds in that code. The precise development record, retained history mapping,
+and excluded material are recorded in [`PROVENANCE.md`](PROVENANCE.md).

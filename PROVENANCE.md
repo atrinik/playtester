@@ -13,26 +13,37 @@ The retained source changes and their destination equivalents are:
 | `55d2ce6f8d09a52d3ce4b25447d187900213179c` | `f4c8145aeff476fcd9195d97d2307b78534ec3a5` |
 | `72f0bf821fb149ed4d2212cae520de6644db44b6` | `6d239437cacb9e3769b180cedecc3642712c4750` |
 
-GitHub verifies both source commits and associates their author, Zoey Rose
-<3865595+zoeyrose@users.noreply.github.com>, with `zoeyrose` account ID
-`3865595`.
+The retained commits use the verified Git author identity Zoey Rose
+<3865595+zoeyrose@users.noreply.github.com>, associated by GitHub with
+`zoeyrose` account ID `3865595`. That metadata identifies the submitting
+account; it is not a claim that Zoey Rose personally wrote every line.
 
 The subtree first appears in the retained repository as a bulk import.
 Development history before that import could not be recovered. This record
 discloses that gap and does not claim that it was reconstructed.
 
-## Direct MIT grant
+## Development process and MIT licensing direction
 
-On 2026-08-10, Zoey Rose stated that all code and project-authored supporting
-material in `atrinik/tools/atrinik_bot` was solely developed by her and
-expressly granted permission to relicense it under the MIT License. The grant
-is recorded in [atrinik/tools#19](https://github.com/atrinik/tools/issues/19#issuecomment-5234746983).
+On 2026-08-10, Zoey Rose corrected and superseded her earlier sole-development
+wording. She attested that the `atrinik_bot` project code in the source revision
+and subtree above was generated and iteratively developed by OpenAI Codex in a
+prior coding session under her direct supervision and steering. Zoey supplied
+requirements and iterative direction, reviewed the resulting code, and
+accepted it. The correction is recorded in
+[atrinik/tools#19](https://github.com/atrinik/tools/issues/19#issuecomment-5234746983).
 
-That current, path-specific grant is the basis for distributing the imported
-source under MIT. It is corroborated by the Zoey Rose historical grant in
-`atrinik/atrinik` at revision
-`28e2ac6424b2fad5ccd3f78f361610a5daa220cf`. Earlier GPL grants remain valid;
-the MIT grant adds another permitted license and does not revoke them.
+Zoey directs release of that code under the MIT License and grants under MIT
+all copyright and other licensable rights in it that she holds. This is a
+factual development-process attribution: it neither claims that Zoey personally
+wrote every line nor identifies Codex or OpenAI as a copyright author or
+holder, and it takes no position on whether machine-generated portions are
+independently copyrightable. The generic historical Zoey Rose grant in
+`atrinik/atrinik` is not used as proof of sole human authorship for this code.
+
+This statement is limited to the `atrinik_bot` project code in the exact source
+boundary above. It makes no authorship or licensing representation about
+unrelated `atrinik/tools` material, external dependencies, linked binaries, or
+Atrinik game content.
 
 Only `atrinik_bot/` was imported. Credentials, databases, runtime state, logs,
 caches, downloaded dependencies, secret-bearing historical snapshots, and
