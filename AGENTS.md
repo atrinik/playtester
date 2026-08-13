@@ -12,14 +12,16 @@
   server state, save-file edits, or validation bypasses.
 - Source modules remain at repository root and CMake assembles the installable
   `atrinik_bot` package with its native extension under `build/`.
-- Keep `dependencies.lock.json`, CMake fetch coordinates, package metadata,
-  CI inputs, and `THIRD_PARTY_NOTICES.md` synchronized. External libraries and
-  content retain their own licenses; linked GPL artifacts are not MIT-only.
+- Keep `dependencies.lock.json`, the atomic compatibility cache installer,
+  CMake fetch coordinates, package metadata, CI inputs, and
+  `THIRD_PARTY_NOTICES.md` synchronized. External libraries and content retain
+  their own licenses; linked GPL artifacts are not MIT-only.
 - Keep credentials, certificates, databases, logs, collected content, caches,
   downloaded dependencies, and all mutable state outside the source tree.
 - Validate changes with the strict-warning native build, CTest, the complete
-  Python regression suite against the pinned content revision and collected
-  runtime, compileall, and `git diff --check`.
+  Python regression suite against the verified pinned compatibility bundle, a
+  clean-directory wheel install/doctor smoke test, compileall, and
+  `git diff --check`.
 - Commits and pull-request titles use Conventional Commits. Preserve unrelated
   work. Semantic-release owns source tags, notes, and GitHub releases; do not
   attach the GPL-linked wheel unless its corresponding-source obligations are

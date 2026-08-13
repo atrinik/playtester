@@ -9,9 +9,9 @@ and keep credentials and mutable state outside the source tree. Update
 `dependencies.lock.json` and `THIRD_PARTY_NOTICES.md` together when a pinned
 input or license boundary changes.
 
-Before submitting a change, build the strict native adapter, run CTest and the
-complete content-aware Python suite described in [README.md](README.md), then
-run:
+Before submitting a change, build the strict native adapter, run CTest, the
+complete content-aware Python suite, and the clean-directory installed-wheel
+smoke test described in [README.md](README.md), then run:
 
 ```sh
 python3 -W error -m compileall -q -f .
