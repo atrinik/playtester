@@ -74,6 +74,8 @@ jobs:
       - name: Validate repository boundaries
         shell: bash
         run: |
+          python3 -m unittest discover -v \
+            -s .github/scripts -p 'test_check_pr_metadata.py'
           python3 -W error -m compileall -q -f .
           empty_tree=$(git hash-object -t tree /dev/null)
           git diff --check "${empty_tree}" HEAD
