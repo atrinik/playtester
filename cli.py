@@ -7,20 +7,21 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 
-from .client import AtrinikClient, ClientConfig
-from .tasks import (BankTask, DepositItemsTask, FarmTask, JunkPolicy,
-                    SellJunkTask, TaskEngine)
-from .navigation import NavigateTask, NavigateThenTask, WorldGraph
-from .quest_tasks import EscapingDesertedIslandTask
-from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
-                                  POLICIES)
-from .web_server import WebControlServer
-from .autoplay import AutoplayTask
+from .compatibility import (CompatibilityError, configure_cached_bundle,
+                            default_cache_root, doctor, install_bundle,
+                            load_lock)
 
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="atrinik-playtester")
+    p.add_argument(
+        "--cache",
+        type=Path,
+        default=default_cache_root(),
+        help="compatibility cache (default: %(default)s)",
+    )
     p.add_argument("--host", default="host.docker.internal")
     p.add_argument("--port", type=int, default=1728)
     p.add_argument("--transport", choices=("auto", "tcp", "quic"),
@@ -61,6 +62,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--archetype", default="half_elf_male")
     p.add_argument("--log-level", default="INFO")
     sub = p.add_subparsers(dest="task", required=True)
+    dependencies = sub.add_parser(
+        "dependencies", help="install the immutable compatibility bundle")
+    dependencies.add_argument("--source-archive", type=Path)
+    dependencies.add_argument("--runtime-archive", type=Path)
+    dependencies.add_argument("--offline", action="store_true")
+    dependencies.add_argument("--json", action="store_true")
+    diagnose = sub.add_parser(
+        "doctor", help="diagnose locked protocol, pathfinding, and content inputs")
+    diagnose.add_argument("--json", action="store_true")
     sub.add_parser("observe")
     web = sub.add_parser("web", help="run the persistent browser dashboard")
     web.add_argument("--listen", default="127.0.0.1")
@@ -102,6 +112,16 @@ def parser() -> argparse.ArgumentParser:
 
 
 async def main_async(args: argparse.Namespace) -> None:
+    from .autoplay import AutoplayTask
+    from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
+                                      POLICIES)
+    from .client import AtrinikClient, ClientConfig
+    from .navigation import NavigateTask, NavigateThenTask, WorldGraph
+    from .quest_tasks import EscapingDesertedIslandTask
+    from .tasks import (BankTask, DepositItemsTask, FarmTask, JunkPolicy,
+                        SellJunkTask, TaskEngine)
+    from .web_server import WebControlServer
+
     config = ClientConfig(
         host=args.host, port=args.port, account=args.account,
         password=args.password, character=args.character,
@@ -203,6 +223,53 @@ async def main_async(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parser().parse_args()
+    try:
+        lock = load_lock()
+    except CompatibilityError as error:
+        raise SystemExit(f"invalid compatibility lock: {error}") from error
+    if args.task == "dependencies":
+        try:
+            installed = install_bundle(
+                args.cache,
+                lock,
+                source_archive=args.source_archive,
+                runtime_archive=args.runtime_archive,
+                offline=args.offline,
+            )
+        except CompatibilityError as error:
+            raise SystemExit(f"dependency installation failed: {error}") from error
+        result = {
+            "content_revision": lock["inputs"]["content"]["revision"],
+            "root": str(installed["root"]),
+            "runtime": str(installed["runtime"]),
+            "source": str(installed["source"]),
+        }
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(f"Installed compatibility bundle: {result['root']}")
+            print(f"Content source: {result['source']}")
+            print(f"Classic runtime: {result['runtime']}")
+        return
+    if args.task == "doctor":
+        result = doctor(args.cache, lock)
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            for check in result["checks"]:
+                print(f"{check['status'].upper():5} {check['name']}: {check['detail']}")
+        if not result["ok"]:
+            raise SystemExit(1)
+        return
+    try:
+        installed = configure_cached_bundle(args.cache, lock)
+    except CompatibilityError as error:
+        raise SystemExit(
+            f"compatibility bundle unavailable: {error}\n"
+            "Run 'atrinik-playtester dependencies' first."
+        ) from error
+    if not args.runtime_content:
+        args.runtime_content = str(installed["runtime"])
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

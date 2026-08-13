@@ -18,13 +18,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Check out content dependency
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Select the minimum supported Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          repository: atrinik/content
-          ref: 96073eeff1854fc29347fdafd32e622394f24c07
-          path: build/dependencies/content
-          persist-credentials: false
+          python-version: "3.11"
 
       - name: Install protocol dependency
         run: >-
@@ -34,27 +31,45 @@ jobs:
 
       - name: Build and test playtester
         env:
-          ATRINIK_RUNTIME_CONTENT: ${{ github.workspace }}/build/content-runtime
-          PYTHONPATH: ${{ github.workspace }}/build/playtester/python:${{ github.workspace }}/build/dependencies/content/tools
+          ATRINIK_PLAYTESTER_CACHE: ${{ runner.temp }}/atrinik-playtester-cache
+          PYTHONPATH: ${{ github.workspace }}/build/playtester/python
         run: |
           cmake -S . -B build/playtester -G Ninja -DBUILD_TESTING=ON
           cmake --build build/playtester --parallel
           ctest --test-dir build/playtester --output-on-failure
-          python3 build/dependencies/content/tools/build_runtime.py \
-            --source build/dependencies/content \
-            --source-commit 96073eeff1854fc29347fdafd32e622394f24c07 \
-            --output build/content-runtime
-          cd build/playtester
-          python3 -m unittest -v atrinik_bot.test_bot
+          python3 -m atrinik_bot dependencies --json
+          python3 -m atrinik_bot doctor --json
+          python3 - <<'PY'
+          import unittest
+          from atrinik_bot.compatibility import (
+              configure_cached_bundle,
+              default_cache_root,
+              load_lock,
+          )
 
-      - name: Build and inspect wheel
+          configure_cached_bundle(default_cache_root(), load_lock())
+          result = unittest.TextTestRunner(verbosity=2).run(
+              unittest.defaultTestLoader.loadTestsFromName("atrinik_bot.test_bot")
+          )
+          raise SystemExit(not result.wasSuccessful())
+          PY
+
+      - name: Build, install, and smoke-test wheel from a clean directory
         env:
-          PYTHONPATH: ${{ github.workspace }}/build/installed:${{ github.workspace }}/build/dependencies/content/tools
+          ATRINIK_PLAYTESTER_CACHE: ${{ runner.temp }}/atrinik-playtester-cache
         run: |
           python3 -m pip wheel --no-deps --wheel-dir build/dist .
           unzip -l build/dist/*.whl | grep -q 'licenses/THIRD_PARTY_NOTICES.md'
-          python3 -m pip install --no-deps --target build/installed build/dist/*.whl
-          python3 -m atrinik_bot --help
+          unzip -l build/dist/*.whl | grep -q 'atrinik_bot/dependencies.lock.json'
+          python3 -m venv "${RUNNER_TEMP}/atrinik-playtester-wheel"
+          "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/pip" install build/dist/*.whl
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \
+            -m atrinik_bot dependencies --offline --json
+          "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \
+            -m atrinik_bot doctor --json
+          "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \
+            -m atrinik_bot --help
 
       - name: Validate repository boundaries
         shell: bash

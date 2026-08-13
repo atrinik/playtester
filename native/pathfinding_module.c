@@ -742,5 +742,21 @@ static struct PyModuleDef module = {
 };
 
 PyMODINIT_FUNC PyInit__pathfinding(void) {
-    return PyModule_Create(&module);
+    PyObject *created = PyModule_Create(&module);
+    if (created == NULL) {
+        return NULL;
+    }
+    if (PyModule_AddStringConstant(created,
+                                   "__dependency_release__",
+                                   ATRINIK_PATHFINDING_RELEASE) < 0) {
+        Py_DECREF(created);
+        return NULL;
+    }
+    if (PyModule_AddStringConstant(created,
+                                   "__dependency_sha256__",
+                                   ATRINIK_PATHFINDING_SHA256) < 0) {
+        Py_DECREF(created);
+        return NULL;
+    }
+    return created;
 }

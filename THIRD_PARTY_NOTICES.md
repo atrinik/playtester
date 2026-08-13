@@ -22,8 +22,16 @@ or Atrinik game content.
 - `scikit-build-core`, used to build the package, is Apache-2.0.
 
 The playtester reads Atrinik content and imports content analysis tooling from
-a separate content checkout. Those tools and content retain their repository
-and per-file licenses; they are not covered by this repository's MIT License.
+the separately distributed `atrinik/content` `v2.14.0` release at commit
+`7dde0c0afe8840fc95dd26f404310e77d9c82621` on `main`. The source archive is
+`atrinik-content-2.14.0.tar.gz`
+(`sha256:bd5aa9acb8dd17c07e16913cb36c58644f7910f28f47e3b0739d00d91936a9e6`),
+and the Classic runtime is
+`atrinik-content-2.14.0-classic-runtime.tar.gz`
+(`sha256:f4ad326e20e221869897c72f7e33b533c408ce6654038dbfc4352da1c3391261`).
+The tools, runtime, and content retain their repository and per-file licenses;
+they are cached external inputs and are not covered by this repository's MIT
+License.
 
 Release artifacts must record their exact resolved dependency graph and retain
 all required license texts and notices. No linked GPL binary should be

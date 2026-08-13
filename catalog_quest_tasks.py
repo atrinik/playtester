@@ -86,6 +86,7 @@ NPC: dict[str, Place] = {
     # Dockside Sam owns the Lost Memories quest interface. The other Incuna
     # Sam on world_0_83 is the later voyage NPC for sailing to Strakewood.
     "Sam Goodberry (Incuna)": _p("/shattered_islands/world_4_85", 4, 13),
+    "Elara Harth": _p("/shattered_islands/world_4_85", 9, 4),
     "Brelend Lee": _p("/shattered_islands/world_4_84", 7, 7),
     "Ken Berger": _p("/shattered_islands/world_4_84", 20, 9),
     "John Aldman": _p("/shattered_islands/world_4_83_-1", 6, 17),
@@ -237,6 +238,12 @@ POLICIES: dict[str, QuestPolicy] = {
 # is completed before departure when those parts remain active.
 POLICIES["Lost Memories"] = QuestPolicy(
     "Lost Memories", _dialog("Sam Goodberry", place=NPC["Sam Goodberry (Incuna)"]), {
+        "Speak with Sam Goodberry": _part(_dialog(
+            "Sam Goodberry", place=NPC["Sam Goodberry (Incuna)"],
+            choices=(r"=:remember\]",))),
+        "Your First Apartment": _part(Action(
+            "apartment_tutorial", NPC["Elara Harth"], "Elara Harth",
+            choices=(r"=:claim\]",))),
         # The heal response completes speak_priest and immediately renders the
         # first healed_body page without closing the interface. Keep one
         # ordered policy across that authored part boundary.
@@ -292,6 +299,7 @@ POLICIES["Lost Memories"] = QuestPolicy(
         "The Presence": _part(_dialog("Brelend Lee"), "Brelend Lee", "the_presence"),
         "The Journey": _part(_dialog("Sam Goodberry", place=NPC["Sam Goodberry (Incuna)"]), "Sam Goodberry", "the_journey"),
     }, priority=(
+        "Speak with Sam Goodberry", "Your First Apartment",
         "The Priest", "Healed Body...", "... Broken Spirit", "Gearing Up",
         "The Arcane", "Shooting Practice", "The Priestess",
         # The authored tonic route is safe for the intended level-1 character.
@@ -465,6 +473,90 @@ class ApplyAtTask(BotTask):
             return
         await client.apply(item.tag)
         self.applied = True
+
+
+class IncunaApartmentTutorialTask(BotTask):
+    """Claim the main-line Incuna apartment and use its tutorial hammock."""
+
+    INCUNA_MAP = "/shattered_islands/world_4_85"
+    APARTMENT_MAP = "/shattered_islands/incuna/apartments/beach_nook"
+    PORTAL_XY = (10, 4)
+    HAMMOCK_XY = (11, 11)
+
+    def __init__(self, graph: WorldGraph, action: Action):
+        super().__init__("lost-memories:incuna-apartment")
+        self.graph = graph
+        self.action = action
+        self.stage = "claim"
+        self.child: BotTask | None = None
+        self.applied = False
+        self.last_move = 0.0
+        self.portal_attempts = 0
+
+    def _inside_apartment(self, client: AtrinikClient) -> bool:
+        path = client.state.map.path
+        raw = getattr(client.state.map, "raw_path", "")
+        return self.APARTMENT_MAP in path or self.APARTMENT_MAP in raw
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        if client.state.phase != "playing":
+            return
+        if self.applied:
+            self.complete()
+            return
+        if self._inside_apartment(client):
+            self.stage = "hammock"
+            self.child = None
+        if self.child is not None:
+            await self.child.tick(client)
+            if self.child.status == TaskStatus.FAILED:
+                self.fail(self.child.error)
+            elif self.child.status == TaskStatus.COMPLETE:
+                self.child = None
+                if self.stage == "portal":
+                    self.portal_attempts += 1
+                    if self.portal_attempts >= 3:
+                        self.fail("apartment portal did not activate")
+                else:
+                    self.stage = "portal"
+            return
+        if self.stage == "claim":
+            assert self.action.place is not None
+            self.child = DialogAtTask(
+                self.graph, self.action.place, self.action.npc,
+                self.action.choices)
+            return
+        if self.stage == "portal":
+            if client.state.map.path != self.INCUNA_MAP:
+                self.fail("apartment portal did not enter the Incuna beach nook")
+                return
+            self.child = NavigateTask(
+                self.graph, self.INCUNA_MAP, self.PORTAL_XY)
+            return
+
+        hammock = next((
+            item for item in client.state.ground
+            if item.name.casefold() == "hammock to reality"
+        ), None)
+        if hammock is not None:
+            await client.apply(hammock.tag)
+            self.applied = True
+            return
+        if time.monotonic() - self.last_move < 0.65:
+            return
+        current_x = client.state.map.world_x
+        current_y = client.state.map.world_y
+        dx = self.HAMMOCK_XY[0] - current_x
+        dy = self.HAMMOCK_XY[1] - current_y
+        if max(abs(dx), abs(dy)) > 8:
+            self.fail("apartment hammock is outside the bounded entry route")
+            return
+        view_x = client.state.map.player_x + dx
+        view_y = client.state.map.player_y + dy
+        await client.move_to_view(view_x, view_y)
+        self.last_move = time.monotonic()
 
 
 class AcquireContainerItemTask(BotTask):
@@ -768,6 +860,8 @@ class CatalogQuestTask(BotTask):
                                 (action.place.x, action.place.y))
         if action.kind == "apply":
             return ApplyAtTask(self.graph, action.place, action.item)
+        if action.kind == "apartment_tutorial":
+            return IncunaApartmentTutorialTask(self.graph, action)
         if action.kind == "container":
             return AcquireContainerItemTask(
                 self.graph, action.place, action.item, action.object_name,

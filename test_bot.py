@@ -21,6 +21,7 @@ from .navigation import (BuySpellTask, FarmCircuitTask, FoodProfile,
 from .catalog_quest_tasks import (ApplyAtTask, CatalogQuestTask, DialogAtTask,
                                   AcquireContainerItemTask,
                                   AcquireContainerItemsTask,
+                                  IncunaApartmentTutorialTask,
                                   KeyThenContainerTask, LostMemoriesArrivalTask,
                                   NPC, POLICIES, RECOMMENDED_QUEST_ORDER)
 from .client import AtrinikClient, ClientConfig
@@ -6043,6 +6044,45 @@ class QuestTests(unittest.TestCase):
         })()
         self.assertIsNone(task.navigation.destination_xy)
         self.assertTrue(task._requirements_met(client))
+
+    def test_lost_memories_main_line_apartment_policy(self):
+        policy = POLICIES["Lost Memories"]
+        self.assertEqual(
+            policy.parts["Speak with Sam Goodberry"].action.choices,
+            (r"=:remember\]",),
+        )
+        action = policy.parts["Your First Apartment"].action
+        self.assertEqual(action.kind, "apartment_tutorial")
+        task = CatalogQuestTask(built_graph(), policy)._action_task(
+            action, "Your First Apartment")
+        self.assertIsInstance(task, IncunaApartmentTutorialTask)
+
+    def test_incuna_apartment_tutorial_enters_hammock_and_applies(self):
+        action = POLICIES["Lost Memories"].parts[
+            "Your First Apartment"].action
+        task = IncunaApartmentTutorialTask(built_graph(), action)
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.map = MapState(
+            path=(IncunaApartmentTutorialTask.APARTMENT_MAP + "/Sera"),
+            world_x=11, world_y=12, player_x=8, player_y=8,
+        )
+        client.moves, client.applied = [], []
+
+        async def move_to_view(x, y):
+            client.moves.append((x, y))
+
+        async def apply(tag):
+            client.applied.append(tag)
+
+        client.move_to_view, client.apply = move_to_view, apply
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.moves, [(8, 7)])
+        client.state.place_item(Item(90, name="hammock to reality"), 0)
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.applied, [90])
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
 
     def test_quest_list(self):
         data = (

@@ -1,18 +1,55 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "bundle_version": "classic-main-v1",
   "inputs": {
     "content": {
       "repository": "atrinik/content",
-      "revision": "96073eeff1854fc29347fdafd32e622394f24c07",
-      "release": "v1.8.0",
+      "branch": "main",
+      "revision": "7dde0c0afe8840fc95dd26f404310e77d9c82621",
+      "release": "v2.14.0",
       "license": "LicenseRef-Atrinik-Content",
-      "disposition": "external tooling and runtime input; not distributed"
+      "disposition": "external tooling, catalog, and runtime input; not distributed",
+      "source": {
+        "artifact": "atrinik-content-2.14.0.tar.gz",
+        "url": "https://github.com/atrinik/content/releases/download/v2.14.0/atrinik-content-2.14.0.tar.gz",
+        "sha256": "bd5aa9acb8dd17c07e16913cb36c58644f7910f28f47e3b0739d00d91936a9e6",
+        "root": "atrinik-content-2.14.0",
+        "max_download_bytes": 67108864,
+        "max_members": 25000,
+        "max_unpacked_bytes": 268435456,
+        "required_paths": {
+          "arch": "directory",
+          "contracts": "directory",
+          "maps": "directory",
+          "tools/content_catalog": "directory",
+          "tools/world_content_audit.py": "file"
+        }
+      },
+      "classic_runtime": {
+        "artifact": "atrinik-content-2.14.0-classic-runtime.tar.gz",
+        "url": "https://github.com/atrinik/content/releases/download/v2.14.0/atrinik-content-2.14.0-classic-runtime.tar.gz",
+        "sha256": "f4ad326e20e221869897c72f7e33b533c408ce6654038dbfc4352da1c3391261",
+        "root": "atrinik-content-2.14.0-classic-runtime",
+        "format": "atrinik-classic-runtime-content-v1",
+        "max_download_bytes": 67108864,
+        "max_members": 10000,
+        "max_unpacked_bytes": 268435456,
+        "required_paths": {
+          "attribution": "directory",
+          "lib/animations": "file",
+          "lib/archetypes": "file",
+          "lib/bmaps": "file",
+          "maps": "directory"
+        }
+      }
     },
     "pathfinding": {
       "repository": "atrinik/legacy-libatrinik",
       "release": "v1.1.5",
       "archive": "libatrinik-1.1.5.tar.gz",
+      "url": "https://github.com/atrinik/legacy-libatrinik/releases/download/v1.1.5/libatrinik-1.1.5.tar.gz",
       "sha256": "3c07b178cc236881f52272df6e38bc2d4186943b782e4cee34b2e733da9c8f9a",
+      "module": "atrinik_bot._pathfinding",
       "license": "GPL-2.0-or-later",
       "disposition": "external source linked into the native extension"
     },
@@ -21,6 +58,7 @@
       "release": "v1.0.9",
       "artifact": "atrinik_protocol-1.0.9-py3-none-any.whl",
       "sha256": "78954264fa49ac8736dbfc7a72669f619e0202e6ae15445a0b0839aa8f30eb8a",
+      "distribution": "atrinik-protocol",
       "license": "MIT",
       "disposition": "external runtime dependency; not vendored"
     }
