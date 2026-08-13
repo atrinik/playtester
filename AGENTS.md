@@ -23,7 +23,10 @@
   clean-directory wheel install/doctor smoke test, compileall, and
   `git diff --check`.
 - Commits and pull-request titles use Conventional Commits. Preserve unrelated
-  work. Semantic-release owns source tags, notes, and GitHub releases; do not
+  work. For nonclosing cross-repository linkage, use a full GitHub issue URL;
+  shorthand `owner/repository#number` is reserved for an intentional closing
+  reference because the release-note generator can render it as “closes.”
+  Semantic-release owns source tags, notes, and GitHub releases; do not
   attach the GPL-linked wheel unless its corresponding-source obligations are
   satisfied. Update this guide when ownership, dependency, interface, or
   validation contracts change.
