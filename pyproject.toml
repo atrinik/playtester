@@ -13,9 +13,9 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 maintainers = [
   {name = "Zoey Rose"},
 ]
-dependencies = [
-  "atrinik-protocol @ https://github.com/atrinik/legacy-protocol/releases/download/v1.0.9/atrinik_protocol-1.0.9-py3-none-any.whl#sha256=78954264fa49ac8736dbfc7a72669f619e0202e6ae15445a0b0839aa8f30eb8a",
-]
+# The Classic protocol wheel is installed from dependencies.lock.json by
+# scripts/install_locked_protocol.py so metadata and CI share one input.
+dependencies = []
 
 [project.optional-dependencies]
 quic = ["aioquic>=1.2"]

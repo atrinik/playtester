@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .compatibility import (CompatibilityError, configure_cached_bundle,
                             default_cache_root, doctor, install_bundle,
-                            load_lock)
+                            load_lock, preflight_lock)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -68,8 +68,15 @@ def parser() -> argparse.ArgumentParser:
     dependencies.add_argument("--runtime-archive", type=Path)
     dependencies.add_argument("--offline", action="store_true")
     dependencies.add_argument("--json", action="store_true")
+    preflight = sub.add_parser(
+        "preflight", help="verify every locked repository, release, asset, and digest")
+    preflight.add_argument("--json", action="store_true")
     diagnose = sub.add_parser(
         "doctor", help="diagnose locked protocol, pathfinding, and content inputs")
+    diagnose.add_argument(
+        "--preflight", action="store_true",
+        help="also verify the locked release metadata over HTTPS",
+    )
     diagnose.add_argument("--json", action="store_true")
     sub.add_parser("observe")
     web = sub.add_parser("web", help="run the persistent browser dashboard")
@@ -227,6 +234,24 @@ def main() -> None:
         lock = load_lock()
     except CompatibilityError as error:
         raise SystemExit(f"invalid compatibility lock: {error}") from error
+    if args.task == "preflight":
+        try:
+            result = preflight_lock(lock)
+        except CompatibilityError as error:
+            result = {"ok": False, "checks": [], "error": str(error)}
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        elif result["ok"]:
+            for check in result["checks"]:
+                print(
+                    f"OK    {check['name']}: {check['repository']}@{check['release']} "
+                    f"{check['artifact']} sha256:{check['sha256']}"
+                )
+        else:
+            print(f"ERROR lock-availability: {result['error']}")
+        if not result["ok"]:
+            raise SystemExit(1)
+        return
     if args.task == "dependencies":
         try:
             installed = install_bundle(
@@ -252,7 +277,7 @@ def main() -> None:
             print(f"Classic runtime: {result['runtime']}")
         return
     if args.task == "doctor":
-        result = doctor(args.cache, lock)
+        result = doctor(args.cache, lock, verify_remote=args.preflight)
         if args.json:
             print(json.dumps(result, indent=2, sort_keys=True))
         else:

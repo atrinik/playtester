@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 from typing import BinaryIO
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -21,6 +22,8 @@ import urllib.request
 LOCK_NAME = "dependencies.lock.json"
 MARKER_NAME = ".atrinik-playtester-input.json"
 BUFFER_SIZE = 1024 * 1024
+GITHUB_API = "https://api.github.com"
+GITHUB_USER_AGENT = "atrinik-playtester/compatibility-v1"
 
 
 class CompatibilityError(RuntimeError):
@@ -51,6 +54,14 @@ def load_lock(path: Path | None = None) -> dict:
         raise CompatibilityError("content lock is incomplete")
     if content.get("branch") != "main":
         raise CompatibilityError("content input must be authored on main")
+    if not isinstance(content.get("repository"), str):
+        raise CompatibilityError("content repository is missing")
+    if not isinstance(content.get("revision"), str) or len(content["revision"]) != 40:
+        raise CompatibilityError("content revision is invalid")
+    try:
+        int(content["revision"], 16)
+    except ValueError as error:
+        raise CompatibilityError("content revision is invalid") from error
     for name in ("source", "classic_runtime"):
         artifact = content.get(name)
         required = {
@@ -70,12 +81,23 @@ def load_lock(path: Path | None = None) -> dict:
         if parsed.scheme != "https" or not parsed.netloc:
             raise CompatibilityError(f"content {name} URL must use HTTPS")
     for name, required in (
-        ("pathfinding", {"repository", "release", "archive", "url", "sha256", "module"}),
-        ("protocol", {"repository", "release", "artifact", "sha256", "distribution"}),
+        ("pathfinding", {
+            "repository", "release", "revision", "archive", "url", "sha256", "module",
+        }),
+        ("protocol", {
+            "repository", "release", "revision", "artifact", "url", "sha256",
+            "distribution",
+        }),
     ):
         dependency = inputs[name]
         if not isinstance(dependency, dict) or not required.issubset(dependency):
             raise CompatibilityError(f"{name} lock is incomplete")
+        if not isinstance(dependency["revision"], str) or len(dependency["revision"]) != 40:
+            raise CompatibilityError(f"{name} revision is invalid")
+        try:
+            int(dependency["revision"], 16)
+        except ValueError as error:
+            raise CompatibilityError(f"{name} revision is invalid") from error
         try:
             valid_digest = len(dependency["sha256"]) == 64 and int(
                 dependency["sha256"], 16) >= 0
@@ -83,9 +105,10 @@ def load_lock(path: Path | None = None) -> dict:
             valid_digest = False
         if not valid_digest:
             raise CompatibilityError(f"{name} SHA-256 is invalid")
-    pathfinding_url = urllib.parse.urlparse(inputs["pathfinding"]["url"])
-    if pathfinding_url.scheme != "https" or not pathfinding_url.netloc:
-        raise CompatibilityError("pathfinding URL must use HTTPS")
+    for name in ("pathfinding", "protocol"):
+        dependency_url = urllib.parse.urlparse(inputs[name]["url"])
+        if dependency_url.scheme != "https" or not dependency_url.netloc:
+            raise CompatibilityError(f"{name} URL must use HTTPS")
     return value
 
 
@@ -93,6 +116,162 @@ def lock_digest(lock: dict) -> str:
     """Return the stable identity of a parsed lock."""
     encoded = json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _release_specs(lock: dict) -> tuple[dict, ...]:
+    """Return the release assets whose coordinates are governed by the lock."""
+    inputs = lock["inputs"]
+    content = inputs["content"]
+    return tuple(
+        {
+            "name": f"content.{name}",
+            "repository": content["repository"],
+            "release": content["release"],
+            "revision": content["revision"],
+            "artifact": artifact["artifact"],
+            "url": artifact["url"],
+            "sha256": artifact["sha256"],
+        }
+        for name in ("source", "classic_runtime")
+        for artifact in (content[name],)
+    ) + (
+        {
+            "name": "pathfinding",
+            "repository": inputs["pathfinding"]["repository"],
+            "release": inputs["pathfinding"]["release"],
+            "revision": inputs["pathfinding"]["revision"],
+            "artifact": inputs["pathfinding"]["archive"],
+            "url": inputs["pathfinding"]["url"],
+            "sha256": inputs["pathfinding"]["sha256"],
+        },
+        {
+            "name": "protocol",
+            "repository": inputs["protocol"]["repository"],
+            "release": inputs["protocol"]["release"],
+            "revision": inputs["protocol"]["revision"],
+            "artifact": inputs["protocol"]["artifact"],
+            "url": inputs["protocol"]["url"],
+            "sha256": inputs["protocol"]["sha256"],
+        },
+    )
+
+
+def protocol_requirement(lock: dict) -> str:
+    """Return the exact PEP 508 requirement selected by the compatibility lock."""
+    protocol = lock["inputs"]["protocol"]
+    return (
+        f"{protocol['distribution']} @ {protocol['url']}"
+        f"#sha256={protocol['sha256']}"
+    )
+
+
+def _github_json(url: str, opener=None) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": GITHUB_USER_AGENT,
+        },
+    )
+    fetch = opener or urllib.request.urlopen
+    try:
+        with fetch(request, timeout=30) as response:
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        raise CompatibilityError(
+            f"lock preflight request failed for {url}: HTTP {error.code}"
+        ) from error
+    except (OSError, urllib.error.URLError, TimeoutError) as error:
+        raise CompatibilityError(
+            f"lock preflight request failed for {url}: {error}"
+        ) from error
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise CompatibilityError(
+            f"lock preflight received invalid JSON from {url}"
+        ) from error
+    if not isinstance(value, dict):
+        raise CompatibilityError(f"lock preflight received a non-object from {url}")
+    return value
+
+
+def preflight_lock(lock: dict, *, opener=None) -> dict:
+    """Verify every locked repository, tag, asset URL, and SHA-256 digest."""
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for spec in _release_specs(lock):
+        grouped.setdefault((spec["repository"], spec["release"]), []).append(spec)
+
+    checks: list[dict[str, str]] = []
+    for (repository, release), specs in grouped.items():
+        encoded_repository = urllib.parse.quote(repository, safe="/")
+        encoded_release = urllib.parse.quote(release, safe="")
+        release_url = (
+            f"{GITHUB_API}/repos/{encoded_repository}/releases/tags/{encoded_release}"
+        )
+        try:
+            release_data = _github_json(release_url, opener=opener)
+        except CompatibilityError as error:
+            raise CompatibilityError(
+                f"{specs[0]['name']}: repository {repository} or tag {release} "
+                f"is unavailable: {error}"
+            ) from error
+        if release_data.get("tag_name") != release:
+            raise CompatibilityError(
+                f"{specs[0]['name']}: repository {repository} has no exact tag {release}"
+            )
+        try:
+            commit_data = _github_json(
+                f"{GITHUB_API}/repos/{encoded_repository}/commits/{encoded_release}",
+                opener=opener,
+            )
+        except CompatibilityError as error:
+            raise CompatibilityError(
+                f"{specs[0]['name']}: tag {repository}@{release} has no "
+                f"resolvable commit: {error}"
+            ) from error
+        actual_revision = commit_data.get("sha")
+        for spec in specs:
+            if actual_revision != spec["revision"]:
+                raise CompatibilityError(
+                    f"{spec['name']}: tag {repository}@{release} resolves to "
+                    f"{actual_revision or 'no commit'}, expected {spec['revision']}"
+                )
+        assets = release_data.get("assets")
+        if not isinstance(assets, list):
+            raise CompatibilityError(
+                f"{repository}@{release}: release asset metadata is missing"
+            )
+        by_name = {
+            asset.get("name"): asset for asset in assets if isinstance(asset, dict)
+        }
+        for spec in specs:
+            asset = by_name.get(spec["artifact"])
+            if asset is None:
+                raise CompatibilityError(
+                    f"{spec['name']}: release {repository}@{release} is missing "
+                    f"asset {spec['artifact']}"
+                )
+            if asset.get("browser_download_url") != spec["url"]:
+                raise CompatibilityError(
+                    f"{spec['name']}: asset {spec['artifact']} URL does not match the lock"
+                )
+            actual_digest = asset.get("digest")
+            expected_digest = f"sha256:{spec['sha256']}"
+            if actual_digest != expected_digest:
+                raise CompatibilityError(
+                    f"{spec['name']}: asset {spec['artifact']} digest is "
+                    f"{actual_digest or 'missing'}, expected {expected_digest}"
+                )
+            checks.append({
+                "name": spec["name"],
+                "repository": repository,
+                "release": release,
+                "revision": spec["revision"],
+                "artifact": spec["artifact"],
+                "sha256": spec["sha256"],
+            })
+    return {"ok": True, "checks": checks}
 
 
 def default_cache_root() -> Path:
@@ -446,7 +625,7 @@ def configure_cached_bundle(cache: Path, lock: dict) -> dict:
     return installed
 
 
-def doctor(cache: Path, lock: dict) -> dict:
+def doctor(cache: Path, lock: dict, *, verify_remote: bool = False) -> dict:
     """Diagnose every locked input without mutating cache or source state."""
     checks: list[dict[str, str]] = []
 
@@ -457,6 +636,12 @@ def doctor(cache: Path, lock: dict) -> dict:
             checks.append({"name": name, "status": "error", "detail": str(error)})
         else:
             checks.append({"name": name, "status": "ok", "detail": detail})
+
+    if verify_remote:
+        check(
+            "lock-availability",
+            lambda: f"{len(preflight_lock(lock)['checks'])} locked release assets verified",
+        )
 
     installed: dict | None = None
 
@@ -496,8 +681,7 @@ def doctor(cache: Path, lock: dict) -> dict:
                 "installed protocol has no verifiable direct-artifact record"
             ) from error
         expected_url = (
-            f"https://github.com/{protocol['repository']}/releases/download/"
-            f"{protocol['release']}/{protocol['artifact']}"
+            protocol["url"]
         )
         if direct.get("url") != expected_url:
             raise CompatibilityError("installed protocol artifact URL does not match the lock")

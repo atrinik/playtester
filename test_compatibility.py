@@ -70,7 +70,7 @@ class CompatibilityTests(unittest.TestCase):
                     "repository": "atrinik/content",
                     "branch": "main",
                     "revision": "7" * 40,
-                    "release": "v2.14.0",
+                    "release": "v1.0.0",
                     "license": "LicenseRef-Atrinik-Content",
                     "disposition": "external",
                     "source": self.spec(
@@ -85,8 +85,9 @@ class CompatibilityTests(unittest.TestCase):
                     ),
                 },
                 "pathfinding": {
-                    "repository": "atrinik/legacy-libatrinik",
-                    "release": "v1.1.5",
+                    "repository": "atrinik/classic",
+                    "release": "v5.48.0",
+                    "revision": "c" * 40,
                     "archive": "source.tar.gz",
                     "url": "https://example.invalid/source.tar.gz",
                     "sha256": "a" * 64,
@@ -95,12 +96,14 @@ class CompatibilityTests(unittest.TestCase):
                     "disposition": "external",
                 },
                 "protocol": {
-                    "repository": "atrinik/legacy-protocol",
-                    "release": "v1.0.9",
+                    "repository": "atrinik/classic",
+                    "release": "v5.48.0",
+                    "revision": "c" * 40,
                     "artifact": "protocol.whl",
+                    "url": "https://example.invalid/protocol.whl",
                     "sha256": "b" * 64,
-                    "distribution": "atrinik-protocol",
-                    "license": "MIT",
+                    "distribution": "atrinik-classic-protocol",
+                    "license": "GPL-2.0-or-later",
                     "disposition": "external",
                 },
             },
@@ -121,17 +124,97 @@ class CompatibilityTests(unittest.TestCase):
         )
         return source, runtime, self.make_lock(source, runtime)
 
-    def test_repository_lock_binds_content_main_release(self) -> None:
+    def test_repository_lock_binds_current_classic_inputs(self) -> None:
         lock = compatibility.load_lock()
         content = lock["inputs"]["content"]
         self.assertEqual(content["branch"], "main")
         self.assertEqual(content["revision"],
-                         "7dde0c0afe8840fc95dd26f404310e77d9c82621")
-        self.assertEqual(content["release"], "v2.14.0")
+                         "63eb9bb5f02fb9104c2385d5e01c28c3df20b735")
+        self.assertEqual(content["release"], "v1.0.0")
         self.assertEqual(
             content["classic_runtime"]["sha256"],
-            "f4ad326e20e221869897c72f7e33b533c408ce6654038dbfc4352da1c3391261",
+            "e1bffdd1b492472ef594b558c322c655976a95888e7a1d0ab6a56ade2a21b0d5",
         )
+        pathfinding = lock["inputs"]["pathfinding"]
+        self.assertEqual(pathfinding["repository"], "atrinik/classic")
+        self.assertEqual(pathfinding["release"], "v5.48.0")
+        self.assertEqual(pathfinding["revision"],
+                         "a1af490e841891648015610a3418b0f5ba6daafb")
+        protocol = lock["inputs"]["protocol"]
+        self.assertEqual(protocol["distribution"], "atrinik-classic-protocol")
+        self.assertEqual(protocol["release"], "v5.48.0")
+        self.assertEqual(protocol["sha256"],
+                         "4a6bdd681ac21e8baa3feebc9398b004c0626d5dcc104c4cd921ec9b2051d25d")
+
+    def test_preflight_verifies_release_assets_and_commit(self) -> None:
+        lock = compatibility.load_lock()
+        specs = compatibility._release_specs(lock)
+
+        class Response:
+            def __init__(self, value: dict) -> None:
+                self.value = value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(self.value).encode()
+
+        grouped = {}
+        for spec in specs:
+            grouped.setdefault(
+                (spec["repository"], spec["release"]), []
+            ).append(spec)
+
+        def fake_open(request, timeout):
+            url = request.full_url
+            for (repository, release), values in grouped.items():
+                if f"/repos/{repository}/releases/tags/{release}" in url:
+                    return Response({
+                        "tag_name": release,
+                        "assets": [
+                            {
+                                "name": value["artifact"],
+                                "browser_download_url": value["url"],
+                                "digest": f"sha256:{value['sha256']}",
+                            }
+                            for value in values
+                        ],
+                    })
+                if f"/repos/{repository}/commits/{release}" in url:
+                    return Response({"sha": values[0]["revision"]})
+            raise AssertionError(url)
+
+        result = compatibility.preflight_lock(lock, opener=fake_open)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["checks"]), 4)
+        self.assertEqual(
+            result["checks"][-1]["artifact"],
+            "atrinik_classic_protocol-5.48.0-py3-none-any.whl",
+        )
+
+        def missing_asset(request, timeout):
+            url = request.full_url
+            if "/releases/tags/" in url:
+                return Response({"tag_name": "v1.0.0", "assets": []})
+            return Response({"sha": specs[0]["revision"]})
+
+        with self.assertRaisesRegex(compatibility.CompatibilityError, "missing asset"):
+            compatibility.preflight_lock(lock, opener=missing_asset)
+
+        def missing_repository(request, timeout):
+            raise compatibility.urllib.error.HTTPError(
+                request.full_url, 404, "not found", {}, None
+            )
+
+        with self.assertRaisesRegex(
+            compatibility.CompatibilityError,
+            "repository atrinik/content or tag v1.0.0 is unavailable",
+        ):
+            compatibility.preflight_lock(lock, opener=missing_repository)
 
     def test_lock_validation_rejects_malformed_content_and_digests(self) -> None:
         source, runtime, lock = self.valid_inputs()
@@ -232,15 +315,12 @@ class CompatibilityTests(unittest.TestCase):
         protocol = lock["inputs"]["protocol"]
         direct = json.dumps({
             "archive_info": {"hash": f"sha256={protocol['sha256']}"},
-            "url": (
-                f"https://github.com/{protocol['repository']}/releases/download/"
-                f"{protocol['release']}/{protocol['artifact']}"
-            ),
+            "url": protocol["url"],
         })
         distribution = SimpleNamespace(
-            version="1.0.9", read_text=lambda name: direct)
+            version="5.48.0", read_text=lambda name: direct)
         extension = SimpleNamespace(
-            __dependency_release__="v1.1.5",
+            __dependency_release__="v5.48.0",
             __dependency_sha256__=lock["inputs"]["pathfinding"]["sha256"],
         )
         with mock.patch.object(compatibility.importlib.metadata, "distribution",
@@ -273,8 +353,29 @@ class CompatibilityTests(unittest.TestCase):
             incompatible = compatibility.doctor(cache, lock)
         self.assertFalse(incompatible["ok"])
         by_name = {item["name"]: item for item in incompatible["checks"]}
-        self.assertIn("expected 1.0.9", by_name["protocol"]["detail"])
-        self.assertIn("expected v1.1.5", by_name["pathfinding"]["detail"])
+        self.assertIn("expected 5.48.0", by_name["protocol"]["detail"])
+        self.assertIn("expected v5.48.0", by_name["pathfinding"]["detail"])
+
+    def test_doctor_remote_diagnostic_reports_preflight_failure(self) -> None:
+        source, runtime, lock = self.valid_inputs()
+        cache = self.root / "cache"
+        compatibility.install_bundle(
+            cache, lock, source_archive=source, runtime_archive=runtime
+        )
+        with mock.patch.object(
+            compatibility,
+            "preflight_lock",
+            side_effect=compatibility.CompatibilityError(
+                "protocol: release atrinik/classic@v5.48.0 is missing asset"
+            ),
+        ):
+            result = compatibility.doctor(cache, lock, verify_remote=True)
+        self.assertFalse(result["ok"])
+        remote = next(
+            item for item in result["checks"] if item["name"] == "lock-availability"
+        )
+        self.assertEqual(remote["status"], "error")
+        self.assertIn("missing asset", remote["detail"])
 
     def test_configure_uses_cache_without_ambient_checkout(self) -> None:
         source, runtime, lock = self.valid_inputs()
