@@ -23,11 +23,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install protocol dependency
-        run: >-
-          python3 -m pip install
-          'atrinik-protocol @
-          https://github.com/atrinik/legacy-protocol/releases/download/v1.0.9/atrinik_protocol-1.0.9-py3-none-any.whl#sha256=78954264fa49ac8736dbfc7a72669f619e0202e6ae15445a0b0839aa8f30eb8a'
+      - name: Preflight and install locked protocol dependency
+        run: python3 scripts/install_locked_protocol.py --json
 
       - name: Build and test playtester
         env:
@@ -38,7 +35,7 @@ jobs:
           cmake --build build/playtester --parallel
           ctest --test-dir build/playtester --output-on-failure
           python3 -m atrinik_bot dependencies --json
-          python3 -m atrinik_bot doctor --json
+          python3 -m atrinik_bot doctor --preflight --json
           python3 - <<'PY'
           import unittest
           from atrinik_bot.compatibility import (
@@ -62,6 +59,8 @@ jobs:
           unzip -l build/dist/*.whl | grep -q 'licenses/THIRD_PARTY_NOTICES.md'
           unzip -l build/dist/*.whl | grep -q 'atrinik_bot/dependencies.lock.json'
           python3 -m venv "${RUNNER_TEMP}/atrinik-playtester-wheel"
+          "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \
+            scripts/install_locked_protocol.py --json
           "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/pip" install build/dist/*.whl
           cd "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \

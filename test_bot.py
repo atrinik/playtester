@@ -161,19 +161,19 @@ class ProtocolTests(unittest.TestCase):
                           if name == "treant_evil")
         # The same numeric ID is valid in bmaps but names an unrelated sprite;
         # this was the source of the dashboard's tied-bollard diagnosis.
-        self.assertEqual(client.faces[treant_id], "bollard_tied_e_2.101")
+        self.assertEqual(client.faces[treant_id], "bollard_tied_e_1.101")
         obj = MapObject(5, treant_id, 0, c.MAP_FLAG_ANIMATION,
                         animation=treant_id)
         self.assertEqual(map_object_visual_name(client, obj), "treant_evil")
         static = MapObject(5, treant_id, 0, 0)
         self.assertEqual(map_object_visual_name(client, static),
-                         "bollard_tied_e_2.101")
+                         "bollard_tied_e_1.101")
 
     def test_packet(self):
-        self.assertEqual(c.SOCKET_VERSION, 1072)
+        self.assertEqual(c.SOCKET_VERSION, 1080)
         self.assertEqual(
             Packet(c.S_VERSION).add("I", c.SOCKET_VERSION).encode(),
-            b"\x00\x05\x03\x00\x00\x04\x30",
+            b"\x00\x05\x03\x00\x00\x04\x38",
         )
 
     def test_item_decoder_retains_authoritative_read_flag(self):
@@ -8521,12 +8521,12 @@ class NavigationTests(unittest.TestCase):
 
     def test_local_shop_path_does_not_cross_automatic_exit(self):
         source = "/shattered_islands/world_5_58"
-        # Entering (5, 20) immediately teleports to (3, 20). The ordinary
+        # Entering (5, 17) immediately teleports to (3, 17). The ordinary
         # path between two stock tiles inside the shop must walk around that
         # mat instead of planning an impossible post-teleport step.
         path = self.graph.local_path(source, (5, 21), (6, 18))
         self.assertTrue(path)
-        self.assertNotIn((5, 20), path)
+        self.assertNotIn((5, 17), path)
         self.assertEqual(path[-1], (6, 18))
 
         # From the opposite component, routing to the same stock tile must
@@ -8535,9 +8535,9 @@ class NavigationTests(unittest.TestCase):
             source, (3, 19), source, [(6, 18)])
         self.assertEqual(len(route), 1)
         self.assertTrue(route[0].automatic)
-        self.assertEqual((route[0].x, route[0].y), (3, 20))
+        self.assertEqual((route[0].x, route[0].y), (3, 17))
         self.assertEqual(
-            (route[0].destination_x, route[0].destination_y), (5, 20))
+            (route[0].destination_x, route[0].destination_y), (5, 17))
 
     def test_apartment_is_destination_not_cross_world_shortcut(self):
         destination = "/shattered_islands/world_5_58"

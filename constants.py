@@ -1,4 +1,4 @@
-"""Wire constants, with command IDs supplied by atrinik-protocol."""
+"""Classic wire constants, with command IDs supplied by the locked protocol."""
 
 from atrinik_protocol import (ClientToServerCommand, PROTOCOL_VERSION,
                               ServerToClientCommand)

@@ -26,14 +26,22 @@ into the single start-to-finish campaign described above.
 ## Install and acquire compatible inputs
 
 Build and install the wheel from the repository root in any clean Python 3.11+
-environment. The wheel declares the checksum-pinned protocol binding and always
-builds the checksum-pinned pathfinding archive selected by the compatibility
-lock; it does not bundle or relicense either dependency.
+environment. The protocol wheel and native pathfinding archive are selected by
+the compatibility lock; the project does not bundle or relicense either
+dependency. Preflight and install the protocol wheel from that lock before
+building the package:
 
 ```sh
 python3 -m venv /path/to/playtester-environment
+/path/to/playtester-environment/bin/python scripts/install_locked_protocol.py
 /path/to/playtester-environment/bin/pip install .
 ```
+
+The installer verifies the locked repository, release tag, exact commit, asset,
+download URL, and SHA-256 digest before invoking pip. The
+`atrinik-playtester preflight` command repeats that remote availability check,
+while `doctor --preflight` reports the same check alongside local cache and
+installed-input diagnostics.
 
 Install the exact content compiler/catalog and Classic runtime selected by
 [`dependencies.lock.json`](dependencies.lock.json). The default cache is
@@ -43,6 +51,7 @@ overridden with `--cache` or `ATRINIK_PLAYTESTER_CACHE`.
 ```sh
 /path/to/playtester-environment/bin/atrinik-playtester dependencies
 /path/to/playtester-environment/bin/atrinik-playtester doctor
+/path/to/playtester-environment/bin/atrinik-playtester preflight
 ```
 
 `dependencies` downloads the source and Classic-runtime release archives over
@@ -52,8 +61,8 @@ from already downloaded files without network access:
 
 ```sh
 atrinik-playtester dependencies \
-  --source-archive /media/atrinik-content-2.14.0.tar.gz \
-  --runtime-archive /media/atrinik-content-2.14.0-classic-runtime.tar.gz \
+  --source-archive /media/atrinik-content-1.0.0.tar.gz \
+  --runtime-archive /media/atrinik-content-1.0.0-classic-runtime.tar.gz \
   --offline
 ```
 
@@ -67,6 +76,8 @@ from that cache; no aggregate repository or ambient sibling checkout is needed.
 
 Requirements are Python 3.11+, CMake 3.21+, Ninja, and a C17 compiler. The
 native adapter uses the checksum-pinned Classic libatrinik pathfinding release.
+Run `scripts/install_locked_protocol.py` with the Python environment that will
+build the package before configuring CMake.
 
 ```sh
 cmake -S . -B build/playtester -G Ninja -DBUILD_TESTING=ON

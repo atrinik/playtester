@@ -8,12 +8,12 @@ or Atrinik game content.
 
 ## Direct dependencies
 
-- `atrinik-protocol` v1.0.9 is MIT-licensed. It is downloaded as a
-  checksum-pinned wheel from `atrinik/legacy-protocol`
-  (`sha256:78954264fa49ac8736dbfc7a72669f619e0202e6ae15445a0b0839aa8f30eb8a`)
+- `atrinik-classic-protocol` v5.48.0 is GPL-2.0-or-later. It is downloaded as
+  a checksum-pinned wheel from `atrinik/classic`
+  (`sha256:4a6bdd681ac21e8baa3feebc9398b004c0626d5dcc104c4cd921ec9b2051d25d`)
   and is not vendored here.
-- `libatrinik` v1.1.5 is GPL-2.0-or-later. Its checksum-pinned source archive
-  (`sha256:3c07b178cc236881f52272df6e38bc2d4186943b782e4cee34b2e733da9c8f9a`)
+- `libatrinik` v5.48.0 is GPL-2.0-or-later. Its checksum-pinned source archive
+  (`sha256:2b85b0ed3e122f1cfdb0d1aee1d5fcad3e906dfe51e4dbd5d7b9a5aac80f5c4d`)
   supplies the pathfinding library used by the native adapter and is not
   vendored here. The adapter source remains MIT, but a distributed wheel or
   binary linked with this library must satisfy the applicable GPL requirements
@@ -22,13 +22,13 @@ or Atrinik game content.
 - `scikit-build-core`, used to build the package, is Apache-2.0.
 
 The playtester reads Atrinik content and imports content analysis tooling from
-the separately distributed `atrinik/content` `v2.14.0` release at commit
-`7dde0c0afe8840fc95dd26f404310e77d9c82621` on `main`. The source archive is
-`atrinik-content-2.14.0.tar.gz`
-(`sha256:bd5aa9acb8dd17c07e16913cb36c58644f7910f28f47e3b0739d00d91936a9e6`),
+the separately distributed `atrinik/content` `v1.0.0` release at commit
+`63eb9bb5f02fb9104c2385d5e01c28c3df20b735` on `main`. The source archive is
+`atrinik-content-1.0.0.tar.gz`
+(`sha256:922cd119b3e0c71aab7d5f83eab538c120d537b584f12d039eced7ecf9b63924`),
 and the Classic runtime is
-`atrinik-content-2.14.0-classic-runtime.tar.gz`
-(`sha256:f4ad326e20e221869897c72f7e33b533c408ce6654038dbfc4352da1c3391261`).
+`atrinik-content-1.0.0-classic-runtime.tar.gz`
+(`sha256:e1bffdd1b492472ef594b558c322c655976a95888e7a1d0ab6a56ade2a21b0d5`).
 The tools, runtime, and content retain their repository and per-file licenses;
 they are cached external inputs and are not covered by this repository's MIT
 License.
