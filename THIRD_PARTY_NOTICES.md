@@ -18,7 +18,7 @@ or Atrinik game content.
   vendored here. The adapter source remains MIT, but a distributed wheel or
   binary linked with this library must satisfy the applicable GPL requirements
   and must not be represented as MIT-only.
-- `aioquic`, when the optional QUIC feature is installed, is BSD-3-Clause.
+- `aioquic`, used for the required QUIC transport, is BSD-3-Clause.
 - `scikit-build-core`, used to build the package, is Apache-2.0.
 
 The playtester reads Atrinik content and imports content analysis tooling from
