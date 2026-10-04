@@ -8,11 +8,12 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from . import constants as c
+from .access_codes import normalize_access_code
 from .model import Character, GameState, InterfaceState, Item, MapObject
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
@@ -90,7 +91,7 @@ class ClientConfig:
     password: str = ""
     character: str = ""
     party_name: str = ""
-    join_password: str = ""
+    access_code: str = field(default="", repr=False)
     # The server accepts viewports up to 17x17. Asking for a larger map causes
     # it to reject the setup field and silently use its fallback dimensions.
     map_width: int = 17
@@ -122,6 +123,7 @@ class AtrinikClient:
         self._reconnect_requested = False
         self._closed = False
         self._setup_sent = False
+        self._access_accepted = False
         self._account_sent = False
         self._character_sent = False
         self._last_keepalive = 0.0
@@ -607,54 +609,24 @@ class AtrinikClient:
     async def connect(self) -> None:
         if not self.config.account or not self.config.password:
             raise ValueError("account and password are required")
-        if "\0" in self.config.join_password:
-            raise ValueError("join password cannot contain a NUL byte")
-        if len(self.config.join_password.encode("utf-8")) >= 1024:
-            raise ValueError("join password must be shorter than 1024 bytes")
-        if self.config.join_password and self.config.transport == "tcp":
-            raise ValueError("server join passwords require encrypted QUIC")
+        if self.config.access_code:
+            self.config.access_code = normalize_access_code(self.config.access_code)
+        if self.config.transport not in ("auto", "quic"):
+            raise ValueError("protocol 1081 requires encrypted QUIC")
+        if not self.config.certificate_sha256:
+            raise ValueError("QUIC requires a pinned certificate SHA-256")
         self.state.phase = "connecting"
-        if self.config.transport not in ("auto", "tcp", "quic"):
-            raise ValueError(
-                f"unknown transport {self.config.transport!r}; choose auto, "
-                "tcp, or quic"
-            )
-
-        tcp_error: OSError | asyncio.TimeoutError | None = None
-        if (self.config.transport in ("auto", "tcp") and
-                not self.config.join_password):
-            try:
-                self.reader, self.writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.config.host,
-                                            self.config.port),
-                    self.config.connect_timeout,
-                )
-                self.transport = "tcp"
-            except (OSError, asyncio.TimeoutError) as exc:
-                tcp_error = exc
-                if self.config.transport == "tcp":
-                    raise
-                log.info("legacy TCP connection failed; trying QUIC: %s", exc)
-
-        if self.reader is None:
-            if not self.config.certificate_sha256:
-                suffix = f" after TCP failed: {tcp_error}" if tcp_error else ""
-                raise ValueError(
-                    "QUIC requires --certificate-sha256 or "
-                    "ATRINIK_BOT_CERTIFICATE_SHA256" + suffix
-                )
-            self._quic_stream = await QuicStream.connect(
-                self.config.host,
-                self.config.quic_port,
-                self.config.certificate_sha256,
-                self.config.connect_timeout,
-            )
-            self.reader = self._quic_stream.reader
-            self.writer = self._quic_stream.writer
-            self.transport = "quic"
+        self._quic_stream = await QuicStream.connect(
+            self.config.host, self.config.quic_port,
+            self.config.certificate_sha256, self.config.connect_timeout,
+        )
+        self.reader = self._quic_stream.reader
+        self.writer = self._quic_stream.writer
+        self.transport = "quic"
 
         self.state.phase = "version"
         self._setup_sent = self._account_sent = self._character_sent = False
+        self._access_accepted = False
         await self.send(Packet(c.S_VERSION).add("I", c.SOCKET_VERSION))
         port = (self.config.quic_port if self.transport == "quic" else
                 self.config.port)
@@ -752,8 +724,14 @@ class AtrinikClient:
             self.state.phase = "disconnected"
 
     async def _dispatch(self, packet_type: int, data: bytes) -> None:
+        if (self.state.phase in ("version", "access-policy", "access-auth")
+                and packet_type not in (c.C_VERSION, c.C_ACCESS_POLICY,
+                                        c.C_ACCESS_RESULT, c.C_KEEPALIVE)):
+            raise ProtocolError("application packet before access admission")
         handlers = {
             c.C_VERSION: self._handle_version,
+            c.C_ACCESS_POLICY: self._handle_access_policy,
+            c.C_ACCESS_RESULT: self._handle_access_result,
             c.C_SETUP: self._handle_setup,
             c.C_CHARACTERS: self._handle_characters,
             c.C_PLAYER: self._handle_player,
@@ -777,21 +755,50 @@ class AtrinikClient:
         await handler(Cursor(data), data)
 
     async def _handle_version(self, cur: Cursor, raw: bytes) -> None:
+        if self.state.phase != "version" or len(raw) != 4:
+            raise ProtocolError("unexpected protocol version frame")
         self.state.server_version = cur.u32()
         if self.state.server_version != c.SOCKET_VERSION:
-            log.warning("protocol version differs: server=%d bot=%d",
-                        self.state.server_version, c.SOCKET_VERSION)
+            raise ProtocolError("incompatible server protocol version")
+        self.state.phase = "access-policy"
+
+    async def _handle_access_policy(self, cur: Cursor, raw: bytes) -> None:
+        if (self.state.phase != "access-policy" or self.transport != "quic"
+                or len(raw) != 2 or raw[0] != 1 or raw[1] not in (0, 1)):
+            raise ProtocolError("invalid access policy")
+        if raw[1] == 0:
+            self._access_accepted = True
+            await self._send_setup()
+            return
+        if not self.config.access_code:
+            raise ProtocolError("access unavailable")
+        code = normalize_access_code(self.config.access_code).encode("ascii")
+        packet = Packet(c.S_ACCESS_AUTH).u8(1)
+        packet.data.extend(code)
+        self.state.phase = "access-auth"
+        await self.send(packet)
+
+    async def _handle_access_result(self, cur: Cursor, raw: bytes) -> None:
+        if (self.state.phase != "access-auth" or self.transport != "quic"
+                or len(raw) != 2 or raw[0] != 1 or raw[1] not in (0, 1)):
+            raise ProtocolError("invalid access result")
+        if raw[1] != 0:
+            raise ProtocolError("access unavailable")
+        self._access_accepted = True
+        await self._send_setup()
+
+    async def _send_setup(self) -> None:
         packet = (Packet(c.S_SETUP)
                   .u8(c.SETUP_SOUND).u8(0)
                   .u8(c.SETUP_MAPSIZE).u8(self.config.map_width).u8(self.config.map_height)
-                  .u8(c.SETUP_DATA_URL).string("")
-                  .u8(c.SETUP_JOIN_PASSWORD).string(
-                      self.config.join_password))
-        await self.send(packet)
+                  .u8(c.SETUP_DATA_URL).string(""))
         self._setup_sent = True
         self.state.phase = "setup"
+        await self.send(packet)
 
     async def _handle_setup(self, cur: Cursor, raw: bytes) -> None:
+        if not self._access_accepted or not self._setup_sent or self.state.phase != "setup":
+            raise ProtocolError("setup before access admission")
         while cur.remaining:
             setup_type = cur.u8()
             if setup_type == c.SETUP_SOUND:
@@ -800,9 +807,6 @@ class AtrinikClient:
                 self.state.map.width, self.state.map.height = cur.u8(), cur.u8()
             elif setup_type == c.SETUP_DATA_URL:
                 cur.cstring()
-            elif setup_type == c.SETUP_JOIN_PASSWORD:
-                if not cur.u8():
-                    raise ProtocolError("server rejected the join password")
             else:
                 raise ProtocolError(f"unknown setup field {setup_type}")
         if not self._account_sent:

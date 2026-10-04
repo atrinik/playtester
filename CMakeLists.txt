@@ -61,9 +61,14 @@ include(CTest)
 if (BUILD_TESTING)
     add_test(NAME atrinik-bot-pathfinding
         COMMAND "${Python3_EXECUTABLE}" -m unittest -v atrinik_bot.test_pathfinding)
+    add_test(NAME atrinik-bot-access
+        COMMAND "${Python3_EXECUTABLE}" -m unittest -v
+            atrinik_bot.test_access_codes atrinik_bot.test_access_admission)
     add_test(NAME atrinik-bot-compatibility
         COMMAND "${Python3_EXECUTABLE}" -m unittest -v atrinik_bot.test_compatibility)
     set_tests_properties(atrinik-bot-pathfinding PROPERTIES
+        ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python")
+    set_tests_properties(atrinik-bot-access PROPERTIES
         ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python")
     set_tests_properties(atrinik-bot-compatibility PROPERTIES
         ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python")

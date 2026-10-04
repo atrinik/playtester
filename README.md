@@ -13,7 +13,7 @@ outcome from authoritative game state, and emit a machine-readable result.
 
 ## Current capability
 
-The migrated implementation provides direct Classic TCP and QUIC transports,
+The migrated implementation provides pinned, encrypted Classic QUIC transport,
 account and character setup, a live world model, content-derived navigation,
 16 formal quest executors, adaptive farming through level 115, persistent
 memory, and a loopback operator dashboard.
@@ -151,3 +151,14 @@ OpenAI Codex under Zoey Rose's direct supervision and steering, then reviewed
 and accepted by her. Zoey directs its MIT release and grants all rights she
 holds in that code. The precise development record, retained history mapping,
 and excluded material are recorded in [`PROVENANCE.md`](PROVENANCE.md).
+
+## Protected servers
+
+Protocol1081 receives an authenticated admission-policy announcement before setup
+or account login. Open servers need no code. Protected servers take one
+16-character invite code from an owner-only regular file using
+`--access-code-file /private/path`; the code never belongs in command arguments,
+environment variables, dashboard state or checkpoints. The server certificate
+pin is required for both modes. Account credentials remain separate. The old
+join-password option and setup subtype are removed; old peers fail version
+negotiation. Codes grant ordinary admission and never operator capabilities.
