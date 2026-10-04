@@ -24,6 +24,12 @@ MARKER_NAME = ".atrinik-playtester-input.json"
 BUFFER_SIZE = 1024 * 1024
 GITHUB_API = "https://api.github.com"
 GITHUB_USER_AGENT = "atrinik-playtester/compatibility-v1"
+REQUIRED_PROTOCOL_VERSION = 1081
+REQUIRED_PROTOCOL_COMMANDS = (
+    ("ClientToServerCommand", "ACCESS_AUTH", 23),
+    ("ServerToClientCommand", "ACCESS_RESULT", 29),
+    ("ServerToClientCommand", "ACCESS_POLICY", 31),
+)
 
 
 class CompatibilityError(RuntimeError):
@@ -196,7 +202,8 @@ def _github_json(url: str, opener=None) -> dict:
     return value
 
 
-def preflight_lock(lock: dict, *, opener=None) -> dict:
+def preflight_lock(lock: dict, *, opener=None,
+                   verify_installed_protocol: bool = True) -> dict:
     """Verify every locked repository, tag, asset URL, and SHA-256 digest."""
     grouped: dict[tuple[str, str], list[dict]] = {}
     for spec in _release_specs(lock):
@@ -271,6 +278,24 @@ def preflight_lock(lock: dict, *, opener=None) -> dict:
                 "artifact": spec["artifact"],
                 "sha256": spec["sha256"],
             })
+    if verify_installed_protocol:
+        protocol = lock["inputs"]["protocol"]
+        compatibility_check = {
+            "name": "protocol.compatibility",
+            "repository": protocol["repository"],
+            "release": protocol["release"],
+            "revision": protocol["revision"],
+            "artifact": protocol["artifact"],
+            "sha256": protocol["sha256"],
+        }
+        try:
+            compatibility_check["detail"] = protocol_compatibility(lock)
+        except CompatibilityError as error:
+            compatibility_check.update(status="error", detail=str(error))
+            checks.append(compatibility_check)
+            return {"ok": False, "checks": checks, "error": str(error)}
+        compatibility_check["status"] = "ok"
+        checks.append(compatibility_check)
     return {"ok": True, "checks": checks}
 
 
@@ -625,6 +650,72 @@ def configure_cached_bundle(cache: Path, lock: dict) -> dict:
     return installed
 
 
+def protocol_surface(module) -> int:
+    """Verify the exact wire version and command surface consumed by the app."""
+    issues = []
+    wire_version = getattr(module, "PROTOCOL_VERSION", None)
+    if wire_version != REQUIRED_PROTOCOL_VERSION:
+        issues.append(
+            f"wire version {wire_version!r}, expected {REQUIRED_PROTOCOL_VERSION}"
+        )
+    for enum_name, member_name, expected_value in REQUIRED_PROTOCOL_COMMANDS:
+        enum_type = getattr(module, enum_name, None)
+        member = getattr(enum_type, member_name, None)
+        if member is None:
+            issues.append(f"missing {enum_name}.{member_name}")
+            continue
+        try:
+            actual_value = int(member)
+        except (TypeError, ValueError):
+            actual_value = None
+        if actual_value != expected_value:
+            issues.append(
+                f"{enum_name}.{member_name} is {actual_value!r}, "
+                f"expected {expected_value}"
+            )
+    if issues:
+        raise CompatibilityError(
+            "installed protocol is incompatible: " + "; ".join(issues)
+        )
+    return wire_version
+
+
+def protocol_compatibility(lock: dict) -> str:
+    """Verify the installed locked artifact and the wire surface we consume."""
+    protocol = lock["inputs"]["protocol"]
+    try:
+        distribution = importlib.metadata.distribution(protocol["distribution"])
+    except importlib.metadata.PackageNotFoundError as error:
+        raise CompatibilityError("installed protocol distribution is missing") from error
+    actual = distribution.version
+    expected = protocol["release"].removeprefix("v")
+    if actual != expected:
+        raise CompatibilityError(f"expected {expected}, found {actual}")
+    try:
+        direct = json.loads(distribution.read_text("direct_url.json") or "")
+        archive_info = direct["archive_info"]
+        artifact_hash = archive_info.get("hash")
+        if artifact_hash is None:
+            artifact_hash = "sha256=" + archive_info["hashes"]["sha256"]
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise CompatibilityError(
+            "installed protocol has no verifiable direct-artifact record"
+        ) from error
+    if direct.get("url") != protocol["url"]:
+        raise CompatibilityError("installed protocol artifact URL does not match the lock")
+    if artifact_hash != f"sha256={protocol['sha256']}":
+        raise CompatibilityError("installed protocol artifact digest does not match the lock")
+
+    try:
+        module = importlib.import_module("atrinik_protocol")
+    except ImportError as error:
+        raise CompatibilityError("installed protocol module is unavailable") from error
+    wire_version = protocol_surface(module)
+    return (
+        f"{actual} wire {wire_version} sha256:{protocol['sha256']}"
+    )
+
+
 def doctor(cache: Path, lock: dict, *, verify_remote: bool = False) -> dict:
     """Diagnose every locked input without mutating cache or source state."""
     checks: list[dict[str, str]] = []
@@ -638,9 +729,15 @@ def doctor(cache: Path, lock: dict, *, verify_remote: bool = False) -> dict:
             checks.append({"name": name, "status": "ok", "detail": detail})
 
     if verify_remote:
+        def remote_preflight() -> str:
+            result = preflight_lock(lock)
+            if not result["ok"]:
+                raise CompatibilityError(result["error"])
+            return f"{len(result['checks'])} locked inputs verified"
+
         check(
             "lock-availability",
-            lambda: f"{len(preflight_lock(lock)['checks'])} locked release assets verified",
+            remote_preflight,
         )
 
     installed: dict | None = None
@@ -662,34 +759,7 @@ def doctor(cache: Path, lock: dict, *, verify_remote: bool = False) -> dict:
 
     check("content-tooling", content_tools)
 
-    protocol = lock["inputs"]["protocol"]
-
-    def protocol_version() -> str:
-        distribution = importlib.metadata.distribution(protocol["distribution"])
-        actual = distribution.version
-        expected = protocol["release"].removeprefix("v")
-        if actual != expected:
-            raise CompatibilityError(f"expected {expected}, found {actual}")
-        try:
-            direct = json.loads(distribution.read_text("direct_url.json") or "")
-            archive_info = direct["archive_info"]
-            artifact_hash = archive_info.get("hash")
-            if artifact_hash is None:
-                artifact_hash = "sha256=" + archive_info["hashes"]["sha256"]
-        except (KeyError, TypeError, json.JSONDecodeError) as error:
-            raise CompatibilityError(
-                "installed protocol has no verifiable direct-artifact record"
-            ) from error
-        expected_url = (
-            protocol["url"]
-        )
-        if direct.get("url") != expected_url:
-            raise CompatibilityError("installed protocol artifact URL does not match the lock")
-        if artifact_hash != f"sha256={protocol['sha256']}":
-            raise CompatibilityError("installed protocol artifact digest does not match the lock")
-        return f"{actual} sha256:{protocol['sha256']}"
-
-    check("protocol", protocol_version)
+    check("protocol", lambda: protocol_compatibility(lock))
     pathfinding = lock["inputs"]["pathfinding"]
 
     def pathfinding_version() -> str:
