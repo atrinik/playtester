@@ -122,4 +122,3 @@ class AccessAdmissionTests(unittest.TestCase):
             transport="tcp"))
         with self.assertRaisesRegex(ValueError, "encrypted QUIC"):
             asyncio.run(client.connect())
-

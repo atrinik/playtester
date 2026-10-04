@@ -17,7 +17,6 @@ from .access_codes import normalize_access_code
 from .model import Character, GameState, InterfaceState, Item, MapObject
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
-from .quests import parse_quest_book
 from .transport import QuicStream
 
 log = logging.getLogger(__name__)
@@ -1526,6 +1525,8 @@ class AtrinikClient:
         self.state.books.append(raw)
         del self.state.books[:-20]
         if b"Quest List" in raw or b"No quests to speak of" in raw:
+            from .quests import parse_quest_book
+
             self.state.quests = parse_quest_book(raw)
             self.state.quests_loaded = True
             await self.emit("quests", self.state.quests)
