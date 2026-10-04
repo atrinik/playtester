@@ -15,10 +15,7 @@ maintainers = [
 ]
 # The Classic protocol wheel is installed from dependencies.lock.json by
 # scripts/install_locked_protocol.py so metadata and CI share one input.
-dependencies = []
-
-[project.optional-dependencies]
-quic = ["aioquic>=1.2"]
+dependencies = ["aioquic>=1.2"]
 
 [project.scripts]
 atrinik-playtester = "atrinik_bot.cli:main"

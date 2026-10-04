@@ -29,6 +29,7 @@ S_COMBAT = int(ClientToServerCommand.COMBAT)
 S_TALK = int(ClientToServerCommand.TALK)
 S_MOVE = int(ClientToServerCommand.MOVE)
 S_TARGET = int(ClientToServerCommand.TARGET)
+S_ACCESS_AUTH = int(ClientToServerCommand.ACCESS_AUTH)
 
 # Server -> client packet types.
 C_MAP = int(ServerToClientCommand.MAP)
@@ -59,6 +60,8 @@ C_SOUND_AMBIENT = int(ServerToClientCommand.SOUND_AMBIENT)
 C_INTERFACE = int(ServerToClientCommand.INTERFACE)
 C_NOTIFICATION = int(ServerToClientCommand.NOTIFICATION)
 C_KEEPALIVE = int(ServerToClientCommand.KEEPALIVE)
+C_ACCESS_RESULT = int(ServerToClientCommand.ACCESS_RESULT)
+C_ACCESS_POLICY = int(ServerToClientCommand.ACCESS_POLICY)
 
 # DRAWINFO chat channels shared with common/toolkit/socket.h.
 CHAT_TYPE_CHAT = 3
@@ -77,7 +80,7 @@ CMD_PARTY_REMOVE_MEMBER = 7
 SETUP_SOUND = 0
 SETUP_MAPSIZE = 1
 SETUP_DATA_URL = 2
-SETUP_JOIN_PASSWORD = 3
+# Setup subtype 3 is reserved; server-wide join passwords were removed.
 SETUP_ASSET_TRANSPORT = 4
 SETUP_CONNECTION_MODE = 5
 

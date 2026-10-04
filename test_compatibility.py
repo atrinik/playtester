@@ -124,6 +124,24 @@ class CompatibilityTests(unittest.TestCase):
         )
         return source, runtime, self.make_lock(source, runtime)
 
+    @staticmethod
+    def protocol_distribution(lock: dict, *, version: str = "5.48.0"):
+        protocol = lock["inputs"]["protocol"]
+        direct = json.dumps({
+            "archive_info": {"hash": f"sha256={protocol['sha256']}"},
+            "url": protocol["url"],
+        })
+        return SimpleNamespace(version=version, read_text=lambda name: direct)
+
+    @staticmethod
+    def protocol_module(*, version: int = 1081):
+        return SimpleNamespace(
+            PROTOCOL_VERSION=version,
+            ClientToServerCommand=SimpleNamespace(ACCESS_AUTH=23),
+            ServerToClientCommand=SimpleNamespace(
+                ACCESS_RESULT=29, ACCESS_POLICY=31),
+        )
+
     def test_repository_lock_binds_current_classic_inputs(self) -> None:
         lock = compatibility.load_lock()
         content = lock["inputs"]["content"]
@@ -188,7 +206,8 @@ class CompatibilityTests(unittest.TestCase):
                     return Response({"sha": values[0]["revision"]})
             raise AssertionError(url)
 
-        result = compatibility.preflight_lock(lock, opener=fake_open)
+        result = compatibility.preflight_lock(
+            lock, opener=fake_open, verify_installed_protocol=False)
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["checks"]), 4)
         self.assertEqual(
@@ -203,7 +222,8 @@ class CompatibilityTests(unittest.TestCase):
             return Response({"sha": specs[0]["revision"]})
 
         with self.assertRaisesRegex(compatibility.CompatibilityError, "missing asset"):
-            compatibility.preflight_lock(lock, opener=missing_asset)
+            compatibility.preflight_lock(
+                lock, opener=missing_asset, verify_installed_protocol=False)
 
         def missing_repository(request, timeout):
             raise compatibility.urllib.error.HTTPError(
@@ -214,7 +234,30 @@ class CompatibilityTests(unittest.TestCase):
             compatibility.CompatibilityError,
             "repository atrinik/content or tag v1.0.0 is unavailable",
         ):
-            compatibility.preflight_lock(lock, opener=missing_repository)
+            compatibility.preflight_lock(
+                lock, opener=missing_repository,
+                verify_installed_protocol=False)
+
+        with mock.patch.object(
+            compatibility, "protocol_compatibility",
+            return_value="5.49.0 wire 1081 sha256:candidate",
+        ):
+            compatible = compatibility.preflight_lock(lock, opener=fake_open)
+        self.assertEqual(len(compatible["checks"]), 5)
+        self.assertEqual(
+            compatible["checks"][-1]["name"], "protocol.compatibility")
+
+        with mock.patch.object(
+            compatibility, "protocol_compatibility",
+            side_effect=compatibility.CompatibilityError(
+                "installed protocol is incompatible: wire version 1080, expected 1081"
+            ),
+        ):
+            incompatible = compatibility.preflight_lock(lock, opener=fake_open)
+        self.assertFalse(incompatible["ok"])
+        self.assertEqual(len(incompatible["checks"]), 5)
+        self.assertEqual(incompatible["checks"][-1]["status"], "error")
+        self.assertIn("wire version 1080", incompatible["error"])
 
     def test_lock_validation_rejects_malformed_content_and_digests(self) -> None:
         source, runtime, lock = self.valid_inputs()
@@ -312,27 +355,72 @@ class CompatibilityTests(unittest.TestCase):
         compatibility.install_bundle(
             cache, lock, source_archive=source, runtime_archive=runtime
         )
-        protocol = lock["inputs"]["protocol"]
-        direct = json.dumps({
-            "archive_info": {"hash": f"sha256={protocol['sha256']}"},
-            "url": protocol["url"],
-        })
-        distribution = SimpleNamespace(
-            version="5.48.0", read_text=lambda name: direct)
+        distribution = self.protocol_distribution(lock)
+        protocol_module = self.protocol_module()
         extension = SimpleNamespace(
             __dependency_release__="v5.48.0",
             __dependency_sha256__=lock["inputs"]["pathfinding"]["sha256"],
         )
+        def import_module(name):
+            return protocol_module if name == "atrinik_protocol" else extension
+
         with mock.patch.object(compatibility.importlib.metadata, "distribution",
                                return_value=distribution), mock.patch.object(
                                    compatibility.importlib, "import_module",
-                                   return_value=extension):
+                                   side_effect=import_module):
             result = compatibility.doctor(cache, lock)
         self.assertTrue(result["ok"], result)
         self.assertEqual(
             [item["name"] for item in result["checks"]],
             ["content-bundle", "content-tooling", "protocol", "pathfinding"],
         )
+
+    def test_protocol_compatibility_rejects_old_surface_and_accepts_candidate(
+            self) -> None:
+        _, _, lock = self.valid_inputs()
+        distribution = self.protocol_distribution(lock)
+        old_protocol = SimpleNamespace(
+            PROTOCOL_VERSION=1080,
+            ClientToServerCommand=SimpleNamespace(),
+            ServerToClientCommand=SimpleNamespace(),
+        )
+        with mock.patch.object(
+            compatibility.importlib.metadata, "distribution",
+            return_value=distribution,
+        ), mock.patch.object(
+            compatibility.importlib, "import_module", return_value=old_protocol,
+        ), self.assertRaisesRegex(
+            compatibility.CompatibilityError,
+            "wire version 1080.*missing ClientToServerCommand.ACCESS_AUTH.*"
+            "missing ServerToClientCommand.ACCESS_RESULT.*"
+            "missing ServerToClientCommand.ACCESS_POLICY",
+        ):
+            compatibility.protocol_compatibility(lock)
+
+        candidate = self.protocol_module()
+        with mock.patch.object(
+            compatibility.importlib.metadata, "distribution",
+            return_value=distribution,
+        ), mock.patch.object(
+            compatibility.importlib, "import_module", return_value=candidate,
+        ):
+            detail = compatibility.protocol_compatibility(lock)
+        self.assertIn("wire 1081", detail)
+        self.assertIn(lock["inputs"]["protocol"]["sha256"], detail)
+
+    def test_protocol_compatibility_preserves_artifact_identity_checks(self) -> None:
+        _, _, lock = self.valid_inputs()
+        distribution = self.protocol_distribution(lock, version="0.0.0")
+        with mock.patch.object(
+            compatibility.importlib.metadata, "distribution",
+            return_value=distribution,
+        ), mock.patch.object(
+            compatibility.importlib, "import_module",
+            return_value=self.protocol_module(),
+        ), self.assertRaisesRegex(
+            compatibility.CompatibilityError, "expected 5.48.0, found 0.0.0"
+        ):
+            compatibility.protocol_compatibility(lock)
 
     def test_doctor_reports_missing_and_incompatible_inputs(self) -> None:
         source, runtime, lock = self.valid_inputs()
