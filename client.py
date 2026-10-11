@@ -1551,13 +1551,16 @@ class AtrinikClient:
                 m.tiles.clear()
             else:
                 connected_tile, xoff, yoff, zoff = cur.u8(), cur.i8(), cur.i8(), cur.i8()
-                if not 1 <= connected_tile <= 10 or abs(zoff) > c.MAP_MAX_DEPTH:
+                expected_zoff = {9: 1, 10: -1}.get(connected_tile, 0)
+                if not 1 <= connected_tile <= 10 or zoff != expected_zoff:
                     raise ProtocolError("invalid MAP connection")
                 if zoff:
                     m.tiles.clear()
                 else:
                     m.scroll(xoff, yoff)
         m.world_x, m.world_y, m.player_sub_layer = cur.u8(), cur.u8(), cur.u8()
+        if update == c.MAP_NEW and (m.world_x >= real_width or m.world_y >= real_height):
+            raise ProtocolError("MAP player outside declared map dimensions")
         if m.player_sub_layer >= 7:
             raise ProtocolError("invalid MAP player sublayer")
         if update == c.MAP_SAME:

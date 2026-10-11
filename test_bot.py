@@ -152,6 +152,11 @@ class MapWireTests(unittest.TestCase):
                     self.envelope(blocks=((0, b""), (0, b""))),
                     self.envelope(blocks=((0, b""), (7, b""))),
                     self.envelope(marker=4097), self.envelope(sublayer=7),
+                    self.envelope(x=32), self.envelope(y=32),
+                    self.envelope(c.MAP_CONNECTED, connected=(1, 0, 0, 1)),
+                    self.envelope(c.MAP_CONNECTED, connected=(9, 0, 0, 0)),
+                    self.envelope(c.MAP_CONNECTED, connected=(10, 0, 0, 1)),
+                    self.envelope(c.MAP_CONNECTED, connected=(0, 0, 0, 0)),
                     self.envelope() + b"extra"):
             with self.assertRaises(ProtocolError):
                 self.decode(client, bad)
