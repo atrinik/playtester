@@ -10,7 +10,8 @@ from pathlib import Path
 
 from .client import logical_map_path, map_object_visual_name
 from .protocol import Cursor, Packet, ProtocolError
-from .transport import QUIC_ALPN, normalize_certificate_sha256
+from .transport import (QUIC_ALPN, QUIC_GAME_STREAM_PREFACE,
+                        normalize_certificate_sha256)
 from .quests import dialogue_choices, flatten_parts, load_catalog, parse_quest_book
 from .navigation import (BuySpellTask, FarmCircuitTask, FoodProfile,
                          MapEdge, MapNode,
@@ -146,6 +147,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_quic_alpn_matches_current_classic_server(self):
         self.assertEqual(QUIC_ALPN, "atrinik/2")
+
+    def test_quic_game_stream_preface_matches_current_classic_server(self):
+        self.assertEqual(QUIC_GAME_STREAM_PREFACE, b"ATRN\x01\x00\x00\x01")
 
     def test_unique_map_path(self):
         self.assertEqual(

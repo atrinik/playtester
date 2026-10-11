@@ -13,6 +13,9 @@ from .protocol import ProtocolError
 
 # Must match libatrinik/socket_quic.c's socket_quic_alpn.
 QUIC_ALPN = "atrinik/2"
+# Must match libatrinik/socket.c's socket_stream_preface_encode() for the
+# mandatory GAME stream: magic, stream kind, reserved byte, protocol version.
+QUIC_GAME_STREAM_PREFACE = b"ATRN\x01\x00\x00\x01"
 
 
 def normalize_certificate_sha256(value: str) -> str:
@@ -73,6 +76,11 @@ class QuicStream:
                     f"(expected {expected}, got {actual})"
                 )
             reader, writer = await protocol.create_stream()
+            # Classic QUIC does not carry gameplay frames directly on an
+            # arbitrary bidirectional stream. The server first classifies the
+            # stream from this typed preface, then reads normal socket frames.
+            writer.write(QUIC_GAME_STREAM_PREFACE)
+            await asyncio.wait_for(writer.drain(), timeout)
             return cls(context, reader, writer)
         except BaseException:
             if protocol is not None:
