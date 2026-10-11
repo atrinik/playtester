@@ -181,6 +181,9 @@ class GameState:
     quests: dict[str, QuestProgress] = field(default_factory=dict)
     quests_loaded: bool = False
     target_code: int = 0
+    target_level: int = 0
+    target_actor_count: int = 0
+    target_relative_depth: int = 0
     target_id: int = 0
     target_color: str = ""
     target_name: str = ""

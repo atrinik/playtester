@@ -170,11 +170,80 @@ class ProtocolTests(unittest.TestCase):
                          "bollard_tied_e_1.101")
 
     def test_packet(self):
-        self.assertEqual(c.SOCKET_VERSION, 1080)
+        self.assertEqual(c.SOCKET_VERSION, 1084)
         self.assertEqual(
             Packet(c.S_VERSION).add("I", c.SOCKET_VERSION).encode(),
-            b"\x00\x05\x03\x00\x00\x04\x38",
+            b"\x00\x05\x03\x00\x00\x04\x3c",
         )
+
+    def test_target_select_uses_depth_aware_exact_payload(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            sent = []
+
+            async def send(packet):
+                sent.append(packet.encode())
+
+            client.send = send
+            await client.target(7, 8, 0x12345678, -6)
+            await client.clear_target()
+            self.assertEqual(sent, [
+                b"\x00\x09\x16\x01\x07\x08\xfa\x12\x34\x56\x78",
+                b"\x00\x02\x16\x02",
+            ])
+            for depth in (-7, 7):
+                with self.assertRaisesRegex(ValueError, "relative_depth"):
+                    await client.target(7, 8, 1, depth)
+            with self.assertRaisesRegex(ValueError, "actor_count"):
+                await client.target(7, 8, 0)
+
+        asyncio.run(scenario())
+
+    def test_target_reply_is_transactional_and_uses_server_identity(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.target_name = "old target"
+            client.state.target_level = 13
+            client.state.target_actor_count = 99
+            client.state.target_relative_depth = 4
+            client.state.target_id = 99
+            payload = (
+                bytes((c.TARGET_ENEMY,)) + b"red\0orc\0" + bytes((12,)) +
+                (0x12345678).to_bytes(4, "big") + b"\xfa\x01\x00"
+            )
+            await client._handle_target(Cursor(payload), payload)
+            self.assertEqual(client.state.target_name, "orc")
+            self.assertEqual(client.state.target_level, 12)
+            self.assertEqual(client.state.target_actor_count, 0x12345678)
+            self.assertEqual(client.state.target_relative_depth, -6)
+            self.assertEqual(client.state.target_id, 0x12345678)
+            for end in range(len(payload)):
+                truncated = payload[:end]
+                with self.assertRaises(ProtocolError):
+                    await client._handle_target(Cursor(truncated), truncated)
+                self.assertEqual(client.state.target_name, "orc")
+                self.assertEqual(client.state.target_actor_count, 0x12345678)
+                self.assertEqual(client.state.target_relative_depth, -6)
+            unknown = bytes((255,)) + payload[1:]
+            with self.assertRaises(ProtocolError):
+                await client._handle_target(Cursor(unknown), unknown)
+            self.assertEqual(client.state.target_name, "orc")
+            self.assertEqual(client.state.target_actor_count, 0x12345678)
+            self.assertEqual(client.state.target_relative_depth, -6)
+
+        asyncio.run(scenario())
+
+    def test_reconnect_resets_target_identity(self):
+        client = AtrinikClient(ClientConfig(
+            account="a", password="b", transport="invalid"))
+        client.state.target_actor_count = 99
+        client.state.target_relative_depth = -6
+        client.state.target_id = 99
+        with self.assertRaisesRegex(ValueError, "unknown transport"):
+            asyncio.run(client.connect())
+        self.assertEqual(client.state.target_actor_count, 0)
+        self.assertEqual(client.state.target_relative_depth, 0)
+        self.assertEqual(client.state.target_id, 0)
 
     def test_item_decoder_retains_authoritative_read_flag(self):
         client = AtrinikClient(ClientConfig())

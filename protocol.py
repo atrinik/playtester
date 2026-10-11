@@ -65,6 +65,7 @@ class Packet:
         return self
 
     def u8(self, value: int) -> "Packet": return self.add("B", value)
+    def i8(self, value: int) -> "Packet": return self.add("b", value)
     def u16(self, value: int) -> "Packet": return self.add("H", value)
     def u32(self, value: int) -> "Packet": return self.add("I", value)
     def string(self, value: str) -> "Packet":

@@ -125,7 +125,6 @@ class AtrinikClient:
         self._account_sent = False
         self._character_sent = False
         self._last_keepalive = 0.0
-        self._pending_target_id = 0
         self._death_depletion_until = 0.0
         self._pending_death_losses: list[tuple[float, str]] = []
         self._party_setup_name = ""
@@ -596,6 +595,17 @@ class AtrinikClient:
     def add_handler(self, handler: EventHandler) -> None:
         self._handlers.append(handler)
 
+    def _reset_target_identity(self) -> None:
+        self.state.target_code = c.TARGET_SELF
+        self.state.target_level = 0
+        self.state.target_actor_count = 0
+        self.state.target_relative_depth = 0
+        self.state.target_id = 0
+        self.state.target_color = ""
+        self.state.target_name = ""
+        self.state.combat = False
+        self.state.combat_force = False
+
     async def emit(self, kind: str, data=None) -> None:
         event = Event(kind, data)
         await self.events.put(event)
@@ -614,6 +624,7 @@ class AtrinikClient:
         if self.config.join_password and self.config.transport == "tcp":
             raise ValueError("server join passwords require encrypted QUIC")
         self.state.phase = "connecting"
+        self._reset_target_identity()
         if self.config.transport not in ("auto", "tcp", "quic"):
             raise ValueError(
                 f"unknown transport {self.config.transport!r}; choose auto, "
@@ -1261,15 +1272,34 @@ class AtrinikClient:
             f"channel={msg_type} sender={sender} response={response}")
 
     async def _handle_target(self, cur: Cursor, raw: bytes) -> None:
-        self.state.target_code = cur.u8()
-        self.state.target_color = cur.cstring()
-        self.state.target_name = cur.cstring()
-        self.state.target_id = (
-            self._pending_target_id
-            if self.state.target_code != c.TARGET_SELF else 0)
-        self.state.combat = bool(cur.u8())
-        self.state.combat_force = bool(cur.u8())
-        await self.emit("target", self.state.target_name)
+        # Parse and validate the complete reply before publishing any of it.
+        # A malformed frame must not replace a currently authoritative target.
+        target_code = cur.u8()
+        target_color = cur.cstring()
+        target_name = cur.cstring()
+        target_level = cur.u8()
+        target_actor_count = cur.u32()
+        target_relative_depth = cur.i8()
+        combat = cur.u8()
+        combat_force = cur.u8()
+        if (cur.remaining or target_code > c.TARGET_FRIEND or
+                not -c.TARGET_MAX_RELATIVE_DEPTH <= target_relative_depth <=
+                c.TARGET_MAX_RELATIVE_DEPTH or
+                combat not in (0, 1) or combat_force not in (0, 1) or
+                (target_code == c.TARGET_SELF and
+                 (target_actor_count != 0 or target_relative_depth != 0)) or
+                (target_code != c.TARGET_SELF and target_actor_count == 0)):
+            raise ProtocolError("invalid target response")
+        self.state.target_code = target_code
+        self.state.target_color = target_color
+        self.state.target_name = target_name
+        self.state.target_level = target_level
+        self.state.target_actor_count = target_actor_count
+        self.state.target_relative_depth = target_relative_depth
+        self.state.target_id = target_actor_count
+        self.state.combat = bool(combat)
+        self.state.combat_force = bool(combat_force)
+        await self.emit("target", target_name)
 
     async def _handle_stats(self, cur: Cursor, raw: bytes) -> None:
         changed: dict[str, int | float] = {}
@@ -1564,18 +1594,23 @@ class AtrinikClient:
         self.record_action("clear", "cancel queued movement/actions")
         await self.send(Packet(c.S_CLEAR))
 
-    async def target(self, x: int, y: int, target_id: int = 0) -> None:
-        self.record_action("target", f"id={target_id} view={x},{y}")
-        # The server reports selected-target HP in the stats stream without
-        # repeating the object's map ID. Retain the ID used for this request
-        # so combat policies can associate that percentage with one monster.
-        self._pending_target_id = target_id
-        await self.send(Packet(c.S_TARGET).u8(c.TARGET_MAPXY).u8(x).u8(y).u32(target_id))
+    async def target(self, x: int, y: int, actor_count: int,
+                     relative_depth: int = 0) -> None:
+        if not -c.TARGET_MAX_RELATIVE_DEPTH <= relative_depth <= c.TARGET_MAX_RELATIVE_DEPTH:
+            raise ValueError(
+                f"relative_depth must be -{c.TARGET_MAX_RELATIVE_DEPTH}.."
+                f"{c.TARGET_MAX_RELATIVE_DEPTH}")
+        if actor_count <= 0:
+            raise ValueError("actor_count must be nonzero")
+        self.record_action(
+            "target",
+            f"actor_count={actor_count} view={x},{y} depth={relative_depth}")
+        await self.send(Packet(c.S_TARGET).u8(c.TARGET_MAPXY).u8(x).u8(y)
+                        .i8(relative_depth).u32(actor_count))
 
     async def clear_target(self) -> None:
         self.record_action("target", "clear")
-        self._pending_target_id = 0
-        self.state.target_id = 0
+        self._reset_target_identity()
         await self.send(Packet(c.S_TARGET).u8(c.TARGET_CLEAR))
 
     async def set_combat(self, enabled: bool, force: bool = False) -> None:

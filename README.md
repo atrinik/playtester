@@ -43,6 +43,17 @@ download URL, and SHA-256 digest before invoking pip. The
 while `doctor --preflight` reports the same check alongside local cache and
 installed-input diagnostics.
 
+For a coordinated unreleased Classic protocol change, retain the immutable lock
+and point only the development process at that checkout's generated bindings:
+
+```sh
+export ATRINIK_PLAYTESTER_PROTOCOL_SOURCE=/path/to/classic/protocol/generated/python
+```
+
+The source directory must contain `atrinik_protocol`. Playtester requires the
+currently coordinated protocol revision and rejects an older installed wheel;
+do not use this override for a released run.
+
 Install the exact content compiler/catalog and Classic runtime selected by
 [`dependencies.lock.json`](dependencies.lock.json). The default cache is
 `$XDG_CACHE_HOME/atrinik/playtester` or `~/.cache/atrinik/playtester` and can be

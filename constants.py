@@ -1,9 +1,34 @@
-"""Classic wire constants, with command IDs supplied by the locked protocol."""
+"""Classic wire constants, with command IDs supplied by the protocol package."""
+
+import os
+from pathlib import Path
+import sys
+
+# Development and coordinated integration tests may use the generated bindings
+# from the checked-out Classic protocol source. Released playtester installs
+# continue to resolve the immutable wheel selected by dependencies.lock.json.
+_protocol_source = os.environ.get("ATRINIK_PLAYTESTER_PROTOCOL_SOURCE")
+if _protocol_source:
+    _protocol_source_path = Path(_protocol_source).expanduser().resolve()
+    if not (_protocol_source_path / "atrinik_protocol" / "__init__.py").is_file():
+        raise RuntimeError(
+            "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE must contain atrinik_protocol"
+        )
+    sys.path.insert(0, str(_protocol_source_path))
 
 from atrinik_protocol import (ClientToServerCommand, PROTOCOL_VERSION,
                               ServerToClientCommand)
 
 SOCKET_VERSION = PROTOCOL_VERSION
+
+# TARGET's depth-aware framing was introduced by this protocol revision.
+REQUIRED_PROTOCOL_VERSION = 1084
+if SOCKET_VERSION != REQUIRED_PROTOCOL_VERSION:
+    raise RuntimeError(
+        f"playtester requires Classic protocol {REQUIRED_PROTOCOL_VERSION}; "
+        "install the coordinated protocol wheel or set "
+        "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE to its generated/python directory"
+    )
 
 # Client -> server packet types.
 S_CONTROL = int(ClientToServerCommand.CONTROL)
@@ -93,6 +118,8 @@ TARGET_NEUTRAL = 2
 TARGET_FRIEND = 3
 TARGET_MAPXY = 1
 TARGET_CLEAR = 2
+# MAP2 supports the viewer level plus six levels above and below it.
+TARGET_MAX_RELATIVE_DEPTH = 6
 
 TALK_NPC = 1
 TALK_INV = 2
