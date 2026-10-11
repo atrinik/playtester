@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from . import constants as c
-from .model import Character, GameState, InterfaceState, Item, MapObject
+from .model import Character, GameState, InterfaceState, Item, MapObject, MapState
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .quests import parse_quest_book
@@ -121,6 +122,7 @@ class AtrinikClient:
         self._handlers: list[EventHandler] = []
         self._reconnect_requested = False
         self._closed = False
+        self._map_pending = None
         self._setup_sent = False
         self._account_sent = False
         self._character_sent = False
@@ -622,6 +624,11 @@ class AtrinikClient:
                 "join passwords are unsupported by Classic protocol 1084")
         self.state.phase = "connecting"
         self._reset_target_identity()
+        self._map_pending = None
+        # A fresh connection cannot inherit map-published actor identities.
+        # The server will publish a complete MAP2 view for the new session.
+        self.state.map = MapState(width=self.config.map_width,
+                                  height=self.config.map_height)
         if self.config.transport not in ("auto", "tcp", "quic"):
             raise ValueError(
                 f"unknown transport {self.config.transport!r}; choose auto, "
@@ -1419,80 +1426,207 @@ class AtrinikClient:
             else:
                 raise ProtocolError(f"unknown mapstats field {kind}")
 
-    async def _handle_map(self, cur: Cursor, raw: bytes) -> None:
-        m = self.state.map
-        update = cur.u8()
-        old_x, old_y, old_path = m.world_x, m.world_y, m.path
-        if update != c.MAP_SAME:
-            m.name, m.music, m.weather = cur.cstring(), cur.cstring(), cur.cstring()
-            height_diff, has_region_map = cur.u8(), cur.u8()
-            m.region, m.region_longname = cur.cstring(), cur.cstring()
-            m.raw_path = cur.cstring()
-            m.path = logical_map_path(m.raw_path)
-            if update == c.MAP_NEW:
-                map_real_width, map_real_height = cur.u8(), cur.u8()
-                m.tiles.clear()
-            elif update == c.MAP_CONNECTED:
-                connected_tile, xoff, yoff = cur.u8(), cur.i8(), cur.i8()
-                m.scroll(xoff, yoff)
-            else:
-                raise ProtocolError(f"unknown map update type {update}")
-        m.world_x, m.world_y = cur.u8(), cur.u8()
-        if update == c.MAP_SAME:
-            m.scroll(m.world_x - old_x, m.world_y - old_y)
-        m.player_x, m.player_y = m.width // 2, m.height // 2
-        m.player_sub_layer, m.in_building = cur.u8(), bool(cur.u8())
+    @staticmethod
+    def _map_string(cur: Cursor, maximum: int) -> str:
+        end = cur.data.find(b"\0", cur.pos)
+        if end < cur.pos or end - cur.pos > maximum:
+            raise ProtocolError("invalid MAP2 string")
+        return cur.cstring()
 
-        while cur.remaining:
-            mask = cur.u16()
-            x, y = (mask >> 11) & 0x1F, (mask >> 6) & 0x1F
-            if mask & c.MAP_MASK_CLEAR:
-                m.clear(x, y)
-                continue
-            tile = m.tile(x, y)
-            if mask & c.MAP_MASK_DARKNESS:
-                tile.darkness[0] = cur.u8()
-            if mask & c.MAP_MASK_DARKNESS_MORE:
-                for sublayer in range(1, 7):
-                    tile.darkness[sublayer] = cur.u8()
-            for _ in range(cur.u8()):
-                layer = cur.u8()
+    @staticmethod
+    def _map_tile_copy(tiles: dict[tuple[int, int], object], x: int, y: int):
+        from .model import Tile
+        return tiles.setdefault((x, y), Tile())
+
+    def _map_level(self, cur: Cursor, size: int, m, depth: int) -> None:
+        from .model import MapObject, Tile
+        if size > cur.remaining:
+            raise ProtocolError("MAP2 level exceeds envelope")
+        body = Cursor(cur.take(size))
+        tiles = m.tiles_at_depth(depth)
+        known_mask = (c.MAP2_MASK_SUPPORT_HEIGHT | c.MAP2_MASK_CLEAR |
+                      c.MAP2_MASK_LIGHT_LEVEL | c.MAP2_MASK_LIGHT_LEVEL_MORE |
+                      c.MAP2_MASK_HARD_CLEAR | c.MAP2_MASK_FOW)
+        known_flags2 = (c.MAP_FLAG2_ALPHA | c.MAP_FLAG2_ROTATE | c.MAP_FLAG2_ZOOM |
+                        c.MAP_FLAG2_TARGET | c.MAP_FLAG2_PROBE | c.MAP_FLAG2_PRIORITY |
+                        c.MAP_FLAG2_SECONDPASS | c.MAP_FLAG2_GLOW | c.MAP_FLAG2_ROOF |
+                        c.MAP_FLAG2_DOOR | c.MAP_FLAG2_EXIT)
+        while body.remaining:
+            mask = body.u16(); x, y = (mask >> 11) & 31, (mask >> 6) & 31
+            values = mask & 63
+            if x >= m.width or y >= m.height or values & ~known_mask:
+                raise ProtocolError("invalid MAP2 tile mask")
+            if values & c.MAP2_MASK_CLEAR:
+                if values & ~(c.MAP2_MASK_CLEAR | c.MAP2_MASK_HARD_CLEAR):
+                    raise ProtocolError("invalid MAP2 clear")
+                tiles[(x, y)] = Tile(); continue
+            if values & c.MAP2_MASK_HARD_CLEAR:
+                raise ProtocolError("invalid MAP2 hard clear")
+            tile = self._map_tile_copy(tiles, x, y)
+            if values & c.MAP2_MASK_SUPPORT_HEIGHT: body.i16()
+            fogged = tile.fogged
+            if values & c.MAP2_MASK_FOW:
+                fog_value = body.u8()
+                if fog_value > 1: raise ProtocolError("invalid MAP2 fow")
+                fogged = bool(fog_value)
+            if values & c.MAP2_MASK_LIGHT_LEVEL: tile.darkness[0] = body.u16()
+            if values & c.MAP2_MASK_LIGHT_LEVEL_MORE:
+                for sub in range(1, 7): tile.darkness[sub] = body.u16()
+            count = body.u8()
+            if count > c.MAP2_REAL_LAYERS: raise ProtocolError("too many MAP2 layers")
+            seen=set()
+            for _ in range(count):
+                layer=body.u8()
                 if layer == c.MAP_LAYER_CLEAR:
-                    tile.objects.pop(cur.u8(), None)
-                    continue
-                face, object_flags, flags = cur.u16(), cur.u8(), cur.u8()
-                obj = MapObject(layer=layer, face=face, object_flags=object_flags, flags=flags)
-                if flags & c.MAP_FLAG_MULTI: cur.u8()
-                if flags & c.MAP_FLAG_NAME:
-                    obj.name, obj.name_color = cur.cstring(), cur.cstring()
+                    layer=body.u8()
+                    if layer >= c.MAP2_REAL_LAYERS or layer in seen: raise ProtocolError("invalid MAP2 layer")
+                    seen.add(layer); tile.objects.pop(layer, None); continue
+                if layer >= c.MAP2_REAL_LAYERS or layer in seen: raise ProtocolError("invalid MAP2 layer")
+                seen.add(layer)
+                face, object_flags, flags = body.u16(), body.u8(), body.u8()
+                obj=MapObject(layer, face, object_flags, flags)
+                if flags & c.MAP_FLAG_MULTI: body.u8()
+                if flags & c.MAP_FLAG_NAME: obj.name, obj.name_color = self._map_string(body,63), self._map_string(body,6)
                 if flags & c.MAP_FLAG_ANIMATION:
-                    # request.c places animation_id in the uint16 nominally
-                    # called Face ID whenever this flag is set.
-                    obj.animation = face
-                    obj.animation_speed = cur.u8()
-                    obj.direction = cur.u8()
-                    anim_flags = cur.u8()
-                    if anim_flags & c.ANIM_MOVING: cur.u8()
-                if flags & c.MAP_FLAG_HEIGHT: cur.i16()
-                if flags & c.MAP_FLAG_ALIGN: cur.i16()
+                    obj.animation=face; obj.animation_speed=body.u8(); obj.direction=body.u8(); anim=body.u8()
+                    if anim & ~15: raise ProtocolError("invalid MAP2 animation")
+                    if anim & c.ANIM_MOVING: body.u8()
+                if flags & c.MAP_FLAG_HEIGHT: body.i16()
+                if flags & c.MAP_FLAG_ALIGN: body.i16()
                 if flags & c.MAP_FLAG_MORE:
-                    flags2 = cur.u32()
-                    if flags2 & c.MAP_FLAG2_ALPHA: cur.u8()
-                    if flags2 & c.MAP_FLAG2_ROTATE: cur.i16()
-                    if flags2 & c.MAP_FLAG2_ZOOM: cur.u16(); cur.u16()
+                    flags2=body.u32()
+                    if flags2 & ~known_flags2: raise ProtocolError("unknown MAP2 object flags")
+                    if flags2 & c.MAP_FLAG2_ALPHA: body.u8()
+                    if flags2 & c.MAP_FLAG2_ROTATE: body.i16()
+                    if flags2 & c.MAP_FLAG2_ZOOM: body.u16(); body.u16()
                     if flags2 & c.MAP_FLAG2_TARGET:
-                        obj.target_id, obj.is_friend = cur.u32(), bool(cur.u8())
-                    if flags2 & c.MAP_FLAG2_PROBE: obj.target_hp = cur.u8()
-                    if flags2 & c.MAP_FLAG2_GLOW: cur.cstring(); cur.u8()
-                tile.objects[layer] = obj
-            ext_flags = cur.u8()
-            if ext_flags & c.MAP_EXT_ANIM:
-                for _ in range(cur.u8()):
-                    cur.u8(); cur.u8(); cur.i16()
-        await self.emit("map", {
-            "path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y,
-            "changed_map": old_path != m.path,
-        })
+                        actor_count, friend=body.u32(), body.u8()
+                        if friend > 1: raise ProtocolError("invalid MAP2 target friend")
+                        # TARGET identity is authoritative only for living
+                        # layers. Other drawable layers may carry the bit for
+                        # rendering but cannot grant a player action.
+                        if layer % 7 == 5 and face != 0:
+                            obj.target_id, obj.is_friend = actor_count, bool(friend)
+                    if flags2 & c.MAP_FLAG2_PROBE:
+                        obj.target_hp=body.u8()
+                        if obj.target_hp > 100: raise ProtocolError("invalid MAP2 target hp")
+                    if flags2 & c.MAP_FLAG2_GLOW: self._map_string(body,6); body.u8()
+                tile.objects[layer]=obj
+            ext=body.u8()
+            if ext & ~(c.MAP_EXT_ANIM|c.MAP_EXT_LIGHT_RGB|c.MAP_EXT_LIGHT_KEYFRAME): raise ProtocolError("unknown MAP2 tile flags")
+            if ext & c.MAP_EXT_LIGHT_RGB:
+                bitmap=body.u8()
+                if bitmap & ~127: raise ProtocolError("invalid MAP2 rgb bitmap")
+                for sub in range(7):
+                    if bitmap & (1<<sub): body.u16(); body.u16(); body.u16()
+            if ext & c.MAP_EXT_LIGHT_KEYFRAME:
+                scalar=body.u8()
+                if scalar & ~127: raise ProtocolError("invalid MAP2 keyframe bitmap")
+                for sub in range(7):
+                    if scalar & (1<<sub): body.u16()
+                rgb=body.u8()
+                if rgb & ~scalar: raise ProtocolError("invalid MAP2 keyframe rgb")
+                for sub in range(7):
+                    if rgb & (1<<sub): body.u16(); body.u16(); body.u16()
+            if ext & c.MAP_EXT_ANIM:
+                animations=body.u8(); seen_sub=set()
+                if animations > 7: raise ProtocolError("too many MAP2 animations")
+                for _ in range(animations):
+                    sub, kind=body.u8(), body.u8(); body.i16()
+                    if sub >= 7 or sub in seen_sub or kind not in (1,2): raise ProtocolError("invalid MAP2 animation")
+                    seen_sub.add(sub)
+            # Fog applies after the record: remembered geometry may remain,
+            # but it must never remain an actionable target identity.
+            tile.fogged = fogged
+            if fogged:
+                tile.objects.clear()
+        if body.remaining: raise ProtocolError("MAP2 level trailing bytes")
+
+    async def _handle_map(self, cur: Cursor, raw: bytes) -> None:
+        # A malformed envelope invalidates an unfinished generation.  The
+        # published state remains untouched because `_handle_map_inner` stages
+        # all mutations on a copy.
+        try:
+            await self._handle_map_inner(cur, raw)
+        except ProtocolError:
+            # Only a rejected continuation invalidates its active generation.
+            # A malformed new header has not superseded the validated pending
+            # header, so it cannot revoke that generation's eventual publish.
+            if raw and raw[0] == c.MAP_PARTIAL:
+                self._map_pending = None
+            raise
+
+    async def _handle_map_inner(self, cur: Cursor, raw: bytes) -> None:
+        if len(raw) > c.MAP2_ENVELOPE_MAX:
+            raise ProtocolError("MAP2 envelope exceeds server limit")
+        update=cur.u8()
+        if update not in (c.MAP_SAME,c.MAP_NEW,c.MAP_CONNECTED,c.MAP_PARTIAL):
+            raise ProtocolError("unknown MAP2 update")
+        if update == c.MAP_PARTIAL:
+            pending=self._map_pending
+            if pending is None: raise ProtocolError("unsolicited MAP2 continuation")
+            m, total, sequence, px, py, sublayer, declared, old_path = pending
+        else:
+            m=copy.deepcopy(self.state.map); old_path=m.path
+            physical_width = physical_height = None
+            if update != c.MAP_SAME:
+                m.name,m.music,m.weather=self._map_string(cur,4095),self._map_string(cur,4095),self._map_string(cur,255)
+                if cur.u8()>1 or cur.u8()>1: raise ProtocolError("invalid MAP2 metadata")
+                m.region,m.region_longname=self._map_string(cur,255),self._map_string(cur,255)
+                m.raw_path=self._map_string(cur,4095); m.path=logical_map_path(m.raw_path)
+                if update == c.MAP_NEW:
+                    map_width,map_height=cur.u8(),cur.u8()
+                    if not map_width or not map_height: raise ProtocolError("invalid MAP2 dimensions")
+                    physical_width, physical_height = map_width, map_height
+                    m.level_tiles={0:{}}; m.tiles=m.level_tiles[0]
+                else:
+                    tile,xoff,yoff,zoff=cur.u8(),cur.i8(),cur.i8(),cur.i8()
+                    if not 1<=tile<=10 or (tile==9 and zoff!=1) or (tile==10 and zoff!=-1) or (tile<9 and zoff): raise ProtocolError("invalid MAP2 connected update")
+                    m.scroll(xoff,yoff); m.scroll_depths(zoff)
+        px,py,sublayer=cur.u8(),cur.u8(),cur.u8(); marker=cur.u16()
+        if sublayer>=7: raise ProtocolError("invalid MAP2 sublayer")
+        if (update == c.MAP_NEW and
+                (px >= physical_width or py >= physical_height)):
+            raise ProtocolError("MAP2 player position outside map")
+        if update == c.MAP_SAME:
+            m.scroll(px - m.world_x, py - m.world_y)
+        timed=marker & c.MAP2_CONTINUATION_TIMED_LIGHT; marker &= ~c.MAP2_CONTINUATION_TIMED_LIGHT
+        if update == c.MAP_PARTIAL:
+            if timed or not marker or marker != sequence or (px,py,sublayer)!=(pending[3],pending[4],pending[5]): raise ProtocolError("invalid MAP2 continuation")
+        elif marker>4096: raise ProtocolError("too many MAP2 continuations")
+        if timed:
+            generation,start,end,flags=cur.u64(),cur.u64(),cur.u64(),cur.u8()
+            if not generation or end<=start or end-start!=3600 or not flags or flags & ~3: raise ProtocolError("invalid MAP2 timed light")
+        count=cur.u8()
+        if not 1<=count<=13: raise ProtocolError("invalid MAP2 level count")
+        depths=set()
+        for _ in range(count):
+            depth,size=cur.i8(),cur.u32()
+            if (not -6<=depth<=6 or depth in depths or
+                    size > c.MAP2_LEVEL_PAYLOAD_MAX or size > cur.remaining or
+                    (update==c.MAP_PARTIAL and not size)):
+                raise ProtocolError("invalid MAP2 level")
+            depths.add(depth); self._map_level(cur,size,m,depth)
+        if cur.remaining: raise ProtocolError("MAP2 trailing bytes")
+        if update == c.MAP_PARTIAL:
+            if not depths <= declared: raise ProtocolError("undeclared MAP2 continuation depth")
+            if sequence == total:
+                self._map_pending=None; self.state.map=m
+            else:
+                self._map_pending=(m,total,sequence+1,px,py,sublayer,declared,old_path); return
+        else:
+            if 0 not in depths: raise ProtocolError("MAP2 full update missing depth zero")
+            # A fully validated complete header supersedes an interrupted
+            # generation; late partials from it cannot publish stale state.
+            self._map_pending = None
+            m.world_x,m.world_y,m.player_sub_layer=px,py,sublayer
+            m.player_x,m.player_y=m.width//2,m.height//2
+            # Full headers declare the active set; stale linked levels lose authority.
+            m.level_tiles={d:m.level_tiles.get(d,{}) for d in depths}; m.tiles=m.level_tiles[0]
+            if marker:
+                self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
+            self.state.map=m
+        await self.emit("map", {"path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y, "changed_map": old_path != m.path})
 
     async def _handle_interface(self, cur: Cursor, raw: bytes) -> None:
         if not raw:
