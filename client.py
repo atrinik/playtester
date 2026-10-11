@@ -1293,7 +1293,6 @@ class AtrinikClient:
         if (cur.remaining or target_code > c.TARGET_FRIEND or
                 not -c.TARGET_MAX_RELATIVE_DEPTH <= target_relative_depth <=
                 c.TARGET_MAX_RELATIVE_DEPTH or
-                combat not in (0, 1) or combat_force not in (0, 1) or
                 (target_code == c.TARGET_SELF and
                  (target_actor_count != 0 or target_relative_depth != 0)) or
                 (target_code != c.TARGET_SELF and target_actor_count == 0)):

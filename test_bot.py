@@ -669,6 +669,29 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(client.state.target_name, "orc")
             self.assertEqual(client.state.target_actor_count, 0x12345678)
             self.assertEqual(client.state.target_relative_depth, -6)
+            with self.assertRaises(ProtocolError):
+                await client._handle_target(Cursor(payload + b"\0"), payload + b"\0")
+            self.assertEqual(client.state.target_name, "orc")
+            self.assertEqual(client.state.target_actor_count, 0x12345678)
+            self.assertEqual(client.state.target_relative_depth, -6)
+            for combat in (0, 1, 2, 255):
+                for combat_force in (0, 1, 2, 255):
+                    actor_count = 0x10000000 + combat * 0x100 + combat_force
+                    reply = (
+                        bytes((c.TARGET_NEUTRAL,)) + b"blue\0target\0" +
+                        bytes((17,)) + actor_count.to_bytes(4, "big") +
+                        b"\x06" + bytes((combat, combat_force))
+                    )
+                    await client._handle_target(Cursor(reply), reply)
+                    self.assertEqual(client.state.target_code, c.TARGET_NEUTRAL)
+                    self.assertEqual(client.state.target_color, "blue")
+                    self.assertEqual(client.state.target_name, "target")
+                    self.assertEqual(client.state.target_level, 17)
+                    self.assertEqual(client.state.target_actor_count, actor_count)
+                    self.assertEqual(client.state.target_relative_depth, 6)
+                    self.assertEqual(client.state.target_id, actor_count)
+                    self.assertEqual(client.state.combat, bool(combat))
+                    self.assertEqual(client.state.combat_force, bool(combat_force))
 
         asyncio.run(scenario())
 
