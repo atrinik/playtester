@@ -6527,6 +6527,23 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(quests["Example"].parts[0].current, 2)
         self.assertEqual(quests["Finished"].status, "completed")
 
+    def test_book_quest_payload_loads_parser_lazily(self):
+        data = b"[book]Quest List[/book][title]Incomplete quests:[/title]"
+        expected = {"Example": QuestProgress(name="Example")}
+
+        async def scenario():
+            with tempfile.TemporaryDirectory() as directory:
+                client = AtrinikClient(ClientConfig(
+                    runtime_state_path=str(Path(directory) / "state.sqlite3")))
+                with patch("atrinik_bot.quests.parse_quest_book",
+                           return_value=expected) as parser:
+                    await client._handle_book(Cursor(data), data)
+                parser.assert_called_once_with(data)
+                self.assertIs(client.state.quests, expected)
+                self.assertTrue(client.state.quests_loaded)
+
+        asyncio.run(scenario())
+
     def test_every_formal_quest_has_an_executor(self):
         catalog = load_catalog()
         self.assertEqual(
