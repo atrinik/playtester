@@ -11,7 +11,8 @@ from typing import Any
 from .protocol import ProtocolError
 
 
-QUIC_ALPN = "atrinik/1"
+# Must match libatrinik/socket_quic.c's socket_quic_alpn.
+QUIC_ALPN = "atrinik/2"
 
 
 def normalize_certificate_sha256(value: str) -> str:

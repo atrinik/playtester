@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .client import logical_map_path, map_object_visual_name
 from .protocol import Cursor, Packet, ProtocolError
-from .transport import normalize_certificate_sha256
+from .transport import QUIC_ALPN, normalize_certificate_sha256
 from .quests import dialogue_choices, flatten_parts, load_catalog, parse_quest_book
 from .navigation import (BuySpellTask, FarmCircuitTask, FoodProfile,
                          MapEdge, MapNode,
@@ -143,6 +143,9 @@ class ProtocolTests(unittest.TestCase):
         for invalid in ("", "ab" * 31, "xy" * 32):
             with self.assertRaises(ValueError):
                 normalize_certificate_sha256(invalid)
+
+    def test_quic_alpn_matches_current_classic_server(self):
+        self.assertEqual(QUIC_ALPN, "atrinik/2")
 
     def test_unique_map_path(self):
         self.assertEqual(
