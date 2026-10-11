@@ -280,6 +280,23 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_mapstats_time_record_is_transactional(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.game_seconds = 7
+            client.state.game_millis_per_minute = 11
+            payload = bytes((5,)) + (123456).to_bytes(8, "big") + (250).to_bytes(4, "big")
+            await client._handle_mapstats(Cursor(payload), payload)
+            self.assertEqual(client.state.game_seconds, 123456)
+            self.assertEqual(client.state.game_millis_per_minute, 250)
+            for end in range(1, len(payload)):
+                with self.assertRaises(ProtocolError):
+                    await client._handle_mapstats(Cursor(payload[:end]), payload[:end])
+                self.assertEqual(client.state.game_seconds, 123456)
+                self.assertEqual(client.state.game_millis_per_minute, 250)
+
+        asyncio.run(scenario())
+
     def test_map2_continuations_publish_only_after_ordered_final_packet(self):
         async def scenario():
             client = AtrinikClient(ClientConfig())

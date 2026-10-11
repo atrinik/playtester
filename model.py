@@ -212,6 +212,8 @@ class GameState:
     items: dict[int, Item] = field(default_factory=dict)
     inventories: dict[int, list[int]] = field(default_factory=dict)
     map: MapState = field(default_factory=MapState)
+    game_seconds: int = 0
+    game_millis_per_minute: int = 0
     interface: InterfaceState | None = None
     messages: list[tuple[float, int, str, str]] = field(default_factory=list)
     books: list[bytes] = field(default_factory=list)

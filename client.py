@@ -1413,6 +1413,10 @@ class AtrinikClient:
         await self.emit("items_deleted", deleted)
 
     async def _handle_mapstats(self, cur: Cursor, raw: bytes) -> None:
+        # Decode into local values so a truncated multi-field record cannot
+        # publish only part of a server time synchronization.
+        game_seconds = self.state.game_seconds
+        game_millis_per_minute = self.state.game_millis_per_minute
         while cur.remaining:
             kind = cur.u8()
             if kind == 1:
@@ -1423,8 +1427,12 @@ class AtrinikClient:
                 self.state.map.weather = cur.cstring()
             elif kind == 4:
                 cur.cstring(); cur.cstring()
+            elif kind == 5:
+                game_seconds, game_millis_per_minute = cur.u64(), cur.u32()
             else:
                 raise ProtocolError(f"unknown mapstats field {kind}")
+        self.state.game_seconds = game_seconds
+        self.state.game_millis_per_minute = game_millis_per_minute
 
     @staticmethod
     def _map_string(cur: Cursor, maximum: int) -> str:
