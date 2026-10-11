@@ -15,7 +15,7 @@ from .compatibility import (CompatibilityError, configure_cached_bundle,
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="atrinik-playtester")
+    p = argparse.ArgumentParser(prog="atrinik-playtester", allow_abbrev=False)
     p.add_argument(
         "--cache",
         type=Path,
@@ -24,7 +24,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--host", default="host.docker.internal")
     p.add_argument("--port", type=int, default=1728)
-    p.add_argument("--transport", choices=("auto", "tcp", "quic"),
+    p.add_argument("--transport", choices=("auto", "quic"),
                    default="auto")
     p.add_argument("--quic-port", type=int, default=1730)
     p.add_argument(
@@ -36,9 +36,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--password", default=os.getenv("ATRINIK_BOT_PASSWORD", ""))
     p.add_argument("--character", default=os.getenv("ATRINIK_BOT_CHARACTER", ""))
     p.add_argument(
-        "--join-password",
-        default=os.getenv("ATRINIK_BOT_JOIN_PASSWORD", ""),
-        help="private server password (prefer ATRINIK_BOT_JOIN_PASSWORD)",
+        "--access-code-file", type=Path,
+        help="owner-only file containing the invite code; never pass the code in argv",
     )
     p.add_argument("--party-name", default=os.getenv("ATRINIK_BOT_PARTY", ""),
                    help="form or rejoin this open party after every login")
@@ -129,10 +128,13 @@ async def main_async(args: argparse.Namespace) -> None:
                         SellJunkTask, TaskEngine)
     from .web_server import WebControlServer
 
+    from .access_codes import read_access_code
+
+    code = read_access_code(args.access_code_file) if args.access_code_file else ""
     config = ClientConfig(
         host=args.host, port=args.port, account=args.account,
         password=args.password, character=args.character,
-        join_password=args.join_password,
+        access_code=code,
         party_name=args.party_name,
         transport=args.transport, quic_port=args.quic_port,
         certificate_sha256=args.certificate_sha256,

@@ -26,6 +26,18 @@ jobs:
       - name: Preflight and install locked protocol dependency
         run: python3 scripts/install_locked_protocol.py --json
 
+      - name: Install required runtime dependencies
+        run: |
+          python3 - <<'PYCODE'
+          import subprocess
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          requirements = tomllib.loads(Path("pyproject.toml").read_text())["project"]["dependencies"]
+          subprocess.run([sys.executable, "-m", "pip", "install", *requirements], check=True)
+          PYCODE
+
       - name: Build and test playtester
         env:
           ATRINIK_PLAYTESTER_CACHE: ${{ runner.temp }}/atrinik-playtester-cache

@@ -1,4 +1,4 @@
-"""TCP and certificate-pinned QUIC stream transports for the game protocol."""
+"""Certificate-pinned QUIC stream transport for the game protocol."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from typing import Any
 from .protocol import ProtocolError
 
 
-QUIC_ALPN = "atrinik/1"
+QUIC_ALPN = "atrinik/2"
+# Typed-stream v1: ATRN magic, game role, reserved byte, big-endian version.
+GAME_STREAM_PREFACE = b"ATRN\x01\x00\x00\x01"
 
 
 def normalize_certificate_sha256(value: str) -> str:
@@ -72,6 +74,8 @@ class QuicStream:
                     f"(expected {expected}, got {actual})"
                 )
             reader, writer = await protocol.create_stream()
+            writer.write(GAME_STREAM_PREFACE)
+            await asyncio.wait_for(writer.drain(), timeout)
             return cls(context, reader, writer)
         except BaseException:
             if protocol is not None:

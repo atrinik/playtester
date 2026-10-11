@@ -8,9 +8,9 @@ or Atrinik game content.
 
 ## Direct dependencies
 
-- `atrinik-classic-protocol` v5.48.0 is GPL-2.0-or-later. It is downloaded as
+- `atrinik-classic-protocol` v5.84.0 is GPL-2.0-or-later. It is downloaded as
   a checksum-pinned wheel from `atrinik/classic`
-  (`sha256:4a6bdd681ac21e8baa3feebc9398b004c0626d5dcc104c4cd921ec9b2051d25d`)
+  (`sha256:ed81ff5caf2edf32817276d828458bcb671a1a097424d6383a88ad9133ecd865`)
   and is not vendored here.
 - `libatrinik` v5.48.0 is GPL-2.0-or-later. Its checksum-pinned source archive
   (`sha256:2b85b0ed3e122f1cfdb0d1aee1d5fcad3e906dfe51e4dbd5d7b9a5aac80f5c4d`)
@@ -18,7 +18,7 @@ or Atrinik game content.
   vendored here. The adapter source remains MIT, but a distributed wheel or
   binary linked with this library must satisfy the applicable GPL requirements
   and must not be represented as MIT-only.
-- `aioquic`, when the optional QUIC feature is installed, is BSD-3-Clause.
+- `aioquic`, used for the required QUIC transport, is BSD-3-Clause.
 - `scikit-build-core`, used to build the package, is Apache-2.0.
 
 The playtester reads Atrinik content and imports content analysis tooling from

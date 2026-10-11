@@ -13,7 +13,7 @@ outcome from authoritative game state, and emit a machine-readable result.
 
 ## Current capability
 
-The migrated implementation provides direct Classic TCP and QUIC transports,
+The migrated implementation provides pinned, encrypted Classic QUIC transport,
 account and character setup, a live world model, content-derived navigation,
 16 formal quest executors, adaptive farming through level 115, persistent
 memory, and a loopback operator dashboard.
@@ -77,7 +77,8 @@ from that cache; no aggregate repository or ambient sibling checkout is needed.
 Requirements are Python 3.11+, CMake 3.21+, Ninja, and a C17 compiler. The
 native adapter uses the checksum-pinned Classic libatrinik pathfinding release.
 Run `scripts/install_locked_protocol.py` with the Python environment that will
-build the package before configuring CMake.
+build the package before configuring CMake. Install the required `aioquic`
+transport dependency in that environment for the live TLS regression tests.
 
 ```sh
 cmake -S . -B build/playtester -G Ninja -DBUILD_TESTING=ON
@@ -121,6 +122,7 @@ variables or a private launcher:
 ```sh
 ATRINIK_BOT_ACCOUNT=playtester-account \
 ATRINIK_BOT_PASSWORD='replace-me' \
+ATRINIK_BOT_CERTIFICATE_SHA256='replace-with-server-certificate-sha256' \
 ATRINIK_BOT_CHARACTER=Playtester \
 ATRINIK_BOT_RUNTIME_STATE=/private/state/playtester.sqlite3 \
 atrinik-playtester autoplay
@@ -151,3 +153,22 @@ OpenAI Codex under Zoey Rose's direct supervision and steering, then reviewed
 and accepted by her. Zoey directs its MIT release and grants all rights she
 holds in that code. The precise development record, retained history mapping,
 and excluded material are recorded in [`PROVENANCE.md`](PROVENANCE.md).
+
+## Protected servers
+
+The playtester uses `atrinik/2` QUIC with a typed game-stream preface.
+The locked Classic protocol receives an authenticated admission-policy announcement before setup
+or account login. Open servers need no code. Protected servers take one
+16-character invite code from an owner-only regular file using
+`--access-code-file /private/path`; the code never belongs in command arguments,
+environment variables, dashboard state or checkpoints. The server certificate
+pin is required for both modes. Account credentials remain separate. The old
+join-password option and setup subtype are removed; old peers fail version
+negotiation. Codes grant ordinary admission and never operator capabilities.
+
+The MAP decoder follows the locked Classic wire version, including framed
+linked depths, ordered continuations and Q5.11/timed-light payloads. Bot
+observations and navigation use physical depth zero. Other depths are validated
+and discarded; a vertical map transition clears the main cache, which fills
+from subsequent server observations. Colored lighting and timed interpolation
+are consumed for framing rather than rendered.
