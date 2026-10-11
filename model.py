@@ -60,8 +60,19 @@ class MapObject:
 @dataclass(slots=True)
 class Tile:
     darkness: list[int] = field(default_factory=lambda: [0] * 7)
+    # Wire radiance is Q5.11, independent of target authority.
+    support_height: int = 0
     objects: dict[int, MapObject] = field(default_factory=dict)
     fogged: bool = False
+
+    @property
+    def fog_of_war(self) -> bool:
+        """Compatibility observation backed by the authority fog flag."""
+        return self.fogged
+
+    @fog_of_war.setter
+    def fog_of_war(self, value: bool) -> None:
+        self.fogged = bool(value)
 
     @property
     def targets(self) -> list[MapObject]:

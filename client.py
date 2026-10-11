@@ -9,11 +9,12 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from . import constants as c
+from .access_codes import normalize_access_code
 from .model import Character, GameState, InterfaceState, Item, MapObject, MapState
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
@@ -91,7 +92,7 @@ class ClientConfig:
     password: str = ""
     character: str = ""
     party_name: str = ""
-    join_password: str = ""
+    access_code: str = field(default="", repr=False)
     # The server accepts viewports up to 17x17. Asking for a larger map causes
     # it to reject the setup field and silently use its fallback dimensions.
     map_width: int = 17
@@ -619,63 +620,35 @@ class AtrinikClient:
     async def connect(self) -> None:
         if not self.config.account or not self.config.password:
             raise ValueError("account and password are required")
-        if self.config.join_password:
-            raise ValueError(
-                "join passwords are unsupported by Classic protocol 1084")
+        if self.config.access_code:
+            self.config.access_code = normalize_access_code(self.config.access_code)
+        # Reset map-derived action authority before any reconnect attempt,
+        # including a rejected transport configuration.
         self.state.phase = "connecting"
         self._reset_target_identity()
         self._map_pending = None
-        # A fresh connection cannot inherit map-published actor identities.
-        # The server will publish a complete MAP2 view for the new session.
         self.state.map = MapState(width=self.config.map_width,
                                   height=self.config.map_height)
-        if self.config.transport not in ("auto", "tcp", "quic"):
-            raise ValueError(
-                f"unknown transport {self.config.transport!r}; choose auto, "
-                "tcp, or quic"
-            )
-
-        tcp_error: OSError | asyncio.TimeoutError | None = None
-        if (self.config.transport in ("auto", "tcp") and
-                not self.config.join_password):
-            try:
-                self.reader, self.writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.config.host,
-                                            self.config.port),
-                    self.config.connect_timeout,
-                )
-                self.transport = "tcp"
-            except (OSError, asyncio.TimeoutError) as exc:
-                tcp_error = exc
-                if self.config.transport == "tcp":
-                    raise
-                log.info("legacy TCP connection failed; trying QUIC: %s", exc)
-
-        if self.reader is None:
-            if not self.config.certificate_sha256:
-                suffix = f" after TCP failed: {tcp_error}" if tcp_error else ""
-                raise ValueError(
-                    "QUIC requires --certificate-sha256 or "
-                    "ATRINIK_BOT_CERTIFICATE_SHA256" + suffix
-                )
-            self._quic_stream = await QuicStream.connect(
-                self.config.host,
-                self.config.quic_port,
-                self.config.certificate_sha256,
-                self.config.connect_timeout,
-            )
-            self.reader = self._quic_stream.reader
-            self.writer = self._quic_stream.writer
-            self.transport = "quic"
-
+        if self.config.transport not in ("auto", "quic"):
+            raise ValueError("Classic protocol requires encrypted QUIC")
+        if not self.config.certificate_sha256:
+            raise ValueError("QUIC requires a pinned certificate SHA-256")
+        self._quic_stream = await QuicStream.connect(
+            self.config.host, self.config.quic_port,
+            self.config.certificate_sha256, self.config.connect_timeout,
+        )
+        self.reader = self._quic_stream.reader
+        self.writer = self._quic_stream.writer
+        self.transport = "quic"
         self.state.phase = "version"
         self._setup_sent = self._account_sent = self._character_sent = False
+        self._access_accepted = False
         await self.send(Packet(c.S_VERSION).add("I", c.SOCKET_VERSION))
-        port = (self.config.quic_port if self.transport == "quic" else
-                self.config.port)
-        await self.emit("connected", (self.config.host, port, self.transport))
+        await self.emit("connected", (self.config.host, self.config.quic_port,
+                                      self.transport))
 
     async def _close_transport(self) -> None:
+        self._map_pending = None
         writer = self.writer
         quic_stream = self._quic_stream
         self.reader = self.writer = None
@@ -767,8 +740,14 @@ class AtrinikClient:
             self.state.phase = "disconnected"
 
     async def _dispatch(self, packet_type: int, data: bytes) -> None:
+        if (self.state.phase in ("version", "access-policy", "access-auth")
+                and packet_type not in (c.C_VERSION, c.C_ACCESS_POLICY,
+                                        c.C_ACCESS_RESULT, c.C_KEEPALIVE)):
+            raise ProtocolError("application packet before access admission")
         handlers = {
             c.C_VERSION: self._handle_version,
+            c.C_ACCESS_POLICY: self._handle_access_policy,
+            c.C_ACCESS_RESULT: self._handle_access_result,
             c.C_SETUP: self._handle_setup,
             c.C_CHARACTERS: self._handle_characters,
             c.C_PLAYER: self._handle_player,
@@ -792,19 +771,50 @@ class AtrinikClient:
         await handler(Cursor(data), data)
 
     async def _handle_version(self, cur: Cursor, raw: bytes) -> None:
+        if self.state.phase != "version" or len(raw) != 4:
+            raise ProtocolError("unexpected protocol version frame")
         self.state.server_version = cur.u32()
         if self.state.server_version != c.SOCKET_VERSION:
-            log.warning("protocol version differs: server=%d bot=%d",
-                        self.state.server_version, c.SOCKET_VERSION)
+            raise ProtocolError("incompatible server protocol version")
+        self.state.phase = "access-policy"
+
+    async def _handle_access_policy(self, cur: Cursor, raw: bytes) -> None:
+        if (self.state.phase != "access-policy" or self.transport != "quic"
+                or len(raw) != 2 or raw[0] != 1 or raw[1] not in (0, 1)):
+            raise ProtocolError("invalid access policy")
+        if raw[1] == 0:
+            self._access_accepted = True
+            await self._send_setup()
+            return
+        if not self.config.access_code:
+            raise ProtocolError("access unavailable")
+        code = normalize_access_code(self.config.access_code).encode("ascii")
+        packet = Packet(c.S_ACCESS_AUTH).u8(1)
+        packet.data.extend(code)
+        self.state.phase = "access-auth"
+        await self.send(packet)
+
+    async def _handle_access_result(self, cur: Cursor, raw: bytes) -> None:
+        if (self.state.phase != "access-auth" or self.transport != "quic"
+                or len(raw) != 2 or raw[0] != 1 or raw[1] not in (0, 1)):
+            raise ProtocolError("invalid access result")
+        if raw[1] != 0:
+            raise ProtocolError("access unavailable")
+        self._access_accepted = True
+        await self._send_setup()
+
+    async def _send_setup(self) -> None:
         packet = (Packet(c.S_SETUP)
                   .u8(c.SETUP_SOUND).u8(0)
                   .u8(c.SETUP_MAPSIZE).u8(self.config.map_width).u8(self.config.map_height)
                   .u8(c.SETUP_DATA_URL).string(""))
-        await self.send(packet)
         self._setup_sent = True
         self.state.phase = "setup"
+        await self.send(packet)
 
     async def _handle_setup(self, cur: Cursor, raw: bytes) -> None:
+        if not self._access_accepted or not self._setup_sent or self.state.phase != "setup":
+            raise ProtocolError("setup before access admission")
         while cur.remaining:
             setup_type = cur.u8()
             if setup_type == c.SETUP_SOUND:
@@ -1413,24 +1423,26 @@ class AtrinikClient:
         await self.emit("items_deleted", deleted)
 
     async def _handle_mapstats(self, cur: Cursor, raw: bytes) -> None:
-        # Decode into local values so a truncated multi-field record cannot
-        # publish only part of a server time synchronization.
+        # Publish metadata and time together only after the complete payload
+        # validates, so a truncated record cannot expose partial observations.
+        m = copy.deepcopy(self.state.map)
         game_seconds = self.state.game_seconds
         game_millis_per_minute = self.state.game_millis_per_minute
         while cur.remaining:
             kind = cur.u8()
             if kind == 1:
-                self.state.map.name = cur.cstring()
+                m.name = self._map_string(cur, 4095)
             elif kind == 2:
-                self.state.map.music = cur.cstring()
+                m.music = self._map_string(cur, 4095)
             elif kind == 3:
-                self.state.map.weather = cur.cstring()
+                m.weather = self._map_string(cur, 255)
             elif kind == 4:
-                cur.cstring(); cur.cstring()
+                self._map_string(cur, 4095); self._map_string(cur, 4095)
             elif kind == 5:
                 game_seconds, game_millis_per_minute = cur.u64(), cur.u32()
             else:
                 raise ProtocolError(f"unknown mapstats field {kind}")
+        self.state.map = m
         self.state.game_seconds = game_seconds
         self.state.game_millis_per_minute = game_millis_per_minute
 
@@ -1471,7 +1483,7 @@ class AtrinikClient:
             if values & c.MAP2_MASK_HARD_CLEAR:
                 raise ProtocolError("invalid MAP2 hard clear")
             tile = self._map_tile_copy(tiles, x, y)
-            if values & c.MAP2_MASK_SUPPORT_HEIGHT: body.i16()
+            if values & c.MAP2_MASK_SUPPORT_HEIGHT: tile.support_height = body.i16()
             fogged = tile.fogged
             if values & c.MAP2_MASK_FOW:
                 fog_value = body.u8()
@@ -1717,7 +1729,8 @@ class AtrinikClient:
             raise ValueError("direction must be 0..8")
         self.record_action("retreat" if run else "step",
                            f"direction={direction}")
-        await self.send(Packet(c.S_MOVE).u8(direction).u8(int(run)))
+        # Epoch zero keeps ordinary direct actions outside keyboard replacement.
+        await self.send(Packet(c.S_MOVE).u8(direction).u8(int(run)).u32(0))
 
     async def move_to_view(self, x: int, y: int) -> None:
         self.record_action("pathfind", f"view={x},{y}")
@@ -1756,10 +1769,8 @@ class AtrinikClient:
         item = self.state.items.get(item_tag)
         self.record_action("fire",
                            f"{item.name if item else item_tag or 'readied item'} direction={direction}")
-        packet = Packet(c.S_FIRE).u8(direction)
-        if item_tag:
-            packet.u32(item_tag)
-        await self.send(packet)
+        # The tag is required even when firing the readied item (tag zero).
+        await self.send(Packet(c.S_FIRE).u8(direction).u32(item_tag).u32(0))
 
     async def apply(self, tag: int, apply_action: int = 0) -> None:
         item = self.state.items.get(tag)

@@ -16,6 +16,7 @@ from compatibility import (  # noqa: E402  (the source tree is the script's pack
     CompatibilityError,
     load_lock,
     preflight_lock,
+    protocol_compatibility,
     protocol_requirement,
 )
 
@@ -31,7 +32,7 @@ def main() -> int:
 
     try:
         lock = load_lock(ROOT / "dependencies.lock.json")
-        result = preflight_lock(lock)
+        result = preflight_lock(lock, verify_installed_protocol=False)
     except CompatibilityError as error:
         if args.json:
             print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
@@ -39,21 +40,39 @@ def main() -> int:
             print(f"ERROR lock-availability: {error}", file=sys.stderr)
         return 1
 
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                protocol_requirement(lock),
+            ],
+            check=True,
+        )
+        result["checks"].append({
+            "name": "protocol.compatibility",
+            "detail": protocol_compatibility(lock),
+        })
+    except (CompatibilityError, subprocess.CalledProcessError) as error:
+        if isinstance(error, CompatibilityError):
+            result["checks"].append({
+                "name": "protocol.compatibility",
+                "status": "error",
+                "detail": str(error),
+            })
+        result.update(ok=False, error=str(error))
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"ERROR protocol-compatibility: {error}", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
-        print(f"Verified {len(result['checks'])} locked release assets.")
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            protocol_requirement(lock),
-        ],
-        check=True,
-    )
+        print(f"Verified {len(result['checks'])} locked inputs.")
     return 0
 
 

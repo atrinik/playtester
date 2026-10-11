@@ -1,4 +1,4 @@
-"""TCP and certificate-pinned QUIC stream transports for the game protocol."""
+"""Certificate-pinned QUIC stream transport for the game protocol."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ from typing import Any
 from .protocol import ProtocolError
 
 
-# Must match libatrinik/socket_quic.c's socket_quic_alpn.
 QUIC_ALPN = "atrinik/2"
-# Must match libatrinik/socket.c's socket_stream_preface_encode() for the
-# mandatory GAME stream: magic, stream kind, reserved byte, protocol version.
-QUIC_GAME_STREAM_PREFACE = b"ATRN\x01\x00\x00\x01"
+# Typed-stream v1: ATRN magic, game role, reserved byte, big-endian version.
+GAME_STREAM_PREFACE = b"ATRN\x01\x00\x00\x01"
+# Public alias retained for callers predating the typed-stream naming.
+QUIC_GAME_STREAM_PREFACE = GAME_STREAM_PREFACE
 
 
 def normalize_certificate_sha256(value: str) -> str:
@@ -76,10 +76,7 @@ class QuicStream:
                     f"(expected {expected}, got {actual})"
                 )
             reader, writer = await protocol.create_stream()
-            # Classic QUIC does not carry gameplay frames directly on an
-            # arbitrary bidirectional stream. The server first classifies the
-            # stream from this typed preface, then reads normal socket frames.
-            writer.write(QUIC_GAME_STREAM_PREFACE)
+            writer.write(GAME_STREAM_PREFACE)
             await asyncio.wait_for(writer.drain(), timeout)
             return cls(context, reader, writer)
         except BaseException:

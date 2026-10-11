@@ -297,6 +297,51 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_map2_support_height_and_fog_alias_revoke_target_authority(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            body = self._map2_actor_tile(
+                5, 4, 5, 103,
+                mask=c.MAP2_MASK_SUPPORT_HEIGHT | c.MAP2_MASK_FOW)
+            # MAP2 orders support height then FOW before the layer records.
+            body = body[:2] + b"\xff\xfb\x01" + body[2:]
+            payload = self._map2_packet(c.MAP_NEW, [(0, body)])
+            await client._handle_map(Cursor(payload), payload)
+            tile = client.state.map.tile(5, 4)
+            self.assertEqual(tile.support_height, -5)
+            self.assertTrue(tile.fogged)
+            self.assertTrue(tile.fog_of_war)
+            self.assertEqual(list(client.state.map.targets()), [])
+
+        asyncio.run(scenario())
+
+    def test_mapstats_metadata_and_clock_publish_atomically(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.map.name = "old"
+            client.state.game_seconds = 7
+            client.state.game_millis_per_minute = 11
+            old_map = client.state.map
+            payload = (b"\x01new\0\x05" + (123456).to_bytes(8, "big") +
+                       (250).to_bytes(4, "big"))
+            # A boundary after the complete name record is itself a valid
+            # one-field MAPSTATS packet; every actual partial field must fail.
+            for end in (*range(1, 5), *range(6, len(payload))):
+                with self.assertRaises(ProtocolError):
+                    await client._handle_mapstats(
+                        Cursor(payload[:end]), payload[:end])
+                self.assertIs(client.state.map, old_map)
+                self.assertEqual(client.state.map.name, "old")
+                self.assertEqual((client.state.game_seconds,
+                                  client.state.game_millis_per_minute), (7, 11))
+            await client._handle_mapstats(Cursor(payload), payload)
+            self.assertIsNot(client.state.map, old_map)
+            self.assertEqual(client.state.map.name, "new")
+            self.assertEqual((client.state.game_seconds,
+                              client.state.game_millis_per_minute), (123456, 250))
+
+        asyncio.run(scenario())
+
     def test_map2_continuations_publish_only_after_ordered_final_packet(self):
         async def scenario():
             client = AtrinikClient(ClientConfig())
@@ -493,7 +538,7 @@ class ProtocolTests(unittest.TestCase):
                              [200])
 
             client.config.transport = "invalid"
-            with self.assertRaisesRegex(ValueError, "unknown transport"):
+            with self.assertRaisesRegex(ValueError, "encrypted QUIC"):
                 await client.connect()
             self.assertEqual(client.state.map.level_tiles, {0: {}})
 
@@ -585,7 +630,7 @@ class ProtocolTests(unittest.TestCase):
         client.state.target_actor_count = 99
         client.state.target_relative_depth = -6
         client.state.target_id = 99
-        with self.assertRaisesRegex(ValueError, "unknown transport"):
+        with self.assertRaisesRegex(ValueError, "encrypted QUIC"):
             asyncio.run(client.connect())
         self.assertEqual(client.state.target_actor_count, 0)
         self.assertEqual(client.state.target_relative_depth, 0)
@@ -598,8 +643,9 @@ class ProtocolTests(unittest.TestCase):
         client._decode_item_fields(Cursor(payload), c.UPD_FLAGS, item)
         self.assertEqual(item.flags, c.ITEM_NO_SKILL_IDENT)
 
-    def test_version_setup_uses_canonical_fields(self):
+    def test_version_waits_for_access_policy_before_setup(self):
         client = AtrinikClient(ClientConfig())
+        client.state.phase = "version"
         sent = []
 
         async def send(packet):
@@ -608,15 +654,13 @@ class ProtocolTests(unittest.TestCase):
         client.send = send
         raw = c.SOCKET_VERSION.to_bytes(4, "big")
         asyncio.run(client._handle_version(Cursor(raw), raw))
-        self.assertEqual(sent, [
-            b"\x00\x08\x02\x00\x00\x01\x11\x11\x02\x00",
-        ])
+        self.assertEqual(sent, [])
+        self.assertEqual(client.state.phase, "access-policy")
 
-    def test_join_password_is_rejected_by_protocol_1084(self):
+    def test_connect_rejects_plaintext_transport_before_network(self):
         client = AtrinikClient(ClientConfig(
-            account="a", password="b", join_password="test-secret",
-            transport="quic"))
-        with self.assertRaisesRegex(ValueError, "unsupported"):
+            account="a", password="b", transport="tcp"))
+        with self.assertRaisesRegex(ValueError, "encrypted QUIC"):
             asyncio.run(client.connect())
 
     def test_characters_connection_ids(self):

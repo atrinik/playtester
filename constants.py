@@ -16,9 +16,18 @@ if _protocol_source:
         )
     sys.path.insert(0, str(_protocol_source_path))
 
-from atrinik_protocol import (ClientToServerCommand, PROTOCOL_VERSION,
-                              ServerToClientCommand)
+import atrinik_protocol as _protocol
 
+if _protocol_source:
+    _protocol_origin = Path(_protocol.__file__).resolve()
+    if _protocol_origin != (_protocol_source_path / "atrinik_protocol" / "__init__.py").resolve():
+        raise RuntimeError(
+            "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE was not imported; remove the "
+            "already-loaded incompatible protocol module")
+
+ClientToServerCommand = _protocol.ClientToServerCommand
+PROTOCOL_VERSION = _protocol.PROTOCOL_VERSION
+ServerToClientCommand = _protocol.ServerToClientCommand
 SOCKET_VERSION = PROTOCOL_VERSION
 
 # TARGET's depth-aware framing was introduced by this protocol revision.
@@ -54,6 +63,7 @@ S_COMBAT = int(ClientToServerCommand.COMBAT)
 S_TALK = int(ClientToServerCommand.TALK)
 S_MOVE = int(ClientToServerCommand.MOVE)
 S_TARGET = int(ClientToServerCommand.TARGET)
+S_ACCESS_AUTH = int(ClientToServerCommand.ACCESS_AUTH)
 
 # Server -> client packet types.
 C_MAP = int(ServerToClientCommand.MAP)
@@ -84,6 +94,8 @@ C_SOUND_AMBIENT = int(ServerToClientCommand.SOUND_AMBIENT)
 C_INTERFACE = int(ServerToClientCommand.INTERFACE)
 C_NOTIFICATION = int(ServerToClientCommand.NOTIFICATION)
 C_KEEPALIVE = int(ServerToClientCommand.KEEPALIVE)
+C_ACCESS_RESULT = int(ServerToClientCommand.ACCESS_RESULT)
+C_ACCESS_POLICY = int(ServerToClientCommand.ACCESS_POLICY)
 
 # DRAWINFO chat channels shared with common/toolkit/socket.h.
 CHAT_TYPE_CHAT = 3
@@ -146,7 +158,14 @@ MAP2_MASK_LIGHT_LEVEL = 0x04
 MAP2_MASK_LIGHT_LEVEL_MORE = 0x08
 MAP2_MASK_HARD_CLEAR = 0x10
 MAP2_MASK_FOW = 0x20
-# Compatibility names used by older policy-only map code.
+# Compatibility names used by the access-admission branch and policy-only map
+# callers. All describe the single MAP2 grammar above.
+MAP_MAX_DEPTH = MAP2_MAX_DEPTH
+MAP_MAX_CONTINUATIONS = 4096
+MAP_TIMED_LIGHT = MAP2_CONTINUATION_TIMED_LIGHT
+MAP_MASK_SUPPORT_HEIGHT = MAP2_MASK_SUPPORT_HEIGHT
+MAP_MASK_HARD_CLEAR = MAP2_MASK_HARD_CLEAR
+MAP_MASK_FOW = MAP2_MASK_FOW
 MAP_MASK_CLEAR = MAP2_MASK_CLEAR
 MAP_MASK_DARKNESS = MAP2_MASK_LIGHT_LEVEL
 MAP_MASK_DARKNESS_MORE = MAP2_MASK_LIGHT_LEVEL_MORE
@@ -173,6 +192,7 @@ MAP_FLAG2_EXIT = 0x400
 MAP_EXT_ANIM = 0x01
 MAP_EXT_LIGHT_RGB = 0x02
 MAP_EXT_LIGHT_KEYFRAME = 0x04
+MAP_EXT_RGB16 = MAP_EXT_LIGHT_RGB
 ANIM_MOVING = 0x01
 
 IF_TEXT = 0

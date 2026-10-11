@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "bundle_version": "classic-v5.48.0-content-v1.0.0",
+  "bundle_version": "protocol-v5.84.0-pathfinding-v5.48.0-content-v1.0.0",
   "inputs": {
     "content": {
       "repository": "atrinik/content",
@@ -56,11 +56,11 @@
     },
     "protocol": {
       "repository": "atrinik/classic",
-      "release": "v5.48.0",
-      "revision": "a1af490e841891648015610a3418b0f5ba6daafb",
-      "artifact": "atrinik_classic_protocol-5.48.0-py3-none-any.whl",
-      "url": "https://github.com/atrinik/classic/releases/download/v5.48.0/atrinik_classic_protocol-5.48.0-py3-none-any.whl",
-      "sha256": "4a6bdd681ac21e8baa3feebc9398b004c0626d5dcc104c4cd921ec9b2051d25d",
+      "release": "v5.84.0",
+      "revision": "4917fea7cfc1fad28f0600c3b87ddea16f9059c5",
+      "artifact": "atrinik_classic_protocol-5.84.0-py3-none-any.whl",
+      "url": "https://github.com/atrinik/classic/releases/download/v5.84.0/atrinik_classic_protocol-5.84.0-py3-none-any.whl",
+      "sha256": "ed81ff5caf2edf32817276d828458bcb671a1a097424d6383a88ad9133ecd865",
       "distribution": "atrinik-classic-protocol",
       "license": "GPL-2.0-or-later",
       "disposition": "external runtime dependency; not vendored"
