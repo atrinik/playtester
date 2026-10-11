@@ -64,7 +64,7 @@ if (BUILD_TESTING)
     add_test(NAME atrinik-bot-access
         COMMAND "${Python3_EXECUTABLE}" -m unittest -v
             atrinik_bot.test_access_codes atrinik_bot.test_access_admission
-            atrinik_bot.test_transport)
+            atrinik_bot.test_transport atrinik_bot.test_wire_commands)
     add_test(NAME atrinik-bot-compatibility
         COMMAND "${Python3_EXECUTABLE}" -m unittest -v atrinik_bot.test_compatibility)
     set_tests_properties(atrinik-bot-pathfinding PROPERTIES
