@@ -1558,7 +1558,8 @@ class AtrinikClient:
             raise ValueError("direction must be 0..8")
         self.record_action("retreat" if run else "step",
                            f"direction={direction}")
-        await self.send(Packet(c.S_MOVE).u8(direction).u8(int(run)))
+        # Epoch zero keeps ordinary direct actions outside keyboard replacement.
+        await self.send(Packet(c.S_MOVE).u8(direction).u8(int(run)).u32(0))
 
     async def move_to_view(self, x: int, y: int) -> None:
         self.record_action("pathfind", f"view={x},{y}")
@@ -1592,10 +1593,8 @@ class AtrinikClient:
         item = self.state.items.get(item_tag)
         self.record_action("fire",
                            f"{item.name if item else item_tag or 'readied item'} direction={direction}")
-        packet = Packet(c.S_FIRE).u8(direction)
-        if item_tag:
-            packet.u32(item_tag)
-        await self.send(packet)
+        # The tag is required even when firing the readied item (tag zero).
+        await self.send(Packet(c.S_FIRE).u8(direction).u32(item_tag).u32(0))
 
     async def apply(self, tag: int, apply_action: int = 0) -> None:
         item = self.state.items.get(tag)
