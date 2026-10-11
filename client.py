@@ -611,7 +611,7 @@ class AtrinikClient:
         if self.config.access_code:
             self.config.access_code = normalize_access_code(self.config.access_code)
         if self.config.transport not in ("auto", "quic"):
-            raise ValueError("protocol 1081 requires encrypted QUIC")
+            raise ValueError("Classic protocol requires encrypted QUIC")
         if not self.config.certificate_sha256:
             raise ValueError("QUIC requires a pinned certificate SHA-256")
         self.state.phase = "connecting"

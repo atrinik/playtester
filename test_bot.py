@@ -170,10 +170,10 @@ class ProtocolTests(unittest.TestCase):
                          "bollard_tied_e_1.101")
 
     def test_packet(self):
-        self.assertEqual(c.SOCKET_VERSION, 1081)
+        self.assertEqual(c.SOCKET_VERSION, 1083)
         self.assertEqual(
             Packet(c.S_VERSION).add("I", c.SOCKET_VERSION).encode(),
-            b"\x00\x05\x03\x00\x00\x04\x39",
+            b"\x00\x05\x03\x00\x00\x04\x3b",
         )
 
     def test_item_decoder_retains_authoritative_read_flag(self):

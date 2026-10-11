@@ -24,7 +24,7 @@ MARKER_NAME = ".atrinik-playtester-input.json"
 BUFFER_SIZE = 1024 * 1024
 GITHUB_API = "https://api.github.com"
 GITHUB_USER_AGENT = "atrinik-playtester/compatibility-v1"
-REQUIRED_PROTOCOL_VERSION = 1081
+REQUIRED_PROTOCOL_VERSION = 1083
 REQUIRED_PROTOCOL_COMMANDS = (
     ("ClientToServerCommand", "ACCESS_AUTH", 23),
     ("ServerToClientCommand", "ACCESS_RESULT", 29),

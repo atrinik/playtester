@@ -134,7 +134,7 @@ class CompatibilityTests(unittest.TestCase):
         return SimpleNamespace(version=version, read_text=lambda name: direct)
 
     @staticmethod
-    def protocol_module(*, version: int = 1081):
+    def protocol_module(*, version: int = 1083):
         return SimpleNamespace(
             PROTOCOL_VERSION=version,
             ClientToServerCommand=SimpleNamespace(ACCESS_AUTH=23),
@@ -160,9 +160,9 @@ class CompatibilityTests(unittest.TestCase):
                          "a1af490e841891648015610a3418b0f5ba6daafb")
         protocol = lock["inputs"]["protocol"]
         self.assertEqual(protocol["distribution"], "atrinik-classic-protocol")
-        self.assertEqual(protocol["release"], "v5.48.0")
+        self.assertEqual(protocol["release"], "v5.84.0")
         self.assertEqual(protocol["sha256"],
-                         "4a6bdd681ac21e8baa3feebc9398b004c0626d5dcc104c4cd921ec9b2051d25d")
+                         "ed81ff5caf2edf32817276d828458bcb671a1a097424d6383a88ad9133ecd865")
 
     def test_preflight_verifies_release_assets_and_commit(self) -> None:
         lock = compatibility.load_lock()
@@ -212,7 +212,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(len(result["checks"]), 4)
         self.assertEqual(
             result["checks"][-1]["artifact"],
-            "atrinik_classic_protocol-5.48.0-py3-none-any.whl",
+            "atrinik_classic_protocol-5.84.0-py3-none-any.whl",
         )
 
         def missing_asset(request, timeout):
@@ -240,7 +240,7 @@ class CompatibilityTests(unittest.TestCase):
 
         with mock.patch.object(
             compatibility, "protocol_compatibility",
-            return_value="5.49.0 wire 1081 sha256:candidate",
+            return_value="5.49.0 wire 1083 sha256:candidate",
         ):
             compatible = compatibility.preflight_lock(lock, opener=fake_open)
         self.assertEqual(len(compatible["checks"]), 5)
@@ -250,7 +250,7 @@ class CompatibilityTests(unittest.TestCase):
         with mock.patch.object(
             compatibility, "protocol_compatibility",
             side_effect=compatibility.CompatibilityError(
-                "installed protocol is incompatible: wire version 1080, expected 1081"
+                "installed protocol is incompatible: wire version 1080, expected 1083"
             ),
         ):
             incompatible = compatibility.preflight_lock(lock, opener=fake_open)
@@ -405,7 +405,7 @@ class CompatibilityTests(unittest.TestCase):
             compatibility.importlib, "import_module", return_value=candidate,
         ):
             detail = compatibility.protocol_compatibility(lock)
-        self.assertIn("wire 1081", detail)
+        self.assertIn("wire 1083", detail)
         self.assertIn(lock["inputs"]["protocol"]["sha256"], detail)
 
     def test_protocol_compatibility_preserves_artifact_identity_checks(self) -> None:
