@@ -1811,6 +1811,32 @@ class AtrinikClient:
         packet.string(message)
         await self.send(packet)
 
+    async def talk_to_target(self, x: int, y: int, relative_depth: int,
+                             actor_count: int, message: str) -> None:
+        """Talk to one currently published MAP2 actor without selecting it."""
+        if any(not isinstance(value, int) or isinstance(value, bool)
+               for value in (x, y, relative_depth, actor_count)):
+            raise TypeError("target coordinates, depth, and actor_count must be integers")
+        game_map = self.state.map
+        if not (0 <= x < game_map.width and 0 <= y < game_map.height):
+            raise ValueError("target coordinates are outside the map viewport")
+        if not -c.MAP2_MAX_DEPTH <= relative_depth <= c.MAP2_MAX_DEPTH:
+            raise ValueError(
+                f"relative_depth must be -{c.MAP2_MAX_DEPTH}..{c.MAP2_MAX_DEPTH}")
+        if not 0 < actor_count <= 0xFFFFFFFF:
+            raise ValueError("actor_count must be a nonzero uint32")
+        if not isinstance(message, str):
+            raise TypeError("message must be a string")
+        encoded_message = message.encode("utf-8")
+        if (not encoded_message or b"\0" in encoded_message or
+                len(encoded_message) > c.TALK_NPC_TARGET_MESSAGE_MAX):
+            raise ValueError("message must be nonempty, NUL-free, and within the TALK limit")
+        self.record_action(
+            "talk",
+            f"actor_count={actor_count} view={x},{y} depth={relative_depth}: {message}")
+        await self.send(Packet(c.S_TALK).u8(c.TALK_NPC_TARGET).u8(x).u8(y)
+                        .i8(relative_depth).u32(actor_count).string(message))
+
     async def talk_to_item(self, talk_type: int, tag: int, message: str) -> None:
         if talk_type not in (c.TALK_INV, c.TALK_BELOW, c.TALK_CONTAINER):
             raise ValueError("invalid item talk type")

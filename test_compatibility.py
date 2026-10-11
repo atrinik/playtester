@@ -144,6 +144,8 @@ class CompatibilityTests(unittest.TestCase):
             ClientToServerCommand=SimpleNamespace(ACCESS_AUTH=23),
             ServerToClientCommand=SimpleNamespace(
                 ACCESS_RESULT=29, ACCESS_POLICY=31),
+            TalkMode=SimpleNamespace(NPC_TARGET=7),
+            TALK_NPC_TARGET_MESSAGE_MAX=4095,
         )
 
     def test_repository_lock_binds_current_classic_inputs(self) -> None:
@@ -397,7 +399,9 @@ class CompatibilityTests(unittest.TestCase):
             compatibility.CompatibilityError,
             "wire version 1080.*missing ClientToServerCommand.ACCESS_AUTH.*"
             "missing ServerToClientCommand.ACCESS_RESULT.*"
-            "missing ServerToClientCommand.ACCESS_POLICY",
+            "missing ServerToClientCommand.ACCESS_POLICY.*"
+            "missing TalkMode.NPC_TARGET.*"
+            "missing TALK_NPC_TARGET_MESSAGE_MAX",
         ):
             compatibility.protocol_compatibility(lock)
 
@@ -412,6 +416,19 @@ class CompatibilityTests(unittest.TestCase):
         self.assertIn("wire 1084", detail)
         self.assertIn(lock["inputs"]["protocol"]["sha256"], detail)
 
+        for name, value in (("NPC_TARGET", 8),
+                            ("TALK_NPC_TARGET_MESSAGE_MAX", 4094)):
+            candidate = self.protocol_module()
+            target = (candidate.TalkMode if name == "NPC_TARGET" else candidate)
+            setattr(target, name, value)
+            with mock.patch.object(
+                compatibility.importlib.metadata, "distribution",
+                return_value=distribution,
+            ), mock.patch.object(
+                compatibility.importlib, "import_module", return_value=candidate,
+            ), self.assertRaisesRegex(compatibility.CompatibilityError, name):
+                compatibility.protocol_compatibility(lock)
+
     def test_protocol_source_override_requires_the_configured_1084_package(self) -> None:
         _, _, lock = self.valid_inputs()
         source = self.root / "generated"
@@ -423,7 +440,9 @@ class CompatibilityTests(unittest.TestCase):
             "class ClientToServerCommand(IntEnum): ACCESS_AUTH = 23\n"
             "class ServerToClientCommand(IntEnum):\n"
             "    ACCESS_RESULT = 29\n"
-            "    ACCESS_POLICY = 31\n")
+            "    ACCESS_POLICY = 31\n"
+            "class TalkMode(IntEnum): NPC_TARGET = 7\n"
+            "TALK_NPC_TARGET_MESSAGE_MAX = 4095\n")
         previous = sys.modules.pop("atrinik_protocol", None)
         try:
             with mock.patch.dict(os.environ, {

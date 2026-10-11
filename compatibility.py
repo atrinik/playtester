@@ -29,6 +29,10 @@ REQUIRED_PROTOCOL_COMMANDS = (
     ("ClientToServerCommand", "ACCESS_AUTH", 23),
     ("ServerToClientCommand", "ACCESS_RESULT", 29),
     ("ServerToClientCommand", "ACCESS_POLICY", 31),
+    ("TalkMode", "NPC_TARGET", 7),
+)
+REQUIRED_PROTOCOL_CONSTANTS = (
+    ("TALK_NPC_TARGET_MESSAGE_MAX", 4095),
 )
 
 
@@ -673,6 +677,12 @@ def protocol_surface(module) -> int:
                 f"{enum_name}.{member_name} is {actual_value!r}, "
                 f"expected {expected_value}"
             )
+    for name, expected_value in REQUIRED_PROTOCOL_CONSTANTS:
+        value = getattr(module, name, None)
+        if value is None:
+            issues.append(f"missing {name}")
+        elif value != expected_value:
+            issues.append(f"{name} is {value!r}, expected {expected_value}")
     if issues:
         raise CompatibilityError(
             "installed protocol is incompatible: " + "; ".join(issues)

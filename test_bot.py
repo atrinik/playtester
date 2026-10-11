@@ -206,6 +206,54 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_targeted_talk_uses_exact_actor_identity_without_selection(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.target_id = 99
+            client.state.target_relative_depth = 4
+            sent = []
+
+            async def send(packet):
+                sent.append(packet.encode())
+
+            client.send = send
+            await client.talk_to_target(7, 8, -6, 0x12345678, "hello")
+            self.assertEqual(sent, [
+                b"\x00\x0f\x14\x07\x07\x08\xfa\x12\x34\x56\x78hello\0",
+            ])
+            self.assertEqual(client.state.target_id, 99)
+            self.assertEqual(client.state.target_relative_depth, 4)
+            await client.talk("hello", "Guard")
+            self.assertEqual(sent[1], b"\x00\x0e\x14\x05Guard\0hello\0")
+            await client.talk_to_target(
+                7, 8, 6, 1, "x" * c.TALK_NPC_TARGET_MESSAGE_MAX)
+            self.assertEqual(len(sent[-1]), 2 + 1 + 8 +
+                             c.TALK_NPC_TARGET_MESSAGE_MAX + 1)
+
+            invalid = (
+                (True, 8, 0, 1, "hello"),
+                (-1, 8, 0, 1, "hello"),
+                (client.state.map.width, 8, 0, 1, "hello"),
+                (7, -1, 0, 1, "hello"),
+                (7, client.state.map.height, 0, 1, "hello"),
+                (7, 8, -7, 1, "hello"),
+                (7, 8, 7, 1, "hello"),
+                (7, 8, 0, 0, "hello"),
+                (7, 8, 0, 0x1_0000_0000, "hello"),
+                (7, 8, 0, 1, ""),
+                (7, 8, 0, 1, "not\0a command"),
+                (7, 8, 0, 1, "x" * (c.TALK_NPC_TARGET_MESSAGE_MAX + 1)),
+                (7, 8, 0, 1, "🙂" * 1024),
+            )
+            for args in invalid:
+                with self.assertRaises((TypeError, ValueError)):
+                    await client.talk_to_target(*args)
+            with self.assertRaisesRegex(ValueError, "invalid item talk type"):
+                await client.talk_to_item(c.TALK_NPC_TARGET, 1, "hello")
+            self.assertEqual(len(sent), 3)
+
+        asyncio.run(scenario())
+
     @staticmethod
     def _map2_actor_tile(x, y, layer, actor_count, friend=False, face=321,
                          mask=0):

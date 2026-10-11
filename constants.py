@@ -39,6 +39,16 @@ if SOCKET_VERSION != REQUIRED_PROTOCOL_VERSION:
         "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE to its generated/python directory"
     )
 
+try:
+    TalkMode = _protocol.TalkMode
+    TALK_NPC_TARGET_MESSAGE_MAX = _protocol.TALK_NPC_TARGET_MESSAGE_MAX
+except AttributeError as error:
+    raise RuntimeError(
+        "playtester requires the Classic targeted TALK protocol surface; install "
+        "the coordinated protocol wheel or set "
+        "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE to its generated/python directory"
+    ) from error
+
 # Client -> server packet types.
 S_CONTROL = int(ClientToServerCommand.CONTROL)
 S_ASK_FACE = int(ClientToServerCommand.ASK_FACE)
@@ -135,12 +145,13 @@ TARGET_CLEAR = 2
 # MAP2 supports the viewer level plus six levels above and below it.
 TARGET_MAX_RELATIVE_DEPTH = 6
 
-TALK_NPC = 1
-TALK_INV = 2
-TALK_BELOW = 3
-TALK_CONTAINER = 4
-TALK_NPC_NAME = 5
-TALK_CLOSE = 6
+TALK_NPC = int(TalkMode.NPC)
+TALK_INV = int(TalkMode.INV)
+TALK_BELOW = int(TalkMode.BELOW)
+TALK_CONTAINER = int(TalkMode.CONTAINER)
+TALK_NPC_NAME = int(TalkMode.NPC_NAME)
+TALK_CLOSE = int(TalkMode.CLOSE)
+TALK_NPC_TARGET = int(TalkMode.NPC_TARGET)
 
 MAP_SAME = 0
 MAP_NEW = 1
