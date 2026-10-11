@@ -22,6 +22,10 @@
   Python regression suite against the verified pinned compatibility bundle, a
   clean-directory wheel install/doctor smoke test, compileall, and
   `git diff --check`.
+- Pull requests to `main` run the `Dependency review` job with read-only
+  contents permission. It rejects introduced high or critical vulnerabilities
+  across runtime, development, and unknown dependency scopes. Validate workflow
+  changes with actionlint and `git diff --check`.
 - Commits and pull-request titles use Conventional Commits. Preserve unrelated
   work. For nonclosing cross-repository linkage, use a full GitHub issue URL;
   shorthand `owner/repository#number` is reserved for an intentional closing
