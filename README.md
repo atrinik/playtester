@@ -165,3 +165,10 @@ environment variables, dashboard state or checkpoints. The server certificate
 pin is required for both modes. Account credentials remain separate. The old
 join-password option and setup subtype are removed; old peers fail version
 negotiation. Codes grant ordinary admission and never operator capabilities.
+
+The MAP decoder follows the locked Classic wire version, including framed
+linked depths, ordered continuations and Q5.11/timed-light payloads. Bot
+observations and navigation use physical depth zero. Other depths are validated
+and discarded; a vertical map transition clears the main cache, which fills
+from subsequent server observations. Colored lighting and timed interpolation
+are consumed for framing rather than rendered.

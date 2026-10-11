@@ -60,6 +60,9 @@ class MapObject:
 @dataclass(slots=True)
 class Tile:
     darkness: list[int] = field(default_factory=lambda: [0] * 7)
+    # Wire radiance is Q5.11, independent of navigation/target observations.
+    support_height: int = 0
+    fog_of_war: bool = False
     objects: dict[int, MapObject] = field(default_factory=dict)
 
     @property
@@ -84,6 +87,8 @@ class MapState:
     player_y: int = 8
     player_sub_layer: int = 0
     in_building: bool = False
+    game_seconds: int = 0
+    millis_per_game_minute: int = 0
     tiles: dict[tuple[int, int], Tile] = field(default_factory=dict)
 
     def tile(self, x: int, y: int) -> Tile:

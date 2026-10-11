@@ -51,6 +51,143 @@ def built_graph():
     return WorldGraph().build()
 
 
+class MapWireTests(unittest.TestCase):
+    @staticmethod
+    def envelope(update=c.MAP_NEW, *, blocks=((0, b""),), marker=0,
+                 x=4, y=5, sublayer=0, timed=b"", connected=(1, 0, 0, 0)):
+        packet = Packet(0).u8(update)
+        if update in (c.MAP_NEW, c.MAP_CONNECTED):
+            packet.string("Test").string("").string("").u8(0).u8(0)
+            packet.string("region").string("Region").string("/test")
+            if update == c.MAP_NEW:
+                packet.u8(32).u8(32)
+            else:
+                packet.u8(connected[0])
+                for offset in connected[1:]:
+                    packet.add("b", offset)
+        packet.u8(x).u8(y).u8(sublayer).u16(marker)
+        packet.data.extend(timed)
+        packet.u8(len(blocks))
+        for depth, data in blocks:
+            packet.add("b", depth).u32(len(data))
+            packet.data.extend(data)
+        return bytes(packet.data)
+
+    @staticmethod
+    def tile(x=8, y=8, face=42):
+        return bytes(Packet(0).u16(x << 11 | y << 6).u8(1).u8(3)
+                     .u16(face).u8(0).u8(0).u8(0).data)
+
+    def decode(self, client, data):
+        asyncio.run(client._handle_map(Cursor(data), data))
+
+    def test_main_depth_and_radiance_extensions_preserve_target_framing(self):
+        tile = Packet(0).u16(8 << 11 | 8 << 6 | 0x2D).add("h", -5).u8(1)
+        for value in range(7):
+            tile.u16(2048 + value)
+        tile.u8(1).u8(3).u16(99).u8(0).u8(c.MAP_FLAG_ANIMATION | c.MAP_FLAG_MORE)
+        tile.u8(10).u8(2).u8(c.ANIM_MOVING).u8(5)
+        tile.u32(c.MAP_FLAG2_TARGET | c.MAP_FLAG2_PROBE | c.MAP_FLAG2_EXIT)
+        tile.u32(123).u8(0).u8(80)
+        tile.u8(c.MAP_EXT_RGB16 | c.MAP_EXT_LIGHT_KEYFRAME | c.MAP_EXT_ANIM)
+        tile.u8(1).u16(4096).u16(1024).u16(0)
+        tile.u8(3).u16(3000).u16(2000).u8(2).u16(100).u16(200).u16(300)
+        tile.u8(1).u8(0).u8(1).add("h", -12)
+        descriptor = bytes(Packet(0).add("Q", 1).add("Q", 7200)
+                           .add("Q", 10800).u8(2).data)
+        data = self.envelope(blocks=((-1, self.tile(face=7)), (0, bytes(tile.data)),
+                                     (1, self.tile(face=8))),
+                             marker=c.MAP_TIMED_LIGHT, timed=descriptor)
+        client = AtrinikClient(ClientConfig())
+        self.decode(client, data)
+        m = client.state.map
+        self.assertEqual((m.path, m.world_x, m.world_y), ("/test", 4, 5))
+        self.assertEqual(len(m.tiles), 1)
+        cell = m.tiles[8, 8]
+        self.assertEqual(cell.support_height, -5)
+        self.assertTrue(cell.fog_of_war)
+        self.assertEqual(cell.darkness, list(range(2048, 2055)))
+        self.assertEqual((cell.objects[3].animation, cell.objects[3].target_id,
+                          cell.objects[3].target_hp), (99, 123, 80))
+
+    def test_continuations_publish_once_after_matching_final_sequence(self):
+        client = AtrinikClient(ClientConfig())
+        original = client.state.map
+        self.decode(client, self.envelope(marker=2, blocks=((0, self.tile()), (1, b""))))
+        self.assertIs(client.state.map, original)
+        for data in (
+                self.envelope(c.MAP_PARTIAL, marker=2, blocks=((0, self.tile()),)),
+                self.envelope(c.MAP_PARTIAL, marker=1, x=6, blocks=((0, self.tile()),)),
+                self.envelope(c.MAP_PARTIAL, marker=1, blocks=((-1, self.tile()),))):
+            with self.assertRaises(ProtocolError):
+                self.decode(client, data)
+            self.assertIs(client.state.map, original)
+        self.decode(client, self.envelope(c.MAP_PARTIAL, marker=1,
+                                         blocks=((1, self.tile()),)))
+        self.assertIs(client.state.map, original)
+        self.decode(client, self.envelope(c.MAP_PARTIAL, marker=2,
+                                         blocks=((0, self.tile(x=9, face=43)),)))
+        self.assertEqual(len(client.state.map.tiles), 2)
+        self.assertEqual(client.events.qsize(), 1)
+        with self.assertRaises(ProtocolError):
+            self.decode(client, self.envelope(c.MAP_PARTIAL, marker=3,
+                                             blocks=((0, self.tile()),)))
+
+    def test_truncation_and_invalid_nested_depth_leave_published_map_intact(self):
+        client = AtrinikClient(ClientConfig())
+        self.decode(client, self.envelope(blocks=((0, self.tile()),)))
+        original = client.state.map
+        data = self.envelope(blocks=((0, self.tile(face=43)), (1, self.tile())))
+        for end in range(len(data)):
+            with self.assertRaises(ProtocolError, msg=f"truncated at {end}"):
+                self.decode(client, data[:end])
+            self.assertIs(client.state.map, original)
+        bad_tiles = (self.tile(x=31), b"\x00\x10", b"\x00\x06",
+                     b"\x00\x00\x00\x02\x80", b"\x00\x00\x00\x08")
+        for bad in bad_tiles:
+            with self.assertRaises(ProtocolError):
+                self.decode(client, self.envelope(blocks=((0, self.tile()), (1, bad))))
+            self.assertIs(client.state.map, original)
+        for bad in (self.envelope(blocks=()), self.envelope(blocks=((1, b""),)),
+                    self.envelope(blocks=((0, b""), (0, b""))),
+                    self.envelope(blocks=((0, b""), (7, b""))),
+                    self.envelope(marker=4097), self.envelope(sublayer=7),
+                    self.envelope() + b"extra"):
+            with self.assertRaises(ProtocolError):
+                self.decode(client, bad)
+            self.assertIs(client.state.map, original)
+
+    def test_same_connected_and_reconnect_reset_main_cache(self):
+        client = AtrinikClient(ClientConfig())
+        self.decode(client, self.envelope(blocks=((0, self.tile()),)))
+        self.decode(client, self.envelope(c.MAP_SAME, x=5))
+        self.assertIn((7, 8), client.state.map.tiles)
+        self.decode(client, self.envelope(c.MAP_CONNECTED, x=0, connected=(1, -2, 0, 0)))
+        self.assertIn((9, 8), client.state.map.tiles)
+        self.decode(client, self.envelope(c.MAP_CONNECTED, connected=(9, 0, 0, 1),
+                                         blocks=((0, self.tile(face=45)),)))
+        self.assertEqual(list(client.state.map.tiles), [(8, 8)])
+        self.decode(client, self.envelope(marker=1))
+        asyncio.run(client._close_transport())
+        with self.assertRaises(ProtocolError):
+            self.decode(client, self.envelope(c.MAP_PARTIAL, marker=1,
+                                             blocks=((0, self.tile()),)))
+        self.decode(client, self.envelope(blocks=((0, self.tile(x=3, face=46)),)))
+        self.assertEqual(list(client.state.map.tiles), [(3, 8)])
+
+    def test_mapstats_clock_is_consumed_transactionally(self):
+        client = AtrinikClient(ClientConfig())
+        data = bytes(Packet(0).u8(5).add("Q", 123456).u32(6000)
+                     .u8(1).string("new name").data)
+        asyncio.run(client._handle_mapstats(Cursor(data), data))
+        m = client.state.map
+        self.assertEqual((m.name, m.game_seconds, m.millis_per_game_minute),
+                         ("new name", 123456, 6000))
+        with self.assertRaises(ProtocolError):
+            asyncio.run(client._handle_mapstats(Cursor(data[:-1]), data[:-1]))
+        self.assertIs(client.state.map, m)
+
+
 class ProtocolTests(unittest.TestCase):
     def test_full_player_inventory_packet_releases_replay_barrier(self):
         async def scenario():
