@@ -102,6 +102,8 @@ CMD_PARTY_REMOVE_MEMBER = 7
 SETUP_SOUND = 0
 SETUP_MAPSIZE = 1
 SETUP_DATA_URL = 2
+# Reserved legacy setup subtype. Classic protocol 1084 does not negotiate a
+# join password and the server rejects this subtype.
 SETUP_JOIN_PASSWORD = 3
 SETUP_ASSET_TRANSPORT = 4
 SETUP_CONNECTION_MODE = 5

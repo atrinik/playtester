@@ -38,7 +38,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--join-password",
         default=os.getenv("ATRINIK_BOT_JOIN_PASSWORD", ""),
-        help="private server password (prefer ATRINIK_BOT_JOIN_PASSWORD)",
+        help="legacy unsupported option; Classic protocol 1084 rejects it",
     )
     p.add_argument("--party-name", default=os.getenv("ATRINIK_BOT_PARTY", ""),
                    help="form or rejoin this open party after every login")

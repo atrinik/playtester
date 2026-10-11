@@ -255,8 +255,8 @@ class ProtocolTests(unittest.TestCase):
         client._decode_item_fields(Cursor(payload), c.UPD_FLAGS, item)
         self.assertEqual(item.flags, c.ITEM_NO_SKILL_IDENT)
 
-    def test_version_setup_sends_join_password(self):
-        client = AtrinikClient(ClientConfig(join_password="test-secret"))
+    def test_version_setup_uses_canonical_fields(self):
+        client = AtrinikClient(ClientConfig())
         sent = []
 
         async def send(packet):
@@ -266,41 +266,14 @@ class ProtocolTests(unittest.TestCase):
         raw = c.SOCKET_VERSION.to_bytes(4, "big")
         asyncio.run(client._handle_version(Cursor(raw), raw))
         self.assertEqual(sent, [
-            b"\x00\x15\x02\x00\x00\x01\x11\x11\x02\x00"
-            b"\x03test-secret\x00",
+            b"\x00\x08\x02\x00\x00\x01\x11\x11\x02\x00",
         ])
 
-    def test_setup_requires_join_password_acceptance(self):
-        client = AtrinikClient(ClientConfig(
-            account="a", password="b", join_password="test-secret"))
-        sent = []
-
-        async def send(packet):
-            sent.append(packet.encode())
-
-        client.send = send
-        accepted = bytes((c.SETUP_JOIN_PASSWORD, 1))
-        asyncio.run(client._handle_setup(Cursor(accepted), accepted))
-        self.assertEqual(client.state.phase, "account")
-        self.assertEqual(sent, [b"\x00\x06\x07\x01a\x00b\x00"])
-
-        rejected = AtrinikClient(ClientConfig(
-            account="a", password="b", join_password="wrong"))
-        payload = bytes((c.SETUP_JOIN_PASSWORD, 0))
-        with self.assertRaisesRegex(ProtocolError, "rejected"):
-            asyncio.run(rejected._handle_setup(Cursor(payload), payload))
-
-    def test_join_password_rejects_plain_tcp_and_invalid_values(self):
-        for password in ("bad\0tail", "x" * 1024):
-            client = AtrinikClient(ClientConfig(
-                account="a", password="b", join_password=password,
-                transport="quic"))
-            with self.assertRaises(ValueError):
-                asyncio.run(client.connect())
+    def test_join_password_is_rejected_by_protocol_1084(self):
         client = AtrinikClient(ClientConfig(
             account="a", password="b", join_password="test-secret",
-            transport="tcp"))
-        with self.assertRaisesRegex(ValueError, "encrypted QUIC"):
+            transport="quic"))
+        with self.assertRaisesRegex(ValueError, "unsupported"):
             asyncio.run(client.connect())
 
     def test_characters_connection_ids(self):

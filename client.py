@@ -617,12 +617,9 @@ class AtrinikClient:
     async def connect(self) -> None:
         if not self.config.account or not self.config.password:
             raise ValueError("account and password are required")
-        if "\0" in self.config.join_password:
-            raise ValueError("join password cannot contain a NUL byte")
-        if len(self.config.join_password.encode("utf-8")) >= 1024:
-            raise ValueError("join password must be shorter than 1024 bytes")
-        if self.config.join_password and self.config.transport == "tcp":
-            raise ValueError("server join passwords require encrypted QUIC")
+        if self.config.join_password:
+            raise ValueError(
+                "join passwords are unsupported by Classic protocol 1084")
         self.state.phase = "connecting"
         self._reset_target_identity()
         if self.config.transport not in ("auto", "tcp", "quic"):
@@ -795,9 +792,7 @@ class AtrinikClient:
         packet = (Packet(c.S_SETUP)
                   .u8(c.SETUP_SOUND).u8(0)
                   .u8(c.SETUP_MAPSIZE).u8(self.config.map_width).u8(self.config.map_height)
-                  .u8(c.SETUP_DATA_URL).string("")
-                  .u8(c.SETUP_JOIN_PASSWORD).string(
-                      self.config.join_password))
+                  .u8(c.SETUP_DATA_URL).string(""))
         await self.send(packet)
         self._setup_sent = True
         self.state.phase = "setup"
@@ -811,9 +806,6 @@ class AtrinikClient:
                 self.state.map.width, self.state.map.height = cur.u8(), cur.u8()
             elif setup_type == c.SETUP_DATA_URL:
                 cur.cstring()
-            elif setup_type == c.SETUP_JOIN_PASSWORD:
-                if not cur.u8():
-                    raise ProtocolError("server rejected the join password")
             else:
                 raise ProtocolError(f"unknown setup field {setup_type}")
         if not self._account_sent:
