@@ -23,11 +23,15 @@
   clean-directory wheel install/doctor smoke test, compileall, and
   `git diff --check`.
 - Dependency review is advisory, including operational errors. Before merge, the
-  implementing Codex must read its PR comment or job summary, fix actionable
-  introduced risk, or record explicit maintainer acceptance of existing risk.
-  Fork and Dependabot comment permissions may be restricted; read the job
-  summary when the comment is unavailable. Validate workflow changes with
-  actionlint and `git diff --check`.
+  implementing Codex must inspect the latest run for the current PR head and
+  read its job summary even when a bot comment exists, fix actionable introduced
+  risk, or record explicit maintainer acceptance of existing risk. A comment
+  from an earlier run is not current evidence; unavailable reports leave results
+  unknown. Reporting applies to eligible PR runs where this workflow exists in
+  the relevant PR/merge revision; removing branch filters does not backport it.
+  License metadata reporting does not automate compatibility policy: existing
+  repository license and provenance constraints remain authoritative. Validate
+  workflow changes with actionlint and `git diff --check`.
 - Commits and pull-request titles use Conventional Commits. Preserve unrelated
   work. For nonclosing cross-repository linkage, use a full GitHub issue URL;
   shorthand `owner/repository#number` is reserved for an intentional closing
