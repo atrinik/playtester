@@ -22,10 +22,16 @@
   Python regression suite against the verified pinned compatibility bundle, a
   clean-directory wheel install/doctor smoke test, compileall, and
   `git diff --check`.
-- Pull requests to `main` run the `Dependency review` job with read-only
-  contents permission. It rejects introduced high or critical vulnerabilities
-  across runtime, development, and unknown dependency scopes. Validate workflow
-  changes with actionlint and `git diff --check`.
+- Dependency review is advisory, including operational errors. Before merge, the
+  implementing Codex must inspect the latest run for the current PR head and
+  read its job summary even when a bot comment exists, fix actionable introduced
+  risk, or record explicit maintainer acceptance of existing risk. A comment
+  from an earlier run is not current evidence; unavailable reports leave results
+  unknown. Reporting applies to eligible PR runs where this workflow exists in
+  the relevant PR/merge revision; removing branch filters does not backport it.
+  License metadata reporting does not automate compatibility policy: existing
+  repository license and provenance constraints remain authoritative. Validate
+  workflow changes with actionlint and `git diff --check`.
 - Commits and pull-request titles use Conventional Commits. Preserve unrelated
   work. For nonclosing cross-repository linkage, use a full GitHub issue URL;
   shorthand `owner/repository#number` is reserved for an intentional closing
