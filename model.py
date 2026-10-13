@@ -60,13 +60,24 @@ class MapObject:
 @dataclass(slots=True)
 class Tile:
     darkness: list[int] = field(default_factory=lambda: [0] * 7)
-    # Wire radiance is Q5.11, independent of navigation/target observations.
+    # Wire radiance is Q5.11, independent of target authority.
     support_height: int = 0
-    fog_of_war: bool = False
     objects: dict[int, MapObject] = field(default_factory=dict)
+    fogged: bool = False
+
+    @property
+    def fog_of_war(self) -> bool:
+        """Compatibility observation backed by the authority fog flag."""
+        return self.fogged
+
+    @fog_of_war.setter
+    def fog_of_war(self, value: bool) -> None:
+        self.fogged = bool(value)
 
     @property
     def targets(self) -> list[MapObject]:
+        if self.fogged:
+            return []
         return [obj for obj in self.objects.values() if obj.target_id]
 
 
@@ -87,29 +98,61 @@ class MapState:
     player_y: int = 8
     player_sub_layer: int = 0
     in_building: bool = False
-    game_seconds: int = 0
-    millis_per_game_minute: int = 0
     tiles: dict[tuple[int, int], Tile] = field(default_factory=dict)
+    # MAP2 carries independently cached maps from six levels below through six
+    # levels above the player's current map.  ``tiles`` remains the depth-zero
+    # compatibility view used by the navigation policy.
+    level_tiles: dict[int, dict[tuple[int, int], Tile]] = field(default_factory=dict)
 
-    def tile(self, x: int, y: int) -> Tile:
-        return self.tiles.setdefault((x, y), Tile())
+    def __post_init__(self) -> None:
+        if 0 in self.level_tiles:
+            self.tiles = self.level_tiles[0]
+        else:
+            self.level_tiles[0] = self.tiles
 
-    def clear(self, x: int, y: int) -> None:
-        self.tiles[(x, y)] = Tile()
+    def tiles_at_depth(self, depth: int) -> dict[tuple[int, int], Tile]:
+        if not -6 <= depth <= 6:
+            raise ValueError("map depth outside MAP2 range")
+        return self.level_tiles.setdefault(depth, {})
+
+    def tile(self, x: int, y: int, depth: int = 0) -> Tile:
+        return self.tiles_at_depth(depth).setdefault((x, y), Tile())
+
+    def clear(self, x: int, y: int, depth: int = 0) -> None:
+        self.tiles_at_depth(depth)[(x, y)] = Tile()
 
     def scroll(self, dx: int, dy: int) -> None:
         shifted: dict[tuple[int, int], Tile] = {}
-        for (x, y), tile in self.tiles.items():
-            nx, ny = x - dx, y - dy
-            if 0 <= nx < self.width and 0 <= ny < self.height:
-                shifted[(nx, ny)] = tile
-        self.tiles = shifted
+        for depth, tiles in self.level_tiles.items():
+            shifted: dict[tuple[int, int], Tile] = {}
+            for (x, y), tile in tiles.items():
+                nx, ny = x - dx, y - dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    shifted[(nx, ny)] = tile
+            self.level_tiles[depth] = shifted
+        self.tiles = self.level_tiles.setdefault(0, {})
+
+    def scroll_depths(self, zoff: int) -> None:
+        shifted: dict[int, dict[tuple[int, int], Tile]] = {}
+        for depth, tiles in self.level_tiles.items():
+            new_depth = depth - zoff
+            if -6 <= new_depth <= 6:
+                shifted[new_depth] = tiles
+        self.level_tiles = shifted
+        self.tiles = self.level_tiles.setdefault(0, {})
 
     def targets(self, friendly: bool | None = None):
         for (x, y), tile in self.tiles.items():
             for obj in tile.targets:
                 if friendly is None or obj.is_friend == friendly:
                     yield x, y, obj
+
+    def depth_targets(self, friendly: bool | None = None):
+        for depth, tiles in self.level_tiles.items():
+            for (x, y), tile in tiles.items():
+                for obj in tile.targets:
+                    if friendly is None or obj.is_friend == friendly:
+                        yield depth, x, y, obj
 
 
 @dataclass(slots=True)
@@ -180,12 +223,17 @@ class GameState:
     items: dict[int, Item] = field(default_factory=dict)
     inventories: dict[int, list[int]] = field(default_factory=dict)
     map: MapState = field(default_factory=MapState)
+    game_seconds: int = 0
+    game_millis_per_minute: int = 0
     interface: InterfaceState | None = None
     messages: list[tuple[float, int, str, str]] = field(default_factory=list)
     books: list[bytes] = field(default_factory=list)
     quests: dict[str, QuestProgress] = field(default_factory=dict)
     quests_loaded: bool = False
     target_code: int = 0
+    target_level: int = 0
+    target_actor_count: int = 0
+    target_relative_depth: int = 0
     target_id: int = 0
     target_color: str = ""
     target_name: str = ""

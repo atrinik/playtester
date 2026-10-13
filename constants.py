@@ -1,9 +1,53 @@
-"""Classic wire constants, with command IDs supplied by the locked protocol."""
+"""Classic wire constants, with command IDs supplied by the protocol package."""
 
-from atrinik_protocol import (ClientToServerCommand, PROTOCOL_VERSION,
-                              ServerToClientCommand)
+import os
+from pathlib import Path
+import sys
 
+# Development and coordinated integration tests may use the generated bindings
+# from the checked-out Classic protocol source. Released playtester installs
+# continue to resolve the immutable wheel selected by dependencies.lock.json.
+_protocol_source = os.environ.get("ATRINIK_PLAYTESTER_PROTOCOL_SOURCE")
+if _protocol_source:
+    _protocol_source_path = Path(_protocol_source).expanduser().resolve()
+    if not (_protocol_source_path / "atrinik_protocol" / "__init__.py").is_file():
+        raise RuntimeError(
+            "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE must contain atrinik_protocol"
+        )
+    sys.path.insert(0, str(_protocol_source_path))
+
+import atrinik_protocol as _protocol
+
+if _protocol_source:
+    _protocol_origin = Path(_protocol.__file__).resolve()
+    if _protocol_origin != (_protocol_source_path / "atrinik_protocol" / "__init__.py").resolve():
+        raise RuntimeError(
+            "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE was not imported; remove the "
+            "already-loaded incompatible protocol module")
+
+ClientToServerCommand = _protocol.ClientToServerCommand
+PROTOCOL_VERSION = _protocol.PROTOCOL_VERSION
+ServerToClientCommand = _protocol.ServerToClientCommand
 SOCKET_VERSION = PROTOCOL_VERSION
+
+# TARGET's depth-aware framing was introduced by this protocol revision.
+REQUIRED_PROTOCOL_VERSION = 1084
+if SOCKET_VERSION != REQUIRED_PROTOCOL_VERSION:
+    raise RuntimeError(
+        f"playtester requires Classic protocol {REQUIRED_PROTOCOL_VERSION}; "
+        "install the coordinated protocol wheel or set "
+        "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE to its generated/python directory"
+    )
+
+try:
+    TalkMode = _protocol.TalkMode
+    TALK_NPC_TARGET_MESSAGE_MAX = _protocol.TALK_NPC_TARGET_MESSAGE_MAX
+except AttributeError as error:
+    raise RuntimeError(
+        "playtester requires the Classic targeted TALK protocol surface; install "
+        "the coordinated protocol wheel or set "
+        "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE to its generated/python directory"
+    ) from error
 
 # Client -> server packet types.
 S_CONTROL = int(ClientToServerCommand.CONTROL)
@@ -80,7 +124,9 @@ CMD_PARTY_REMOVE_MEMBER = 7
 SETUP_SOUND = 0
 SETUP_MAPSIZE = 1
 SETUP_DATA_URL = 2
-# Setup subtype 3 is reserved; server-wide join passwords were removed.
+# Reserved legacy setup subtype. Classic protocol 1084 does not negotiate a
+# join password and the server rejects this subtype.
+SETUP_JOIN_PASSWORD = 3
 SETUP_ASSET_TRANSPORT = 4
 SETUP_CONNECTION_MODE = 5
 
@@ -96,27 +142,44 @@ TARGET_NEUTRAL = 2
 TARGET_FRIEND = 3
 TARGET_MAPXY = 1
 TARGET_CLEAR = 2
+# MAP2 supports the viewer level plus six levels above and below it.
+TARGET_MAX_RELATIVE_DEPTH = 6
 
-TALK_NPC = 1
-TALK_INV = 2
-TALK_BELOW = 3
-TALK_CONTAINER = 4
-TALK_NPC_NAME = 5
-TALK_CLOSE = 6
+TALK_NPC = int(TalkMode.NPC)
+TALK_INV = int(TalkMode.INV)
+TALK_BELOW = int(TalkMode.BELOW)
+TALK_CONTAINER = int(TalkMode.CONTAINER)
+TALK_NPC_NAME = int(TalkMode.NPC_NAME)
+TALK_CLOSE = int(TalkMode.CLOSE)
+TALK_NPC_TARGET = int(TalkMode.NPC_TARGET)
 
 MAP_SAME = 0
 MAP_NEW = 1
 MAP_CONNECTED = 2
 MAP_PARTIAL = 3
-MAP_MAX_DEPTH = 6
+MAP2_MAX_DEPTH = 6
+MAP2_SUB_LAYERS = 7
+MAP2_REAL_LAYERS = 49
+MAP2_CONTINUATION_TIMED_LIGHT = 0x8000
+MAP2_ENVELOPE_MAX = 65_534
+MAP2_LEVEL_PAYLOAD_MAX = MAP2_ENVELOPE_MAX - 7 - 5
+MAP2_MASK_SUPPORT_HEIGHT = 0x01
+MAP2_MASK_CLEAR = 0x02
+MAP2_MASK_LIGHT_LEVEL = 0x04
+MAP2_MASK_LIGHT_LEVEL_MORE = 0x08
+MAP2_MASK_HARD_CLEAR = 0x10
+MAP2_MASK_FOW = 0x20
+# Compatibility names used by the access-admission branch and policy-only map
+# callers. All describe the single MAP2 grammar above.
+MAP_MAX_DEPTH = MAP2_MAX_DEPTH
 MAP_MAX_CONTINUATIONS = 4096
-MAP_TIMED_LIGHT = 0x8000
-MAP_MASK_SUPPORT_HEIGHT = 0x01
-MAP_MASK_HARD_CLEAR = 0x10
-MAP_MASK_FOW = 0x20
-MAP_MASK_CLEAR = 0x02
-MAP_MASK_DARKNESS = 0x04
-MAP_MASK_DARKNESS_MORE = 0x08
+MAP_TIMED_LIGHT = MAP2_CONTINUATION_TIMED_LIGHT
+MAP_MASK_SUPPORT_HEIGHT = MAP2_MASK_SUPPORT_HEIGHT
+MAP_MASK_HARD_CLEAR = MAP2_MASK_HARD_CLEAR
+MAP_MASK_FOW = MAP2_MASK_FOW
+MAP_MASK_CLEAR = MAP2_MASK_CLEAR
+MAP_MASK_DARKNESS = MAP2_MASK_LIGHT_LEVEL
+MAP_MASK_DARKNESS_MORE = MAP2_MASK_LIGHT_LEVEL_MORE
 MAP_LAYER_CLEAR = 255
 MAP_FLAG_MULTI = 0x01
 MAP_FLAG_NAME = 0x02
@@ -138,8 +201,9 @@ MAP_FLAG2_ROOF = 0x100
 MAP_FLAG2_DOOR = 0x200
 MAP_FLAG2_EXIT = 0x400
 MAP_EXT_ANIM = 0x01
-MAP_EXT_RGB16 = 0x02
+MAP_EXT_LIGHT_RGB = 0x02
 MAP_EXT_LIGHT_KEYFRAME = 0x04
+MAP_EXT_RGB16 = MAP_EXT_LIGHT_RGB
 ANIM_MOVING = 0x01
 
 IF_TEXT = 0

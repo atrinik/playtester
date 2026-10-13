@@ -24,11 +24,15 @@ MARKER_NAME = ".atrinik-playtester-input.json"
 BUFFER_SIZE = 1024 * 1024
 GITHUB_API = "https://api.github.com"
 GITHUB_USER_AGENT = "atrinik-playtester/compatibility-v1"
-REQUIRED_PROTOCOL_VERSION = 1083
+REQUIRED_PROTOCOL_VERSION = 1084
 REQUIRED_PROTOCOL_COMMANDS = (
     ("ClientToServerCommand", "ACCESS_AUTH", 23),
     ("ServerToClientCommand", "ACCESS_RESULT", 29),
     ("ServerToClientCommand", "ACCESS_POLICY", 31),
+    ("TalkMode", "NPC_TARGET", 7),
+)
+REQUIRED_PROTOCOL_CONSTANTS = (
+    ("TALK_NPC_TARGET_MESSAGE_MAX", 4095),
 )
 
 
@@ -673,6 +677,12 @@ def protocol_surface(module) -> int:
                 f"{enum_name}.{member_name} is {actual_value!r}, "
                 f"expected {expected_value}"
             )
+    for name, expected_value in REQUIRED_PROTOCOL_CONSTANTS:
+        value = getattr(module, name, None)
+        if value is None:
+            issues.append(f"missing {name}")
+        elif value != expected_value:
+            issues.append(f"{name} is {value!r}, expected {expected_value}")
     if issues:
         raise CompatibilityError(
             "installed protocol is incompatible: " + "; ".join(issues)
@@ -681,7 +691,39 @@ def protocol_surface(module) -> int:
 
 
 def protocol_compatibility(lock: dict) -> str:
-    """Verify the installed locked artifact and the wire surface we consume."""
+    """Verify the selected protocol source and its consumed wire surface.
+
+    A development override is deliberately distinct from the immutable release
+    wheel: it must resolve the generated package from the supplied tree and
+    satisfy the current wire contract. Without it, the installed wheel must
+    match the lock byte-for-byte as well as the consumer contract.
+    """
+    override = os.environ.get("ATRINIK_PLAYTESTER_PROTOCOL_SOURCE")
+    if override:
+        root = Path(override).expanduser().resolve()
+        package = root / "atrinik_protocol" / "__init__.py"
+        if not package.is_file():
+            raise CompatibilityError(
+                "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE must contain atrinik_protocol")
+        root_text = str(root)
+        if root_text not in sys.path:
+            sys.path.insert(0, root_text)
+        existing = sys.modules.get("atrinik_protocol")
+        if existing is not None:
+            origin = Path(getattr(existing, "__file__", "")).resolve()
+            if origin != (root / "atrinik_protocol" / "__init__.py").resolve():
+                raise CompatibilityError(
+                    "protocol module was imported before the configured source override")
+        try:
+            module = importlib.import_module("atrinik_protocol")
+        except ImportError as error:
+            raise CompatibilityError("configured protocol source is unavailable") from error
+        origin = Path(getattr(module, "__file__", "")).resolve()
+        if origin != (root / "atrinik_protocol" / "__init__.py").resolve():
+            raise CompatibilityError("configured protocol source was not imported")
+        wire_version = protocol_surface(module)
+        return f"source {root} wire {wire_version}"
+
     protocol = lock["inputs"]["protocol"]
     try:
         distribution = importlib.metadata.distribution(protocol["distribution"])

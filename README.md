@@ -43,6 +43,20 @@ download URL, and SHA-256 digest before invoking pip. The
 while `doctor --preflight` reports the same check alongside local cache and
 installed-input diagnostics.
 
+For a coordinated unreleased Classic protocol change, retain the immutable lock
+and point only the development process at that checkout's generated bindings:
+
+```sh
+export ATRINIK_PLAYTESTER_PROTOCOL_SOURCE=/path/to/classic/protocol/generated/python
+```
+
+The source directory must contain `atrinik_protocol`. Playtester requires the
+protocol revision 1084 and rejects an older installed wheel. The immutable
+`v5.90.0` lock identifies the matching released wire-1084 wheel, so normal
+installation and `doctor` require no source override. Do not use the override
+for a released run; it validates the exact generated-source module origin
+rather than relabeling an installed artifact.
+
 Install the exact content compiler/catalog and Classic runtime selected by
 [`dependencies.lock.json`](dependencies.lock.json). The default cache is
 `$XDG_CACHE_HOME/atrinik/playtester` or `~/.cache/atrinik/playtester` and can be
@@ -166,9 +180,9 @@ pin is required for both modes. Account credentials remain separate. The old
 join-password option and setup subtype are removed; old peers fail version
 negotiation. Codes grant ordinary admission and never operator capabilities.
 
-The MAP decoder follows the locked Classic wire version, including framed
-linked depths, ordered continuations and Q5.11/timed-light payloads. Bot
-observations and navigation use physical depth zero. Other depths are validated
-and discarded; a vertical map transition clears the main cache, which fills
-from subsequent server observations. Colored lighting and timed interpolation
-are consumed for framing rather than rendered.
+The MAP decoder follows the coordinated Classic wire contract, including
+framed linked depths, ordered continuations and Q5.11/timed-light payloads. It
+retains every advertised depth from -6 through +6 atomically; the depth-zero
+view remains the navigation compatibility surface, while target selection uses
+the authoritative linked-depth actor count. Colored lighting and timed
+interpolation are consumed for framing rather than rendered.
