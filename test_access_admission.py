@@ -1,6 +1,11 @@
 """Source-level handshake gates without content or native pathfinding inputs."""
 
 import asyncio
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from .client import AtrinikClient, ClientConfig
@@ -105,6 +110,36 @@ class AccessAdmissionTests(unittest.TestCase):
                     asyncio.run(client._dispatch(command, b""))
             self.assertEqual(sent, [])
             self.assertFalse(client._account_sent)
+
+    def test_setup_before_policy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                runtime_state_path=str(Path(directory) / "state.sqlite3")))
+            with self.assertRaisesRegex(ProtocolError, "access admission"):
+                asyncio.run(client._handle_setup(Cursor(b""), b""))
+            self.assertFalse(client._account_sent)
+
+    def test_client_import_and_construction_need_no_content_tooling(self):
+        package_parent = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as directory:
+            environment = os.environ.copy()
+            environment.update({
+                "PYTHONPATH": str(package_parent),
+                "PYTHONNOUSERSITE": "1",
+            })
+            environment.pop("ATRINIK_RUNTIME_CONTENT", None)
+            completed = subprocess.run(
+                [sys.executable, "-c", (
+                    "import sys; "
+                    "from atrinik_bot.client import AtrinikClient, ClientConfig; "
+                    "from atrinik_bot.constants import SOCKET_VERSION; "
+                    f"AtrinikClient(ClientConfig(runtime_state_path={str(Path(directory) / 'state.sqlite3')!r})); "
+                    "assert 'atrinik_bot.quests' not in sys.modules; "
+                    "print(SOCKET_VERSION)")],
+                env=environment, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False, timeout=10, cwd=directory)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "1084")
 
     def test_access_code_is_not_in_config_representation(self):
         config = ClientConfig(access_code="0123456789ABCDEF")

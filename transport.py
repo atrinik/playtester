@@ -14,6 +14,8 @@ from .protocol import ProtocolError
 QUIC_ALPN = "atrinik/2"
 # Typed-stream v1: ATRN magic, game role, reserved byte, big-endian version.
 GAME_STREAM_PREFACE = b"ATRN\x01\x00\x00\x01"
+# Public alias retained for callers predating the typed-stream naming.
+QUIC_GAME_STREAM_PREFACE = GAME_STREAM_PREFACE
 
 
 def normalize_certificate_sha256(value: str) -> str:

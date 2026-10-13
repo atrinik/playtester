@@ -20,8 +20,12 @@ class CompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self._protocol_override = mock.patch.dict(
+            os.environ, {"ATRINIK_PLAYTESTER_PROTOCOL_SOURCE": ""})
+        self._protocol_override.start()
 
     def tearDown(self) -> None:
+        self._protocol_override.stop()
         self.temporary.cleanup()
 
     @staticmethod
@@ -134,12 +138,14 @@ class CompatibilityTests(unittest.TestCase):
         return SimpleNamespace(version=version, read_text=lambda name: direct)
 
     @staticmethod
-    def protocol_module(*, version: int = 1083):
+    def protocol_module(*, version: int = 1084):
         return SimpleNamespace(
             PROTOCOL_VERSION=version,
             ClientToServerCommand=SimpleNamespace(ACCESS_AUTH=23),
             ServerToClientCommand=SimpleNamespace(
                 ACCESS_RESULT=29, ACCESS_POLICY=31),
+            TalkMode=SimpleNamespace(NPC_TARGET=7),
+            TALK_NPC_TARGET_MESSAGE_MAX=4095,
         )
 
     def test_repository_lock_binds_current_classic_inputs(self) -> None:
@@ -160,9 +166,9 @@ class CompatibilityTests(unittest.TestCase):
                          "a1af490e841891648015610a3418b0f5ba6daafb")
         protocol = lock["inputs"]["protocol"]
         self.assertEqual(protocol["distribution"], "atrinik-classic-protocol")
-        self.assertEqual(protocol["release"], "v5.84.0")
+        self.assertEqual(protocol["release"], "v5.90.0")
         self.assertEqual(protocol["sha256"],
-                         "ed81ff5caf2edf32817276d828458bcb671a1a097424d6383a88ad9133ecd865")
+                         "5b8dc038184ff69b78a6b790310624fa9bda9ab8b11e87bd805a1beb4ee32c39")
 
     def test_preflight_verifies_release_assets_and_commit(self) -> None:
         lock = compatibility.load_lock()
@@ -212,7 +218,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(len(result["checks"]), 4)
         self.assertEqual(
             result["checks"][-1]["artifact"],
-            "atrinik_classic_protocol-5.84.0-py3-none-any.whl",
+            "atrinik_classic_protocol-5.90.0-py3-none-any.whl",
         )
 
         def missing_asset(request, timeout):
@@ -240,7 +246,7 @@ class CompatibilityTests(unittest.TestCase):
 
         with mock.patch.object(
             compatibility, "protocol_compatibility",
-            return_value="5.49.0 wire 1083 sha256:candidate",
+            return_value="5.49.0 wire 1084 sha256:candidate",
         ):
             compatible = compatibility.preflight_lock(lock, opener=fake_open)
         self.assertEqual(len(compatible["checks"]), 5)
@@ -250,7 +256,7 @@ class CompatibilityTests(unittest.TestCase):
         with mock.patch.object(
             compatibility, "protocol_compatibility",
             side_effect=compatibility.CompatibilityError(
-                "installed protocol is incompatible: wire version 1080, expected 1083"
+                "installed protocol is incompatible: wire version 1080, expected 1084"
             ),
         ):
             incompatible = compatibility.preflight_lock(lock, opener=fake_open)
@@ -393,7 +399,9 @@ class CompatibilityTests(unittest.TestCase):
             compatibility.CompatibilityError,
             "wire version 1080.*missing ClientToServerCommand.ACCESS_AUTH.*"
             "missing ServerToClientCommand.ACCESS_RESULT.*"
-            "missing ServerToClientCommand.ACCESS_POLICY",
+            "missing ServerToClientCommand.ACCESS_POLICY.*"
+            "missing TalkMode.NPC_TARGET.*"
+            "missing TALK_NPC_TARGET_MESSAGE_MAX",
         ):
             compatibility.protocol_compatibility(lock)
 
@@ -405,8 +413,74 @@ class CompatibilityTests(unittest.TestCase):
             compatibility.importlib, "import_module", return_value=candidate,
         ):
             detail = compatibility.protocol_compatibility(lock)
-        self.assertIn("wire 1083", detail)
+        self.assertIn("wire 1084", detail)
         self.assertIn(lock["inputs"]["protocol"]["sha256"], detail)
+
+        for name, value in (("NPC_TARGET", 8),
+                            ("TALK_NPC_TARGET_MESSAGE_MAX", 4094)):
+            candidate = self.protocol_module()
+            target = (candidate.TalkMode if name == "NPC_TARGET" else candidate)
+            setattr(target, name, value)
+            with mock.patch.object(
+                compatibility.importlib.metadata, "distribution",
+                return_value=distribution,
+            ), mock.patch.object(
+                compatibility.importlib, "import_module", return_value=candidate,
+            ), self.assertRaisesRegex(compatibility.CompatibilityError, name):
+                compatibility.protocol_compatibility(lock)
+
+    def test_protocol_source_override_requires_the_configured_1084_package(self) -> None:
+        _, _, lock = self.valid_inputs()
+        source = self.root / "generated"
+        package = source / "atrinik_protocol"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            "from enum import IntEnum\n"
+            "PROTOCOL_VERSION = 1084\n"
+            "class ClientToServerCommand(IntEnum): ACCESS_AUTH = 23\n"
+            "class ServerToClientCommand(IntEnum):\n"
+            "    ACCESS_RESULT = 29\n"
+            "    ACCESS_POLICY = 31\n"
+            "class TalkMode(IntEnum): NPC_TARGET = 7\n"
+            "TALK_NPC_TARGET_MESSAGE_MAX = 4095\n")
+        previous = sys.modules.pop("atrinik_protocol", None)
+        try:
+            with mock.patch.dict(os.environ, {
+                    "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE": str(source)}):
+                detail = compatibility.protocol_compatibility(lock)
+            self.assertIn("wire 1084", detail)
+            self.assertIn(str(source), detail)
+        finally:
+            sys.modules.pop("atrinik_protocol", None)
+            if previous is not None:
+                sys.modules["atrinik_protocol"] = previous
+            while str(source) in sys.path:
+                sys.path.remove(str(source))
+
+    def test_protocol_source_override_rejects_preloaded_nested_package(self) -> None:
+        _, _, lock = self.valid_inputs()
+        source = self.root / "generated"
+        expected = source / "atrinik_protocol"
+        shadow = source / "shadow" / "atrinik_protocol"
+        expected.mkdir(parents=True)
+        shadow.mkdir(parents=True)
+        (expected / "__init__.py").write_text("PROTOCOL_VERSION = 1084\n")
+        shadow_file = shadow / "__init__.py"
+        shadow_file.write_text("PROTOCOL_VERSION = 1084\n")
+        previous = sys.modules.get("atrinik_protocol")
+        fake = SimpleNamespace(__file__=str(shadow_file))
+        sys.modules["atrinik_protocol"] = fake
+        try:
+            with mock.patch.dict(os.environ, {
+                    "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE": str(source)}), self.assertRaisesRegex(
+                        compatibility.CompatibilityError, "imported before|was not imported"):
+                compatibility.protocol_compatibility(lock)
+        finally:
+            sys.modules.pop("atrinik_protocol", None)
+            if previous is not None:
+                sys.modules["atrinik_protocol"] = previous
+            while str(source) in sys.path:
+                sys.path.remove(str(source))
 
     def test_protocol_compatibility_preserves_artifact_identity_checks(self) -> None:
         _, _, lock = self.valid_inputs()

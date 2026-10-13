@@ -10,7 +10,8 @@ from pathlib import Path
 
 from .client import logical_map_path, map_object_visual_name
 from .protocol import Cursor, Packet, ProtocolError
-from .transport import normalize_certificate_sha256
+from .transport import (QUIC_ALPN, QUIC_GAME_STREAM_PREFACE,
+                        normalize_certificate_sha256)
 from .quests import dialogue_choices, flatten_parts, load_catalog, parse_quest_book
 from .navigation import (BuySpellTask, FarmCircuitTask, FoodProfile,
                          MapEdge, MapNode,
@@ -49,148 +50,6 @@ from .autoplay import AutoplayTask
 @lru_cache(maxsize=1)
 def built_graph():
     return WorldGraph().build()
-
-
-class MapWireTests(unittest.TestCase):
-    @staticmethod
-    def envelope(update=c.MAP_NEW, *, blocks=((0, b""),), marker=0,
-                 x=4, y=5, sublayer=0, timed=b"", connected=(1, 0, 0, 0)):
-        packet = Packet(0).u8(update)
-        if update in (c.MAP_NEW, c.MAP_CONNECTED):
-            packet.string("Test").string("").string("").u8(0).u8(0)
-            packet.string("region").string("Region").string("/test")
-            if update == c.MAP_NEW:
-                packet.u8(32).u8(32)
-            else:
-                packet.u8(connected[0])
-                for offset in connected[1:]:
-                    packet.add("b", offset)
-        packet.u8(x).u8(y).u8(sublayer).u16(marker)
-        packet.data.extend(timed)
-        packet.u8(len(blocks))
-        for depth, data in blocks:
-            packet.add("b", depth).u32(len(data))
-            packet.data.extend(data)
-        return bytes(packet.data)
-
-    @staticmethod
-    def tile(x=8, y=8, face=42):
-        return bytes(Packet(0).u16(x << 11 | y << 6).u8(1).u8(3)
-                     .u16(face).u8(0).u8(0).u8(0).data)
-
-    def decode(self, client, data):
-        asyncio.run(client._handle_map(Cursor(data), data))
-
-    def test_main_depth_and_radiance_extensions_preserve_target_framing(self):
-        tile = Packet(0).u16(8 << 11 | 8 << 6 | 0x2D).add("h", -5).u8(1)
-        for value in range(7):
-            tile.u16(2048 + value)
-        tile.u8(1).u8(3).u16(99).u8(0).u8(c.MAP_FLAG_ANIMATION | c.MAP_FLAG_MORE)
-        tile.u8(10).u8(2).u8(c.ANIM_MOVING).u8(5)
-        tile.u32(c.MAP_FLAG2_TARGET | c.MAP_FLAG2_PROBE | c.MAP_FLAG2_EXIT)
-        tile.u32(123).u8(0).u8(80)
-        tile.u8(c.MAP_EXT_RGB16 | c.MAP_EXT_LIGHT_KEYFRAME | c.MAP_EXT_ANIM)
-        tile.u8(1).u16(4096).u16(1024).u16(0)
-        tile.u8(3).u16(3000).u16(2000).u8(2).u16(100).u16(200).u16(300)
-        tile.u8(1).u8(0).u8(1).add("h", -12)
-        descriptor = bytes(Packet(0).add("Q", 1).add("Q", 7200)
-                           .add("Q", 10800).u8(2).data)
-        data = self.envelope(blocks=((-1, self.tile(face=7)), (0, bytes(tile.data)),
-                                     (1, self.tile(face=8))),
-                             marker=c.MAP_TIMED_LIGHT, timed=descriptor)
-        client = AtrinikClient(ClientConfig())
-        self.decode(client, data)
-        m = client.state.map
-        self.assertEqual((m.path, m.world_x, m.world_y), ("/test", 4, 5))
-        self.assertEqual(len(m.tiles), 1)
-        cell = m.tiles[8, 8]
-        self.assertEqual(cell.support_height, -5)
-        self.assertTrue(cell.fog_of_war)
-        self.assertEqual(cell.darkness, list(range(2048, 2055)))
-        self.assertEqual((cell.objects[3].animation, cell.objects[3].target_id,
-                          cell.objects[3].target_hp), (99, 123, 80))
-
-    def test_continuations_publish_once_after_matching_final_sequence(self):
-        client = AtrinikClient(ClientConfig())
-        original = client.state.map
-        self.decode(client, self.envelope(marker=2, blocks=((0, self.tile()), (1, b""))))
-        self.assertIs(client.state.map, original)
-        for data in (
-                self.envelope(c.MAP_PARTIAL, marker=2, blocks=((0, self.tile()),)),
-                self.envelope(c.MAP_PARTIAL, marker=1, x=6, blocks=((0, self.tile()),)),
-                self.envelope(c.MAP_PARTIAL, marker=1, blocks=((-1, self.tile()),))):
-            with self.assertRaises(ProtocolError):
-                self.decode(client, data)
-            self.assertIs(client.state.map, original)
-        self.decode(client, self.envelope(c.MAP_PARTIAL, marker=1,
-                                         blocks=((1, self.tile()),)))
-        self.assertIs(client.state.map, original)
-        self.decode(client, self.envelope(c.MAP_PARTIAL, marker=2,
-                                         blocks=((0, self.tile(x=9, face=43)),)))
-        self.assertEqual(len(client.state.map.tiles), 2)
-        self.assertEqual(client.events.qsize(), 1)
-        with self.assertRaises(ProtocolError):
-            self.decode(client, self.envelope(c.MAP_PARTIAL, marker=3,
-                                             blocks=((0, self.tile()),)))
-
-    def test_truncation_and_invalid_nested_depth_leave_published_map_intact(self):
-        client = AtrinikClient(ClientConfig())
-        self.decode(client, self.envelope(blocks=((0, self.tile()),)))
-        original = client.state.map
-        data = self.envelope(blocks=((0, self.tile(face=43)), (1, self.tile())))
-        for end in range(len(data)):
-            with self.assertRaises(ProtocolError, msg=f"truncated at {end}"):
-                self.decode(client, data[:end])
-            self.assertIs(client.state.map, original)
-        bad_tiles = (self.tile(x=31), b"\x00\x10", b"\x00\x06",
-                     b"\x00\x00\x00\x02\x80", b"\x00\x00\x00\x08")
-        for bad in bad_tiles:
-            with self.assertRaises(ProtocolError):
-                self.decode(client, self.envelope(blocks=((0, self.tile()), (1, bad))))
-            self.assertIs(client.state.map, original)
-        for bad in (self.envelope(blocks=()), self.envelope(blocks=((1, b""),)),
-                    self.envelope(blocks=((0, b""), (0, b""))),
-                    self.envelope(blocks=((0, b""), (7, b""))),
-                    self.envelope(marker=4097), self.envelope(sublayer=7),
-                    self.envelope(x=32), self.envelope(y=32),
-                    self.envelope(c.MAP_CONNECTED, connected=(1, 0, 0, 1)),
-                    self.envelope(c.MAP_CONNECTED, connected=(9, 0, 0, 0)),
-                    self.envelope(c.MAP_CONNECTED, connected=(10, 0, 0, 1)),
-                    self.envelope(c.MAP_CONNECTED, connected=(0, 0, 0, 0)),
-                    self.envelope() + b"extra"):
-            with self.assertRaises(ProtocolError):
-                self.decode(client, bad)
-            self.assertIs(client.state.map, original)
-
-    def test_same_connected_and_reconnect_reset_main_cache(self):
-        client = AtrinikClient(ClientConfig())
-        self.decode(client, self.envelope(blocks=((0, self.tile()),)))
-        self.decode(client, self.envelope(c.MAP_SAME, x=5))
-        self.assertIn((7, 8), client.state.map.tiles)
-        self.decode(client, self.envelope(c.MAP_CONNECTED, x=0, connected=(1, -2, 0, 0)))
-        self.assertIn((9, 8), client.state.map.tiles)
-        self.decode(client, self.envelope(c.MAP_CONNECTED, connected=(9, 0, 0, 1),
-                                         blocks=((0, self.tile(face=45)),)))
-        self.assertEqual(list(client.state.map.tiles), [(8, 8)])
-        self.decode(client, self.envelope(marker=1))
-        asyncio.run(client._close_transport())
-        with self.assertRaises(ProtocolError):
-            self.decode(client, self.envelope(c.MAP_PARTIAL, marker=1,
-                                             blocks=((0, self.tile()),)))
-        self.decode(client, self.envelope(blocks=((0, self.tile(x=3, face=46)),)))
-        self.assertEqual(list(client.state.map.tiles), [(3, 8)])
-
-    def test_mapstats_clock_is_consumed_transactionally(self):
-        client = AtrinikClient(ClientConfig())
-        data = bytes(Packet(0).u8(5).add("Q", 123456).u32(6000)
-                     .u8(1).string("new name").data)
-        asyncio.run(client._handle_mapstats(Cursor(data), data))
-        m = client.state.map
-        self.assertEqual((m.name, m.game_seconds, m.millis_per_game_minute),
-                         ("new name", 123456, 6000))
-        with self.assertRaises(ProtocolError):
-            asyncio.run(client._handle_mapstats(Cursor(data[:-1]), data[:-1]))
-        self.assertIs(client.state.map, m)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -286,6 +145,12 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 normalize_certificate_sha256(invalid)
 
+    def test_quic_alpn_matches_current_classic_server(self):
+        self.assertEqual(QUIC_ALPN, "atrinik/2")
+
+    def test_quic_game_stream_preface_matches_current_classic_server(self):
+        self.assertEqual(QUIC_GAME_STREAM_PREFACE, b"ATRN\x01\x00\x00\x01")
+
     def test_unique_map_path(self):
         self.assertEqual(
             logical_map_path(
@@ -312,11 +177,535 @@ class ProtocolTests(unittest.TestCase):
                          "bollard_tied_e_1.101")
 
     def test_packet(self):
-        self.assertEqual(c.SOCKET_VERSION, 1083)
+        self.assertEqual(c.SOCKET_VERSION, 1084)
         self.assertEqual(
             Packet(c.S_VERSION).add("I", c.SOCKET_VERSION).encode(),
-            b"\x00\x05\x03\x00\x00\x04\x3b",
+            b"\x00\x05\x03\x00\x00\x04\x3c",
         )
+
+    def test_target_select_uses_depth_aware_exact_payload(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            sent = []
+
+            async def send(packet):
+                sent.append(packet.encode())
+
+            client.send = send
+            await client.target(7, 8, 0x12345678, -6)
+            await client.clear_target()
+            self.assertEqual(sent, [
+                b"\x00\x09\x16\x01\x07\x08\xfa\x12\x34\x56\x78",
+                b"\x00\x02\x16\x02",
+            ])
+            for depth in (-7, 7):
+                with self.assertRaisesRegex(ValueError, "relative_depth"):
+                    await client.target(7, 8, 1, depth)
+            with self.assertRaisesRegex(ValueError, "actor_count"):
+                await client.target(7, 8, 0)
+
+        asyncio.run(scenario())
+
+    def test_targeted_talk_uses_exact_actor_identity_without_selection(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.target_id = 99
+            client.state.target_relative_depth = 4
+            sent = []
+
+            async def send(packet):
+                sent.append(packet.encode())
+
+            client.send = send
+            await client.talk_to_target(7, 8, -6, 0x12345678, "hello")
+            self.assertEqual(sent, [
+                b"\x00\x0f\x14\x07\x07\x08\xfa\x12\x34\x56\x78hello\0",
+            ])
+            self.assertEqual(client.state.target_id, 99)
+            self.assertEqual(client.state.target_relative_depth, 4)
+            await client.talk("hello", "Guard")
+            self.assertEqual(sent[1], b"\x00\x0e\x14\x05Guard\0hello\0")
+            await client.talk_to_target(
+                7, 8, 6, 1, "x" * c.TALK_NPC_TARGET_MESSAGE_MAX)
+            self.assertEqual(len(sent[-1]), 2 + 1 + 8 +
+                             c.TALK_NPC_TARGET_MESSAGE_MAX + 1)
+
+            invalid = (
+                (True, 8, 0, 1, "hello"),
+                (-1, 8, 0, 1, "hello"),
+                (client.state.map.width, 8, 0, 1, "hello"),
+                (7, -1, 0, 1, "hello"),
+                (7, client.state.map.height, 0, 1, "hello"),
+                (7, 8, -7, 1, "hello"),
+                (7, 8, 7, 1, "hello"),
+                (7, 8, 0, 0, "hello"),
+                (7, 8, 0, 0x1_0000_0000, "hello"),
+                (7, 8, 0, 1, ""),
+                (7, 8, 0, 1, "not\0a command"),
+                (7, 8, 0, 1, "x" * (c.TALK_NPC_TARGET_MESSAGE_MAX + 1)),
+                (7, 8, 0, 1, "🙂" * 1024),
+            )
+            for args in invalid:
+                with self.assertRaises((TypeError, ValueError)):
+                    await client.talk_to_target(*args)
+            with self.assertRaisesRegex(ValueError, "invalid item talk type"):
+                await client.talk_to_item(c.TALK_NPC_TARGET, 1, "hello")
+            self.assertEqual(len(sent), 3)
+
+        asyncio.run(scenario())
+
+    @staticmethod
+    def _map2_actor_tile(x, y, layer, actor_count, friend=False, face=321,
+                         mask=0):
+        """Build one MAP2 tile carrying a target-bearing map object."""
+        mask |= (x << 11) | (y << 6)
+        return (
+            mask.to_bytes(2, "big") + bytes((1, layer)) +
+            face.to_bytes(2, "big") + bytes((0, c.MAP_FLAG_MORE)) +
+            c.MAP_FLAG2_TARGET.to_bytes(4, "big") +
+            actor_count.to_bytes(4, "big") + bytes((int(friend), 0))
+        )
+
+    @staticmethod
+    def _map2_packet(update, levels, *, marker=0, world_x=4, world_y=5,
+                     sublayer=0, width=11, height=9, connected=None,
+                     timed=False):
+        """Build a MAP2 packet directly from protocol constants and fields."""
+        packet = bytearray((update,))
+        if update not in (c.MAP_PARTIAL, c.MAP_SAME):
+            packet.extend(b"Map Two\0music\0clear\0")
+            packet.extend((0, 0))
+            packet.extend(b"region\0Region Long\0/maps/two\0")
+            if update == c.MAP_NEW:
+                packet.extend((width, height))
+            elif update == c.MAP_CONNECTED:
+                if connected is None:
+                    raise AssertionError("MAP_CONNECTED needs tile and offsets")
+                tile, xoff, yoff, zoff = connected
+                packet.extend((tile, xoff & 0xff, yoff & 0xff, zoff & 0xff))
+        packet.extend((world_x, world_y, sublayer))
+        packet.extend((marker | (c.MAP2_CONTINUATION_TIMED_LIGHT if timed else 0)).to_bytes(2, "big"))
+        if timed:
+            packet.extend((1).to_bytes(8, "big"))
+            packet.extend((7200).to_bytes(8, "big"))
+            packet.extend((10800).to_bytes(8, "big"))
+            packet.append(1)
+        packet.append(len(levels))
+        for depth, body in levels:
+            packet.extend(depth.to_bytes(1, "big", signed=True))
+            packet.extend(len(body).to_bytes(4, "big"))
+            packet.extend(body)
+        return bytes(packet)
+
+    def test_map2_new_tracks_depth_targets_and_preserves_depth_zero_tiles(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            payload = self._map2_packet(c.MAP_NEW, [
+                (0, self._map2_actor_tile(5, 4, 5, 100)),
+                (-6, self._map2_actor_tile(2, 1, 5, 101, True)),
+                (6, self._map2_actor_tile(8, 7, 5, 102)),
+            ])
+            await client._handle_map(Cursor(payload), payload)
+
+            game_map = client.state.map
+            self.assertEqual((game_map.width, game_map.height), (17, 17))
+            self.assertIs(game_map.tiles, game_map.level_tiles[0])
+            self.assertEqual(
+                [(depth, x, y, obj.target_id, obj.is_friend)
+                 for depth, x, y, obj in game_map.depth_targets()],
+                [(0, 5, 4, 100, False), (-6, 2, 1, 101, True),
+                 (6, 8, 7, 102, False)],
+            )
+            self.assertEqual(
+                [(x, y, obj.target_id) for x, y, obj in game_map.targets()],
+                [(5, 4, 100)],
+            )
+            self.assertEqual(
+                [(depth, x, y, obj.target_id)
+                 for depth, x, y, obj in game_map.depth_targets(True)],
+                [(-6, 2, 1, 101)],
+            )
+
+        asyncio.run(scenario())
+
+    def test_mapstats_time_record_is_transactional(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.game_seconds = 7
+            client.state.game_millis_per_minute = 11
+            payload = bytes((5,)) + (123456).to_bytes(8, "big") + (250).to_bytes(4, "big")
+            await client._handle_mapstats(Cursor(payload), payload)
+            self.assertEqual(client.state.game_seconds, 123456)
+            self.assertEqual(client.state.game_millis_per_minute, 250)
+            for end in range(1, len(payload)):
+                with self.assertRaises(ProtocolError):
+                    await client._handle_mapstats(Cursor(payload[:end]), payload[:end])
+                self.assertEqual(client.state.game_seconds, 123456)
+                self.assertEqual(client.state.game_millis_per_minute, 250)
+
+        asyncio.run(scenario())
+
+    def test_map2_support_height_and_fog_alias_revoke_target_authority(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            body = self._map2_actor_tile(
+                5, 4, 5, 103,
+                mask=c.MAP2_MASK_SUPPORT_HEIGHT | c.MAP2_MASK_FOW)
+            # MAP2 orders support height then FOW before the layer records.
+            body = body[:2] + b"\xff\xfb\x01" + body[2:]
+            payload = self._map2_packet(c.MAP_NEW, [(0, body)])
+            await client._handle_map(Cursor(payload), payload)
+            tile = client.state.map.tile(5, 4)
+            self.assertEqual(tile.support_height, -5)
+            self.assertTrue(tile.fogged)
+            self.assertTrue(tile.fog_of_war)
+            self.assertEqual(list(client.state.map.targets()), [])
+
+        asyncio.run(scenario())
+
+    def test_mapstats_metadata_and_clock_publish_atomically(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.map.name = "old"
+            client.state.game_seconds = 7
+            client.state.game_millis_per_minute = 11
+            old_map = client.state.map
+            payload = (b"\x01new\0\x05" + (123456).to_bytes(8, "big") +
+                       (250).to_bytes(4, "big"))
+            # A boundary after the complete name record is itself a valid
+            # one-field MAPSTATS packet; every actual partial field must fail.
+            for end in (*range(1, 5), *range(6, len(payload))):
+                with self.assertRaises(ProtocolError):
+                    await client._handle_mapstats(
+                        Cursor(payload[:end]), payload[:end])
+                self.assertIs(client.state.map, old_map)
+                self.assertEqual(client.state.map.name, "old")
+                self.assertEqual((client.state.game_seconds,
+                                  client.state.game_millis_per_minute), (7, 11))
+            await client._handle_mapstats(Cursor(payload), payload)
+            self.assertIsNot(client.state.map, old_map)
+            self.assertEqual(client.state.map.name, "new")
+            self.assertEqual((client.state.game_seconds,
+                              client.state.game_millis_per_minute), (123456, 250))
+
+        asyncio.run(scenario())
+
+    def test_map2_continuations_publish_only_after_ordered_final_packet(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            old_map = client.state.map
+            old_map.path = "/old"
+            old_map.tile(1, 1).objects[2] = MapObject(2, 1, 0, 0)
+
+            initial = self._map2_packet(
+                c.MAP_NEW, [(0, b""), (-6, b""), (6, b"")], marker=2)
+            await client._handle_map(Cursor(initial), initial)
+            self.assertIs(client.state.map, old_map)
+            self.assertEqual(client.state.map.path, "/old")
+
+            first = self._map2_packet(
+                c.MAP_PARTIAL,
+                [(-6, self._map2_actor_tile(2, 1, 5, 101, True))], marker=1)
+            await client._handle_map(Cursor(first), first)
+            self.assertIs(client.state.map, old_map)
+            self.assertEqual(client.state.map.path, "/old")
+
+            final = self._map2_packet(
+                c.MAP_PARTIAL,
+                [(0, self._map2_actor_tile(5, 4, 5, 100)),
+                 (6, self._map2_actor_tile(8, 7, 5, 102))], marker=2)
+            await client._handle_map(Cursor(final), final)
+            self.assertIsNot(client.state.map, old_map)
+            self.assertEqual(client.state.map.path, "/maps/two")
+            self.assertEqual(
+                [(depth, obj.target_id)
+                 for depth, _x, _y, obj in client.state.map.depth_targets()],
+                [(0, 100), (-6, 101), (6, 102)],
+            )
+
+        asyncio.run(scenario())
+
+    def test_map2_malformed_packets_do_not_publish_partial_map(self):
+        async def scenario():
+            async def expect_rejected(payload):
+                client = AtrinikClient(ClientConfig())
+                old_map = client.state.map
+                old_map.path = "/old"
+                old_map.tile(1, 1).objects[2] = MapObject(2, 1, 0, 0)
+                with self.assertRaises(ProtocolError):
+                    await client._handle_map(Cursor(payload), payload)
+                self.assertIs(client.state.map, old_map)
+                self.assertEqual(client.state.map.path, "/old")
+                self.assertIn((1, 1), client.state.map.tiles)
+
+            valid = self._map2_packet(
+                c.MAP_NEW, [(0, self._map2_actor_tile(5, 4, 5, 100))])
+            await expect_rejected(valid[:-1])
+            await expect_rejected(self._map2_packet(c.MAP_NEW, [(0, b""),
+                                                                  (0, b"")]))
+            await expect_rejected(self._map2_packet(c.MAP_NEW, [(7, b"")]))
+            await expect_rejected(self._map2_packet(c.MAP_PARTIAL,
+                                                    [(0, b"")], marker=1))
+
+            client = AtrinikClient(ClientConfig())
+            old_map = client.state.map
+            pending = self._map2_packet(c.MAP_NEW, [(0, b"")], marker=2)
+            await client._handle_map(Cursor(pending), pending)
+            invalid_continuation = self._map2_packet(
+                c.MAP_PARTIAL, [(0, self._map2_actor_tile(5, 4, 5, 100))],
+                marker=2)
+            with self.assertRaises(ProtocolError):
+                await client._handle_map(Cursor(invalid_continuation),
+                                         invalid_continuation)
+            self.assertIs(client.state.map, old_map)
+
+            # A new complete header aborts the old generation.  A late
+            # continuation cannot replace the newly published state.
+            client = AtrinikClient(ClientConfig())
+            first_generation = self._map2_packet(c.MAP_NEW, [(0, b"")],
+                                                 marker=1)
+            await client._handle_map(Cursor(first_generation), first_generation)
+            replacement = self._map2_packet(
+                c.MAP_NEW, [(0, self._map2_actor_tile(5, 4, 5, 200))])
+            await client._handle_map(Cursor(replacement), replacement)
+            published = client.state.map
+            late = self._map2_packet(
+                c.MAP_PARTIAL, [(0, self._map2_actor_tile(5, 4, 5, 100))],
+                marker=1)
+            with self.assertRaises(ProtocolError):
+                await client._handle_map(Cursor(late), late)
+            self.assertIs(client.state.map, published)
+            self.assertEqual(
+                [obj.target_id for _, _, obj in client.state.map.targets()],
+                [200])
+
+            # A malformed complete header cannot supersede a previously
+            # validated generation; its ordered continuation still commits.
+            client = AtrinikClient(ClientConfig())
+            pending = self._map2_packet(c.MAP_NEW, [(0, b"")], marker=1)
+            await client._handle_map(Cursor(pending), pending)
+            malformed_complete = self._map2_packet(
+                c.MAP_NEW, [(0, self._map2_actor_tile(5, 4, 5, 300))])[:-1]
+            with self.assertRaises(ProtocolError):
+                await client._handle_map(Cursor(malformed_complete),
+                                         malformed_complete)
+            completion = self._map2_packet(
+                c.MAP_PARTIAL, [(0, self._map2_actor_tile(5, 4, 5, 400))],
+                marker=1)
+            await client._handle_map(Cursor(completion), completion)
+            self.assertEqual(
+                [obj.target_id for _, _, obj in client.state.map.targets()],
+                [400])
+
+            # Oversized forged envelopes cannot discard a validated pending
+            # generation, whose matching continuation remains authoritative.
+            client = AtrinikClient(ClientConfig())
+            pending = self._map2_packet(c.MAP_NEW, [(0, b"")], marker=1)
+            await client._handle_map(Cursor(pending), pending)
+            forged = (self._map2_packet(c.MAP_NEW, [(0, b"")]) + b"\0" *
+                      (c.MAP2_ENVELOPE_MAX + 1))
+            with self.assertRaises(ProtocolError):
+                await client._handle_map(Cursor(forged), forged)
+            completion = self._map2_packet(
+                c.MAP_PARTIAL, [(0, self._map2_actor_tile(5, 4, 5, 500))],
+                marker=1)
+            await client._handle_map(Cursor(completion), completion)
+            self.assertEqual(
+                [obj.target_id for _, _, obj in client.state.map.targets()],
+                [500])
+
+        asyncio.run(scenario())
+
+    def test_map2_target_authority_fog_and_living_clear(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            nonliving = self._map2_actor_tile(2, 2, 4, 101)
+            faceless = self._map2_actor_tile(3, 2, 5, 102, face=0)
+            payload = self._map2_packet(c.MAP_NEW, [(0, nonliving + faceless)])
+            await client._handle_map(Cursor(payload), payload)
+            self.assertEqual(list(client.state.map.targets()), [])
+
+            living = self._map2_actor_tile(5, 4, 5, 103)
+            same = self._map2_packet(c.MAP_SAME, [(0, living)])
+            await client._handle_map(Cursor(same), same)
+            self.assertEqual([obj.target_id for _, _, obj in client.state.map.targets()], [103])
+
+            fogged = self._map2_actor_tile(5, 4, 5, 103,
+                                           mask=c.MAP2_MASK_FOW)
+            fogged = fogged[:2] + b"\x01" + fogged[2:]
+            same = self._map2_packet(c.MAP_SAME, [(0, fogged)])
+            await client._handle_map(Cursor(same), same)
+            self.assertEqual(list(client.state.map.targets()), [])
+
+            # A clear for the actionable living layer revokes a prior target.
+            unfogged = self._map2_actor_tile(5, 4, 5, 103,
+                                             mask=c.MAP2_MASK_FOW)
+            unfogged = unfogged[:2] + b"\x00" + unfogged[2:]
+            same = self._map2_packet(c.MAP_SAME, [(0, unfogged)])
+            await client._handle_map(Cursor(same), same)
+            self.assertEqual(
+                [obj.target_id for _, _, obj in client.state.map.targets()],
+                [103])
+            clear = ((5 << 11) | (4 << 6)).to_bytes(2, "big") + bytes(
+                (1, c.MAP_LAYER_CLEAR, 5, 0))
+            same = self._map2_packet(c.MAP_SAME, [(0, clear)])
+            await client._handle_map(Cursor(same), same)
+            self.assertEqual(list(client.state.map.targets()), [])
+
+        asyncio.run(scenario())
+
+    def test_map2_same_connected_and_full_headers_replace_cached_levels(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig(account="a", password="b"))
+            initial = self._map2_packet(c.MAP_NEW, [
+                (0, self._map2_actor_tile(5, 4, 5, 100)),
+                (-1, self._map2_actor_tile(3, 3, 5, 101)),
+                (-6, self._map2_actor_tile(2, 1, 5, 106)),
+            ])
+            await client._handle_map(Cursor(initial), initial)
+            same = self._map2_packet(c.MAP_SAME, [(0, b""), (-1, b"")],
+                                     world_x=5)
+            await client._handle_map(Cursor(same), same)
+            self.assertEqual([(x, y, obj.target_id)
+                              for x, y, obj in client.state.map.targets()],
+                             [(4, 4, 100)])
+
+            connected = self._map2_packet(
+                c.MAP_CONNECTED, [(0, b""), (-1, b""), (-2, b"")],
+                world_x=5, connected=(9, 0, 0, 1))
+            await client._handle_map(Cursor(connected), connected)
+            self.assertEqual([(depth, obj.target_id)
+                              for depth, _x, _y, obj in client.state.map.depth_targets()],
+                             [(-1, 100), (-2, 101)])
+
+            replacement = self._map2_packet(
+                c.MAP_NEW, [(0, self._map2_actor_tile(6, 4, 5, 200))])
+            await client._handle_map(Cursor(replacement), replacement)
+            self.assertEqual(set(client.state.map.level_tiles), {0})
+            self.assertEqual([obj.target_id for _, _, obj in client.state.map.targets()],
+                             [200])
+
+            client.config.transport = "invalid"
+            with self.assertRaisesRegex(ValueError, "encrypted QUIC"):
+                await client.connect()
+            self.assertEqual(client.state.map.level_tiles, {0: {}})
+
+        asyncio.run(scenario())
+
+    def test_map2_complete_depth_range_timed_extensions_and_rejections(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            rgb = self._map2_actor_tile(5, 4, 5, 100)
+            rgb = (rgb[:-1] + bytes((c.MAP_EXT_LIGHT_RGB |
+                                      c.MAP_EXT_LIGHT_KEYFRAME, 1)) +
+                   b"\x00\x01\x00\x02\x00\x03" +
+                   b"\x01\x00\x04\x01\x00\x05\x00\x06\x00\x07")
+            complete = self._map2_packet(
+                c.MAP_NEW,
+                [(depth, rgb if depth == 0 else b"")
+                 for depth in range(-c.MAP2_MAX_DEPTH, c.MAP2_MAX_DEPTH + 1)],
+                timed=True)
+            await client._handle_map(Cursor(complete), complete)
+            self.assertEqual(set(client.state.map.level_tiles), set(range(-6, 7)))
+            self.assertEqual([obj.target_id for _, _, obj in client.state.map.targets()],
+                             [100])
+
+            published = client.state.map
+            async def rejected(packet):
+                with self.assertRaises(ProtocolError):
+                    await client._handle_map(Cursor(packet), packet)
+                self.assertIs(client.state.map, published)
+
+            await rejected(self._map2_packet(c.MAP_NEW, [(0, b"")], marker=4097))
+            first = self._map2_actor_tile(5, 4, 5, 101)
+            second = self._map2_actor_tile(5, 4, 5, 102)
+            duplicate_layer = first[:2] + b"\x02" + first[3:] + second[3:]
+            await rejected(self._map2_packet(c.MAP_NEW, [(0, duplicate_layer)]))
+            bad_string = (((5 << 11) | (4 << 6)).to_bytes(2, "big") +
+                          bytes((1, 5)) + (1).to_bytes(2, "big") +
+                          bytes((0, c.MAP_FLAG_NAME)) + b"x" * 64 + b"\0")
+            await rejected(self._map2_packet(c.MAP_NEW, [(0, bad_string)]))
+            oversized_level = self._map2_packet(c.MAP_NEW, [(0, b"")])
+            oversized_level = oversized_level[:-4] + (c.MAP2_LEVEL_PAYLOAD_MAX + 1).to_bytes(4, "big")
+            await rejected(oversized_level)
+            await rejected(self._map2_packet(c.MAP_NEW, [(0, b"")]) +
+                           b"\0" * (c.MAP2_ENVELOPE_MAX + 1))
+            await rejected(complete[:-1])
+            bad_keyframe = self._map2_actor_tile(5, 4, 5, 201)
+            bad_keyframe = (bad_keyframe[:-1] +
+                            bytes((c.MAP_EXT_LIGHT_KEYFRAME, 0, 1)))
+            await rejected(self._map2_packet(c.MAP_NEW, [(0, bad_keyframe)]))
+
+        asyncio.run(scenario())
+
+    def test_target_reply_is_transactional_and_uses_server_identity(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.target_name = "old target"
+            client.state.target_level = 13
+            client.state.target_actor_count = 99
+            client.state.target_relative_depth = 4
+            client.state.target_id = 99
+            payload = (
+                bytes((c.TARGET_ENEMY,)) + b"red\0orc\0" + bytes((12,)) +
+                (0x12345678).to_bytes(4, "big") + b"\xfa\x01\x00"
+            )
+            await client._handle_target(Cursor(payload), payload)
+            self.assertEqual(client.state.target_name, "orc")
+            self.assertEqual(client.state.target_level, 12)
+            self.assertEqual(client.state.target_actor_count, 0x12345678)
+            self.assertEqual(client.state.target_relative_depth, -6)
+            self.assertEqual(client.state.target_id, 0x12345678)
+            for end in range(len(payload)):
+                truncated = payload[:end]
+                with self.assertRaises(ProtocolError):
+                    await client._handle_target(Cursor(truncated), truncated)
+                self.assertEqual(client.state.target_name, "orc")
+                self.assertEqual(client.state.target_actor_count, 0x12345678)
+                self.assertEqual(client.state.target_relative_depth, -6)
+            unknown = bytes((255,)) + payload[1:]
+            with self.assertRaises(ProtocolError):
+                await client._handle_target(Cursor(unknown), unknown)
+            self.assertEqual(client.state.target_name, "orc")
+            self.assertEqual(client.state.target_actor_count, 0x12345678)
+            self.assertEqual(client.state.target_relative_depth, -6)
+            with self.assertRaises(ProtocolError):
+                await client._handle_target(Cursor(payload + b"\0"), payload + b"\0")
+            self.assertEqual(client.state.target_name, "orc")
+            self.assertEqual(client.state.target_actor_count, 0x12345678)
+            self.assertEqual(client.state.target_relative_depth, -6)
+            for combat in (0, 1, 2, 255):
+                for combat_force in (0, 1, 2, 255):
+                    actor_count = 0x10000000 + combat * 0x100 + combat_force
+                    reply = (
+                        bytes((c.TARGET_NEUTRAL,)) + b"blue\0target\0" +
+                        bytes((17,)) + actor_count.to_bytes(4, "big") +
+                        b"\x06" + bytes((combat, combat_force))
+                    )
+                    await client._handle_target(Cursor(reply), reply)
+                    self.assertEqual(client.state.target_code, c.TARGET_NEUTRAL)
+                    self.assertEqual(client.state.target_color, "blue")
+                    self.assertEqual(client.state.target_name, "target")
+                    self.assertEqual(client.state.target_level, 17)
+                    self.assertEqual(client.state.target_actor_count, actor_count)
+                    self.assertEqual(client.state.target_relative_depth, 6)
+                    self.assertEqual(client.state.target_id, actor_count)
+                    self.assertEqual(client.state.combat, bool(combat))
+                    self.assertEqual(client.state.combat_force, bool(combat_force))
+
+        asyncio.run(scenario())
+
+    def test_reconnect_resets_target_identity(self):
+        client = AtrinikClient(ClientConfig(
+            account="a", password="b", transport="invalid"))
+        client.state.target_actor_count = 99
+        client.state.target_relative_depth = -6
+        client.state.target_id = 99
+        with self.assertRaisesRegex(ValueError, "encrypted QUIC"):
+            asyncio.run(client.connect())
+        self.assertEqual(client.state.target_actor_count, 0)
+        self.assertEqual(client.state.target_relative_depth, 0)
+        self.assertEqual(client.state.target_id, 0)
 
     def test_item_decoder_retains_authoritative_read_flag(self):
         client = AtrinikClient(ClientConfig())
@@ -324,6 +713,26 @@ class ProtocolTests(unittest.TestCase):
         payload = c.ITEM_NO_SKILL_IDENT.to_bytes(4, "big")
         client._decode_item_fields(Cursor(payload), c.UPD_FLAGS, item)
         self.assertEqual(item.flags, c.ITEM_NO_SKILL_IDENT)
+
+    def test_version_waits_for_access_policy_before_setup(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "version"
+        sent = []
+
+        async def send(packet):
+            sent.append(packet.encode())
+
+        client.send = send
+        raw = c.SOCKET_VERSION.to_bytes(4, "big")
+        asyncio.run(client._handle_version(Cursor(raw), raw))
+        self.assertEqual(sent, [])
+        self.assertEqual(client.state.phase, "access-policy")
+
+    def test_connect_rejects_plaintext_transport_before_network(self):
+        client = AtrinikClient(ClientConfig(
+            account="a", password="b", transport="tcp"))
+        with self.assertRaisesRegex(ValueError, "encrypted QUIC"):
+            asyncio.run(client.connect())
 
     def test_characters_connection_ids(self):
         client = AtrinikClient(ClientConfig())
@@ -6188,6 +6597,23 @@ class QuestTests(unittest.TestCase):
         quests = parse_quest_book(data)
         self.assertEqual(quests["Example"].parts[0].current, 2)
         self.assertEqual(quests["Finished"].status, "completed")
+
+    def test_book_quest_payload_loads_parser_lazily(self):
+        data = b"[book]Quest List[/book][title]Incomplete quests:[/title]"
+        expected = {"Example": QuestProgress(name="Example")}
+
+        async def scenario():
+            with tempfile.TemporaryDirectory() as directory:
+                client = AtrinikClient(ClientConfig(
+                    runtime_state_path=str(Path(directory) / "state.sqlite3")))
+                with patch("atrinik_bot.quests.parse_quest_book",
+                           return_value=expected) as parser:
+                    await client._handle_book(Cursor(data), data)
+                parser.assert_called_once_with(data)
+                self.assertIs(client.state.quests, expected)
+                self.assertTrue(client.state.quests_loaded)
+
+        asyncio.run(scenario())
 
     def test_every_formal_quest_has_an_executor(self):
         catalog = load_catalog()
