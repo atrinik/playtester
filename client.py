@@ -124,6 +124,7 @@ class AtrinikClient:
         self._closed = False
         self._map_pending = None
         self._setup_sent = False
+        self._access_accepted = False
         self._account_sent = False
         self._character_sent = False
         self._last_keepalive = 0.0

@@ -166,9 +166,9 @@ class CompatibilityTests(unittest.TestCase):
                          "a1af490e841891648015610a3418b0f5ba6daafb")
         protocol = lock["inputs"]["protocol"]
         self.assertEqual(protocol["distribution"], "atrinik-classic-protocol")
-        self.assertEqual(protocol["release"], "v5.84.0")
+        self.assertEqual(protocol["release"], "v5.90.0")
         self.assertEqual(protocol["sha256"],
-                         "ed81ff5caf2edf32817276d828458bcb671a1a097424d6383a88ad9133ecd865")
+                         "5b8dc038184ff69b78a6b790310624fa9bda9ab8b11e87bd805a1beb4ee32c39")
 
     def test_preflight_verifies_release_assets_and_commit(self) -> None:
         lock = compatibility.load_lock()
@@ -218,7 +218,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(len(result["checks"]), 4)
         self.assertEqual(
             result["checks"][-1]["artifact"],
-            "atrinik_classic_protocol-5.84.0-py3-none-any.whl",
+            "atrinik_classic_protocol-5.90.0-py3-none-any.whl",
         )
 
         def missing_asset(request, timeout):

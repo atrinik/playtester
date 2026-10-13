@@ -111,14 +111,19 @@ class AccessAdmissionTests(unittest.TestCase):
             self.assertEqual(sent, [])
             self.assertFalse(client._account_sent)
 
+    def test_setup_before_policy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                runtime_state_path=str(Path(directory) / "state.sqlite3")))
+            with self.assertRaisesRegex(ProtocolError, "access admission"):
+                asyncio.run(client._handle_setup(Cursor(b""), b""))
+            self.assertFalse(client._account_sent)
+
     def test_client_import_and_construction_need_no_content_tooling(self):
-        canonical = os.environ.get("ATRINIK_PLAYTESTER_PROTOCOL_SOURCE")
-        self.assertTrue(canonical, "test requires the canonical protocol source")
         package_parent = Path(__file__).resolve().parent.parent
         with tempfile.TemporaryDirectory() as directory:
             environment = os.environ.copy()
             environment.update({
-                "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE": canonical,
                 "PYTHONPATH": str(package_parent),
                 "PYTHONNOUSERSITE": "1",
             })
