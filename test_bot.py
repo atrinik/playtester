@@ -10699,6 +10699,65 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             headers={"Origin": f"http://localhost:{self.port}"})
         self.assertEqual(status, 200)
 
+    async def test_dashboard_serves_static_face_images_and_resolves_animations(self):
+        from .face_images import FaceImages
+        png_a = b"\x89PNG\r\n\x1a\nface-a"
+        png_b = b"\x89PNG\r\n\x1a\nface-b"
+        with tempfile.TemporaryDirectory() as directory:
+            lib = Path(directory) / "lib"
+            lib.mkdir()
+            (lib / "atrinik.0").write_bytes(
+                b"IMAGE 0 %d grass.101\n" % len(png_a) + png_a +
+                b"IMAGE 1 %d hero.111\n" % len(png_b) + png_b)
+            (lib / "animations").write_text(
+                "anim hero\nfacings 9\ntrans.101\nhero.111\nmina\n")
+            self.server.face_images = FaceImages(Path(directory))
+            status, payload = await self.request("GET", "/api/face/grass.101")
+            self.assertEqual((status, payload), (200, png_a))
+            # Animated objects render statically as their first visible frame.
+            status, payload = await self.request("GET", "/api/face/hero")
+            self.assertEqual((status, payload), (200, png_b))
+            for name in ("missing.101", "..%2Fsecret", "../lib/atrinik.0", ""):
+                status, _ = await self.request("GET", f"/api/face/{name}")
+                self.assertEqual(status, 404, name)
+
+    async def test_dashboard_state_include_limits_the_snapshot(self):
+        status, payload = await self.request("GET", "/api/state?include=phase,stats")
+        self.assertEqual(status, 200)
+        self.assertEqual(set(json.loads(payload)), {"phase", "stats"})
+        status, payload = await self.request("GET", "/api/state")
+        self.assertIn("decisions", json.loads(payload))
+
+    async def test_dashboard_can_resume_autoplay_and_items_carry_faces(self):
+        from .autoplay import AutoplayTask
+        status, payload = await self.request(
+            "POST", "/api/task", {"type": "autoplay", "until_level": 50})
+        self.assertEqual(status, 200)
+        self.assertIsInstance(self.engine.task, AutoplayTask)
+        self.assertEqual(self.engine.task.target_level, 50)
+        self.client.state.player_tag = 7
+        self.client.faces[12] = "apple.101"
+        self.client.state.place_item(Item(601, name="apple", face=12), 7)
+        status, payload = await self.request("GET", "/api/state?include=inventory")
+        apple = next(i for i in json.loads(payload)["inventory"] if i["tag"] == 601)
+        self.assertEqual(apple["face"], "apple.101")
+        relic = Item(602, name="relic", face=12, flags=(
+            c.ITEM_MAGICAL | c.ITEM_DAMNED | c.ITEM_UNPAID | c.ITEM_TRAPPED))
+        self.client.state.place_item(relic, 7)
+        status, payload = await self.request("GET", "/api/state?include=inventory")
+        torch = Item(603, name="torch", face=12, animation=4)
+        self.client.animations[4] = "torch_lit"
+        self.client.state.place_item(torch, 7)
+        status, payload = await self.request("GET", "/api/state?include=inventory")
+        torch = next(i for i in json.loads(payload)["inventory"] if i["tag"] == 603)
+        # Animated items draw their animation, like the graphical client.
+        self.assertEqual(torch["face"], "torch_lit")
+        relic = next(i for i in json.loads(payload)["inventory"] if i["tag"] == 602)
+        self.assertEqual(
+            {k: relic[k] for k in ("magical", "cursed", "damned", "unpaid", "trapped", "locked")},
+            {"magical": True, "cursed": True, "damned": True, "unpaid": True,
+             "trapped": True, "locked": False})
+
     async def test_dashboard_pickup_moves_only_an_underfoot_item(self):
         self.client.state.player_tag = 7
         item = Item(501, name="staple food", quantity=5)
@@ -10796,13 +10855,13 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
     async def test_dashboard_and_task_replacement_without_login(self):
         status, page = await self.request("GET", "/")
         self.assertEqual(status, 200)
-        self.assertIn(b"Atrinik Operator", page)
-        self.assertIn(b"Bot activity", page)
-        self.assertIn(b"/app.js?v=8", page)
+        self.assertIn(b"Atrinik Observer", page)
+        self.assertIn(b'data-tab="activity"', page)
+        self.assertIn(b"/app.js?v=11", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
-        self.assertIn(b"Persistent decisions", page)
+        self.assertIn(b"Raw orders", page)
         self.assertNotIn(b'||"<p class="', script)
         status, payload = await self.request("GET", "/api/state")
         snapshot = json.loads(payload)
