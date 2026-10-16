@@ -12,12 +12,14 @@ import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from . import constants as c
 from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                   POLICIES, RECOMMENDED_QUEST_ORDER)
+from .autoplay import AutoplayTask
 from .client import AtrinikClient, map_object_visual_name
+from .face_images import FaceImages
 from .farm_spots import farm_spot_catalog
 from .navigation import (FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
@@ -446,6 +448,8 @@ class DashboardState:
         for item in state.inventory:
             inventory.append({
                 "tag": item.tag, "name": item.name, "quantity": item.quantity,
+                "face_id": item.face,
+                "face": self.client.faces.get(item.face, ""),
                 "weight": item.weight, "type": item.item_type,
                 "quality": item.quality, "condition": item.condition,
                 "identified": InventoryPolicy().identified(item),
@@ -564,6 +568,8 @@ class WebControlServer:
         self.host, self.port = host, port
         self.catalog = load_catalog()
         self.dashboard = DashboardState(client, engine, graph, self.catalog)
+        self.face_images = FaceImages(
+            getattr(client, "_runtime_content_root", Path(".")))
         self.server: asyncio.Server | None = None
 
     @staticmethod
@@ -610,14 +616,15 @@ class WebControlServer:
             await self.server.wait_closed()
 
     async def _reply(self, writer: asyncio.StreamWriter, status: int, body: bytes,
-                     content_type: str = "application/json; charset=utf-8") -> None:
+                     content_type: str = "application/json; charset=utf-8",
+                     cache: str = "no-store") -> None:
         labels = {200: "OK", 201: "Created", 204: "No Content",
                   400: "Bad Request", 403: "Forbidden", 404: "Not Found",
                   405: "Method Not Allowed",
                   409: "Conflict", 413: "Content Too Large", 500: "Internal Server Error"}
         header = (f"HTTP/1.1 {status} {labels.get(status, 'Error')}\r\n"
                   f"Content-Type: {content_type}\r\nContent-Length: {len(body)}\r\n"
-                  "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                  f"Cache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\n"
                   "Connection: close\r\n\r\n").encode()
         writer.write(header + body)
         await writer.drain()
@@ -650,8 +657,8 @@ class WebControlServer:
                 await self._reply(writer, 413, _json_bytes({"error": "body too large"}))
                 return
             body = await reader.readexactly(length) if length else b""
-            path = urlsplit(raw_target).path
-            await self._route(writer, method, path, body)
+            target = urlsplit(raw_target)
+            await self._route(writer, method, target.path, body, target.query)
         except (ValueError, json.JSONDecodeError, asyncio.IncompleteReadError) as exc:
             await self._reply(writer, 400, _json_bytes({"error": str(exc)}))
         except Exception as exc:
@@ -665,9 +672,25 @@ class WebControlServer:
                 pass
 
     async def _route(self, writer: asyncio.StreamWriter, method: str,
-                     path: str, body: bytes) -> None:
+                     path: str, body: bytes, query: str = "") -> None:
         if method == "GET" and path == "/api/state":
-            await self._reply(writer, 200, _json_bytes(self.dashboard.snapshot()))
+            snapshot = self.dashboard.snapshot()
+            include = {
+                key for value in parse_qs(query).get("include", [])
+                for key in value.split(",") if key}
+            if include:
+                # The live view polls a small slice; heavy lists load on demand.
+                snapshot = {key: value for key, value in snapshot.items()
+                            if key in include}
+            await self._reply(writer, 200, _json_bytes(snapshot))
+            return
+        if method == "GET" and path.startswith("/api/face/"):
+            image = self.face_images.png(path[len("/api/face/"):])
+            if image is None:
+                await self._reply(writer, 404, _json_bytes({"error": "unknown face"}))
+            else:
+                await self._reply(writer, 200, image, "image/png",
+                                  cache="public, max-age=86400, immutable")
             return
         if method == "POST" and path in ("/api/task", "/api/action"):
             data = json.loads(body or b"{}")
@@ -712,6 +735,9 @@ class WebControlServer:
                 await self.client.set_combat(False)
                 await self.client.clear_target()
             return {"ok": True, "task": None}
+        if kind == "autoplay":
+            until = max(1, min(115, int(data.get("until_level", 115) or 115)))
+            return await self._replace_task(AutoplayTask(self.graph, target_level=until))
         if kind == "quest":
             name = str(data.get("name", ""))
             if name == "all":

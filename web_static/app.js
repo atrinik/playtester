@@ -1,54 +1,369 @@
-const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-let state=null, selected=new Set(), busy=false, lastMessageCount=0, lastQuestSig='', lastFarmSig='', lastNavSig='', spotLevelInitialized=false;
-const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const lines=id=>$(id).value.split('\n').map(x=>x.trim()).filter(Boolean);
-function toast(text,error=false){const el=$('#toast');el.textContent=text;el.className=error?'show error':'show';setTimeout(()=>el.className='',2600)}
-async function post(path,data){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});const out=await r.json();if(!r.ok)throw Error(out.error||r.statusText);toast(out.task?`Task set: ${out.task}`:'Command accepted');return out}
-function bar(label,value,max,cls=''){const pct=Math.max(0,Math.min(100,(+value||0)/Math.max(1,+max||1)*100));return `<div class="vital"><b>${label}</b><div class="bar ${cls}"><i style="width:${pct}%"></i></div><span>${value||0} / ${max||0}</span></div>`}
-function renderHeader(){const on=state.phase==='playing';$('#connection-dot').classList.toggle('on',on);$('#connection').textContent=state.phase;$('#character').textContent=state.character||'No character';$('#location').textContent=state.map.path||'Waiting for map'}
-function xpNumber(value){return Math.max(0,+value||0).toLocaleString()}
-function renderStats(){const s=state.stats,lp=state.level_progress||{};$("#level").textContent=s.level??"—";$("#level").title=lp.next_experience==null?`${xpNumber(lp.experience)} XP · maximum tracked level`:`${xpNumber(lp.experience)} / ${xpNumber(lp.next_experience)} XP · ${xpNumber(lp.remaining_experience)} remaining · ${lp.progress_percent??0}%`;$("#vitals").innerHTML=bar("HP",s.hp,s.maxhp)+bar("SP",s.sp,s.maxsp,"mana")+bar("Food",s.food,1000,"food");const keys=["str","dex","con","int","pow","wc","ac","dam","armour","speed"];$("#stats").innerHTML=keys.map(k=>`<div class="stat"><b>${esc(s[k]??"—")}</b><small>${k}</small></div>`).join("");$("#skills").innerHTML=(state.skills||[]).map(x=>{const cap=x.next_experience==null,title=cap?`${x.name}: ${xpNumber(x.experience)} XP · maximum tracked level`:`${x.name}: ${xpNumber(x.experience)} / ${xpNumber(x.next_experience)} XP · ${xpNumber(x.remaining_experience)} remaining`;return `<span class="skill" title="${esc(title)}">${esc(x.name)} <b>L${x.level}</b><small>${xpNumber(x.experience)}${cap?" XP":` / ${xpNumber(x.next_experience)} · ${x.progress_percent??0}%`}</small></span>`}).join("")}
-function money(value){const v=Math.max(0,+value||0),parts=[];for(const [name,n] of [["gold",10000],["silver",100],["copper",1]]){const q=Math.floor((v%({gold:1000000,silver:10000,copper:100}[name]))/n);if(q)parts.push(`${q} ${name}`)}return parts.join(" ")||"0 copper"}
-function renderEconomy(){const e=state.economy||{},c=state.conditions||{};$('#wealth').textContent=`Carried: ${money(e.carried)} · Bank: ${e.bank_known?money(e.banked):'unknown'} · Spendable: ${e.bank_known?money(e.total):`${money(e.carried)} + unknown bank`}`;$('#conditions').textContent=`Depletion: ${c.depletion_points_known?`${c.depletion_points}/${c.depletion_threshold} points before restoration`:'unknown'}`}
-function glyph(tile){if(tile.player)return '◆';const named=[...tile.objects].reverse().find(o=>o.name||o.target);if(!named)return tile.objects.length?'·':'';if(named.target)return named.friendly?'F':'!';return (named.name||named.face||'·').charAt(0).toUpperCase()}
-function renderMap(){const m=state.map;$('#map-name').textContent=[m.name,m.region].filter(Boolean).join(' · ')||'No map loaded';$('#coords').textContent=`${m.x}, ${m.y}`;const map=$('#map');map.style.gridTemplateColumns=`repeat(${m.width},var(--cell))`;map.style.gridTemplateRows=`repeat(${m.height},var(--cell))`;map.innerHTML=m.tiles.map(t=>{const target=[...t.objects].reverse().find(o=>o.target);const cls=t.player?'player':target?(target.friendly?'friend':'enemy'):(t.objects.length?'feature':'');const title=[`world ${t.world_x},${t.world_y}`,...t.objects.map(o=>o.name||o.face).filter(Boolean)].join('\n');return `<button class="tile ${cls}" data-x="${t.x}" data-y="${t.y}" title="${esc(title)}">${esc(glyph(t))}</button>`}).join('');$$('.tile').forEach(b=>b.onclick=()=>post('/api/action',{type:'move',x:+b.dataset.x,y:+b.dataset.y}).catch(e=>toast(e.message,true)))}
-function renderTask(){const t=state.task;$('#task').innerHTML=t?`<strong>${esc(t.name)}</strong><br><span>${esc(t.status)}</span>${t.error?` · ${esc(t.error)}`:''}${(t.trace||[]).slice(1).map(s=>`<div class="task-step" style="margin-left:${Math.max(0,s.depth-1)*10}px">↳ ${esc(s.name)} · ${esc(s.status)}${s.detail?`<br><small>${esc(s.detail)}</small>`:''}${s.destination?`<br><code>${esc(s.destination)}${s.coordinates?` @ ${s.coordinates.join(',')}`:''}</code>`:''}</div>`).join('')}`:`<strong>Idle</strong>${state.last_task?`<br><span>Last: ${esc(state.last_task.name)} — ${esc(state.last_task.status)}</span>`:''}`}
-function flags(i){return [i.equipped&&'<span class="badge good">equipped</span>',i.applied&&'<span class="badge good">applied</span>',i.locked&&'<span class="badge warn">locked</span>',i.magical&&'<span class="badge">magic</span>'].filter(Boolean).join('')}
-function itemAction(type,tag){post('/api/action',{type,tag}).catch(e=>toast(e.message,true))}
-function renderInventory(){for(const tag of [...selected])if(!state.inventory.some(i=>i.tag===tag))selected.delete(tag);$('#inventory-summary').textContent=`${state.inventory.length} stacks · ${selected.size} selected`;$('#inventory').innerHTML=state.inventory.map(i=>`<tr><td><input class="pick" type="checkbox" data-tag="${i.tag}" ${selected.has(i.tag)?'checked':''}></td><td><strong>${esc(i.name)}</strong>${i.required_level?`<br><small>Requires level ${i.required_level}</small>`:''}</td><td>${i.quantity}</td><td>${(+i.weight*i.quantity).toFixed(2)}</td><td>${i.condition===255?'—':`${i.condition}%`}</td><td><div class="flags">${flags(i)}</div></td><td><div class="item-actions"><button data-act="apply" data-tag="${i.tag}">Apply</button><button class="secondary" data-act="examine" data-tag="${i.tag}">Look</button><button class="secondary" data-act="lock" data-tag="${i.tag}">${i.locked?'Unlock':'Lock'}</button><button class="danger" data-act="drop" data-tag="${i.tag}">Drop</button></div></td></tr>`).join('');$$('.pick').forEach(x=>x.onchange=()=>{const tag=+x.dataset.tag;x.checked?selected.add(tag):selected.delete(tag);renderInventory()});$$('[data-act]').forEach(x=>x.onclick=()=>itemAction(x.dataset.act,+x.dataset.tag))}
-function renderGround(){const items=state.ground||[];$("#ground-summary").textContent=`${items.length} stack${items.length===1?"":"s"}`;$("#ground-items").innerHTML=items.map(i=>`<article class="activity-row"><strong>${esc(i.name)}</strong><span>${i.quantity} available ${i.unpaid?'<span class="badge warn">unpaid</span>':''} ${!i.identified?'<span class="badge warn">unknown</span>':''} ${i.cursed?'<span class="badge warn">cursed</span>':''}</span><small>${esc(i.face||"unknown face")} · type ${i.type||"pending inference"}${i.quality===255?"":` · Q${i.quality}/C${i.condition}`}${i.required_level?` · level ${i.required_level}`:""}${i.inferred_skill_name?` · ${esc(i.inferred_skill_name)}`:""}</small><button class="pickup-item" data-tag="${i.tag}">Pick up</button></article>`).join("")||'<p class="muted">Nothing underfoot.</p>';$$('.pickup-item').forEach(b=>b.onclick=()=>post("/api/action",{type:"pickup",tag:+b.dataset.tag}).catch(e=>toast(e.message,true)))}
-function objective(o,p){const progress=p.current!==null?` (${p.current}/${p.required})`:'';return `<div class="objective">${esc(o.quantity)} × ${esc(o.name)}${progress}</div>`}
-function monsterBand(s){return s.monster_level_min===null?'monsters unknown':`monsters L${s.monster_level_min}${s.monster_level_max!==s.monster_level_min?`–${s.monster_level_max}`:''}`}
-function roamingBand(s){return s.roaming_monster_level_min===null?'':` · neighbor roamers L${s.roaming_monster_level_min}${s.roaming_monster_level_max!==s.roaming_monster_level_min?`–${s.roaming_monster_level_max}`:''}`}
-function useFarmSpot(id){const spot=(state.farm_spots||[]).find(x=>x.id===id);if(!spot)return;$("#farm-spot").value=id;$("#farm-zone").value=spot.zone;$("#farm-target").value=spot.target;$("#farm-item").value="";$("#farm-spot-hint").textContent=`Combat ${spot.min_level}–${spot.max_level} · ${monsterBand(spot)}${roamingBand(spot)} · treasure D${spot.treasure_difficulty} · ${spot.circuit&&spot.circuit.length?`${spot.circuit.length}-map circuit · `:""}${spot.notes||spot.map_name}`;toast(`Loaded farm spot: ${spot.name}`)}
-function renderFarmCards(){const level=+$('#spot-level').value||0, category=$('#spot-category').value;const spots=(state.farm_spots||[]).filter(s=>(!level||(s.min_level<=level&&level<=s.max_level))&&(!category||s.category===category));$('#farm-spots').innerHTML=spots.map(s=>`<article class="farm-card ${level&&s.min_level<=level&&level<=s.max_level?'recommended':''}"><div class="farm-head"><div><small>Combat ${s.min_level}–${s.max_level} · ${monsterBand(s)}${roamingBand(s)} · treasure D${s.treasure_difficulty} · ${esc(s.category)}</small><h3>${esc(s.name)}</h3></div><button class="small use-spot" data-id="${s.id}">Use</button></div><code title="${esc(s.zone)}">${esc(s.zone)}</code>${s.target?`<span class="badge warn">Target: ${esc(s.target)}</span>`:'<span class="badge">All hostiles</span>'}${s.notable_drops.map(d=>`<div class="drops">◆ ${esc(d)}</div>`).join('')}<p class="muted">${esc(s.notes)}</p></article>`).join('')||'<p class="muted">No curated spots overlap that level and type.</p>';$$('.use-spot').forEach(b=>b.onclick=()=>useFarmSpot(b.dataset.id))}
-function renderFarmSpots(){const sig=JSON.stringify(state.farm_spots||[]);if(sig!==lastFarmSig){lastFarmSig=sig;const old=$('#farm-spot').value;$('#farm-spot').innerHTML='<option value="">Choose a known farm spot…</option>'+(state.farm_spots||[]).map(s=>`<option value="${s.id}">Combat ${s.min_level}–${s.max_level} · ${monsterBand(s)} · ${esc(s.name)}</option>`).join('');if([...$('#farm-spot').options].some(o=>o.value===old))$('#farm-spot').value=old}if(!spotLevelInitialized&&state.stats.level){$('#spot-level').value=state.stats.level;spotLevelInitialized=true}renderFarmCards()}
-function useNavigationSpot(id){const spot=(state.navigation_spots||[]).find(x=>x.id===id);if(!spot)return;$('#nav-spot').value=id;$('#nav-map').value=spot.destination;$('#nav-x').value=spot.x??'';$('#nav-y').value=spot.y??'';const req=spot.requirements.length?` Requires: ${spot.requirements.join('; ')}.`:'';$('#nav-spot-hint').textContent=`${spot.category} · difficulty ${spot.difficulty} · ${spot.notes||spot.map_name}.${req}`;toast(`Loaded destination: ${spot.name}`)}
-function goNavigationSpot(id){const spot=(state.navigation_spots||[]).find(x=>x.id===id);if(!spot)return;post('/api/task',{type:'navigate',destination:spot.destination,x:spot.x,y:spot.y}).catch(e=>toast(e.message,true))}
-function renderNavigationCards(){const query=$('#nav-search').value.trim().toLowerCase(),category=$('#nav-category').value;const spots=(state.navigation_spots||[]).filter(s=>(!category||s.category===category)&&(!query||`${s.name} ${s.destination} ${s.notes} ${s.region}`.toLowerCase().includes(query)));$('#navigation-spots').innerHTML=spots.map(s=>`<article class="farm-card"><div class="farm-head"><div><small>${esc(s.category)} · treasure difficulty ${s.difficulty}</small><h3>${esc(s.name)}</h3></div><button class="small go-nav-spot" data-id="${s.id}">Go</button></div><code title="${esc(s.destination)}">${esc(s.destination)}${s.x!==null?` @ ${s.x},${s.y}`:''}</code><span class="badge">${esc(s.map_name||s.region||s.category)}</span>${s.requirements.map(r=>`<div class="drops">Requires: ${esc(r)}</div>`).join('')}<p class="muted">${esc(s.notes)}</p></article>`).join('')||'<p class="muted">No known destinations match these filters.</p>';$$('.go-nav-spot').forEach(b=>b.onclick=()=>goNavigationSpot(b.dataset.id))}
-function renderNavigationSpots(){const sig=JSON.stringify(state.navigation_spots||[]);if(sig!==lastNavSig){lastNavSig=sig;const old=$('#nav-spot').value;$('#nav-spot').innerHTML='<option value="">Choose a known destination…</option>'+(state.navigation_spots||[]).map(s=>`<option value="${s.id}">${esc(s.name)} · ${esc(s.category)}</option>`).join('');if([...$('#nav-spot').options].some(o=>o.value===old))$('#nav-spot').value=old}renderNavigationCards()}
-function renderQuests(){const sig=JSON.stringify(state.quests);if(sig===lastQuestSig)return;lastQuestSig=sig;const select=$('#quest-select'), old=select.value;select.innerHTML=state.quests.map(q=>`<option value="${esc(q.name)}">${q.order}. ${esc(q.name)} [${q.availability}]</option>`).join('');if([...select.options].some(o=>o.value===old))select.value=old;$('#quests').innerHTML=state.quests.map(q=>`<article class="quest ${q.availability}"><div class="quest-head"><div><small>#${q.order} · ${esc(q.giver)}</small><h3>${esc(q.name)}</h3></div><button class="small run-q" data-name="${esc(q.name)}">${q.availability==='active'?'Resume':q.availability==='completed'?'Review':'Start'}</button></div><div class="quest-meta"><span class="badge ${q.availability==='active'?'warn':q.availability==='completed'?'good':''}">${q.availability}</span><span class="badge">Level ${esc(q.suggested_level)}</span></div><p class="muted">${esc(q.start_location)}</p>${q.requirements.map(r=>`<p class="objective">Requires: ${esc(r)}</p>`).join('')}<details ${q.availability==='active'?'open':''}><summary>${q.parts.length} objective stages</summary>${q.parts.map(p=>`<div class="part"><strong>${esc(p.name)} <span class="badge ${p.ready_to_turn_in?'good':''}">${esc(p.status)}${p.ready_to_turn_in?' · ready':''}</span></strong><p>${esc(p.info)}</p>${p.objectives.map(o=>objective(o,p)).join('')}</div>`).join('')}</details></article>`).join('');$$('.run-q').forEach(b=>b.onclick=()=>post('/api/task',{type:'quest',name:b.dataset.name}).catch(e=>toast(e.message,true)))}
-function renderQuestJournal(){const journal=state.quest_journal||[];$('#quest-journal').innerHTML=journal.map(q=>`<article class="quest ${q.status}"><div class="quest-head"><h3>${esc(q.name)}</h3><span class="badge ${q.status==='completed'?'good':'warn'}">${esc(q.status)}</span></div>${q.parts.length?`<details ${q.status!=='completed'?'open':''}><summary>${q.parts.length} reported stage${q.parts.length===1?'':'s'}</summary>${q.parts.map(p=>`<div class="part"><strong>${esc(p.name)} <span class="badge">${esc(p.status)}</span></strong>${p.description?`<p>${esc(p.description)}</p>`:''}${p.current!==null?`<div class="objective">Progress: ${p.current}/${p.required}</div>`:''}</div>`).join('')}</details>`:'<p class="muted">Completed quest</p>'}</article>`).join('')||'<p class="muted">No quests reported. Press “Refresh journal (Q)” to request the current list.</p>'}
-function renderMessages(){const box=$('#messages');const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<35;box.innerHTML=state.messages.map(m=>`<div class="message"><time>${new Date(m.time*1000).toLocaleTimeString()}</time>${esc(m.text)}</div>`).join('');if(atBottom||state.messages.length!==lastMessageCount)box.scrollTop=box.scrollHeight;lastMessageCount=state.messages.length;const d=state.interface;$('#dialogue').innerHTML=d?`<h3>${esc(d.title)}</h3><p>${esc(d.text)}</p>${d.links.map((l,i)=>`<button class="dialog-link" data-index="${i}">${esc(l)}</button>`).join('')}`:'No dialogue open.';$$('.dialog-link').forEach(b=>b.onclick=()=>post('/api/action',{type:'dialog',index:+b.dataset.index}).catch(e=>toast(e.message,true)))}
-function renderActivity(){const decisions=$("#activity-mode").value!=="orders",actions=[...(decisions?(state.decisions||[]):(state.actions||[]))].reverse();$("#activity-summary").textContent=`${actions.length} ${decisions?"saved decisions":"recent orders"}`;$("#activity").innerHTML=actions.map(a=>`<article class="activity-row"><time>${new Date(a.time*1000).toLocaleString()}</time><strong>${esc(a.action)}${a.count>1?` ×${a.count}`:""}</strong><span>${esc(a.detail)}</span><small>${esc(a.task||"operator")} · ${esc(a.map||"unknown map")} @ ${a.x},${a.y}</small></article>`).join("")||`<p class="muted">No ${decisions?"decisions":"bot orders"} recorded.</p>`}
-function render(){renderHeader();renderStats();renderEconomy();renderMap();renderTask();renderActivity();renderInventory();renderGround();renderFarmSpots();renderNavigationSpots();renderQuests();renderQuestJournal();renderMessages()}
-async function poll(){if(busy)return;busy=true;try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error(r.statusText);state=await r.json();render()}catch(e){$('#connection').textContent=`Dashboard unavailable: ${e.message||e}`;$('#connection-dot').classList.remove('on')}finally{busy=false}}
-$$('.tabs button').forEach(b=>b.onclick=()=>{$$('.tabs button').forEach(x=>x.classList.toggle('active',x===b));$$('.tab-page').forEach(x=>x.classList.toggle('active',x.id===`${b.dataset.tab}-tab`))});
-$('#stop-task').onclick=()=>post('/api/task',{type:'stop'}).catch(e=>toast(e.message,true));
-$('#activity-mode').onchange=renderActivity;
-$('#run-quest').onclick=()=>post('/api/task',{type:'quest',name:$('#quest-select').value}).catch(e=>toast(e.message,true));
-$('#run-all').onclick=()=>post('/api/task',{type:'quest',name:'all'}).catch(e=>toast(e.message,true));
-$('#farm-spot').onchange=e=>{if(e.target.value)useFarmSpot(e.target.value)};
-$('#spot-level').oninput=renderFarmCards;$('#spot-category').onchange=renderFarmCards;
-$('#nav-spot').onchange=e=>{if(e.target.value)useNavigationSpot(e.target.value)};
-$('#nav-search').oninput=renderNavigationCards;$('#nav-category').onchange=renderNavigationCards;
-$("#run-farm").onclick=()=>{const spot=(state.farm_spots||[]).find(x=>x.id===$("#farm-spot").value);const common={until_level:+$("#farm-level").value,combat_skill:$("#farm-skill").value,combat_spell:$("#farm-spell").value};const usesCircuit=spot&&spot.circuit&&spot.circuit.length&&$("#farm-zone").value===spot.zone&&$("#farm-target").value===spot.target;if(usesCircuit)post("/api/task",{type:"farm_circuit",legs:spot.circuit,...common}).catch(e=>toast(e.message,true));else post("/api/task",{type:"farm",zone:$("#farm-zone").value,target:$("#farm-target").value,item:$("#farm-item").value,quantity:+$("#farm-quantity").value,...common}).catch(e=>toast(e.message,true))};
-$('#run-nav').onclick=()=>post('/api/task',{type:'navigate',destination:$('#nav-map').value,x:$('#nav-x').value,y:$('#nav-y').value}).catch(e=>toast(e.message,true));
-$('#sell-selected').onclick=()=>post('/api/task',{type:'sell_items',merchant:'shop-floor',tags:[...selected]}).catch(e=>toast(e.message,true));
-$('#sell-junk').onclick=()=>post('/api/task',{type:'sell_junk',merchant:'shop-floor',patterns:lines('#junk-patterns')}).catch(e=>toast(e.message,true));
-$('#bank').onclick=()=>post('/api/task',{type:'bank',banker:$('#banker').value,amount:$('#bank-amount').value}).catch(e=>toast(e.message,true));
-$('#deposit').onclick=()=>post('/api/task',{type:'deposit',container:$('#container').value,patterns:lines('#deposit-patterns')}).catch(e=>toast(e.message,true));
-$('#refresh-quests').onclick=()=>post('/api/action',{type:'refresh_quests'}).catch(e=>toast(e.message,true));
-$('#chat-form').onsubmit=e=>{e.preventDefault();post('/api/action',{type:'chat',text:$('#chat-input').value}).then(()=>$('#chat-input').value='').catch(e=>toast(e.message,true))};
-$('#command-form').onsubmit=e=>{e.preventDefault();post('/api/action',{type:'command',command:$('#command-input').value}).then(()=>$('#command-input').value='').catch(e=>toast(e.message,true))};
-poll();setInterval(poll,750);
+"use strict";
+// Atrinik observer dashboard. Polls a small live slice of /api/state every
+// second and the heavy lists less often; renders the ground-level map from the
+// runtime face images, statically (no animation), like the graphical client.
+
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
+
+const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party";
+const SLOW_KEYS = "decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
+// Server inventory also carries objects the real client keeps out of the bag.
+const HIDDEN_TYPES = new Set([29, 43, 114]); // spell, skill, force
+const CATEGORIES = [
+  ["all", "All items", () => true],
+  ["equipped", "Equipped", i => i.equipped || i.applied],
+  ["weapons", "Weapons & armour", i => [15, 16, 33, 34, 35, 87, 99, 100, 104, 113, 39, 70].includes(i.type)],
+  ["consumables", "Food, potions & scrolls", i => [5, 6, 54, 111, 109].includes(i.type)],
+  ["missiles", "Missiles", i => i.type === 13],
+  ["valuables", "Money & valuables", i => [36, 59, 60, 116, 117].includes(i.type)],
+  ["containers", "Containers & keys", i => [21, 122].includes(i.type)],
+  ["books", "Books & notes", i => [8, 80, 85].includes(i.type)],
+];
+
+let live = {}, slow = {}, selectedTag = null, unreadChat = 0, seenMessages = -1;
+
+// ---------- feedback ----------
+let toastTimer = 0;
+function toast(text, error = false) {
+  const el = $("#toast");
+  el.textContent = text;
+  el.className = error ? "show error" : "show";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.className = ""), 3200);
+}
+async function post(path, data) {
+  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data) });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw Error(out.error || r.statusText);
+  return out;
+}
+// Run a request from a button: disable it, show progress, report the outcome.
+async function act(button, label, path, data) {
+  const original = button ? button.textContent : "";
+  if (button) { button.disabled = true; button.textContent = "…"; }
+  try {
+    await post(path, data);
+    toast(label);
+    setTimeout(pollLive, 250);
+  } catch (e) {
+    toast(`${label} failed: ${e.message}`, true);
+  } finally {
+    if (button) { button.disabled = false; button.textContent = original; }
+  }
+}
+const task = (button, label, data) => act(button, label, "/api/task", data);
+const action = (button, label, data) => act(button, label, "/api/action", data);
+
+// ---------- face images ----------
+const faces = new Map();
+let redrawQueued = false;
+function face(name) {
+  if (!name) return null;
+  let img = faces.get(name);
+  if (!img) {
+    img = new Image();
+    img.onload = queueRedraw;
+    img.onerror = () => (img.failed = true);
+    img.src = `/api/face/${encodeURIComponent(name)}`;
+    faces.set(name, img);
+  }
+  return img.complete && !img.failed && img.naturalWidth ? img : null;
+}
+const faceUrl = name => (name ? `/api/face/${encodeURIComponent(name)}` : "");
+
+// ---------- header, vitals, automation ----------
+function bar(label, value, max, cls) {
+  const pct = Math.max(0, Math.min(100, ((+value || 0) / Math.max(1, +max || 1)) * 100));
+  const low = cls === "hp" && pct < 30 ? " low" : "";
+  return `<div class="vital"><b>${label}</b><div class="bar ${cls}${low}"><i style="width:${pct}%"></i><span>${value ?? "—"} / ${max ?? "—"}</span></div></div>`;
+}
+function renderHeader() {
+  const s = live.stats || {}, lp = live.level_progress || {}, m = live.map || {};
+  const on = live.phase === "playing";
+  $("#connection-dot").classList.toggle("on", on);
+  $("#connection").textContent = on ? "Playing" : live.phase || "offline";
+  $("#character").textContent = live.character || "No character";
+  $("#level-chip").textContent = `LV ${s.level ?? "—"}`;
+  $("#xp-bar").style.width = `${lp.progress_percent ?? 0}%`;
+  $("#xp-text").textContent = lp.next_experience == null ? `${(+lp.experience || 0).toLocaleString()} XP` : `${lp.progress_percent ?? 0}% · ${(+lp.remaining_experience || 0).toLocaleString()} to go`;
+  $("#map-name").textContent = clean(m.name) || "No map";
+  $("#map-region").textContent = m.region || "";
+  $("#coords").textContent = m.path ? `${m.path}  (${m.x}, ${m.y})` : "—";
+}
+function renderVitals() {
+  const s = live.stats || {};
+  $("#vitals").innerHTML = bar("HP", s.hp, s.maxhp, "hp") + bar("SP", s.sp, s.maxsp, "sp") + bar("Food", s.food, 999, "food");
+  const t = live.target;
+  $("#target").innerHTML = t && t.id ? `Target: <b>${esc(t.name)}</b> · ${t.hp ?? "?"}% HP${t.combat ? " · fighting" : ""}` : "No target";
+}
+function renderTask() {
+  const t = live.task, last = live.last_task;
+  if (t) {
+    const steps = t.trace || [];
+    const leaf = steps[steps.length - 1];
+    const circuit = steps.map(x => x.detail).filter(Boolean)[0];
+    $("#task").innerHTML = `${esc(t.name)}<span class="state ${esc(t.status)}">${esc(t.status)}</span>${leaf && leaf !== steps[0] ? `<small>${esc(leaf.name)}</small>` : ""}${circuit ? `<small>${esc(circuit)}</small>` : ""}${t.error ? `<small class="flag bad">${esc(t.error)}</small>` : ""}`;
+    $("#trace").innerHTML = steps.map(x => `<div style="padding-left:${x.depth * 10}px">${esc(x.name)} · ${esc(x.status)}${x.error ? ` · ${esc(x.error)}` : ""}${x.detail ? `<br>${esc(x.detail)}` : ""}</div>`).join("");
+  } else {
+    $("#task").innerHTML = `Idle<span class="state idle">no task</span>${last ? `<small>Last: ${esc(last.name)} · ${esc(last.status)}${last.error ? ` · ${esc(last.error)}` : ""}</small>` : ""}`;
+    $("#trace").innerHTML = "";
+  }
+  const a = live.current_action;
+  $("#action-now").textContent = a ? `Now: ${a.action} ${a.detail || ""}` : "";
+  $("#resume").textContent = t && t.name.startsWith("autoplay") ? "Restart autoplay" : "Start autoplay";
+}
+function renderCharacter() {
+  const s = live.stats || {};
+  const stat = (k, label) => `<div class="stat"><b>${s[k] ?? "—"}</b><span>${label}</span></div>`;
+  $("#stats").innerHTML = [["str", "STR"], ["dex", "DEX"], ["con", "CON"], ["int", "INT"], ["pow", "POW"], ["wc", "WC"], ["ac", "AC"], ["dam", "DAM"]].map(([k, l]) => stat(k, l)).join("");
+  $("#skills").innerHTML = (live.skills || []).filter(k => k.level > 0).sort((a, b) => b.level - a.level).map(k =>
+    `<div class="skill"><span>${esc(k.name)}</span><b>${k.level}</b><div class="bar"><i style="width:${k.progress_percent || 0}%"></i></div></div>`).join("") || '<span class="muted">No skills yet</span>';
+  $("#protections").innerHTML = Object.entries(live.protections || {}).filter(([, v]) => v).map(([k, v]) => `<span>${esc(k)} ${v}%</span>`).join("") || '<span class="muted">None</span>';
+  const e = live.economy || {};
+  const money = v => { v = +v || 0; return `${Math.floor(v / 10000)}g ${Math.floor((v % 10000) / 100)}s ${v % 100}c`; };
+  $("#wealth").textContent = `Carried ${money(e.carried)} · Bank ${e.bank_known ? money(e.banked) : "unknown"}`;
+}
+
+// ---------- map: static isometric ground level ----------
+const TW = 48, TH = 24, HALF_W = TW / 2, HALF_H = TH / 2;
+let zoom = 0; // 0 = fit
+const canvas = $("#map"), ctx = canvas.getContext("2d");
+let mapLayout = null;
+function queueRedraw() { if (!redrawQueued) { redrawQueued = true; requestAnimationFrame(() => { redrawQueued = false; drawMap(); }); } }
+function drawMap() {
+  const m = live.map;
+  if (!m || !m.tiles) return;
+  const w = m.width, h = m.height, top = 72; // headroom for tall sprites
+  const width = (w + h) * HALF_W, height = (w + h) * HALF_H + top + 8;
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  const ox = h * HALF_W, oy = top;
+  mapLayout = { ox, oy, w, h };
+  ctx.fillStyle = "#070909";
+  ctx.fillRect(0, 0, width, height);
+  ctx.imageSmoothingEnabled = false;
+  const tiles = [...m.tiles].sort((a, b) => a.x + a.y - (b.x + b.y) || a.x - b.x);
+  const targetId = live.target && live.target.id;
+  const labels = [];
+  for (const t of tiles) {
+    const sx = ox + (t.x - t.y) * HALF_W - HALF_W, sy = oy + (t.x + t.y) * HALF_H;
+    if (!t.objects.length) continue;
+    for (const o of [...t.objects].sort((a, b) => a.layer - b.layer)) {
+      const img = face(o.face);
+      if (!img) continue;
+      // Bottom-align to the tile, centred horizontally, like the client.
+      ctx.drawImage(img, sx + (TW - img.width) / 2, sy + TH - img.height);
+    }
+    const creature = [...t.objects].reverse().find(o => o.name && o.layer >= 5);
+    const isTarget = targetId && t.objects.some(o => o.target_id === targetId);
+    if (t.player) outline(sx, sy, "#d9ad5b", 2);
+    else if (isTarget) outline(sx, sy, "#ff4b3e", 2);
+    if (creature && !t.player) {
+      const hostile = t.objects.some(o => o.target && !o.friendly);
+      const friendly = t.objects.some(o => o.friendly);
+      dot(sx, sy, hostile ? "#e0675b" : friendly ? "#63c08a" : "#9aa4a1");
+      labels.push([creature.name, sx + HALF_W, sy - 30, hostile]);
+    }
+  }
+  if ($("#show-names").checked) {
+    ctx.font = "11px Inter, sans-serif";
+    ctx.textAlign = "center";
+    for (const [name, x, y, hostile] of labels) {
+      ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0,0,0,.85)"; ctx.strokeText(name, x, y);
+      ctx.fillStyle = hostile ? "#ff9b90" : "#e8e4d6"; ctx.fillText(name, x, y);
+    }
+  }
+  applyZoom();
+}
+function outline(sx, sy, color, width) {
+  ctx.beginPath();
+  ctx.moveTo(sx + HALF_W, sy); ctx.lineTo(sx + TW, sy + HALF_H); ctx.lineTo(sx + HALF_W, sy + TH); ctx.lineTo(sx, sy + HALF_H); ctx.closePath();
+  ctx.lineWidth = width; ctx.strokeStyle = color; ctx.stroke();
+}
+function dot(sx, sy, color) { ctx.beginPath(); ctx.arc(sx + HALF_W, sy + HALF_H, 3, 0, 7); ctx.fillStyle = color; ctx.fill(); }
+function applyZoom() {
+  const wrap = $("#map-wrap");
+  const fit = Math.max(0.5, Math.min((wrap.clientWidth - 8) / canvas.width, (wrap.clientHeight - 8) / canvas.height));
+  const scale = zoom === 0 ? fit : Math.max(0.5, fit * Math.pow(1.35, zoom));
+  canvas.style.width = `${canvas.width * scale}px`;
+  canvas.style.height = `${canvas.height * scale}px`;
+}
+function tileAt(event) {
+  if (!mapLayout) return null;
+  const r = canvas.getBoundingClientRect();
+  const px = ((event.clientX - r.left) * canvas.width) / r.width - mapLayout.ox;
+  const py = ((event.clientY - r.top) * canvas.height) / r.height - mapLayout.oy;
+  const x = Math.floor((px / HALF_W + py / HALF_H) / 2), y = Math.floor((py / HALF_H - px / HALF_W) / 2);
+  if (x < 0 || y < 0 || x >= mapLayout.w || y >= mapLayout.h) return null;
+  return (live.map.tiles || []).find(t => t.x === x && t.y === y) || null;
+}
+canvas.addEventListener("mousemove", e => {
+  const t = tileAt(e), tip = $("#map-tip");
+  if (!t) { tip.style.display = "none"; return; }
+  const names = t.objects.filter(o => o.name).map(o => `${esc(o.name)}${o.hp ? ` (${o.hp}%)` : ""}`);
+  tip.innerHTML = `<b>${t.world_x}, ${t.world_y}</b>${t.player ? " · Sera" : ""}${names.length ? `<br>${names.join("<br>")}` : ""}<br><span class="muted">Click to walk here</span>`;
+  const wr = $("#map-wrap").getBoundingClientRect();
+  tip.style.left = `${e.clientX - wr.left + 14}px`;
+  tip.style.top = `${e.clientY - wr.top + 14}px`;
+  tip.style.display = "block";
+});
+canvas.addEventListener("mouseleave", () => ($("#map-tip").style.display = "none"));
+canvas.addEventListener("click", e => {
+  const t = tileAt(e);
+  if (t) action(null, `Walking to ${t.world_x}, ${t.world_y}${live.task ? " (autoplay may take over again)" : ""}`, { type: "move", x: t.x, y: t.y });
+});
+$$("[data-zoom]").forEach(b => (b.onclick = () => { const d = +b.dataset.zoom; zoom = d === 0 ? 0 : zoom + d; applyZoom(); }));
+$("#show-names").onchange = queueRedraw;
+window.addEventListener("resize", applyZoom);
+
+// ---------- underfoot ----------
+function renderGround() {
+  const items = live.ground || [];
+  $("#ground").innerHTML = items.length ? items.map(i => `<button class="slot" data-ground="${i.tag}" title="${esc(i.name)} — click to pick up">${i.face ? `<img src="${faceUrl(i.face)}" alt="">` : `<span class="fallback">${esc(i.name)}</span>`}${i.quantity > 1 ? `<span class="qty">${i.quantity}</span>` : ""}</button>`).join("") : '<span class="muted">Nothing</span>';
+  $$("[data-ground]").forEach(b => (b.onclick = () => action(b, `Picked up ${b.title.split(" — ")[0]}`, { type: "pickup", tag: +b.dataset.ground })));
+}
+
+// ---------- inventory ----------
+CATEGORIES.forEach(([id, label]) => $("#inv-category").insertAdjacentHTML("beforeend", `<option value="${id}">${label}</option>`));
+let lastInvSig = "";
+function visibleItems() {
+  const query = $("#inv-search").value.trim().toLowerCase();
+  const [, , test] = CATEGORIES.find(c => c[0] === $("#inv-category").value) || CATEGORIES[0];
+  return (live.inventory || []).filter(i => !HIDDEN_TYPES.has(i.type) && test(i) && (!query || i.name.toLowerCase().includes(query)));
+}
+function slotClass(i) {
+  return ["slot", i.equipped && "equipped", !i.equipped && i.applied && "applied", i.magical && "magical", i.cursed && "cursed", i.unpaid && "unpaid", i.tag === selectedTag && "selected"].filter(Boolean).join(" ");
+}
+function renderInventory() {
+  const items = visibleItems();
+  const sig = JSON.stringify([items.map(i => [i.tag, i.quantity, i.equipped, i.applied, i.locked, i.face]), selectedTag, $("#inv-category").value]);
+  if (sig !== lastInvSig) {
+    lastInvSig = sig;
+    const grid = $("#inventory");
+    const equipped = items.filter(i => i.equipped || i.applied), rest = items.filter(i => !(i.equipped || i.applied));
+    const slot = i => `<button class="${slotClass(i)}" data-tag="${i.tag}" title="${esc(i.name)}">${i.face ? `<img src="${faceUrl(i.face)}" alt="" loading="lazy">` : `<span class="fallback">${esc(i.name)}</span>`}${i.quantity > 1 ? `<span class="qty">${i.quantity}</span>` : ""}${i.locked ? '<span class="mark">🔒</span>' : ""}</button>`;
+    grid.innerHTML = (equipped.length && rest.length ? `<div class="inv-group">Worn & wielded</div>${equipped.map(slot).join("")}<div class="inv-group">Carried</div>` : equipped.map(slot).join("")) + rest.map(slot).join("") || '<span class="muted">No items</span>';
+    $$("[data-tag]").forEach(b => (b.onclick = () => { selectedTag = +b.dataset.tag; renderInventory(); }));
+  }
+  renderItemDetail();
+}
+function renderItemDetail() {
+  const i = (live.inventory || []).find(x => x.tag === selectedTag);
+  const box = $("#item-detail");
+  if (!i) { box.className = "item-detail muted"; box.textContent = "Select an item to see details and actions."; return; }
+  box.className = "item-detail";
+  const flags = [i.equipped && '<span class="flag good">equipped</span>', !i.equipped && i.applied && '<span class="flag good">applied</span>', i.locked && '<span class="flag warn">locked</span>', i.magical && '<span class="flag magic">magical</span>', i.cursed && '<span class="flag bad">cursed</span>', i.unpaid && '<span class="flag warn">unpaid</span>', !i.identified && '<span class="flag">unidentified</span>'].filter(Boolean).join("");
+  const meta = [i.quantity > 1 && `×${i.quantity}`, i.weight != null && `${(+i.weight * Math.max(1, i.quantity)).toFixed(1)} kg`, i.condition != null && i.condition !== 255 && `condition ${i.condition}%`, i.required_level && `needs level ${i.required_level}`].filter(Boolean).join(" · ");
+  box.innerHTML = `<div class="item-head">${i.face ? `<img src="${faceUrl(i.face)}" alt="">` : "<span></span>"}<div><strong>${esc(i.name)}</strong><div class="item-meta">${meta}</div><div>${flags}</div></div></div>
+    <div class="item-actions">
+      <button data-do="apply">${i.equipped || i.applied ? "Unequip / unapply" : "Use / equip"}</button>
+      <button data-do="examine">Examine</button>
+      <button data-do="lock">${i.locked ? "Unlock" : "Lock"}</button>
+      <button data-do="drop" class="danger" ${i.locked ? "disabled title='Unlock first'" : ""}>Drop</button>
+    </div><p class="muted small">Examine results appear in the Chat tab.</p>`;
+  $$("[data-do]").forEach(b => (b.onclick = () => {
+    const kind = b.dataset.do;
+    if (kind === "drop" && !confirm(`Drop ${i.name}?`)) return;
+    const verbs = { apply: i.equipped || i.applied ? "Unequipped" : "Used", examine: "Examined", lock: i.locked ? "Unlocked" : "Locked", drop: "Dropped" };
+    action(b, `${verbs[kind]} ${i.name}`, { type: kind, tag: i.tag });
+  }));
+}
+$("#inv-search").oninput = () => { lastInvSig = ""; renderInventory(); };
+$("#inv-category").onchange = () => { lastInvSig = ""; renderInventory(); };
+
+// ---------- activity ----------
+function renderActivity() {
+  const list = [...((($("#activity-mode").value === "actions" ? slow.actions : slow.decisions) || []))].reverse();
+  const q = $("#activity-search").value.trim().toLowerCase();
+  $("#activity").innerHTML = list.filter(a => !q || `${a.action} ${a.detail} ${a.map}`.toLowerCase().includes(q)).slice(0, 250).map(a =>
+    `<div class="act"><time>${new Date(a.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><b title="${esc(a.task)}">${esc(a.action)}</b><span>${esc(a.detail)}${a.map ? ` <span class="muted">· ${esc(a.map.split("/").pop())} ${a.x},${a.y}</span>` : ""}</span></div>`).join("") || '<span class="muted">No activity yet</span>';
+}
+$("#activity-mode").onchange = renderActivity;
+$("#activity-search").oninput = renderActivity;
+
+// ---------- chat and dialogue ----------
+function renderChat() {
+  const msgs = live.messages || [], box = $("#messages");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  if (msgs.length !== seenMessages || !box.childElementCount) {
+    box.innerHTML = msgs.map(m => `<div class="msg"><time>${new Date(m.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span style="color:#${/^[0-9a-f]{6}$/i.test(m.color || "") ? m.color : "e8e4d6"}">${esc(clean(m.text))}</span></div>`).join("");
+    // The first load is history, not unread chat.
+    if (seenMessages >= 0 && !$("#tab-chat").classList.contains("active")) unreadChat += Math.max(0, msgs.length - seenMessages);
+    seenMessages = msgs.length;
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  }
+  $("#chat-badge").textContent = unreadChat ? Math.min(unreadChat, 99) : "";
+  const d = live.interface;
+  $("#dialogue").innerHTML = d ? `<b>${esc(d.title)}</b><p>${esc(d.text)}</p>${d.links.map((l, i) => `<button data-link="${i}">${esc(l)}</button>`).join("")}` : "";
+  $$("[data-link]").forEach(b => (b.onclick = () => action(b, `Chose “${b.textContent}”`, { type: "dialog", index: +b.dataset.link })));
+}
+$("#chat-form").onsubmit = e => { e.preventDefault(); const v = $("#chat-input").value.trim(); if (v) action(e.submitter, `Said: ${v}`, { type: "chat", text: v }).then(() => ($("#chat-input").value = "")); };
+$("#command-form").onsubmit = e => { e.preventDefault(); const v = $("#command-input").value.trim(); if (v) action(e.submitter, `Ran ${v}`, { type: "command", command: v }).then(() => ($("#command-input").value = "")); };
+
+// ---------- quests, places, tasks ----------
+let lastSlowSig = "";
+function renderSlowLists() {
+  const sig = JSON.stringify([slow.quests, slow.quest_journal, (slow.farm_spots || []).length, (slow.navigation_spots || []).length]);
+  if (sig === lastSlowSig) return;
+  lastSlowSig = sig;
+  $("#quest-journal").innerHTML = (slow.quest_journal || []).map(q => `<div class="quest ${esc(q.status)}"><strong>${esc(q.name)}</strong><span class="flag">${esc(q.status)}</span></div>`).join("") || '<span class="muted">Journal not loaded — press Refresh.</span>';
+  $("#quests").innerHTML = (slow.quests || []).map(q => `<div class="quest"><strong>${esc(q.name)}</strong><button class="small" data-quest="${esc(q.name)}">Run</button><small>Level ${esc(q.suggested_level)} · ${esc(q.availability)}</small></div>`).join("");
+  $$("[data-quest]").forEach(b => (b.onclick = () => task(b, `Started quest ${b.dataset.quest}`, { type: "quest", name: b.dataset.quest })));
+  const level = (live.stats || {}).level || 1;
+  $("#farm-spot").innerHTML = (slow.farm_spots || []).map(s => `<option value="${esc(s.id)}" ${s.min_level <= level && level <= s.max_level ? "" : 'class="muted"'}>${esc(s.name)} · L${s.min_level}–${s.max_level}${s.min_level <= level && level <= s.max_level ? " ✓" : ""}</option>`).join("");
+  const fit = (slow.farm_spots || []).find(s => s.min_level <= level && level <= s.max_level);
+  if (fit) $("#farm-spot").value = fit.id;
+  $("#nav-spot").innerHTML = '<option value="">Known destinations…</option>' + (slow.navigation_spots || []).map(s => `<option value="${esc(s.id)}">${esc(s.name)} · ${esc(s.category)}</option>`).join("");
+}
+$("#nav-spot").onchange = () => { const s = (slow.navigation_spots || []).find(x => x.id === $("#nav-spot").value); if (s) { $("#nav-map").value = s.destination; $("#nav-x").value = s.x ?? ""; $("#nav-y").value = s.y ?? ""; } };
+$("#resume").onclick = e => task(e.target, "Autoplay started", { type: "autoplay", until_level: 115 });
+$("#stop").onclick = e => task(e.target, "Stopped — Sera is idle", { type: "stop" });
+$("#run-auto").onclick = e => task(e.target, `Autoplay started (until level ${$("#auto-level").value})`, { type: "autoplay", until_level: +$("#auto-level").value });
+$("#run-all").onclick = e => task(e.target, "Started all formal quests", { type: "quest", name: "all" });
+$("#refresh-quests").onclick = e => action(e.target, "Requested quest journal", { type: "refresh_quests" });
+$("#run-farm").onclick = e => {
+  const s = (slow.farm_spots || []).find(x => x.id === $("#farm-spot").value);
+  if (!s) return toast("Choose a farm spot first", true);
+  const common = { until_level: +$("#farm-level").value };
+  task(e.target, `Farming ${s.name}`, s.circuit && s.circuit.length ? { type: "farm_circuit", legs: s.circuit, ...common } : { type: "farm", zone: s.zone, target: s.target, item: "", quantity: 1, ...common });
+};
+$("#run-nav").onclick = e => { const dest = $("#nav-map").value.trim(); if (!dest) return toast("Enter a map path or choose a destination", true); task(e.target, `Travelling to ${dest}`, { type: "navigate", destination: dest, x: $("#nav-x").value, y: $("#nav-y").value }); };
+$("#bank").onclick = e => task(e.target, "Depositing money", { type: "bank", banker: $("#banker").value, amount: $("#bank-amount").value });
+$("#sell-junk").onclick = e => task(e.target, "Selling junk", { type: "sell_junk", merchant: "shop-floor", patterns: $("#junk-patterns").value.split("\n").map(x => x.trim()).filter(Boolean) });
+
+// ---------- tabs ----------
+$$(".tabs button").forEach(b => (b.onclick = () => {
+  $$(".tabs button").forEach(x => x.classList.toggle("active", x === b));
+  $$(".tab").forEach(x => x.classList.toggle("active", x.id === `tab-${b.dataset.tab}`));
+  if (b.dataset.tab === "chat") { unreadChat = 0; renderChat(); const m = $("#messages"); m.scrollTop = m.scrollHeight; }
+  if (b.dataset.tab === "activity") renderActivity();
+}));
+
+// ---------- polling ----------
+let liveBusy = false, slowBusy = false;
+async function pollLive() {
+  if (liveBusy) return;
+  liveBusy = true;
+  try {
+    const r = await fetch(`/api/state?include=${LIVE_KEYS}`, { cache: "no-store" });
+    if (!r.ok) throw Error(`${r.status} ${r.statusText}`);
+    live = await r.json();
+    renderHeader(); renderVitals(); renderTask(); renderCharacter(); drawMap(); renderGround(); renderInventory(); renderChat();
+  } catch (e) {
+    $("#connection").textContent = `Dashboard offline (${e.message})`;
+    $("#connection-dot").classList.remove("on");
+  } finally { liveBusy = false; }
+}
+async function pollSlow() {
+  if (slowBusy) return;
+  slowBusy = true;
+  try {
+    const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
+    if (r.ok) { slow = await r.json(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+  } finally { slowBusy = false; }
+}
+pollLive(); pollSlow();
+setInterval(pollLive, 1000);
+setInterval(pollSlow, 5000);
