@@ -714,6 +714,36 @@ class ProtocolTests(unittest.TestCase):
         client._decode_item_fields(Cursor(payload), c.UPD_FLAGS, item)
         self.assertEqual(item.flags, c.ITEM_NO_SKILL_IDENT)
 
+    def test_item_extra_matches_server_for_effect_objects(self):
+        # A poison pulse sends UPD_EXTRA for the poisoning object; the server
+        # writes no extra fields for it, so the glow must follow directly.
+        client = AtrinikClient(ClientConfig())
+        for item_type in (c.TYPE_POISONING, c.TYPE_FORCE):
+            with self.subTest(item_type=item_type):
+                item = Item(31, item_type=item_type)
+                cur = Cursor(b"blue\x00\x07")
+                client._decode_item_fields(cur, c.UPD_EXTRA | c.UPD_GLOW, item)
+                self.assertEqual((item.glow, item.glow_speed), ("blue", 7))
+                self.assertEqual(cur.remaining, 0)
+                self.assertNotIn("seconds", item.extra)
+
+    def test_item_extra_still_decodes_spells_and_skills(self):
+        client = AtrinikClient(ClientConfig())
+        spell = Item(32, item_type=c.TYPE_SPELL)
+        cur = Cursor((5).to_bytes(2, "big") + (3).to_bytes(4, "big") +
+                     (9).to_bytes(4, "big") + b"zap\x00")
+        client._decode_item_fields(cur, c.UPD_EXTRA, spell)
+        self.assertEqual((spell.extra["cost"], spell.extra["path"],
+                          spell.extra["flags"], spell.extra["message"]),
+                         (5, 3, 9, "zap"))
+        self.assertEqual(cur.remaining, 0)
+        skill = Item(33, item_type=c.TYPE_SKILL)
+        cur = Cursor(bytes([12]) + (4567).to_bytes(8, "big", signed=True) + b"hit\x00")
+        client._decode_item_fields(cur, c.UPD_EXTRA, skill)
+        self.assertEqual((skill.extra["level"], skill.extra["experience"],
+                          skill.extra["message"]), (12, 4567, "hit"))
+        self.assertEqual(cur.remaining, 0)
+
     def test_version_waits_for_access_policy_before_setup(self):
         client = AtrinikClient(ClientConfig())
         client.state.phase = "version"
