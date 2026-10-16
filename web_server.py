@@ -439,6 +439,7 @@ class DashboardState:
                     "world_x": game_map.world_x + x - cx,
                     "world_y": game_map.world_y + y - cy,
                     "player": x == cx and y == cy,
+                    "fogged": bool(tile and tile.fogged),
                     "objects": objects,
                 })
         return {

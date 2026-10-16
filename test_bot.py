@@ -345,6 +345,36 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_map2_soft_clear_and_fog_keep_remembered_geometry_like_the_client(self):
+        from .model import MapObject
+
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            body = self._map2_actor_tile(5, 4, 5, 103)
+            await client._handle_map(Cursor(self._map2_packet(c.MAP_NEW, [(0, body)])), b"")
+            tile = client.state.map.tile(5, 4)
+            # floor (0), wall (4), item (2) and a second sub-layer floor (7).
+            for layer in (0, 4, 2, 7):
+                tile.objects[layer] = MapObject(layer, 10 + layer, 0, 0)
+            self.assertTrue(tile.targets)
+
+            def clear(mask):
+                return ((5 << 11) | (4 << 6) | mask).to_bytes(2, "big")
+
+            soft = self._map2_packet(c.MAP_SAME, [(0, clear(c.MAP2_MASK_CLEAR))])
+            await client._handle_map(Cursor(soft), soft)
+            tile = client.state.map.tile(5, 4)
+            # The client keeps floor/mask/wall as fog memory, drops the rest.
+            self.assertEqual(sorted(tile.objects), [0, 4, 7])
+            self.assertTrue(tile.fogged)
+            self.assertEqual(tile.targets, [])
+
+            hard = self._map2_packet(c.MAP_SAME, [(0, clear(c.MAP2_MASK_CLEAR | c.MAP2_MASK_HARD_CLEAR))])
+            await client._handle_map(Cursor(hard), hard)
+            self.assertEqual(client.state.map.tile(5, 4).objects, {})
+
+        asyncio.run(scenario())
+
     def test_map2_support_height_and_fog_alias_revoke_target_authority(self):
         async def scenario():
             client = AtrinikClient(ClientConfig())
@@ -10857,7 +10887,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=11", page)
+        self.assertIn(b"/app.js?v=12", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

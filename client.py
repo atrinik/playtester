@@ -1482,7 +1482,15 @@ class AtrinikClient:
             if values & c.MAP2_MASK_CLEAR:
                 if values & ~(c.MAP2_MASK_CLEAR | c.MAP2_MASK_HARD_CLEAR):
                     raise ProtocolError("invalid MAP2 clear")
-                tiles[(x, y)] = Tile(); continue
+                if values & c.MAP2_MASK_HARD_CLEAR or (x, y) not in tiles:
+                    tiles[(x, y)] = Tile()
+                    if not values & c.MAP2_MASK_HARD_CLEAR:
+                        tiles[(x, y)].fogged = True
+                else:
+                    # A soft clear is the client's fog-of-war transition.
+                    remembered = self._map_tile_copy(tiles, x, y)
+                    remembered.remember_as_fog()
+                continue
             if values & c.MAP2_MASK_HARD_CLEAR:
                 raise ProtocolError("invalid MAP2 hard clear")
             tile = self._map_tile_copy(tiles, x, y)
@@ -1560,9 +1568,10 @@ class AtrinikClient:
                     seen_sub.add(sub)
             # Fog applies after the record: remembered geometry may remain,
             # but it must never remain an actionable target identity.
-            tile.fogged = fogged
             if fogged:
-                tile.objects.clear()
+                tile.remember_as_fog()
+            else:
+                tile.fogged = False
         if body.remaining: raise ProtocolError("MAP2 level trailing bytes")
 
     async def _handle_map(self, cur: Cursor, raw: bytes) -> None:
