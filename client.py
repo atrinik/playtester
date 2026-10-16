@@ -1363,8 +1363,12 @@ class AtrinikClient:
                 item.extra.update(cost=cur.u16(), path=cur.u32(), flags=cur.u32(), message=cur.cstring())
             elif item.item_type == c.TYPE_SKILL:
                 item.extra.update(level=cur.u8(), experience=cur.i64(), message=cur.cstring())
-            elif item.item_type in (c.TYPE_FORCE, c.TYPE_POISONING):
-                item.extra.update(seconds=cur.i32(), message=cur.cstring())
+            # The server writes extra fields only for SPELL and SKILL
+            # (server/src/socket/item.c add_object_to_packet). Force and
+            # poisoning effects travel in the explicit status-effect packet
+            # since Classic #134, yet poison pulses still send UPD_EXTRA
+            # for the poisoning object: reading fields here desynchronizes
+            # the rest of the packet.
         if flags & c.UPD_GLOW:
             item.glow, item.glow_speed = cur.cstring(), cur.u8()
 
