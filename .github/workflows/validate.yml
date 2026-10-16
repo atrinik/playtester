@@ -9,9 +9,11 @@ on:
 permissions:
   contents: read
 
+# Independent parts run concurrently; "Playtester validation" stays the single
+# required check and passes only when every part succeeded.
 jobs:
-  validate:
-    name: Playtester validation
+  tests:
+    name: Build and unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -38,30 +40,40 @@ jobs:
           subprocess.run([sys.executable, "-m", "pip", "install", *requirements], check=True)
           PYCODE
 
-      - name: Build and test playtester
-        env:
-          ATRINIK_PLAYTESTER_CACHE: ${{ runner.temp }}/atrinik-playtester-cache
-          PYTHONPATH: ${{ github.workspace }}/build/playtester/python
+      - name: Build native extension and run CTest
         run: |
           cmake -S . -B build/playtester -G Ninja -DBUILD_TESTING=ON
           cmake --build build/playtester --parallel
           ctest --test-dir build/playtester --output-on-failure
+
+      - name: Install and verify the compatibility bundle
+        env:
+          ATRINIK_PLAYTESTER_CACHE: ${{ runner.temp }}/atrinik-playtester-cache
+          PYTHONPATH: ${{ github.workspace }}/build/playtester/python
+        run: |
           python3 -m atrinik_bot dependencies --json
           python3 -m atrinik_bot doctor --preflight --json
-          python3 - <<'PY'
-          import unittest
-          from atrinik_bot.compatibility import (
-              configure_cached_bundle,
-              default_cache_root,
-              load_lock,
-          )
 
-          configure_cached_bundle(default_cache_root(), load_lock())
-          result = unittest.TextTestRunner(verbosity=2).run(
-              unittest.defaultTestLoader.loadTestsFromName("atrinik_bot.test_bot")
-          )
-          raise SystemExit(not result.wasSuccessful())
-          PY
+      # The world graph costs more than all tests together and is cached per
+      # process, so build it once and fork one worker per runner CPU.
+      - name: Run the unit test suite in parallel
+        env:
+          ATRINIK_PLAYTESTER_CACHE: ${{ runner.temp }}/atrinik-playtester-cache
+          PYTHONPATH: ${{ github.workspace }}/build/playtester/python
+        run: python3 .github/scripts/run_tests_parallel.py
+
+  wheel:
+    name: Wheel smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select the minimum supported Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
 
       - name: Build, install, and smoke-test wheel from a clean directory
         env:
@@ -75,12 +87,29 @@ jobs:
             scripts/install_locked_protocol.py --json
           "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/pip" install build/dist/*.whl
           cd "${RUNNER_TEMP}"
+          # This job has no earlier cache: populate it once, then prove that
+          # offline reuse of the verified cache still works.
+          "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \
+            -m atrinik_bot dependencies --json
           "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \
             -m atrinik_bot dependencies --offline --json
           "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \
             -m atrinik_bot doctor --json
           "${RUNNER_TEMP}/atrinik-playtester-wheel/bin/python" \
             -m atrinik_bot --help
+
+  boundaries:
+    name: Repository boundaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Select the minimum supported Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
 
       - name: Validate repository boundaries
         shell: bash
@@ -98,3 +127,19 @@ jobs:
             echo "mutable or secret-bearing file is tracked" >&2
             exit 1
           fi
+
+  validate:
+    name: Playtester validation
+    needs: [tests, wheel, boundaries]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation part to succeed
+        env:
+          RESULTS: ${{ needs.tests.result }} ${{ needs.wheel.result }} ${{ needs.boundaries.result }}
+        run: |
+          echo "tests wheel boundaries: ${RESULTS}"
+          for result in ${RESULTS}; do
+            test "${result}" = success
+          done
