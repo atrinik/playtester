@@ -707,6 +707,18 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(client.state.target_relative_depth, 0)
         self.assertEqual(client.state.target_id, 0)
 
+    def test_merchant_timeout_reports_what_the_dialogue_offered(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        task = BuyDialogueStockTask("sage", r"word of recall")
+        self.assertEqual(task._dialogue_diagnostic(client),
+                         " (no dialogue opened by 'sage')")
+        client.state.interface = InterfaceState(
+            title="Sage", links=["[a=#news]News[/a]", "[a=quests]Quests[/a]"])
+        self.assertEqual(
+            task._dialogue_diagnostic(client),
+            " ('sage' dialogue 'Sage' offered no stock links; 2 link(s): News; Quests)")
+
     def test_item_decoder_retains_authoritative_read_flag(self):
         client = AtrinikClient(ClientConfig())
         item = Item(17)

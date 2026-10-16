@@ -4178,6 +4178,17 @@ class BuyDialogueStockTask(BotTask):
                 result.append(match.group(2))
         return result
 
+    def _dialogue_diagnostic(self, client: AtrinikClient) -> str:
+        """Describe what the merchant actually answered, for live diagnosis."""
+        interface = client.state.interface
+        if interface is None:
+            return f" (no dialogue opened by {self.merchant!r})"
+        labels = [re.sub(r"\[/?[a-z]+(=[^\]]*)?\]", "", link).strip()
+                  for link in interface.links]
+        shown = "; ".join(label for label in labels[:6] if label)[:200]
+        return (f" ({self.merchant!r} dialogue {interface.title!r} offered no stock"
+                f" links; {len(labels)} link(s): {shown or 'none'})")
+
     @staticmethod
     def _interface_payload(client: AtrinikClient) -> str:
         interface = client.state.interface
@@ -4250,7 +4261,8 @@ class BuyDialogueStockTask(BotTask):
             if not destinations:
                 if now - self._sent_at <= 5.0:
                     return
-                self.fail("merchant stock dialogue did not arrive")
+                self.fail("merchant stock dialogue did not arrive" +
+                          self._dialogue_diagnostic(client))
                 return
             self.checked = True
             self._item_name = self._select_stock(client, destinations)
@@ -4758,7 +4770,14 @@ class RetrieveItemsTask(BotTask):
                 self._opened_at = now
                 return
             if now - self._opened_at > 5.0:
-                self.fail("storage container contents did not load")
+                where = ("underfoot" if any(item.tag == container.tag
+                                            for item in client.state.ground)
+                         else "carried")
+                known = sorted(tag for tag, contents in client.state.inventories.items()
+                               if tag not in (0, client.state.player_tag))
+                self.fail("storage container contents did not load"
+                          f" ({container.name!r} tag={container.tag} {where};"
+                          f" received container contents for {known[:6] or 'none'})")
             return
         if now - self._opened_at < 0.5:
             return
