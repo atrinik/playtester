@@ -163,6 +163,7 @@ function drawMap() {
       // Bottom-align to the tile, centred horizontally, like the client.
       ctx.drawImage(img, sx + (TW - img.width) / 2, sy + TH - img.height);
     }
+    if (t.fogged) fog(sx, sy);
     const creature = [...t.objects].reverse().find(o => o.name && o.layer % 7 === 5);
     const isTarget = targetId && t.objects.some(o => o.target_id === targetId);
     if (t.player) outline(sx, sy, "#d9ad5b", 2);
@@ -188,6 +189,12 @@ function outline(sx, sy, color, width) {
   ctx.beginPath();
   ctx.moveTo(sx + HALF_W, sy); ctx.lineTo(sx + TW, sy + HALF_H); ctx.lineTo(sx + HALF_W, sy + TH); ctx.lineTo(sx, sy + HALF_H); ctx.closePath();
   ctx.lineWidth = width; ctx.strokeStyle = color; ctx.stroke();
+}
+// Remembered but not currently visible ground, dimmed like the client.
+function fog(sx, sy) {
+  ctx.beginPath();
+  ctx.moveTo(sx + HALF_W, sy); ctx.lineTo(sx + TW, sy + HALF_H); ctx.lineTo(sx + HALF_W, sy + TH); ctx.lineTo(sx, sy + HALF_H); ctx.closePath();
+  ctx.fillStyle = "rgba(4, 6, 8, 0.55)"; ctx.fill();
 }
 function dot(sx, sy, color) { ctx.beginPath(); ctx.arc(sx + HALF_W, sy + HALF_H, 3, 0, 7); ctx.fillStyle = color; ctx.fill(); }
 function applyZoom() {

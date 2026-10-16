@@ -57,6 +57,10 @@ class MapObject:
     animation_speed: int = 0
 
 
+# Floor, floor mask and wall: the per-sub-layer kinds the client keeps in fog.
+REMEMBERED_LAYER_KINDS = frozenset({0, 1, 4})
+
+
 @dataclass(slots=True)
 class Tile:
     darkness: list[int] = field(default_factory=lambda: [0] * 7)
@@ -73,6 +77,18 @@ class Tile:
     @fog_of_war.setter
     def fog_of_war(self, value: bool) -> None:
         self.fogged = bool(value)
+
+    def remember_as_fog(self) -> None:
+        """Keep remembered geometry and forget transient state, like the client.
+
+        Classic's map_clear_live_cell() drops item, item2, living and effect
+        layers but keeps floor, floor-mask and wall layers as fog-of-war
+        memory. Wire layers are 7 * sub_layer + object_layer - 1, so geometry
+        is layer % 7 in (0, 1, 4).
+        """
+        self.objects = {layer: obj for layer, obj in self.objects.items()
+                        if layer % 7 in REMEMBERED_LAYER_KINDS}
+        self.fogged = True
 
     @property
     def targets(self) -> list[MapObject]:
