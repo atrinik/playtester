@@ -10690,6 +10690,98 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(client.moves, [])
 
 
+class BuildInfoTests(unittest.TestCase):
+    COMMIT = "4a29be882631e570df3028c6e6ead2893b3d4723"
+
+    def test_release_build_shows_tag_and_short_commit(self):
+        from .build_info import describe_build
+
+        build = describe_build({"tag": "v1.17.0", "distance": 0,
+                                "commit": self.COMMIT, "dirty": False})
+        self.assertEqual(build["label"], "v1.17.0 · 4a29be8")
+        self.assertEqual(build["version"], "v1.17.0")
+        self.assertEqual(build["release_url"],
+                         "https://github.com/atrinik/playtester/releases/tag/v1.17.0")
+        self.assertEqual(build["commit_url"],
+                         f"https://github.com/atrinik/playtester/commit/{self.COMMIT}")
+
+    def test_unreleased_and_unknown_builds_are_labelled_honestly(self):
+        from .build_info import describe_build
+
+        ahead = describe_build({"tag": "v1.17.0", "distance": 3,
+                                "commit": self.COMMIT, "dirty": True})
+        self.assertEqual(ahead["label"], "v1.17.0+3 · 4a29be8 (modified)")
+        untagged = describe_build({"tag": "", "distance": 0,
+                                   "commit": self.COMMIT, "dirty": False})
+        self.assertEqual(untagged["label"], "unreleased · 4a29be8")
+        self.assertEqual(untagged["release_url"], "")
+        for raw in (None, {}, {"tag": "<script>", "commit": "not-a-sha",
+                               "distance": True, "dirty": "yes"}):
+            build = describe_build(raw)
+            self.assertEqual(build["label"], "unknown build", raw)
+            self.assertEqual((build["tag"], build["commit"], build["distance"],
+                              build["dirty"], build["commit_url"]),
+                             ("", "", 0, False, ""), raw)
+
+    def test_installed_package_records_its_source_commit(self):
+        from .build_info import BUILD_INFO_PATH, build_info
+
+        if not BUILD_INFO_PATH.exists():
+            self.skipTest("running from sources, not the CMake-built package")
+        self.assertRegex(build_info()["commit"], r"^[0-9a-f]{40}$")
+
+    def test_cmake_script_records_tag_distance_and_local_changes(self):
+        import shutil
+        import subprocess
+
+        cmake, git = shutil.which("cmake"), shutil.which("git")
+        if cmake is None or git is None:
+            self.skipTest("cmake and git are required")
+        # Sources sit at the repository root; the CMake-built copy is below build/.
+        script = next((
+            parent / "scripts" / "build_info.cmake"
+            for parent in Path(__file__).resolve().parents
+            if (parent / "scripts" / "build_info.cmake").exists()), None)
+        if script is None:
+            self.skipTest("build_info.cmake is not in an enclosing checkout")
+        from .build_info import describe_build
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, output = Path(tmp) / "repo", Path(tmp) / "out.json"
+            repo.mkdir()
+
+            def run(*args):
+                return subprocess.run(
+                    [git, "-C", str(repo), "-c", "user.name=t", "-c",
+                     "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+                     "-c", "tag.gpgsign=false", *args],
+                    check=True, capture_output=True, text=True).stdout.strip()
+
+            def record():
+                subprocess.run([cmake, f"-DSOURCE_DIR={repo}", f"-DOUTPUT={output}",
+                                "-P", str(script)], check=True, capture_output=True)
+                return describe_build(json.loads(output.read_text()))
+
+            run("init", "-q")
+            (repo / "file").write_text("one\n")
+            run("add", "file")
+            run("commit", "-q", "-m", "one")
+            run("tag", "v1.2.3")
+            head = run("rev-parse", "HEAD")
+            self.assertEqual(record()["label"], f"v1.2.3 · {head[:7]}")
+            (repo / "file").write_text("two\n")
+            run("commit", "-q", "-am", "two")
+            head = run("rev-parse", "HEAD")
+            build = record()
+            self.assertEqual((build["tag"], build["distance"], build["commit"]),
+                             ("v1.2.3", 1, head))
+            (repo / "file").write_text("three\n")
+            self.assertTrue(record()["dirty"])
+            # Without Git metadata the build still succeeds, reporting unknown.
+            shutil.rmtree(repo / ".git")
+            self.assertEqual(record()["label"], "unknown build")
+
+
 class WebTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = AtrinikClient(ClientConfig())
@@ -10725,6 +10817,16 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         await writer.wait_closed()
         head, payload = raw.split(b"\r\n\r\n", 1)
         return int(head.split()[1]), payload
+
+    async def test_dashboard_reports_the_running_build(self):
+        from .build_info import build_info
+
+        status, payload = await self.request("GET", "/api/state?include=build")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), {"build": build_info()})
+        status, page = await self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="build"', page)
 
     async def test_dashboard_rejects_remote_binding_and_cross_site_control(self):
         with self.assertRaisesRegex(ValueError, "only listen on loopback"):
@@ -10900,7 +11002,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=12", page)
+        self.assertIn(b"/app.js?v=13", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

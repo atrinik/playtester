@@ -18,6 +18,7 @@ from . import constants as c
 from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                   POLICIES, RECOMMENDED_QUEST_ORDER)
 from .autoplay import AutoplayTask
+from .build_info import build_info
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
 from .farm_spots import farm_spot_catalog
@@ -524,6 +525,7 @@ class DashboardState:
         } for item in state.ground]
         return {
             "server_time": time.time(), "uptime": time.time() - self.started_at,
+            "build": build_info(),
             "phase": state.phase, "connected": state.phase != "disconnected",
             "inventory_ready": state.inventory_replay_complete,
             "character": state.player_name, "account": state.account,
