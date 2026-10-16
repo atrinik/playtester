@@ -4923,6 +4923,13 @@ class TaskEngine:
             if await self._protect_idle():
                 await asyncio.sleep(self.tick_rate)
                 continue
+            state = self.client.state
+            if (self.task is not None and state.phase == "playing" and
+                    not state.map.path):
+                # A reconnect reaches "playing" before its first MAP2: do not
+                # plan against the empty map that login just reset.
+                await asyncio.sleep(self.tick_rate)
+                continue
             if self.task is not None:
                 self.client.action_context = self.task.name
                 try:

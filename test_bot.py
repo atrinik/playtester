@@ -345,6 +345,33 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_engine_waits_for_the_first_map_after_a_reconnect(self):
+        from .tasks import BotTask
+
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.phase = "playing"
+            engine = TaskEngine(client, tick_rate=0.01)
+            ticks = []
+
+            class Probe(BotTask):
+                async def tick(self, client):
+                    ticks.append(client.state.map.path)
+
+            engine.set_task(Probe("probe"))
+            engine.running = True
+            runner = asyncio.create_task(engine.run())
+            await asyncio.sleep(0.05)
+            self.assertEqual(ticks, [])
+            client.state.map.path = "/shattered_islands/world_14_77"
+            await asyncio.sleep(0.05)
+            engine.running = False
+            await runner
+            self.assertTrue(ticks)
+            self.assertEqual(set(ticks), {"/shattered_islands/world_14_77"})
+
+        asyncio.run(scenario())
+
     def test_map2_soft_clear_and_fog_keep_remembered_geometry_like_the_client(self):
         from .model import MapObject
 
