@@ -350,19 +350,35 @@ class ProtocolTests(unittest.TestCase):
 
         async def scenario():
             client = AtrinikClient(ClientConfig())
-            client.state.phase = "playing"
             engine = TaskEngine(client, tick_rate=0.01)
             ticks = []
 
             class Probe(BotTask):
                 async def tick(self, client):
+                    # Without a connection this send raises ConnectionError,
+                    # which would permanently fail the task.
+                    await client.talk("hello", "sage")
                     ticks.append(client.state.map.path)
 
-            engine.set_task(Probe("probe"))
+            probe = Probe("probe")
+            engine.set_task(probe)
             engine.running = True
             runner = asyncio.create_task(engine.run())
-            await asyncio.sleep(0.05)
-            self.assertEqual(ticks, [])
+            # The whole reconnect holds the task: disconnected, connecting
+            # (even with a stale map), then playing before the first MAP2.
+            for phase, path in (("disconnected", ""), ("connecting", "/stale"),
+                                ("playing", "")):
+                client.state.phase = phase
+                client.state.map.path = path
+                await asyncio.sleep(0.05)
+                self.assertEqual(ticks, [], phase)
+                self.assertIs(engine.task, probe, phase)
+            sent = []
+
+            async def send(packet):
+                sent.append(packet)
+
+            client.send = send
             client.state.map.path = "/shattered_islands/world_14_77"
             await asyncio.sleep(0.05)
             engine.running = False

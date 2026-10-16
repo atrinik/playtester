@@ -4924,10 +4924,12 @@ class TaskEngine:
                 await asyncio.sleep(self.tick_rate)
                 continue
             state = self.client.state
-            if (self.task is not None and state.phase == "playing" and
-                    not state.map.path):
-                # A reconnect reaches "playing" before its first MAP2: do not
-                # plan against the empty map that login just reset.
+            if (self.task is not None and
+                    (state.phase != "playing" or not state.map.path)):
+                # Hold the task through a whole reconnect: while disconnected
+                # or connecting there is no writer to send on, and "playing"
+                # arrives before the first MAP2, so do not plan against the
+                # empty map that login just reset either.
                 await asyncio.sleep(self.tick_rate)
                 continue
             if self.task is not None:
