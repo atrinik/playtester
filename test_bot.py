@@ -2431,8 +2431,11 @@ class QuestTests(unittest.TestCase):
         client.state.active_upgrade_shop_sweep_cursor = 76
         resumed = circuit._new_upgrade_shopping(client)
         self.assertEqual(resumed.index, 76)
-        self.assertEqual(resumed.waypoints[resumed.index][0],
-                         "/shattered_islands/world_6_46")
+        # Resume the exact persisted waypoint of the deterministic sweep; which
+        # map that index lands on follows the authored shop stock in content.
+        self.assertEqual(resumed.waypoints, regional.waypoints)
+        self.assertEqual(resumed.waypoints[resumed.index],
+                         regional.waypoints[76])
         # Centennial's nominal map currently has no authored unpaid stock
         # tiles, so it is correctly absent rather than creating empty travel.
         self.assertFalse(graph.shop_stocks[

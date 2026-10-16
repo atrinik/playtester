@@ -1,19 +1,19 @@
 {
   "schema_version": 2,
-  "bundle_version": "protocol-v5.90.0-pathfinding-v5.48.0-content-v1.0.0",
+  "bundle_version": "protocol-v5.90.0-pathfinding-v5.48.0-content-v1.14.0",
   "inputs": {
     "content": {
       "repository": "atrinik/content",
       "branch": "main",
-      "revision": "63eb9bb5f02fb9104c2385d5e01c28c3df20b735",
-      "release": "v1.0.0",
+      "revision": "49f5aab195feb94820193b3fc835989582da7823",
+      "release": "v1.14.0",
       "license": "LicenseRef-Atrinik-Content",
       "disposition": "external tooling, catalog, and runtime input; not distributed",
       "source": {
-        "artifact": "atrinik-content-1.0.0.tar.gz",
-        "url": "https://github.com/atrinik/content/releases/download/v1.0.0/atrinik-content-1.0.0.tar.gz",
-        "sha256": "922cd119b3e0c71aab7d5f83eab538c120d537b584f12d039eced7ecf9b63924",
-        "root": "atrinik-content-1.0.0",
+        "artifact": "atrinik-content-1.14.0.tar.gz",
+        "url": "https://github.com/atrinik/content/releases/download/v1.14.0/atrinik-content-1.14.0.tar.gz",
+        "sha256": "d60ba286dac7c88400eb6f1822814ecdac4a81e0e8687cd7a0263f9c0f699eaa",
+        "root": "atrinik-content-1.14.0",
         "max_download_bytes": 67108864,
         "max_members": 25000,
         "max_unpacked_bytes": 268435456,
@@ -26,10 +26,10 @@
         }
       },
       "classic_runtime": {
-        "artifact": "atrinik-content-1.0.0-classic-runtime.tar.gz",
-        "url": "https://github.com/atrinik/content/releases/download/v1.0.0/atrinik-content-1.0.0-classic-runtime.tar.gz",
-        "sha256": "e1bffdd1b492472ef594b558c322c655976a95888e7a1d0ab6a56ade2a21b0d5",
-        "root": "atrinik-content-1.0.0-classic-runtime",
+        "artifact": "atrinik-content-1.14.0-classic-runtime.tar.gz",
+        "url": "https://github.com/atrinik/content/releases/download/v1.14.0/atrinik-content-1.14.0-classic-runtime.tar.gz",
+        "sha256": "e7a761f328c23e9c596506dbb003610d56b6ff50bb33998db041c6da5018bc94",
+        "root": "atrinik-content-1.14.0-classic-runtime",
         "format": "atrinik-classic-runtime-content-v1",
         "max_download_bytes": 67108864,
         "max_members": 10000,

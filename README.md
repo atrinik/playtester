@@ -75,8 +75,8 @@ from already downloaded files without network access:
 
 ```sh
 atrinik-playtester dependencies \
-  --source-archive /media/atrinik-content-1.0.0.tar.gz \
-  --runtime-archive /media/atrinik-content-1.0.0-classic-runtime.tar.gz \
+  --source-archive /media/atrinik-content-1.14.0.tar.gz \
+  --runtime-archive /media/atrinik-content-1.14.0-classic-runtime.tar.gz \
   --offline
 ```
 

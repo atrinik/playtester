@@ -153,11 +153,11 @@ class CompatibilityTests(unittest.TestCase):
         content = lock["inputs"]["content"]
         self.assertEqual(content["branch"], "main")
         self.assertEqual(content["revision"],
-                         "63eb9bb5f02fb9104c2385d5e01c28c3df20b735")
-        self.assertEqual(content["release"], "v1.0.0")
+                         "49f5aab195feb94820193b3fc835989582da7823")
+        self.assertEqual(content["release"], "v1.14.0")
         self.assertEqual(
             content["classic_runtime"]["sha256"],
-            "e1bffdd1b492472ef594b558c322c655976a95888e7a1d0ab6a56ade2a21b0d5",
+            "e7a761f328c23e9c596506dbb003610d56b6ff50bb33998db041c6da5018bc94",
         )
         pathfinding = lock["inputs"]["pathfinding"]
         self.assertEqual(pathfinding["repository"], "atrinik/classic")
@@ -224,7 +224,7 @@ class CompatibilityTests(unittest.TestCase):
         def missing_asset(request, timeout):
             url = request.full_url
             if "/releases/tags/" in url:
-                return Response({"tag_name": "v1.0.0", "assets": []})
+                return Response({"tag_name": "v1.14.0", "assets": []})
             return Response({"sha": specs[0]["revision"]})
 
         with self.assertRaisesRegex(compatibility.CompatibilityError, "missing asset"):
@@ -238,7 +238,7 @@ class CompatibilityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             compatibility.CompatibilityError,
-            "repository atrinik/content or tag v1.0.0 is unavailable",
+            "repository atrinik/content or tag v1.14.0 is unavailable",
         ):
             compatibility.preflight_lock(
                 lock, opener=missing_repository,
