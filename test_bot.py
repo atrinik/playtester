@@ -10729,6 +10729,15 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         status, payload = await self.request("GET", "/api/state?include=inventory")
         apple = next(i for i in json.loads(payload)["inventory"] if i["tag"] == 601)
         self.assertEqual(apple["face"], "apple.101")
+        relic = Item(602, name="relic", face=12, flags=(
+            c.ITEM_MAGICAL | c.ITEM_DAMNED | c.ITEM_UNPAID | c.ITEM_TRAPPED))
+        self.client.state.place_item(relic, 7)
+        status, payload = await self.request("GET", "/api/state?include=inventory")
+        relic = next(i for i in json.loads(payload)["inventory"] if i["tag"] == 602)
+        self.assertEqual(
+            {k: relic[k] for k in ("magical", "cursed", "damned", "unpaid", "trapped", "locked")},
+            {"magical": True, "cursed": True, "damned": True, "unpaid": True,
+             "trapped": True, "locked": False})
 
     async def test_dashboard_pickup_moves_only_an_underfoot_item(self):
         self.client.state.player_tag = 7
@@ -10829,7 +10838,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=9", page)
+        self.assertIn(b"/app.js?v=10", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

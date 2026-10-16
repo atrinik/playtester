@@ -457,6 +457,10 @@ class DashboardState:
                 "applied": bool(item.flags & c.ITEM_APPLIED),
                 "locked": bool(item.flags & c.ITEM_LOCKED),
                 "magical": bool(item.flags & c.ITEM_MAGICAL),
+                "cursed": bool(item.flags & (c.ITEM_CURSED | c.ITEM_DAMNED)),
+                "damned": bool(item.flags & c.ITEM_DAMNED),
+                "unpaid": bool(item.flags & c.ITEM_UNPAID),
+                "trapped": bool(item.flags & c.ITEM_TRAPPED),
                 "equipped": item.tag in equipped,
                 "extra": item.extra,
             })

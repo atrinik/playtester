@@ -236,14 +236,26 @@ function visibleItems() {
 function slotClass(i) {
   return ["slot", i.equipped && "equipped", !i.equipped && i.applied && "applied", i.magical && "magical", i.cursed && "cursed", i.unpaid && "unpaid", i.tag === selectedTag && "selected"].filter(Boolean).join(" ");
 }
+// Corner markers like the graphical client: lock top-left, magic/curse
+// top-right, shop/trap/identification bottom-left.
+function markers(i) {
+  const tl = i.locked ? '<span class="mk tl" title="Locked">🔒</span>' : "";
+  const tr = [i.magical && '<b class="mk-magic" title="Magical">✦</b>', i.cursed && `<b class="mk-curse" title="${i.damned ? "Damned" : "Cursed"}">${i.damned ? "☠☠" : "☠"}</b>`].filter(Boolean).join("");
+  const bl = [i.unpaid && '<b class="mk-unpaid" title="Unpaid">$</b>', i.trapped && '<b class="mk-trap" title="Trapped">⚠</b>', i.identified === false && '<b class="mk-unid" title="Unidentified">?</b>'].filter(Boolean).join("");
+  return tl + (tr ? `<span class="mk tr">${tr}</span>` : "") + (bl ? `<span class="mk bl">${bl}</span>` : "");
+}
+function statusText(i) {
+  const s = [i.equipped && "equipped", !i.equipped && i.applied && "applied", i.magical && "magical", i.damned ? "damned" : i.cursed && "cursed", i.unpaid && "unpaid", i.trapped && "trapped", i.locked && "locked", i.identified === false && "unidentified"].filter(Boolean);
+  return s.length ? ` (${s.join(", ")})` : "";
+}
 function renderInventory() {
   const items = visibleItems();
-  const sig = JSON.stringify([items.map(i => [i.tag, i.quantity, i.equipped, i.applied, i.locked, i.face]), selectedTag, $("#inv-category").value]);
+  const sig = JSON.stringify([items.map(i => [i.tag, i.quantity, i.equipped, i.applied, i.locked, i.face, i.magical, i.cursed, i.damned, i.unpaid, i.trapped, i.identified]), selectedTag, $("#inv-category").value]);
   if (sig !== lastInvSig) {
     lastInvSig = sig;
     const grid = $("#inventory");
     const equipped = items.filter(i => i.equipped || i.applied), rest = items.filter(i => !(i.equipped || i.applied));
-    const slot = i => `<button class="${slotClass(i)}" data-tag="${i.tag}" title="${esc(i.name)}">${i.face ? `<img src="${faceUrl(i.face)}" alt="" loading="lazy">` : `<span class="fallback">${esc(i.name)}</span>`}${i.quantity > 1 ? `<span class="qty">${i.quantity}</span>` : ""}${i.locked ? '<span class="mark">🔒</span>' : ""}</button>`;
+    const slot = i => `<button class="${slotClass(i)}" data-tag="${i.tag}" title="${esc(i.name)}${statusText(i)}">${i.face ? `<img src="${faceUrl(i.face)}" alt="" loading="lazy">` : `<span class="fallback">${esc(i.name)}</span>`}${i.quantity > 1 ? `<span class="qty">${i.quantity}</span>` : ""}${markers(i)}</button>`;
     grid.innerHTML = (equipped.length && rest.length ? `<div class="inv-group">Worn & wielded</div>${equipped.map(slot).join("")}<div class="inv-group">Carried</div>` : equipped.map(slot).join("")) + rest.map(slot).join("") || '<span class="muted">No items</span>';
     $$("[data-tag]").forEach(b => (b.onclick = () => { selectedTag = +b.dataset.tag; renderInventory(); }));
   }
@@ -254,7 +266,7 @@ function renderItemDetail() {
   const box = $("#item-detail");
   if (!i) { box.className = "item-detail muted"; box.textContent = "Select an item to see details and actions."; return; }
   box.className = "item-detail";
-  const flags = [i.equipped && '<span class="flag good">equipped</span>', !i.equipped && i.applied && '<span class="flag good">applied</span>', i.locked && '<span class="flag warn">locked</span>', i.magical && '<span class="flag magic">magical</span>', i.cursed && '<span class="flag bad">cursed</span>', i.unpaid && '<span class="flag warn">unpaid</span>', !i.identified && '<span class="flag">unidentified</span>'].filter(Boolean).join("");
+  const flags = [i.equipped && '<span class="flag good">equipped</span>', !i.equipped && i.applied && '<span class="flag good">applied</span>', i.locked && '<span class="flag warn">locked</span>', i.magical && '<span class="flag magic">magical</span>', i.cursed && `<span class="flag bad">${i.damned ? "damned" : "cursed"}</span>`, i.trapped && '<span class="flag bad">trapped</span>', i.unpaid && '<span class="flag warn">unpaid</span>', !i.identified && '<span class="flag">unidentified</span>'].filter(Boolean).join("");
   const meta = [i.quantity > 1 && `×${i.quantity}`, i.weight != null && `${(+i.weight * Math.max(1, i.quantity)).toFixed(1)} kg`, i.condition != null && i.condition !== 255 && `condition ${i.condition}%`, i.required_level && `needs level ${i.required_level}`].filter(Boolean).join(" · ");
   box.innerHTML = `<div class="item-head">${i.face ? `<img src="${faceUrl(i.face)}" alt="">` : "<span></span>"}<div><strong>${esc(i.name)}</strong><div class="item-meta">${meta}</div><div>${flags}</div></div></div>
     <div class="item-actions">

@@ -106,11 +106,13 @@ details summary { cursor: pointer; color: var(--muted); margin-top: .6rem; font-
 .slot { position: relative; width: 52px; height: 52px; background: #10161a; border: 1px solid #263034; border-radius: 6px; padding: 0; display: grid; place-items: center; }
 .slot img { max-width: 48px; max-height: 48px; image-rendering: pixelated; }
 .slot .qty { position: absolute; right: 2px; bottom: 0; font-size: 11px; text-shadow: 0 0 2px #000, 0 0 2px #000; }
-.slot .mark { position: absolute; left: 2px; top: 0; font-size: 10px; }
+.slot .mk { position: absolute; font-size: 10px; line-height: 1; display: flex; gap: 1px; text-shadow: 0 0 2px #000, 0 0 2px #000; }
+.slot .mk.tl { left: 2px; top: 2px; } .slot .mk.tr { right: 2px; top: 2px; } .slot .mk.bl { left: 2px; bottom: 2px; }
+.mk-magic { color: #c9a4ff; } .mk-curse { color: #ff5a4c; } .mk-unpaid { color: #f2cf55; } .mk-trap { color: #ffad42; } .mk-unid { color: #9fd3ff; }
 .slot.equipped { border-color: var(--gold); box-shadow: inset 0 0 0 1px var(--gold); }
 .slot.applied { border-color: var(--green); }
-.slot.magical { background: #18142a; }
-.slot.cursed { background: #2a1414; }
+.slot.magical { background: #1c1633; box-shadow: inset 0 0 8px rgba(181, 139, 224, .35); }
+.slot.cursed { background: #2e1414; box-shadow: inset 0 0 8px rgba(224, 103, 91, .45); }
 .slot.unpaid { border-style: dashed; border-color: #d8b54a; }
 .slot.selected { outline: 2px solid var(--blue); outline-offset: 1px; }
 .slot .fallback { font-size: 9px; line-height: 1.1; color: var(--muted); padding: 2px; text-align: center; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; max-height: 48px; word-break: break-word; }
