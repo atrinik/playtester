@@ -9021,6 +9021,19 @@ class NavigationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.graph = built_graph()
 
+    def test_parallel_map_parsing_matches_sequential_order(self):
+        import os
+        from . import navigation
+        paths = list(navigation.map_files())[:96]
+        with patch.dict(os.environ, {"ATRINIK_GRAPH_WORKERS": "1"}):
+            sequential = navigation._parse_map_files(paths)
+        with patch.dict(os.environ, {"ATRINIK_GRAPH_WORKERS": "3"}):
+            parallel = navigation._parse_map_files(paths)
+        self.assertEqual(parallel, sequential)
+        for value, expected in (("4", 4), ("0", 1), ("bogus", 1)):
+            with patch.dict(os.environ, {"ATRINIK_GRAPH_WORKERS": value}):
+                self.assertEqual(navigation._graph_parse_workers(), expected)
+
     def test_world_graph(self):
         self.assertGreaterEqual(len(self.graph.nodes), 3600)
         route = self.graph.route(

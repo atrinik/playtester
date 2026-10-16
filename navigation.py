@@ -6,6 +6,8 @@ import ast
 import json
 import logging
 import math
+import multiprocessing
+import os
 import posixpath
 import re
 import xml.etree.ElementTree as ET
@@ -54,6 +56,35 @@ def content_attr(attrs: dict, key: str, default=None):
 # which is intentionally shaped for parse_blocks()' list-valued attributes.
 one = content_attr
 
+
+
+def _graph_parse_workers() -> int:
+    """Worker processes for map parsing: ATRINIK_GRAPH_WORKERS or up to 8 CPUs."""
+    configured = os.environ.get("ATRINIK_GRAPH_WORKERS", "").strip()
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError:
+            return 1
+    return max(1, min(8, os.cpu_count() or 1))
+
+
+def _parse_map_file(path: Path) -> dict:
+    return parse_blocks(path)
+
+
+def _parse_map_files(paths: list[Path]) -> list[dict]:
+    """Parse authored map files, in parallel where the platform allows.
+
+    Parsing dominates WorldGraph.build(). Forked workers inherit the loaded
+    content tooling; results return in input order, so the graph is identical
+    to a sequential build. Falls back to sequential parsing without fork.
+    """
+    workers = min(_graph_parse_workers(), len(paths))
+    if workers <= 1 or "fork" not in multiprocessing.get_all_start_methods():
+        return [parse_blocks(path) for path in paths]
+    with multiprocessing.get_context("fork").Pool(workers) as pool:
+        return pool.map(_parse_map_file, paths, chunksize=32)
 
 @dataclass(slots=True, frozen=True)
 class Waypoint:
@@ -428,8 +459,8 @@ class WorldGraph:
         apartments = _apartment_destinations(self.map_root)
         seller_interfaces = _dialogue_seller_interfaces(self.map_root)
         parsed_maps: dict[str, tuple[Path, dict]] = {}
-        for path in map_files():
-            parsed = parse_blocks(path)
+        paths = list(map_files())
+        for path, parsed in zip(paths, _parse_map_files(paths)):
             header = parsed["header"]
             if header is None:
                 continue
