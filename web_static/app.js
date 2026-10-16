@@ -11,11 +11,11 @@ const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party";
 const SLOW_KEYS = "decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
 // Server inventory also carries objects the real client keeps out of the bag.
-const HIDDEN_TYPES = new Set([29, 43, 114]); // spell, skill, force
+const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
   ["all", "All items", () => true],
   ["equipped", "Equipped", i => i.equipped || i.applied],
-  ["weapons", "Weapons & armour", i => [15, 16, 33, 34, 35, 87, 99, 100, 104, 113, 39, 70].includes(i.type)],
+  ["weapons", "Weapons & armour", i => [14, 15, 16, 33, 34, 35, 87, 99, 100, 104, 113, 39, 70].includes(i.type)],
   ["consumables", "Food, potions & scrolls", i => [5, 6, 54, 111, 109].includes(i.type)],
   ["missiles", "Missiles", i => i.type === 13],
   ["valuables", "Money & valuables", i => [36, 59, 60, 116, 117].includes(i.type)],
@@ -23,7 +23,7 @@ const CATEGORIES = [
   ["books", "Books & notes", i => [8, 80, 85].includes(i.type)],
 ];
 
-let live = {}, slow = {}, selectedTag = null, unreadChat = 0, seenMessages = -1;
+let live = {}, slow = {}, selectedTag = null, unreadChat = 0, lastMessageTime = null, lastMessageSig = "";
 
 // ---------- feedback ----------
 let toastTimer = 0;
@@ -48,8 +48,10 @@ async function act(button, label, path, data) {
     await post(path, data);
     toast(label);
     setTimeout(pollLive, 250);
+    return true;
   } catch (e) {
     toast(`${label} failed: ${e.message}`, true);
+    return false;
   } finally {
     if (button) { button.disabled = false; button.textContent = original; }
   }
@@ -125,6 +127,11 @@ function renderCharacter() {
   const e = live.economy || {};
   const money = v => { v = +v || 0; return `${Math.floor(v / 10000)}g ${Math.floor((v % 10000) / 100)}s ${v % 100}c`; };
   $("#wealth").textContent = `Carried ${money(e.carried)} · Bank ${e.bank_known ? money(e.banked) : "unknown"}`;
+  const cond = live.conditions || {};
+  $("#depletion").textContent = cond.depletion_points_known
+    ? `Depletion ${cond.depletion_points} / ${cond.depletion_threshold} before a priest visit`
+    : "Depletion unknown";
+  $("#depletion").classList.toggle("warn-text", !!cond.depletion_points_known && cond.depletion_points > 0);
 }
 
 // ---------- map: static isometric ground level ----------
@@ -156,7 +163,7 @@ function drawMap() {
       // Bottom-align to the tile, centred horizontally, like the client.
       ctx.drawImage(img, sx + (TW - img.width) / 2, sy + TH - img.height);
     }
-    const creature = [...t.objects].reverse().find(o => o.name && o.layer >= 5);
+    const creature = [...t.objects].reverse().find(o => o.name && o.layer % 7 === 5);
     const isTarget = targetId && t.objects.some(o => o.target_id === targetId);
     if (t.player) outline(sx, sy, "#d9ad5b", 2);
     else if (isTarget) outline(sx, sy, "#ff4b3e", 2);
@@ -290,7 +297,7 @@ function renderActivity() {
   const list = [...((($("#activity-mode").value === "actions" ? slow.actions : slow.decisions) || []))].reverse();
   const q = $("#activity-search").value.trim().toLowerCase();
   $("#activity").innerHTML = list.filter(a => !q || `${a.action} ${a.detail} ${a.map}`.toLowerCase().includes(q)).slice(0, 250).map(a =>
-    `<div class="act"><time>${new Date(a.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><b title="${esc(a.task)}">${esc(a.action)}</b><span>${esc(a.detail)}${a.map ? ` <span class="muted">· ${esc(a.map.split("/").pop())} ${a.x},${a.y}</span>` : ""}</span></div>`).join("") || '<span class="muted">No activity yet</span>';
+    `<div class="act"><time>${new Date(a.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><b title="${esc(a.task)}">${esc(a.action)}${a.count > 1 ? ` ×${a.count}` : ""}</b><span>${esc(a.detail)}${a.map ? ` <span class="muted">· ${esc(a.map.split("/").pop())} ${a.x},${a.y}</span>` : ""}</span></div>`).join("") || '<span class="muted">No activity yet</span>';
 }
 $("#activity-mode").onchange = renderActivity;
 $("#activity-search").oninput = renderActivity;
@@ -299,11 +306,16 @@ $("#activity-search").oninput = renderActivity;
 function renderChat() {
   const msgs = live.messages || [], box = $("#messages");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-  if (msgs.length !== seenMessages || !box.childElementCount) {
+  // The server keeps only the newest messages, so compare identities, not counts.
+  const newest = msgs.length ? msgs[msgs.length - 1] : null;
+  const sig = newest ? `${newest.time}|${newest.text}|${msgs.length}` : "";
+  if (sig !== lastMessageSig || !box.childElementCount) {
     box.innerHTML = msgs.map(m => `<div class="msg"><time>${new Date(m.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span style="color:#${/^[0-9a-f]{6}$/i.test(m.color || "") ? m.color : "e8e4d6"}">${esc(clean(m.text))}</span></div>`).join("");
     // The first load is history, not unread chat.
-    if (seenMessages >= 0 && !$("#tab-chat").classList.contains("active")) unreadChat += Math.max(0, msgs.length - seenMessages);
-    seenMessages = msgs.length;
+    if (lastMessageTime !== null && !$("#tab-chat").classList.contains("active"))
+      unreadChat += msgs.filter(m => m.time > lastMessageTime).length;
+    lastMessageTime = newest ? newest.time : lastMessageTime ?? 0;
+    lastMessageSig = sig;
     if (atBottom) box.scrollTop = box.scrollHeight;
   }
   $("#chat-badge").textContent = unreadChat ? Math.min(unreadChat, 99) : "";
@@ -311,13 +323,13 @@ function renderChat() {
   $("#dialogue").innerHTML = d ? `<b>${esc(d.title)}</b><p>${esc(d.text)}</p>${d.links.map((l, i) => `<button data-link="${i}">${esc(l)}</button>`).join("")}` : "";
   $$("[data-link]").forEach(b => (b.onclick = () => action(b, `Chose “${b.textContent}”`, { type: "dialog", index: +b.dataset.link })));
 }
-$("#chat-form").onsubmit = e => { e.preventDefault(); const v = $("#chat-input").value.trim(); if (v) action(e.submitter, `Said: ${v}`, { type: "chat", text: v }).then(() => ($("#chat-input").value = "")); };
-$("#command-form").onsubmit = e => { e.preventDefault(); const v = $("#command-input").value.trim(); if (v) action(e.submitter, `Ran ${v}`, { type: "command", command: v }).then(() => ($("#command-input").value = "")); };
+$("#chat-form").onsubmit = e => { e.preventDefault(); const v = $("#chat-input").value.trim(); if (v) action(e.submitter, `Said: ${v}`, { type: "chat", text: v }).then(ok => { if (ok) $("#chat-input").value = ""; }); };
+$("#command-form").onsubmit = e => { e.preventDefault(); const v = $("#command-input").value.trim(); if (v) action(e.submitter, `Ran ${v}`, { type: "command", command: v }).then(ok => { if (ok) $("#command-input").value = ""; }); };
 
 // ---------- quests, places, tasks ----------
 let lastSlowSig = "";
 function renderSlowLists() {
-  const sig = JSON.stringify([slow.quests, slow.quest_journal, (slow.farm_spots || []).length, (slow.navigation_spots || []).length]);
+  const sig = JSON.stringify([slow.quests, slow.quest_journal, (slow.farm_spots || []).length, (slow.navigation_spots || []).length, (live.stats || {}).level]);
   if (sig === lastSlowSig) return;
   lastSlowSig = sig;
   $("#quest-journal").innerHTML = (slow.quest_journal || []).map(q => `<div class="quest ${esc(q.status)}"><strong>${esc(q.name)}</strong><span class="flag">${esc(q.status)}</span></div>`).join("") || '<span class="muted">Journal not loaded — press Refresh.</span>';
@@ -325,10 +337,13 @@ function renderSlowLists() {
   $$("[data-quest]").forEach(b => (b.onclick = () => task(b, `Started quest ${b.dataset.quest}`, { type: "quest", name: b.dataset.quest })));
   const level = (live.stats || {}).level || 1;
   $("#farm-spot").innerHTML = (slow.farm_spots || []).map(s => `<option value="${esc(s.id)}" ${s.min_level <= level && level <= s.max_level ? "" : 'class="muted"'}>${esc(s.name)} · L${s.min_level}–${s.max_level}${s.min_level <= level && level <= s.max_level ? " ✓" : ""}</option>`).join("");
+  const chosen = $("#farm-spot").dataset.chosen;
   const fit = (slow.farm_spots || []).find(s => s.min_level <= level && level <= s.max_level);
-  if (fit) $("#farm-spot").value = fit.id;
+  if (chosen && (slow.farm_spots || []).some(s => s.id === chosen)) $("#farm-spot").value = chosen;
+  else if (fit) $("#farm-spot").value = fit.id;
   $("#nav-spot").innerHTML = '<option value="">Known destinations…</option>' + (slow.navigation_spots || []).map(s => `<option value="${esc(s.id)}">${esc(s.name)} · ${esc(s.category)}</option>`).join("");
 }
+$("#farm-spot").onchange = () => ($("#farm-spot").dataset.chosen = $("#farm-spot").value);
 $("#nav-spot").onchange = () => { const s = (slow.navigation_spots || []).find(x => x.id === $("#nav-spot").value); if (s) { $("#nav-map").value = s.destination; $("#nav-x").value = s.x ?? ""; $("#nav-y").value = s.y ?? ""; } };
 $("#resume").onclick = e => task(e.target, "Autoplay started", { type: "autoplay", until_level: 115 });
 $("#stop").onclick = e => task(e.target, "Stopped — Sera is idle", { type: "stop" });
@@ -362,7 +377,7 @@ async function pollLive() {
     const r = await fetch(`/api/state?include=${LIVE_KEYS}`, { cache: "no-store" });
     if (!r.ok) throw Error(`${r.status} ${r.statusText}`);
     live = await r.json();
-    renderHeader(); renderVitals(); renderTask(); renderCharacter(); drawMap(); renderGround(); renderInventory(); renderChat();
+    renderHeader(); renderVitals(); renderTask(); renderCharacter(); drawMap(); renderGround(); renderInventory(); renderChat(); renderSlowLists();
   } catch (e) {
     $("#connection").textContent = `Dashboard offline (${e.message})`;
     $("#connection-dot").classList.remove("on");

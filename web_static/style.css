@@ -19,7 +19,7 @@ input, select, textarea { background: #0f1416; border: 1px solid var(--line); bo
 input[type=number] { width: 5.5em; }
 h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 .5rem; }
 h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: .8rem 0 .35rem; }
-.muted { color: var(--muted); } .small { font-size: 12px; } .mono { font-family: ui-monospace, monospace; }
+.muted { color: var(--muted); } .warn-text { color: var(--gold); } .small { font-size: 12px; } .mono { font-family: ui-monospace, monospace; }
 .row { display: flex; gap: .4rem; align-items: center; } .row > input:not([type=number]) { flex: 1; }
 .between { justify-content: space-between; }
 .scroll { overflow: auto; min-height: 0; }

@@ -109,6 +109,15 @@ def _clean_markup(text: str) -> str:
     return re.sub(r"\[[^]]+\]", "", text).strip()
 
 
+def item_visual_name(client: AtrinikClient, item: Any) -> str:
+    """Name the client would draw: the animation when one is set, else the face."""
+    if getattr(item, "animation", 0):
+        name = getattr(client, "animations", {}).get(item.animation, "")
+        if name:
+            return name
+    return getattr(client, "faces", {}).get(item.face, "")
+
+
 class DashboardState:
     def __init__(self, client: AtrinikClient, engine: TaskEngine,
                  graph: WorldGraph, catalog: dict[str, QuestDefinition]):
@@ -449,7 +458,7 @@ class DashboardState:
             inventory.append({
                 "tag": item.tag, "name": item.name, "quantity": item.quantity,
                 "face_id": item.face,
-                "face": self.client.faces.get(item.face, ""),
+                "face": item_visual_name(self.client, item),
                 "weight": item.weight, "type": item.item_type,
                 "quality": item.quality, "condition": item.condition,
                 "identified": InventoryPolicy().identified(item),
@@ -494,7 +503,7 @@ class DashboardState:
         ground = [{
             "tag": item.tag, "name": item.name, "quantity": item.quantity,
             "face_id": item.face,
-            "face": self.client.faces.get(item.face, ""),
+            "face": item_visual_name(self.client, item),
             "type": item.item_type,
             "quality": item.quality, "condition": item.condition,
             "identified": (item.quality != 255
