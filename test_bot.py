@@ -6107,10 +6107,26 @@ class QuestTests(unittest.TestCase):
         # The abandoned engagement and selection are dropped entirely.
         self.assertIsNone(farm._engaged_target)
         self.assertEqual(client.cleared_targets, 1)
+
         # Its squares (view (9, 8) is world (11, 10)) are marked so the route
         # steers around it; her own square stays open.
         self.assertIn((11, 10), task.navigation._threat_blocked)
         self.assertNotIn((10, 10), task.navigation._threat_blocked)
+
+        # Also for a committed creature beyond the nearby radius.
+        far = MapObject(3, 1, 0, 0, name="sword spider", target_id=101, target_hp=55)
+        client.state.map.tiles.clear()
+        client.state.map.tile(14, 8).objects[3] = far
+        client.state.target_id = far.target_id
+        farm.remember_engagement(client, 14, 8, far.target_id)
+        task._last_pull_target = far.target_id
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIsNone(farm._engaged_target)
+        self.assertEqual(task._last_pull_target, 0)
+        self.assertEqual(client.cleared_targets, 2)
+        self.assertIn(("navigation-transit-hold-fire", "target=101"), client.decisions)
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = target
 
         # On the destination map the farm's own combat applies as before.
         client.state.map.path = "/farm"

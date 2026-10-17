@@ -3001,27 +3001,32 @@ class NavigateThenTask(BotTask):
                 await self._retreat_step(
                     client, nearby, avoid_backtrack=True)
             return True
-        if hold_fire and nearby:
-            # Keep walking; mark their squares so the route steers around.
-            self._halo_threats(client, nearby, radius=1)
-            if getattr(client.state, "combat", False):
-                await client.set_combat(False)
+        combat_released = False
+        if hold_fire:
             engaged = (self.task._engaged_target
                        if isinstance(self.task, FarmTask) else None)
             abandoned = self._last_pull_target or (engaged[0] if engaged else 0)
             if abandoned:
+                # Drop the engagement entirely, wherever the creature is: a
+                # kept FarmTask engagement would hold patrol and steer
+                # retreats around a creature left behind on this map.
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("navigation-transit-hold-fire",
                              f"target={abandoned}")
-                # Drop the engagement entirely: a kept FarmTask engagement
-                # would hold patrol and steer retreats around a creature
-                # left behind on this map.
                 self._last_pull_target = 0
                 if engaged is not None:
                     self.task._engaged_target = None
+                if getattr(client.state, "combat", False):
+                    await client.set_combat(False)
+                    combat_released = True
                 if getattr(client.state, "target_id", 0):
                     await client.clear_target()
+        if hold_fire and nearby:
+            # Keep walking; mark their squares so the route steers around.
+            self._halo_threats(client, nearby, radius=1)
+            if getattr(client.state, "combat", False) and not combat_released:
+                await client.set_combat(False)
             self._defending = False
             return False
         # Only close a short gap. Chasing a merely visible target across the
