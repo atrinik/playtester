@@ -6224,11 +6224,225 @@ class QuestTests(unittest.TestCase):
             graph, "/farm", farm, combat_approach=True,
             safety=farm.safety)
         task._last_pull_target = target.target_id
+        # Cornered in transit: the giant is hitting her and the route has
+        # made no progress, so defending is the last resort.
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "hill giant hit you for 9 damage.")]
+        self._corner(task, client)
 
         self.assertTrue(asyncio.run(
             task._defend_while_navigating(client)))
         self.assertTrue(client.direct_moves)
         self.assertEqual(task._last_pull_target, target.target_id)
+
+    def test_pack_avoidance_does_not_restart_the_cornered_clock(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 12
+        client.state.map.world_y = 12
+        # A two-member pack five tiles off: transit avoids it and replans.
+        client.state.map.tile(13, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="spider", target_id=300, target_hp=100)
+        client.state.map.tile(13, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="spider", target_id=301, target_hp=100)
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider hit you for 3 damage.")]
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node}
+        task = NavigateThenTask(
+            graph, "/shop", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        self._corner(task, client)
+        moved_at = task._last_moved_at
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        # The replan refreshed the navigation's clock, not the movement one.
+        self.assertGreater(task.navigation._last_progress, moved_at)
+        self.assertEqual(task._last_moved_at, moved_at)
+        # Still standing there and being hit, one closes in: she is cornered.
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="spider", target_id=300, target_hp=100)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(client.targets)
+
+    def test_failed_first_route_under_attack_leaves_room_to_defend(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="sword spider", target_id=100, target_hp=55)
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "sword spider hit you for 3 damage.")]
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/island": MapNode("/island", width=5, height=5)}
+        task = NavigateThenTask(
+            graph, "/island", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task.status = TaskStatus.RUNNING
+        # She has just moved, so the first tick holds fire and plans; the
+        # plan fails (the island has no way in), but the trip does not end
+        # while she is being hit ...
+        m = client.state.map
+        task._last_position = (m.path, m.world_x, m.world_y)
+        task._last_moved_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.navigation.status, TaskStatus.FAILED)
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertEqual(client.targets, [])
+        # ... so the next defensive tick fights back: no route is cornered.
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(client.targets)
+        # Once the contact ends (the first quiet tick ends the defence), the
+        # failure surfaces.
+        client.state.messages = []
+        client.state.map.tiles.clear()
+        asyncio.run(task.tick(client))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+
+    def test_pack_avoidance_also_releases_a_held_fire_engagement(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 12
+        client.state.map.world_y = 12
+        committed = MapObject(3, 1, 0, 0, name="spider", target_id=300, target_hp=100)
+        client.state.map.tile(13, 8).objects[3] = committed
+        client.state.map.tile(13, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="spider", target_id=301, target_hp=100)
+        client.state.target_id = committed.target_id
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        farm = FarmTask(zone="/farm", target="ice golem")
+        farm.remember_engagement(client, 13, 8, committed.target_id)
+        task = NavigateThenTask(graph, "/farm", farm, combat_approach=True,
+                                safety=farm.safety)
+        task._last_pull_target = committed.target_id
+        # The pack-avoidance replan returns early; the engagement goes too.
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task.navigation.route, [])
+        self.assertIsNone(farm._engaged_target)
+        self.assertEqual(task._last_pull_target, 0)
+        self.assertEqual(client.cleared_targets, 1)
+
+    def test_combat_steps_do_not_end_the_last_resort(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="sword spider", target_id=100, target_hp=55)
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "sword spider hit you for 3 damage.")]
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5), combat_approach=True)
+        self._corner(task, client)
+        moved_at = task._last_moved_at
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(task._defending)
+        # A defensive step moves her; she keeps defending instead of
+        # treating it as renewed route progress.
+        client.state.map.world_x = 11
+        task._last_defense_action = 0.0
+        client.targets.clear()
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task._last_moved_at, moved_at)
+        self.assertTrue(client.targets)
+
+    @staticmethod
+    def _corner(task, client):
+        """She has stood on this square past the cornered threshold."""
+        m = client.state.map
+        task._last_position = (m.path, m.world_x, m.world_y)
+        task._last_moved_at = time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1
+
+    def test_transit_holds_fire_while_the_route_still_progresses(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        target = MapObject(
+            3, 1, 0, 0, name="sword spider", target_id=100, target_hp=55)
+        client.state.map.tile(9, 8).objects[3] = target
+        client.state.target_id = target.target_id
+        client.state.combat = True
+        # Hit, but still walking: keep going instead of fighting.
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "sword spider hit you for 2 damage.")]
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        transit = MapNode(path="/test", width=25, height=25)
+        transit.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": transit, "/farm": MapNode(path="/farm", width=24, height=24)}
+        farm = FarmTask(zone="/farm", target="ice golem")
+        farm.remember_engagement(client, 9, 8, target.target_id)
+        task = NavigateThenTask(
+            graph, "/farm", farm, combat_approach=True, safety=farm.safety)
+        task._last_pull_target = target.target_id
+
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.targets, [])
+        self.assertEqual(client.combat, [False])
+        self.assertEqual(task._last_pull_target, 0)
+        self.assertIn(("navigation-transit-hold-fire", "target=100"), client.decisions)
+        # The abandoned engagement and selection are dropped entirely.
+        self.assertIsNone(farm._engaged_target)
+        self.assertEqual(client.cleared_targets, 1)
+
+        # Its squares (view (9, 8) is world (11, 10)) are marked so the route
+        # steers around it; her own square stays open.
+        self.assertIn((11, 10), task.navigation._threat_blocked)
+        self.assertNotIn((10, 10), task.navigation._threat_blocked)
+        # The click path in flight, planned without it, is cancelled once.
+        self.assertEqual(client.clears, 1)
+        self.assertIsNone(task.navigation._issued_click)
+        task.navigation._issued_click = ("/test", 12, 12)
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.clears, 1)
+        self.assertEqual(task.navigation._issued_click, ("/test", 12, 12))
+        # The same creature moving rebuilds its halo, and the click with it.
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 9).objects[3] = target
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.clears, 2)
+        self.assertIsNone(task.navigation._issued_click)
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = target
+
+        # Also for a committed creature beyond the nearby radius.
+        far = MapObject(3, 1, 0, 0, name="sword spider", target_id=101, target_hp=55)
+        client.state.map.tiles.clear()
+        client.state.map.tile(14, 8).objects[3] = far
+        client.state.target_id = far.target_id
+        farm.remember_engagement(client, 14, 8, far.target_id)
+        task._last_pull_target = far.target_id
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIsNone(farm._engaged_target)
+        self.assertEqual(task._last_pull_target, 0)
+        self.assertEqual(client.cleared_targets, 2)
+        self.assertIn(("navigation-transit-hold-fire", "target=101"), client.decisions)
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = target
+
+        # On the destination map the farm's own combat applies as before.
+        client.state.map.path = "/farm"
+        graph.nodes["/farm"].terrain = transit.terrain
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
 
     def test_farm_navigation_recovers_hp_and_mana_before_advancing(self):
         client = self._combat_client()
@@ -6299,11 +6513,20 @@ class QuestTests(unittest.TestCase):
         task = NavigateThenTask(
             graph, "/shop", BuyGroundItemsTask(r"^staple food$", 5),
             combat_approach=True)
+        # Not cornered: two healthy threats are walked around, not split.
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIsNone(task._retreat_attempt)
+        self.assertEqual(client.targets, [])
+        self.assertEqual(client.direct_moves, [])
+        # Cornered (hit, no route progress): split them before fighting.
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "kobold chief hit you for 4 damage.")]
+        self._corner(task, client)
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(task._last_pull_target, 0)
         self.assertIsNotNone(task._retreat_attempt)
         self.assertEqual(client.targets, [])
-        self.assertEqual(client.combat, [False])
+        self.assertEqual(client.combat[-1], False)
 
     def test_persistent_pack_at_exit_selects_an_alternate_route(self):
         client = self._combat_client()
@@ -6358,6 +6581,9 @@ class QuestTests(unittest.TestCase):
             return True
 
         task._retreat_step = retreat
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "kobold chief hit you for 4 damage.")]
+        self._corner(task, client)
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(calls, [{"avoid_backtrack": True}])
 
@@ -7148,6 +7374,7 @@ class QuestTests(unittest.TestCase):
         client.state.messages = [(
             time.time(), 2, "cc66ff",
             "stone giant hit you for 18 damage.")]
+        client.state.combat = True
         graph = WorldGraph()
         danger = MapNode(path="/danger", width=25, height=25)
         danger.terrain = {
@@ -9002,6 +9229,73 @@ class NavigationTests(unittest.TestCase):
         task._last_action = 0.0
         asyncio.run(task.tick(client))
         self.assertEqual(len(client.steps), 2)
+
+    def test_tiled_levels_are_pack_hazards_with_a_fallback_through_them(self):
+        def lane(path, width=3):
+            node = MapNode(path, width=width, height=1)
+            node.terrain = {(x, 0): 1 for x in range(width)}
+            return node
+
+        graph = WorldGraph()
+        town = "/shattered_islands/world_0_68"
+        farm = "/shattered_islands/world_1_50"
+        tunnel = "/shattered_islands/world_4_53_-2"
+        west = "/shattered_islands/world_-2_57"
+        nodes = {path: lane(path) for path in (town, farm, tunnel, west, "/interior/inn")}
+        graph.nodes.update(nodes)
+        for path in nodes:
+            graph.named_spawns[path] = []
+        graph.transit_max_aggro_pack = lambda path: 5 if path in (tunnel, west) else 0
+        surface = NavigateTask(graph, farm)
+        hazards = surface._known_pack_hazard_maps()
+        self.assertIn(tunnel, hazards)
+        self.assertIn(west, hazards)
+        self.assertNotIn("/interior/inn", hazards)
+
+        # Surface trip: the tunnel shortcut is avoided while a surface way
+        # round exists ...
+        nodes[town].edges.append(MapEdge(town, tunnel, 2, 0, 0, 0))
+        nodes[tunnel].edges.append(MapEdge(tunnel, farm, 2, 0, 0, 0))
+        nodes[town].edges.append(MapEdge(town, west, 0, 0, 2, 0))
+        nodes[west].edges.append(MapEdge(west, "/interior/inn", 0, 0, 2, 0))
+        nodes["/interior/inn"].edges.append(MapEdge("/interior/inn", farm, 0, 0, 0, 0))
+        graph.transit_max_aggro_pack = lambda path: 5 if path == tunnel else 0
+
+        class FakeClient:
+            def __init__(self, path):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(path=path, width=17, height=17,
+                                          world_x=1, world_y=0)
+
+        route = NavigateTask(graph, farm)._plan(FakeClient(town))
+        self.assertNotIn(tunnel, [edge.destination for edge in route])
+        # ... but taken, avoiding the rest, when it is the only way.
+        nodes[town].edges = [edge for edge in nodes[town].edges if edge.destination == tunnel]
+        graph._world_search_snapshot = None
+        route = NavigateTask(graph, farm)._plan(FakeClient(town))
+        self.assertEqual([edge.destination for edge in route], [tunnel, farm])
+
+        # When every way needs an over-levelled map, relaxing that hazard
+        # still avoids the tunnel if a pack-free route exists, even though
+        # the way through the tunnel would be shorter.
+        outer = "/shattered_islands/world_2_60"
+        other = "/shattered_islands/world_5_55"
+        ring = ["/shattered_islands/world_3_60", "/shattered_islands/world_3_61"]
+        for path in (outer, other, *ring):
+            graph.nodes[path] = lane(path)
+            graph.named_spawns[path] = []
+        nodes[town].edges = [MapEdge(town, tunnel, 2, 0, 0, 0),
+                             MapEdge(town, outer, 0, 0, 0, 0)]
+        nodes[tunnel].edges = [MapEdge(tunnel, other, 2, 0, 0, 0)]
+        graph.nodes[other].edges = [MapEdge(other, farm, 2, 0, 0, 0)]
+        graph.nodes[outer].edges = [MapEdge(outer, ring[0], 2, 0, 0, 0)]
+        graph.nodes[ring[0]].edges = [MapEdge(ring[0], ring[1], 2, 0, 0, 0)]
+        graph.nodes[ring[1]].edges = [MapEdge(ring[1], farm, 2, 0, 0, 0)]
+        graph._world_search_snapshot = None
+        task = NavigateTask(graph, farm)
+        task._known_overlevel_hazard_maps = lambda client: {outer, other}
+        route = task._plan(FakeClient(town))
+        self.assertEqual([edge.destination for edge in route], [outer, *ring, farm])
 
     def test_stalled_click_path_learns_live_blocker(self):
         class FakeClient:
