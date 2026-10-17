@@ -19,6 +19,7 @@ from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                   POLICIES, RECOMMENDED_QUEST_ORDER)
 from .autoplay import AutoplayTask
 from .build_info import build_info
+from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
 from .farm_spots import farm_spot_catalog
@@ -572,7 +573,16 @@ class DashboardState:
             "messages": messages, "interface": interface,
             "quests_loaded": state.quests_loaded, "quests": self.quests(),
             "quest_journal": self.quest_journal(),
+            "farming_analysis": self.farming_analysis(),
         }
+
+    def farming_analysis(self) -> dict[str, Any]:
+        analyzer = getattr(self.client, "farm_analyzer", None)
+        objective = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
+        if analyzer is None:
+            return {"status": "unavailable", "objective": objective,
+                    "objectives": OBJECTIVES, "ranking": []}
+        return analyzer.snapshot(objective)
 
 
 class WebControlServer:
@@ -893,6 +903,12 @@ class WebControlServer:
 
     async def _action(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
+        if kind == "farm_objective":
+            objective = str(data.get("objective", ""))
+            if objective not in OBJECTIVES:
+                raise ValueError(f"unknown farming objective {objective!r}")
+            self.client.set_farm_objective(objective)
+            return {"ok": True, "objective": objective}
         if kind == "chat":
             text = str(data.get("text", "")).strip()
             if not text:

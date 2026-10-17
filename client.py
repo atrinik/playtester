@@ -15,6 +15,7 @@ from typing import Awaitable, Callable
 
 from . import constants as c
 from .access_codes import normalize_access_code
+from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .model import Character, GameState, InterfaceState, Item, MapObject, MapState
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
@@ -175,6 +176,8 @@ class AtrinikClient:
         )
         self.faces = self._load_faces()
         self.animations = self._load_animations()
+        # Background farm ranking; set by the CLI when the bundle provides it.
+        self.farm_analyzer = None
 
     def load_character_memory(self, character: str) -> None:
         memory = self._memory_store()
@@ -274,6 +277,9 @@ class AtrinikClient:
                 self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = bool(
                 record.get("apartment_bed_bound", False))
+            objective = record.get("farm_objective", DEFAULT_OBJECTIVE)
+            self.state.farm_objective = (
+                objective if objective in OBJECTIVES else DEFAULT_OBJECTIVE)
             try:
                 self.state.last_bank_deposit_at = max(
                     0.0, float(record.get("last_bank_deposit_at", 0.0)))
@@ -308,6 +314,7 @@ class AtrinikClient:
             self.state.farm_zone_last_checked = {}
             self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = False
+            self.state.farm_objective = DEFAULT_OBJECTIVE
             self.state.bank_balance = 0
             self.state.bank_balance_known = False
             self.state.bank_balance_observed_at = 0.0
@@ -411,6 +418,17 @@ class AtrinikClient:
             return
         self._runtime_memory.setdefault(character, {})[
             "vendor_quotes"] = dict(self.state.vendor_quotes)
+        self._persist_character_memory()
+
+    def set_farm_objective(self, objective: str) -> None:
+        """Persist which farming-analyzer ranking autoplay follows."""
+        if objective not in OBJECTIVES:
+            raise ValueError(f"unknown farming objective {objective!r}")
+        self.state.farm_objective = objective
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})["farm_objective"] = objective
         self._persist_character_memory()
 
     def set_apartment_bed_bound(self, bound: bool = True) -> None:

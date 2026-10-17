@@ -59,3 +59,10 @@ observed.
 
 External libraries, content tooling, and game data retain their own licenses
 as recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+Farm-spot rankings come from the MIT `atrinik/tools` farming analyzer, run as a
+separate locked process. It derives XP colors and caps by reading the
+GPL-2.0-or-later Classic server's `exp.c` and `skill_util.c` as text; the
+playtester passes only its own measured combat statistics in and reads the
+analyzer's JSON report out. No analyzer or server source is copied into this
+repository, and ranking results are gameplay estimates, not imported code.

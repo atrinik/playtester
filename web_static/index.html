@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Atrinik Observer</title>
-  <link rel="stylesheet" href="/style.css?v=12">
+  <link rel="stylesheet" href="/style.css?v=13">
 </head>
 <body>
   <header class="topbar">
@@ -77,6 +77,7 @@
         <button data-tab="activity">Activity</button>
         <button data-tab="chat">Chat <span id="chat-badge" class="badge"></span></button>
         <button data-tab="quests">Quests</button>
+        <button data-tab="farming">Farming</button>
         <button data-tab="tasks">Tasks</button>
       </nav>
 
@@ -111,6 +112,14 @@
         <div id="quests" class="list"></div>
       </div>
 
+      <div id="tab-farming" class="tab scroll">
+        <div class="row between"><h2>Farming analyzer</h2><span id="fa-status" class="muted small"></span></div>
+        <div id="fa-objectives" class="segmented" role="radiogroup" aria-label="Preferred farming objective"></div>
+        <p id="fa-profile" class="muted small"></p>
+        <div id="fa-ranking" class="list"></div>
+        <p class="muted small">Ranked by the farming analyzer from the locked content and Classic experience tables, simulating Sera's live combat stats. Rates are model estimates for comparing spots, not live measurements.</p>
+      </div>
+
       <div id="tab-tasks" class="tab scroll">
         <p class="muted small">Starting any of these replaces autoplay until it finishes; use <b>Start autoplay</b> to return to the campaign.</p>
         <section class="form">
@@ -140,6 +149,6 @@
     </section>
   </main>
   <div id="toast" role="status"></div>
-  <script src="/app.js?v=13"></script>
+  <script src="/app.js?v=14"></script>
 </body>
 </html>

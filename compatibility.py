@@ -36,6 +36,14 @@ REQUIRED_PROTOCOL_CONSTANTS = (
 )
 
 
+# Archive inputs unpacked beside the content, as (lock input, bundle directory).
+TOOL_INPUTS = (("farming_analyzer", "analyzer"), ("classic_server", "classic-server"))
+ARCHIVE_FIELDS = frozenset({
+    "artifact", "url", "sha256", "root", "max_download_bytes",
+    "max_members", "max_unpacked_bytes", "required_paths",
+})
+
+
 class CompatibilityError(RuntimeError):
     """A compatibility input is missing, unsafe, or inconsistent."""
 
@@ -43,6 +51,33 @@ class CompatibilityError(RuntimeError):
 def lock_path() -> Path:
     """Return the repository or installed-package compatibility lock."""
     return Path(__file__).with_name(LOCK_NAME)
+
+
+def _valid_revision(value) -> bool:
+    if not isinstance(value, str) or len(value) != 40:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_archive_spec(name: str, artifact) -> None:
+    """Require one complete, digest-pinned HTTPS archive with extraction limits."""
+    if not isinstance(artifact, dict) or not ARCHIVE_FIELDS.issubset(artifact):
+        raise CompatibilityError(f"{name} lock is incomplete")
+    try:
+        valid_digest = len(artifact["sha256"]) == 64 and int(artifact["sha256"], 16) >= 0
+    except (TypeError, ValueError):
+        valid_digest = False
+    if not valid_digest:
+        raise CompatibilityError(f"{name} SHA-256 is invalid")
+    parsed = urllib.parse.urlparse(artifact["url"])
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise CompatibilityError(f"{name} URL must use HTTPS")
+    if not isinstance(artifact["required_paths"], dict) or not artifact["required_paths"]:
+        raise CompatibilityError(f"{name} lock has no required paths")
 
 
 def load_lock(path: Path | None = None) -> dict:
@@ -57,7 +92,9 @@ def load_lock(path: Path | None = None) -> dict:
     if not isinstance(value.get("bundle_version"), str):
         raise CompatibilityError("compatibility lock has no bundle version")
     inputs = value.get("inputs")
-    if not isinstance(inputs, dict) or set(inputs) != {"content", "pathfinding", "protocol"}:
+    expected_inputs = {"content", "pathfinding", "protocol"} | {
+        name for name, _ in TOOL_INPUTS}
+    if not isinstance(inputs, dict) or set(inputs) != expected_inputs:
         raise CompatibilityError("compatibility lock inputs are incomplete")
     content = inputs["content"]
     if not isinstance(content, dict):
@@ -73,23 +110,15 @@ def load_lock(path: Path | None = None) -> dict:
     except ValueError as error:
         raise CompatibilityError("content revision is invalid") from error
     for name in ("source", "classic_runtime"):
-        artifact = content.get(name)
-        required = {
-            "artifact", "url", "sha256", "root", "max_download_bytes",
-            "max_members", "max_unpacked_bytes", "required_paths",
-        }
-        if not isinstance(artifact, dict) or not required.issubset(artifact):
-            raise CompatibilityError(f"content {name} lock is incomplete")
-        try:
-            valid_digest = len(artifact["sha256"]) == 64 and int(
-                artifact["sha256"], 16) >= 0
-        except (TypeError, ValueError):
-            valid_digest = False
-        if not valid_digest:
-            raise CompatibilityError(f"content {name} SHA-256 is invalid")
-        parsed = urllib.parse.urlparse(artifact["url"])
-        if parsed.scheme != "https" or not parsed.netloc:
-            raise CompatibilityError(f"content {name} URL must use HTTPS")
+        _validate_archive_spec(f"content {name}", content.get(name))
+    for name, _directory in TOOL_INPUTS:
+        tool = inputs[name]
+        if not isinstance(tool, dict) or not isinstance(tool.get("repository"), str) or \
+                not isinstance(tool.get("release"), str):
+            raise CompatibilityError(f"{name} lock is incomplete")
+        if not _valid_revision(tool.get("revision")):
+            raise CompatibilityError(f"{name} revision is invalid")
+        _validate_archive_spec(name, tool)
     for name, required in (
         ("pathfinding", {
             "repository", "release", "revision", "archive", "url", "sha256", "module",
@@ -163,6 +192,17 @@ def _release_specs(lock: dict) -> tuple[dict, ...]:
             "url": inputs["protocol"]["url"],
             "sha256": inputs["protocol"]["sha256"],
         },
+    ) + tuple(
+        {
+            "name": name,
+            "repository": inputs[name]["repository"],
+            "release": inputs[name]["release"],
+            "revision": inputs[name]["revision"],
+            "artifact": inputs[name]["artifact"],
+            "url": inputs[name]["url"],
+            "sha256": inputs[name]["sha256"],
+        }
+        for name, _directory in TOOL_INPUTS
     )
 
 
@@ -564,10 +604,14 @@ def inspect_bundle(cache: Path, lock: dict, *, full: bool) -> dict:
     if not isinstance(marker_inputs, dict):
         raise CompatibilityError("compatibility bundle marker is incomplete")
     content = lock["inputs"]["content"]
-    for name, directory in (("source", root / "source"), ("classic_runtime", root / "runtime")):
+    archives = [("source", root / "source", content["source"]),
+                ("classic_runtime", root / "runtime", content["classic_runtime"])]
+    archives += [(name, root / directory, lock["inputs"][name])
+                 for name, directory in TOOL_INPUTS]
+    for name, directory, spec in archives:
         if directory.is_symlink() or not directory.is_dir():
             raise CompatibilityError(f"cached {name} directory is missing or unsafe")
-        for relative, expected_type in content[name]["required_paths"].items():
+        for relative, expected_type in spec["required_paths"].items():
             candidate = directory / relative
             valid = candidate.is_file() if expected_type == "file" else candidate.is_dir()
             if not valid or candidate.is_symlink():
@@ -583,6 +627,8 @@ def inspect_bundle(cache: Path, lock: dict, *, full: bool) -> dict:
         "root": root,
         "source": root / "source",
         "runtime": root / "runtime",
+        "analyzer": root / "analyzer",
+        "classic_server": root / "classic-server",
         "marker": marker,
     }
 
@@ -593,9 +639,11 @@ def install_bundle(
     *,
     source_archive: Path | None = None,
     runtime_archive: Path | None = None,
+    analyzer_archive: Path | None = None,
+    server_archive: Path | None = None,
     offline: bool = False,
 ) -> dict:
-    """Install both content inputs as one immutable atomic cache generation."""
+    """Install every archive input as one immutable atomic cache generation."""
     cache = cache.expanduser().resolve()
     destination = bundle_root(cache, lock)
     if destination.exists():
@@ -607,12 +655,20 @@ def install_bundle(
     runtime = _archive_path(
         content["classic_runtime"], downloads, runtime_archive, offline=offline
     )
+    supplied = {"farming_analyzer": analyzer_archive, "classic_server": server_archive}
+    tools = [
+        (name, directory, lock["inputs"][name],
+         _archive_path(lock["inputs"][name], downloads, supplied[name], offline=offline))
+        for name, directory in TOOL_INPUTS
+    ]
     bundles = destination.parent
     bundles.mkdir(mode=0o700, parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix="bundle-", dir=bundles))
     try:
         _extract_archive(source, staging / "source", content["source"])
         _extract_archive(runtime, staging / "runtime", content["classic_runtime"])
+        for _name, directory, spec, archive in tools:
+            _extract_archive(archive, staging / directory, spec)
         marker = {
             "schema_version": 1,
             "lock_sha256": lock_digest(lock),
@@ -630,10 +686,21 @@ def install_bundle(
                     "archive_sha256": content["classic_runtime"]["sha256"],
                     "tree_sha256": _tree_digest(staging / "runtime"),
                 },
+                **{
+                    name: {
+                        "artifact": spec["artifact"],
+                        "archive_sha256": spec["sha256"],
+                        "release": spec["release"],
+                        "tree_sha256": _tree_digest(staging / directory),
+                    }
+                    for name, directory, spec, _archive in tools
+                },
             },
         }
         _make_tree_readonly(staging / "source")
         _make_tree_readonly(staging / "runtime")
+        for _name, directory, _spec, _archive in tools:
+            _make_tree_readonly(staging / directory)
         _write_json_atomic(staging / MARKER_NAME, marker)
         return _publish_staging(staging, destination, cache, lock)
     finally:
@@ -800,6 +867,17 @@ def doctor(cache: Path, lock: dict, *, verify_remote: bool = False) -> dict:
         return str(module)
 
     check("content-tooling", content_tools)
+
+    def farming_analyzer() -> str:
+        if installed is None:
+            raise CompatibilityError("content bundle is unavailable")
+        module = installed["analyzer"] / "farming_analyzer" / "__main__.py"
+        experience = installed["classic_server"] / "src" / "server" / "exp.c"
+        if not module.is_file() or not experience.is_file():
+            raise CompatibilityError("farming analyzer inputs are missing")
+        return f"{lock['inputs']['farming_analyzer']['release']} {module.parent}"
+
+    check("farming-analyzer", farming_analyzer)
 
     check("protocol", lambda: protocol_compatibility(lock))
     pathfinding = lock["inputs"]["pathfinding"]

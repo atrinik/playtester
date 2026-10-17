@@ -9,7 +9,7 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party";
-const SLOW_KEYS = "build,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
+const SLOW_KEYS = "build,farming_analysis,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -113,6 +113,44 @@ function renderBuild() {
   if (b.dirty) parts.push('<span class="warn-text" title="Built from a checkout with local changes">modified</span>');
   $("#build").innerHTML = parts.join(" · ");
 }
+// Farming analyzer: status, the objective toggle and that objective's ranking.
+const rate = v => { v = +v || 0; return v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${Math.round(v / 1e3)}k` : `${Math.round(v)}`; };
+const coins = v => { v = Math.round(+v || 0); return v >= 10000 ? `${(v / 10000).toFixed(1)}g` : v >= 100 ? `${Math.round(v / 100)}s` : `${v}c`; };
+const since = t => { const s = Math.max(0, Date.now() / 1000 - t); return s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`; };
+let lastFarmingSig = "";
+function renderFarming() {
+  const fa = slow.farming_analysis;
+  if (!fa) return;
+  const sig = JSON.stringify([fa.status, fa.objective, fa.finished_at, fa.error, fa.running]);
+  const status = $("#fa-status");
+  status.classList.toggle("warn-text", fa.status === "failed" || fa.status === "unsupported");
+  status.textContent = fa.running ? "Analyzing…"
+    : fa.status === "ready" ? `Updated ${since(fa.finished_at)} ago · ${fa.duration}s run`
+    : fa.status === "failed" ? `Last run failed: ${fa.error}`
+    : fa.status === "unsupported" ? `Not analyzed: ${fa.error}`
+    : fa.status === "unavailable" ? "Analyzer unavailable" : "Waiting for the first run";
+  if (sig === lastFarmingSig) return;
+  lastFarmingSig = sig;
+  $("#fa-objectives").innerHTML = Object.entries(fa.objectives || {}).map(([key, label]) =>
+    `<button role="radio" aria-checked="${key === fa.objective}" class="${key === fa.objective ? "active" : ""}" data-objective="${esc(key)}">${esc(label)}</button>`).join("");
+  const p = fa.profile;
+  $("#fa-profile").textContent = p
+    ? `Simulating ${p.skill} ${p.skill_level} · DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing · HP ${p.max_health} · AC ${p.armour_class}`
+    : "";
+  $("#fa-ranking").innerHTML = (fa.ranking || []).map((r, i) => `
+    <div class="spot${i === 0 ? " top" : ""}">
+      <div class="spot-head"><b>#${i + 1} ${esc(r.name)}</b><span class="flag">${esc(String(r.region || "").replace(/_/g, " "))}</span></div>
+      <small>${esc(r.location || (r.map_paths || []).join(", "))}</small>
+      <div class="spot-metrics"><span title="Estimated XP per hour">XP ${rate(r.xp_hour)}/h</span><span title="Estimated money per hour">${coins(r.money_hour)}/h</span><span title="Estimated loot value per hour">Loot ${rate(r.loot_hour)}/h</span><span title="Estimated incoming damage per clear">Danger ${Math.round(+r.danger || 0)}</span></div>
+      <small class="muted">${esc((r.monsters || []).slice(0, 5).join(", "))}${(r.monsters || []).length > 5 ? " …" : ""}</small>
+    </div>`).join("") || '<span class="muted">No ranking yet.</span>';
+}
+$("#fa-objectives").addEventListener("click", e => {
+  const b = e.target.closest("button[data-objective]");
+  if (!b || b.classList.contains("active")) return;
+  action(b, `Farming objective: ${b.textContent}`, { type: "farm_objective", objective: b.dataset.objective })
+    .then(ok => { if (ok) { lastFarmingSig = ""; pollSlow(); } });
+});
 function renderVitals() {
   const s = live.stats || {};
   $("#vitals").innerHTML = bar("HP", s.hp, s.maxhp, "hp") + bar("SP", s.sp, s.maxsp, "sp") + bar("Food", s.food, 999, "food");
@@ -413,7 +451,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
   } finally { slowBusy = false; }
 }
 pollLive(); pollSlow();

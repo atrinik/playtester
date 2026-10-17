@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "bundle_version": "protocol-v5.90.0-pathfinding-v5.48.0-content-v1.14.0",
+  "bundle_version": "protocol-v5.90.0-pathfinding-v5.48.0-content-v1.14.0-analyzer-v3.8.0-server-v5.99.0",
   "inputs": {
     "content": {
       "repository": "atrinik/content",
@@ -64,6 +64,43 @@
       "distribution": "atrinik-classic-protocol",
       "license": "GPL-2.0-or-later",
       "disposition": "external runtime dependency; not vendored"
+    },
+    "farming_analyzer": {
+      "repository": "atrinik/tools",
+      "release": "v3.8.0",
+      "revision": "c624e500fd59ca43835022ef58e64186ee71e9d0",
+      "license": "MIT",
+      "disposition": "external farm-ranking tool run as a separate process; not distributed",
+      "artifact": "atrinik-tools-farming-analyzer-3.8.0.tar.gz",
+      "url": "https://github.com/atrinik/tools/releases/download/v3.8.0/atrinik-tools-farming-analyzer-3.8.0.tar.gz",
+      "sha256": "3adcce5154e3a8c5f5a909f775c68efe7a65ffad859f1ab38a0596b8b1f1f25d",
+      "root": "atrinik-tools-farming-analyzer-3.8.0",
+      "max_download_bytes": 1048576,
+      "max_members": 200,
+      "max_unpacked_bytes": 8388608,
+      "required_paths": {
+        "LICENSE": "file",
+        "farming_analyzer/__main__.py": "file",
+        "farming_analyzer/cli.py": "file"
+      }
+    },
+    "classic_server": {
+      "repository": "atrinik/classic",
+      "release": "v5.99.0",
+      "revision": "adcab31088a7ce02555d7a6f4f862034a982abbb",
+      "license": "GPL-2.0-or-later",
+      "disposition": "external analyzer data input: experience and skill tables are read as text by the separate analyzer process; not distributed, linked or executed",
+      "artifact": "atrinik-classic-server-5.99.0.tar.gz",
+      "url": "https://github.com/atrinik/classic/releases/download/v5.99.0/atrinik-classic-server-5.99.0.tar.gz",
+      "sha256": "ea3fd518bacbad7b7f2ccc2ac1425cc32470abd1422ec91832dc07e7c63534e5",
+      "root": "atrinik-classic-server-5.99.0",
+      "max_download_bytes": 8388608,
+      "max_members": 4000,
+      "max_unpacked_bytes": 67108864,
+      "required_paths": {
+        "src/server/exp.c": "file",
+        "src/server/skill_util.c": "file"
+      }
     }
   }
 }
