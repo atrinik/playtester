@@ -8298,6 +8298,10 @@ class QuestTests(unittest.TestCase):
         client.state.savebed_map, client.state.savebed_xy = "/inn", (2, 0)
         circuit._savebed_search(client).run()
         self.assertFalse(circuit._needs_savebed(client))
+        # Bound to the inn's other bed, one move farther: not worth a rebind.
+        client.state.savebed_map, client.state.savebed_xy = "/inn", (1, 0)
+        circuit._savebed_search(client).run()
+        self.assertFalse(circuit._needs_savebed(client))
         # Never bound yet: any reachable bed beats the default spawn.
         client.state.savebed_map, client.state.savebed_xy = "", None
         circuit._savebed_search(client).run()
@@ -8309,6 +8313,26 @@ class QuestTests(unittest.TestCase):
                          ("/inn", (1, 0), 2))
         circuit._bed_failed.add(("/inn", (1, 0)))
         self.assertEqual(circuit._savebed_search(client).run().result[0], STARTER_APARTMENT)
+
+    def test_farm_circuit_moves_to_a_much_nearer_bed_on_the_same_map(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 8
+        graph = WorldGraph()
+        hall = MapNode("/hall", width=40, height=1)
+        hall.terrain = {(x, 0): 1 for x in range(40)}
+        hall.edges.append(MapEdge("/hall", "/farm", 39, 0, 0, 0))
+        farm = MapNode("/farm", width=5, height=1)
+        farm.terrain = {(x, 0): 1 for x in range(5)}
+        graph.nodes.update({"/hall": hall, "/farm": farm})
+        graph.savebeds["/hall"] = [(0, 0), (37, 0)]
+        # Bound to the far bed of a long hall: the exit-side bed saves 37.
+        client.state.savebed_map, client.state.savebed_xy = "/hall", (0, 0)
+        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
+        search = circuit._savebed_search(client).run()
+        self.assertEqual((search.result, search.current_walk), (("/hall", (37, 0), 2), 39))
+        self.assertTrue(circuit._needs_savebed(client))
+        self.assertEqual(circuit._new_savebed(client).navigation.destination_xy, (37, 0))
 
     def test_farm_circuit_keeps_a_savebed_that_is_nearly_as_close(self):
         client = type("Client", (), {})()

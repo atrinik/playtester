@@ -4497,8 +4497,12 @@ class FarmCircuitTask(BotTask):
         target = search.result
         if target is None:
             return False
-        if getattr(client.state, "savebed_map", "") == target[0]:
+        bound = (getattr(client.state, "savebed_map", ""),
+                 tuple(getattr(client.state, "savebed_xy", None) or ()))
+        if bound == (target[0], tuple(target[1])):
             return False
+        # Another bed on the same map counts like any other: only a real gain
+        # (an inn's far corner versus its exit-side beds) is worth a rebind.
         current = search.current_walk
         return current is None or target[2] + self.SAVEBED_MIN_GAIN_TILES <= current
 
