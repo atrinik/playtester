@@ -40,7 +40,7 @@ KEEP_REVIEWS = 10
 
 _HIT = re.compile(
     r"^(?P<who>.+?) hit you for (?P<amount>\d+)(?: \(-?\d+\))?"
-    r"(?: (?P<type>[a-z][a-z ]*?) damage)?[.!]?$", re.I)
+    r"(?: (?:(?P<type>[a-z][a-z ]*?) )?damage)?[.!]?$", re.I)
 _DISENGAGE = re.compile(r"sp=(?P<sp>\d+) next-heal=(?P<heal>\d+)")
 
 
@@ -153,8 +153,12 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None) -> t
     now = time.time() if now is None else now
     record = dict(record or {})
     level = int(record.get("level", 0) or 0)
+    # Only failures that happen with every tactic already at its maximum count
+    # toward the last-resort pause; failures on the way up do not.
     failures = [stamp for stamp in record.get("failures", ())
-                if now - float(stamp) <= PAUSE_WINDOW_SECONDS] + [review.time]
+                if now - float(stamp) <= PAUSE_WINDOW_SECONDS]
+    if level >= MAX_LEVEL:
+        failures.append(review.time)
     causes = dict(record.get("causes", {}))
     causes[review.cause] = int(causes.get(review.cause, 0)) + 1
     reviews = list(record.get("reviews", ()))[-(KEEP_REVIEWS - 1):]

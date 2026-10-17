@@ -3580,6 +3580,9 @@ class FarmCircuitTask(BotTask):
             client, path, f"{what} on {failure_map or 'unknown map'}")
         return True
 
+    RECALL_STATE = ("_emergency_recall_source", "_emergency_recall_apply_at",
+                    "_emergency_recall_cast_at", "_emergency_recall_origin")
+
     def _spot_key(self) -> str:
         return self_improvement.spot_key(self.spot, self.legs)
 
@@ -3618,9 +3621,15 @@ class FarmCircuitTask(BotTask):
                 client, path, "repeated failures at the maximum adaptation level",
                 seconds=self_improvement.PAUSE_SECONDS)
             return True
-        # Rebuild the farm child so the tighter margins apply immediately.
+        # Rebuild the farm child so the tighter margins apply immediately, but
+        # keep any Word of Recall still in flight: the recall decision is
+        # recorded when it is fired, and a fresh task would fire another.
         if self.child is not None:
+            previous = getattr(self.child, "task", None)
             self.child = self._new_child()
+            for name in self.RECALL_STATE:
+                if hasattr(previous, name):
+                    setattr(self.child.task, name, getattr(previous, name))
             self._farm_started_at = 0.0
             self._empty_spawn_since = 0.0
         return False

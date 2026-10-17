@@ -10382,12 +10382,19 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         # The analyzer's pick is unchanged: the spot is kept.
         self.assertFalse(circuit._upgrade_progression(client, rebuilt))
         self.assertEqual(circuit.spot["name"], "Trees")
-        # An emergency recall there teaches again.
+        # An emergency recall there teaches again, and the rebuilt task keeps
+        # the recall in flight instead of firing another.
+        rebuilt._emergency_recall_cast_at = 123.0
+        rebuilt._emergency_recall_origin = self.TREES
         client.decision_history.append({
             "time": time.time() + 2, "action": "emergency-recall", "detail": "",
             "task": "", "map": self.TREES})
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
+        self.assertIsNot(circuit.child.task, rebuilt)
+        self.assertEqual((circuit.child.task._emergency_recall_cast_at,
+                          circuit.child.task._emergency_recall_origin),
+                         (123.0, self.TREES))
         # Once the pick is reached, a failure elsewhere does not count.
         circuit.child.navigation.complete()
         client.decision_history.append({
@@ -10539,6 +10546,9 @@ class SelfImprovementTests(unittest.TestCase):
                               "fire wyvern hit you for 20 (-20) slash damage."])
         self.assertEqual(burned.cause, "damage-type:fire")
         self.assertEqual(burned.damage_by_type, {"fire": 60, "slash": 20})
+        untyped = self.review(["giant frog hit you for 20 damage.",
+                               "crocodile hit you for 25 damage."])
+        self.assertEqual((untyped.cause, untyped.damage_taken), ("pack", 45))
         beaten = self.review(["ogre hit you for 50 (-50) impact damage."])
         self.assertEqual(beaten.cause, "out-damaged")
         self.assertIn("ogre", beaten.detail)
@@ -10558,8 +10568,15 @@ class SelfImprovementTests(unittest.TestCase):
         review = self.review(["ogre hit you for 50 (-50) impact damage."])
         record, pause = si.learn({}, review, now=1000.0)
         self.assertEqual((record["level"], pause), (1, False))
-        for _ in range(si.MAX_LEVEL + 2):
+        # Failures on the way to the maximum level never count toward a pause.
+        for _ in range(si.MAX_LEVEL - 1):
             record, pause = si.learn(record, review, now=1000.0)
+            self.assertFalse(pause)
+        self.assertEqual((record["level"], record["failures"]), (si.MAX_LEVEL, []))
+        for _ in range(si.PAUSE_FAILURES - 1):
+            record, pause = si.learn(record, review, now=1000.0)
+            self.assertFalse(pause)
+        record, pause = si.learn(record, review, now=1000.0)
         self.assertEqual(record["level"], si.MAX_LEVEL)
         self.assertTrue(pause)
         self.assertLessEqual(len(record["reviews"]), si.KEEP_REVIEWS)
