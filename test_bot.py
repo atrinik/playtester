@@ -6021,11 +6021,60 @@ class QuestTests(unittest.TestCase):
             graph, "/farm", farm, combat_approach=True,
             safety=farm.safety)
         task._last_pull_target = target.target_id
+        # Cornered in transit: the giant is hitting her and the route has
+        # made no progress, so defending is the last resort.
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "hill giant hit you for 9 damage.")]
+        task.navigation._last_progress = (
+            time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1)
 
         self.assertTrue(asyncio.run(
             task._defend_while_navigating(client)))
         self.assertTrue(client.direct_moves)
         self.assertEqual(task._last_pull_target, target.target_id)
+
+    def test_transit_holds_fire_while_the_route_still_progresses(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        target = MapObject(
+            3, 1, 0, 0, name="sword spider", target_id=100, target_hp=55)
+        client.state.map.tile(9, 8).objects[3] = target
+        client.state.target_id = target.target_id
+        client.state.combat = True
+        # Hit, but still walking: keep going instead of fighting.
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "sword spider hit you for 2 damage.")]
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        transit = MapNode(path="/test", width=25, height=25)
+        transit.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": transit, "/farm": MapNode(path="/farm", width=24, height=24)}
+        farm = FarmTask(zone="/farm", target="ice golem")
+        farm.remember_engagement(client, 9, 8, target.target_id)
+        task = NavigateThenTask(
+            graph, "/farm", farm, combat_approach=True, safety=farm.safety)
+        task._last_pull_target = target.target_id
+        task.navigation._last_progress = time.monotonic()  # still walking
+
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.targets, [])
+        self.assertEqual(client.combat, [False])
+        self.assertEqual(task._last_pull_target, 0)
+        self.assertIn(("navigation-transit-hold-fire", "target=100"), client.decisions)
+        # Its squares (view (9, 8) is world (11, 10)) are marked so the route
+        # steers around it; her own square stays open.
+        self.assertIn((11, 10), task.navigation._threat_blocked)
+        self.assertNotIn((10, 10), task.navigation._threat_blocked)
+
+        # On the destination map the farm's own combat applies as before.
+        client.state.map.path = "/farm"
+        graph.nodes["/farm"].terrain = transit.terrain
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
 
     def test_farm_navigation_recovers_hp_and_mana_before_advancing(self):
         client = self._combat_client()
@@ -6096,11 +6145,21 @@ class QuestTests(unittest.TestCase):
         task = NavigateThenTask(
             graph, "/shop", BuyGroundItemsTask(r"^staple food$", 5),
             combat_approach=True)
+        # Not cornered: two healthy threats are walked around, not split.
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIsNone(task._retreat_attempt)
+        self.assertEqual(client.targets, [])
+        self.assertEqual(client.direct_moves, [])
+        # Cornered (hit, no route progress): split them before fighting.
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "kobold chief hit you for 4 damage.")]
+        task.navigation._last_progress = (
+            time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1)
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(task._last_pull_target, 0)
         self.assertIsNotNone(task._retreat_attempt)
         self.assertEqual(client.targets, [])
-        self.assertEqual(client.combat, [False])
+        self.assertEqual(client.combat[-1], False)
 
     def test_persistent_pack_at_exit_selects_an_alternate_route(self):
         client = self._combat_client()
@@ -6155,6 +6214,10 @@ class QuestTests(unittest.TestCase):
             return True
 
         task._retreat_step = retreat
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "kobold chief hit you for 4 damage.")]
+        task.navigation._last_progress = (
+            time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1)
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(calls, [{"avoid_backtrack": True}])
 
@@ -6945,6 +7008,7 @@ class QuestTests(unittest.TestCase):
         client.state.messages = [(
             time.time(), 2, "cc66ff",
             "stone giant hit you for 18 damage.")]
+        client.state.combat = True
         graph = WorldGraph()
         danger = MapNode(path="/danger", width=25, height=25)
         danger.terrain = {
@@ -8763,6 +8827,28 @@ class NavigationTests(unittest.TestCase):
         task._last_action = 0.0
         asyncio.run(task.tick(client))
         self.assertEqual(len(client.steps), 2)
+
+    def test_tiled_levels_are_pack_hazards_only_between_surface_maps(self):
+        graph = WorldGraph()
+        level = "/shattered_islands/world_4_53_-2"
+        west = "/shattered_islands/world_-2_57"
+        for path in (level, west, "/shattered_islands/world_1_50",
+                     "/shattered_islands/world_0_68", "/interior/inn"):
+            graph.nodes[path] = MapNode(path, width=24, height=24)
+            graph.named_spawns[path] = []
+        graph.transit_max_aggro_pack = lambda path: 5
+        surface = NavigateTask(graph, "/shattered_islands/world_1_50")
+        hazards = surface._known_pack_hazard_maps("/shattered_islands/world_0_68")
+        self.assertIn(level, hazards)
+        self.assertIn(west, hazards)
+        self.assertNotIn("/interior/inn", hazards)
+        # Into, out of or within the levels, they route through each other.
+        self.assertNotIn(level, surface._known_pack_hazard_maps(level))
+        below = NavigateTask(graph, level)
+        self.assertNotIn(level, below._known_pack_hazard_maps(
+            "/shattered_islands/world_0_68"))
+        self.assertIn(west, below._known_pack_hazard_maps(
+            "/shattered_islands/world_0_68"))
 
     def test_stalled_click_path_learns_live_blocker(self):
         class FakeClient:

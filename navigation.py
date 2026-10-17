@@ -1645,7 +1645,10 @@ class NavigateTask(BotTask):
                 hazards.add(path)
         return hazards
 
-    def _known_pack_hazard_maps(self) -> set[str]:
+    SURFACE_MAP = re.compile(r"/shattered_islands/world_-?\d+_-?\d+")
+    TILED_LEVEL_MAP = re.compile(r"/shattered_islands/world_-?\d+_-?\d+_-?\d+")
+
+    def _known_pack_hazard_maps(self, source: str = "") -> set[str]:
         """Return open-world maps with three-plus joining aggressors.
 
         Interior maps often contain several separated rooms and may require a
@@ -1655,13 +1658,25 @@ class NavigateTask(BotTask):
         the live-validated pursuit failure this coarse map-level gate models;
         smaller or room-separated contacts remain the live combat policy's
         responsibility.
+
+        Tiled levels above and below the world grid (``world_X_Y_-2``) are
+        rated too for a trip between two surface maps: leaving them out made a
+        surface-pack detour look safe through the tunnels below Fort Sether,
+        whose spider and bat packs held Sera for over ten minutes. A trip that
+        starts or ends on such a level routes through its neighbours as
+        before, since those levels split into components joined only through
+        each other. Negative grid coordinates (``world_-2_57``) are part of
+        the grid as well.
         """
         estimator = getattr(self.graph, "transit_max_aggro_pack", None)
         if estimator is None:
             return set()
+        surface_trip = bool(self.SURFACE_MAP.fullmatch(source or "") and
+                            self.SURFACE_MAP.fullmatch(self.destination))
         return {
             path for path in self.graph.named_spawns
-            if re.fullmatch(r"/shattered_islands/world_\d+_\d+", path) and
+            if (self.SURFACE_MAP.fullmatch(path) or
+                (surface_trip and self.TILED_LEVEL_MAP.fullmatch(path))) and
             estimator(path) >= 3
         }
 
@@ -1675,7 +1690,7 @@ class NavigateTask(BotTask):
         )
         ranged_hazards = self._known_ranged_hazard_maps(client)
         overlevel_hazards = self._known_overlevel_hazard_maps(client)
-        pack_hazards = self._known_pack_hazard_maps()
+        pack_hazards = self._known_pack_hazard_maps(source)
         protected_hazards = (
             ranged_hazards | pack_hazards | set(self.KNOWN_LETHAL_TRANSIT))
         kwargs = {
@@ -2416,6 +2431,9 @@ class NavigateThenTask(BotTask):
     """Route to an authored map, then run another character-state task."""
 
     PACK_EXIT_BYPASS_SECONDS = 15.0
+    # Off the destination map, fight back only once something has been
+    # hitting her and the route has made no progress for this long.
+    TRANSIT_CORNERED_SECONDS = 4.0
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -2675,6 +2693,24 @@ class NavigateThenTask(BotTask):
         self._combat_attempt = (m.path, *path[1], now)
         return True
 
+    def _halo_threats(self, client: AtrinikClient, threats, *, radius: int) -> None:
+        """Mark the walkable squares around threats as temporarily blocked."""
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
+        if node is None:
+            return
+        allow_locked = self.navigation._allow_locked(client)
+        for _, view_x, view_y, _ in threats:
+            world_x = m.world_x + view_x - cx
+            world_y = m.world_y + view_y - cy
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    point = world_x + dx, world_y + dy
+                    if (point != (m.world_x, m.world_y) and
+                            node.walkable(*point, allow_locked=allow_locked)):
+                        self.navigation._threat_blocked.add(point)
+
     async def _defend_while_navigating(self, client: AtrinikClient) -> bool:
         """Pause an encounter approach to heal or clear an aggroed pack."""
         if not self.combat_approach:
@@ -2765,6 +2801,19 @@ class NavigateThenTask(BotTask):
             self._last_pull_target = 0
         nearby = [threat for threat in threats if threat[0] <= 4]
         pull_pack = [threat for threat in threats if threat[0] <= 6]
+        # Travel is not farming. Off the destination map, combat is the last
+        # resort: only when something is hitting her and she has stopped
+        # making route progress (or has no route at all). Otherwise she keeps
+        # walking and the route
+        # steers around them (live: zero-XP spiders and bats below Fort
+        # Sether kept her fighting and looting instead of travelling).
+        hold_fire = (
+            m.path != self.navigation.destination and
+            not (recent_hostile_contact(client, 3.0) and
+                 (self.navigation.status == TaskStatus.FAILED or
+                  (self.navigation._last_progress and
+                   time.monotonic() - self.navigation._last_progress >=
+                   self.TRANSIT_CORNERED_SECONDS))))
         if await self._abandon_stalled_transit_target(client, committed):
             return True
         hp = client.state.stats.get("hp", 0)
@@ -2778,7 +2827,7 @@ class NavigateThenTask(BotTask):
         # below that, survival immediately wins and normal melee remains free
         # to finish the enemy after healing.
         if (ratio > self.safety.flee_below and nearest is not None and
-                isinstance(self.task, FarmTask) and
+                not hold_fire and isinstance(self.task, FarmTask) and
                 self.task.should_training_finish(client, nearest[3])):
             _, x, y, obj = nearest
             self.task.remember_engagement(client, x, y, obj.target_id)
@@ -2866,7 +2915,7 @@ class NavigateThenTask(BotTask):
         pack_offensive = (self.task.primary_combat_spell(client)
                           if isinstance(self.task, FarmTask) else None)
         if (safe and nearest is not None and nearest[0] > 2 and
-                len(pull_pack) >= 2 and pack_offensive is None):
+                len(pull_pack) >= 2 and (pack_offensive is None or hold_fire)):
             if await self._bypass_pack_blocked_exit(client):
                 return False
             node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
@@ -2905,7 +2954,7 @@ class NavigateThenTask(BotTask):
                 self._defending = False
                 return False
         if (safe and nearest is not None and nearest[0] > 2 and
-                len(pull_pack) >= 2 and
+                len(pull_pack) >= 2 and not hold_fire and
                 time.monotonic() - self._last_pull_at >= 2.5):
             offensive = pack_offensive
             if (offensive is not None and
@@ -2928,7 +2977,7 @@ class NavigateThenTask(BotTask):
         if (overwhelmed and pack_offensive is None and
                 await self._bypass_pack_blocked_exit(client)):
             return False
-        if not safe or overwhelmed:
+        if not safe or (overwhelmed and not hold_fire):
             if safety_action_issued:
                 # FIRE/APPLY was just sent by SafetyPolicy. Clearing in this
                 # same tick cancels it and creates an endless heal/food retry
@@ -2944,6 +2993,19 @@ class NavigateThenTask(BotTask):
                 await self._retreat_step(
                     client, nearby, avoid_backtrack=True)
             return True
+        if hold_fire and nearby:
+            # Keep walking; mark their squares so the route steers around.
+            self._halo_threats(client, nearby, radius=1)
+            if getattr(client.state, "combat", False):
+                await client.set_combat(False)
+            if self._last_pull_target:
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("navigation-transit-hold-fire",
+                             f"target={self._last_pull_target}")
+                self._last_pull_target = 0
+            self._defending = False
+            return False
         # Only close a short gap. Chasing a merely visible target across the
         # viewport was what repeatedly pulled the character into larger packs.
         if nearest is not None and nearest[0] <= 4:
