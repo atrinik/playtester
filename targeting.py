@@ -20,6 +20,27 @@ UNRESPONSIVE_TARGET_SECONDS = 120.0
 REQUEST_GAP = 2.0
 
 
+def target_set_aside(state: Any, actor_count: int) -> bool:
+    """Whether an actor is set aside as unselectable right now.
+
+    An acknowledgement of it since it was set aside (one that arrived just
+    after the timeout), or the server having it selected, lifts that.
+    """
+    ignored = getattr(getattr(state, "map", None), "ignored_targets", None)
+    if not ignored:
+        return False
+    expiry = ignored.get(actor_count, 0.0)
+    if expiry <= time.monotonic():
+        ignored.pop(actor_count, None)
+        return False
+    acked, acked_at = getattr(state, "target_ack", (0, 0.0))
+    if (getattr(state, "target_id", 0) == actor_count or
+            (acked == actor_count and acked_at >= expiry - UNRESPONSIVE_TARGET_SECONDS)):
+        del ignored[actor_count]
+        return False
+    return True
+
+
 async def select_target(client: Any, x: int, y: int, actor_count: int,
                         relative_depth: int = 0) -> bool:
     """Ask the provider to select an actor unless it has proven unselectable.
@@ -32,8 +53,7 @@ async def select_target(client: Any, x: int, y: int, actor_count: int,
     """
     state = client.state
     now = time.monotonic()
-    target_ignored = getattr(state.map, "target_ignored", None)
-    if target_ignored is not None and target_ignored(actor_count):
+    if target_set_aside(state, actor_count):
         return False
     # Minimal states (as some providers and tests keep) start with none yet.
     requested, since, last = (tuple(getattr(state, "target_request", ())) + (0, 0.0, 0.0))[:3]

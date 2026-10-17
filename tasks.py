@@ -20,7 +20,7 @@ except ModuleNotFoundError:
     from world_content_audit import load_archetypes
 
 from . import constants as c
-from .targeting import select_target
+from .targeting import select_target, target_set_aside
 from .client import (COIN_VALUES, AtrinikClient, map_object_visual_name,
                      update_bank_balance)
 from .model import STARTER_APARTMENT, Item, MapObject
@@ -2690,6 +2690,7 @@ class FarmTask(BotTask):
                 self._last_action = now
                 return True
             # The blocker cannot be selected: fall back to retreating.
+            self.release_engagement(obj.target_id)
         if self._cornered_breakout_target:
             self._cornered_breakout_target = 0
         threats = [(x, y) for x, y, _ in visible_threats]
@@ -2777,6 +2778,7 @@ class FarmTask(BotTask):
                 await client.clear_actions()
                 if not await select_target(client, x, y, obj.target_id):
                     self._cornered_breakout_target = 0
+                    self.release_engagement(obj.target_id)
                     return False
                 await client.set_combat(True, force=True)
                 recorder = getattr(client, "record_action", None)
@@ -3172,6 +3174,12 @@ class FarmTask(BotTask):
                      f"step={point[0]},{point[1]}")
         return True
 
+    def release_engagement(self, target_id: int) -> None:
+        """Forget the engagement with an actor that cannot be selected."""
+        if (self._engaged_target is not None and
+                self._engaged_target[0] == target_id):
+            self._engaged_target = None
+
     def target_temporarily_unreachable(self, target_id: int) -> bool:
         now = time.monotonic()
         expiry = self._unreachable_targets.get(target_id, 0.0)
@@ -3237,7 +3245,7 @@ class FarmTask(BotTask):
             for x, y, obj in m.targets(friendly=False)
             if self.within_farm_map(client, x, y) and
             not self.target_temporarily_unreachable(obj.target_id) and
-            not m.target_ignored(obj.target_id) and
+            not target_set_aside(client.state, obj.target_id) and
             not self.ignore_unrequested_peaceful(client, obj)
         ]
         # A kill is terminal evidence for older contact. Keep the longer raw
@@ -3386,7 +3394,7 @@ class FarmTask(BotTask):
             if not self.within_farm_map(client, x, y):
                 continue
             if (self.target_temporarily_unreachable(obj.target_id) or
-                    client.state.map.target_ignored(obj.target_id)):
+                    target_set_aside(client.state, obj.target_id)):
                 continue
             semantic = map_object_semantic(client, obj)
             world_x = client.state.map.world_x + x - cx
@@ -3535,7 +3543,10 @@ class FarmTask(BotTask):
             self.remember_engagement(client, x, y, obj.target_id)
             if (getattr(client.state, "target_id", 0) != obj.target_id and
                     not await select_target(client, x, y, obj.target_id)):
-                return  # set aside as unselectable; choose again next tick
+                # Set aside as unselectable: let go of it so the next tick
+                # chooses another actor or patrols on.
+                self.release_engagement(obj.target_id)
+                return
             if not self.target_tile_walkable(client, x, y):
                 # Never land a killing blow over water/void: the corpse and
                 # rare drop would be unreachable. Keep the target selected,

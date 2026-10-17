@@ -4921,6 +4921,31 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.direct_moves, [])
         self.assertEqual(client.moves, [])
 
+    def test_unselectable_targets_release_their_engagement(self):
+        client = self._combat_client()
+        client.state.map.tile(11, 8).objects.clear()
+        task = FarmTask(zone="/test")
+
+        async def refuse(*args, **kwargs):
+            return False
+
+        with patch("atrinik_bot.tasks.select_target", refuse):
+            asyncio.run(task.tick(client))
+        self.assertIsNone(task._engaged_target)
+
+    def test_late_acknowledgements_lift_a_set_aside(self):
+        from . import targeting
+        from .targeting import target_set_aside
+
+        state = GameState()
+        now = time.monotonic()
+        state.map.ignored_targets[1343754] = now + targeting.UNRESPONSIVE_TARGET_SECONDS
+        self.assertTrue(target_set_aside(state, 1343754))
+        # The server's reply arrives just after the timeout.
+        state.target_ack = (1343754, now + 0.1)
+        self.assertFalse(target_set_aside(state, 1343754))
+        self.assertNotIn(1343754, state.map.ignored_targets)
+
     def test_set_aside_targets_stay_threats_but_are_not_chosen(self):
         client = self._combat_client()
         client.state.map.tile(11, 8).objects.clear()

@@ -26,7 +26,7 @@ except ModuleNotFoundError:
                                      load_archetypes, map_files, parse_blocks)
 
 from . import constants as c
-from .targeting import select_target
+from .targeting import select_target, target_set_aside
 
 from .client import AtrinikClient, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
@@ -2763,7 +2763,7 @@ class NavigateThenTask(BotTask):
         global_peaceful = getattr(
             self.navigation.graph, "peaceful_monster_identities", set())
         for x, y, obj in m.targets(friendly=False):
-            if m.target_ignored(obj.target_id):
+            if target_set_aside(client.state, obj.target_id):
                 continue  # cannot be selected; still counted as a threat elsewhere
             if (isinstance(self.task, FarmTask) and
                     self.task.target_temporarily_unreachable(
@@ -2888,8 +2888,10 @@ class NavigateThenTask(BotTask):
                 self.task.should_training_finish(client, nearest[3])):
             _, x, y, obj = nearest
             self.task.remember_engagement(client, x, y, obj.target_id)
-            if (await select_target(client, x, y, obj.target_id) and
-                    await self.task.training_finisher(client, x, y, obj)):
+            selected = await select_target(client, x, y, obj.target_id)
+            if not selected:
+                self.task.release_engagement(obj.target_id)
+            if selected and await self.task.training_finisher(client, x, y, obj):
                 self._defending = True
                 self._last_defense_action = time.monotonic()
                 return True
@@ -3022,6 +3024,8 @@ class NavigateThenTask(BotTask):
                     self.task.remember_engagement(
                         client, x, y, obj.target_id)
                 if not await select_target(client, x, y, obj.target_id):
+                    if isinstance(self.task, FarmTask):
+                        self.task.release_engagement(obj.target_id)
                     return False
                 direction = self.task.spell_fire_direction(
                     offensive, x, y, cx, cy)
@@ -3096,6 +3100,8 @@ class NavigateThenTask(BotTask):
                     self.task.remember_engagement(
                         client, x, y, obj.target_id)
                 if not await select_target(client, x, y, obj.target_id):
+                    if isinstance(self.task, FarmTask):
+                        self.task.release_engagement(obj.target_id)
                     return False
                 semantic = f"{obj.name} {map_object_visual_name(client, obj)}"
                 force = bool(
