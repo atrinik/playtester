@@ -1125,7 +1125,7 @@ class AtrinikClient:
             "you feel less healthy", "watch out, your mind is going!",
             "your spirit feels drained!",
         )
-        if "save bed location is updated" in lowered:
+        if lowered.strip() == "you save and your save bed location is updated.":
             # Whichever task applied it, the server binds the respawn to the
             # square the character stands on.
             m = self.state.map

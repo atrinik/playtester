@@ -8894,6 +8894,27 @@ class QuestTests(unittest.TestCase):
         # East room bed: already with the farm.
         self.assertEqual(savebed_walk(graph, "/farm", (9, 0), ["/farm"]), 0)
 
+    def test_unroutable_nearer_beds_do_not_use_up_candidate_slots(self):
+        from . import navigation
+        from .navigation import nearest_savebed
+
+        graph = WorldGraph()
+        farm = MapNode("/farm", width=3, height=1)
+        farm.terrain = {(x, 0): 1 for x in range(3)}
+        # /aaa is one hop away, but its bed is walled into a closet.
+        aaa = MapNode("/aaa", width=5, height=1)
+        aaa.terrain = {(x, 0): 1 for x in range(5)}
+        aaa.blocked = {(1, 0)}
+        aaa.edges.append(MapEdge("/aaa", "/farm", 4, 0, 0, 0))
+        tavern = MapNode("/tavern", width=3, height=1)
+        tavern.terrain = {(x, 0): 1 for x in range(3)}
+        tavern.edges.append(MapEdge("/tavern", "/farm", 2, 0, 0, 0))
+        graph.nodes.update({"/farm": farm, "/aaa": aaa, "/tavern": tavern})
+        graph.savebeds["/aaa"] = [(0, 0)]
+        graph.savebeds["/tavern"] = [(0, 0)]
+        with patch.object(navigation, "SAVEBED_CANDIDATES", 1):
+            self.assertEqual(nearest_savebed(graph, ["/farm"]), ("/tavern", (0, 0), 2))
+
     def test_apartment_exits_record_their_runtime_return(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.json")
@@ -8958,6 +8979,10 @@ class QuestTests(unittest.TestCase):
             client.load_character_memory("Sera")
             client.state.map = MapState(path="/shattered_islands/incuna/apartments/beach_nook",
                                         world_x=3, world_y=2)
+            # Another player quoting the confirmation does not move it.
+            payload = bytes([2]) + b"ffffff\0Zoey says: You save and your save bed location is updated.\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            self.assertEqual(client.state.savebed_map, "")
             payload = bytes([2]) + b"ffffff\0You save and your save bed location is updated.\0"
             asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
             self.assertEqual((client.state.savebed_map, client.state.savebed_xy),

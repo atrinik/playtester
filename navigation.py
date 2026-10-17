@@ -3790,8 +3790,15 @@ class SavebedSearch:
         if hops:
             cutoff = min(hops.values()) + SAVEBED_HOP_SLACK
             candidates = sorted((m for m in hops if hops[m] <= cutoff),
-                                key=lambda m: (hops[m], m))[:SAVEBED_CANDIDATES]
-        for bed_map in sorted(candidates):
+                                key=lambda m: (hops[m], m))
+        # Nearest maps first, until SAVEBED_CANDIDATES of them are priced: a
+        # map whose beds turn out unroutable (the hop count only proves the
+        # map is connected) does not use up a slot.
+        priced_maps = 0
+        for bed_map in candidates:
+            if priced_maps >= SAVEBED_CANDIDATES:
+                break
+            priced = False
             # Beds in one walkable component share everything after their
             # first exit; beds in another component get their own route.
             groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
@@ -3815,6 +3822,8 @@ class SavebedSearch:
                                 _segment_steps(graph, bed_map, point, first))
                     if prices:
                         self._consider(bed_map, point, min(prices))
+                        priced = True
+            priced_maps += priced
         if current is not None and current[0] in graph.nodes:
             options = yield from _bed_walk(
                 graph, current[0], tuple(current[1]), spot_maps, returns)
