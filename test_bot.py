@@ -345,6 +345,49 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_engine_waits_for_the_first_map_after_a_reconnect(self):
+        from .tasks import BotTask
+
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            engine = TaskEngine(client, tick_rate=0.01)
+            ticks = []
+
+            class Probe(BotTask):
+                async def tick(self, client):
+                    # Without a connection this send raises ConnectionError,
+                    # which would permanently fail the task.
+                    await client.talk("hello", "sage")
+                    ticks.append(client.state.map.path)
+
+            probe = Probe("probe")
+            engine.set_task(probe)
+            engine.running = True
+            runner = asyncio.create_task(engine.run())
+            # The whole reconnect holds the task: disconnected, connecting
+            # (even with a stale map), then playing before the first MAP2.
+            for phase, path in (("disconnected", ""), ("connecting", "/stale"),
+                                ("playing", "")):
+                client.state.phase = phase
+                client.state.map.path = path
+                await asyncio.sleep(0.05)
+                self.assertEqual(ticks, [], phase)
+                self.assertIs(engine.task, probe, phase)
+            sent = []
+
+            async def send(packet):
+                sent.append(packet)
+
+            client.send = send
+            client.state.map.path = "/shattered_islands/world_14_77"
+            await asyncio.sleep(0.05)
+            engine.running = False
+            await runner
+            self.assertTrue(ticks)
+            self.assertEqual(set(ticks), {"/shattered_islands/world_14_77"})
+
+        asyncio.run(scenario())
+
     def test_map2_soft_clear_and_fog_keep_remembered_geometry_like_the_client(self):
         from .model import MapObject
 
