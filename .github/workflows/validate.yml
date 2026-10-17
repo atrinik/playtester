@@ -26,6 +26,9 @@ jobs:
           python-version: "3.11"
 
       - name: Preflight and install locked protocol dependency
+        env:
+          # Authenticated API calls avoid the anonymous per-runner rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/install_locked_protocol.py --json
 
       - name: Install required runtime dependencies
@@ -49,6 +52,7 @@ jobs:
       - name: Install and verify the compatibility bundle
         env:
           ATRINIK_PLAYTESTER_CACHE: ${{ runner.temp }}/atrinik-playtester-cache
+          GITHUB_TOKEN: ${{ github.token }}
           PYTHONPATH: ${{ github.workspace }}/build/playtester/python
         run: |
           python3 -m atrinik_bot dependencies --json
@@ -78,6 +82,7 @@ jobs:
       - name: Build, install, and smoke-test wheel from a clean directory
         env:
           ATRINIK_PLAYTESTER_CACHE: ${{ runner.temp }}/atrinik-playtester-cache
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 -m pip wheel --no-deps --wheel-dir build/dist .
           unzip -l build/dist/*.whl | grep -q 'licenses/THIRD_PARTY_NOTICES.md'

@@ -214,6 +214,36 @@ class CompatibilityTests(unittest.TestCase):
                          "ea3fd518bacbad7b7f2ccc2ac1425cc32470abd1422ec91832dc07e7c63534e5")
         self.assertIn("src/server/exp.c", server["required_paths"])
 
+    def test_github_token_is_sent_only_to_the_github_api(self) -> None:
+        seen = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def fake_open(request, timeout):
+            seen.append(request.get_header("Authorization"))
+            return Response()
+
+        api = compatibility.GITHUB_API + "/repos/atrinik/content/releases/tags/v1.14.0"
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "ghs_example"}):
+            compatibility._github_json(api, opener=fake_open)
+            self.assertNotIn(
+                "Authorization",
+                compatibility._github_headers("https://example.invalid/api/repos"))
+            self.assertNotIn(
+                "Authorization",
+                compatibility._github_headers("https://api.github.com.example.invalid/x"))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            compatibility._github_json(api, opener=fake_open)
+        self.assertEqual(seen, ["Bearer ghs_example", None])
+
     def test_preflight_verifies_release_assets_and_commit(self) -> None:
         lock = compatibility.load_lock()
         specs = compatibility._release_specs(lock)
