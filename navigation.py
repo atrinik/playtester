@@ -28,6 +28,7 @@ except ModuleNotFoundError:
 from . import constants as c
 
 from .client import AtrinikClient, map_object_visual_name
+from .farm_analyzer import DEFAULT_OBJECTIVE
 from .pathfinding import graph_search, grid_reachable, grid_search
 from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
@@ -3343,6 +3344,48 @@ class BuySpellTask(BotTask):
             self.fail(f"could not buy {self.spell}; check funds and seller")
 
 
+_MONSTER_LABEL = re.compile(r"\s+L\d+(?:\u00d7\d+)?$")
+
+
+def analyzer_spot_legs(spot: dict, graph: "WorldGraph") -> tuple[tuple[str, str], ...]:
+    """Circuit legs for one analyzer result, or () if any map is unknown."""
+    legs = []
+    names = sorted({
+        _MONSTER_LABEL.sub("", str(label)).strip()
+        for label in spot.get("monsters") or ()} - {""})
+    # Escape regex syntax but keep spaces readable in logs and the dashboard.
+    target = "|".join(re.escape(name).replace("\\ ", " ") for name in names)
+    for raw in spot.get("map_paths") or ():
+        path = "/" + str(raw).removeprefix("maps/").lstrip("/")
+        if path not in graph.nodes:
+            return ()
+        legs.append((path, target))
+    return tuple(legs)
+
+
+def analyzer_farm_selection(
+        client: AtrinikClient, graph: "WorldGraph"
+) -> tuple[tuple[tuple[str, str], ...], dict] | None:
+    """The preferred objective's highest-ranked spot that is usable right now.
+
+    The farming analyzer is the source of truth. The only exceptions are live
+    failures: a spot quarantined after a death, an emergency recall, ten minutes
+    without XP, or an unreachable route is skipped until its quarantine ends.
+    """
+    analyzer = getattr(client, "farm_analyzer", None)
+    if analyzer is None:
+        return None
+    objective = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
+    quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
+    now = time.time()
+    for spot in analyzer.ranking(objective):
+        legs = analyzer_spot_legs(spot, graph)
+        if legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
+                        for path, _ in legs):
+            return legs, spot
+    return None
+
+
 class FarmCircuitTask(BotTask):
     """Rotate between nearby farm maps without abandoning fights or loot."""
 
@@ -3373,160 +3416,13 @@ class FarmCircuitTask(BotTask):
     AUTO_WIZARD_AOE_REVIEW_LEVEL = 25
     AUTO_WIZARD_AOE_TARGET = 15
 
-    EARLY_NAMED_LEGS = (
-        ("/shattered_islands/world_3_69", "Thrakir|lost soul"),
-        ("/shattered_islands/world_3_68", "Fahrgorm|evil treant"),
-    )
-    EARLY_WASP_LEGS = (
-        ("/shattered_islands/world_3_69", "giant wasp|wasp_giant|wasp giant"),
-    )
-    EARLY_DAY_BEE_LEGS = (
-        ("/shattered_islands/world_4_68",
-         "killer bee|bee_killer|bee killer"),
-    )
-    EARLY_TREE_LEGS = (
-        ("/shattered_islands/world_10_78", "evil treant|quickwood"),
-    )
-    WIZARD_LOST_SOUL_LEGS = (
-        ("/shattered_islands/world_3_69", "Thrakir|lost soul"),
-    )
-    # farming_analyzer.py ranks this connected level-9--12 mud-hand circuit
-    # second for Sera's measured Wizardry 6 and 8 builds. Its nominally
-    # higher-scoring Brynknot sewer circuit is not component-routable from the
-    # surface entrance, while both of these maps are a verified short route
-    # from the existing Eld Woods farm. Their residents are aggressive, but
-    # their authored detection radii permit controlled one-at-a-time pulls;
-    # the wider viewport cluster is density context, not one encounter.
-    WIZARD_MUD_HAND_CATCHUP_LEGS = (
-        ("/shattered_islands/world_12_79", "mud hand"),
-        ("/shattered_islands/world_12_78", "mud hand"),
-    )
-    MID_TREE_LEGS = (
-        ("/shattered_islands/world_14_79", "evil treant|quickwood"),
-    )
-    QUICKWOOD_11_LEGS = (
-        ("/shattered_islands/world_14_79", "quickwood"),
-    )
-    TREE_13_LEGS = (
-        ("/shattered_islands/world_14_78", "evil treant|quickwood"),
-    ) + MID_TREE_LEGS
-    TREE_15_LEGS = (
-        ("/shattered_islands/world_14_77",
-         "Kotung|evil treant|quickwood"),
-    ) + TREE_13_LEGS
-    # Quickwoods cease awarding Sera XP at level 18.  Keep the same proven
-    # three-map respawn circuit but stop spending combat time, HP, food and
-    # mana on its zero-value filler population.
-    TREE_18_LEGS = (
-        ("/shattered_islands/world_14_77", "Kotung|evil treant"),
-        ("/shattered_islands/world_14_78", "evil treant"),
-    )
-    # At Slash 19 the level-13 evil treants on world_14_78 cross the server's
-    # grey threshold and award no XP. Keep only the level-15--17 residents in
-    # the upper pocket rather than paying combat, healing, food, corpse and
-    # travel overhead for a zero-value fallback map.
-    TREE_19_LEGS = (
-        ("/shattered_islands/world_14_77", "Kotung|evil treant"),
-    )
-    # The server's exact level-color table makes level-15 residents grey at
-    # skill 22, while level-16 evil treants and level-17 Kotung still pay.
-    # Patrol only Kotung's shared spawn point instead of automatically moving
-    # to the live-rejected deer or untested zero-acid-protection slug tier.
-    TREE_22_LEGS = (
-        ("/shattered_islands/world_14_77", "Kotung"),
-    )
-    # Historical guarded trial retained for its quarantine regression. Live
-    # play showed that the nominally passive spider factions assist one
-    # another: three became visible, at least two attacked together, exhausted
-    # healing, and killed Sera. It must not be selected automatically.
-    FORT_SETHER_19_LEGS = ((
-        "/shattered_islands/world_4_51_-2",
-        "spider|brown bat|sword spider"),)
-    # Historical analyzer candidates retained only for explicit guarded tests.
-    # Live play invalidated the selected-subset premise: nearby crocodiles and
-    # frogs joined, pursued across map seams, exhausted healing, and caused a
-    # death. Automatic Slash progression uses TREE_18_LEGS instead. A manual
-    # retry still receives death and ten-minute no-XP quarantine protection.
-    ANALYZER_SLASH_18_LEGS = (
-        ("/shattered_islands/world_4_51", "mud hand"),
-    )
-    # Kill XP is calculated from the finishing skill's level, not character
-    # level.  These lower-level passive targets still reach the per-kill cap
-    # for Wizardry 6-9 while dying faster and costing less healing than the
-    # level-15-17 main-school tier.  The night-only lost-soul check adds a
-    # 1/30 Ring of the Ghost opportunity without idling for its schedule.
-    WIZARD_LOW_CATCHUP_LEGS = (
-        WIZARD_LOST_SOUL_LEGS + WIZARD_MUD_HAND_CATCHUP_LEGS)
-    WIZARD_MID_CATCHUP_LEGS = (
-        WIZARD_LOST_SOUL_LEGS + WIZARD_MUD_HAND_CATCHUP_LEGS)
-    DARK_CAVE_WYVERN_LEGS = ((
-        "/shattered_islands/strakewood_island/dark_cave/dark_cave_0101",
-        "fire wyvern lord|fire wyvern"),)
-    DEER_LEGS = (("/shattered_islands/world_11_75", "deer"),)
-    DEER_TIER_LEGS = DEER_LEGS + TREE_15_LEGS
-    # Revisit the previously rejected deer only after concrete equipment
-    # improvements reduce modeled per-kill damage by roughly thirty percent.
-    # The one remaining XP-bearing tree pocket is a respawn fallback.
-    DEER_READINESS_LEGS = DEER_LEGS + TREE_19_LEGS
-    # The corrected analyzer separates direct acquisition from viewport
-    # density. This level-18--20 field has six nearby aggressive residents but
-    # no isolated pull point is inside more than one resident's detection
-    # radius. Its modeled L20 profile is both safer and several times faster
-    # than the last Eld Woods tree spawn. Retain the map after recoverable bad
-    # pulls: retreat, approach a different isolated boundary, and retry.
-    STRAKEWOOD_20_LEGS = ((
-        "/shattered_islands/world_1_50",
-        "giant frog|crocodile|mud hand"),)
-    SLUG_LEGS = (("/shattered_islands/world_13_73", "giant slug"),)
-    RED_ANT_LEGS = (("/shattered_islands/world_14_73", "red ant"),)
+    # Live failures exclude an analyzer pick for this long; see the README.
     FARM_DEATH_QUARANTINE_SECONDS = 6 * 60 * 60
     FARM_NO_PROGRESS_SECONDS = 10 * 60
     OPTIONAL_RARE_DETOUR_INTERVAL = 30 * 60
-    # Higher-level autoplay tiers are deliberately anchored to maps whose
-    # authored residents and graph routes are known exactly.  Empty target
-    # patterns farm every server-confirmed hostile on the destination map;
-    # peaceful NPC classification still excludes guards and quest actors.
-    # Thresholds trail the strongest resident where practical so a secondary
-    # skill cannot push the character into a nominal map-difficulty band.
-    UNDERGROUND_CITY_31_LEGS = ((
-        "/shattered_islands/strakewood_island/underground_city/"
-        "underground_city_0_1", ""),)
-    HEMLOCK_37_LEGS = ((
-        "/shattered_islands/eld_woods_island/hemlock_cave/"
-        "hemlock_cave_0103", ""),)
-    UNDERGROUND_CITY_46_LEGS = ((
-        "/shattered_islands/strakewood_island/underground_city/"
-        "underground_city_4_4_-1", ""),)
-    UNDERGROUND_CITY_55_LEGS = ((
-        "/shattered_islands/strakewood_island/underground_city/"
-        "underground_city_5_2_-1", ""),)
-    ZECHNA_60_LEGS = ((
-        "/shattered_islands/strakewood_island/zechna_temple/"
-        "zechna_temple_1_0", ""),)
-    UNDERGROUND_CITY_68_LEGS = ((
-        "/shattered_islands/strakewood_island/underground_city/"
-        "underground_city_1_3_-2", ""),)
-    UNDERGROUND_CITY_80_LEGS = ((
-        "/shattered_islands/strakewood_island/underground_city/"
-        "underground_city_0_0_-2", ""),)
-    UNDERGROUND_CITY_83_LEGS = ((
-        "/shattered_islands/strakewood_island/underground_city/"
-        "underground_city_1_0_-2", ""),)
-    ZECHNA_88_LEGS = ((
-        "/shattered_islands/strakewood_island/zechna_temple/"
-        "zechna_temple_1_0_-2", ""),)
-    ZECHNA_95_LEGS = ((
-        "/shattered_islands/strakewood_island/zechna_temple/"
-        "zechna_temple_0_1_-2", ""),)
-    UNDERGROUND_CITY_100_LEGS = ((
-        "/shattered_islands/strakewood_island/underground_city/"
-        "underground_city_6_-1_-3", ""),)
-    ZECHNA_99_LEGS = ((
-        "/shattered_islands/strakewood_island/zechna_temple/"
-        "zechna_temple_0_0_-3", "lom lobon|dread gazer|gazer dread"),)
-    EARLY_BASE_LEGS = (EARLY_NAMED_LEGS + EARLY_WASP_LEGS +
-                       EARLY_DAY_BEE_LEGS + EARLY_TREE_LEGS)
-    EARLY_SAFE_LEGS = EARLY_BASE_LEGS
+    # Margins for analyzer picks with aggressive residents, and for the rest.
+    AGGRESSIVE_SAFETY = (0.80, 0.95)
+    PASSIVE_SAFETY = (0.75, 0.90)
 
     def __init__(self, graph: WorldGraph,
                  legs: Sequence[tuple[str, str]], *,
@@ -3535,6 +3431,8 @@ class FarmCircuitTask(BotTask):
                  combat_spell: str = "",
                  combat_skill_until_level: int = 0,
                  clear_hostile_route: bool = False,
+                 analyzer_driven: bool = False,
+                 spot: dict | None = None,
                  clock: Callable[[], float] = time.monotonic):
         if not legs:
             raise ValueError("a farm circuit needs at least one leg")
@@ -3542,8 +3440,10 @@ class FarmCircuitTask(BotTask):
             path.rsplit("/", 1)[-1] for path, _ in legs))
         self.graph = graph
         self.legs = tuple((path, target) for path, target in legs)
-        self._adaptive_early_progression = (
-            self.legs == self.EARLY_SAFE_LEGS)
+        # Autoplay farms whatever the farming analyzer ranks first for the
+        # preferred objective; explicit circuits keep their given legs.
+        self.analyzer_driven = bool(analyzer_driven)
+        self.spot = spot
         self.dwell_seconds = max(5.0, float(dwell_seconds))
         self.switch_grace = max(0.0, float(switch_grace))
         self.level_until = max(0, int(level_until))
@@ -3552,7 +3452,7 @@ class FarmCircuitTask(BotTask):
         self.combat_skill_until_level = max(
             0, int(combat_skill_until_level))
         self._auto_combat_build = bool(
-            self._adaptive_early_progression and
+            self.analyzer_driven and
             not combat_skill and not combat_spell and
             not combat_skill_until_level)
         self._lore_book_attempts: set[int] = set()
@@ -3615,157 +3515,8 @@ class FarmCircuitTask(BotTask):
         self._tier_progress_at: float | None = None
         self._tier_progress_exp = 0
 
-    def _progression_legs(self, level: int) -> tuple[tuple[str, str], ...]:
-        """Retain rare-spawn checks while upgrading out-levelled XP legs."""
-        if not self._adaptive_early_progression:
-            return self.legs
-        if level >= 102:
-            # These level-98/99 residents remain above the server's level-115
-            # grey threshold (82), while avoiding the adjacent level-114/115
-            # balrog tier until protections and live evidence justify it.
-            return self.ZECHNA_99_LEGS
-        if level >= 98:
-            return self.UNDERGROUND_CITY_100_LEGS
-        if level >= 92:
-            return self.ZECHNA_95_LEGS
-        if level >= 85:
-            return self.ZECHNA_88_LEGS
-        if level >= 82:
-            return self.UNDERGROUND_CITY_83_LEGS
-        if level >= 76:
-            return self.UNDERGROUND_CITY_80_LEGS
-        if level >= 64:
-            return self.UNDERGROUND_CITY_68_LEGS
-        if level >= 57:
-            return self.ZECHNA_60_LEGS
-        if level >= 52:
-            return self.UNDERGROUND_CITY_55_LEGS
-        if level >= 44:
-            return self.UNDERGROUND_CITY_46_LEGS
-        if level >= 36:
-            return self.HEMLOCK_37_LEGS
-        if level >= 30:
-            return self.UNDERGROUND_CITY_31_LEGS
-        if level >= 22:
-            return self.TREE_22_LEGS
-        if level >= 19:
-            return self.TREE_19_LEGS
-        if level >= 18:
-            # The analyzer's selected-spawn estimates omitted inevitable
-            # crocodile/frog joins on a fresh map. Live trials exhausted the
-            # healing loop on both western and eastern candidates; retain the
-            # already-proven XP-bearing Eld Woods tree pockets.
-            return self.TREE_18_LEGS
-        if level >= 15:
-            return self.TREE_15_LEGS
-        if level >= 13:
-            return self.TREE_13_LEGS
-        if level >= 11:
-            # Live trials invalidated the static "melee-only" ogre audit:
-            # world_6_56 spawned a stone giant, two ettins and two ogres in
-            # immediate mutual aggro range, while the later belts remain
-            # unverified. Keep automatic progression on isolated passive trees
-            # until every higher-risk pocket has survived a controlled trial.
-            return self.MID_TREE_LEGS
-        if level >= 10:
-            return self.QUICKWOOD_11_LEGS
-        if level >= 9:
-            return self.EARLY_SAFE_LEGS
-        return self.EARLY_BASE_LEGS
-
-    def _safe_progression_legs(
-            self, client: AtrinikClient,
-            level: int) -> tuple[tuple[str, str], ...]:
-        """Fall back below quarantined or inherently crowded farm maps."""
-        now = time.time()
-        quarantine = getattr(
-            client.state, "farm_zone_quarantine", {}) or {}
-        if (19 <= level < 25 and self._deer_readiness(client) and
-                float(quarantine.get(
-                    self.DEER_LEGS[0][0], 0.0) or 0.0) <= now and
-                all(self.graph.farm_max_aggro_pack(path) <= 1
-                    for path, _ in self.DEER_READINESS_LEGS)):
-            return self.DEER_READINESS_LEGS
-        if (20 <= level < 22 and self._strakewood_readiness(client) and
-                all(self.graph.farm_max_aggro_pack(path) <= 1
-                    for path, _ in self.STRAKEWOOD_20_LEGS)):
-            return self.STRAKEWOOD_20_LEGS
-        for candidate_level in range(max(1, level), 0, -1):
-            legs = self._progression_legs(candidate_level)
-            if all(
-                    float(quarantine.get(path, 0.0) or 0.0) <= now and
-                    self.graph.farm_max_aggro_pack(path) <= 1
-                    for path, _ in legs):
-                return legs
-        return self.EARLY_BASE_LEGS
-
-    @staticmethod
-    def _deer_readiness(client: AtrinikClient) -> bool:
-        """Require the live defence/offence profile that justifies a retrial."""
-        stats = client.state.stats
-        protections = client.state.protections
-        return bool(
-            int(stats.get("level", 0) or 0) >= 20 and
-            int(stats.get("maxhp", 0) or 0) >= 190 and
-            int(stats.get("ac", 0) or 0) >= 35 and
-            int(stats.get("wc", 0) or 0) >= 28 and
-            int(stats.get("dam", 0) or 0) >= 38 and
-            int(protections.get(c.ATTACK_IMPACT, 0) or 0) >= 40 and
-            int(protections.get(c.ATTACK_SLASH, 0) or 0) >= 45 and
-            int(protections.get(c.ATTACK_CLEAVE, 0) or 0) >= 50 and
-            int(protections.get(c.ATTACK_PIERCE, 0) or 0) >= 45)
-
-    @staticmethod
-    def _strakewood_readiness(client: AtrinikClient) -> bool:
-        """Require the live L21 profile used by the corrected farm model."""
-        stats = client.state.stats
-        protections = client.state.protections
-        return bool(
-            int(stats.get("level", 0) or 0) >= 21 and
-            int(stats.get("maxhp", 0) or 0) >= 200 and
-            int(stats.get("ac", 0) or 0) >= 36 and
-            int(stats.get("wc", 0) or 0) >= 29 and
-            int(stats.get("dam", 0) or 0) >= 40 and
-            int(protections.get(c.ATTACK_IMPACT, 0) or 0) >= 40 and
-            int(protections.get(c.ATTACK_SLASH, 0) or 0) >= 45 and
-            int(protections.get(c.ATTACK_CLEAVE, 0) or 0) >= 50 and
-            int(protections.get(c.ATTACK_PIERCE, 0) or 0) >= 45)
-
-    def _catchup_progression_legs(
-            self, client: AtrinikClient) -> tuple[tuple[str, str], ...]:
-        """Select faster, loot-aware targets for a lagging trained skill."""
-        if (not self._auto_combat_build or
-                self.combat_skill != "wizardry spells" or
-                not self.combat_skill_until_level):
-            return ()
-        wizardry = self._skill_level(client, "wizardry spells")
-        if wizardry >= self.combat_skill_until_level:
-            return ()
-        legs = list(self.WIZARD_LOW_CATCHUP_LEGS if wizardry < 8 else
-                    self.WIZARD_MID_CATCHUP_LEGS)
-
-        # The fire-wyvern lord is a useful catch-up target and has a 1/80
-        # special bracer drop, but its authored firestorm makes an unprotected
-        # automatic visit needless tail risk.  Add it only from authoritative
-        # live protection state, and stop the rare hunt once the drop is owned.
-        has_bracers = any(
-            "fire wyvern" in item.name.casefold()
-            for item in client.state.inventory)
-        fire_protection = int(client.state.protections.get(
-            c.ATTACK_FIRE, 0) or 0)
-        if fire_protection >= 10 and not has_bracers:
-            legs[1:1] = self.DARK_CAVE_WYVERN_LEGS
-
-        now = time.time()
-        quarantine = getattr(
-            client.state, "farm_zone_quarantine", {}) or {}
-        return tuple(
-            leg for leg in legs
-            if float(quarantine.get(leg[0], 0.0) or 0.0) <= now and
-            self.graph.farm_max_aggro_pack(leg[0]) <= 1)
-
     def _observe_farm_death(self, client: AtrinikClient) -> bool:
-        """Quarantine a farm after death or a guarded-trial safety failure."""
+        """Quarantine an analyzer pick after a death or an emergency recall."""
         history = getattr(client, "decision_history", ())
         if self._decision_history_index > len(history):
             self._decision_history_index = 0
@@ -3788,63 +3539,27 @@ class FarmCircuitTask(BotTask):
                 self._decision_history_time,
                 float(history[-1].get("time", 0.0) or 0.0))
         active_paths = {path for path, _ in self.legs}
-        death = next((record for record in reversed(records)
-                      if record.get("action") == "death"), None)
-        if death is None:
-            quarantine = getattr(
-                client.state, "farm_zone_quarantine", {}) or {}
-            recent_cutoff = time.time() - 10 * 60
-            maxhp = int(client.state.stats.get("maxhp", 0) or 0)
-            hp = int(client.state.stats.get("hp", maxhp) or 0)
-            guarded_trials = (
-                (self.DEER_READINESS_LEGS, self.DEER_LEGS[0][0],
-                 {"emergency-disengage"}, 0.82,
-                 "guarded deer trial required emergency disengagement"),
-            )
-            for legs, path, actions, threshold, reason in guarded_trials:
-                if (self.legs != legs or path not in active_paths or
-                        float(quarantine.get(path, 0.0) or 0.0) >
-                        time.time()):
-                    continue
-                failure = next((
-                    record for record in reversed(history)
-                    if (record.get("action") in actions and
-                        record.get("map") == path and
-                        (record in records or
-                         float(record.get("time", 0.0) or 0.0) >=
-                         recent_cutoff))), None)
-                live_breach = bool(
-                    client.state.map.path == path and maxhp > 0 and
-                    hp / maxhp <= threshold)
-                if failure is None and not live_breach:
-                    continue
-                self._quarantine_farm_path(client, path, reason)
-                return True
+        failure = next((record for record in reversed(records)
+                        if record.get("action") in ("death", "emergency-recall")),
+                       None)
+        if failure is None:
             return False
-        death_map = str(death.get("map", ""))
-        path = death_map if death_map in active_paths else ""
-        # The authored destination can be suitable while its only approach is
-        # not (the live Old Outpost trial proved exactly this). During the
-        # ordinary farm NavigateThen child, attribute a transit death to the
-        # requested destination so autoplay demotes instead of replaying the
-        # same lethal road after every respawn. Maintenance children are held
-        # separately and therefore never reach this branch.
+        failure_map = str(failure.get("map", ""))
+        path = failure_map if failure_map in active_paths else ""
+        # The destination can be suitable while its only approach is not (the
+        # live Old Outpost trial proved exactly this). During the ordinary farm
+        # NavigateThen child, attribute a transit failure to the requested
+        # destination so autoplay moves on instead of replaying the same lethal
+        # road. Maintenance children are held separately and never reach this.
         if (not path and self.child is not None and
                 self.child.navigation.destination in active_paths and
                 self.child.navigation.status != TaskStatus.COMPLETE):
             path = self.child.navigation.destination
         if not path:
             return False
-        if path == self.STRAKEWOOD_20_LEGS[0][0]:
-            recorder = getattr(client, "record_action", None)
-            if recorder is not None:
-                recorder(
-                    "farm-retry-after-death",
-                    f"{path} retained for improved pull recovery")
-            return False
+        what = "combat death" if failure.get("action") == "death" else "emergency recall"
         self._quarantine_farm_path(
-            client, path,
-            f"combat death on {death_map or 'unknown map'}")
+            client, path, f"{what} on {failure_map or 'unknown map'}")
         return True
 
     def _quarantine_farm_path(self, client: AtrinikClient, path: str,
@@ -3864,13 +3579,8 @@ class FarmCircuitTask(BotTask):
 
     def _observe_stalled_farm(self, client: AtrinikClient,
                               farm: FarmTask) -> bool:
-        """Demote a high tier which produces no character XP for ten minutes."""
-        analyzer_trial = self.legs in (
-            self.ANALYZER_SLASH_18_LEGS,
-            self.FORT_SETHER_19_LEGS,
-        )
-        if (not self._adaptive_early_progression or
-                (self._progression_level < 30 and not analyzer_trial) or
+        """Exclude an analyzer pick which produces no character XP for ten minutes."""
+        if (not self.analyzer_driven or
                 self.child is None or
                 client.state.map.path != self.child.navigation.destination):
             self._tier_progress_at = None
@@ -3971,14 +3681,22 @@ class FarmCircuitTask(BotTask):
 
     def _upgrade_progression(self, client: AtrinikClient,
                              farm: FarmTask) -> bool:
+        """Follow the analyzer's best usable spot for the preferred objective."""
         level = self._combat_progression_level(client)
         self._progression_level = level
-        desired = (self._catchup_progression_legs(client) or
-                   self._safe_progression_legs(client, level))
-        if desired == self.legs or self._busy_finishing_fight_or_loot(
-                client, farm):
+        if not self.analyzer_driven:
+            return False
+        selection = analyzer_farm_selection(client, self.graph)
+        if selection is None:
+            return False
+        desired, spot = selection
+        if desired == self.legs:
+            self.spot = spot
+            return False
+        if self._busy_finishing_fight_or_loot(client, farm):
             return False
         self.legs = desired
+        self.spot = spot
         self.leg_index = self._next_ready_leg(0, level)
         self.child = self._new_child()
         self._farm_started_at = 0.0
@@ -3987,10 +3705,15 @@ class FarmCircuitTask(BotTask):
         self._tier_progress_exp = self._current_exp
         self.name = "farm-circuit:" + "+".join(
             path.rsplit("/", 1)[-1] for path, _ in self.legs)
-        log.info("farm progression upgraded for combat level %s: %s",
-                 level,
-                 ", ".join(path.rsplit("/", 1)[-1]
-                           for path, _ in self.legs))
+        objective = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
+        log.info("farming analyzer selected %s for %s: %s",
+                 spot.get("name", "?"), objective,
+                 ", ".join(path.rsplit("/", 1)[-1] for path, _ in self.legs))
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("farm-spot-selected",
+                     f"{spot.get('name', '?')} ({objective}): "
+                     + ", ".join(path for path, _ in self.legs))
         return True
 
     async def _recover_failed_navigation(
@@ -4028,6 +3751,15 @@ class FarmCircuitTask(BotTask):
         # if movement is awaiting acknowledgement. The next tick retries from
         # the authoritative position instead of handing a fight to idle safety.
         return True
+
+    def _exclude_unreachable_leg(self, client: AtrinikClient,
+                                 farm: FarmTask) -> bool:
+        """Quarantine an analyzer pick whose map cannot be reached, then reselect."""
+        assert self.child is not None
+        navigation = self.child.navigation
+        self._quarantine_farm_path(
+            client, navigation.destination, f"unreachable: {navigation.error}")
+        return self._upgrade_progression(client, farm)
 
     def _reset_dwell_off_farm(self, map_path: str) -> bool:
         """Count dwell only while physically present on the farm map."""
@@ -4081,13 +3813,12 @@ class FarmCircuitTask(BotTask):
             neutral_spawn(spawn) for spawn in priorities)
         aggressive_spawns = [
             spawn for spawn in priorities if not neutral_spawn(spawn)]
-        # The isolated-radius planner is enabled for the analyzed dense farm
-        # whose authored geometry and direct-aggro result were verified. Keep
-        # established adjacent patrols elsewhere until each map has the same
-        # evidence; an item_power radius alone does not prove its approach is
-        # suitable for this pull style.
-        isolated_radius_pulls = (
-            zone == self.STRAKEWOOD_20_LEGS[0][0])
+        # Aggressive residents are pulled one at a time from boundary squares
+        # outside every other resident's authored detection radius; passive
+        # spawns keep the adjacent patrol.
+        aggressive = self.analyzer_driven and (bool(aggressive_spawns) or float(
+            (self.spot or {}).get("aggressive_spawns", 0) or 0) > 0)
+        isolated_radius_pulls = aggressive and bool(aggressive_spawns)
         patrol = []
         pull_avoidance: dict[
             tuple[int, int], set[tuple[int, int]]] = {}
@@ -4190,66 +3921,18 @@ class FarmCircuitTask(BotTask):
         farm._lore_book_attempts = self._lore_book_attempts
         farm._spellbook_attempts = self._spellbook_attempts
         farm._unreachable_targets = self._unreachable_targets
+        if self.analyzer_driven:
+            flee, heal = (self.AGGRESSIVE_SAFETY if aggressive else
+                          self.PASSIVE_SAFETY)
+            farm.safety.flee_below = flee
+            farm.safety.heal_below = heal
         if "lost soul" in target.casefold():
             # One soul produces closely spaced physical + secondary damage
             # packets; a 55% trigger can lose the entire margin while a heal
             # merely matches the next attack. Begin control early enough to
             # create separation before the following weapon cycle.
-            farm.safety.flee_below = 0.72
-            farm.safety.heal_below = 0.88
-        if zone.endswith("/world_6_56"):
-            farm.safety.flee_below = 0.72
-            farm.safety.heal_below = 0.88
-        elif zone.endswith(("/world_14_79", "/world_14_78")):
-            farm.safety.flee_below = 0.75
-            farm.safety.heal_below = 0.90
-        elif zone.endswith("/world_4_51_-2"):
-            farm.safety.flee_below = 0.80
-            farm.safety.heal_below = 0.95
-        elif zone.endswith("/world_4_51"):
-            farm.safety.flee_below = 0.75
-            farm.safety.heal_below = 0.92
-        elif zone.endswith("/world_14_77"):
-            farm.safety.flee_below = 0.78
-            farm.safety.heal_below = 0.92
-        elif zone.endswith("/world_11_75"):
-            # This high-throughput field previously produced a 1%-HP escape.
-            # The readiness-gated retrial starts disengagement well before
-            # that tail and automatically demotes after the first emergency.
-            farm.safety.flee_below = 0.82
-            farm.safety.heal_below = 0.95
-        elif zone.endswith("/world_1_50"):
-            # Enter each resident's radius through its isolated pull square,
-            # then use timer-synchronized kiting to draw it away. A bad pull
-            # disengages and recovers but does not abandon this good map.
-            farm.safety.flee_below = 0.82
-            farm.safety.heal_below = 0.95
-        elif zone.endswith("/world_13_73"):
-            farm.safety.flee_below = 0.78
-            farm.safety.heal_below = 0.92
-        elif zone.endswith("/world_14_73"):
-            farm.safety.flee_below = 0.75
-            farm.safety.heal_below = 0.90
-        elif any(root in zone for root in (
-                "/hemlock_cave/", "/underground_city/",
-                "/vielumin_ruins/", "/zechna_temple/",
-                "/rockforge/")):
-            # Source-level fit is not live survival proof. New autonomous
-            # dungeon tiers begin with an early escape and near-full recovery
-            # margin; empirical kill/death telemetry can justify relaxing a
-            # specific tier later without exposing a fresh character to the
-            # generic 55/75 defaults.
-            farm.safety.flee_below = 0.80
-            farm.safety.heal_below = 0.95
-        elif "/old_outpost/" in zone:
-            # Elemental golems are individually kiteable, but the entrance
-            # geometry can wake more than one.  Keep a larger recovery margin
-            # for controlled trials until the pocket has live pack evidence.
-            farm.safety.flee_below = 0.80
-            farm.safety.heal_below = 0.98
-        elif zone.endswith(("/world_5_57", "/world_6_57")):
-            farm.safety.flee_below = 0.75
-            farm.safety.heal_below = 0.90
+            farm.safety.flee_below = max(farm.safety.flee_below, 0.72)
+            farm.safety.heal_below = max(farm.safety.heal_below, 0.88)
         task = NavigateThenTask(
             self.graph, zone, farm, combat_approach=True,
             safety=farm.safety)
@@ -4996,19 +4679,6 @@ class FarmCircuitTask(BotTask):
                 time.time() - self._farm_zone_last_checked.get(
                     path, 0.0) < self.OPTIONAL_RARE_DETOUR_INTERVAL):
             return False
-        if self._adaptive_early_progression:
-            folded = target.casefold()
-            if level < 11 and "lost soul" in folded:
-                return False
-            if "killer bee" in folded or "bee_killer" in folded:
-                return 8 <= level < 10 and self._leg_available(index)
-            if (level < 10 and path.endswith("/world_1_58") and
-                    "skeleton" in folded):
-                return False
-            if (level < 10 and
-                    path.startswith("/shattered_islands/world_7_") and
-                    ("hill giant" in folded or "ogre" in folded)):
-                return False
         return self._leg_available(index)
 
     def _mark_current_optional_check(self, client: AtrinikClient) -> None:
@@ -5692,6 +5362,9 @@ class FarmCircuitTask(BotTask):
                     return
                 if (isinstance(farm, FarmTask) and
                         await self._recover_failed_navigation(client, farm)):
+                    return
+                if (self.analyzer_driven and isinstance(farm, FarmTask) and
+                        self._exclude_unreachable_leg(client, farm)):
                     return
                 self.fail(self.child.navigation.error)
             return

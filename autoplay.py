@@ -7,7 +7,8 @@ import time
 
 from .client import AtrinikClient
 from .catalog_quest_tasks import CatalogQuestTask, POLICIES
-from .navigation import FarmCircuitTask, NavigateThenTask, WorldGraph
+from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
+                         analyzer_farm_selection)
 from .quest_tasks import EscapingDesertedIslandTask
 from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
 
@@ -36,6 +37,7 @@ class AutoplayTask(BotTask):
         self._mana_recovery_attempted = False
         self._retry_at = 0.0
         self._consecutive_failures = 0
+        self._awaiting_ranking_recorded = False
         self.safety = SafetyPolicy()
 
     def _needs_mana_crystal_start(self, client: AtrinikClient) -> bool:
@@ -190,8 +192,25 @@ class AutoplayTask(BotTask):
             await self._start_mana_crystal_recovery(client)
             return
 
+        # The farming analyzer is the only source of farm spots. Until its
+        # first ranking (or a usable, unquarantined spot) exists, stay safe
+        # where the character is instead of guessing a spot.
+        selection = analyzer_farm_selection(client, self.graph)
+        if selection is None:
+            if not self._awaiting_ranking_recorded:
+                self._awaiting_ranking_recorded = True
+                analyzer = getattr(client, "farm_analyzer", None)
+                status = getattr(analyzer, "status", "unavailable")
+                log.info("autoplay waiting for a farming analyzer spot (%s)", status)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("awaiting-farm-ranking", f"analyzer {status}")
+            await self.safety.enforce(client)
+            return
+        self._awaiting_ranking_recorded = False
+        legs, spot = selection
         await self._set_child(
             client, "adaptive-farming",
             FarmCircuitTask(
-                self.graph, list(FarmCircuitTask.EARLY_SAFE_LEGS),
-                level_until=self.target_level))
+                self.graph, list(legs), level_until=self.target_level,
+                analyzer_driven=True, spot=spot))

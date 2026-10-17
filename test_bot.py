@@ -42,7 +42,6 @@ from .model import InterfaceState
 from .quest_tasks import DialogTask, EscapingDesertedIslandTask
 from .web_server import (DashboardState, WebControlServer,
                          experience_progress, experience_thresholds)
-from .farm_spots import FARM_SPOTS
 from .navigation_spots import NAVIGATION_SPOTS
 from . import constants as c
 from .autoplay import AutoplayTask
@@ -51,6 +50,41 @@ from .autoplay import AutoplayTask
 @lru_cache(maxsize=1)
 def built_graph():
     return WorldGraph().build()
+
+
+# Literal circuits for farm-circuit mechanics tests. Production farm spots come
+# only from the farming analyzer (see analyzer_farm_selection).
+EARLY_LEGS = (
+    ("/shattered_islands/world_3_69", "Thrakir|lost soul"),
+    ("/shattered_islands/world_3_68", "Fahrgorm|evil treant"),
+    ("/shattered_islands/world_3_69", "giant wasp|wasp_giant|wasp giant"),
+    ("/shattered_islands/world_4_68", "killer bee|bee_killer|bee killer"),
+    ("/shattered_islands/world_10_78", "evil treant|quickwood"),
+)
+LOST_SOUL_LEGS = (("/shattered_islands/world_3_69", "Thrakir|lost soul"),)
+MUD_HAND_LEGS = (
+    ("/shattered_islands/world_12_79", "mud hand"),
+    ("/shattered_islands/world_12_78", "mud hand"),
+)
+
+
+def analyzer_spot(name, paths, monsters, *, aggressive=0):
+    """One farming-analyzer result in its JSON shape."""
+    return {"path": "|".join(paths), "name": name, "region": "test",
+            "map_paths": ["maps" + path for path in paths], "monsters": list(monsters),
+            "xp_hour": 1.0, "money_hour": 1.0, "loot_hour": 1.0, "danger": 1.0,
+            "aggressive_spawns": aggressive}
+
+
+class StubAnalyzer:
+    """A finished farming analyzer with fixed rankings per objective."""
+
+    def __init__(self, rankings):
+        self.rankings = rankings
+        self.status = "ready"
+
+    def ranking(self, objective):
+        return list(self.rankings.get(objective, ()))
 
 
 class ProtocolTests(unittest.TestCase):
@@ -2601,7 +2635,7 @@ class QuestTests(unittest.TestCase):
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["level"] = 18
         circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS),
+            graph, list(EARLY_LEGS),
             combat_spell="magic bullet")
 
         sweep = circuit._new_upgrade_shopping(client)
@@ -2609,7 +2643,7 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(sweep._new_child().task.allow_launchers)
 
         adaptive = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
+            graph, list(EARLY_LEGS), analyzer_driven=True)
         self.assertTrue(adaptive._auto_combat_build)
         self.assertEqual(adaptive.combat_spell, "")
         between_milestones = adaptive._new_upgrade_shopping(client)
@@ -6812,76 +6846,6 @@ class QuestTests(unittest.TestCase):
                 )
                 self.assertTrue(all(choice.startswith("=:") for choice in choices))
 
-    def test_farm_spot_catalog_covers_progression(self):
-        graph = built_graph()
-        self.assertGreaterEqual(len(FARM_SPOTS), 35)
-        self.assertEqual(len({spot.id for spot in FARM_SPOTS}), len(FARM_SPOTS))
-        self.assertFalse([spot.zone for spot in FARM_SPOTS
-                          if spot.zone not in graph.nodes])
-        self.assertFalse([level for level in range(1, 116)
-                          if not any(spot.min_level <= level <= spot.max_level
-                                     for spot in FARM_SPOTS)])
-        self.assertTrue(all(spot.target for spot in FARM_SPOTS
-                            if spot.category == "boss"))
-        combined = next(spot for spot in FARM_SPOTS
-                        if spot.id == "fahrgorm_thrakir")
-        self.assertEqual([zone for zone, _ in combined.circuit], [
-            "/shattered_islands/world_3_69",
-            "/shattered_islands/world_3_68",
-            "/shattered_islands/world_3_69",
-            "/shattered_islands/world_4_68",
-            "/shattered_islands/world_10_78",
-        ])
-        self.assertEqual(combined.circuit[1][1], "Fahrgorm|evil treant")
-        self.assertEqual(combined.circuit[2][1], "giant wasp|wasp_giant|wasp giant")
-        self.assertEqual(
-            combined.circuit[3][1], "killer bee|bee_killer|bee killer")
-        self.assertEqual(
-            combined.circuit[4][1], "evil treant|quickwood")
-        foothills = next(spot for spot in FARM_SPOTS
-                         if spot.id == "giant_foothills")
-        self.assertEqual((foothills.min_level, foothills.max_level), (14, 18))
-        self.assertEqual([zone for zone, _ in foothills.circuit], [
-            "/shattered_islands/world_7_57",
-            "/shattered_islands/world_7_56",
-        ])
-        self.assertIn("Ring of the Ghost — 1/30", combined.notable_drops)
-        self.assertIn("19:00–07:00", next(
-            spot.notes for spot in FARM_SPOTS if spot.id == "thrakir"))
-        late = {spot.id: spot for spot in FARM_SPOTS if spot.id in {
-            "eld_passive_trees", "eld_deer", "eld_giant_slugs",
-            "eld_red_ants"}}
-        self.assertEqual(set(late), {
-            "eld_passive_trees", "eld_deer", "eld_giant_slugs",
-            "eld_red_ants"})
-        self.assertEqual(
-            [(late[key].min_level, late[key].max_level, late[key].target)
-             for key in ("eld_passive_trees", "eld_deer",
-                         "eld_giant_slugs", "eld_red_ants")],
-            [(11, 17, "Kotung|evil treant|quickwood"),
-             (18, 22, "deer"), (22, 27, "giant slug"),
-             (25, 30, "red ant")])
-        self.assertEqual(len(late["eld_passive_trees"].circuit), 3)
-        self.assertIn("Crossbow Accuracy — 1/40",
-                      late["eld_passive_trees"].notable_drops)
-        self.assertIn("crocodile", late["eld_deer"].notes)
-        combined_data = combined.as_dict(graph)
-        self.assertEqual(combined_data["monster_levels"], [5, 6, 7])
-        self.assertEqual(combined_data["monster_level_min"], 5)
-        self.assertEqual(combined_data["monster_level_max"], 7)
-        self.assertIn("treasure_difficulty", combined_data)
-        dark_data = next(
-            spot for spot in FARM_SPOTS if spot.id == "dark_cave").as_dict(
-                graph)
-        self.assertEqual(dark_data["monster_levels"], [10, 11, 12])
-        ogre_map = "/shattered_islands/world_6_56"
-        self.assertEqual(max(graph.map_monster_levels[ogre_map].values()), 8)
-        self.assertEqual(
-            graph.map_roaming_monster_levels[ogre_map]["stone giant"], 11)
-        self.assertEqual(
-            graph.map_roaming_monster_levels[ogre_map]["ettin"], 9)
-        self.assertIn("acid", late["eld_giant_slugs"].notes)
-
     def test_ordinary_foothills_legs_patrol_authored_spawn_squares(self):
         graph = built_graph()
         circuit = FarmCircuitTask(graph, [
@@ -6905,7 +6869,7 @@ class QuestTests(unittest.TestCase):
     def test_wasp_leg_patrols_only_exact_neutral_spawn_neighborhoods(self):
         graph = built_graph()
         circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
+            graph, list(EARLY_LEGS))
         circuit.leg_index = 2
         wasps = circuit._new_child().task
         self.assertTrue(wasps.neutral_targets)
@@ -6923,7 +6887,7 @@ class QuestTests(unittest.TestCase):
     def test_day_killer_bee_supplement_is_neutral_and_exactly_patrolled(self):
         graph = built_graph()
         circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
+            graph, list(EARLY_LEGS))
         circuit.leg_index = 3
         bees = circuit._new_child().task
         expected = {(spawn.x, spawn.y) for spawn in graph.farm_priorities(
@@ -6935,25 +6899,10 @@ class QuestTests(unittest.TestCase):
                                 for x, y in bees.patrol)
                             for sx, sy in expected))
 
-    def test_bear_pocket_is_excluded_from_automatic_progression(self):
-        graph = built_graph()
-        circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
-        expected = graph.farm_priorities(
-            "/shattered_islands/world_5_69", "grey bear")
-        self.assertEqual(len(expected), 4)
-        self.assertEqual([spawn.level for spawn in expected], [11, 10, 10, 10])
-        self.assertNotIn(("/shattered_islands/world_5_69", "grey bear"),
-                         circuit._progression_legs(9))
-        self.assertNotIn(("/shattered_islands/world_5_69", "grey bear"),
-                         circuit._progression_legs(10))
-        self.assertIn("/shattered_islands/world_4_69",
-                      NavigateTask.KNOWN_LETHAL_TRANSIT)
-
     def test_alternate_tree_leg_has_six_isolated_neutral_spawns(self):
         graph = built_graph()
         circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
+            graph, list(EARLY_LEGS))
         circuit.leg_index = 4
         trees = circuit._new_child().task
         expected = graph.farm_priorities(
@@ -6971,52 +6920,13 @@ class QuestTests(unittest.TestCase):
 
     def test_named_spawn_patrol_uses_observation_squares(self):
         circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS))
+            built_graph(), list(EARLY_LEGS))
         circuit.leg_index = 1
         fahrgorm = circuit._new_child().task
         self.assertTrue(fahrgorm.neutral_targets)
         self.assertNotIn((12, 11), fahrgorm.patrol)
         self.assertTrue(any(max(abs(x - 12), abs(y - 11)) == 1
                             for x, y in fahrgorm.patrol))
-
-    def test_early_circuit_excludes_live_failed_ogre_pockets(self):
-        graph = built_graph()
-        circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
-        self.assertEqual(circuit._progression_legs(8),
-                         FarmCircuitTask.EARLY_BASE_LEGS)
-        self.assertEqual(circuit._progression_legs(9),
-                         FarmCircuitTask.EARLY_BASE_LEGS)
-        self.assertEqual(circuit._progression_legs(10),
-                         FarmCircuitTask.QUICKWOOD_11_LEGS)
-        for level in (11, 12):
-            self.assertEqual(
-                circuit._progression_legs(level),
-                FarmCircuitTask.MID_TREE_LEGS)
-        self.assertEqual(circuit._progression_legs(13),
-                         FarmCircuitTask.TREE_13_LEGS)
-        unsafe_ogre_maps = {
-            "/shattered_islands/world_6_56",
-            "/shattered_islands/world_5_57",
-            "/shattered_islands/world_6_57",
-        }
-        for level in (9, 10, 11, 12, 13):
-            self.assertFalse(any(
-                path in unsafe_ogre_maps
-                for path, _ in circuit._progression_legs(level)))
-        quickwoods = circuit._progression_legs(10)[0]
-        self.assertEqual(len(graph.farm_priorities(*quickwoods)), 5)
-        self.assertEqual({spawn.level for spawn in
-                          graph.farm_priorities(*quickwoods)}, {11, 12})
-        mid_trees = circuit._progression_legs(11)[0]
-        self.assertEqual(len(graph.farm_priorities(*mid_trees)), 7)
-        self.assertTrue(graph.nodes[mid_trees[0]].peaceful_identities &
-                        {"evil treant", "quickwood"})
-        circuit.legs = circuit._progression_legs(11)
-        circuit.leg_index = 0
-        tree_farm = circuit._new_child().task
-        self.assertTrue(tree_farm.neutral_targets)
-        self.assertEqual(tree_farm.safety.flee_below, 0.75)
 
     def test_failed_circuit_route_retreats_instead_of_ending_task(self):
         client = self._combat_client()
@@ -7095,6 +7005,9 @@ class QuestTests(unittest.TestCase):
         client.state.inventory.append(crystal)
         client.state.items[crystal.tag] = crystal
         autoplay = AutoplayTask(built_graph(), target_level=115)
+        client.farm_analyzer = StubAnalyzer({"xp": [analyzer_spot(
+            "Eld Woods trees", ["/shattered_islands/world_14_79"],
+            ["evil treant L13×2", "quickwood L11"])]})
 
         asyncio.run(autoplay.tick(client))
         self.assertIsInstance(
@@ -7102,8 +7015,48 @@ class QuestTests(unittest.TestCase):
         asyncio.run(autoplay.tick(client))
         self.assertEqual(autoplay.phase, "adaptive-farming")
         self.assertIsInstance(autoplay.child, FarmCircuitTask)
-        self.assertTrue(autoplay.child._adaptive_early_progression)
+        self.assertTrue(autoplay.child.analyzer_driven)
+        self.assertEqual(autoplay.child.legs, (
+            ("/shattered_islands/world_14_79", "evil treant|quickwood"),))
+        self.assertEqual(autoplay.child.spot["name"], "Eld Woods trees")
         self.assertEqual(autoplay.child.level_until, 115)
+
+    def test_autoplay_waits_safely_until_the_analyzer_has_a_spot(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 22, "hp": 100, "maxhp": 100})
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay._intro_complete = True
+        holds = []
+
+        class Hold:
+            async def enforce(self, client):
+                holds.append(client.state.map.path)
+                return True
+
+        autoplay.safety = Hold()
+        with patch.object(autoplay, "_needs_mana_crystal_start", return_value=False), \
+                patch.object(autoplay, "_needs_mana_crystal_recovery", return_value=False):
+            for _ in range(3):
+                asyncio.run(autoplay.tick(client))
+            self.assertIsNone(autoplay.child)
+            self.assertEqual(len(holds), 3)
+            waits = [record for record in client.decision_history
+                     if record["action"] == "awaiting-farm-ranking"]
+            self.assertEqual(len(waits), 1)
+            # Every ranked spot quarantined is the same as no spot.
+            spot = analyzer_spot("Trees", ["/shattered_islands/world_14_79"],
+                                 ["evil treant L13"])
+            client.farm_analyzer = StubAnalyzer({"xp": [spot]})
+            client.state.farm_zone_quarantine = {
+                "/shattered_islands/world_14_79": time.time() + 60}
+            asyncio.run(autoplay.tick(client))
+            self.assertIsNone(autoplay.child)
+            client.state.farm_zone_quarantine = {}
+            asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        self.assertEqual(autoplay.child.legs[0][0], "/shattered_islands/world_14_79")
 
     def test_autoplay_recovers_started_mana_crystal_from_apartment(self):
         client = self._combat_client()
@@ -7213,394 +7166,6 @@ class QuestTests(unittest.TestCase):
             autoplay.child, EscapingDesertedIslandTask)
         self.assertEqual(autoplay.status, TaskStatus.RUNNING)
 
-    def test_late_progression_uses_only_live_safe_xp_pockets(self):
-        graph = built_graph()
-        circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
-        expected = {
-            13: FarmCircuitTask.TREE_13_LEGS,
-            14: FarmCircuitTask.TREE_13_LEGS,
-            15: FarmCircuitTask.TREE_15_LEGS,
-            17: FarmCircuitTask.TREE_15_LEGS,
-            18: FarmCircuitTask.TREE_18_LEGS,
-            19: FarmCircuitTask.TREE_19_LEGS,
-            21: FarmCircuitTask.TREE_19_LEGS,
-            22: FarmCircuitTask.TREE_22_LEGS,
-            25: FarmCircuitTask.TREE_22_LEGS,
-            28: FarmCircuitTask.TREE_22_LEGS,
-            30: FarmCircuitTask.UNDERGROUND_CITY_31_LEGS,
-        }
-        for level, legs in expected.items():
-            self.assertEqual(circuit._progression_legs(level), legs)
-        self.assertEqual(
-            [path for path, _ in FarmCircuitTask.TREE_13_LEGS],
-            ["/shattered_islands/world_14_78",
-             "/shattered_islands/world_14_79"])
-        self.assertEqual(
-            [path for path, _ in FarmCircuitTask.TREE_15_LEGS],
-            ["/shattered_islands/world_14_77",
-             "/shattered_islands/world_14_78",
-             "/shattered_islands/world_14_79"])
-        self.assertEqual(
-            FarmCircuitTask.TREE_18_LEGS,
-            (("/shattered_islands/world_14_77", "Kotung|evil treant"),
-             ("/shattered_islands/world_14_78", "evil treant")))
-        self.assertEqual(
-            FarmCircuitTask.TREE_19_LEGS,
-            (("/shattered_islands/world_14_77", "Kotung|evil treant"),))
-        self.assertEqual(
-            [path for path, _ in FarmCircuitTask.ANALYZER_SLASH_18_LEGS],
-            ["/shattered_islands/world_4_51"])
-        self.assertEqual(
-            [path for path, _ in FarmCircuitTask.DEER_TIER_LEGS],
-            ["/shattered_islands/world_11_75",
-             "/shattered_islands/world_14_77",
-             "/shattered_islands/world_14_78",
-             "/shattered_islands/world_14_79"])
-        self.assertEqual(
-            [path for path, _ in FarmCircuitTask.DEER_READINESS_LEGS],
-            ["/shattered_islands/world_11_75",
-             "/shattered_islands/world_14_77"])
-        expected_counts = {
-            FarmCircuitTask.TREE_13_LEGS[0]: 8,
-            FarmCircuitTask.TREE_15_LEGS[0]: 7,
-            FarmCircuitTask.DEER_LEGS[0]: 9,
-            FarmCircuitTask.SLUG_LEGS[0]: 9,
-            FarmCircuitTask.RED_ANT_LEGS[0]: 7,
-        }
-        for (path, target), count in expected_counts.items():
-            priorities = graph.farm_priorities(path, target)
-            self.assertEqual(len(priorities), count)
-            peaceful = graph.nodes[path].peaceful_identities
-            self.assertTrue(all(
-                graph._semantic_name(spawn.named) in peaceful or
-                any(graph._semantic_name(name) in peaceful
-                    for name in spawn.candidates)
-                for spawn in priorities))
-            circuit.legs = ((path, target),)
-            circuit.leg_index = 0
-            farm = circuit._new_child().task
-            self.assertTrue(farm.neutral_targets)
-            self.assertGreaterEqual(farm.safety.flee_below, 0.75)
-            if path == FarmCircuitTask.DEER_LEGS[0][0]:
-                self.assertEqual(farm.safety.flee_below, 0.82)
-                self.assertEqual(farm.safety.heal_below, 0.95)
-
-    def test_improved_level_twenty_loadout_unlocks_guarded_deer_retrial(self):
-        graph = built_graph()
-        client = type("Client", (), {})()
-        client.state = GameState(phase="playing", player_tag=7)
-        client.state.stats.update({
-            "level": 20, "maxhp": 194, "ac": 35, "wc": 28, "dam": 38,
-        })
-        client.state.protections.update({
-            c.ATTACK_IMPACT: 43, c.ATTACK_SLASH: 49,
-            c.ATTACK_CLEAVE: 54, c.ATTACK_PIERCE: 48,
-        })
-        circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
-
-        self.assertTrue(circuit._deer_readiness(client))
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 19),
-            circuit.DEER_READINESS_LEGS)
-        client.state.stats["ac"] = 34
-        self.assertFalse(circuit._deer_readiness(client))
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 19),
-            circuit.TREE_19_LEGS)
-        client.state.stats["ac"] = 35
-        client.state.farm_zone_quarantine[
-            circuit.DEER_LEGS[0][0]] = time.time() + 3600
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 19),
-            circuit.TREE_19_LEGS)
-        client.state.stats.update({
-            "level": 21, "maxhp": 202, "ac": 36, "wc": 29, "dam": 40,
-        })
-        self.assertTrue(circuit._strakewood_readiness(client))
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 20),
-            circuit.STRAKEWOOD_20_LEGS)
-        trial_path = circuit.STRAKEWOOD_20_LEGS[0][0]
-        client.state.farm_zone_quarantine[trial_path] = time.time() + 3600
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 20),
-            circuit.STRAKEWOOD_20_LEGS)
-
-    def test_guarded_deer_emergency_is_persistently_quarantined(self):
-        graph = built_graph()
-        client = type("Client", (), {})()
-        client.state = GameState(phase="playing", player_tag=7)
-        client.state.farm_zone_quarantine = {}
-        client.decision_history = [{
-            "action": "emergency-disengage",
-            "map": FarmCircuitTask.DEER_LEGS[0][0],
-        }]
-        client.quarantines = []
-        client.quarantine_farm_zone = lambda path, until: (
-            client.state.farm_zone_quarantine.__setitem__(path, until),
-            client.quarantines.append((path, until)))
-        client.record_action = lambda action, detail="": None
-        circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.DEER_READINESS_LEGS))
-
-        self.assertTrue(circuit._observe_farm_death(client))
-        self.assertEqual(client.quarantines[0][0],
-                         FarmCircuitTask.DEER_LEGS[0][0])
-
-        # A capped decision ledger keeps the same length as new records evict
-        # old ones. Timestamp tracking must still observe the new emergency.
-        now = time.time()
-        client.state.farm_zone_quarantine = {}
-        client.quarantines.clear()
-        client.decision_history = [
-            {"action": "status", "map": "/safe", "time": now + index}
-            for index in range(2000)
-        ]
-        capped = FarmCircuitTask(
-            graph, list(FarmCircuitTask.DEER_READINESS_LEGS))
-        capped._decision_history_index = len(client.decision_history)
-        capped._decision_history_time = client.decision_history[-1]["time"]
-        client.decision_history.pop(0)
-        client.decision_history.append({
-            "action": "emergency-disengage",
-            "map": FarmCircuitTask.DEER_LEGS[0][0],
-            "time": now + 2001,
-        })
-        self.assertTrue(capped._observe_farm_death(client))
-
-        # A fresh process must also honor a recent persisted emergency instead
-        # of immediately replaying the failed guarded trial.
-        client.state.farm_zone_quarantine = {}
-        restarted = FarmCircuitTask(
-            graph, list(FarmCircuitTask.DEER_READINESS_LEGS))
-        restarted._decision_history_index = len(client.decision_history)
-        restarted._decision_history_time = client.decision_history[-1]["time"]
-        self.assertTrue(restarted._observe_farm_death(client))
-
-        # The good aggressive-density farm learns to split and retry rather
-        # than treating one imperfect pull as evidence to abandon the map.
-        client.state.farm_zone_quarantine = {}
-        client.decision_history = [{
-            "action": "farm-pack-split",
-            "map": FarmCircuitTask.STRAKEWOOD_20_LEGS[0][0],
-        }]
-        strakewood = FarmCircuitTask(
-            graph, list(FarmCircuitTask.STRAKEWOOD_20_LEGS))
-        self.assertFalse(strakewood._observe_farm_death(client))
-        strake_farm = strakewood._new_child().task
-        self.assertEqual(strake_farm.safety.flee_below, 0.82)
-        self.assertEqual(strake_farm.safety.heal_below, 0.95)
-        self.assertEqual(
-            strake_farm.aggressive_detection_ranges["giant frog"], 3)
-        priorities = graph.farm_priorities(
-            *FarmCircuitTask.STRAKEWOOD_20_LEGS[0])
-        self.assertEqual(len(strake_farm.patrol), len(priorities))
-        for goal in strake_farm.patrol:
-            self.assertEqual(sum(
-                max(abs(goal[0] - spawn.x),
-                    abs(goal[1] - spawn.y)) <= spawn.aggro_radius
-                for spawn in priorities), 1)
-            self.assertNotIn(goal, strake_farm.pull_avoidance[goal])
-
-        client.decision_history.append({
-            "action": "death",
-            "map": FarmCircuitTask.STRAKEWOOD_20_LEGS[0][0],
-        })
-        self.assertFalse(strakewood._observe_farm_death(client))
-        self.assertFalse(client.state.farm_zone_quarantine)
-
-        for path, target in FarmCircuitTask.ANALYZER_SLASH_18_LEGS:
-            priorities = graph.farm_priorities(path, target)
-            self.assertTrue(priorities)
-            self.assertFalse(FarmCircuitTask(
-                graph, [(path, target)])._new_child().task.neutral_targets)
-            self.assertTrue(all(
-                spawn.level <= 16 for spawn in priorities))
-            farm = FarmCircuitTask(
-                graph, [(path, target)])._new_child().task
-            self.assertEqual(farm.safety.flee_below, 0.75)
-            self.assertEqual(farm.safety.heal_below, 0.92)
-        self.assertEqual(
-            graph.farm_max_aggro_pack(
-                FarmCircuitTask.ANALYZER_SLASH_18_LEGS[0][0]), 1)
-        self.assertEqual(
-            graph.farm_max_aggro_pack(
-                FarmCircuitTask.WIZARD_MUD_HAND_CATCHUP_LEGS[0][0]), 1)
-        self.assertEqual(
-            graph.transit_max_aggro_pack(
-                FarmCircuitTask.ANALYZER_SLASH_18_LEGS[0][0]), 3)
-        self.assertEqual(
-            graph.transit_max_aggro_pack(
-                FarmCircuitTask.WIZARD_MUD_HAND_CATCHUP_LEGS[0][0]), 6)
-        self.assertEqual(
-            graph.farm_max_aggro_pack(
-                FarmCircuitTask.TREE_18_LEGS[1][0]), 1)
-        self.assertEqual(
-            graph.transit_max_aggro_pack(
-                "/shattered_islands/world_6_50"), 3)
-        self.assertEqual(
-            graph.transit_max_aggro_pack(
-                "/shattered_islands/world_6_51"), 1)
-        fort_sether = FarmCircuitTask.FORT_SETHER_19_LEGS[0]
-        self.assertGreater(graph.farm_max_aggro_pack(fort_sether[0]), 1)
-        self.assertEqual(
-            [spawn.named for spawn in graph.farm_priorities(*fort_sether)],
-            ["spider", "brown bat", "spider", "sword spider", "brown bat"])
-        brownrott = next(
-            spawn for spawn in graph.named_spawns[fort_sether[0]]
-            if spawn.named == "Brownrott")
-        self.assertTrue(brownrott.peaceful)
-        fort_farm = FarmCircuitTask(
-            graph, [fort_sether])._new_child().task
-        self.assertFalse(fort_farm.neutral_targets)
-        self.assertEqual(fort_farm.safety.flee_below, 0.80)
-        self.assertEqual(fort_farm.safety.heal_below, 0.95)
-        route_client = AtrinikClient(ClientConfig())
-        route_client.state.map = MapState(
-            path=FarmCircuitTask.TREE_18_LEGS[0][0],
-            world_x=7, world_y=18)
-        fort_route = NavigateTask(graph, fort_sether[0])
-        fort_route.allow_ranged_hazard_fallback = True
-        self.assertTrue(fort_route._plan(route_client))
-        self.assertTrue(fort_route._threat_fallback)
-        kotung = graph.farm_priorities(*FarmCircuitTask.TREE_15_LEGS[0])
-        self.assertEqual(kotung[0].named, "Kotung")
-        level_22 = graph.farm_priorities(*FarmCircuitTask.TREE_22_LEGS[0])
-        self.assertEqual(
-            [(spawn.named, spawn.level) for spawn in level_22],
-            [("Kotung", 17), ("evil treant", 16)])
-
-        client = type("Client", (), {})()
-        client.state = GameState(phase="playing", player_tag=7)
-        client.state.stats["level"] = 18
-        client.state.map = MapState(
-            path=FarmCircuitTask.TREE_15_LEGS[0][0],
-            world_x=10, world_y=10)
-        route = NavigateTask(graph, FarmCircuitTask.DEER_LEGS[0][0])
-        with self.assertRaises(ValueError):
-            route._plan(client)
-        route.allow_ranged_hazard_fallback = True
-        edges = route._plan(client)
-        self.assertTrue(route._threat_fallback)
-        self.assertTrue(route._route_threat_maps)
-        for path in [client.state.map.path] + [edge.destination
-                                               for edge in edges]:
-            node = graph.nodes[path]
-            aggressive_levels = [
-                level for name, level in
-                graph.map_monster_levels.get(path, {}).items()
-                if name not in node.peaceful_identities]
-            self.assertLessEqual(max(aggressive_levels, default=0), 18)
-
-    def test_autoplay_has_source_audited_reachable_post_30_ladder(self):
-        graph = built_graph()
-        circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS))
-        expected = {
-            30: FarmCircuitTask.UNDERGROUND_CITY_31_LEGS,
-            36: FarmCircuitTask.HEMLOCK_37_LEGS,
-            44: FarmCircuitTask.UNDERGROUND_CITY_46_LEGS,
-            52: FarmCircuitTask.UNDERGROUND_CITY_55_LEGS,
-            57: FarmCircuitTask.ZECHNA_60_LEGS,
-            64: FarmCircuitTask.UNDERGROUND_CITY_68_LEGS,
-            76: FarmCircuitTask.UNDERGROUND_CITY_80_LEGS,
-            82: FarmCircuitTask.UNDERGROUND_CITY_83_LEGS,
-            85: FarmCircuitTask.ZECHNA_88_LEGS,
-            92: FarmCircuitTask.ZECHNA_95_LEGS,
-            98: FarmCircuitTask.UNDERGROUND_CITY_100_LEGS,
-            102: FarmCircuitTask.ZECHNA_99_LEGS,
-            115: FarmCircuitTask.ZECHNA_99_LEGS,
-        }
-        hub = "/shattered_islands/world_0_69"
-        previous_threshold = 29
-        for threshold, legs in expected.items():
-            self.assertGreater(threshold, previous_threshold)
-            previous_threshold = threshold
-            self.assertEqual(circuit._progression_legs(threshold), legs)
-            for path, _ in legs:
-                self.assertIn(path, graph.nodes)
-                self.assertTrue(graph.route(hub, path))
-                levels = list(graph.map_monster_levels[path].values())
-                self.assertTrue(levels)
-                # Each transition is based on exact authored residents, not
-                # the map header's treasure difficulty alone.
-                self.assertLessEqual(min(levels), threshold + 6)
-                circuit.legs = legs
-                circuit.leg_index = 0
-                farm = circuit._new_child().task
-                self.assertGreaterEqual(farm.safety.flee_below, 0.80)
-                self.assertGreaterEqual(farm.safety.heal_below, 0.95)
-        endgame_path, endgame_target = FarmCircuitTask.ZECHNA_99_LEGS[0]
-        endgame_levels = [
-            spawn.level for spawn in
-            graph.farm_priorities(endgame_path, endgame_target)
-        ]
-        self.assertTrue(endgame_levels)
-        self.assertGreaterEqual(min(endgame_levels), 82)
-        self.assertLessEqual(max(endgame_levels), 99)
-
-    def test_autoplay_demotes_around_persistently_quarantined_farm(self):
-        client = AtrinikClient(ClientConfig())
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS))
-        dangerous = FarmCircuitTask.TREE_22_LEGS[0][0]
-        client.state.farm_zone_quarantine[dangerous] = time.time() + 3600
-
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 28),
-            FarmCircuitTask.TREE_13_LEGS)
-        client.state.farm_zone_quarantine[dangerous] = time.time() - 1
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 28),
-            FarmCircuitTask.TREE_22_LEGS)
-
-        analyzer_path = FarmCircuitTask.ANALYZER_SLASH_18_LEGS[0][0]
-        client.state.farm_zone_quarantine[analyzer_path] = time.time() + 3600
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 18),
-            FarmCircuitTask.TREE_18_LEGS)
-
-        fort_path = FarmCircuitTask.FORT_SETHER_19_LEGS[0][0]
-        client.state.farm_zone_quarantine[fort_path] = time.time() + 3600
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 19),
-            FarmCircuitTask.TREE_19_LEGS)
-
-    def test_autoplay_rejects_unaudited_multi_aggro_progression(self):
-        client = AtrinikClient(ClientConfig())
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS))
-
-        self.assertGreater(
-            circuit.graph.farm_max_aggro_pack(
-                FarmCircuitTask.UNDERGROUND_CITY_31_LEGS[0][0]), 1)
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 30),
-            FarmCircuitTask.TREE_22_LEGS)
-
-    def test_autoplay_quarantines_current_farm_after_combat_death(self):
-        client = AtrinikClient(ClientConfig())
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS))
-        circuit.legs = FarmCircuitTask.UNDERGROUND_CITY_31_LEGS
-        path = FarmCircuitTask.UNDERGROUND_CITY_31_LEGS[0][0]
-        client.decision_history.append({
-            "time": time.time(), "action": "death", "detail": "died",
-            "task": circuit.name, "map": path, "x": 4, "y": 5,
-        })
-
-        self.assertTrue(circuit._observe_farm_death(client))
-        self.assertGreater(
-            client.state.farm_zone_quarantine[path], time.time())
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 30),
-            FarmCircuitTask.TREE_22_LEGS)
-        self.assertEqual(
-            client.decision_history[-1]["action"],
-            "farm-zone-quarantine")
-
     def test_autoplay_attributes_transit_death_to_farm_destination(self):
         client = AtrinikClient(ClientConfig())
         graph = WorldGraph()
@@ -7620,114 +7185,6 @@ class QuestTests(unittest.TestCase):
         self.assertGreater(
             client.state.farm_zone_quarantine["/farm"], time.time())
 
-    def test_autoplay_demotes_high_tier_after_ten_minutes_without_xp(self):
-        now = [0.0]
-        client = AtrinikClient(ClientConfig())
-        client.state.phase = "playing"
-        client.state.stats.update({
-            "level": 30, "exp": 1_000, "hp": 100, "maxhp": 100,
-        })
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS),
-            clock=lambda: now[0])
-        circuit.legs = FarmCircuitTask.UNDERGROUND_CITY_31_LEGS
-        circuit.leg_index = 0
-        circuit.child = circuit._new_child()
-        circuit.child.navigation.complete()
-        path = circuit.child.navigation.destination
-        client.state.map = MapState(path=path, width=17, height=17)
-        circuit._progression_level = 30
-        circuit._current_exp = 1_000
-        farm = circuit.child.task
-
-        self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        now[0] = 599.0
-        self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        now[0] = 601.0
-        self.assertTrue(circuit._observe_stalled_farm(client, farm))
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 30),
-            FarmCircuitTask.TREE_22_LEGS)
-
-    def test_analyzer_trial_demotes_after_ten_minutes_without_xp(self):
-        now = [0.0]
-        client = AtrinikClient(ClientConfig())
-        client.state.phase = "playing"
-        client.state.stats.update({
-            "level": 19, "exp": 1_000, "hp": 186, "maxhp": 186,
-        })
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS),
-            clock=lambda: now[0])
-        circuit.legs = FarmCircuitTask.ANALYZER_SLASH_18_LEGS
-        circuit.child = circuit._new_child()
-        circuit.child.navigation.complete()
-        client.state.map = MapState(
-            path=circuit.child.navigation.destination,
-            width=17, height=17)
-        circuit._progression_level = 18
-        circuit._current_exp = 1_000
-        farm = circuit.child.task
-
-        self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        now[0] = 601.0
-        self.assertTrue(circuit._observe_stalled_farm(client, farm))
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 18),
-            FarmCircuitTask.TREE_18_LEGS)
-
-    def test_fort_sether_trial_demotes_after_ten_minutes_without_xp(self):
-        now = [0.0]
-        client = AtrinikClient(ClientConfig())
-        client.state.phase = "playing"
-        client.state.stats.update({
-            "level": 19, "exp": 1_000, "hp": 186, "maxhp": 186,
-        })
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS),
-            clock=lambda: now[0])
-        circuit.legs = FarmCircuitTask.FORT_SETHER_19_LEGS
-        circuit.child = circuit._new_child()
-        circuit.child.navigation.complete()
-        client.state.map = MapState(
-            path=circuit.child.navigation.destination,
-            width=17, height=17)
-        circuit._progression_level = 19
-        circuit._current_exp = 1_000
-        farm = circuit.child.task
-
-        self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        now[0] = 601.0
-        self.assertTrue(circuit._observe_stalled_farm(client, farm))
-        self.assertEqual(
-            circuit._safe_progression_legs(client, 19),
-            FarmCircuitTask.TREE_19_LEGS)
-
-    def test_high_tier_xp_resets_no_progress_watchdog(self):
-        now = [0.0]
-        client = AtrinikClient(ClientConfig())
-        client.state.phase = "playing"
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS),
-            clock=lambda: now[0])
-        circuit.legs = FarmCircuitTask.UNDERGROUND_CITY_31_LEGS
-        circuit.child = circuit._new_child()
-        circuit.child.navigation.complete()
-        client.state.map = MapState(
-            path=circuit.child.navigation.destination,
-            width=17, height=17)
-        circuit._progression_level = 30
-        circuit._current_exp = 1_000
-        farm = circuit.child.task
-
-        self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        now[0] = 500.0
-        circuit._current_exp = 1_001
-        self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        now[0] = 1_099.0
-        self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        self.assertFalse(client.state.farm_zone_quarantine)
-
     def test_adaptive_circuit_periodically_trains_wizardry(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
@@ -7739,7 +7196,7 @@ class QuestTests(unittest.TestCase):
         client.state.place_item(wizardry, 7)
         client.state.place_item(bullet, 7)
         circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS))
+            built_graph(), list(EARLY_LEGS), analyzer_driven=True)
         circuit.child = circuit._new_child()
         farm = circuit.child.task
 
@@ -7765,61 +7222,9 @@ class QuestTests(unittest.TestCase):
             client, circuit.child.task))
         self.assertEqual(circuit.combat_skill_until_level, 15)
 
-    def test_wizardry_catchup_uses_directly_pullable_lower_level_farms(self):
-        client = type("Client", (), {})()
-        client.state = GameState(phase="playing", player_tag=7)
-        client.state.stats.update({"level": 18, "hp": 178, "maxhp": 178})
-        wizardry = Item(1, item_type=c.TYPE_SKILL,
-                        name="wizardry spells")
-        wizardry.extra["level"] = 6
-        bullet = Item(2, item_type=c.TYPE_SPELL, name="magic bullet")
-        client.state.place_item(wizardry, 7)
-        client.state.place_item(bullet, 7)
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS))
-        circuit.combat_skill = "wizardry spells"
-        circuit.combat_spell = "magic bullet"
-        circuit.combat_skill_until_level = 10
-
-        low = circuit._catchup_progression_legs(client)
-        self.assertEqual(low, FarmCircuitTask.WIZARD_MUD_HAND_CATCHUP_LEGS)
-
-        wizardry.extra["level"] = 8
-        mid = circuit._catchup_progression_legs(client)
-        self.assertEqual(mid, FarmCircuitTask.WIZARD_MUD_HAND_CATCHUP_LEGS)
-
-        client.state.protections[c.ATTACK_FIRE] = 10
-        protected = circuit._catchup_progression_legs(client)
-        self.assertEqual(
-            protected, FarmCircuitTask.WIZARD_MUD_HAND_CATCHUP_LEGS)
-
-        bracers = Item(3, item_type=c.TYPE_BRACERS,
-                       name="bracers of the fire wyvern")
-        client.state.place_item(bracers, 7)
-        self.assertNotIn(FarmCircuitTask.DARK_CAVE_WYVERN_LEGS[0],
-                         circuit._catchup_progression_legs(client))
-
-    def test_analyzer_selected_wizard_farms_are_separately_pullable(self):
-        graph = built_graph()
-        source = "/shattered_islands/world_14_78"
-        for leg in FarmCircuitTask.WIZARD_MUD_HAND_CATCHUP_LEGS:
-            path, target = leg
-            priorities = graph.farm_priorities(path, target)
-            self.assertTrue(priorities)
-            self.assertTrue(graph.route_points(source, (1, 21), path, []))
-            self.assertEqual(graph.farm_max_aggro_pack(path), 1)
-            self.assertGreater(graph.transit_max_aggro_pack(path), 1)
-            self.assertFalse(any(
-                any(graph._semantic_name(identity) in
-                    graph.nodes[path].peaceful_identities
-                    for identity in (spawn.named,) + spawn.candidates)
-                for spawn in priorities))
-            farm = FarmCircuitTask(graph, [leg])._new_child().task
-            self.assertFalse(farm.neutral_targets)
-
     def test_explicit_combat_training_disables_automatic_build_review(self):
         circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS),
+            built_graph(), list(EARLY_LEGS), analyzer_driven=True,
             combat_skill="bow archery", combat_skill_until_level=5)
         self.assertFalse(circuit._auto_combat_build)
 
@@ -7827,8 +7232,11 @@ class QuestTests(unittest.TestCase):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["level"] = 11
-        circuit = FarmCircuitTask(built_graph(), list(
-            FarmCircuitTask.EARLY_SAFE_LEGS))
+        client.farm_analyzer = StubAnalyzer({"xp": [analyzer_spot(
+            "Eld Woods trees", ["/shattered_islands/world_14_79"],
+            ["evil treant L13×2"])]})
+        circuit = FarmCircuitTask(built_graph(), list(EARLY_LEGS),
+                                  analyzer_driven=True)
         circuit.child = circuit._new_child()
         farm = circuit.child.task
         farm._engaged_target = (99, "/farm", 1, 1, time.monotonic())
@@ -7836,33 +7244,8 @@ class QuestTests(unittest.TestCase):
         farm._engaged_target = None
         self.assertTrue(circuit._upgrade_progression(client, farm))
         self.assertIn("world_14_79", circuit.name)
-        self.assertNotIn("world_6_56", circuit.name)
-
-    def test_progression_uses_equipped_weapon_skill_not_overall_level(self):
-        client = type("Client", (), {})()
-        client.state = GameState(phase="playing", player_tag=7)
-        client.state.stats["level"] = 10
-        skill = Item(90, item_type=c.TYPE_SKILL, name="slash weapons",
-                     extra={"level": 9, "experience": 490_000})
-        weapon = Item(91, flags=c.ITEM_APPLIED,
-                      item_type=c.TYPE_WEAPON,
-                      required_skill_tag=skill.tag, name="iron shortsword")
-        client.state.place_item(skill, 7)
-        client.state.place_item(weapon, 7)
-        client.state.equipment[c.EQUIP_WEAPON] = weapon.tag
-        circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.EARLY_SAFE_LEGS))
-        farm = circuit._new_child().task
-        self.assertEqual(circuit._combat_progression_level(client), 9)
-        self.assertFalse(circuit._upgrade_progression(client, farm))
-        skill.extra["level"] = 10
-        self.assertTrue(circuit._upgrade_progression(client, farm))
-        self.assertEqual(circuit.legs, FarmCircuitTask.QUICKWOOD_11_LEGS)
-        skill.extra["level"] = 11
-        self.assertTrue(circuit._upgrade_progression(client, farm))
-        self.assertEqual(circuit.legs, FarmCircuitTask.MID_TREE_LEGS)
-        self.assertIn("world_14_79", circuit.name)
-        self.assertNotIn("world_6_56", circuit.name)
+        self.assertEqual(circuit.legs,
+                         (("/shattered_islands/world_14_79", "evil treant"),))
 
     def test_off_map_maintenance_return_resets_farm_dwell(self):
         circuit = FarmCircuitTask(
@@ -7935,10 +7318,10 @@ class QuestTests(unittest.TestCase):
         now = [100.0]
         graph = built_graph()
         circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS) + [
+            graph, list(EARLY_LEGS) + [
                 ("/shattered_islands/world_1_58", "skeleton")],
             clock=lambda: now[0])
-        graveyard_index = len(FarmCircuitTask.EARLY_SAFE_LEGS)
+        graveyard_index = len(EARLY_LEGS)
         circuit.leg_index = graveyard_index
         graveyard = circuit._new_child().task
         expected = {(spawn.x, spawn.y) for spawn in graph.farm_priorities(
@@ -7957,34 +7340,10 @@ class QuestTests(unittest.TestCase):
         circuit.server_clock.anchor_minute = 19 * 60
         self.assertTrue(circuit._leg_available(graveyard_index))
 
-    def test_adaptive_circuit_defers_hard_legs_to_safe_levels(self):
-        graph = built_graph()
-        circuit = FarmCircuitTask(
-            graph, list(FarmCircuitTask.EARLY_SAFE_LEGS),
-            clock=lambda: 10.0)
-        circuit.server_clock.anchor_minute = 20 * 60
-        circuit.server_clock.anchor_at = 10.0
-        self.assertTrue(circuit._leg_available(0))
-        self.assertFalse(circuit._leg_ready(0, 8))
-        self.assertEqual(circuit._next_ready_leg(0, 8), 1)
-        self.assertFalse(circuit._leg_ready(3, 8))
-        self.assertFalse(circuit._leg_ready(3, 9))
-        self.assertFalse(circuit._leg_ready(3, 10))
-        circuit.server_clock.anchor_minute = 12 * 60
-        self.assertTrue(circuit._leg_ready(2, 8))
-        self.assertTrue(circuit._leg_ready(3, 8))
-        self.assertTrue(circuit._leg_ready(3, 9))
-        self.assertFalse(circuit._leg_ready(3, 10))
-        self.assertEqual(circuit._next_ready_leg(2, 8), 2)
-        circuit.server_clock.anchor_minute = 20 * 60
-        self.assertFalse(circuit._leg_ready(0, 10))
-        self.assertTrue(circuit._leg_ready(0, 11))
-        self.assertEqual(circuit._next_ready_leg(0, 11), 0)
-
     def test_rare_detour_check_has_persisted_thirty_minute_cooldown(self):
         circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.WIZARD_LOW_CATCHUP_LEGS))
-        path = FarmCircuitTask.WIZARD_LOST_SOUL_LEGS[0][0]
+            built_graph(), list(LOST_SOUL_LEGS + MUD_HAND_LEGS))
+        path = LOST_SOUL_LEGS[0][0]
         circuit._farm_zone_last_checked[path] = time.time()
         self.assertFalse(circuit._leg_ready(0, 18))
         self.assertEqual(circuit._next_ready_leg(0, 18), 1)
@@ -7994,7 +7353,7 @@ class QuestTests(unittest.TestCase):
 
     def test_unreachable_target_cooldown_survives_circuit_leg_change(self):
         circuit = FarmCircuitTask(
-            built_graph(), list(FarmCircuitTask.WIZARD_LOW_CATCHUP_LEGS))
+            built_graph(), list(LOST_SOUL_LEGS + MUD_HAND_LEGS))
         circuit._unreachable_targets[100] = time.monotonic() + 60
         first = circuit._new_child().task
         circuit.leg_index = 1
@@ -8550,24 +7909,6 @@ class QuestTests(unittest.TestCase):
                           souls.safety.heal_below), (0.72, 0.88))
         self.assertEqual((trees.safety.flee_below,
                           trees.safety.heal_below), (0.55, 0.70))
-
-    def test_old_outpost_trial_uses_elemental_pack_margin(self):
-        zone = ("/shattered_islands/strakewood_island/old_outpost/"
-                "old_outpost_0101")
-        graph = WorldGraph()
-        graph.nodes[zone] = MapNode(zone, width=24, height=24)
-        child = FarmCircuitTask(
-            graph, [(zone, "ice golem")])._new_child()
-        farm = child.task
-        self.assertEqual((farm.safety.flee_below,
-                          farm.safety.heal_below), (0.80, 0.98))
-        self.assertIs(child.safety, farm.safety)
-        self.assertFalse(child.navigation.allow_ranged_hazard_fallback)
-        expedition = FarmCircuitTask(
-            graph, [(zone, "ice golem")],
-            clear_hostile_route=True)._new_child()
-        self.assertTrue(
-            expedition.navigation.allow_ranged_hazard_fallback)
 
     def test_hostile_route_expedition_aborts_to_its_origin_on_adds(self):
         class FakeClient:
@@ -10925,6 +10266,127 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertIn("--json", command)
 
 
+class AnalyzerFarmSelectionTests(unittest.TestCase):
+    TREES = "/shattered_islands/world_14_79"
+    POCKET = "/shattered_islands/world_14_78"
+    UPPER = "/shattered_islands/world_14_77"
+
+    def client(self, rankings):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 22, "exp": 1000, "hp": 100, "maxhp": 100})
+        client.farm_analyzer = StubAnalyzer(rankings)
+        return client
+
+    def test_spot_legs_follow_analyzer_maps_and_monsters(self):
+        from .navigation import analyzer_spot_legs
+
+        graph = built_graph()
+        spot = analyzer_spot("Circuit", [self.TREES, self.POCKET],
+                             ["evil treant L13×3", "quickwood L11×2", "evil treant L14"])
+        self.assertEqual(analyzer_spot_legs(spot, graph), (
+            (self.TREES, "evil treant|quickwood"),
+            (self.POCKET, "evil treant|quickwood")))
+        unknown = analyzer_spot("Nowhere", [self.TREES, "/no/such/map"], ["rat L1"])
+        self.assertEqual(analyzer_spot_legs(unknown, graph), ())
+
+    def test_selection_follows_the_objective_and_skips_live_failures(self):
+        from .navigation import analyzer_farm_selection
+
+        graph = built_graph()
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        gold = analyzer_spot("Gold", [self.UPPER], ["Kotung L17"])
+        client = self.client({"xp": [trees, pocket], "money": [gold, trees]})
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
+        client.state.farm_objective = "money"
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Gold")
+        client.state.farm_objective = "xp"
+        client.state.farm_zone_quarantine = {self.TREES: time.time() + 60}
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
+        client.state.farm_zone_quarantine = {self.TREES: time.time() - 1}
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
+        client.farm_analyzer = None
+        self.assertIsNone(analyzer_farm_selection(client, graph))
+
+    def circuit(self, client, spot):
+        from .navigation import analyzer_spot_legs
+
+        circuit = FarmCircuitTask(built_graph(), list(analyzer_spot_legs(
+            spot, built_graph())), analyzer_driven=True, spot=spot)
+        circuit.child = circuit._new_child()
+        return circuit
+
+    def test_death_and_emergency_recall_exclude_the_pick_and_reselect(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        upper = analyzer_spot("Upper", [self.UPPER], ["evil treant L16"])
+        for action, quarantined, survivor in (
+                ("death", self.TREES, "Pocket"),
+                ("emergency-recall", self.TREES, "Pocket")):
+            with self.subTest(action=action):
+                client = self.client({"xp": [trees, pocket, upper]})
+                circuit = self.circuit(client, trees)
+                farm = circuit.child.task
+                client.decision_history.append({
+                    "time": time.time() + 1, "action": action, "detail": "",
+                    "task": "", "map": quarantined})
+                self.assertTrue(circuit._observe_farm_death(client))
+                self.assertGreater(client.state.farm_zone_quarantine[quarantined], time.time())
+                self.assertTrue(circuit._upgrade_progression(client, farm))
+                self.assertEqual(circuit.spot["name"], survivor)
+                self.assertEqual(circuit.legs[0][0], self.POCKET)
+                self.assertIn("farm-spot-selected",
+                              [record["action"] for record in client.decision_history])
+        # Once the pick is reached, a failure elsewhere does not exclude it.
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        circuit.child.navigation.complete()
+        client.decision_history.append({
+            "time": time.time() + 1, "action": "death", "detail": "",
+            "task": "", "map": "/elsewhere"})
+        self.assertFalse(circuit._observe_farm_death(client))
+
+    def test_no_xp_for_ten_minutes_excludes_any_analyzer_pick(self):
+        now = [1000.0]
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = FarmCircuitTask(built_graph(), [(self.TREES, "evil treant")],
+                                  analyzer_driven=True, spot=trees, clock=lambda: now[0])
+        circuit.child = circuit._new_child()
+        client.state.map.path = self.TREES
+        farm = circuit.child.task
+        self.assertFalse(circuit._observe_stalled_farm(client, farm))
+        now[0] += circuit.FARM_NO_PROGRESS_SECONDS - 1
+        self.assertFalse(circuit._observe_stalled_farm(client, farm))
+        circuit._current_exp += 10  # XP resets the watchdog
+        self.assertFalse(circuit._observe_stalled_farm(client, farm))
+        now[0] += circuit.FARM_NO_PROGRESS_SECONDS + 1
+        self.assertTrue(circuit._observe_stalled_farm(client, farm))
+        self.assertIn(self.TREES, client.state.farm_zone_quarantine)
+        explicit = FarmCircuitTask(built_graph(), [(self.TREES, "evil treant")])
+        self.assertFalse(explicit.analyzer_driven)
+
+    def test_unreachable_pick_is_excluded_instead_of_failing_autoplay(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        client = self.client({"xp": [trees, pocket]})
+        circuit = self.circuit(client, trees)
+        circuit.child.navigation.status = TaskStatus.FAILED
+        circuit.child.navigation.error = "no component route"
+        self.assertTrue(circuit._exclude_unreachable_leg(client, circuit.child.task))
+        self.assertIn(self.TREES, client.state.farm_zone_quarantine)
+        self.assertEqual(circuit.spot["name"], "Pocket")
+
+    def test_aggressive_picks_get_cautious_margins_and_isolated_pulls(self):
+        passive = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [passive]})
+        circuit = self.circuit(client, passive)
+        self.assertEqual((circuit.child.task.safety.flee_below,
+                          circuit.child.task.safety.heal_below),
+                         FarmCircuitTask.PASSIVE_SAFETY)
+
+
 class BuildInfoTests(unittest.TestCase):
     COMMIT = "4a29be882631e570df3028c6e6ead2893b3d4723"
 
@@ -11269,7 +10731,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=14", page)
+        self.assertIn(b"/app.js?v=15", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -11279,7 +10741,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         snapshot = json.loads(payload)
         self.assertEqual(status, 200)
         self.assertEqual(len(snapshot["quests"]), 16)
-        self.assertEqual(len(snapshot["farm_spots"]), len(FARM_SPOTS))
+        self.assertEqual(snapshot["farm_spots"], [])
         self.assertEqual(len(snapshot["navigation_spots"]),
                          len(NAVIGATION_SPOTS))
         self.assertIn("quest_journal", snapshot)

@@ -22,8 +22,7 @@ from .build_info import build_info
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
-from .farm_spots import farm_spot_catalog
-from .navigation import (FarmCircuitTask, NavigateTask, NavigateThenTask,
+from .navigation import (analyzer_spot_legs, FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
 from .quest_tasks import EscapingDesertedIslandTask
@@ -564,7 +563,7 @@ class DashboardState:
             "task": task_data, "last_task": self.engine.last_task,
             "map": self.map(), "inventory": inventory, "ground": ground,
             "skills": sorted(skills, key=lambda skill: (-skill["level"], skill["name"])),
-            "farm_spots": farm_spot_catalog(self.graph),
+            "farm_spots": self.analyzer_farm_spots(),
             "navigation_spots": navigation_spot_catalog(self.graph),
             "actions": self.client.action_history[-200:],
             "decisions": self.client.decision_history[-500:],
@@ -575,6 +574,23 @@ class DashboardState:
             "quest_journal": self.quest_journal(),
             "farming_analysis": self.farming_analysis(),
         }
+
+    def analyzer_farm_spots(self) -> list[dict[str, Any]]:
+        """The preferred objective's ranked spots, as manual farm circuits."""
+        analyzer = getattr(self.client, "farm_analyzer", None)
+        if analyzer is None:
+            return []
+        objective = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
+        spots = []
+        for rank, spot in enumerate(analyzer.ranking(objective), 1):
+            legs = analyzer_spot_legs(spot, self.graph)
+            if legs:
+                spots.append({
+                    "id": str(spot.get("path") or rank),
+                    "name": f"#{rank} {spot.get('name', '?')}",
+                    "circuit": [list(leg) for leg in legs],
+                })
+        return spots
 
     def farming_analysis(self) -> dict[str, Any]:
         analyzer = getattr(self.client, "farm_analyzer", None)

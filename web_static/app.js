@@ -392,18 +392,16 @@ $("#command-form").onsubmit = e => { e.preventDefault(); const v = $("#command-i
 // ---------- quests, places, tasks ----------
 let lastSlowSig = "";
 function renderSlowLists() {
-  const sig = JSON.stringify([slow.quests, slow.quest_journal, (slow.farm_spots || []).length, (slow.navigation_spots || []).length, (live.stats || {}).level]);
+  const sig = JSON.stringify([slow.quests, slow.quest_journal, (slow.farm_spots || []).map(s => s.id), (slow.navigation_spots || []).length]);
   if (sig === lastSlowSig) return;
   lastSlowSig = sig;
   $("#quest-journal").innerHTML = (slow.quest_journal || []).map(q => `<div class="quest ${esc(q.status)}"><strong>${esc(q.name)}</strong><span class="flag">${esc(q.status)}</span></div>`).join("") || '<span class="muted">Journal not loaded — press Refresh.</span>';
   $("#quests").innerHTML = (slow.quests || []).map(q => `<div class="quest"><strong>${esc(q.name)}</strong><button class="small" data-quest="${esc(q.name)}">Run</button><small>Level ${esc(q.suggested_level)} · ${esc(q.availability)}</small></div>`).join("");
   $$("[data-quest]").forEach(b => (b.onclick = () => task(b, `Started quest ${b.dataset.quest}`, { type: "quest", name: b.dataset.quest })));
-  const level = (live.stats || {}).level || 1;
-  $("#farm-spot").innerHTML = (slow.farm_spots || []).map(s => `<option value="${esc(s.id)}" ${s.min_level <= level && level <= s.max_level ? "" : 'class="muted"'}>${esc(s.name)} · L${s.min_level}–${s.max_level}${s.min_level <= level && level <= s.max_level ? " ✓" : ""}</option>`).join("");
+  // Spots come from the farming analyzer's ranking for the preferred objective.
+  $("#farm-spot").innerHTML = (slow.farm_spots || []).map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join("") || '<option value="">Waiting for the farming analyzer…</option>';
   const chosen = $("#farm-spot").dataset.chosen;
-  const fit = (slow.farm_spots || []).find(s => s.min_level <= level && level <= s.max_level);
   if (chosen && (slow.farm_spots || []).some(s => s.id === chosen)) $("#farm-spot").value = chosen;
-  else if (fit) $("#farm-spot").value = fit.id;
   $("#nav-spot").innerHTML = '<option value="">Known destinations…</option>' + (slow.navigation_spots || []).map(s => `<option value="${esc(s.id)}">${esc(s.name)} · ${esc(s.category)}</option>`).join("");
 }
 $("#farm-spot").onchange = () => ($("#farm-spot").dataset.chosen = $("#farm-spot").value);
@@ -417,7 +415,7 @@ $("#run-farm").onclick = e => {
   const s = (slow.farm_spots || []).find(x => x.id === $("#farm-spot").value);
   if (!s) return toast("Choose a farm spot first", true);
   const common = { until_level: +$("#farm-level").value };
-  task(e.target, `Farming ${s.name}`, s.circuit && s.circuit.length ? { type: "farm_circuit", legs: s.circuit, ...common } : { type: "farm", zone: s.zone, target: s.target, item: "", quantity: 1, ...common });
+  task(e.target, `Farming ${s.name}`, { type: "farm_circuit", legs: s.circuit, ...common });
 };
 $("#run-nav").onclick = e => { const dest = $("#nav-map").value.trim(); if (!dest) return toast("Enter a map path or choose a destination", true); task(e.target, `Travelling to ${dest}`, { type: "navigate", destination: dest, x: $("#nav-x").value, y: $("#nav-y").value }); };
 $("#bank").onclick = e => task(e.target, "Depositing money", { type: "bank", banker: $("#banker").value, amount: $("#bank-amount").value });
