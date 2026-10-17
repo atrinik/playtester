@@ -8275,6 +8275,18 @@ class QuestTests(unittest.TestCase):
         self.assertIsInstance(circuit._restoration.task, TempleServiceTask)
         self.assertEqual(circuit._restoration.task.cost, 980)
 
+    def test_paid_but_ineffective_temple_service_backs_off(self):
+        # Live: Saruthar took the fee and said he would cast, but the
+        # depletion force stayed; retrying every half hour drains the purse.
+        self.assertEqual(
+            FarmCircuitTask.restoration_backoff("temple service did not remove depletion"),
+            FarmCircuitTask.PAID_RESTORATION_RETRY_SECONDS)
+        self.assertEqual(
+            FarmCircuitTask.restoration_backoff("no component route from /a to /b"),
+            FarmCircuitTask.RESTORATION_RETRY_SECONDS)
+        self.assertGreater(FarmCircuitTask.PAID_RESTORATION_RETRY_SECONDS,
+                           FarmCircuitTask.RESTORATION_RETRY_SECONDS)
+
     def test_temple_service_pays_from_bank_and_verifies_force_removal(self):
         class FakeClient:
             def __init__(self):
