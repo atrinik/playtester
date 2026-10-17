@@ -864,6 +864,17 @@ class FarmTask(BotTask):
         return (0 <= world_x < self.map_bounds[0] and
                 0 <= world_y < self.map_bounds[1])
 
+    def corpse_tile_standable(self, path: str, x: int, y: int) -> bool:
+        """Whether the character can stand on a corpse's tile to loot it.
+
+        A crocodile or frog killed in swamp water leaves its corpse on a tile
+        the player cannot enter; probing it only repeats failed steps.
+        """
+        node = self.map_node
+        if node is None or node.path != path or not node.terrain:
+            return True
+        return node.walkable(x, y)
+
     def retreat_tile_walkable(self, path: str, x: int, y: int) -> bool:
         """Reject authored walls/fixtures before issuing a direct escape step."""
         node = self.map_node
@@ -975,6 +986,13 @@ class FarmTask(BotTask):
                     f"({world_x}, {world_y})")
             return
         key = (path, world_x, world_y)
+        if not self.corpse_tile_standable(path, world_x, world_y):
+            self._ignored_corpse_tiles.add(key)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("corpse-probe-skip",
+                         f"unstandable tile at {path} ({world_x}, {world_y})")
+            return
         if key not in self._ignored_corpse_tiles:
             self._suspected_corpse_tiles.setdefault(key, (now, 0))
             log.info("target vanished; probing probable corpse at %s (%s, %s)",
@@ -2278,6 +2296,8 @@ class FarmTask(BotTask):
             world_y = m.world_y + view_y - cy
             if (m.path, world_x, world_y) in self._ignored_corpse_tiles:
                 continue
+            if not self.corpse_tile_standable(m.path, world_x, world_y):
+                continue
             visible_corpses.append((view_x, view_y, world_x, world_y))
         if visible_corpses:
             hp = client.state.stats.get("hp", 0)
@@ -2317,6 +2337,10 @@ class FarmTask(BotTask):
                     log.info("abandoned unreachable probable corpse at %s", key)
                 else:
                     self._suspected_corpse_tiles[key] = (created, attempts)
+        for key in [key for key in self._suspected_corpse_tiles
+                    if not self.corpse_tile_standable(*key)]:
+            self._suspected_corpse_tiles.pop(key, None)
+            self._ignored_corpse_tiles.add(key)
         candidates = []
         for key, (created, attempts) in self._suspected_corpse_tiles.items():
             if key[0] != m.path or attempts >= 5:

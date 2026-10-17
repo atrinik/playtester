@@ -3071,6 +3071,10 @@ class NavigateThenTask(BotTask):
                             0 <= world[1] < node.width and
                             0 <= world[2] < node.height):
                         continue
+                    if (node is not None and node.terrain and
+                            not node.walkable(world[1], world[2])):
+                        # Corpses in water cannot be stood on to loot.
+                        continue
                     if world in self.task._ignored_corpse_tiles:
                         continue
                     corpses.append((distance, view_x, view_y))
