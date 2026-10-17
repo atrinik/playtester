@@ -531,13 +531,20 @@ class AtrinikClient:
         self._persist_character_memory()
 
     def forget_bank_balance(self) -> None:
-        """Drop a cached balance that may no longer match the server."""
+        """Drop a cached balance that may no longer match the server.
+
+        An unknown balance reads as 0, exactly as after a restart without a
+        fresh observation, so no wallet check counts the stale amount; the
+        budgeted flows read the bank again before relying on it.
+        """
+        self.state.bank_balance = 0
         self.state.bank_balance_known = False
         self.state.bank_balance_observed_at = 0.0
         character = self.state.player_name or self.config.character
         if not character:
             return
         record = self._runtime_memory.setdefault(character, {})
+        record["bank_balance"] = 0
         record["bank_balance_observed_at"] = 0.0
         self._persist_character_memory()
 

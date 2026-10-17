@@ -3866,6 +3866,7 @@ class BuyShopUpgradeTask(BotTask):
                 if forget is not None:
                     forget()
                 else:
+                    client.state.bank_balance = 0
                     client.state.bank_balance_known = False
             raise
 

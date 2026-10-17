@@ -1506,6 +1506,24 @@ class ProtocolTests(unittest.TestCase):
             self.assertFalse(restored.lore_book_attempted(
                 restored.state.inventory[1]))
 
+    def test_forgotten_bank_balance_is_unknown_and_zero_across_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.set_bank_balance(4_524)
+            client.forget_bank_balance()
+            self.assertEqual((client.state.bank_balance, client.state.bank_balance_known),
+                             (0, False))
+            restarted = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            restarted.state.player_name = "Sera"
+            restarted.load_character_memory("Sera")
+            self.assertEqual((restarted.state.bank_balance,
+                              restarted.state.bank_balance_known), (0, False))
+
     def test_depletion_points_persist_and_count_only_in_death_window(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.json")
@@ -7892,6 +7910,9 @@ class QuestTests(unittest.TestCase):
         # next budgeted purchase.
         self.assertEqual(client.persisted, [4_524])
         self.assertFalse(client.state.bank_balance_known)
+        # The stale reservation is not left for wallet checks to count.
+        self.assertEqual(client.state.bank_balance, 0)
+        self.assertEqual(BuyShopUpgradeTask.wallet_value(client), 0)
 
     def test_mass_identify_pays_flat_service_and_verifies_item_updates(self):
         class FakeClient:
