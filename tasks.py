@@ -758,6 +758,8 @@ class FarmTask(BotTask):
             for goal, blocked in (pull_avoidance or {}).items()
         }
         self._priority_target_ids: dict[int, int] = {}
+        # Peaceful creatures seen occupying a named spawn; attacked with force.
+        self._spawn_blocker_ids: set[int] = set()
         self._visible_target_count = 0
         self._patrol_index = 0
         self._last_action = 0.0
@@ -3336,20 +3338,25 @@ class FarmTask(BotTask):
             world_x = client.state.map.world_x + x - cx
             world_y = client.state.map.world_y + y - cy
             priority_rank = None
+            on_spawn = False
             for rank, (spawn_x, spawn_y, named) in enumerate(
                     self.priority_spawns):
-                if (named.casefold() in semantic.casefold() or
-                        max(abs(world_x - spawn_x),
-                            abs(world_y - spawn_y)) <= 1):
+                near = max(abs(world_x - spawn_x),
+                           abs(world_y - spawn_y)) <= 1
+                on_spawn = on_spawn or near
+                if named.casefold() in semantic.casefold() or near:
                     priority_rank = (rank if priority_rank is None else
                                      min(priority_rank, rank))
             # A spawn point holds one creature at a time. An authored-peaceful
             # occupant of a named spawn (the evil treant that Kotung's shared
             # spawn rolls 90% of the time) is the reroll blocker, not a
             # bystander: leaving it alive means the named target never spawns.
-            if (priority_rank is None and
-                    self.ignore_unrequested_peaceful(client, obj)):
+            # Only standing on the spawn qualifies; the same species elsewhere
+            # is still unrequested wildlife, whatever the spawn's candidates.
+            if not on_spawn and self.ignore_unrequested_peaceful(client, obj):
                 continue
+            if on_spawn and self.authored_peaceful(client, obj):
+                self._spawn_blocker_ids.add(obj.target_id)
             if priority_rank is not None:
                 previous = self._priority_target_ids.get(
                     obj.target_id, priority_rank)
@@ -3487,8 +3494,11 @@ class FarmTask(BotTask):
             if await self.training_finisher(client, x, y, obj):
                 return
             semantic = map_object_semantic(client, obj)
+            # Peaceful creatures must be provoked deliberately: the requested
+            # species, and a peaceful blocker occupying a named spawn.
             force = bool(
-                self.target_pattern and self.target_pattern.search(semantic))
+                (self.target_pattern and self.target_pattern.search(semantic)) or
+                obj.target_id in self._spawn_blocker_ids)
             await client.set_combat(True, force=force)
             spell_alignment_pending = False
             if self.combat_spell:
