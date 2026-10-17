@@ -8845,6 +8845,55 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(task._temporary_blocked, set())
         self.assertEqual(task._runtime_blocked, set())
 
+    def test_learned_blocks_that_trap_the_character_are_reset(self):
+        # Live on world_2_67: learned stall blocks ringed Sera while a visible
+        # guard kept her on the occupant branch, cancelling for minutes.
+        graph = WorldGraph()
+        node = MapNode("/test/field", width=5, height=5)
+        node.terrain = {(x, y): 1 for x in range(5) for y in range(5)}
+        graph.nodes[node.path] = node
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(
+                    path=node.path, width=17, height=17, world_x=2, world_y=2)
+                # A guard in view at world (0, 0), off the route.
+                self.state.map.tile(6, 6).objects[5] = MapObject(
+                    5, 0, 0, 0, target_id=99)
+                self.steps = []
+                self.clears = 0
+                self.actions = []
+
+            async def move(self, direction):
+                self.steps.append(direction)
+
+            async def clear_actions(self):
+                self.clears += 1
+
+            def record_action(self, action, detail):
+                self.actions.append((action, detail))
+
+        client = FakeClient()
+        task = NavigateTask(graph, node.path, (4, 4))
+        task._runtime_blocked = {
+            (2 + dx, 2 + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            if (dx, dy) != (0, 0)}
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.steps, [])
+        self.assertEqual(len(task._runtime_blocked), 8)
+        task._last_progress -= 6.0  # past the five-second reset
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._runtime_blocked, set())
+        self.assertEqual(
+            [action for action, _ in client.actions].count(
+                "navigation-learned-blocks-reset"), 1)
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.steps), 1)
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+
     def test_locked_gate_requires_its_exact_authored_key(self):
         graph = built_graph()
         node = graph.nodes["/shattered_islands/world_2_70"]

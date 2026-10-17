@@ -1530,6 +1530,9 @@ class NavigateTask(BotTask):
     """Follow the authored path one verified protocol move at a time."""
 
     STALL_RETRY_SECONDS = 0.65
+    # Learned stall blockers are guesses. Once they leave no route at all and
+    # the character has not moved for this long, they are the trap.
+    LEARNED_BLOCK_RESET_SECONDS = 5.0
     ACCESS_ITEM = re.compile(r"\b(key|talisman|amulet|pass|token)\b", re.I)
     EARLY_ROUTE_HAZARD = re.compile(
         r"(?:rock thrower|battle thrower|skel(?:eton)? mage|"
@@ -1931,6 +1934,21 @@ class NavigateTask(BotTask):
             allow_locked=self._allow_locked(client),
             excluded=blocked)
         if not path:
+            if (self._runtime_blocked and
+                    now - self._last_progress >= self.LEARNED_BLOCK_RESET_SECONDS):
+                # Live trap on world_2_67: six learned blocks ringed Sera while a
+                # visible guard kept this branch on the occupant path below, so
+                # she cancelled and replanned for minutes without one step.
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("navigation-learned-blocks-reset",
+                             ", ".join(f"{x},{y}" for x, y in sorted(self._runtime_blocked)))
+                self._runtime_blocked.clear()
+                await client.clear_actions()
+                self._issued_goal = None
+                self._issued_click = None
+                self._last_action = now
+                return True
             if self._temporary_blocked:
                 if await self._step_to_open_boundary(
                         client, world_x, world_y, now, blocked):
