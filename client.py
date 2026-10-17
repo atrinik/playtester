@@ -501,8 +501,20 @@ class AtrinikClient:
         the authored graph's static apartment exits are only placeholders.
         """
         if (old_path and old_path != m.path and "/apartments/" in old_path and
-                "/apartments/" not in m.path):
+                "/apartments/" not in m.path and not self._recently_moved_by_force()):
             self.set_apartment_return(old_path, m.path, m.world_x, m.world_y)
+
+    def _recently_moved_by_force(self, seconds: float = 15.0) -> bool:
+        """Whether a death or recall, not an exit, may explain a map change."""
+        cutoff = time.time() - seconds
+        for entry in reversed(self.decision_history):
+            if not isinstance(entry, dict):
+                continue
+            if float(entry.get("time", 0) or 0) < cutoff:
+                break
+            if entry.get("action") in ("death", "emergency-recall"):
+                return True
+        return False
 
     def set_apartment_return(self, apartment: str, path: str, x: int, y: int) -> None:
         """Persist where leaving an apartment put the character."""

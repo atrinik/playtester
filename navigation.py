@@ -3498,6 +3498,24 @@ def _segment_steps(graph: WorldGraph, map_path: str, here: tuple[int, int],
     return steps + (1 if edge.kind == "tile" else 0)
 
 
+def _spawn_points(graph: WorldGraph, map_path: str) -> list[tuple[int, int]]:
+    """Walkable authored spawn tiles of a map: where its farm actually is."""
+    node = graph.nodes.get(map_path)
+    if node is None:
+        return []
+    return sorted({(spawn.x, spawn.y) for spawn in graph.named_spawns.get(map_path, ())
+                   if node.walkable(spawn.x, spawn.y)})
+
+
+def _reaches(graph: WorldGraph, map_path: str, point: tuple[int, int],
+             targets: list[tuple[int, int]]) -> bool:
+    """Whether point shares a walkable component with a target (or none known)."""
+    if not targets:
+        return True
+    component = graph._component(map_path, point)
+    return any(target in component for target in targets)
+
+
 def _route_walk(graph: WorldGraph, start_map: str, start_xy: tuple[int, int],
                 edges: Sequence[MapEdge]) -> int:
     """Moves along a planned route until it enters its destination map."""
@@ -3522,7 +3540,8 @@ def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
     graph's static alternatives, so its walk continues from the observed
     return point in ``returns``; without one it is unknown (None).
     """
-    if bed_map in spot_maps:
+    targets = {spot: _spawn_points(graph, spot) for spot in spot_maps}
+    if bed_map in spot_maps and _reaches(graph, bed_map, point, targets[bed_map]):
         return [(0, None)]
     start_map, start_xy, base, first = bed_map, point, 0, None
     if "/apartments/" in bed_map:
@@ -3538,12 +3557,14 @@ def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
         first = min(exits, key=lambda edge: _segment_steps(graph, bed_map, point, edge))
         base = _segment_steps(graph, bed_map, point, first)
         start_map, start_xy = back[0], tuple(back[1])
-        if start_map in spot_maps:
+        if start_map in spot_maps and _reaches(graph, start_map, start_xy, targets[start_map]):
             return [(base, first)]
     options = []
     for spot in spot_maps:
         try:
-            edges = graph.route_points(start_map, start_xy, spot, [])
+            # Arrive in the part of the circuit map the farm's spawns are
+            # in: a bed (or arrival) in a disconnected room does not count.
+            edges = graph.route_points(start_map, start_xy, spot, targets[spot])
         except (ValueError, KeyError):
             edges = None
         yield

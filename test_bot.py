@@ -8647,6 +8647,26 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(nearest_savebed(graph, ["/farm_a", "/east"]),
                          ("/hall", (28, 0), 1))
 
+    def test_a_bed_cut_off_from_the_farm_room_is_not_already_there(self):
+        from .navigation import NamedSpawn, savebed_walk
+
+        # The circuit map has two rooms; the farm's spawn is in the east one
+        # and the bed in the west one, joined only through /yard.
+        graph = WorldGraph()
+        farm = MapNode("/farm", width=11, height=1)
+        farm.terrain = {(x, 0): 1 for x in range(11)}
+        farm.blocked = {(5, 0)}
+        farm.edges.append(MapEdge("/farm", "/yard", 0, 0, 0, 0))
+        yard = MapNode("/yard", width=3, height=1)
+        yard.terrain = {(x, 0): 1 for x in range(3)}
+        yard.edges.append(MapEdge("/yard", "/farm", 2, 0, 10, 0))
+        graph.nodes.update({"/farm": farm, "/yard": yard})
+        graph.named_spawns["/farm"] = [NamedSpawn("/farm", 8, 0, "rat", ("rat",))]
+        # West room bed: out to /yard (2 moves), across it (2), back in.
+        self.assertEqual(savebed_walk(graph, "/farm", (2, 0), ["/farm"]), 4)
+        # East room bed: already with the farm.
+        self.assertEqual(savebed_walk(graph, "/farm", (9, 0), ["/farm"]), 0)
+
     def test_apartment_exits_record_their_runtime_return(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.json")
@@ -8660,6 +8680,13 @@ class QuestTests(unittest.TestCase):
                                        MapState(path="/shattered_islands/world_0_67"))
             self.assertEqual(client.state.apartment_returns,
                              {STARTER_APARTMENT: ("/shattered_islands/world_0_68", (7, 12))})
+            # A death or recall that happens to leave the apartment is not
+            # its exit's return point.
+            client.record_action("emergency-recall", "via scroll")
+            client._observe_map_change(STARTER_APARTMENT,
+                                       MapState(path="/shattered_islands/world_4_45", world_x=1, world_y=1))
+            self.assertEqual(client.state.apartment_returns[STARTER_APARTMENT][0],
+                             "/shattered_islands/world_0_68")
             restarted = AtrinikClient(ClientConfig(
                 character="Sera", runtime_state_path=path))
             restarted.state.player_name = "Sera"
