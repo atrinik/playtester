@@ -4813,8 +4813,14 @@ class FarmCircuitTask(BotTask):
             self.graph, "/shattered_islands/world_3_58",
             TempleServiceTask("Saruthar", "remove depletion", "depletion",
                               self._depletion_service_cost(client)),
-            destination_xy=(13, 13), combat_approach=True)
+            destination_xy=(13, 13), combat_approach=True,
+            safety=SafetyPolicy(heal_below=0.85, flee_below=0.70))
         task.navigation.tolerance = 1
+        # The temple lies south of the Strakewood swamps, whose crocodile and
+        # frog packs make every way there a pack-hazard map. Depletion keeps
+        # Sera weak until it is removed, so take the careful route through
+        # them rather than give up; the stricter safety policy heals early.
+        task.navigation.allow_ranged_hazard_fallback = True
         return task
 
     def _queue_depletion_service(self, client: AtrinikClient) -> bool:

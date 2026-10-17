@@ -8258,6 +8258,10 @@ class QuestTests(unittest.TestCase):
                          "/shattered_islands/world_3_58")
         self.assertEqual(service.navigation.destination_xy, (13, 13))
         self.assertEqual(service.navigation.tolerance, 1)
+        # Every way to the temple crosses pack-hazard swamp; the trip must
+        # still go, carefully.
+        self.assertTrue(service.navigation.allow_ranged_hazard_fallback)
+        self.assertEqual(service.safety.heal_below, 0.85)
         self.assertTrue(graph.nodes[service.navigation.destination].walkable(
             *service.navigation.destination_xy))
         self.assertIsInstance(service.task, TempleServiceTask)
@@ -10085,6 +10089,26 @@ class NavigationTests(unittest.TestCase):
         task = NavigateTask(graph, "/shattered_islands/world_6_56")
         with self.assertRaises(ValueError):
             task._plan(client)
+
+    def test_depletion_trip_crosses_the_swamps_carefully(self):
+        # Live failure: from world_4_45 every way south to Saruthar crosses
+        # the Strakewood swamp packs, so a hazard-free plan does not exist.
+        graph = built_graph()
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 23
+        client.state.map = MapState(
+            path="/shattered_islands/world_4_45", world_x=19, world_y=4)
+        strict = NavigateTask(graph, "/shattered_islands/world_3_58", destination_xy=(13, 13))
+        strict.tolerance = 1
+        with self.assertRaisesRegex(ValueError, "no component route"):
+            strict._plan(client)
+        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
+        service = circuit._new_depletion_service(client)
+        route = service.navigation._plan(client)
+        self.assertEqual(route[-1].destination, "/shattered_islands/world_3_58")
+        self.assertFalse({edge.destination for edge in route} &
+                         set(NavigateTask.KNOWN_LETHAL_TRANSIT))
 
     def test_navigation_never_uses_known_lethal_mixed_map_as_transit(self):
         graph = built_graph()
