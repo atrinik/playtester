@@ -153,7 +153,7 @@ class ProtocolTests(unittest.TestCase):
                 self.payload = payload
 
             async def drain(self):
-                raise asyncio.TimeoutError
+                await asyncio.sleep(3600)  # flow control never drains
 
             def close(self):
                 self.closed = True
@@ -163,6 +163,7 @@ class ProtocolTests(unittest.TestCase):
 
         async def run():
             client = AtrinikClient(ClientConfig(connect_timeout=0.01))
+            client.SEND_STALL_SECONDS = 0.01
             writer = Writer()
             client.writer = writer
             client.state.phase = "playing"
@@ -424,6 +425,161 @@ class ProtocolTests(unittest.TestCase):
             await runner
             self.assertTrue(ticks)
             self.assertEqual(set(ticks), {"/shattered_islands/world_14_77"})
+
+        asyncio.run(scenario())
+
+    def test_engine_keeps_the_task_when_the_connection_drops_mid_tick(self):
+        from .tasks import BotTask
+
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.phase = "playing"
+            client.state.map.path = "/shattered_islands/world_14_77"
+            engine = TaskEngine(client, tick_rate=0.01)
+            ticks = []
+
+            class Probe(BotTask):
+                survives_disconnect = True
+
+                async def tick(self, client):
+                    ticks.append(client.state.phase)
+                    # Not connected: the send raises ConnectionError.
+                    await client.clear_actions()
+
+            probe = Probe("probe")
+            engine.set_task(probe)
+            engine.running = True
+            runner = asyncio.create_task(engine.run())
+            await asyncio.sleep(0.05)
+            self.assertTrue(ticks)
+            self.assertIs(engine.task, probe)
+            self.assertNotEqual(probe.status, TaskStatus.FAILED)
+            # After the reconnect the same task carries on.
+            sent = []
+
+            async def send(packet):
+                sent.append(packet)
+
+            client.send = send
+            await asyncio.sleep(0.05)
+            engine.running = False
+            await runner
+            self.assertIs(engine.task, probe)
+            self.assertTrue(sent)
+
+            # A task that cannot rebuild its in-flight work still fails.
+            class Plain(BotTask):
+                async def tick(self, client):
+                    await client.clear_actions()
+
+            client.send = AtrinikClient.send.__get__(client)
+            plain = Plain("plain")
+            engine.set_task(plain)
+            engine.running = True
+            runner = asyncio.create_task(engine.run())
+            await asyncio.sleep(0.05)
+            engine.running = False
+            await runner
+            self.assertIsNone(engine.task)
+            self.assertEqual(plain.status, TaskStatus.FAILED)
+
+        asyncio.run(scenario())
+
+    def test_autoplay_rebuilds_its_child_after_a_lost_connection(self):
+        from .autoplay import AutoplayTask
+        from .tasks import BotTask
+
+        class Child(BotTask):
+            async def tick(self, client):
+                raise ConnectionError("not connected")
+
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        autoplay = AutoplayTask(WorldGraph(), target_level=115)
+        self.assertTrue(autoplay.survives_disconnect)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay.phase = "adaptive-farming"
+        autoplay.child = Child("half-done purchase")
+        with self.assertRaises(ConnectionError):
+            asyncio.run(autoplay.tick(client))
+        self.assertIsNone(autoplay.child)
+        self.assertEqual(autoplay.status, TaskStatus.RUNNING)
+        self.assertIn("autoplay-disconnect",
+                      [entry["action"] for entry in client.decision_history])
+        # An interrupted mana-crystal recovery may be tried again.
+        autoplay._retry_at = 0.0
+        autoplay.phase = "mana-crystal-recovery"
+        autoplay._mana_recovery_attempted = True
+        autoplay.child = Child("mana-crystal recovery")
+        with self.assertRaises(ConnectionError):
+            asyncio.run(autoplay.tick(client))
+        self.assertFalse(autoplay._mana_recovery_attempted)
+        # ... and so may one whose setup lost the connection.
+        autoplay.phase = "adaptive-farming"
+        autoplay.child = None
+        with self.assertRaises(ConnectionError):
+            asyncio.run(autoplay._start_mana_crystal_recovery(client))
+        self.assertFalse(autoplay._mana_recovery_attempted)
+
+    def test_transport_os_errors_are_reported_as_lost_connections(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+
+            class Writer:
+                def write(self, data):
+                    raise OSError(101, "Network is unreachable")
+
+                async def drain(self):
+                    pass
+
+                def close(self):
+                    pass
+
+                async def wait_closed(self):
+                    raise OSError(32, "Broken pipe")
+
+            client.writer = Writer()
+            client.state.phase = "playing"
+            with self.assertRaises(ConnectionError) as raised:
+                await client.clear_actions()
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            # The transport is detached so the read loop wakes and reconnects.
+            self.assertIsNone(client.writer)
+            self.assertEqual(client.state.phase, "disconnected")
+            self.assertTrue(client._reconnect_requested)
+
+            # Resets, broken pipes and transport timeouts tear down the
+            # transport the same way; ETIMEDOUT is not a stalled drain.
+            for error in (ConnectionResetError, BrokenPipeError, TimeoutError):
+                class Broken(Writer):
+                    def write(self, data, error=error):
+                        raise error()
+
+                client.writer = Broken()
+                client.state.phase = "playing"
+                client._reconnect_requested = False
+                with self.assertRaises(ConnectionError):
+                    await client.clear_actions()
+                self.assertIsNone(client.writer, error)
+                self.assertEqual(client.state.phase, "disconnected", error)
+                self.assertTrue(client._reconnect_requested, error)
+
+            # A late failure on an already replaced transport leaves the new
+            # connection alone.
+            class Late(Writer):
+                def write(self, data):
+                    client.writer = fresh
+                    raise ConnectionResetError()
+
+            fresh = Writer()
+            client.writer = Late()
+            client.state.phase = "playing"
+            client._reconnect_requested = False
+            with self.assertRaises(ConnectionError):
+                await client.clear_actions()
+            self.assertIs(client.writer, fresh)
+            self.assertEqual(client.state.phase, "playing")
+            self.assertFalse(client._reconnect_requested)
 
         asyncio.run(scenario())
 
@@ -1349,6 +1505,24 @@ class ProtocolTests(unittest.TestCase):
                     item, restored.state.player_tag)
             self.assertFalse(restored.lore_book_attempted(
                 restored.state.inventory[1]))
+
+    def test_forgotten_bank_balance_is_unknown_and_zero_across_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.set_bank_balance(4_524)
+            client.forget_bank_balance()
+            self.assertEqual((client.state.bank_balance, client.state.bank_balance_known),
+                             (0, False))
+            restarted = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            restarted.state.player_name = "Sera"
+            restarted.load_character_memory("Sera")
+            self.assertEqual((restarted.state.bank_balance,
+                              restarted.state.bank_balance_known), (0, False))
 
     def test_depletion_points_persist_and_count_only_in_death_window(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5508,6 +5682,35 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.decisions, [
             ("threat-origin-retired", "confirmed kill target=100"),
             ("corpse-probe-queued", "/test (13, 10)")])
+
+        # A kill in water leaves a corpse she cannot stand on: no probe. The
+        # water tile carries an explicit terrain record without the walk bit.
+        water = MapNode("/test", width=25, height=25)
+        water.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        water.terrain[(13, 10)] = 2
+        swamp = FarmTask(zone="/test")
+        swamp.map_node = water
+        swamp.remember_engagement(client, 11, 8, 101)
+        client.decisions.clear()
+        swamp.observe_engaged_target(client, [])
+        self.assertNotIn(death_tile, swamp._suspected_corpse_tiles)
+        self.assertIn(death_tile, swamp._ignored_corpse_tiles)
+        self.assertIn(("corpse-probe-skip", "unstandable tile at /test (13, 10)"),
+                      client.decisions)
+        # A probe queued before the terrain was known is dropped, not walked.
+        swamp._suspected_corpse_tiles[death_tile] = (time.monotonic() - 5.0, 0)
+        swamp._ignored_corpse_tiles.clear()
+        client.moves.clear()
+        asyncio.run(swamp.loot_nearby(client))
+        self.assertNotIn(death_tile, swamp._suspected_corpse_tiles)
+        self.assertIn(death_tile, swamp._ignored_corpse_tiles)
+        self.assertEqual(client.moves, [])
+        # A sparse cell with no terrain record stays standable, as the server
+        # treats it as passable; only an explicit record or blocker rules out.
+        del water.terrain[(13, 10)]
+        self.assertTrue(swamp.corpse_tile_standable("/test", 13, 10))
+        water.blocked.add((13, 10))
+        self.assertFalse(swamp.corpse_tile_standable("/test", 13, 10))
         self.assertTrue(asyncio.run(task.loot_nearby(client)))
         # Hidden-corpse recovery advances one acknowledged tile at a time.
         self.assertEqual(client.moves, [(9, 8)])
@@ -7829,6 +8032,42 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)
         self.assertEqual(client.state.depletion_points, 0)
+
+    def test_temple_service_forgets_the_bank_balance_when_its_send_is_lost(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance = 5_504
+                self.state.bank_balance_known = True
+                self.state.place_item(Item(
+                    22, item_type=c.TYPE_FORCE, quality=0,
+                    name="depletion"), 7)
+                self.persisted = []
+                self.connected = False
+                self.talks = []
+
+            def set_bank_balance(self, balance):
+                self.persisted.append(balance)
+                self.state.bank_balance = balance
+
+            async def talk(self, message, npc):
+                if not self.connected:
+                    raise ConnectionError("not connected")
+                self.talks.append((message, npc))
+
+        client = FakeClient()
+        task = TempleServiceTask(
+            "Saruthar", "remove depletion", "depletion", 980)
+        with self.assertRaises(ConnectionError):
+            asyncio.run(task.tick(client))
+        # The server may or may not have charged: neither the reserved nor the
+        # refunded balance is trusted, so the bank is read again before the
+        # next budgeted purchase.
+        self.assertEqual(client.persisted, [4_524])
+        self.assertFalse(client.state.bank_balance_known)
+        # The stale reservation is not left for wallet checks to count.
+        self.assertEqual(client.state.bank_balance, 0)
+        self.assertEqual(BuyShopUpgradeTask.wallet_value(client), 0)
 
     def test_mass_identify_pays_flat_service_and_verifies_item_updates(self):
         class FakeClient:

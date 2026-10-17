@@ -18,10 +18,14 @@ log = logging.getLogger(__name__)
 class AutoplayTask(BotTask):
     """Bootstrap a character and keep autonomous progression running.
 
-    This root deliberately owns child replacement.  A reconnect preserves the
-    in-memory child; a process restart reconstructs the same phase from live
-    quest and character state, so neither case needs a dashboard submission.
+    This root deliberately owns child replacement.  A reconnect between ticks
+    preserves the in-memory child; a connection lost during a child's tick
+    drops that child, and a process restart reconstructs the phase, both from
+    live quest and character state, so none needs a dashboard submission.
     """
+
+    # Rebuilds its child from the server's state after a reconnect.
+    survives_disconnect = True
 
     MANA_CRYSTAL_LEVEL = 18
     MANA_CRYSTAL_QUEST = "Gandyld's Mana Crystal"
@@ -85,19 +89,26 @@ class AutoplayTask(BotTask):
     async def _start_mana_crystal_recovery(
             self, client: AtrinikClient) -> None:
         self._mana_recovery_attempted = True
-        await client.clear_actions()
-        await client.set_combat(False)
-        await client.clear_target()
-        await self._set_child(
-            client, "mana-crystal-recovery",
-            NavigateThenTask(
-                self.graph,
-                "/shattered_islands/strakewood_island/apartments/"
-                "apartment_cheap",
-                RetrieveItemsTask(
-                    "chest", (r"Gandyld's Mana Crystal",),
-                    require_match=True),
-                destination_xy=(1, 3), combat_approach=True))
+        try:
+            await client.clear_actions()
+            await client.set_combat(False)
+            await client.clear_target()
+            await self._set_child(
+                client, "mana-crystal-recovery",
+                NavigateThenTask(
+                    self.graph,
+                    "/shattered_islands/strakewood_island/apartments/"
+                    "apartment_cheap",
+                    RetrieveItemsTask(
+                        "chest", (r"Gandyld's Mana Crystal",),
+                        require_match=True),
+                    destination_xy=(1, 3), combat_approach=True))
+        except ConnectionError:
+            # Setup was interrupted before the recovery ran to an outcome.
+            self._mana_recovery_attempted = False
+            if self.phase == "mana-crystal-recovery":
+                self.child = None
+            raise
 
     async def _set_child(self, client: AtrinikClient, phase: str,
                          child: BotTask) -> None:
@@ -145,7 +156,23 @@ class AutoplayTask(BotTask):
                 if self._needs_mana_crystal_recovery(client):
                     await self._start_mana_crystal_recovery(client)
                     return
-            await self.child.tick(client)
+            try:
+                await self.child.tick(client)
+            except ConnectionError as exc:
+                # The child's dialogue, transfer, or purchase may be half done;
+                # rebuild it from the server's state after the reconnect.
+                log.warning("autoplay %s child lost its connection (%s); "
+                            "rebuilding it after the reconnect",
+                            self.phase, exc or "closed")
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("autoplay-disconnect",
+                             f"{self.phase}: {self.child.name}")
+                if self.phase == "mana-crystal-recovery":
+                    # The interrupted recovery never ran to an outcome.
+                    self._mana_recovery_attempted = False
+                self.child = None
+                raise
             if self.child.status not in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
                 return

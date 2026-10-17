@@ -8,9 +8,11 @@ import random
 import re
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
+from typing import Any
 
 try:
     from tools.world_content_audit import load_archetypes
@@ -129,6 +131,21 @@ def map_object_semantic(client: AtrinikClient, obj) -> str:
         return f"{value} {human} {chr(32).join(reversed(human.split()))}"
 
     return f"{aliases(obj.name)} {aliases(visual)}"
+
+
+def corpse_tile_standable(node, path: str, x: int, y: int) -> bool:
+    """Whether authored content rules out standing on a corpse's tile.
+
+    Only an explicit terrain record without the walking bit (water, lava) or
+    a static blocker rules it out. A cell with no terrain record at all stays
+    standable: the server treats such sparse margins as passable.
+    """
+    if node is None or node.path != path:
+        return True
+    point = (x, y)
+    if point in node.blocked:
+        return False
+    return point not in node.terrain or bool(node.terrain[point] & 1)
 
 
 def recent_hostile_contact(client: AtrinikClient, seconds: float = 5.0) -> bool:
@@ -348,6 +365,12 @@ class SafetyPolicy:
 
 
 class BotTask:
+    # Whether the engine keeps this task when the connection drops in the
+    # middle of a tick. Only tasks that rebuild their in-flight work from the
+    # server's state after a reconnect may set it (autoplay does); any other
+    # task would resume with half-finished dialogues or pending transfers.
+    survives_disconnect = False
+
     def __init__(self, name: str):
         self.name = name
         self.status = TaskStatus.READY
@@ -864,6 +887,14 @@ class FarmTask(BotTask):
         return (0 <= world_x < self.map_bounds[0] and
                 0 <= world_y < self.map_bounds[1])
 
+    def corpse_tile_standable(self, path: str, x: int, y: int) -> bool:
+        """Whether the character can stand on a corpse's tile to loot it.
+
+        A crocodile or frog killed in swamp water leaves its corpse on a tile
+        the player cannot enter; probing it only repeats failed steps.
+        """
+        return corpse_tile_standable(self.map_node, path, x, y)
+
     def retreat_tile_walkable(self, path: str, x: int, y: int) -> bool:
         """Reject authored walls/fixtures before issuing a direct escape step."""
         node = self.map_node
@@ -975,6 +1006,13 @@ class FarmTask(BotTask):
                     f"({world_x}, {world_y})")
             return
         key = (path, world_x, world_y)
+        if not self.corpse_tile_standable(path, world_x, world_y):
+            self._ignored_corpse_tiles.add(key)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("corpse-probe-skip",
+                         f"unstandable tile at {path} ({world_x}, {world_y})")
+            return
         if key not in self._ignored_corpse_tiles:
             self._suspected_corpse_tiles.setdefault(key, (now, 0))
             log.info("target vanished; probing probable corpse at %s (%s, %s)",
@@ -2278,6 +2316,8 @@ class FarmTask(BotTask):
             world_y = m.world_y + view_y - cy
             if (m.path, world_x, world_y) in self._ignored_corpse_tiles:
                 continue
+            if not self.corpse_tile_standable(m.path, world_x, world_y):
+                continue
             visible_corpses.append((view_x, view_y, world_x, world_y))
         if visible_corpses:
             hp = client.state.stats.get("hp", 0)
@@ -2317,6 +2357,10 @@ class FarmTask(BotTask):
                     log.info("abandoned unreachable probable corpse at %s", key)
                 else:
                     self._suspected_corpse_tiles[key] = (created, attempts)
+        for key in [key for key in self._suspected_corpse_tiles
+                    if not self.corpse_tile_standable(*key)]:
+            self._suspected_corpse_tiles.pop(key, None)
+            self._ignored_corpse_tiles.add(key)
         candidates = []
         for key, (created, attempts) in self._suspected_corpse_tiles.items():
             if key[0] != m.path or attempts >= 5:
@@ -3755,11 +3799,11 @@ class BuyGroundItemsTask(BotTask):
                 self.fail("shop stock disappeared before purchase")
                 return
         remaining = self._goal - self._inventory_quantity(client)
-        if self.cash_reserve is not None:
-            BuyShopUpgradeTask.account_purchase(client, cost)
-        await client.move_item(
-            client.state.player_tag, stock.tag,
-            min(stock.quantity, remaining))
+        await BuyShopUpgradeTask.send_purchase(
+            client, cost if self.cash_reserve is not None else 0,
+            lambda: client.move_item(
+                client.state.player_tag, stock.tag,
+                min(stock.quantity, remaining)))
         self._attempt_inventory_quantity = inventory_quantity
         self._attempt_at = now
 
@@ -3818,17 +3862,49 @@ class BuyShopUpgradeTask(BotTask):
         return total
 
     @classmethod
-    def account_purchase(cls, client: AtrinikClient, cost: int) -> None:
-        """Reserve the bank-funded portion until inventory payment lands."""
+    def account_purchase(cls, client: AtrinikClient, cost: int) -> int:
+        """Reserve the bank-funded portion until inventory payment lands.
+
+        Returns the amount reserved from the bank balance.
+        """
         bank_spend = max(0, int(cost) - cls.carried_wallet_value(client))
-        if bank_spend and getattr(client.state, "bank_balance_known", False):
-            balance = max(
-                0, int(client.state.bank_balance) - bank_spend)
-            setter = getattr(client, "set_bank_balance", None)
-            if setter is not None:
-                setter(balance)
-            else:
-                client.state.bank_balance = balance
+        if not bank_spend or not getattr(client.state, "bank_balance_known", False):
+            return 0
+        balance = int(client.state.bank_balance)
+        reserved = min(bank_spend, max(0, balance))
+        cls._set_bank_balance(client, balance - reserved)
+        return reserved
+
+    @staticmethod
+    def _set_bank_balance(client: AtrinikClient, balance: int) -> None:
+        setter = getattr(client, "set_bank_balance", None)
+        if setter is not None:
+            setter(balance)
+        else:
+            client.state.bank_balance = balance
+
+    @classmethod
+    async def send_purchase(cls, client: AtrinikClient, cost: int,
+                            send: Callable[[], Awaitable[Any]]) -> None:
+        """Reserve a purchase's bank funds, then send its request.
+
+        When the connection is lost during the send, the server may or may
+        not have processed the purchase, so the reserved balance is neither
+        kept nor refunded: it is forgotten, and the next budgeted purchase
+        reads the bank's real balance first.
+        """
+        reserved = cls.account_purchase(client, cost)
+        try:
+            await send()
+        except ConnectionError:
+            if reserved:
+                forget = getattr(client, "forget_bank_balance", None)
+                if forget is not None:
+                    forget()
+                else:
+                    client.state.bank_balance = 0
+                    client.state.bank_balance_known = False
+            raise
 
     @staticmethod
     def _prototype(client: AtrinikClient, item: Item
@@ -4143,9 +4219,9 @@ class BuyShopUpgradeTask(BotTask):
             item.tag for item in client.state.inventory}
         self._purchase_name = candidate.name.casefold()
         self._purchase_face = candidate.face
-        self.account_purchase(client, cost)
-        await client.move_item(
-            client.state.player_tag, candidate.tag, candidate.quantity)
+        await self.send_purchase(
+            client, cost, lambda: client.move_item(
+                client.state.player_tag, candidate.tag, candidate.quantity))
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder("shop-upgrade-buy",
@@ -4320,9 +4396,9 @@ class BuyDialogueStockTask(BotTask):
             self._inventory_quantity_before = sum(
                 item.quantity for item in client.state.inventory
                 if item.name.casefold() == self._item_name.casefold())
-            BuyShopUpgradeTask.account_purchase(client, total_cost)
             client.state.interface = None
-            await client.talk(quantity, self.merchant)
+            await BuyShopUpgradeTask.send_purchase(
+                client, total_cost, lambda: client.talk(quantity, self.merchant))
             self._stage = "buy"
             self._sent_at = now
             return
@@ -4589,8 +4665,9 @@ class TempleServiceTask(BotTask):
             if wallet < self.cost:
                 self.fail(f"temple service costs {self.cost}, wallet {wallet}")
                 return
-            BuyShopUpgradeTask.account_purchase(client, self.cost)
-            await client.talk(f"buy {self.service}", self.priest)
+            await BuyShopUpgradeTask.send_purchase(
+                client, self.cost,
+                lambda: client.talk(f"buy {self.service}", self.priest))
             self._sent_at = time.monotonic()
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
@@ -4658,9 +4735,10 @@ class MassIdentifyTask(BotTask):
                     f"mass identification needs {required} copper including "
                     f"reserve, wallet {wallet}")
                 return
-            BuyShopUpgradeTask.account_purchase(client, self.cost)
             client.state.interface = None
-            await client.talk("buy identify_all", self.smith)
+            await BuyShopUpgradeTask.send_purchase(
+                client, self.cost,
+                lambda: client.talk("buy identify_all", self.smith))
             self._sent_at = time.monotonic()
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
@@ -4954,6 +5032,18 @@ class TaskEngine:
                 self.client.action_context = self.task.name
                 try:
                     await self.task.tick(self.client)
+                except ConnectionError as exc:
+                    # The server went away mid-tick (live: a MAIN upgrade shut
+                    # it down while autoplay was clearing actions, and autoplay
+                    # ended for good). Hold a task that rebuilds its in-flight
+                    # work through the reconnect, like a disconnect noticed
+                    # between ticks; any other task fails as before.
+                    if getattr(self.task, "survives_disconnect", False):
+                        log.warning("task %s paused: connection lost (%s)",
+                                    self.task.name, exc or "closed")
+                    else:
+                        log.exception("task %s failed", self.task.name)
+                        self.task.fail(str(exc))
                 except Exception as exc:
                     log.exception("task %s failed", self.task.name)
                     self.task.fail(str(exc))
