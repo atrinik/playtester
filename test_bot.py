@@ -36,7 +36,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask,
                     SellItemsTask, SellJunkTask, TaskEngine, TaskStatus,
                     TempleServiceTask,
                     equipment_face_catalog)
-from .model import GameState, Item, MapObject, MapState
+from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, GameState, Item, MapObject,
+                    MapState)
 from .model import QuestProgress
 from .model import InterfaceState
 from .quest_tasks import DialogTask, EscapingDesertedIslandTask
@@ -1297,6 +1298,9 @@ class ProtocolTests(unittest.TestCase):
 
             self.assertEqual(client.state.depletion_points, 2)
             self.assertTrue(client.state.apartment_bed_bound)
+            # Records from before savebeds were tracked by location.
+            self.assertEqual(client.state.savebed_map, STARTER_APARTMENT)
+            self.assertEqual(client.state.savebed_xy, STARTER_APARTMENT_BED)
             self.assertEqual(client.decision_history[0]["action"], "retreat")
             self.assertTrue(state_path.with_suffix(".sqlite3").exists())
             self.assertEqual(state_path.read_text(), state_text)
@@ -1349,6 +1353,25 @@ class ProtocolTests(unittest.TestCase):
                     item, restored.state.player_tag)
             self.assertFalse(restored.lore_book_attempted(
                 restored.state.inventory[1]))
+
+    def test_savebed_location_persists_across_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            self.assertEqual((client.state.savebed_map, client.state.savebed_xy), ("", None))
+            client.set_savebed("/shattered_islands/world_6_48_1", 1, 12)
+            self.assertFalse(client.state.apartment_bed_bound)
+            restarted = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            restarted.state.player_name = "Sera"
+            restarted.load_character_memory("Sera")
+            self.assertEqual(restarted.state.savebed_map, "/shattered_islands/world_6_48_1")
+            self.assertEqual(restarted.state.savebed_xy, (1, 12))
+            restarted.set_savebed(STARTER_APARTMENT, *STARTER_APARTMENT_BED)
+            self.assertTrue(restarted.state.apartment_bed_bound)
 
     def test_depletion_points_persist_and_count_only_in_death_window(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8149,23 +8172,24 @@ class QuestTests(unittest.TestCase):
             quality=90, condition=100, name="ring of the ghost"), 7)
         self.assertTrue(circuit._needs_apartment_storage(rare_client))
 
-    def test_apartment_savebed_is_applied_verified_and_persisted(self):
+    def test_savebed_is_applied_verified_and_persisted_where_it_stands(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
+        client.state.map = MapState(
+            path="/shattered_islands/world_6_48_1", world_x=1, world_y=12)
         client.state.place_item(Item(
             800, item_type=106, name="bed to reality"), 0)
         client.applied = []
-        client.persisted = False
+        client.persisted = None
 
         async def apply(tag):
             client.applied.append(tag)
 
-        def persist(bound=True):
-            client.persisted = bound
-            client.state.apartment_bed_bound = bound
+        def persist(path, x, y):
+            client.persisted = (path, x, y)
 
         client.apply = apply
-        client.set_apartment_bed_bound = persist
+        client.set_savebed = persist
         task = BindSavebedTask()
         asyncio.run(task.tick(client))
         self.assertEqual(client.applied, [800])
@@ -8173,20 +8197,96 @@ class QuestTests(unittest.TestCase):
             2, "ffffff", "You save and your save bed location is updated.")
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)
-        self.assertTrue(client.persisted)
+        self.assertEqual(client.persisted, ("/shattered_islands/world_6_48_1", 1, 12))
 
-    def test_farm_circuit_schedules_one_time_apartment_savebed(self):
+    @staticmethod
+    def savebed_graph(far_width=60):
+        """A farm next to a public inn and a private apartment, with the
+        starter apartment a long walk away through /far."""
+        graph = WorldGraph()
+
+        def lane(path, width):
+            node = MapNode(path, width=width, height=1)
+            node.terrain = {(x, 0): 1 for x in range(width)}
+            graph.nodes[path] = node
+            return node
+
+        lane("/farm", 10)
+        for path in ("/inn", "/shattered_islands/x/apartments/private"):
+            lane(path, 4).edges.append(MapEdge(path, "/farm", 3, 0, 0, 0))
+            graph.savebeds[path].append((1, 0))
+        lane(STARTER_APARTMENT, 4).edges.append(
+            MapEdge(STARTER_APARTMENT, "/far", 3, 0, 0, 0))
+        graph.savebeds[STARTER_APARTMENT].append((1, 0))
+        lane("/far", far_width).edges.append(
+            MapEdge("/far", "/farm", far_width - 1, 0, 0, 0))
+        return graph
+
+    def test_nearest_savebed_prefers_the_shortest_usable_walk(self):
+        from .navigation import nearest_savebed, savebed_walk
+
+        graph = self.savebed_graph()
+        self.assertEqual(savebed_walk(graph, "/inn", (1, 0), ["/farm"]), 3)
+        self.assertEqual(savebed_walk(graph, STARTER_APARTMENT, (1, 0), ["/farm"]), 63)
+        # The equally close private apartment belongs to someone else.
+        self.assertEqual(nearest_savebed(graph, ["/farm"]), ("/inn", (1, 0), 3))
+        self.assertEqual(nearest_savebed(graph, ["/farm"], excluded={"/inn"}),
+                         (STARTER_APARTMENT, (1, 0), 63))
+        self.assertEqual(
+            nearest_savebed(graph, ["/farm"], excluded={"/inn"},
+                            owned={STARTER_APARTMENT, "/shattered_islands/x/apartments/private"}),
+            ("/shattered_islands/x/apartments/private", (1, 0), 3))
+        # A bed with no route to the spot is never chosen.
+        graph.nodes["/inn"].edges.clear()
+        self.assertEqual(nearest_savebed(graph, ["/farm"])[0], STARTER_APARTMENT)
+
+    def test_farm_circuit_moves_its_savebed_next_to_the_spot_before_farming(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["level"] = 8
-        graph = built_graph()
-        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
-        self.assertTrue(circuit._needs_apartment_bed(client))
-        binding = circuit._new_apartment_bed()
-        self.assertEqual(binding.navigation.destination_xy, (4, 1))
+        client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
+        circuit = FarmCircuitTask(self.savebed_graph(), [("/farm", "rat")])
+        # The search spreads its exact routes over ticks before deciding.
+        decisions = [circuit._needs_savebed(client) for _ in range(8)]
+        self.assertFalse(decisions[0])
+        self.assertTrue(decisions[-1])
+        binding = circuit._new_savebed(client)
+        self.assertEqual(binding.navigation.destination, "/inn")
+        self.assertEqual(binding.navigation.destination_xy, (1, 0))
         self.assertIsInstance(binding.task, BindSavebedTask)
-        client.state.apartment_bed_bound = True
-        self.assertFalse(circuit._needs_apartment_bed(client))
+        client.state.savebed_map, client.state.savebed_xy = "/inn", (1, 0)
+        circuit._savebed_search(client).run()
+        self.assertFalse(circuit._needs_savebed(client))
+        # Never bound yet: any reachable bed beats the default spawn.
+        client.state.savebed_map, client.state.savebed_xy = "", None
+        circuit._savebed_search(client).run()
+        self.assertTrue(circuit._needs_savebed(client))
+        # A failed bed is skipped for the next-nearest one.
+        circuit._bed_failed.add("/inn")
+        self.assertEqual(circuit._savebed_search(client).run().result[0], STARTER_APARTMENT)
+
+    def test_farm_circuit_keeps_a_savebed_that_is_nearly_as_close(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 8
+        # The starter apartment is 18 tiles out; the inn's 3 saves under 20.
+        client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
+        circuit = FarmCircuitTask(self.savebed_graph(far_width=15), [("/farm", "rat")])
+        search = circuit._savebed_search(client).run()
+        self.assertEqual((search.result, search.current_walk), (("/inn", (1, 0), 3), 18))
+        self.assertFalse(circuit._needs_savebed(client))
+
+    def test_real_strakewood_circuit_prefers_a_public_bed_over_the_far_apartment(self):
+        from .navigation import nearest_savebed, savebed_walk
+
+        graph = built_graph()
+        spot = ["/shattered_islands/world_0_50", "/shattered_islands/world_0_51",
+                "/shattered_islands/world_1_50", "/shattered_islands/world_1_51"]
+        bed_map, _, tiles = nearest_savebed(graph, spot)
+        self.assertNotIn("/apartments/", bed_map)
+        self.assertNotIn("/house/", bed_map)
+        apartment = savebed_walk(graph, STARTER_APARTMENT, STARTER_APARTMENT_BED, spot)
+        self.assertLessEqual(tiles + FarmCircuitTask.SAVEBED_MIN_GAIN_TILES, apartment)
 
     def test_dashboard_trace_prefers_active_service_over_dormant_farm(self):
         graph = WorldGraph()
@@ -10867,6 +10967,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         analysis = json.loads(payload)["farming_analysis"]
         self.assertEqual(analysis["status"], "unavailable")
+        self.assertIsNone(analysis["savebed"])
         learning = analysis["self_improvement"]
         self.assertEqual([spot["spot"] for spot in learning["spots"]], ["/trees", "/old"])
         self.assertEqual(learning["spots"][0]["level"], 2)
@@ -11070,7 +11171,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=17", page)
+        self.assertIn(b"/app.js?v=18", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

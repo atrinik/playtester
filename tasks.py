@@ -20,7 +20,7 @@ except ModuleNotFoundError:
 from . import constants as c
 from .client import (COIN_VALUES, AtrinikClient, map_object_visual_name,
                      update_bank_balance)
-from .model import Item, MapObject
+from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
 
 log = logging.getLogger(__name__)
@@ -4817,12 +4817,12 @@ class RetrieveItemsTask(BotTask):
 
 
 class BindSavebedTask(BotTask):
-    """Apply an underfoot apartment bed and verify server confirmation."""
+    """Apply an underfoot savebed and verify server confirmation."""
 
     CONFIRM = re.compile(r"save bed location is updated", re.I)
 
     def __init__(self):
-        super().__init__("bind-apartment-savebed")
+        super().__init__("bind-savebed")
         self.message_index = 0
         self.applied_at = 0.0
         self.arrived_at = 0.0
@@ -4838,11 +4838,15 @@ class BindSavebedTask(BotTask):
         for entry in client.state.messages[self.message_index:]:
             text = entry[3] if len(entry) > 3 else ""
             if self.CONFIRM.search(text):
-                setter = getattr(client, "set_apartment_bed_bound", None)
+                # The server binds the respawn to the tile the player stands on.
+                m = client.state.map
+                setter = getattr(client, "set_savebed", None)
                 if setter is not None:
-                    setter(True)
+                    setter(m.path, m.world_x, m.world_y)
                 else:
-                    client.state.apartment_bed_bound = True
+                    client.state.savebed_map = m.path
+                    client.state.savebed_xy = (m.world_x, m.world_y)
+                    client.state.apartment_bed_bound = m.path == STARTER_APARTMENT
                 self.complete()
                 return
         self.message_index = len(client.state.messages)
@@ -4856,7 +4860,7 @@ class BindSavebedTask(BotTask):
                     item.item_type == 106), None)
         if bed is None:
             if now - self.arrived_at > 3.0:
-                self.fail("apartment bed is not underfoot")
+                self.fail("savebed is not underfoot")
             return
         await client.apply(bed.tag)
         recorder = getattr(client, "record_action", None)

@@ -16,7 +16,8 @@ from typing import Awaitable, Callable
 from . import constants as c
 from .access_codes import normalize_access_code
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
-from .model import Character, GameState, InterfaceState, Item, MapObject, MapState
+from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameState,
+                    InterfaceState, Item, MapObject, MapState)
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
@@ -277,6 +278,19 @@ class AtrinikClient:
                 self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = bool(
                 record.get("apartment_bed_bound", False))
+            savebed = record.get("savebed")
+            if (isinstance(savebed, list) and len(savebed) == 3 and
+                    isinstance(savebed[0], str) and
+                    all(isinstance(v, int) for v in savebed[1:])):
+                self.state.savebed_map = savebed[0]
+                self.state.savebed_xy = (savebed[1], savebed[2])
+            elif self.state.apartment_bed_bound:
+                # Records from before savebeds were tracked by location.
+                self.state.savebed_map = STARTER_APARTMENT
+                self.state.savebed_xy = STARTER_APARTMENT_BED
+            else:
+                self.state.savebed_map = ""
+                self.state.savebed_xy = None
             adaptations = record.get("farm_adaptations", {})
             self.state.farm_adaptations = {
                 str(key): dict(value) for key, value in adaptations.items()
@@ -319,6 +333,8 @@ class AtrinikClient:
             self.state.farm_zone_last_checked = {}
             self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = False
+            self.state.savebed_map = ""
+            self.state.savebed_xy = None
             self.state.farm_objective = DEFAULT_OBJECTIVE
             self.state.farm_adaptations = {}
             self.state.bank_balance = 0
@@ -454,6 +470,19 @@ class AtrinikClient:
             return
         self._runtime_memory.setdefault(character, {})[
             "apartment_bed_bound"] = self.state.apartment_bed_bound
+        self._persist_character_memory()
+
+    def set_savebed(self, path: str, x: int, y: int) -> None:
+        """Persist where the server now respawns the character."""
+        self.state.savebed_map = path
+        self.state.savebed_xy = (int(x), int(y))
+        self.state.apartment_bed_bound = path == STARTER_APARTMENT
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        record = self._runtime_memory.setdefault(character, {})
+        record["savebed"] = [path, int(x), int(y)]
+        record["apartment_bed_bound"] = self.state.apartment_bed_bound
         self._persist_character_memory()
 
     def quarantine_farm_zone(self, path: str, until: float) -> None:

@@ -15,7 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 try:
     from tools.world_content_audit import (ROOT as CONTENT_ROOT, flatten,
@@ -30,6 +30,7 @@ from . import constants as c
 from .client import AtrinikClient, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import self_improvement
+from .model import STARTER_APARTMENT
 from .pathfinding import graph_search, grid_reachable, grid_search
 from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
@@ -395,6 +396,8 @@ class WorldGraph:
         self.dialogue_vendors: list[DialogueVendor] = []
         self.food_profiles: dict[str, FoodProfile] = {}
         self.shop_stocks: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        # Savebed ("bed to reality") tiles per map, public and private.
+        self.savebeds: dict[str, list[tuple[int, int]]] = defaultdict(list)
         self.access_item_names: dict[str, set[str]] = defaultdict(set)
         self.monster_levels: dict[str, int] = {}
         # Archetype-level passive identities remain valid when the protocol
@@ -524,6 +527,8 @@ class WorldGraph:
                     point = (x, y)
                     if point not in self.shop_stocks[source]:
                         self.shop_stocks[source].append(point)
+                if obj_type == "106" and (x, y) not in self.savebeds[source]:
+                    self.savebeds[source].append((x, y))
                 # Normal doors are deliberately left to the server pathfinder,
                 # which opens them just like the graphical client's click path.
                 # Static walls, water-only terrain, furniture, and counters are
@@ -3420,6 +3425,137 @@ def analyzer_farm_selection(
     return None
 
 
+# Paths of private savebeds: an apartment or house bed only works for its owner.
+PRIVATE_SAVEBED_MARKERS = ("/apartments/", "/house/")
+# Exact walks cost a tile-level route each (about 0.2 s on the live world), so
+# only the bed maps within this many map transitions of the nearest bed, at
+# most SAVEBED_CANDIDATES of them, get one.
+SAVEBED_HOP_SLACK = 2
+SAVEBED_CANDIDATES = 6
+
+
+def _nearest_spot_maps(graph: WorldGraph, source: str,
+                       spot_maps: Iterable[str]) -> tuple[int, list[str]] | None:
+    """The fewest map transitions from ``source`` to a spot map, and those maps."""
+    best: tuple[int, list[str]] | None = None
+    for spot in spot_maps:
+        if source == spot:
+            return 0, [spot]
+        try:
+            hops = len(graph.route(source, spot))
+        except (ValueError, KeyError):
+            continue
+        if best is None or hops < best[0]:
+            best = (hops, [spot])
+        elif hops == best[0]:
+            best[1].append(spot)
+    return best
+
+
+def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
+                 spot_maps: Iterable[str]) -> int | None:
+    """Estimated tiles walked from a respawn on this bed to the nearest spot map.
+
+    Sums the steps from the bed to each exit along the planned route (and one
+    step through it), so a long world-map walk costs more than a short
+    interior hop; None when no route exists. Only the spot maps fewest map
+    transitions away are walked exactly.
+    """
+    nearest = _nearest_spot_maps(graph, bed_map, spot_maps)
+    if nearest is None:
+        return None
+    if nearest[0] == 0:
+        return 0
+    best = None
+    for spot in nearest[1]:
+        try:
+            edges = graph.route_points(bed_map, bed_xy, spot, [])
+        except (ValueError, KeyError):
+            continue
+        tiles, here = 0, bed_xy
+        for edge in edges:
+            tiles += max(abs(edge.x - here[0]), abs(edge.y - here[1])) + 1
+            here = (edge.destination_x, edge.destination_y)
+        best = tiles if best is None else min(best, tiles)
+    return best
+
+
+class SavebedSearch:
+    """Find the usable savebed whose respawn is the shortest walk from a spot.
+
+    Public beds (inns, taverns) work for anyone; private ones only in
+    ``owned`` maps. Each exact walk is a tile-level route, so ``step()``
+    computes at most one per call and a live caller spreads the search over
+    ticks. ``result`` is (map, bed tile, walk tiles) or None; with
+    ``current`` (map, tile), ``current_walk`` is that bed's walk.
+    """
+
+    def __init__(self, graph: WorldGraph, spot_maps: Iterable[str], *,
+                 owned: Iterable[str] = (STARTER_APARTMENT,),
+                 excluded: Iterable[str] = (),
+                 current: tuple[str, tuple[int, int]] | None = None):
+        self.result: tuple[str, tuple[int, int], int] | None = None
+        self.current_walk: int | None = None
+        self.done = False
+        self._steps = self._search(graph, tuple(dict.fromkeys(spot_maps)),
+                                   set(owned), set(excluded), current)
+
+    def step(self) -> bool:
+        """Advance by at most one exact walk; True once the search is done."""
+        if not self.done:
+            try:
+                next(self._steps)
+            except StopIteration:
+                self.done = True
+        return self.done
+
+    def run(self) -> "SavebedSearch":
+        while not self.step():
+            pass
+        return self
+
+    def _search(self, graph, spot_maps, owned, excluded, current):
+        hops: dict[str, int] = {}
+        for bed_map in sorted(graph.savebeds):
+            if bed_map in excluded or bed_map not in graph.nodes:
+                continue
+            if bed_map not in owned and any(
+                    marker in bed_map for marker in PRIVATE_SAVEBED_MARKERS):
+                continue
+            nearest = _nearest_spot_maps(graph, bed_map, spot_maps)
+            if nearest is not None:
+                hops[bed_map] = nearest[0]
+        yield
+        if hops:
+            cutoff = min(hops.values()) + SAVEBED_HOP_SLACK
+            candidates = sorted((m for m in hops if hops[m] <= cutoff),
+                                key=lambda m: (hops[m], m))[:SAVEBED_CANDIDATES]
+            for bed_map in sorted(candidates):
+                blocked = graph.nodes[bed_map].blocked
+                for point in sorted(graph.savebeds[bed_map]):
+                    if point in blocked:
+                        continue
+                    tiles = savebed_walk(graph, bed_map, point, spot_maps)
+                    yield
+                    if tiles is None:
+                        continue
+                    if self.result is None or tiles < self.result[2]:
+                        self.result = (bed_map, point, tiles)
+                    # Beds in one room are interchangeable; the first
+                    # routable one decides.
+                    break
+        if current is not None and current[0] in graph.nodes:
+            self.current_walk = savebed_walk(graph, current[0], current[1], spot_maps)
+
+
+def nearest_savebed(graph: WorldGraph, spot_maps: Iterable[str], *,
+                    owned: Iterable[str] = (STARTER_APARTMENT,),
+                    excluded: Iterable[str] = ()
+                    ) -> tuple[str, tuple[int, int], int] | None:
+    """The usable savebed whose respawn is the shortest walk from the spot."""
+    return SavebedSearch(graph, spot_maps, owned=owned, excluded=excluded).run().result
+
+
 class FarmCircuitTask(BotTask):
     """Rotate between nearby farm maps without abandoning fights or loot."""
 
@@ -3452,6 +3588,8 @@ class FarmCircuitTask(BotTask):
 
     # Live failures exclude an analyzer pick for this long; see the README.
     FARM_DEATH_QUARANTINE_SECONDS = 6 * 60 * 60
+    # A savebed nearer the circuit must save at least this walk to be worth a detour.
+    SAVEBED_MIN_GAIN_TILES = 20
     FARM_NO_PROGRESS_SECONDS = 10 * 60
     # Time off the farm restarts the no-XP clock instead of counting against it.
     FARM_OBSERVATION_GAP_SECONDS = 60
@@ -3524,6 +3662,9 @@ class FarmCircuitTask(BotTask):
         self._capability_retry_at: dict[str, float] = {}
         self._bed_binding: NavigateThenTask | None = None
         self._bed_retry_at = 0.0
+        self._bed_target: tuple[str, tuple[int, int], int] | None = None
+        self._bed_failed: set[str] = set()
+        self._bed_search: tuple[tuple, SavebedSearch] | None = None
         self._selling: NavigateThenTask | None = None
         self._selling_retry_at = 0.0
         self._banking: NavigateThenTask | None = None
@@ -4238,19 +4379,48 @@ class FarmCircuitTask(BotTask):
                 "chest", unidentified_only=True, valuable_only=True),
             destination_xy=(1, 3), combat_approach=True)
 
-    def _needs_apartment_bed(self, client: AtrinikClient) -> bool:
-        apartment = (
-            "/shattered_islands/strakewood_island/apartments/apartment_cheap")
-        return (int(client.state.stats.get("level", 0) or 0) >= 1 and
-                apartment in self.graph.nodes and
-                not client.state.apartment_bed_bound and
-                self.clock() >= self._bed_retry_at)
+    def _spot_maps(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(path for path, _ in self.legs))
 
-    def _new_apartment_bed(self) -> NavigateThenTask:
+    def _savebed_search(self, client: AtrinikClient) -> SavebedSearch:
+        """This circuit's nearest-savebed search, restarted when its inputs change."""
+        bed_map = getattr(client.state, "savebed_map", "")
+        bed_xy = getattr(client.state, "savebed_xy", None)
+        current = (bed_map, tuple(bed_xy)) if bed_map and bed_xy else None
+        key = (self._spot_maps(), frozenset(self._bed_failed), current)
+        if self._bed_search is None or self._bed_search[0] != key:
+            self._bed_search = (key, SavebedSearch(
+                self.graph, key[0], excluded=self._bed_failed, current=current))
+        return self._bed_search[1]
+
+    def _needs_savebed(self, client: AtrinikClient) -> bool:
+        """Whether a usable bed nearer this circuit beats the current respawn.
+
+        A death then costs only the short walk back from that bed. Binding is
+        a one-time detour per circuit, so it must save a real walk. The search
+        advances one exact route per call and answers False until it is done.
+        """
+        if (int(client.state.stats.get("level", 0) or 0) < 1 or
+                self.clock() < self._bed_retry_at):
+            return False
+        search = self._savebed_search(client)
+        if not search.step():
+            return False
+        target = search.result
+        if target is None:
+            return False
+        if getattr(client.state, "savebed_map", "") == target[0]:
+            return False
+        current = search.current_walk
+        return current is None or target[2] + self.SAVEBED_MIN_GAIN_TILES <= current
+
+    def _new_savebed(self, client: AtrinikClient) -> NavigateThenTask:
+        target = self._savebed_search(client).result
+        assert target is not None
+        self._bed_target = target
         return NavigateThenTask(
-            self.graph,
-            "/shattered_islands/strakewood_island/apartments/apartment_cheap",
-            BindSavebedTask(), destination_xy=(4, 1), combat_approach=True)
+            self.graph, target[0], BindSavebedTask(),
+            destination_xy=target[1], combat_approach=True)
 
     def _observe_disease(self, client: AtrinikClient) -> None:
         messages = client.state.messages
@@ -5283,14 +5453,18 @@ class FarmCircuitTask(BotTask):
             return
         if self._bed_binding is not None:
             await self._bed_binding.tick(client)
+            target = self._bed_target or ("?", (0, 0), 0)
             if self._bed_binding.status == TaskStatus.FAILED:
-                log.warning("apartment savebed binding failed: %s",
-                            self._bed_binding.error)
-                self._bed_retry_at = self.clock() + 1800.0
+                # Try the next-nearest bed shortly; this one stays excluded
+                # for the rest of the circuit.
+                log.warning("savebed binding at %s failed: %s",
+                            target[0], self._bed_binding.error)
+                self._bed_failed.add(target[0])
+                self._bed_retry_at = self.clock() + 300.0
                 self._bed_binding = None
             elif self._bed_binding.status == TaskStatus.COMPLETE:
-                log.info("apartment savebed bound; future deaths return home")
-                self._bed_retry_at = self.clock() + 86400.0
+                log.info("savebed bound at %s %s, about %d tiles from the farm",
+                         target[0], target[1], target[2])
                 self._bed_binding = None
             return
         if self._resupply is not None:
@@ -5388,11 +5562,19 @@ class FarmCircuitTask(BotTask):
             await self._storage.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_apartment_bed(client) and
-                not self._busy_finishing_fight_or_loot(client, farm)):
+                not self._busy_finishing_fight_or_loot(client, farm) and
+                self._needs_savebed(client)):
             await client.clear_actions()
             await client.set_combat(False)
-            self._bed_binding = self._new_apartment_bed()
+            self._bed_binding = self._new_savebed(client)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                target = self._bed_target
+                current = self._savebed_search(client).current_walk
+                recorder("savebed-move",
+                         f"{target[0]} {target[1]}: about {target[2]} tiles "
+                         f"from the farm, current "
+                         f"{current if current is not None else 'unknown'}")
             await self._bed_binding.tick(client)
             return
         if (isinstance(farm, FarmTask) and
