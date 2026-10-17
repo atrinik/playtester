@@ -2461,6 +2461,11 @@ class NavigateThenTask(BotTask):
         self._combat_blocked: set[tuple[str, int, int]] = set()
         self._last_pull_target = 0
         self._last_pull_at = 0.0
+        # Where and when the character last actually moved. The cornered
+        # test needs real movement: route bookkeeping such as pack-avoidance
+        # replans refreshes the navigation's own progress clock.
+        self._last_position: tuple[str, int, int] | None = None
+        self._last_moved_at = 0.0
         self._last_danger_target = 0
         self._last_pack_signature: tuple[int, ...] = ()
         self._pack_exit_stall: tuple[
@@ -2719,6 +2724,10 @@ class NavigateThenTask(BotTask):
         # them every defensive tick so killing a road pack opens its corridor.
         self.navigation._threat_blocked.clear()
         m = client.state.map
+        position = (m.path, m.world_x, m.world_y)
+        if position != self._last_position:
+            self._last_position = position
+            self._last_moved_at = time.monotonic()
         cx, cy = m.width // 2, m.height // 2
         threats = []
         node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
@@ -2802,8 +2811,8 @@ class NavigateThenTask(BotTask):
         nearby = [threat for threat in threats if threat[0] <= 4]
         pull_pack = [threat for threat in threats if threat[0] <= 6]
         # Travel is not farming. Off the destination map, combat is the last
-        # resort: only when something is hitting her and she has stopped
-        # making route progress (or has no route at all). Otherwise she keeps
+        # resort: only when something is hitting her and she has not moved
+        # for a while (or has no route at all). Otherwise she keeps
         # walking and the route
         # steers around them (live: zero-XP spiders and bats below Fort
         # Sether kept her fighting and looting instead of travelling).
@@ -2811,9 +2820,8 @@ class NavigateThenTask(BotTask):
             m.path != self.navigation.destination and
             not (recent_hostile_contact(client, 3.0) and
                  (self.navigation.status == TaskStatus.FAILED or
-                  (self.navigation._last_progress and
-                   time.monotonic() - self.navigation._last_progress >=
-                   self.TRANSIT_CORNERED_SECONDS))))
+                  time.monotonic() - self._last_moved_at >=
+                  self.TRANSIT_CORNERED_SECONDS)))
         if await self._abandon_stalled_transit_target(client, committed):
             return True
         hp = client.state.stats.get("hp", 0)
@@ -2998,12 +3006,22 @@ class NavigateThenTask(BotTask):
             self._halo_threats(client, nearby, radius=1)
             if getattr(client.state, "combat", False):
                 await client.set_combat(False)
-            if self._last_pull_target:
+            engaged = (self.task._engaged_target
+                       if isinstance(self.task, FarmTask) else None)
+            abandoned = self._last_pull_target or (engaged[0] if engaged else 0)
+            if abandoned:
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("navigation-transit-hold-fire",
-                             f"target={self._last_pull_target}")
+                             f"target={abandoned}")
+                # Drop the engagement entirely: a kept FarmTask engagement
+                # would hold patrol and steer retreats around a creature
+                # left behind on this map.
                 self._last_pull_target = 0
+                if engaged is not None:
+                    self.task._engaged_target = None
+                if getattr(client.state, "target_id", 0):
+                    await client.clear_target()
             self._defending = False
             return False
         # Only close a short gap. Chasing a merely visible target across the

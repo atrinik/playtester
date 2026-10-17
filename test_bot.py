@@ -6025,13 +6025,52 @@ class QuestTests(unittest.TestCase):
         # made no progress, so defending is the last resort.
         client.state.messages = [(
             time.time(), 2, "cc66ff", "hill giant hit you for 9 damage.")]
-        task.navigation._last_progress = (
-            time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1)
+        self._corner(task, client)
 
         self.assertTrue(asyncio.run(
             task._defend_while_navigating(client)))
         self.assertTrue(client.direct_moves)
         self.assertEqual(task._last_pull_target, target.target_id)
+
+    def test_pack_avoidance_does_not_restart_the_cornered_clock(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 12
+        client.state.map.world_y = 12
+        # A two-member pack five tiles off: transit avoids it and replans.
+        client.state.map.tile(13, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="spider", target_id=300, target_hp=100)
+        client.state.map.tile(13, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="spider", target_id=301, target_hp=100)
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider hit you for 3 damage.")]
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node}
+        task = NavigateThenTask(
+            graph, "/shop", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        self._corner(task, client)
+        moved_at = task._last_moved_at
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        # The replan refreshed the navigation's clock, not the movement one.
+        self.assertGreater(task.navigation._last_progress, moved_at)
+        self.assertEqual(task._last_moved_at, moved_at)
+        # Still standing there and being hit, one closes in: she is cornered.
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="spider", target_id=300, target_hp=100)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(client.targets)
+
+    @staticmethod
+    def _corner(task, client):
+        """She has stood on this square past the cornered threshold."""
+        m = client.state.map
+        task._last_position = (m.path, m.world_x, m.world_y)
+        task._last_moved_at = time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1
 
     def test_transit_holds_fire_while_the_route_still_progresses(self):
         client = self._combat_client()
@@ -6058,7 +6097,6 @@ class QuestTests(unittest.TestCase):
         task = NavigateThenTask(
             graph, "/farm", farm, combat_approach=True, safety=farm.safety)
         task._last_pull_target = target.target_id
-        task.navigation._last_progress = time.monotonic()  # still walking
 
         self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(client.direct_moves, [])
@@ -6066,6 +6104,9 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.combat, [False])
         self.assertEqual(task._last_pull_target, 0)
         self.assertIn(("navigation-transit-hold-fire", "target=100"), client.decisions)
+        # The abandoned engagement and selection are dropped entirely.
+        self.assertIsNone(farm._engaged_target)
+        self.assertEqual(client.cleared_targets, 1)
         # Its squares (view (9, 8) is world (11, 10)) are marked so the route
         # steers around it; her own square stays open.
         self.assertIn((11, 10), task.navigation._threat_blocked)
@@ -6153,8 +6194,7 @@ class QuestTests(unittest.TestCase):
         # Cornered (hit, no route progress): split them before fighting.
         client.state.messages = [(
             time.time(), 2, "cc66ff", "kobold chief hit you for 4 damage.")]
-        task.navigation._last_progress = (
-            time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1)
+        self._corner(task, client)
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(task._last_pull_target, 0)
         self.assertIsNotNone(task._retreat_attempt)
@@ -6216,8 +6256,7 @@ class QuestTests(unittest.TestCase):
         task._retreat_step = retreat
         client.state.messages = [(
             time.time(), 2, "cc66ff", "kobold chief hit you for 4 damage.")]
-        task.navigation._last_progress = (
-            time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1)
+        self._corner(task, client)
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(calls, [{"avoid_backtrack": True}])
 
