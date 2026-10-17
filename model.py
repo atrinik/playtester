@@ -97,6 +97,13 @@ class Tile:
         return [obj for obj in self.objects.values() if obj.target_id]
 
 
+# DRAWINFO channels that carry player chat (constants.CHAT_TYPE_*).
+CHAT_MESSAGE_TYPES = frozenset({3, 4, 5, 7})
+# The markup naming a player, which frames speech on any channel ("[a=#
+# charname]Zoey[/a] says: ..."); server feedback never quotes a player.
+PLAYER_NAME_LINK = "[a=#charname]"
+
+
 @dataclass(slots=True)
 class MapState:
     name: str = ""
@@ -119,6 +126,9 @@ class MapState:
     # levels above the player's current map.  ``tiles`` remains the depth-zero
     # compatibility view used by the navigation policy.
     level_tiles: dict[int, dict[tuple[int, int], Tile]] = field(default_factory=dict)
+    # Actor counts the server would not select, with the monotonic time until
+    # which they are no longer offered as targets.
+    ignored_targets: dict[int, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if 0 in self.level_tiles:
@@ -157,6 +167,11 @@ class MapState:
         self.level_tiles = shifted
         self.tiles = self.level_tiles.setdefault(0, {})
 
+    def target_ignored(self, target_id: int) -> bool:
+        return self.ignored_targets.get(target_id, 0.0) > time.monotonic()
+
+    # Every visible actor, set-aside ones included: threat detection must
+    # still see them. Choosing whom to attack consults target_ignored.
     def targets(self, friendly: bool | None = None):
         for (x, y), tile in self.tiles.items():
             for obj in tile.targets:
@@ -259,6 +274,10 @@ class GameState:
     game_millis_per_minute: int = 0
     interface: InterfaceState | None = None
     messages: list[tuple[float, int, str, str]] = field(default_factory=list)
+    # Messages trimmed from the front of ``messages``. Positions count from
+    # the first message ever received, so a watcher's position stays valid
+    # once the bounded history is full.
+    message_offset: int = 0
     books: list[bytes] = field(default_factory=list)
     quests: dict[str, QuestProgress] = field(default_factory=dict)
     quests_loaded: bool = False
@@ -271,13 +290,39 @@ class GameState:
     target_name: str = ""
     combat: bool = False
     combat_force: bool = False
+    # The last actor the server reported selecting, and when (monotonic).
+    target_ack: tuple[int, float] = (0, 0.0)
+    # The actor automation is trying to select, since when, and when it last
+    # asked (monotonic).
+    target_request: tuple[int, float, float] = (0, 0.0, 0.0)
     party_name: str = ""
     server_version: int = 0
     last_packet_at: float = 0.0
 
     def add_message(self, msg_type: int, color: str, text: str) -> None:
         self.messages.append((time.time(), msg_type, color, text))
-        del self.messages[:-500]
+        excess = len(self.messages) - 500
+        if excess > 0:
+            del self.messages[:excess]
+            self.message_offset += excess
+
+    @property
+    def message_count(self) -> int:
+        """The position after the newest message."""
+        return self.message_offset + len(self.messages)
+
+    def messages_since(self, position: int, *, chat: bool = False
+                       ) -> list[tuple[float, int, str, str]]:
+        """Messages from ``position`` on, as far as the history still holds.
+
+        Player chat is left out unless asked for: watchers wait for server
+        feedback, and other players must not be able to forge it.
+        """
+        entries = self.messages[max(0, position - self.message_offset):]
+        if chat:
+            return entries
+        return [entry for entry in entries
+                if entry[1] not in CHAT_MESSAGE_TYPES and PLAYER_NAME_LINK not in entry[3]]
 
     @property
     def inventory(self) -> list[Item]:
