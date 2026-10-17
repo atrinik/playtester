@@ -3513,33 +3513,34 @@ ApartmentReturns = dict[str, tuple[str, tuple[int, int]]]
 
 def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
               spot_maps: Sequence[str], returns: ApartmentReturns):
-    """Generator: yields once per exact route; returns (walk, first edge).
+    """Generator: yields once per exact route; returns the walk options.
 
-    ``first`` is the edge the walk leaves ``bed_map`` by, so other beds in
-    the same room are priced by their own steps to it. An apartment's exit
+    Each option is (walk, first edge) for one route found, ``first`` being
+    the edge the walk leaves ``bed_map`` by, so other beds in the same room
+    can be priced by their own steps to each route's first edge. An apartment's exit
     returns to the per-player entrance recorded at runtime, not to the
     graph's static alternatives, so its walk continues from the observed
     return point in ``returns``; without one it is unknown (None).
     """
     if bed_map in spot_maps:
-        return 0, None
+        return [(0, None)]
     start_map, start_xy, base, first = bed_map, point, 0, None
     if "/apartments/" in bed_map:
         back = returns.get(bed_map)
         node = graph.nodes.get(bed_map)
         if back is None or node is None:
-            return None, None
+            return []
         exits = [edge for edge in node.edges if edge.kind != "tile" and (
             graph.local_path(bed_map, point, (edge.x, edge.y)) or
             (edge.x, edge.y) == point)]
         if not exits:
-            return None, None
+            return []
         first = min(exits, key=lambda edge: _segment_steps(graph, bed_map, point, edge))
         base = _segment_steps(graph, bed_map, point, first)
         start_map, start_xy = back[0], tuple(back[1])
         if start_map in spot_maps:
-            return base, first
-    best = None
+            return [(base, first)]
+    options = []
     for spot in spot_maps:
         try:
             edges = graph.route_points(start_map, start_xy, spot, [])
@@ -3548,10 +3549,9 @@ def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
         yield
         if not edges:
             continue
-        walk = base + _route_walk(graph, start_map, start_xy, edges)
-        if best is None or walk < best[0]:
-            best = (walk, first or edges[0])
-    return best if best is not None else (None, None)
+        options.append((base + _route_walk(graph, start_map, start_xy, edges),
+                        first or edges[0]))
+    return options
 
 
 def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
@@ -3567,7 +3567,7 @@ def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
         while True:
             next(steps)
     except StopIteration as done:
-        return done.value[0]
+        return min((walk for walk, _ in done.value), default=None)
 
 
 class SavebedSearch:
@@ -3656,24 +3656,25 @@ class SavebedSearch:
                 groups.setdefault(min(component) if component else point, []).append(point)
             for group in groups.values():
                 anchor = group[0]
-                walk, first = yield from _bed_walk(
+                options = yield from _bed_walk(
                     graph, bed_map, anchor, spot_maps, returns)
-                if walk is None:
-                    continue
                 for point in group:
-                    if point == anchor or first is None:
-                        self._consider(bed_map, point, walk)
-                        continue
-                    if not graph.local_path(bed_map, point, (first.x, first.y)):
-                        continue
-                    self._consider(
-                        bed_map, point,
-                        walk - _segment_steps(graph, bed_map, anchor, first) +
-                        _segment_steps(graph, bed_map, point, first))
+                    # Each bed takes whichever leg's route suits it best: a
+                    # bed beside another exit is priced through that exit.
+                    prices = []
+                    for walk, first in options:
+                        if point == anchor or first is None:
+                            prices.append(walk)
+                        elif graph.local_path(bed_map, point, (first.x, first.y)):
+                            prices.append(
+                                walk - _segment_steps(graph, bed_map, anchor, first) +
+                                _segment_steps(graph, bed_map, point, first))
+                    if prices:
+                        self._consider(bed_map, point, min(prices))
         if current is not None and current[0] in graph.nodes:
-            walk, _ = yield from _bed_walk(
+            options = yield from _bed_walk(
                 graph, current[0], tuple(current[1]), spot_maps, returns)
-            self.current_walk = walk
+            self.current_walk = min((walk for walk, _ in options), default=None)
 
 
 def nearest_savebed(graph: WorldGraph, spot_maps: Iterable[str], *,

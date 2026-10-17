@@ -8622,6 +8622,31 @@ class QuestTests(unittest.TestCase):
                                 excluded={"/rooms"}),
                 ("/tavern", (0, 0), 2))
 
+    def test_each_bed_is_priced_through_the_exit_that_suits_it(self):
+        from .navigation import nearest_savebed
+
+        # One long room with an exit at each end, each to a different
+        # circuit map. The first bed (the anchor) is nearest the west exit;
+        # the east bed is beside the east exit and must be priced through it.
+        graph = WorldGraph()
+        hall = MapNode("/hall", width=30, height=1)
+        hall.terrain = {(x, 0): 1 for x in range(30)}
+        hall.edges.append(MapEdge("/hall", "/west", 0, 0, 0, 0))
+        hall.edges.append(MapEdge("/hall", "/east", 29, 0, 0, 0))
+        west = MapNode("/west", width=5, height=1)
+        west.terrain = {(x, 0): 1 for x in range(5)}
+        west.edges.append(MapEdge("/west", "/farm_a", 4, 0, 0, 0))
+        graph.nodes.update({"/hall": hall, "/west": west})
+        for path in ("/east", "/farm_a"):
+            node = MapNode(path, width=5, height=1)
+            node.terrain = {(x, 0): 1 for x in range(5)}
+            graph.nodes[path] = node
+        graph.savebeds["/hall"] = [(1, 0), (28, 0)]
+        # Legs: /farm_a (behind the short west map, the anchor's best: 5
+        # moves) and /east (next door to the east bed: 1 move).
+        self.assertEqual(nearest_savebed(graph, ["/farm_a", "/east"]),
+                         ("/hall", (28, 0), 1))
+
     def test_apartment_exits_record_their_runtime_return(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.json")
