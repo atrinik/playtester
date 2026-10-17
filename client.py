@@ -726,6 +726,9 @@ class AtrinikClient:
         self._handlers.append(handler)
 
     def _reset_target_identity(self) -> None:
+        # A new connection starts every acknowledgement window afresh.
+        self.state.target_request = (0, 0.0)
+        self.state.target_ack = (0, 0.0)
         self.state.target_code = c.TARGET_SELF
         self.state.target_level = 0
         self.state.target_actor_count = 0

@@ -2614,7 +2614,8 @@ class FarmTask(BotTask):
             assert spell is not None
             await client.clear_actions()
             await client.set_combat(False)
-            await select_target(client, x, y, obj.target_id)
+            if not await select_target(client, x, y, obj.target_id):
+                return False
             self.remember_engagement(client, x, y, obj.target_id)
             await client.fire(direction, spell.tag)
             self.commit_offensive_spell(client, spell)
@@ -2626,7 +2627,8 @@ class FarmTask(BotTask):
             else:
                 await client.clear_actions()
                 await client.set_combat(False)
-                await select_target(client, x, y, obj.target_id)
+                if not await select_target(client, x, y, obj.target_id):
+                    return False
                 self.remember_engagement(client, x, y, obj.target_id)
                 await client.fire(direction, launcher.tag)
                 self._last_pull_at = now
@@ -2683,10 +2685,11 @@ class FarmTask(BotTask):
             x, y, obj = breakout
             self.remember_engagement(client, x, y, obj.target_id)
             await client.clear_actions()
-            await select_target(client, x, y, obj.target_id)
-            await client.set_combat(True, force=True)
-            self._last_action = now
-            return True
+            if await select_target(client, x, y, obj.target_id):
+                await client.set_combat(True, force=True)
+                self._last_action = now
+                return True
+            # The blocker cannot be selected: fall back to retreating.
         if self._cornered_breakout_target:
             self._cornered_breakout_target = 0
         threats = [(x, y) for x, y, _ in visible_threats]
@@ -2772,7 +2775,9 @@ class FarmTask(BotTask):
                 self._cornered_breakout_target = obj.target_id
                 self.remember_engagement(client, x, y, obj.target_id)
                 await client.clear_actions()
-                await select_target(client, x, y, obj.target_id)
+                if not await select_target(client, x, y, obj.target_id):
+                    self._cornered_breakout_target = 0
+                    return False
                 await client.set_combat(True, force=True)
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
@@ -2820,8 +2825,10 @@ class FarmTask(BotTask):
             await client.set_combat(False)
         else:
             x, y, obj = defensive
-            await select_target(client, x, y, obj.target_id)
-            await client.set_combat(True, force=True)
+            if await select_target(client, x, y, obj.target_id):
+                await client.set_combat(True, force=True)
+            else:
+                await client.set_combat(False)
         # The protocol run bit is persistent directional running, not a
         # faster single step. Use one controlled step so fleeing cannot cross
         # map seams or plough through another pack before the next assessment.
@@ -3524,8 +3531,9 @@ class FarmTask(BotTask):
                         value[3].target_id, len(self.priority_spawns)),
                     value[0]))
             self.remember_engagement(client, x, y, obj.target_id)
-            if getattr(client.state, "target_id", 0) != obj.target_id:
-                await select_target(client, x, y, obj.target_id)
+            if (getattr(client.state, "target_id", 0) != obj.target_id and
+                    not await select_target(client, x, y, obj.target_id)):
+                return  # set aside as unselectable; choose again next tick
             if not self.target_tile_walkable(client, x, y):
                 # Never land a killing blow over water/void: the corpse and
                 # rare drop would be unreachable. Keep the target selected,

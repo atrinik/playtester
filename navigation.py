@@ -2886,8 +2886,8 @@ class NavigateThenTask(BotTask):
                 self.task.should_training_finish(client, nearest[3])):
             _, x, y, obj = nearest
             self.task.remember_engagement(client, x, y, obj.target_id)
-            await select_target(client, x, y, obj.target_id)
-            if await self.task.training_finisher(client, x, y, obj):
+            if (await select_target(client, x, y, obj.target_id) and
+                    await self.task.training_finisher(client, x, y, obj)):
                 self._defending = True
                 self._last_defense_action = time.monotonic()
                 return True
@@ -3019,7 +3019,8 @@ class NavigateThenTask(BotTask):
                 if isinstance(self.task, FarmTask):
                     self.task.remember_engagement(
                         client, x, y, obj.target_id)
-                await select_target(client, x, y, obj.target_id)
+                if not await select_target(client, x, y, obj.target_id):
+                    return False
                 direction = self.task.spell_fire_direction(
                     offensive, x, y, cx, cy)
                 if direction is not None:
@@ -3092,7 +3093,8 @@ class NavigateThenTask(BotTask):
                 if isinstance(self.task, FarmTask):
                     self.task.remember_engagement(
                         client, x, y, obj.target_id)
-                await select_target(client, x, y, obj.target_id)
+                if not await select_target(client, x, y, obj.target_id):
+                    return False
                 semantic = f"{obj.name} {map_object_visual_name(client, obj)}"
                 force = bool(
                     isinstance(self.task, FarmTask) and

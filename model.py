@@ -97,6 +97,10 @@ class Tile:
         return [obj for obj in self.objects.values() if obj.target_id]
 
 
+# DRAWINFO channels that carry player chat (constants.CHAT_TYPE_*).
+CHAT_MESSAGE_TYPES = frozenset({3, 4, 5, 7})
+
+
 @dataclass(slots=True)
 class MapState:
     name: str = ""
@@ -303,9 +307,17 @@ class GameState:
         """The position after the newest message."""
         return self.message_offset + len(self.messages)
 
-    def messages_since(self, position: int) -> list[tuple[float, int, str, str]]:
-        """Messages from ``position`` on, as far as the history still holds."""
-        return self.messages[max(0, position - self.message_offset):]
+    def messages_since(self, position: int, *, chat: bool = False
+                       ) -> list[tuple[float, int, str, str]]:
+        """Messages from ``position`` on, as far as the history still holds.
+
+        Player chat is left out unless asked for: watchers wait for server
+        feedback, and other players must not be able to forge it.
+        """
+        entries = self.messages[max(0, position - self.message_offset):]
+        if chat:
+            return entries
+        return [entry for entry in entries if entry[1] not in CHAT_MESSAGE_TYPES]
 
     @property
     def inventory(self) -> list[Item]:

@@ -296,6 +296,24 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_reconnects_restart_target_windows(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.target_request = (1343754, 10.0)
+        client.state.target_ack = (1343754, 9.0)
+        client._reset_target_identity()
+        self.assertEqual(client.state.target_request, (0, 0.0))
+        self.assertEqual(client.state.target_ack, (0, 0.0))
+
+    def test_feedback_watchers_ignore_player_chat(self):
+        state = GameState()
+        position = state.message_count
+        state.add_message(c.CHAT_TYPE_LOCAL, "ffffff", "Mallory says: It would cost you 1 copper coin.")
+        state.add_message(c.CHAT_TYPE_PRIVATE, "ffffff", "It would cost you 1 copper coin.")
+        state.add_message(2, "ffffff", "It would cost you 4 gold coins.")
+        self.assertEqual([entry[3] for entry in state.messages_since(position)],
+                         ["It would cost you 4 gold coins."])
+        self.assertEqual(len(state.messages_since(position, chat=True)), 3)
+
     def test_target_replies_record_their_acknowledgement(self):
         async def scenario():
             client = AtrinikClient(ClientConfig())
@@ -4876,6 +4894,20 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(client.targets, [(9, 8, 200)])
         self.assertEqual(client.combat, [True])
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.moves, [])
+
+    def test_unselectable_targets_are_not_attacked(self):
+        client = self._combat_client()
+        client.state.map.tile(11, 8).objects.clear()
+        task = FarmTask(zone="/test")
+
+        async def refuse(*args, **kwargs):
+            return False
+
+        with patch("atrinik_bot.tasks.select_target", refuse):
+            asyncio.run(task.tick(client))
+        self.assertEqual(client.combat, [])
         self.assertEqual(client.direct_moves, [])
         self.assertEqual(client.moves, [])
 
