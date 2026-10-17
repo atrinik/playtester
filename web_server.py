@@ -614,6 +614,10 @@ class DashboardState:
                       for key, record in recent],
             "goals": self_improvement.improvement_goals(adaptations),
         }
+        state = self.client.state
+        bed_xy = getattr(state, "savebed_xy", None)
+        snapshot["savebed"] = ({"map": state.savebed_map, "x": bed_xy[0], "y": bed_xy[1]}
+                               if getattr(state, "savebed_map", "") and bed_xy else None)
         return snapshot
 
 

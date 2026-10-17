@@ -36,7 +36,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask,
                     SellItemsTask, SellJunkTask, TaskEngine, TaskStatus,
                     TempleServiceTask,
                     equipment_face_catalog)
-from .model import GameState, Item, MapObject, MapState
+from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, GameState, Item, MapObject,
+                    MapState)
 from .model import QuestProgress
 from .model import InterfaceState
 from .quest_tasks import DialogTask, EscapingDesertedIslandTask
@@ -1453,6 +1454,9 @@ class ProtocolTests(unittest.TestCase):
 
             self.assertEqual(client.state.depletion_points, 2)
             self.assertTrue(client.state.apartment_bed_bound)
+            # Records from before savebeds were tracked by location.
+            self.assertEqual(client.state.savebed_map, STARTER_APARTMENT)
+            self.assertEqual(client.state.savebed_xy, STARTER_APARTMENT_BED)
             self.assertEqual(client.decision_history[0]["action"], "retreat")
             self.assertTrue(state_path.with_suffix(".sqlite3").exists())
             self.assertEqual(state_path.read_text(), state_text)
@@ -1505,6 +1509,25 @@ class ProtocolTests(unittest.TestCase):
                     item, restored.state.player_tag)
             self.assertFalse(restored.lore_book_attempted(
                 restored.state.inventory[1]))
+
+    def test_savebed_location_persists_across_restarts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            self.assertEqual((client.state.savebed_map, client.state.savebed_xy), ("", None))
+            client.set_savebed("/shattered_islands/world_6_48_1", 1, 12)
+            self.assertFalse(client.state.apartment_bed_bound)
+            restarted = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            restarted.state.player_name = "Sera"
+            restarted.load_character_memory("Sera")
+            self.assertEqual(restarted.state.savebed_map, "/shattered_islands/world_6_48_1")
+            self.assertEqual(restarted.state.savebed_xy, (1, 12))
+            restarted.set_savebed(STARTER_APARTMENT, *STARTER_APARTMENT_BED)
+            self.assertTrue(restarted.state.apartment_bed_bound)
 
     def test_forgotten_bank_balance_is_unknown_and_zero_across_restarts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8615,23 +8638,24 @@ class QuestTests(unittest.TestCase):
             quality=90, condition=100, name="ring of the ghost"), 7)
         self.assertTrue(circuit._needs_apartment_storage(rare_client))
 
-    def test_apartment_savebed_is_applied_verified_and_persisted(self):
+    def test_savebed_is_applied_verified_and_persisted_where_it_stands(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
+        client.state.map = MapState(
+            path="/shattered_islands/world_6_48_1", world_x=1, world_y=12)
         client.state.place_item(Item(
             800, item_type=106, name="bed to reality"), 0)
         client.applied = []
-        client.persisted = False
+        client.persisted = None
 
         async def apply(tag):
             client.applied.append(tag)
 
-        def persist(bound=True):
-            client.persisted = bound
-            client.state.apartment_bed_bound = bound
+        def persist(path, x, y):
+            client.persisted = (path, x, y)
 
         client.apply = apply
-        client.set_apartment_bed_bound = persist
+        client.set_savebed = persist
         task = BindSavebedTask()
         asyncio.run(task.tick(client))
         self.assertEqual(client.applied, [800])
@@ -8639,20 +8663,360 @@ class QuestTests(unittest.TestCase):
             2, "ffffff", "You save and your save bed location is updated.")
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)
-        self.assertTrue(client.persisted)
+        self.assertEqual(client.persisted, ("/shattered_islands/world_6_48_1", 1, 12))
 
-    def test_farm_circuit_schedules_one_time_apartment_savebed(self):
+    @staticmethod
+    def savebed_graph(far_width=60):
+        """A farm next to a public inn and a private apartment, with the
+        starter apartment a long walk away through /far."""
+        graph = WorldGraph()
+
+        def lane(path, width):
+            node = MapNode(path, width=width, height=1)
+            node.terrain = {(x, 0): 1 for x in range(width)}
+            graph.nodes[path] = node
+            return node
+
+        lane("/farm", 10)
+        for path in ("/inn", "/shattered_islands/x/apartments/private"):
+            lane(path, 4).edges.append(MapEdge(path, "/farm", 3, 0, 0, 0))
+            graph.savebeds[path].append((1, 0))
+        graph.savebeds["/inn"].append((2, 0))
+        lane(STARTER_APARTMENT, 4).edges.append(
+            MapEdge(STARTER_APARTMENT, "/far", 3, 0, 0, 0))
+        graph.savebeds[STARTER_APARTMENT].append((1, 0))
+        lane("/far", far_width).edges.append(
+            MapEdge("/far", "/farm", far_width - 1, 0, 0, 0))
+        return graph
+
+    def test_savebed_walk_measures_from_real_tile_seam_arrivals(self):
+        from .navigation import savebed_walk
+
+        # West map -> east map across a tile seam: the arrival is the east
+        # map's x=0 at the crossing row, not the edge default (0, 0).
+        graph = WorldGraph()
+        for path in ("/west", "/east", "/farm"):
+            node = MapNode(path, width=10, height=10)
+            node.terrain = {(x, y): 1 for x in range(10) for y in range(10)}
+            graph.nodes[path] = node
+        graph.nodes["/west"].edges.append(MapEdge("/west", "/east", 10, 5, kind="tile"))
+        graph.nodes["/east"].edges.append(MapEdge("/east", "/farm", 9, 9, 0, 0))
+        # (5, 9) -> border (9, 9) is 4 moves and the seam 1 more, arriving
+        # at east (0, 9); from there the exit at (9, 9) is 9 moves.
+        self.assertEqual(savebed_walk(graph, "/west", (5, 9), ["/farm"]), 14)
+
+    def test_savebed_walk_follows_walls_and_every_circuit_leg(self):
+        from .navigation import savebed_walk
+
+        # A wall forces a detour that the straight line would miss, and the
+        # second circuit map (two transitions away) is the nearer walk.
+        graph = WorldGraph()
+        bed = MapNode("/bed", width=10, height=10)
+        bed.terrain = {(x, y): 1 for x in range(10) for y in range(10)}
+        bed.blocked = {(5, y) for y in range(9)}
+        graph.nodes["/bed"] = bed
+        for path in ("/a", "/b", "/c"):
+            node = MapNode(path, width=10, height=1)
+            node.terrain = {(x, 0): 1 for x in range(10)}
+            graph.nodes[path] = node
+        bed.edges.append(MapEdge("/bed", "/a", 9, 0, 0, 0))
+        bed.edges.append(MapEdge("/bed", "/c", 0, 1, 0, 0))
+        graph.nodes["/c"].edges.append(MapEdge("/c", "/b", 1, 0, 0, 0))
+        # To /a: around the wall at x=5 via row 9 is 9 + 9 moves (not 9).
+        self.assertEqual(savebed_walk(graph, "/bed", (0, 0), ["/a"]), 18)
+        # /b via /c is 1 + 1 moves, nearer although one transition farther.
+        self.assertEqual(savebed_walk(graph, "/bed", (0, 0), ["/a", "/b"]), 2)
+
+    def test_nearest_savebed_prefers_the_shortest_usable_walk(self):
+        from .navigation import nearest_savebed, savebed_walk
+
+        graph = self.savebed_graph()
+        # Two moves to the exit on (3, 0); stepping onto it is the transfer.
+        self.assertEqual(savebed_walk(graph, "/inn", (1, 0), ["/farm"]), 2)
+        # The apartment's exit returns to the recorded entrance, here /far.
+        returns = {STARTER_APARTMENT: ("/far", (0, 0))}
+        self.assertEqual(savebed_walk(graph, STARTER_APARTMENT, (1, 0), ["/farm"],
+                                      returns=returns), 61)
+        # Without an observed return the apartment walk is unknown.
+        self.assertIsNone(savebed_walk(graph, STARTER_APARTMENT, (1, 0), ["/farm"]))
+        # The inn's other bed, one tile nearer its exit, wins; the equally
+        # close private apartment belongs to someone else.
+        self.assertEqual(nearest_savebed(graph, ["/farm"]), ("/inn", (2, 0), 1))
+        self.assertEqual(nearest_savebed(graph, ["/farm"], excluded={"/inn"},
+                                         returns=returns),
+                         (STARTER_APARTMENT, (1, 0), 61))
+        self.assertIsNone(nearest_savebed(graph, ["/farm"], excluded={"/inn"}))
+        self.assertEqual(
+            nearest_savebed(graph, ["/farm"], excluded={"/inn"},
+                            owned={STARTER_APARTMENT, "/shattered_islands/x/apartments/private"},
+                            returns={**returns,
+                                     "/shattered_islands/x/apartments/private": ("/farm", (0, 0))}),
+            ("/shattered_islands/x/apartments/private", (1, 0), 2))
+        # A bed with no route to the spot is never chosen.
+        graph.nodes["/inn"].edges.clear()
+        self.assertEqual(nearest_savebed(graph, ["/farm"], returns=returns)[0],
+                         STARTER_APARTMENT)
+
+    def test_farm_circuit_moves_its_savebed_next_to_the_spot_before_farming(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["level"] = 8
-        graph = built_graph()
-        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
-        self.assertTrue(circuit._needs_apartment_bed(client))
-        binding = circuit._new_apartment_bed()
-        self.assertEqual(binding.navigation.destination_xy, (4, 1))
+        client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
+        client.state.apartment_returns = {STARTER_APARTMENT: ("/far", (0, 0))}
+        circuit = FarmCircuitTask(self.savebed_graph(), [("/farm", "rat")])
+        # The search spreads its exact routes over ticks before deciding.
+        decisions = [circuit._needs_savebed(client) for _ in range(8)]
+        self.assertFalse(decisions[0])
+        self.assertTrue(decisions[-1])
+        binding = circuit._new_savebed(client)
+        self.assertEqual(binding.navigation.destination, "/inn")
+        self.assertEqual(binding.navigation.destination_xy, (2, 0))
         self.assertIsInstance(binding.task, BindSavebedTask)
-        client.state.apartment_bed_bound = True
-        self.assertFalse(circuit._needs_apartment_bed(client))
+        client.state.savebed_map, client.state.savebed_xy = "/inn", (2, 0)
+        circuit._savebed_search(client).run()
+        self.assertFalse(circuit._needs_savebed(client))
+        # Bound to the inn's other bed, one move farther: not worth a rebind.
+        client.state.savebed_map, client.state.savebed_xy = "/inn", (1, 0)
+        circuit._savebed_search(client).run()
+        self.assertFalse(circuit._needs_savebed(client))
+        # Never bound yet: any reachable bed beats the default spawn.
+        client.state.savebed_map, client.state.savebed_xy = "", None
+        circuit._savebed_search(client).run()
+        self.assertTrue(circuit._needs_savebed(client))
+        # A failed bed tile is skipped for another in the same room first,
+        # then for the next-nearest map.
+        circuit._bed_failed.add(("/inn", (2, 0)))
+        self.assertEqual(circuit._savebed_search(client).run().result,
+                         ("/inn", (1, 0), 2))
+        circuit._bed_failed.add(("/inn", (1, 0)))
+        self.assertEqual(circuit._savebed_search(client).run().result[0], STARTER_APARTMENT)
+
+    def test_farm_circuit_moves_to_a_much_nearer_bed_on_the_same_map(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 8
+        graph = WorldGraph()
+        hall = MapNode("/hall", width=40, height=1)
+        hall.terrain = {(x, 0): 1 for x in range(40)}
+        hall.edges.append(MapEdge("/hall", "/farm", 39, 0, 0, 0))
+        farm = MapNode("/farm", width=5, height=1)
+        farm.terrain = {(x, 0): 1 for x in range(5)}
+        graph.nodes.update({"/hall": hall, "/farm": farm})
+        graph.savebeds["/hall"] = [(0, 0), (37, 0)]
+        # Bound to the far bed of a long hall: the exit-side bed saves 37.
+        client.state.savebed_map, client.state.savebed_xy = "/hall", (0, 0)
+        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
+        search = circuit._savebed_search(client).run()
+        self.assertEqual((search.result, search.current_walk), (("/hall", (37, 0), 2), 39))
+        self.assertTrue(circuit._needs_savebed(client))
+        self.assertEqual(circuit._new_savebed(client).navigation.destination_xy, (37, 0))
+
+    def test_savebed_search_routes_each_bed_component_and_skips_exhausted_maps(self):
+        from . import navigation
+        from .navigation import nearest_savebed
+
+        graph = WorldGraph()
+        # One map, two rooms split by a wall, each with a bed and its own
+        # exit: the east room's exit is right beside the farm.
+        rooms = MapNode("/rooms", width=21, height=1)
+        rooms.terrain = {(x, 0): 1 for x in range(21)}
+        rooms.blocked = {(10, 0)}
+        rooms.edges.append(MapEdge("/rooms", "/road", 0, 0, 0, 0))
+        rooms.edges.append(MapEdge("/rooms", "/farm", 20, 0, 0, 0))
+        road = MapNode("/road", width=30, height=1)
+        road.terrain = {(x, 0): 1 for x in range(30)}
+        road.edges.append(MapEdge("/road", "/farm", 29, 0, 0, 0))
+        farm = MapNode("/farm", width=5, height=1)
+        farm.terrain = {(x, 0): 1 for x in range(5)}
+        graph.nodes.update({"/rooms": rooms, "/road": road, "/farm": farm})
+        graph.savebeds["/rooms"] = [(1, 0), (19, 0)]
+        tavern = MapNode("/tavern", width=3, height=1)
+        tavern.terrain = {(x, 0): 1 for x in range(3)}
+        tavern.edges.append(MapEdge("/tavern", "/farm", 2, 0, 0, 0))
+        aaa = MapNode("/aaa", width=2, height=1)
+        aaa.terrain = {(0, 0): 1, (1, 0): 1}
+        aaa.edges.append(MapEdge("/aaa", "/farm", 1, 0, 0, 0))
+        graph.nodes.update({"/tavern": tavern, "/aaa": aaa})
+        graph.savebeds["/tavern"] = [(0, 0)]
+        graph.savebeds["/aaa"] = [(0, 0)]
+        self.assertEqual(nearest_savebed(graph, ["/farm"], excluded={"/tavern", "/aaa"}),
+                         ("/rooms", (19, 0), 1))
+        # With room for one candidate map, an exhausted nearer map yields
+        # its slot to the next one.
+        with patch.object(navigation, "SAVEBED_CANDIDATES", 1):
+            self.assertEqual(
+                nearest_savebed(graph, ["/farm"], excluded_tiles={("/aaa", (0, 0))},
+                                excluded={"/rooms"}),
+                ("/tavern", (0, 0), 2))
+
+    def test_each_bed_is_priced_through_the_exit_that_suits_it(self):
+        from .navigation import nearest_savebed
+
+        # One long room with an exit at each end, each to a different
+        # circuit map. The first bed (the anchor) is nearest the west exit;
+        # the east bed is beside the east exit and must be priced through it.
+        graph = WorldGraph()
+        hall = MapNode("/hall", width=30, height=1)
+        hall.terrain = {(x, 0): 1 for x in range(30)}
+        hall.edges.append(MapEdge("/hall", "/west", 0, 0, 0, 0))
+        hall.edges.append(MapEdge("/hall", "/east", 29, 0, 0, 0))
+        west = MapNode("/west", width=5, height=1)
+        west.terrain = {(x, 0): 1 for x in range(5)}
+        west.edges.append(MapEdge("/west", "/farm_a", 4, 0, 0, 0))
+        graph.nodes.update({"/hall": hall, "/west": west})
+        for path in ("/east", "/farm_a"):
+            node = MapNode(path, width=5, height=1)
+            node.terrain = {(x, 0): 1 for x in range(5)}
+            graph.nodes[path] = node
+        graph.savebeds["/hall"] = [(1, 0), (28, 0)]
+        # Legs: /farm_a (behind the short west map, the anchor's best: 5
+        # moves) and /east (next door to the east bed: 1 move).
+        self.assertEqual(nearest_savebed(graph, ["/farm_a", "/east"]),
+                         ("/hall", (28, 0), 1))
+
+    def test_a_bed_cut_off_from_the_farm_room_is_not_already_there(self):
+        from .navigation import NamedSpawn, savebed_walk
+
+        # The circuit map has two rooms; the farm's spawn is in the east one
+        # and the bed in the west one, joined only through /yard.
+        graph = WorldGraph()
+        farm = MapNode("/farm", width=11, height=1)
+        farm.terrain = {(x, 0): 1 for x in range(11)}
+        farm.blocked = {(5, 0)}
+        farm.edges.append(MapEdge("/farm", "/yard", 0, 0, 0, 0))
+        yard = MapNode("/yard", width=3, height=1)
+        yard.terrain = {(x, 0): 1 for x in range(3)}
+        yard.edges.append(MapEdge("/yard", "/farm", 2, 0, 10, 0))
+        graph.nodes.update({"/farm": farm, "/yard": yard})
+        graph.named_spawns["/farm"] = [NamedSpawn("/farm", 8, 0, "rat", ("rat",))]
+        # West room bed: out to /yard (2 moves), across it (2), back in.
+        self.assertEqual(savebed_walk(graph, "/farm", (2, 0), ["/farm"]), 4)
+        # East room bed: already with the farm.
+        self.assertEqual(savebed_walk(graph, "/farm", (9, 0), ["/farm"]), 0)
+
+    def test_unroutable_nearer_beds_do_not_use_up_candidate_slots(self):
+        from . import navigation
+        from .navigation import nearest_savebed
+
+        graph = WorldGraph()
+        farm = MapNode("/farm", width=3, height=1)
+        farm.terrain = {(x, 0): 1 for x in range(3)}
+        # /aaa is one hop away, but its bed is walled into a closet.
+        aaa = MapNode("/aaa", width=5, height=1)
+        aaa.terrain = {(x, 0): 1 for x in range(5)}
+        aaa.blocked = {(1, 0)}
+        aaa.edges.append(MapEdge("/aaa", "/farm", 4, 0, 0, 0))
+        tavern = MapNode("/tavern", width=3, height=1)
+        tavern.terrain = {(x, 0): 1 for x in range(3)}
+        tavern.edges.append(MapEdge("/tavern", "/farm", 2, 0, 0, 0))
+        graph.nodes.update({"/farm": farm, "/aaa": aaa, "/tavern": tavern})
+        graph.savebeds["/aaa"] = [(0, 0)]
+        graph.savebeds["/tavern"] = [(0, 0)]
+        with patch.object(navigation, "SAVEBED_CANDIDATES", 1):
+            self.assertEqual(nearest_savebed(graph, ["/farm"]), ("/tavern", (0, 0), 2))
+
+    def test_apartment_exits_record_their_runtime_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            town = MapState(path="/shattered_islands/world_0_68", world_x=7, world_y=12)
+            client._observe_map_change(STARTER_APARTMENT, town)
+            client._observe_map_change("/shattered_islands/world_0_68",
+                                       MapState(path="/shattered_islands/world_0_67"))
+            self.assertEqual(client.state.apartment_returns,
+                             {STARTER_APARTMENT: ("/shattered_islands/world_0_68", (7, 12))})
+            # A death or recall that happens to leave the apartment is not
+            # its exit's return point.
+            client.record_action("emergency-recall", "via scroll")
+            client._observe_map_change(STARTER_APARTMENT,
+                                       MapState(path="/shattered_islands/world_4_45", world_x=1, world_y=1))
+            self.assertEqual(client.state.apartment_returns[STARTER_APARTMENT][0],
+                             "/shattered_islands/world_0_68")
+            restarted = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            restarted.state.player_name = "Sera"
+            restarted.load_character_memory("Sera")
+            self.assertEqual(restarted.state.apartment_returns,
+                             {STARTER_APARTMENT: ("/shattered_islands/world_0_68", (7, 12))})
+
+    def test_an_unpriced_apartment_bed_is_kept_until_its_exit_is_seen(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 8
+        client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
+        circuit = FarmCircuitTask(self.savebed_graph(), [("/farm", "rat")])
+        circuit._savebed_search(client).run()
+        # The apartment's return is unknown: no proven gain, no rebind.
+        self.assertFalse(circuit._needs_savebed(client))
+        client.state.apartment_returns = {STARTER_APARTMENT: ("/far", (0, 0))}
+        circuit._savebed_search(client).run()
+        self.assertTrue(circuit._needs_savebed(client))
+
+    def test_bind_savebed_recognizes_every_savebed_name(self):
+        for name, names in (("hammock to reality", ()), ("save bed", ()),
+                            ("canopy bed", ("canopy bed",))):
+            client = type("Client", (), {})()
+            client.state = GameState(phase="playing", player_tag=7)
+            client.state.place_item(Item(800, item_type=0, name=name), 0)
+            client.applied = []
+
+            async def apply(tag, client=client):
+                client.applied.append(tag)
+
+            client.apply = apply
+            task = BindSavebedTask(names=names)
+            asyncio.run(task.tick(client))
+            self.assertEqual(client.applied, [800], name)
+
+    def test_any_savebed_confirmation_is_persisted_where_she_stands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.state.map = MapState(path="/shattered_islands/incuna/apartments/beach_nook",
+                                        world_x=3, world_y=2)
+            # Another player quoting the confirmation does not move it.
+            payload = bytes([2]) + b"ffffff\0Zoey says: You save and your save bed location is updated.\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            self.assertEqual(client.state.savebed_map, "")
+            payload = bytes([2]) + b"ffffff\0You save and your save bed location is updated.\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            self.assertEqual((client.state.savebed_map, client.state.savebed_xy),
+                             ("/shattered_islands/incuna/apartments/beach_nook", (3, 2)))
+
+    def test_farm_circuit_keeps_a_savebed_that_is_nearly_as_close(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 8
+        # The starter apartment is 16 moves out; the inn's 1 saves under 20.
+        client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
+        client.state.apartment_returns = {STARTER_APARTMENT: ("/far", (0, 0))}
+        circuit = FarmCircuitTask(self.savebed_graph(far_width=15), [("/farm", "rat")])
+        search = circuit._savebed_search(client).run()
+        self.assertEqual((search.result, search.current_walk), (("/inn", (2, 0), 1), 16))
+        self.assertFalse(circuit._needs_savebed(client))
+
+    def test_real_strakewood_circuit_prefers_a_public_bed_over_the_far_apartment(self):
+        from .navigation import nearest_savebed, savebed_walk
+
+        graph = built_graph()
+        spot = ["/shattered_islands/world_0_50", "/shattered_islands/world_0_51",
+                "/shattered_islands/world_1_50", "/shattered_islands/world_1_51"]
+        # Live on 2026-10-17, leaving the starter apartment returned Sera to
+        # Strakewood's world_0_68, not to the graph's static Asteria exit.
+        town = graph.nodes["/shattered_islands/world_0_68"]
+        entrance = next(point for point in sorted(town.terrain) if town.walkable(*point))
+        returns = {STARTER_APARTMENT: ("/shattered_islands/world_0_68", entrance)}
+        bed_map, _, tiles = nearest_savebed(graph, spot, returns=returns)
+        self.assertNotIn("/apartments/", bed_map)
+        self.assertNotIn("/house/", bed_map)
+        apartment = savebed_walk(graph, STARTER_APARTMENT, STARTER_APARTMENT_BED, spot,
+                                 returns=returns)
+        self.assertLessEqual(tiles + FarmCircuitTask.SAVEBED_MIN_GAIN_TILES, apartment)
 
     def test_dashboard_trace_prefers_active_service_over_dormant_farm(self):
         graph = WorldGraph()
@@ -11400,6 +11764,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         analysis = json.loads(payload)["farming_analysis"]
         self.assertEqual(analysis["status"], "unavailable")
+        self.assertIsNone(analysis["savebed"])
         learning = analysis["self_improvement"]
         self.assertEqual([spot["spot"] for spot in learning["spots"]], ["/trees", "/old"])
         self.assertEqual(learning["spots"][0]["level"], 2)
@@ -11603,7 +11968,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=17", page)
+        self.assertIn(b"/app.js?v=18", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

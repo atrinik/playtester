@@ -216,6 +216,15 @@ next-ranked spot, after:
 Explicitly configured circuits keep the old behaviour: a death or emergency
 recall there quarantines the spot.
 
+Before farming a circuit, autoplay moves the character's savebed (the "bed to
+reality" a death respawns at) to the usable bed with the shortest walk to the
+circuit's maps, when that saves at least 20 tiles over the current one. Inn
+and tavern beds work for anyone; apartment and house beds only in the starter
+apartment. The walk is estimated along the world graph's route from the bed,
+and the search spreads its routes over ticks so it never stalls combat. A bed
+that cannot be reached or applied is skipped for the next-nearest one. The
+dashboard's Farming tab shows where she respawns.
+
 When the analyzer gets a spot wrong, the fix belongs in the analyzer.
 
 ## Dependency and content boundaries

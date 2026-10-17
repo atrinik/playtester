@@ -121,7 +121,7 @@ let lastFarmingSig = "";
 function renderFarming() {
   const fa = slow.farming_analysis;
   if (!fa) return;
-  const sig = JSON.stringify([fa.status, fa.objective, fa.finished_at, fa.error, fa.running, fa.self_improvement]);
+  const sig = JSON.stringify([fa.status, fa.objective, fa.finished_at, fa.error, fa.running, fa.self_improvement, fa.savebed]);
   const status = $("#fa-status");
   status.classList.toggle("warn-text", fa.status === "failed" || fa.status === "unsupported");
   status.textContent = fa.running ? "Analyzing…"
@@ -149,7 +149,9 @@ function renderFarming() {
   const goalText = [goals.area_spells ? "area spells for packs" : "",
     goals.offence ? "better weapon and armour" : "", goals.healing ? "more healing" : "",
     ...Object.keys(goals.protection || {}).map(k => `${k} protection`)].filter(Boolean).join(", ");
-  $("#fa-learning").innerHTML = ((learning.spots || []).map(s => `
+  const bed = fa.savebed;
+  const bedText = bed ? `<small class="muted">Respawns at the savebed on ${esc(bed.map.replace(/^.*\//, ""))} (${bed.x}, ${bed.y}).</small>` : "";
+  $("#fa-learning").innerHTML = bedText + ((learning.spots || []).map(s => `
     <div class="spot">
       <div class="spot-head"><b>${esc(s.spot.split("|")[0].replace(/^.*\//, ""))}</b><span class="flag">adaptation ${s.level}/${s.max_level}</span></div>
       ${(s.reviews || []).slice().reverse().map(r => `<small>${new Date(r.time * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${esc(r.kind)} · <b>${esc(r.cause)}</b>: ${esc(r.detail)}${(r.remedies || []).length ? ` → ${esc(r.remedies.join(", "))}` : ""}</small>`).join("")}

@@ -17,7 +17,8 @@ from typing import Any, Awaitable, Callable
 from . import constants as c
 from .access_codes import normalize_access_code
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
-from .model import Character, GameState, InterfaceState, Item, MapObject, MapState
+from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameState,
+                    InterfaceState, Item, MapObject, MapState)
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
@@ -278,6 +279,26 @@ class AtrinikClient:
                 self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = bool(
                 record.get("apartment_bed_bound", False))
+            savebed = record.get("savebed")
+            if (isinstance(savebed, list) and len(savebed) == 3 and
+                    isinstance(savebed[0], str) and
+                    all(isinstance(v, int) for v in savebed[1:])):
+                self.state.savebed_map = savebed[0]
+                self.state.savebed_xy = (savebed[1], savebed[2])
+            elif self.state.apartment_bed_bound:
+                # Records from before savebeds were tracked by location.
+                self.state.savebed_map = STARTER_APARTMENT
+                self.state.savebed_xy = STARTER_APARTMENT_BED
+            else:
+                self.state.savebed_map = ""
+                self.state.savebed_xy = None
+            returns = record.get("apartment_returns", {})
+            self.state.apartment_returns = {
+                apartment: (back[0], (back[1], back[2]))
+                for apartment, back in (returns.items() if isinstance(returns, dict) else ())
+                if isinstance(apartment, str) and isinstance(back, list) and len(back) == 3
+                and isinstance(back[0], str) and all(isinstance(v, int) for v in back[1:])
+            }
             adaptations = record.get("farm_adaptations", {})
             self.state.farm_adaptations = {
                 str(key): dict(value) for key, value in adaptations.items()
@@ -320,6 +341,9 @@ class AtrinikClient:
             self.state.farm_zone_last_checked = {}
             self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = False
+            self.state.savebed_map = ""
+            self.state.savebed_xy = None
+            self.state.apartment_returns = {}
             self.state.farm_objective = DEFAULT_OBJECTIVE
             self.state.farm_adaptations = {}
             self.state.bank_balance = 0
@@ -455,6 +479,56 @@ class AtrinikClient:
             return
         self._runtime_memory.setdefault(character, {})[
             "apartment_bed_bound"] = self.state.apartment_bed_bound
+        self._persist_character_memory()
+
+    def set_savebed(self, path: str, x: int, y: int) -> None:
+        """Persist where the server now respawns the character."""
+        self.state.savebed_map = path
+        self.state.savebed_xy = (int(x), int(y))
+        self.state.apartment_bed_bound = path == STARTER_APARTMENT
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        record = self._runtime_memory.setdefault(character, {})
+        record["savebed"] = [path, int(x), int(y)]
+        record["apartment_bed_bound"] = self.state.apartment_bed_bound
+        self._persist_character_memory()
+
+    def _observe_map_change(self, old_path: str, m: MapState) -> None:
+        """Learn where leaving an apartment put the character.
+
+        The server returns to the per-player entrance recorded at runtime, so
+        the authored graph's static apartment exits are only placeholders.
+        """
+        if (old_path and old_path != m.path and "/apartments/" in old_path and
+                "/apartments/" not in m.path and not self._recently_moved_by_force()):
+            self.set_apartment_return(old_path, m.path, m.world_x, m.world_y)
+
+    def _recently_moved_by_force(self, seconds: float = 15.0) -> bool:
+        """Whether a death or recall, not an exit, may explain a map change."""
+        cutoff = time.time() - seconds
+        for entry in reversed(self.decision_history):
+            if not isinstance(entry, dict):
+                continue
+            if float(entry.get("time", 0) or 0) < cutoff:
+                break
+            if entry.get("action") in ("death", "emergency-recall"):
+                return True
+        return False
+
+    def set_apartment_return(self, apartment: str, path: str, x: int, y: int) -> None:
+        """Persist where leaving an apartment put the character."""
+        back = (path, (int(x), int(y)))
+        if self.state.apartment_returns.get(apartment) == back:
+            return
+        self.state.apartment_returns[apartment] = back
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        record = self._runtime_memory.setdefault(character, {})
+        record["apartment_returns"] = {
+            name: [where, point[0], point[1]]
+            for name, (where, point) in self.state.apartment_returns.items()}
         self._persist_character_memory()
 
     def quarantine_farm_zone(self, path: str, until: float) -> None:
@@ -1051,6 +1125,12 @@ class AtrinikClient:
             "you feel less healthy", "watch out, your mind is going!",
             "your spirit feels drained!",
         )
+        if lowered.strip() == "you save and your save bed location is updated.":
+            # Whichever task applied it, the server binds the respawn to the
+            # square the character stands on.
+            m = self.state.map
+            if m.path:
+                self.set_savebed(m.path, m.world_x, m.world_y)
         died = "defeated in combat" in lowered or "you have died" in lowered
         if died:
             self.record_action("death", text)
@@ -1742,6 +1822,7 @@ class AtrinikClient:
             if marker:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
+        self._observe_map_change(old_path, m)
         await self.emit("map", {"path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y, "changed_map": old_path != m.path})
 
     async def _handle_interface(self, cur: Cursor, raw: bytes) -> None:

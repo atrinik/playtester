@@ -15,7 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 try:
     from tools.world_content_audit import (ROOT as CONTENT_ROOT, flatten,
@@ -30,6 +30,7 @@ from . import constants as c
 from .client import AtrinikClient, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import self_improvement
+from .model import STARTER_APARTMENT
 from .pathfinding import graph_search, grid_reachable, grid_search
 from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
@@ -396,6 +397,10 @@ class WorldGraph:
         self.dialogue_vendors: list[DialogueVendor] = []
         self.food_profiles: dict[str, FoodProfile] = {}
         self.shop_stocks: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        # Savebed ("bed to reality") tiles per map, public and private.
+        self.savebeds: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        # The authored name of each savebed, such as "hammock to reality".
+        self.savebed_names: dict[tuple[str, int, int], str] = {}
         self.access_item_names: dict[str, set[str]] = defaultdict(set)
         self.monster_levels: dict[str, int] = {}
         # Archetype-level passive identities remain valid when the protocol
@@ -525,6 +530,9 @@ class WorldGraph:
                     point = (x, y)
                     if point not in self.shop_stocks[source]:
                         self.shop_stocks[source].append(point)
+                if obj_type == "106" and (x, y) not in self.savebeds[source]:
+                    self.savebeds[source].append((x, y))
+                    self.savebed_names[(source, x, y)] = name
                 # Normal doors are deliberately left to the server pathfinder,
                 # which opens them just like the graphical client's click path.
                 # Static walls, water-only terrain, furniture, and counters are
@@ -3544,6 +3552,295 @@ def analyzer_farm_selection(
     return None
 
 
+# Paths of private savebeds: an apartment or house bed only works for its owner.
+PRIVATE_SAVEBED_MARKERS = ("/apartments/", "/house/")
+# Exact walks cost a tile-level route each (about 0.2 s on the live world), so
+# only the bed maps within this many map transitions of the nearest bed, at
+# most SAVEBED_CANDIDATES of them, get one.
+SAVEBED_HOP_SLACK = 2
+SAVEBED_CANDIDATES = 6
+
+
+def _nearest_spot_maps(graph: WorldGraph, source: str,
+                       spot_maps: Iterable[str]) -> tuple[int, list[str]] | None:
+    """The fewest map transitions from ``source`` to a spot map, and those maps."""
+    best: tuple[int, list[str]] | None = None
+    for spot in spot_maps:
+        if source == spot:
+            return 0, [spot]
+        try:
+            hops = len(graph.route(source, spot))
+        except (ValueError, KeyError):
+            continue
+        if best is None or hops < best[0]:
+            best = (hops, [spot])
+        elif hops == best[0]:
+            best[1].append(spot)
+    return best
+
+
+def _edge_arrival(graph: WorldGraph, edge: MapEdge) -> tuple[int, int]:
+    """Where a route edge lands on its destination map.
+
+    Exits carry their authored arrival. Tile links between tiled world maps
+    keep the default (0, 0) arrival; their crossing square lies just past
+    the source map's border and maps onto the opposite edge of the
+    destination, exactly as ``_tile_transitions`` computes it.
+    """
+    destination = graph.nodes.get(edge.destination)
+    if edge.kind != "tile" or destination is None:
+        if destination is not None and edge.kind == "exit":
+            return (edge.destination_x if edge.destination_x >= 0 else destination.enter_x,
+                    edge.destination_y if edge.destination_y >= 0 else destination.enter_y)
+        return edge.destination_x, edge.destination_y
+    source = graph.nodes.get(edge.source)
+    width = source.width if source is not None else destination.width
+    height = source.height if source is not None else destination.height
+    x = (destination.width - 1 if edge.x < 0 else 0 if edge.x >= width else edge.x)
+    y = (destination.height - 1 if edge.y < 0 else 0 if edge.y >= height else edge.y)
+    return x, y
+
+
+def _segment_steps(graph: WorldGraph, map_path: str, here: tuple[int, int],
+                   edge: MapEdge) -> int:
+    """Moves on ``map_path`` from ``here`` through ``edge``'s departure.
+
+    Follows the authored terrain (``local_path``) so walls, counters and
+    winding corridors count; the straight-line distance is only a fallback.
+    A tile link's crossing lies past the border: walk to the border square,
+    then one move across. Stepping onto an exit is itself the transfer.
+    """
+    node = graph.nodes.get(map_path)
+    target = (edge.x, edge.y)
+    if node is not None:
+        target = (max(0, min(node.width - 1, edge.x)),
+                  max(0, min(node.height - 1, edge.y)))
+    path = graph.local_path(map_path, here, target) if node is not None else []
+    steps = (len(path) - 1 if path else
+             max(abs(target[0] - here[0]), abs(target[1] - here[1])))
+    return steps + (1 if edge.kind == "tile" else 0)
+
+
+def _spawn_points(graph: WorldGraph, map_path: str) -> list[tuple[int, int]]:
+    """Walkable authored spawn tiles of a map: where its farm actually is."""
+    node = graph.nodes.get(map_path)
+    if node is None:
+        return []
+    return sorted({(spawn.x, spawn.y) for spawn in graph.named_spawns.get(map_path, ())
+                   if node.walkable(spawn.x, spawn.y)})
+
+
+def _reaches(graph: WorldGraph, map_path: str, point: tuple[int, int],
+             targets: list[tuple[int, int]]) -> bool:
+    """Whether point shares a walkable component with a target (or none known)."""
+    if not targets:
+        return True
+    component = graph._component(map_path, point)
+    return any(target in component for target in targets)
+
+
+def _route_walk(graph: WorldGraph, start_map: str, start_xy: tuple[int, int],
+                edges: Sequence[MapEdge]) -> int:
+    """Moves along a planned route until it enters its destination map."""
+    tiles, here, current = 0, start_xy, start_map
+    for edge in edges:
+        tiles += _segment_steps(graph, current, here, edge)
+        here, current = _edge_arrival(graph, edge), edge.destination
+    return tiles
+
+
+ApartmentReturns = dict[str, tuple[str, tuple[int, int]]]
+
+
+def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
+              spot_maps: Sequence[str], returns: ApartmentReturns):
+    """Generator: yields once per exact route; returns the walk options.
+
+    Each option is (walk, first edge) for one route found, ``first`` being
+    the edge the walk leaves ``bed_map`` by, so other beds in the same room
+    can be priced by their own steps to each route's first edge. An apartment's exit
+    returns to the per-player entrance recorded at runtime, not to the
+    graph's static alternatives, so its walk continues from the observed
+    return point in ``returns``; without one it is unknown (None).
+    """
+    targets = {spot: _spawn_points(graph, spot) for spot in spot_maps}
+    if bed_map in spot_maps and _reaches(graph, bed_map, point, targets[bed_map]):
+        return [(0, None)]
+    start_map, start_xy, base, first = bed_map, point, 0, None
+    if "/apartments/" in bed_map:
+        back = returns.get(bed_map)
+        node = graph.nodes.get(bed_map)
+        if back is None or node is None:
+            return []
+        exits = [edge for edge in node.edges if edge.kind != "tile" and (
+            graph.local_path(bed_map, point, (edge.x, edge.y)) or
+            (edge.x, edge.y) == point)]
+        if not exits:
+            return []
+        first = min(exits, key=lambda edge: _segment_steps(graph, bed_map, point, edge))
+        base = _segment_steps(graph, bed_map, point, first)
+        start_map, start_xy = back[0], tuple(back[1])
+        if start_map in spot_maps and _reaches(graph, start_map, start_xy, targets[start_map]):
+            return [(base, first)]
+    options = []
+    for spot in spot_maps:
+        try:
+            # Arrive in the part of the circuit map the farm's spawns are
+            # in: a bed (or arrival) in a disconnected room does not count.
+            edges = graph.route_points(start_map, start_xy, spot, targets[spot])
+        except (ValueError, KeyError):
+            edges = None
+        yield
+        if not edges:
+            continue
+        options.append((base + _route_walk(graph, start_map, start_xy, edges),
+                        first or edges[0]))
+    return options
+
+
+def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
+                 spot_maps: Iterable[str], *,
+                 returns: ApartmentReturns | None = None) -> int | None:
+    """Moves walked from a respawn on this bed to the nearest circuit map.
+
+    Every reachable circuit map is routed and walked along its authored
+    paths; None when none is reachable (or an apartment's return is unknown).
+    """
+    steps = _bed_walk(graph, bed_map, tuple(bed_xy), tuple(spot_maps), returns or {})
+    try:
+        while True:
+            next(steps)
+    except StopIteration as done:
+        return min((walk for walk, _ in done.value), default=None)
+
+
+class SavebedSearch:
+    """Find the usable savebed whose respawn is the shortest walk from a spot.
+
+    Public beds (inns, taverns) work for anyone; private ones only in
+    ``owned`` maps, and apartments only once their runtime return point is
+    known (``returns``). Each exact walk is a tile-level route, so ``step()``
+    computes at most one per call and a live caller spreads the search over
+    ticks. ``result`` is (map, bed tile, walk tiles) or None; with
+    ``current`` (map, tile), ``current_walk`` is that bed's walk.
+    """
+
+    def __init__(self, graph: WorldGraph, spot_maps: Iterable[str], *,
+                 owned: Iterable[str] = (STARTER_APARTMENT,),
+                 excluded: Iterable[str] = (),
+                 excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = (),
+                 current: tuple[str, tuple[int, int]] | None = None,
+                 returns: ApartmentReturns | None = None):
+        self.result: tuple[str, tuple[int, int], int] | None = None
+        self.current_walk: int | None = None
+        self.done = False
+        self._steps = self._search(
+            graph, tuple(dict.fromkeys(spot_maps)), set(owned), set(excluded),
+            {(path, tuple(point)) for path, point in excluded_tiles}, current,
+            dict(returns or {}))
+
+    def step(self) -> bool:
+        """Advance by at most one exact route; True once the search is done."""
+        if not self.done:
+            try:
+                next(self._steps)
+            except StopIteration:
+                self.done = True
+        return self.done
+
+    def run(self) -> "SavebedSearch":
+        while not self.step():
+            pass
+        return self
+
+    def _consider(self, bed_map: str, point: tuple[int, int], walk: int) -> None:
+        if self.result is None or (walk, bed_map, point) < (
+                self.result[2], self.result[0], self.result[1]):
+            self.result = (bed_map, point, walk)
+
+    def _search(self, graph, spot_maps, owned, excluded, excluded_tiles, current,
+                returns):
+        eligible: dict[str, list[tuple[int, int]]] = {}
+        hops: dict[str, int] = {}
+        for bed_map in sorted(graph.savebeds):
+            if bed_map in excluded or bed_map not in graph.nodes:
+                continue
+            if bed_map not in owned and any(
+                    marker in bed_map for marker in PRIVATE_SAVEBED_MARKERS):
+                continue
+            blocked = graph.nodes[bed_map].blocked
+            tiles = [point for point in sorted(graph.savebeds[bed_map])
+                     if point not in blocked and (bed_map, point) not in excluded_tiles]
+            # Maps whose beds have all failed must not take candidate slots.
+            if not tiles:
+                continue
+            if "/apartments/" in bed_map:
+                back = returns.get(bed_map)
+                nearest = (None if back is None else
+                           _nearest_spot_maps(graph, back[0], spot_maps))
+                if nearest is not None:
+                    nearest = (nearest[0] + 1, nearest[1])
+            else:
+                nearest = _nearest_spot_maps(graph, bed_map, spot_maps)
+            if nearest is not None:
+                hops[bed_map] = nearest[0]
+                eligible[bed_map] = tiles
+        yield
+        candidates: list[str] = []
+        if hops:
+            cutoff = min(hops.values()) + SAVEBED_HOP_SLACK
+            candidates = sorted((m for m in hops if hops[m] <= cutoff),
+                                key=lambda m: (hops[m], m))
+        # Nearest maps first, until SAVEBED_CANDIDATES of them are priced: a
+        # map whose beds turn out unroutable (the hop count only proves the
+        # map is connected) does not use up a slot.
+        priced_maps = 0
+        for bed_map in candidates:
+            if priced_maps >= SAVEBED_CANDIDATES:
+                break
+            priced = False
+            # Beds in one walkable component share everything after their
+            # first exit; beds in another component get their own route.
+            groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+            for point in eligible[bed_map]:
+                component = graph._component(bed_map, point)
+                groups.setdefault(min(component) if component else point, []).append(point)
+            for group in groups.values():
+                anchor = group[0]
+                options = yield from _bed_walk(
+                    graph, bed_map, anchor, spot_maps, returns)
+                for point in group:
+                    # Each bed takes whichever leg's route suits it best: a
+                    # bed beside another exit is priced through that exit.
+                    prices = []
+                    for walk, first in options:
+                        if point == anchor or first is None:
+                            prices.append(walk)
+                        elif graph.local_path(bed_map, point, (first.x, first.y)):
+                            prices.append(
+                                walk - _segment_steps(graph, bed_map, anchor, first) +
+                                _segment_steps(graph, bed_map, point, first))
+                    if prices:
+                        self._consider(bed_map, point, min(prices))
+                        priced = True
+            priced_maps += priced
+        if current is not None and current[0] in graph.nodes:
+            options = yield from _bed_walk(
+                graph, current[0], tuple(current[1]), spot_maps, returns)
+            self.current_walk = min((walk for walk, _ in options), default=None)
+
+
+def nearest_savebed(graph: WorldGraph, spot_maps: Iterable[str], *,
+                    owned: Iterable[str] = (STARTER_APARTMENT,),
+                    excluded: Iterable[str] = (),
+                    excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = (),
+                    returns: ApartmentReturns | None = None
+                    ) -> tuple[str, tuple[int, int], int] | None:
+    """The usable savebed whose respawn is the shortest walk from the spot."""
+    return SavebedSearch(graph, spot_maps, owned=owned, excluded=excluded,
+                         excluded_tiles=excluded_tiles, returns=returns).run().result
+
+
 class FarmCircuitTask(BotTask):
     """Rotate between nearby farm maps without abandoning fights or loot."""
 
@@ -3576,6 +3873,8 @@ class FarmCircuitTask(BotTask):
 
     # Live failures exclude an analyzer pick for this long; see the README.
     FARM_DEATH_QUARANTINE_SECONDS = 6 * 60 * 60
+    # A savebed nearer the circuit must save at least this walk to be worth a detour.
+    SAVEBED_MIN_GAIN_TILES = 20
     FARM_NO_PROGRESS_SECONDS = 10 * 60
     # Time off the farm restarts the no-XP clock instead of counting against it.
     FARM_OBSERVATION_GAP_SECONDS = 60
@@ -3648,6 +3947,10 @@ class FarmCircuitTask(BotTask):
         self._capability_retry_at: dict[str, float] = {}
         self._bed_binding: NavigateThenTask | None = None
         self._bed_retry_at = 0.0
+        self._bed_target: tuple[str, tuple[int, int], int] | None = None
+        # Bed tiles that could not be reached or applied, as (map, tile).
+        self._bed_failed: set[tuple[str, tuple[int, int]]] = set()
+        self._bed_search: tuple[tuple, SavebedSearch] | None = None
         self._selling: NavigateThenTask | None = None
         self._selling_retry_at = 0.0
         self._banking: NavigateThenTask | None = None
@@ -4362,19 +4665,65 @@ class FarmCircuitTask(BotTask):
                 "chest", unidentified_only=True, valuable_only=True),
             destination_xy=(1, 3), combat_approach=True)
 
-    def _needs_apartment_bed(self, client: AtrinikClient) -> bool:
-        apartment = (
-            "/shattered_islands/strakewood_island/apartments/apartment_cheap")
-        return (int(client.state.stats.get("level", 0) or 0) >= 1 and
-                apartment in self.graph.nodes and
-                not client.state.apartment_bed_bound and
-                self.clock() >= self._bed_retry_at)
+    def _spot_maps(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(path for path, _ in self.legs))
 
-    def _new_apartment_bed(self) -> NavigateThenTask:
+    def _savebed_search(self, client: AtrinikClient) -> SavebedSearch:
+        """This circuit's nearest-savebed search, restarted when its inputs change."""
+        bed_map = getattr(client.state, "savebed_map", "")
+        bed_xy = getattr(client.state, "savebed_xy", None)
+        current = (bed_map, tuple(bed_xy)) if bed_map and bed_xy else None
+        returns = dict(getattr(client.state, "apartment_returns", {}) or {})
+        key = (self._spot_maps(), frozenset(self._bed_failed), current,
+               frozenset(returns.items()))
+        if self._bed_search is None or self._bed_search[0] != key:
+            self._bed_search = (key, SavebedSearch(
+                self.graph, key[0], excluded_tiles=self._bed_failed, current=current,
+                returns=returns))
+        return self._bed_search[1]
+
+    def _needs_savebed(self, client: AtrinikClient) -> bool:
+        """Whether a usable bed nearer this circuit beats the current respawn.
+
+        A death then costs only the short walk back from that bed. Binding is
+        a one-time detour per circuit, so it must save a real walk. The search
+        advances one exact route per call and answers False until it is done.
+        """
+        if (int(client.state.stats.get("level", 0) or 0) < 1 or
+                self.clock() < self._bed_retry_at):
+            return False
+        search = self._savebed_search(client)
+        if not search.step():
+            return False
+        target = search.result
+        if target is None:
+            return False
+        bound = (getattr(client.state, "savebed_map", ""),
+                 tuple(getattr(client.state, "savebed_xy", None) or ()))
+        if bound == (target[0], tuple(target[1])):
+            return False
+        # Another bed on the same map counts like any other: only a real gain
+        # (an inn's far corner versus its exit-side beds) is worth a rebind.
+        current = search.current_walk
+        if current is None:
+            # A bound apartment bed is unpriced until leaving that apartment
+            # has shown where its exit leads; keep it until then rather than
+            # rebinding without proof of a gain. Any other unpriced bed (no
+            # route, an unknown map, none bound) loses to a reachable one.
+            bound_map = bound[0]
+            returns = getattr(client.state, "apartment_returns", {}) or {}
+            return not ("/apartments/" in bound_map and bound_map in self.graph.nodes and
+                        bound_map not in returns)
+        return target[2] + self.SAVEBED_MIN_GAIN_TILES <= current
+
+    def _new_savebed(self, client: AtrinikClient) -> NavigateThenTask:
+        target = self._savebed_search(client).result
+        assert target is not None
+        self._bed_target = target
         return NavigateThenTask(
-            self.graph,
-            "/shattered_islands/strakewood_island/apartments/apartment_cheap",
-            BindSavebedTask(), destination_xy=(4, 1), combat_approach=True)
+            self.graph, target[0], BindSavebedTask(names=tuple(filter(None, (
+                getattr(self.graph, "savebed_names", {}).get((target[0], *target[1])),)))),
+            destination_xy=target[1], combat_approach=True)
 
     def _observe_disease(self, client: AtrinikClient) -> None:
         messages = client.state.messages
@@ -5407,14 +5756,18 @@ class FarmCircuitTask(BotTask):
             return
         if self._bed_binding is not None:
             await self._bed_binding.tick(client)
+            target = self._bed_target or ("?", (0, 0), 0)
             if self._bed_binding.status == TaskStatus.FAILED:
-                log.warning("apartment savebed binding failed: %s",
-                            self._bed_binding.error)
-                self._bed_retry_at = self.clock() + 1800.0
+                # Try the next-nearest bed shortly, another one in the same
+                # room first; this tile stays excluded for the circuit.
+                log.warning("savebed binding at %s %s failed: %s",
+                            target[0], target[1], self._bed_binding.error)
+                self._bed_failed.add((target[0], target[1]))
+                self._bed_retry_at = self.clock() + 300.0
                 self._bed_binding = None
             elif self._bed_binding.status == TaskStatus.COMPLETE:
-                log.info("apartment savebed bound; future deaths return home")
-                self._bed_retry_at = self.clock() + 86400.0
+                log.info("savebed bound at %s %s, about %d tiles from the farm",
+                         target[0], target[1], target[2])
                 self._bed_binding = None
             return
         if self._resupply is not None:
@@ -5512,11 +5865,19 @@ class FarmCircuitTask(BotTask):
             await self._storage.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_apartment_bed(client) and
-                not self._busy_finishing_fight_or_loot(client, farm)):
+                not self._busy_finishing_fight_or_loot(client, farm) and
+                self._needs_savebed(client)):
             await client.clear_actions()
             await client.set_combat(False)
-            self._bed_binding = self._new_apartment_bed()
+            self._bed_binding = self._new_savebed(client)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                target = self._bed_target
+                current = self._savebed_search(client).current_walk
+                recorder("savebed-move",
+                         f"{target[0]} {target[1]}: about {target[2]} tiles "
+                         f"from the farm, current "
+                         f"{current if current is not None else 'unknown'}")
             await self._bed_binding.tick(client)
             return
         if (isinstance(farm, FarmTask) and

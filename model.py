@@ -198,6 +198,12 @@ class QuestProgress:
     parts: list[QuestPartProgress] = field(default_factory=list)
 
 
+# The apartment the intro quests give every character; other apartments and
+# houses are private, so their beds cannot be used without owning them.
+STARTER_APARTMENT = "/shattered_islands/strakewood_island/apartments/apartment_cheap"
+STARTER_APARTMENT_BED = (4, 1)
+
+
 @dataclass(slots=True)
 class GameState:
     phase: str = "disconnected"
@@ -238,6 +244,12 @@ class GameState:
     farm_zone_last_checked: dict[str, float] = field(default_factory=dict)
     lore_attempt_counts: dict[str, int] = field(default_factory=dict)
     apartment_bed_bound: bool = False
+    # Where the server respawns the character: the last savebed it applied.
+    savebed_map: str = ""
+    savebed_xy: tuple[int, int] | None = None
+    # Where leaving each apartment actually put the character: the server
+    # returns to the per-player entrance recorded at runtime.
+    apartment_returns: dict[str, tuple[str, tuple[int, int]]] = field(default_factory=dict)
     equipment: dict[int, int] = field(default_factory=dict)
     protections: dict[int, int] = field(default_factory=dict)
     items: dict[int, Item] = field(default_factory=dict)
