@@ -3332,11 +3332,7 @@ class FarmTask(BotTask):
                 continue
             if self.target_temporarily_unreachable(obj.target_id):
                 continue
-            if self.ignore_unrequested_peaceful(client, obj):
-                continue
             semantic = map_object_semantic(client, obj)
-            distance = max(abs(x - cx), abs(y - cy))
-            threats.append((distance, x, y, obj))
             world_x = client.state.map.world_x + x - cx
             world_y = client.state.map.world_y + y - cy
             priority_rank = None
@@ -3347,8 +3343,20 @@ class FarmTask(BotTask):
                             abs(world_y - spawn_y)) <= 1):
                     priority_rank = (rank if priority_rank is None else
                                      min(priority_rank, rank))
-                    previous = self._priority_target_ids.get(obj.target_id, rank)
-                    self._priority_target_ids[obj.target_id] = min(previous, rank)
+            # A spawn point holds one creature at a time. An authored-peaceful
+            # occupant of a named spawn (the evil treant that Kotung's shared
+            # spawn rolls 90% of the time) is the reroll blocker, not a
+            # bystander: leaving it alive means the named target never spawns.
+            if (priority_rank is None and
+                    self.ignore_unrequested_peaceful(client, obj)):
+                continue
+            if priority_rank is not None:
+                previous = self._priority_target_ids.get(
+                    obj.target_id, priority_rank)
+                self._priority_target_ids[obj.target_id] = min(
+                    previous, priority_rank)
+            distance = max(abs(x - cx), abs(y - cy))
+            threats.append((distance, x, y, obj))
             # Some authored monsters disguise themselves until disturbed.
             # Their live face/name therefore cannot match the farm pattern,
             # but a hostile occupying the authored named-spawn point is the
