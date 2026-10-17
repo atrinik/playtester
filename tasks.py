@@ -831,6 +831,8 @@ class FarmTask(BotTask):
         self._retreat_blocked: set[tuple[str, int, int]] = set()
         self._last_retreat_step_at = 0.0
         self._cornered_breakout_target = 0
+        # Consecutive retreat steps taken with an attacker still adjacent.
+        self._pursued_retreats = 0
         self._emergency_recall_source = 0
         self._emergency_recall_apply_at = 0.0
         self._emergency_recall_cast_at = 0.0
@@ -1547,6 +1549,9 @@ class FarmTask(BotTask):
             return False
         return True
 
+    # Another hostile this close (in tiles) stops melee kiting.
+    KITE_CROWD_RADIUS = 3
+
     async def melee_kite(self, client: AtrinikClient, x: int, y: int,
                          obj, *, map_node: MapNode | None = None,
                          preserve_spell_line: Item | None = None) -> bool:
@@ -1560,8 +1565,14 @@ class FarmTask(BotTask):
         distance = max(abs(x - cx), abs(y - cy))
         target_hp = int(getattr(obj, "target_hp", 0) or
                         client.state.stats.get("target_hp", 0) or 0)
+        # Kiting buys free ticks against one pursuer; among others it walks
+        # into fresh aggro, so with another hostile close by stand and swing.
+        crowded = any(
+            other.target_id != obj.target_id and
+            max(abs(ox - cx), abs(oy - cy)) <= self.KITE_CROWD_RADIUS
+            for ox, oy, other in m.targets(friendly=False))
         if (distance not in (1, 2, 3, 4) or target_hp <= 0 or target_hp > 100 or
-                self._engaged_target is None or
+                self._engaged_target is None or crowded or
                 self._engaged_target[0] != obj.target_id):
             self._kite_gap_target_id = 0
             self._kite_gap_since = 0.0
@@ -2655,6 +2666,11 @@ class FarmTask(BotTask):
                 return True
         return False
 
+    # Retreat steps with an attacker still adjacent before Sera turns to fight
+    # it, and the health share below which she keeps running regardless.
+    PURSUIT_STAND_STEPS = 3
+    STAND_HEALTH_FLOOR = 0.35
+
     async def low_health_retreat(self, client: AtrinikClient) -> bool:
         """Run one tile away from the visible pack, learning blocked steps."""
         m = client.state.map
@@ -2793,6 +2809,36 @@ class FarmTask(BotTask):
         (viable, separation, escape_depth, escape_area, _, direction,
          world_x, world_y) = max(choices)
         recorder = getattr(client, "record_action", None)
+        # A retreat that sheds nobody is worse than standing: the pursuers
+        # keep hitting while melee stays off, and the heals run dry. Once an
+        # attacker has stayed adjacent through PURSUIT_STAND_STEPS retreat
+        # steps, and health is above the critical floor, turn and fight one of
+        # them, the most wounded, through the breakout latch until it dies.
+        adjacent = [(x, y, obj) for x, y, obj in visible_threats
+                    if max(abs(x - cx), abs(y - cy)) <= 1]
+        ratio = (int(client.state.stats.get("hp", 0) or 0) /
+                 max(1, int(client.state.stats.get("maxhp", 1) or 1)))
+        if (adjacent and self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
+                ratio > self.STAND_HEALTH_FLOOR):
+            x, y, obj = min(adjacent, key=lambda entry: (
+                int(getattr(entry[2], "target_hp", 0) or 100),
+                entry[2].target_id != engaged_id))
+            self._pursued_retreats = 0
+            self._cornered_breakout_target = obj.target_id
+            self.remember_engagement(client, x, y, obj.target_id)
+            await client.clear_actions()
+            if await select_target(client, x, y, obj.target_id):
+                await client.set_combat(True, force=True)
+                if recorder is not None:
+                    recorder("pursued-stand",
+                             f"target={obj.target_id} adjacent={len(adjacent)} "
+                             f"hp={ratio:.0%}")
+                self._last_action = now
+                return True
+            self._cornered_breakout_target = 0
+            self.release_engagement(obj.target_id)
+            await client.set_combat(False)
+        self._pursued_retreats = self._pursued_retreats + 1 if adjacent else 0
         if recorder is not None:
             recorder(
                 "retreat-choice",

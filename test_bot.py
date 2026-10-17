@@ -3920,6 +3920,45 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.targets[-1], (7, 9, 100))
         self.assertEqual(client.combat, [True, True])
 
+    def test_pursued_retreat_turns_to_fight_one_attacker(self):
+        client = self._combat_client()
+        client.state.stats.update(hp=100, maxhp=176)
+        task = FarmTask(zone="/test")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        # The shaman at (9,8) stays adjacent however Sera steps (the fake map
+        # never moves it); the chief at (11,8) is three tiles off.
+        for _ in range(task.PURSUIT_STAND_STEPS):
+            self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+            task._retreat_attempt = None
+            task._last_retreat_step_at = 0.0
+        self.assertEqual(client.targets, [])
+        self.assertEqual(len(client.direct_moves), task.PURSUIT_STAND_STEPS)
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(client.targets, [(9, 8, 200)])
+        self.assertEqual(client.combat[-1], True)
+        self.assertEqual(task._cornered_breakout_target, 200)
+        self.assertEqual(len(client.direct_moves), task.PURSUIT_STAND_STEPS)
+
+    def test_critically_hurt_pursued_retreat_keeps_running(self):
+        client = self._combat_client()
+        client.state.stats.update(hp=50, maxhp=176)
+        task = FarmTask(zone="/test")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        for _ in range(task.PURSUIT_STAND_STEPS + 2):
+            self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+            task._retreat_attempt = None
+            task._last_retreat_step_at = 0.0
+        self.assertEqual(client.targets, [])
+        self.assertEqual(len(client.direct_moves), task.PURSUIT_STAND_STEPS + 2)
+
     def test_single_enemy_retreat_keeps_fighting_committed_target(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
@@ -4981,6 +5020,27 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(running)
         dx, dy = c.DIRECTION_DELTAS[direction]
         self.assertEqual(max(abs(9 - (8 + dx)), abs(8 - (8 + dy))), 2)
+
+    def test_melee_kite_stands_when_another_hostile_is_close(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        target = MapObject(
+            3, 1, 0, 0, name="giant slug", target_id=100, target_hp=55)
+        client.state.map.tile(9, 8).objects[3] = target
+        # A second slug two tiles away: kiting would walk into it.
+        client.state.map.tile(6, 7).objects[3] = MapObject(
+            3, 1, 0, 0, name="giant slug", target_id=101, target_hp=100)
+        client.state.stats.update(target_hp=55, action_time=1.40)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task = FarmTask(zone="/test", target="giant slug")
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        task.remember_engagement(client, 9, 8, target.target_id)
+        self.assertFalse(asyncio.run(task.melee_kite(client, 9, 8, target)))
+        self.assertEqual(client.direct_moves, [])
 
     def test_melee_kite_holds_adjacent_when_swing_is_imminent(self):
         client = self._combat_client()
