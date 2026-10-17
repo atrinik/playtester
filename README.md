@@ -150,6 +150,11 @@ dashboard, navigation, quest, farming, banking, selling, and storage options.
 The dashboard binds to loopback and rejects cross-origin control requests; use
 an authenticated local tunnel instead of exposing it directly.
 
+`atrinik-playtester --version`, the startup log line, and the dashboard header
+name the build: its release tag (with `+N` when the commit is N commits past
+it) and short commit, linked to GitHub. CMake records them from Git on every
+build; a tree without Git metadata reports an unknown build.
+
 ## Dependency and content boundaries
 
 The playtester source is independent of its external protocol, pathfinding,

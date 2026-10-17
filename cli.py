@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 
+from .build_info import build_info
 from .compatibility import (CompatibilityError, configure_cached_bundle,
                             default_cache_root, doctor, install_bundle,
                             load_lock, preflight_lock)
@@ -16,6 +17,8 @@ from .compatibility import (CompatibilityError, configure_cached_bundle,
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="atrinik-playtester", allow_abbrev=False)
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {build_info()['label']}")
     p.add_argument(
         "--cache",
         type=Path,
@@ -301,6 +304,10 @@ def main() -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    build = build_info()
+    logging.getLogger(__name__).info(
+        "atrinik-playtester %s%s", build["label"],
+        f" ({build['commit']})" if build["commit"] else "")
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:

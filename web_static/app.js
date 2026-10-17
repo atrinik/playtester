@@ -9,7 +9,7 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party";
-const SLOW_KEYS = "decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
+const SLOW_KEYS = "build,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -94,6 +94,24 @@ function renderHeader() {
   $("#map-name").textContent = clean(m.name) || "No map";
   $("#map-region").textContent = m.region || "";
   $("#coords").textContent = m.path ? `${m.path}  (${m.x}, ${m.y})` : "—";
+}
+// The build never changes while the process runs; it arrives with the slow poll.
+function renderBuild() {
+  const b = slow.build;
+  if (!b) return;
+  const link = (text, href, title) => href
+    ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="${esc(title)}">${esc(text)}</a>`
+    : `<span title="${esc(title)}">${esc(text)}</span>`;
+  const parts = [];
+  if (b.commit) {
+    parts.push(link(b.version || "unreleased", b.release_url,
+      b.distance ? `${b.distance} commit(s) after ${b.tag}` : (b.tag ? `Release ${b.tag}` : "No release tag")));
+    parts.push(link(b.short_commit, b.commit_url, `Commit ${b.commit}`));
+  } else {
+    parts.push(link("unknown build", "", "Built without Git metadata"));
+  }
+  if (b.dirty) parts.push('<span class="warn-text" title="Built from a checkout with local changes">modified</span>');
+  $("#build").innerHTML = parts.join(" · ");
 }
 function renderVitals() {
   const s = live.stats || {};
@@ -395,7 +413,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
   } finally { slowBusy = false; }
 }
 pollLive(); pollSlow();

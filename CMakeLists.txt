@@ -38,14 +38,31 @@ foreach (source IN LISTS ATRINIK_BOT_PYTHON_SOURCES)
     get_filename_component(name "${source}" NAME)
     configure_file("${source}" "${ATRINIK_BOT_BUILD_PACKAGE}/${name}" COPYONLY)
 endforeach ()
-file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/chat_rules.json"
-    DESTINATION "${ATRINIK_BOT_BUILD_PACKAGE}")
-file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock.json"
-    DESTINATION "${ATRINIK_BOT_BUILD_PACKAGE}")
-file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/web_static"
-    DESTINATION "${ATRINIK_BOT_BUILD_PACKAGE}")
+# configure_file makes each copied resource a configure dependency, so a
+# rebuild after a checkout refreshes it before the build revision is recorded.
+foreach (resource IN ITEMS chat_rules.json dependencies.lock.json)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/${resource}"
+        "${ATRINIK_BOT_BUILD_PACKAGE}/${resource}" COPYONLY)
+endforeach ()
+file(GLOB_RECURSE ATRINIK_BOT_WEB_STATIC CONFIGURE_DEPENDS
+    RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/web_static/*")
+foreach (resource IN LISTS ATRINIK_BOT_WEB_STATIC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/${resource}"
+        "${ATRINIK_BOT_BUILD_PACKAGE}/${resource}" COPYONLY)
+endforeach ()
 set_target_properties(_pathfinding PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${ATRINIK_BOT_BUILD_PACKAGE}")
+
+# Regenerated on every build so the reported revision follows the checkout.
+set(ATRINIK_BOT_BUILD_INFO "${ATRINIK_BOT_BUILD_PACKAGE}/_build_info.json")
+add_custom_target(atrinik_bot_build_info ALL
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DOUTPUT=${ATRINIK_BOT_BUILD_INFO}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_info.cmake"
+    BYPRODUCTS "${ATRINIK_BOT_BUILD_INFO}"
+    COMMENT "Recording the playtester source revision"
+    VERBATIM)
 
 install(TARGETS _pathfinding LIBRARY DESTINATION atrinik_bot)
 set(ATRINIK_BOT_INSTALL_SOURCES ${ATRINIK_BOT_PYTHON_SOURCES})
@@ -53,6 +70,7 @@ list(FILTER ATRINIK_BOT_INSTALL_SOURCES EXCLUDE REGEX "/test_[^/]+\\.py$")
 install(FILES ${ATRINIK_BOT_INSTALL_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/chat_rules.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock.json"
+    "${ATRINIK_BOT_BUILD_INFO}"
     DESTINATION atrinik_bot)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/web_static/"
     DESTINATION atrinik_bot/web_static)
