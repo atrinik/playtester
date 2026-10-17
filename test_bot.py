@@ -8215,12 +8215,29 @@ class QuestTests(unittest.TestCase):
         for path in ("/inn", "/shattered_islands/x/apartments/private"):
             lane(path, 4).edges.append(MapEdge(path, "/farm", 3, 0, 0, 0))
             graph.savebeds[path].append((1, 0))
+        graph.savebeds["/inn"].append((2, 0))
         lane(STARTER_APARTMENT, 4).edges.append(
             MapEdge(STARTER_APARTMENT, "/far", 3, 0, 0, 0))
         graph.savebeds[STARTER_APARTMENT].append((1, 0))
         lane("/far", far_width).edges.append(
             MapEdge("/far", "/farm", far_width - 1, 0, 0, 0))
         return graph
+
+    def test_savebed_walk_measures_from_real_tile_seam_arrivals(self):
+        from .navigation import savebed_walk
+
+        # West map -> east map across a tile seam: the arrival is the east
+        # map's x=0 at the crossing row, not the edge default (0, 0).
+        graph = WorldGraph()
+        for path in ("/west", "/east", "/farm"):
+            node = MapNode(path, width=10, height=10)
+            node.terrain = {(x, y): 1 for x in range(10) for y in range(10)}
+            graph.nodes[path] = node
+        graph.nodes["/west"].edges.append(MapEdge("/west", "/east", 10, 5, kind="tile"))
+        graph.nodes["/east"].edges.append(MapEdge("/east", "/farm", 9, 9, 0, 0))
+        # (5, 9) -> seam at (10, 9) costs 6 (5 steps + 1), arriving at
+        # east (0, 9); from there the exit at (9, 9) costs 10 (9 + 1).
+        self.assertEqual(savebed_walk(graph, "/west", (5, 9), ["/farm"]), 16)
 
     def test_nearest_savebed_prefers_the_shortest_usable_walk(self):
         from .navigation import nearest_savebed, savebed_walk
@@ -8261,8 +8278,12 @@ class QuestTests(unittest.TestCase):
         client.state.savebed_map, client.state.savebed_xy = "", None
         circuit._savebed_search(client).run()
         self.assertTrue(circuit._needs_savebed(client))
-        # A failed bed is skipped for the next-nearest one.
-        circuit._bed_failed.add("/inn")
+        # A failed bed tile is skipped for another in the same room first,
+        # then for the next-nearest map.
+        circuit._bed_failed.add(("/inn", (1, 0)))
+        self.assertEqual(circuit._savebed_search(client).run().result,
+                         ("/inn", (2, 0), 2))
+        circuit._bed_failed.add(("/inn", (2, 0)))
         self.assertEqual(circuit._savebed_search(client).run().result[0], STARTER_APARTMENT)
 
     def test_farm_circuit_keeps_a_savebed_that_is_nearly_as_close(self):

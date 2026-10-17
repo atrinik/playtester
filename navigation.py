@@ -3452,6 +3452,28 @@ def _nearest_spot_maps(graph: WorldGraph, source: str,
     return best
 
 
+def _edge_arrival(graph: WorldGraph, edge: MapEdge) -> tuple[int, int]:
+    """Where a route edge lands on its destination map.
+
+    Exits carry their authored arrival. Tile links between tiled world maps
+    keep the default (0, 0) arrival; their crossing square lies just past
+    the source map's border and maps onto the opposite edge of the
+    destination, exactly as ``_tile_transitions`` computes it.
+    """
+    destination = graph.nodes.get(edge.destination)
+    if edge.kind != "tile" or destination is None:
+        if destination is not None and edge.kind == "exit":
+            return (edge.destination_x if edge.destination_x >= 0 else destination.enter_x,
+                    edge.destination_y if edge.destination_y >= 0 else destination.enter_y)
+        return edge.destination_x, edge.destination_y
+    source = graph.nodes.get(edge.source)
+    width = source.width if source is not None else destination.width
+    height = source.height if source is not None else destination.height
+    x = (destination.width - 1 if edge.x < 0 else 0 if edge.x >= width else edge.x)
+    y = (destination.height - 1 if edge.y < 0 else 0 if edge.y >= height else edge.y)
+    return x, y
+
+
 def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
                  spot_maps: Iterable[str]) -> int | None:
     """Estimated tiles walked from a respawn on this bed to the nearest spot map.
@@ -3475,7 +3497,7 @@ def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
         tiles, here = 0, bed_xy
         for edge in edges:
             tiles += max(abs(edge.x - here[0]), abs(edge.y - here[1])) + 1
-            here = (edge.destination_x, edge.destination_y)
+            here = _edge_arrival(graph, edge)
         best = tiles if best is None else min(best, tiles)
     return best
 
@@ -3493,12 +3515,14 @@ class SavebedSearch:
     def __init__(self, graph: WorldGraph, spot_maps: Iterable[str], *,
                  owned: Iterable[str] = (STARTER_APARTMENT,),
                  excluded: Iterable[str] = (),
+                 excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = (),
                  current: tuple[str, tuple[int, int]] | None = None):
         self.result: tuple[str, tuple[int, int], int] | None = None
         self.current_walk: int | None = None
         self.done = False
-        self._steps = self._search(graph, tuple(dict.fromkeys(spot_maps)),
-                                   set(owned), set(excluded), current)
+        self._steps = self._search(
+            graph, tuple(dict.fromkeys(spot_maps)), set(owned), set(excluded),
+            {(path, tuple(point)) for path, point in excluded_tiles}, current)
 
     def step(self) -> bool:
         """Advance by at most one exact walk; True once the search is done."""
@@ -3514,10 +3538,13 @@ class SavebedSearch:
             pass
         return self
 
-    def _search(self, graph, spot_maps, owned, excluded, current):
+    def _search(self, graph, spot_maps, owned, excluded, excluded_tiles, current):
         hops: dict[str, int] = {}
         for bed_map in sorted(graph.savebeds):
             if bed_map in excluded or bed_map not in graph.nodes:
+                continue
+            if all((bed_map, point) in excluded_tiles
+                   for point in graph.savebeds[bed_map]):
                 continue
             if bed_map not in owned and any(
                     marker in bed_map for marker in PRIVATE_SAVEBED_MARKERS):
@@ -3533,7 +3560,7 @@ class SavebedSearch:
             for bed_map in sorted(candidates):
                 blocked = graph.nodes[bed_map].blocked
                 for point in sorted(graph.savebeds[bed_map]):
-                    if point in blocked:
+                    if point in blocked or (bed_map, point) in excluded_tiles:
                         continue
                     tiles = savebed_walk(graph, bed_map, point, spot_maps)
                     yield
@@ -3550,10 +3577,12 @@ class SavebedSearch:
 
 def nearest_savebed(graph: WorldGraph, spot_maps: Iterable[str], *,
                     owned: Iterable[str] = (STARTER_APARTMENT,),
-                    excluded: Iterable[str] = ()
+                    excluded: Iterable[str] = (),
+                    excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = ()
                     ) -> tuple[str, tuple[int, int], int] | None:
     """The usable savebed whose respawn is the shortest walk from the spot."""
-    return SavebedSearch(graph, spot_maps, owned=owned, excluded=excluded).run().result
+    return SavebedSearch(graph, spot_maps, owned=owned, excluded=excluded,
+                         excluded_tiles=excluded_tiles).run().result
 
 
 class FarmCircuitTask(BotTask):
@@ -3663,7 +3692,8 @@ class FarmCircuitTask(BotTask):
         self._bed_binding: NavigateThenTask | None = None
         self._bed_retry_at = 0.0
         self._bed_target: tuple[str, tuple[int, int], int] | None = None
-        self._bed_failed: set[str] = set()
+        # Bed tiles that could not be reached or applied, as (map, tile).
+        self._bed_failed: set[tuple[str, tuple[int, int]]] = set()
         self._bed_search: tuple[tuple, SavebedSearch] | None = None
         self._selling: NavigateThenTask | None = None
         self._selling_retry_at = 0.0
@@ -4390,7 +4420,7 @@ class FarmCircuitTask(BotTask):
         key = (self._spot_maps(), frozenset(self._bed_failed), current)
         if self._bed_search is None or self._bed_search[0] != key:
             self._bed_search = (key, SavebedSearch(
-                self.graph, key[0], excluded=self._bed_failed, current=current))
+                self.graph, key[0], excluded_tiles=self._bed_failed, current=current))
         return self._bed_search[1]
 
     def _needs_savebed(self, client: AtrinikClient) -> bool:
@@ -5455,11 +5485,11 @@ class FarmCircuitTask(BotTask):
             await self._bed_binding.tick(client)
             target = self._bed_target or ("?", (0, 0), 0)
             if self._bed_binding.status == TaskStatus.FAILED:
-                # Try the next-nearest bed shortly; this one stays excluded
-                # for the rest of the circuit.
-                log.warning("savebed binding at %s failed: %s",
-                            target[0], self._bed_binding.error)
-                self._bed_failed.add(target[0])
+                # Try the next-nearest bed shortly, another one in the same
+                # room first; this tile stays excluded for the circuit.
+                log.warning("savebed binding at %s %s failed: %s",
+                            target[0], target[1], self._bed_binding.error)
+                self._bed_failed.add((target[0], target[1]))
                 self._bed_retry_at = self.clock() + 300.0
                 self._bed_binding = None
             elif self._bed_binding.status == TaskStatus.COMPLETE:
