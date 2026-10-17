@@ -1696,6 +1696,11 @@ class ProtocolTests(unittest.TestCase):
             restored.load_character_memory("Sera")
             self.assertEqual(
                 restored.state.last_bank_deposit_at, deposited_at)
+            paid_until = time.time() + 6 * 3600
+            client.defer_paid_restoration(paid_until)
+            restored.load_character_memory("Sera")
+            self.assertAlmostEqual(
+                restored.state.paid_restoration_retry_until, paid_until)
             quarantine_until = time.time() + 3600
             client.quarantine_farm_zone("/dangerous/farm", quarantine_until)
             restored.load_character_memory("Sera")
@@ -8253,6 +8258,10 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(circuit._needs_bank_sync(client))
         client.state.depletion_points = 3
         self.assertTrue(circuit._needs_depletion_service(client))
+        # A persisted paid-failure deadline (from before a restart) holds it.
+        client.state.paid_restoration_retry_until = time.time() + 3600
+        self.assertFalse(circuit._needs_depletion_service(client))
+        client.state.paid_restoration_retry_until = 0.0
         service = circuit._new_depletion_service(client)
         self.assertEqual(service.navigation.destination,
                          "/shattered_islands/world_3_58")
@@ -8275,12 +8284,43 @@ class QuestTests(unittest.TestCase):
         self.assertIsInstance(circuit._restoration.task, TempleServiceTask)
         self.assertEqual(circuit._restoration.task.cost, 980)
 
+    def test_temple_service_reports_whether_the_fee_was_taken(self):
+        from .model import InterfaceState
+
+        def timed_out(interface_text):
+            client = type("Client", (), {})()
+            client.state = GameState(phase="playing", player_tag=7)
+            client.state.place_item(Item(
+                22, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+            if interface_text:
+                client.state.interface = InterfaceState(
+                    title="Saruthar", text=interface_text)
+            task = TempleServiceTask("Saruthar", "remove depletion", "depletion", 2020)
+            task.status = TaskStatus.RUNNING
+            task._sent_at = time.monotonic() - 9.0
+            asyncio.run(task.tick(client))
+            self.assertEqual(task.status, TaskStatus.FAILED)
+            return task.error
+
+        self.assertEqual(
+            timed_out("Removal of depletion\n\nYou pay 20 silver coins and 20 copper coins.\n\n"
+                      "Okay, I will cast remove depletion on you now."),
+            "temple service took payment but did not remove depletion")
+        self.assertEqual(timed_out(""),
+                         "temple service did not answer the purchase of depletion")
+
     def test_paid_but_ineffective_temple_service_backs_off(self):
         # Live: Saruthar took the fee and said he would cast, but the
         # depletion force stayed; retrying every half hour drains the purse.
         self.assertEqual(
-            FarmCircuitTask.restoration_backoff("temple service did not remove depletion"),
+            FarmCircuitTask.restoration_backoff(
+                "temple service took payment but did not remove depletion"),
             FarmCircuitTask.PAID_RESTORATION_RETRY_SECONDS)
+        # An unanswered request was not paid for: the usual half hour.
+        self.assertEqual(
+            FarmCircuitTask.restoration_backoff(
+                "temple service did not answer the purchase of depletion"),
+            FarmCircuitTask.RESTORATION_RETRY_SECONDS)
         self.assertEqual(
             FarmCircuitTask.restoration_backoff("no component route from /a to /b"),
             FarmCircuitTask.RESTORATION_RETRY_SECONDS)

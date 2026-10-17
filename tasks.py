@@ -4701,7 +4701,14 @@ class TempleServiceTask(BotTask):
                          f"{self.service} from {self.priest} cost={self.cost}")
             return
         if time.monotonic() - self._sent_at > 8.0:
-            self.fail(f"temple service did not remove {self.condition}")
+            # Only the priest's "You pay ..." confirms the fee was taken; an
+            # unanswered request (no reply, or a dropped connection) is not.
+            if "you pay" in feedback:
+                self.fail(f"temple service took payment but did not remove "
+                          f"{self.condition}")
+            else:
+                self.fail(f"temple service did not answer the purchase of "
+                          f"{self.condition}")
 
 
 class MassIdentifyTask(BotTask):

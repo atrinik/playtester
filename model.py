@@ -249,6 +249,9 @@ class GameState:
     active_upgrade_shop_sweep_cursor: int = 0
     last_recall_shop_check_at: float = 0.0
     last_utility_shop_check_at: float = 0.0
+    # Wall-clock time before which a paid-but-ineffective temple restoration
+    # is not attempted again.
+    paid_restoration_retry_until: float = 0.0
     vendor_quotes: dict[str, dict[str, int | float | str]] = field(
         default_factory=dict)
     farm_zone_quarantine: dict[str, float] = field(default_factory=dict)
