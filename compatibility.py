@@ -215,14 +215,25 @@ def protocol_requirement(lock: dict) -> str:
     )
 
 
+def _github_headers(url: str) -> dict[str, str]:
+    """Request headers for a GitHub API call.
+
+    Anonymous API calls share a small per-address rate limit, which CI
+    runners regularly exhaust (HTTP 403). ``GITHUB_TOKEN`` lifts it; it is
+    only ever sent to the GitHub API itself, never to asset downloads.
+    """
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": GITHUB_USER_AGENT,
+    }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token and url.startswith(GITHUB_API + "/"):
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _github_json(url: str, opener=None) -> dict:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": GITHUB_USER_AGENT,
-        },
-    )
+    request = urllib.request.Request(url, headers=_github_headers(url))
     fetch = opener or urllib.request.urlopen
     try:
         with fetch(request, timeout=30) as response:
