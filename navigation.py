@@ -1561,6 +1561,9 @@ class NavigateTask(BotTask):
         self._issued_click: tuple[str, int, int] | None = None
         self._excluded_edges: set[tuple[str, str]] = set()
         self._runtime_blocked: set[tuple[int, int]] = set()
+        # When the current local route first disappeared (0.0 while one exists).
+        # Separate from _last_progress, which approach-candidate rotation resets.
+        self._no_route_since = 0.0
         # Dynamic avoidance halos around currently visible threat packs.
         # Unlike learned collision squares, these must disappear as soon as
         # the pack moves or is cleared.
@@ -1933,9 +1936,20 @@ class NavigateTask(BotTask):
             m.path, start, (world_x, world_y),
             allow_locked=self._allow_locked(client),
             excluded=blocked)
+        if path:
+            self._no_route_since = 0.0
+        elif not self._no_route_since:
+            self._no_route_since = now
         if not path:
+            # Reset learned blockers only when they are what closes the route:
+            # a route must exist once they alone are lifted. Threats and live
+            # occupants keep their own waiting and boundary handling.
             if (self._runtime_blocked and
-                    now - self._last_progress >= self.LEARNED_BLOCK_RESET_SECONDS):
+                    now - self._no_route_since >= self.LEARNED_BLOCK_RESET_SECONDS and
+                    self.graph.local_path(
+                        m.path, start, (world_x, world_y),
+                        allow_locked=self._allow_locked(client),
+                        excluded=self._threat_blocked | self._temporary_blocked)):
                 # Live trap on world_2_67: six learned blocks ringed Sera while a
                 # visible guard kept this branch on the occupant path below, so
                 # she cancelled and replanned for minutes without one step.
@@ -1944,6 +1958,7 @@ class NavigateTask(BotTask):
                     recorder("navigation-learned-blocks-reset",
                              ", ".join(f"{x},{y}" for x, y in sorted(self._runtime_blocked)))
                 self._runtime_blocked.clear()
+                self._no_route_since = 0.0
                 await client.clear_actions()
                 self._issued_goal = None
                 self._issued_click = None

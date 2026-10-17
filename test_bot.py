@@ -8882,7 +8882,10 @@ class NavigationTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(client.steps, [])
         self.assertEqual(len(task._runtime_blocked), 8)
-        task._last_progress -= 6.0  # past the five-second reset
+        # Rotating approach candidates refreshes _last_progress; the reset
+        # follows its own no-route timer instead.
+        task._last_progress = time.monotonic()
+        task._no_route_since -= 6.0  # past the five-second reset
         task._last_action = 0.0
         asyncio.run(task.tick(client))
         self.assertEqual(task._runtime_blocked, set())
@@ -8893,6 +8896,45 @@ class NavigationTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(len(client.steps), 1)
         self.assertEqual(task.status, TaskStatus.RUNNING)
+
+    def test_learned_blocks_stay_when_a_threat_closes_the_route(self):
+        graph = WorldGraph()
+        node = MapNode("/test/lane", width=5, height=1)
+        node.terrain = {(x, 0): 1 for x in range(5)}
+        graph.nodes[node.path] = node
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(
+                    path=node.path, width=17, height=17, world_x=0, world_y=0)
+                self.steps = []
+                self.actions = []
+
+            async def move(self, direction):
+                self.steps.append(direction)
+
+            async def clear_actions(self):
+                pass
+
+            def record_action(self, action, detail):
+                self.actions.append((action, detail))
+
+        client = FakeClient()
+        task = NavigateTask(graph, node.path, (4, 0))
+        # Tolerance-bearing navigation, as on a combat approach: the older
+        # no-route branch then waits instead of clearing anything itself.
+        task.tolerance = 1
+        # A stale learned block elsewhere, while a threat halo closes the lane.
+        task._runtime_blocked = {(2, 0)}
+        task._threat_blocked = {(1, 0)}
+        asyncio.run(task.tick(client))
+        task._no_route_since -= 6.0
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._runtime_blocked, {(2, 0)})
+        self.assertNotIn("navigation-learned-blocks-reset",
+                         [action for action, _ in client.actions])
 
     def test_locked_gate_requires_its_exact_authored_key(self):
         graph = built_graph()
