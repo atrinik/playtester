@@ -95,6 +95,7 @@ class CombatProfile:
 
         if (relative(self.damage, other.damage, 0.10) or
                 relative(self.weapon_speed, other.weapon_speed, 0.05) or
+                relative(self.speed, other.speed, 0.05) or
                 relative(self.max_health, other.max_health, 0.10) or
                 abs(self.weapon_class - other.weapon_class) >= 2 or
                 abs(self.armour_class - other.armour_class) >= 2):
