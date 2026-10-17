@@ -1580,14 +1580,19 @@ class FarmTask(BotTask):
             max(abs(ox - cx), abs(oy - cy)) <= self.KITE_CROWD_RADIUS
             for ox, oy, other in m.targets(friendly=False))
         if (distance not in (1, 2, 3, 4) or target_hp <= 0 or target_hp > 100 or
-                self._engaged_target is None or crowded or
+                self._engaged_target is None or
                 self._engaged_target[0] != obj.target_id):
             self._kite_gap_target_id = 0
             self._kite_gap_since = 0.0
             return False
         now = time.monotonic()
+        # A step already sent resolves first, so no second move races it.
         if self._kite_step_pending(client, obj.target_id, now):
             return True
+        if crowded:
+            self._kite_gap_target_id = 0
+            self._kite_gap_since = 0.0
+            return False
         action_time = effective_action_time(client, now)
         maintain_gap_step = False
         if distance in (2, 3, 4):
@@ -2706,8 +2711,8 @@ class FarmTask(BotTask):
         if (breakout is not None and self._stand_latch and
                 ratio <= self.STAND_HEALTH_FLOOR):
             # A stand chosen over a failing retreat ends at the critical
-            # floor: run again rather than fight to the death.
-            self.release_engagement(breakout[2].target_id)
+            # floor: run again rather than fight to the death. The
+            # engagement stays, so recovery cannot rebind to a bystander.
             await client.set_combat(False)
             breakout = None
             self._cornered_breakout_target = 0
@@ -2845,10 +2850,14 @@ class FarmTask(BotTask):
                 not adjacent_ids & self._pursuit_ids):
             self._pursued_retreats = 0
         # On a neutral farm a same-species bystander may look like the
-        # attacker; stand only against the engaged target there.
+        # attacker; stand only against the engaged target there. Never stand
+        # against authored-peaceful actors or ones set aside as unselectable;
+        # their tiles still count as threats for the escape.
         stand_candidates = [
             entry for entry in adjacent
-            if not self.neutral_targets or entry[2].target_id == engaged_id]
+            if (not self.neutral_targets or entry[2].target_id == engaged_id) and
+            not target_set_aside(client.state, entry[2].target_id) and
+            not self.ignore_unrequested_peaceful(client, entry[2])]
         if (stand_candidates and
                 self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
                 ratio > self.STAND_HEALTH_FLOOR):

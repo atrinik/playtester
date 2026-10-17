@@ -3964,6 +3964,46 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(task._cornered_breakout_target, 0)
         self.assertEqual(client.combat[-1], False)
         self.assertEqual(len(client.direct_moves), moves + 1)
+        # The engagement with the proven attacker survives the release.
+        self.assertEqual(task._engaged_target[0], 200)
+
+    def _pursued_stand_task(self, client):
+        client.state.stats.update(hp=100, maxhp=176)
+        task = FarmTask(zone="/test")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        return task
+
+    def _pursue_until_stand(self, client, task):
+        for _ in range(task.PURSUIT_STAND_STEPS + 1):
+            asyncio.run(task.low_health_retreat(client))
+            task._retreat_attempt = None
+            task._last_retreat_step_at = 0.0
+
+    def test_pursued_stand_skips_authored_peaceful_actors(self):
+        client = self._combat_client()
+        task = self._pursued_stand_task(client)
+        # A wounded peaceful deer is adjacent too; the shaman is the stand.
+        client.state.map.tile(7, 8).objects[3] = MapObject(
+            3, 3, 0, 0, name="deer", target_id=300, target_hp=20)
+        task.map_node.peaceful_identities.add("deer")
+        self._pursue_until_stand(client, task)
+        self.assertEqual(client.targets, [(9, 8, 200)])
+        self.assertEqual(task._cornered_breakout_target, 200)
+
+    def test_pursued_stand_skips_set_aside_actors(self):
+        client = self._combat_client()
+        task = self._pursued_stand_task(client)
+        # A wounded adjacent kobold the server would not select.
+        client.state.map.tile(7, 8).objects[3] = MapObject(
+            3, 3, 0, 0, name="kobold", target_id=300, target_hp=20)
+        client.state.map.ignored_targets[300] = time.monotonic() + 60
+        self._pursue_until_stand(client, task)
+        self.assertEqual(client.targets, [(9, 8, 200)])
+        self.assertEqual(task._cornered_breakout_target, 200)
 
     def test_pursuit_count_does_not_outlive_its_retreat(self):
         client = self._combat_client()
@@ -5106,6 +5146,11 @@ class QuestTests(unittest.TestCase):
         task.map_node = node
         task.map_bounds = (25, 25)
         task.remember_engagement(client, 9, 8, target.target_id)
+        # A kite step already sent is still awaited, not abandoned.
+        task._kite_step_attempt = (
+            "/test", 10, 10, 11, 10, time.monotonic(), target.target_id)
+        self.assertTrue(asyncio.run(task.melee_kite(client, 9, 8, target)))
+        task._kite_step_attempt = None
         self.assertFalse(asyncio.run(task.melee_kite(client, 9, 8, target)))
         self.assertEqual(client.direct_moves, [])
         # A spell finisher's line-keeping kite is not stopped by the crowd.
