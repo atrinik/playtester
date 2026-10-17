@@ -7467,9 +7467,12 @@ class QuestTests(unittest.TestCase):
         kotung = graph.farm_priorities(*FarmCircuitTask.TREE_15_LEGS[0])
         self.assertEqual(kotung[0].named, "Kotung")
         level_22 = graph.farm_priorities(*FarmCircuitTask.TREE_22_LEGS[0])
+        # Kotung's shared spawn first, then both paying level-16 treant
+        # spawns; the grey level-15 treant comes last.
         self.assertEqual(
-            [(spawn.named, spawn.level) for spawn in level_22],
-            [("Kotung", 17), ("evil treant", 16)])
+            [(spawn.named, spawn.level, spawn.x, spawn.y) for spawn in level_22],
+            [("Kotung", 17, 10, 13), ("evil treant", 16, 4, 17),
+             ("evil treant", 16, 10, 13), ("evil treant", 15, 16, 20)])
 
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)

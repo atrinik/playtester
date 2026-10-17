@@ -3428,12 +3428,16 @@ class FarmCircuitTask(BotTask):
     TREE_19_LEGS = (
         ("/shattered_islands/world_14_77", "Kotung|evil treant"),
     )
-    # The server's exact level-color table makes level-15 residents grey at
-    # skill 22, while level-16 evil treants and level-17 Kotung still pay.
-    # Patrol only Kotung's shared spawn point instead of automatically moving
-    # to the live-rejected deer or untested zero-acid-protection slug tier.
+    # The server's exact level-color table (green threshold 16 at skills 22
+    # and 23) makes level-15 residents grey, while level-16 evil treants and
+    # level-17 Kotung still pay. Farm both paying treant spawns as well as
+    # Kotung's shared spawn: patrolling only Kotung's spawn left Sera idle
+    # between its respawns at about half the level-21 XP rate. The one grey
+    # level-15 treant costs a short fight. Stay on this map instead of
+    # automatically moving to the live-rejected deer or untested
+    # zero-acid-protection slug tier.
     TREE_22_LEGS = (
-        ("/shattered_islands/world_14_77", "Kotung"),
+        ("/shattered_islands/world_14_77", "Kotung|evil treant"),
     )
     # Historical guarded trial retained for its quarantine regression. Live
     # play showed that the nominally passive spider factions assist one
