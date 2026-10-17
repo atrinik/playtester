@@ -6268,6 +6268,45 @@ class QuestTests(unittest.TestCase):
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
         self.assertTrue(client.targets)
 
+    def test_failed_first_route_under_attack_leaves_room_to_defend(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="sword spider", target_id=100, target_hp=55)
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "sword spider hit you for 3 damage.")]
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/island": MapNode("/island", width=5, height=5)}
+        task = NavigateThenTask(
+            graph, "/island", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task.status = TaskStatus.RUNNING
+        # She has just moved, so the first tick holds fire and plans; the
+        # plan fails (the island has no way in), but the trip does not end
+        # while she is being hit ...
+        m = client.state.map
+        task._last_position = (m.path, m.world_x, m.world_y)
+        task._last_moved_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.navigation.status, TaskStatus.FAILED)
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertEqual(client.targets, [])
+        # ... so the next defensive tick fights back: no route is cornered.
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(client.targets)
+        # Once the contact ends (the first quiet tick ends the defence), the
+        # failure surfaces.
+        client.state.messages = []
+        client.state.map.tiles.clear()
+        asyncio.run(task.tick(client))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+
     @staticmethod
     def _corner(task, client):
         """She has stood on this square past the cornered threshold."""
@@ -6322,6 +6361,14 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(client.clears, 1)
         self.assertEqual(task.navigation._issued_click, ("/test", 12, 12))
+        # The same creature moving rebuilds its halo, and the click with it.
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 9).objects[3] = target
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.clears, 2)
+        self.assertIsNone(task.navigation._issued_click)
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = target
 
         # Also for a committed creature beyond the nearby radius.
         far = MapObject(3, 1, 0, 0, name="sword spider", target_id=101, target_hp=55)
@@ -9129,27 +9176,50 @@ class NavigationTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(len(client.steps), 2)
 
-    def test_tiled_levels_are_pack_hazards_only_between_surface_maps(self):
+    def test_tiled_levels_are_pack_hazards_with_a_fallback_through_them(self):
+        def lane(path, width=3):
+            node = MapNode(path, width=width, height=1)
+            node.terrain = {(x, 0): 1 for x in range(width)}
+            return node
+
         graph = WorldGraph()
-        level = "/shattered_islands/world_4_53_-2"
+        town = "/shattered_islands/world_0_68"
+        farm = "/shattered_islands/world_1_50"
+        tunnel = "/shattered_islands/world_4_53_-2"
         west = "/shattered_islands/world_-2_57"
-        for path in (level, west, "/shattered_islands/world_1_50",
-                     "/shattered_islands/world_0_68", "/interior/inn"):
-            graph.nodes[path] = MapNode(path, width=24, height=24)
+        nodes = {path: lane(path) for path in (town, farm, tunnel, west, "/interior/inn")}
+        graph.nodes.update(nodes)
+        for path in nodes:
             graph.named_spawns[path] = []
-        graph.transit_max_aggro_pack = lambda path: 5
-        surface = NavigateTask(graph, "/shattered_islands/world_1_50")
-        hazards = surface._known_pack_hazard_maps("/shattered_islands/world_0_68")
-        self.assertIn(level, hazards)
+        graph.transit_max_aggro_pack = lambda path: 5 if path in (tunnel, west) else 0
+        surface = NavigateTask(graph, farm)
+        hazards = surface._known_pack_hazard_maps()
+        self.assertIn(tunnel, hazards)
         self.assertIn(west, hazards)
         self.assertNotIn("/interior/inn", hazards)
-        # Into, out of or within the levels, they route through each other.
-        self.assertNotIn(level, surface._known_pack_hazard_maps(level))
-        below = NavigateTask(graph, level)
-        self.assertNotIn(level, below._known_pack_hazard_maps(
-            "/shattered_islands/world_0_68"))
-        self.assertIn(west, below._known_pack_hazard_maps(
-            "/shattered_islands/world_0_68"))
+
+        # Surface trip: the tunnel shortcut is avoided while a surface way
+        # round exists ...
+        nodes[town].edges.append(MapEdge(town, tunnel, 2, 0, 0, 0))
+        nodes[tunnel].edges.append(MapEdge(tunnel, farm, 2, 0, 0, 0))
+        nodes[town].edges.append(MapEdge(town, west, 0, 0, 2, 0))
+        nodes[west].edges.append(MapEdge(west, "/interior/inn", 0, 0, 2, 0))
+        nodes["/interior/inn"].edges.append(MapEdge("/interior/inn", farm, 0, 0, 0, 0))
+        graph.transit_max_aggro_pack = lambda path: 5 if path == tunnel else 0
+
+        class FakeClient:
+            def __init__(self, path):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(path=path, width=17, height=17,
+                                          world_x=1, world_y=0)
+
+        route = NavigateTask(graph, farm)._plan(FakeClient(town))
+        self.assertNotIn(tunnel, [edge.destination for edge in route])
+        # ... but taken, avoiding the rest, when it is the only way.
+        nodes[town].edges = [edge for edge in nodes[town].edges if edge.destination == tunnel]
+        graph._world_search_snapshot = None
+        route = NavigateTask(graph, farm)._plan(FakeClient(town))
+        self.assertEqual([edge.destination for edge in route], [tunnel, farm])
 
     def test_stalled_click_path_learns_live_blocker(self):
         class FakeClient:

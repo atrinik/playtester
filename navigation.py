@@ -1661,23 +1661,20 @@ class NavigateTask(BotTask):
         responsibility.
 
         Tiled levels above and below the world grid (``world_X_Y_-2``) are
-        rated too for a trip between two surface maps: leaving them out made a
-        surface-pack detour look safe through the tunnels below Fort Sether,
-        whose spider and bat packs held Sera for over ten minutes. A trip that
-        starts or ends on such a level routes through its neighbours as
-        before, since those levels split into components joined only through
-        each other. Negative grid coordinates (``world_-2_57``) are part of
-        the grid as well.
+        rated too: leaving them out made a surface-pack detour look safe
+        through the tunnels below Fort Sether, whose spider and bat packs held
+        Sera for over ten minutes. Those levels split into components joined
+        only through each other, so ``_plan`` retries without them when no
+        route avoids them. Negative grid coordinates (``world_-2_57``) are
+        part of the grid as well.
         """
         estimator = getattr(self.graph, "transit_max_aggro_pack", None)
         if estimator is None:
             return set()
-        surface_trip = bool(self.SURFACE_MAP.fullmatch(source or "") and
-                            self.SURFACE_MAP.fullmatch(self.destination))
         return {
             path for path in self.graph.named_spawns
             if (self.SURFACE_MAP.fullmatch(path) or
-                (surface_trip and self.TILED_LEVEL_MAP.fullmatch(path))) and
+                self.TILED_LEVEL_MAP.fullmatch(path)) and
             estimator(path) >= 3
         }
 
@@ -1711,7 +1708,22 @@ class NavigateTask(BotTask):
             try:
                 route = self.graph.route_points(*args, **kwargs)
             except ValueError as preferred_exc:
-                if overlevel_hazards:
+                # Tiled levels only joined the hazards to keep surface trips
+                # off dense tunnels. A trip that needs them (one inside the
+                # tunnels, or with no surface way round) routes through them
+                # as before, still avoiding every other hazard.
+                tiled = {path for path in pack_hazards
+                         if self.TILED_LEVEL_MAP.fullmatch(path)}
+                route = None
+                if tiled:
+                    try:
+                        route = self.graph.route_points(*args, **{
+                            **kwargs, "avoided_maps": kwargs["avoided_maps"] - tiled})
+                    except ValueError:
+                        route = None
+                    pack_hazards = pack_hazards - tiled
+                    protected_hazards = protected_hazards - tiled
+                if route is None and overlevel_hazards:
                     fallback_kwargs = dict(kwargs)
                     fallback_kwargs["avoided_maps"] = protected_hazards
                     try:
@@ -1734,7 +1746,7 @@ class NavigateTask(BotTask):
                             recorder(
                                 "navigation-threat-fallback",
                                 f"no threat-free route to {self.destination}")
-                elif (self.allow_ranged_hazard_fallback and
+                elif (route is None and self.allow_ranged_hazard_fallback and
                       (ranged_hazards or pack_hazards)):
                     fallback_kwargs = dict(kwargs)
                     fallback_kwargs["avoided_maps"] = set(
@@ -1749,7 +1761,7 @@ class NavigateTask(BotTask):
                                 "navigation-threat-fallback",
                                 "careful-clear expedition requires hostile "
                                 f"transit to {self.destination}")
-                else:
+                elif route is None:
                     excluded = sorted(self._excluded_edges)
                     raise ValueError(
                         f"{preferred_exc}; excluded edges: {excluded}") \
@@ -2467,8 +2479,8 @@ class NavigateThenTask(BotTask):
         # replans refreshes the navigation's own progress clock.
         self._last_position: tuple[str, int, int] | None = None
         self._last_moved_at = 0.0
-        # Threats the last held-fire halo was built around.
-        self._hold_fire_signature: tuple[int, ...] = ()
+        # Threats (id and world tile) the last held-fire halo was built around.
+        self._hold_fire_signature: tuple[tuple[int, int, int], ...] = ()
         self._last_danger_target = 0
         self._last_pack_signature: tuple[int, ...] = ()
         self._pack_exit_stall: tuple[
@@ -3030,7 +3042,11 @@ class NavigateThenTask(BotTask):
             self._halo_threats(client, nearby, radius=1)
             if getattr(client.state, "combat", False) and not combat_released:
                 await client.set_combat(False)
-            signature = tuple(sorted(threat[3].target_id for threat in nearby))
+            m = client.state.map
+            cx, cy = m.width // 2, m.height // 2
+            signature = tuple(sorted(
+                (threat[3].target_id, m.world_x + threat[1] - cx,
+                 m.world_y + threat[2] - cy) for threat in nearby))
             if signature != self._hold_fire_signature:
                 # A click path already in flight was planned without these
                 # threats; cancel it so the next plan steers around them.
@@ -3194,6 +3210,11 @@ class NavigateThenTask(BotTask):
         if self.navigation.status != TaskStatus.COMPLETE:
             await self.navigation.tick(client)
             if self.navigation.status == TaskStatus.FAILED:
+                if self.combat_approach and recent_hostile_contact(client, 3.0):
+                    # No route while something is hitting her: stay alive so
+                    # the next defensive tick can fight back as a last resort;
+                    # the failure surfaces once the contact ends.
+                    return
                 self.fail(self.navigation.error)
             return
         await self.task.tick(client)
