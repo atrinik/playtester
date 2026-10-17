@@ -29,6 +29,7 @@ from . import constants as c
 
 from .client import AtrinikClient, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
+from . import self_improvement
 from .pathfinding import graph_search, grid_reachable, grid_search
 from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
@@ -3482,6 +3483,8 @@ class FarmCircuitTask(BotTask):
         # Analyzer-derived safety applies to every analyzer spot, including one
         # an operator starts by hand (which does not follow later rankings).
         self._analyzer_safety = self.analyzer_driven or spot is not None
+        # The character's persisted spot lessons; refreshed on start and tick.
+        self._adaptations: dict[str, dict] = {}
         self.dwell_seconds = max(5.0, float(dwell_seconds))
         self.switch_grace = max(0.0, float(switch_grace))
         self.level_until = max(0, int(level_until))
@@ -3603,13 +3606,71 @@ class FarmCircuitTask(BotTask):
         if not path:
             return False
         what = "combat death" if failure.get("action") == "death" else "emergency recall"
+        if self._analyzer_safety:
+            # Analyzer spots are kept: review what happened and adapt.
+            return self._learn_from_failure(client, failure, path, what)
         self._quarantine_farm_path(
             client, path, f"{what} on {failure_map or 'unknown map'}")
         return True
 
+    RECALL_STATE = ("_emergency_recall_source", "_emergency_recall_apply_at",
+                    "_emergency_recall_cast_at", "_emergency_recall_origin")
+
+    def _spot_key(self) -> str:
+        return self_improvement.spot_key(self.spot, self.legs)
+
+    def _learn_from_failure(self, client: AtrinikClient, failure: dict,
+                            path: str, what: str) -> bool:
+        """Review a failure at an analyzer spot and adapt instead of leaving it.
+
+        Returns True only for the last resort, a short pause after repeated
+        failures with every tactic already at its maximum.
+        """
+        review = self_improvement.review_failure(
+            getattr(client.state, "messages", ()),
+            getattr(client, "decision_history", ()), failure,
+            [leg for leg, _ in self.legs])
+        key = self._spot_key()
+        adaptations = getattr(client.state, "farm_adaptations", {}) or {}
+        record, pause = self_improvement.learn(adaptations.get(key, {}), review)
+        setter = getattr(client, "set_farm_adaptation", None)
+        if setter is not None:
+            setter(key, record)
+        else:
+            adaptations[key] = record
+        self._adaptations = getattr(client.state, "farm_adaptations", {}) or {}
+        remedies =", ".join(self_improvement.remedies(review))
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("farm-failure-review",
+                     f"{what} at {(self.spot or {}).get('name', key)}: {review.cause} "
+                     f"({review.detail}); adaptation level {record['level']}; "
+                     f"improve: {remedies}")
+        log.warning("learning from %s at %s: %s (%s); adaptation level %s",
+                    what, (self.spot or {}).get("name", key), review.cause,
+                    review.detail, record["level"])
+        if pause:
+            self._quarantine_farm_path(
+                client, path, "repeated failures at the maximum adaptation level",
+                seconds=self_improvement.PAUSE_SECONDS)
+            return True
+        # Rebuild the farm child so the tighter margins apply immediately, but
+        # keep any Word of Recall still in flight: the recall decision is
+        # recorded when it is fired, and a fresh task would fire another.
+        if self.child is not None:
+            previous = getattr(self.child, "task", None)
+            self.child = self._new_child()
+            for name in self.RECALL_STATE:
+                if hasattr(previous, name):
+                    setattr(self.child.task, name, getattr(previous, name))
+            self._farm_started_at = 0.0
+            self._empty_spawn_since = 0.0
+        return False
+
     def _quarantine_farm_path(self, client: AtrinikClient, path: str,
-                              reason: str) -> None:
-        until = time.time() + self.FARM_DEATH_QUARANTINE_SECONDS
+                              reason: str, *, seconds: float | None = None) -> None:
+        seconds = self.FARM_DEATH_QUARANTINE_SECONDS if seconds is None else seconds
+        until = time.time() + seconds
         setter = getattr(client, "quarantine_farm_zone", None)
         if setter is not None:
             setter(path, until)
@@ -3619,8 +3680,8 @@ class FarmCircuitTask(BotTask):
         if recorder is not None:
             recorder("farm-zone-quarantine",
                      f"{path} until={int(until)} after {reason}")
-        log.warning("autoplay quarantined farm map for six hours: %s (%s)",
-                    path, reason)
+        log.warning("autoplay quarantined farm map for %.1f hours: %s (%s)",
+                    seconds / 3600, path, reason)
 
     def _observe_stalled_farm(self, client: AtrinikClient,
                               farm: FarmTask) -> bool:
@@ -3985,6 +4046,9 @@ class FarmCircuitTask(BotTask):
         if self._analyzer_safety:
             flee, heal = (self.AGGRESSIVE_SAFETY if aggressive else
                           self.PASSIVE_SAFETY)
+            # Each lesson learned at this spot tightens its recovery margins.
+            level = int((self._adaptations.get(self._spot_key()) or {}).get("level", 0) or 0)
+            flee, heal = self_improvement.margins(level, flee, heal)
             farm.safety.flee_below = flee
             farm.safety.heal_below = heal
         if "lost soul" in target.casefold():
@@ -4813,6 +4877,7 @@ class FarmCircuitTask(BotTask):
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
+        self._adaptations = getattr(client.state, "farm_adaptations", {}) or {}
         if self.clear_hostile_route:
             m = client.state.map
             self._expedition_origin = (m.path, m.world_x, m.world_y)
@@ -4895,6 +4960,7 @@ class FarmCircuitTask(BotTask):
             return
         self._current_exp = int(client.state.stats.get("exp", 0) or 0)
         self._current_map_path = client.state.map.path
+        self._adaptations = getattr(client.state, "farm_adaptations", {}) or {}
         if await self._tick_expedition_return(client):
             return
         # PLAYER precedes the authoritative inventory replay on login and

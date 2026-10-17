@@ -187,13 +187,32 @@ from squares outside other residents' detection radii; other spots use 75%
 and 90%. Until the first ranking exists, autoplay holds position safely.
 The Tasks tab's **Farm** picker lists the same ranked spots.
 
-The only exceptions are live failures. A spot is quarantined for six hours,
-and autoplay moves to the next-ranked spot, after:
+A death or emergency recall at the spot does not make autoplay give it up.
+Instead it reviews the last minute of combat messages and decisions to find
+out why, and adapts:
 
-- a death there (including on the way there);
-- an emergency recall there;
+- **pack**: two or more monsters were hitting at once;
+- **resources**: spell points ran short of the next heal;
+- **damage-type:TYPE**: one non-physical damage type dealt most of the damage;
+- **out-damaged**: a single attacker simply hit harder than she could recover;
+- **route**: the failure happened on the way there, not at the spot.
+
+Each failure raises the spot's adaptation level (up to 4). Each level raises the
+flee threshold by 3% and the heal threshold by 2%, capped at 90% and 98%. The
+lessons are persisted per character, and the dashboard's Farming tab shows
+them, together with improvement goals aggregated across spots (area spells,
+protection types, offence, healing). Only when the spot keeps failing at the
+maximum level (three failures there within an hour) does autoplay pause it for an hour
+and farm the next-ranked spot meanwhile.
+
+A spot is still quarantined for six hours, and autoplay moves to the
+next-ranked spot, after:
+
 - ten minutes there without any character XP;
 - a route there that the world graph cannot plan.
+
+Explicitly configured circuits keep the old behaviour: a death or emergency
+recall there quarantines the spot.
 
 When the analyzer gets a spot wrong, the fix belongs in the analyzer.
 
