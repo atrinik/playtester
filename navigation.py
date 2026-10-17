@@ -38,7 +38,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy,
                     SellJunkTask, TaskStatus,
                     TempleServiceTask,
-                    movement_ack_timeout, recent_hostile_attackers,
+                    corpse_tile_standable, movement_ack_timeout,
+                    recent_hostile_attackers,
                     recent_hostile_contact,
                     retreat_mobility)
 log = logging.getLogger(__name__)
@@ -3071,8 +3072,7 @@ class NavigateThenTask(BotTask):
                             0 <= world[1] < node.width and
                             0 <= world[2] < node.height):
                         continue
-                    if (node is not None and node.terrain and
-                            not node.walkable(world[1], world[2])):
+                    if not corpse_tile_standable(node, m.path, world[1], world[2]):
                         # Corpses in water cannot be stood on to loot.
                         continue
                     if world in self.task._ignored_corpse_tiles:
