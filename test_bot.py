@@ -86,6 +86,10 @@ class StubAnalyzer:
     def ranking(self, objective):
         return list(self.rankings.get(objective, ()))
 
+    def snapshot(self, objective):
+        return {"status": self.status, "objective": objective,
+                "ranking": self.ranking(objective)[:5]}
+
 
 class ProtocolTests(unittest.TestCase):
     def test_full_player_inventory_packet_releases_replay_barrier(self):
@@ -10380,6 +10384,24 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertIn(self.TREES, client.state.farm_zone_quarantine)
         self.assertEqual(circuit.spot["name"], "Pocket")
 
+    def test_excluding_the_last_usable_spot_stops_farming_it(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        farm = circuit.child.task
+        circuit.status = TaskStatus.RUNNING
+        client.state.farm_zone_quarantine = {self.TREES: time.time() + 60}
+        self.assertTrue(circuit._upgrade_progression(client, farm))
+        self.assertEqual(circuit.status, TaskStatus.COMPLETE)
+        self.assertIn("farm-spots-exhausted",
+                      [record["action"] for record in client.decision_history])
+        # Without a quarantined current spot, an empty ranking changes nothing.
+        client = self.client({"xp": []})
+        circuit = self.circuit(client, trees)
+        circuit.status = TaskStatus.RUNNING
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.status, TaskStatus.RUNNING)
+
     def test_aggressive_picks_get_cautious_margins_and_isolated_pulls(self):
         passive = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
         client = self.client({"xp": [passive]})
@@ -10530,6 +10552,27 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         await writer.wait_closed()
         head, payload = raw.split(b"\r\n\r\n", 1)
         return int(head.split()[1]), payload
+
+    async def test_dashboard_farms_a_ranked_spot_with_its_analyzer_safety(self):
+        spot = analyzer_spot("Trees", ["/shattered_islands/world_14_79"],
+                             ["evil treant L13"], aggressive=2)
+        self.client.farm_analyzer = StubAnalyzer({"xp": [spot]})
+        self.server.graph = built_graph()
+        status, payload = await self.request("POST", "/api/task", {
+            "type": "farm_circuit", "analyzer_spot": spot["path"],
+            "legs": [{"zone": "/tampered", "target": "x"}]})
+        self.assertEqual(status, 200, payload)
+        circuit = self.engine.task
+        self.assertIsInstance(circuit, FarmCircuitTask)
+        self.assertIs(circuit.spot, spot)
+        self.assertFalse(circuit.analyzer_driven)
+        self.assertEqual(circuit.legs, (("/shattered_islands/world_14_79", "evil treant"),))
+        child = circuit._new_child()
+        self.assertEqual((child.task.safety.flee_below, child.task.safety.heal_below),
+                         FarmCircuitTask.AGGRESSIVE_SAFETY)
+        status, _ = await self.request("POST", "/api/task", {
+            "type": "farm_circuit", "analyzer_spot": "gone", "legs": []})
+        self.assertEqual(status, 400)
 
     async def test_dashboard_serves_farming_analysis_and_persists_the_objective(self):
         status, payload = await self.request("GET", "/api/state?include=farming_analysis")
@@ -10733,7 +10776,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=15", page)
+        self.assertIn(b"/app.js?v=16", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -10744,6 +10787,15 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(snapshot["quests"]), 16)
         self.assertEqual(snapshot["farm_spots"], [])
+        spot = analyzer_spot("Trees", ["/shattered_islands/world_14_79"],
+                             ["evil treant L13"], aggressive=2)
+        self.client.farm_analyzer = StubAnalyzer({"xp": [spot]})
+        spots = DashboardState(self.client, self.engine, built_graph(),
+                               load_catalog()).snapshot()["farm_spots"]
+        self.assertEqual(spots, [{
+            "id": spot["path"], "name": "#1 Trees",
+            "circuit": [{"zone": "/shattered_islands/world_14_79",
+                         "target": "evil treant"}]}])
         self.assertEqual(len(snapshot["navigation_spots"]),
                          len(NAVIGATION_SPOTS))
         self.assertIn("quest_journal", snapshot)

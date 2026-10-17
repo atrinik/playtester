@@ -588,7 +588,8 @@ class DashboardState:
                 spots.append({
                     "id": str(spot.get("path") or rank),
                     "name": f"#{rank} {spot.get('name', '?')}",
-                    "circuit": [list(leg) for leg in legs],
+                    "circuit": [{"zone": zone, "target": target}
+                                for zone, target in legs],
                 })
         return spots
 
@@ -760,6 +761,17 @@ class WebControlServer:
         self.engine.set_task(task)
         return {"ok": True, "task": task.name}
 
+    def _ranked_spot(self, spot_id: str) -> dict[str, Any]:
+        """A spot from the analyzer's current ranking, for any objective."""
+        analyzer = getattr(self.client, "farm_analyzer", None)
+        if analyzer is not None:
+            for objective in OBJECTIVES:
+                for spot in analyzer.ranking(objective):
+                    if str(spot.get("path")) == spot_id and analyzer_spot_legs(
+                            spot, self.graph):
+                        return spot
+        raise ValueError("analyzer spot is no longer ranked")
+
     async def _set_task(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
         if kind == "stop":
@@ -840,6 +852,13 @@ class WebControlServer:
                     self.graph, zone, task, combat_approach=True)
             return await self._replace_task(task)
         if kind == "farm_circuit":
+            spot = None
+            if data.get("analyzer_spot"):
+                spot = self._ranked_spot(str(data["analyzer_spot"]))
+                # The server's own ranking is authoritative for analyzer spots.
+                data = dict(data, legs=[
+                    {"zone": zone, "target": target}
+                    for zone, target in analyzer_spot_legs(spot, self.graph)])
             raw_legs = data.get("legs", [])
             if not isinstance(raw_legs, list) or not raw_legs:
                 raise ValueError("farm circuit requires at least one leg")
@@ -864,7 +883,8 @@ class WebControlServer:
                 combat_skill_until_level=max(0, int(data.get(
                     "combat_skill_until_level", 0))),
                 clear_hostile_route=bool(data.get(
-                    "clear_hostile_route", False))))
+                    "clear_hostile_route", False)),
+                spot=spot))
         if kind == "sell_junk":
             merchant = str(data.get("merchant", "shop-floor")).strip() or "shop-floor"
             patterns = tuple(str(value) for value in data.get("patterns", []) if value)

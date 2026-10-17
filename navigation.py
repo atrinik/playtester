@@ -3444,6 +3444,9 @@ class FarmCircuitTask(BotTask):
         # preferred objective; explicit circuits keep their given legs.
         self.analyzer_driven = bool(analyzer_driven)
         self.spot = spot
+        # Analyzer-derived safety applies to every analyzer spot, including one
+        # an operator starts by hand (which does not follow later rankings).
+        self._analyzer_safety = self.analyzer_driven or spot is not None
         self.dwell_seconds = max(5.0, float(dwell_seconds))
         self.switch_grace = max(0.0, float(switch_grace))
         self.level_until = max(0, int(level_until))
@@ -3688,6 +3691,20 @@ class FarmCircuitTask(BotTask):
             return False
         selection = analyzer_farm_selection(client, self.graph)
         if selection is None:
+            # Nothing usable is ranked. Never keep farming a spot that live
+            # failures just excluded: finish, and autoplay holds position
+            # safely until a usable spot is ranked again.
+            quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
+            now = time.time()
+            if any(float(quarantine.get(path, 0.0) or 0.0) > now
+                   for path, _ in self.legs):
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("farm-spots-exhausted",
+                             "every ranked spot is quarantined or unusable")
+                log.warning("every ranked farm spot is quarantined; holding")
+                self.complete()
+                return True
             return False
         desired, spot = selection
         if desired == self.legs:
@@ -3816,7 +3833,7 @@ class FarmCircuitTask(BotTask):
         # Aggressive residents are pulled one at a time from boundary squares
         # outside every other resident's authored detection radius; passive
         # spawns keep the adjacent patrol.
-        aggressive = self.analyzer_driven and (bool(aggressive_spawns) or float(
+        aggressive = self._analyzer_safety and (bool(aggressive_spawns) or float(
             (self.spot or {}).get("aggressive_spawns", 0) or 0) > 0)
         isolated_radius_pulls = aggressive and bool(aggressive_spawns)
         patrol = []
@@ -3921,7 +3938,7 @@ class FarmCircuitTask(BotTask):
         farm._lore_book_attempts = self._lore_book_attempts
         farm._spellbook_attempts = self._spellbook_attempts
         farm._unreachable_targets = self._unreachable_targets
-        if self.analyzer_driven:
+        if self._analyzer_safety:
             flee, heal = (self.AGGRESSIVE_SAFETY if aggressive else
                           self.PASSIVE_SAFETY)
             farm.safety.flee_below = flee

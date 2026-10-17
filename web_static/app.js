@@ -415,7 +415,7 @@ $("#run-farm").onclick = e => {
   const s = (slow.farm_spots || []).find(x => x.id === $("#farm-spot").value);
   if (!s) return toast("Choose a farm spot first", true);
   const common = { until_level: +$("#farm-level").value };
-  task(e.target, `Farming ${s.name}`, { type: "farm_circuit", legs: s.circuit, ...common });
+  task(e.target, `Farming ${s.name}`, { type: "farm_circuit", analyzer_spot: s.id, legs: s.circuit, ...common });
 };
 $("#run-nav").onclick = e => { const dest = $("#nav-map").value.trim(); if (!dest) return toast("Enter a map path or choose a destination", true); task(e.target, `Travelling to ${dest}`, { type: "navigate", destination: dest, x: $("#nav-x").value, y: $("#nav-y").value }); };
 $("#bank").onclick = e => task(e.target, "Depositing money", { type: "bank", banker: $("#banker").value, amount: $("#bank-amount").value });
