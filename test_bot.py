@@ -5705,6 +5705,35 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.decisions, [
             ("threat-origin-retired", "confirmed kill target=100"),
             ("corpse-probe-queued", "/test (13, 10)")])
+
+        # A kill in water leaves a corpse she cannot stand on: no probe. The
+        # water tile carries an explicit terrain record without the walk bit.
+        water = MapNode("/test", width=25, height=25)
+        water.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        water.terrain[(13, 10)] = 2
+        swamp = FarmTask(zone="/test")
+        swamp.map_node = water
+        swamp.remember_engagement(client, 11, 8, 101)
+        client.decisions.clear()
+        swamp.observe_engaged_target(client, [])
+        self.assertNotIn(death_tile, swamp._suspected_corpse_tiles)
+        self.assertIn(death_tile, swamp._ignored_corpse_tiles)
+        self.assertIn(("corpse-probe-skip", "unstandable tile at /test (13, 10)"),
+                      client.decisions)
+        # A probe queued before the terrain was known is dropped, not walked.
+        swamp._suspected_corpse_tiles[death_tile] = (time.monotonic() - 5.0, 0)
+        swamp._ignored_corpse_tiles.clear()
+        client.moves.clear()
+        asyncio.run(swamp.loot_nearby(client))
+        self.assertNotIn(death_tile, swamp._suspected_corpse_tiles)
+        self.assertIn(death_tile, swamp._ignored_corpse_tiles)
+        self.assertEqual(client.moves, [])
+        # A sparse cell with no terrain record stays standable, as the server
+        # treats it as passable; only an explicit record or blocker rules out.
+        del water.terrain[(13, 10)]
+        self.assertTrue(swamp.corpse_tile_standable("/test", 13, 10))
+        water.blocked.add((13, 10))
+        self.assertFalse(swamp.corpse_tile_standable("/test", 13, 10))
         self.assertTrue(asyncio.run(task.loot_nearby(client)))
         # Hidden-corpse recovery advances one acknowledged tile at a time.
         self.assertEqual(client.moves, [(9, 8)])
