@@ -1125,6 +1125,12 @@ class AtrinikClient:
             "you feel less healthy", "watch out, your mind is going!",
             "your spirit feels drained!",
         )
+        if "save bed location is updated" in lowered:
+            # Whichever task applied it, the server binds the respawn to the
+            # square the character stands on.
+            m = self.state.map
+            if m.path:
+                self.set_savebed(m.path, m.world_x, m.world_y)
         died = "defeated in combat" in lowered or "you have died" in lowered
         if died:
             self.record_action("death", text)

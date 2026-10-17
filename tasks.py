@@ -4898,9 +4898,13 @@ class BindSavebedTask(BotTask):
     """Apply an underfoot savebed and verify server confirmation."""
 
     CONFIRM = re.compile(r"save bed location is updated", re.I)
+    # Ground items arrive without their type, so savebeds are recognized by
+    # name: the authored name of the target bed, or any of the usual ones.
+    NAME = re.compile(r"\bto reality$|^save bed$", re.I)
 
-    def __init__(self):
+    def __init__(self, names: tuple[str, ...] = ()):
         super().__init__("bind-savebed")
+        self.names = {name.casefold() for name in names}
         self.message_index = 0
         self.applied_at = 0.0
         self.arrived_at = 0.0
@@ -4934,8 +4938,8 @@ class BindSavebedTask(BotTask):
                 self.fail("savebed application was not confirmed")
             return
         bed = next((item for item in client.state.ground
-                    if "bed to reality" in item.name.casefold() or
-                    item.item_type == 106), None)
+                    if item.item_type == 106 or item.name.casefold() in self.names or
+                    self.NAME.search(item.name.strip())), None)
         if bed is None:
             if now - self.arrived_at > 3.0:
                 self.fail("savebed is not underfoot")

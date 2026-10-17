@@ -8921,6 +8921,48 @@ class QuestTests(unittest.TestCase):
             self.assertEqual(restarted.state.apartment_returns,
                              {STARTER_APARTMENT: ("/shattered_islands/world_0_68", (7, 12))})
 
+    def test_an_unpriced_apartment_bed_is_kept_until_its_exit_is_seen(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 8
+        client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
+        circuit = FarmCircuitTask(self.savebed_graph(), [("/farm", "rat")])
+        circuit._savebed_search(client).run()
+        # The apartment's return is unknown: no proven gain, no rebind.
+        self.assertFalse(circuit._needs_savebed(client))
+        client.state.apartment_returns = {STARTER_APARTMENT: ("/far", (0, 0))}
+        circuit._savebed_search(client).run()
+        self.assertTrue(circuit._needs_savebed(client))
+
+    def test_bind_savebed_recognizes_every_savebed_name(self):
+        for name, names in (("hammock to reality", ()), ("save bed", ()),
+                            ("canopy bed", ("canopy bed",))):
+            client = type("Client", (), {})()
+            client.state = GameState(phase="playing", player_tag=7)
+            client.state.place_item(Item(800, item_type=0, name=name), 0)
+            client.applied = []
+
+            async def apply(tag, client=client):
+                client.applied.append(tag)
+
+            client.apply = apply
+            task = BindSavebedTask(names=names)
+            asyncio.run(task.tick(client))
+            self.assertEqual(client.applied, [800], name)
+
+    def test_any_savebed_confirmation_is_persisted_where_she_stands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.state.map = MapState(path="/shattered_islands/incuna/apartments/beach_nook",
+                                        world_x=3, world_y=2)
+            payload = bytes([2]) + b"ffffff\0You save and your save bed location is updated.\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            self.assertEqual((client.state.savebed_map, client.state.savebed_xy),
+                             ("/shattered_islands/incuna/apartments/beach_nook", (3, 2)))
+
     def test_farm_circuit_keeps_a_savebed_that_is_nearly_as_close(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)

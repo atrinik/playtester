@@ -399,6 +399,8 @@ class WorldGraph:
         self.shop_stocks: dict[str, list[tuple[int, int]]] = defaultdict(list)
         # Savebed ("bed to reality") tiles per map, public and private.
         self.savebeds: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        # The authored name of each savebed, such as "hammock to reality".
+        self.savebed_names: dict[tuple[str, int, int], str] = {}
         self.access_item_names: dict[str, set[str]] = defaultdict(set)
         self.monster_levels: dict[str, int] = {}
         # Archetype-level passive identities remain valid when the protocol
@@ -530,6 +532,7 @@ class WorldGraph:
                         self.shop_stocks[source].append(point)
                 if obj_type == "106" and (x, y) not in self.savebeds[source]:
                     self.savebeds[source].append((x, y))
+                    self.savebed_names[(source, x, y)] = name
                 # Normal doors are deliberately left to the server pathfinder,
                 # which opens them just like the graphical client's click path.
                 # Static walls, water-only terrain, furniture, and counters are
@@ -4693,14 +4696,24 @@ class FarmCircuitTask(BotTask):
         # Another bed on the same map counts like any other: only a real gain
         # (an inn's far corner versus its exit-side beds) is worth a rebind.
         current = search.current_walk
-        return current is None or target[2] + self.SAVEBED_MIN_GAIN_TILES <= current
+        if current is None:
+            # A bound apartment bed is unpriced until leaving that apartment
+            # has shown where its exit leads; keep it until then rather than
+            # rebinding without proof of a gain. Any other unpriced bed (no
+            # route, an unknown map, none bound) loses to a reachable one.
+            bound_map = bound[0]
+            returns = getattr(client.state, "apartment_returns", {}) or {}
+            return not ("/apartments/" in bound_map and bound_map in self.graph.nodes and
+                        bound_map not in returns)
+        return target[2] + self.SAVEBED_MIN_GAIN_TILES <= current
 
     def _new_savebed(self, client: AtrinikClient) -> NavigateThenTask:
         target = self._savebed_search(client).result
         assert target is not None
         self._bed_target = target
         return NavigateThenTask(
-            self.graph, target[0], BindSavebedTask(),
+            self.graph, target[0], BindSavebedTask(names=tuple(filter(None, (
+                getattr(self.graph, "savebed_names", {}).get((target[0], *target[1])),)))),
             destination_xy=target[1], combat_approach=True)
 
     def _observe_disease(self, client: AtrinikClient) -> None:
