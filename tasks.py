@@ -350,6 +350,12 @@ class SafetyPolicy:
 
 
 class BotTask:
+    # Whether the engine keeps this task when the connection drops in the
+    # middle of a tick. Only tasks that rebuild their in-flight work from the
+    # server's state after a reconnect may set it (autoplay does); any other
+    # task would resume with half-finished dialogues or pending transfers.
+    survives_disconnect = False
+
     def __init__(self, name: str):
         self.name = name
         self.status = TaskStatus.READY
@@ -3846,17 +3852,21 @@ class BuyShopUpgradeTask(BotTask):
                             send: Callable[[], Awaitable[Any]]) -> None:
         """Reserve a purchase's bank funds, then send its request.
 
-        A connection lost during the send keeps the task for a retry after the
-        reconnect, so give the reservation back first: otherwise the retry
-        reserves it a second time and the persisted balance stays too low.
+        When the connection is lost during the send, the server may or may
+        not have processed the purchase, so the reserved balance is neither
+        kept nor refunded: it is forgotten, and the next budgeted purchase
+        reads the bank's real balance first.
         """
         reserved = cls.account_purchase(client, cost)
         try:
             await send()
         except ConnectionError:
-            if reserved and getattr(client.state, "bank_balance_known", False):
-                cls._set_bank_balance(
-                    client, int(client.state.bank_balance) + reserved)
+            if reserved:
+                forget = getattr(client, "forget_bank_balance", None)
+                if forget is not None:
+                    forget()
+                else:
+                    client.state.bank_balance_known = False
             raise
 
     @staticmethod
@@ -4988,10 +4998,15 @@ class TaskEngine:
                 except ConnectionError as exc:
                     # The server went away mid-tick (live: a MAIN upgrade shut
                     # it down while autoplay was clearing actions, and autoplay
-                    # ended for good). Hold the task through the reconnect like
-                    # a disconnect noticed between ticks.
-                    log.warning("task %s paused: connection lost (%s)",
-                                self.task.name, exc or "closed")
+                    # ended for good). Hold a task that rebuilds its in-flight
+                    # work through the reconnect, like a disconnect noticed
+                    # between ticks; any other task fails as before.
+                    if getattr(self.task, "survives_disconnect", False):
+                        log.warning("task %s paused: connection lost (%s)",
+                                    self.task.name, exc or "closed")
+                    else:
+                        log.exception("task %s failed", self.task.name)
+                        self.task.fail(str(exc))
                 except Exception as exc:
                     log.exception("task %s failed", self.task.name)
                     self.task.fail(str(exc))

@@ -438,6 +438,8 @@ class ProtocolTests(unittest.TestCase):
             ticks = []
 
             class Probe(BotTask):
+                survives_disconnect = True
+
                 async def tick(self, client):
                     ticks.append(client.state.phase)
                     # Not connected: the send raises ConnectionError.
@@ -464,7 +466,45 @@ class ProtocolTests(unittest.TestCase):
             self.assertIs(engine.task, probe)
             self.assertTrue(sent)
 
+            # A task that cannot rebuild its in-flight work still fails.
+            class Plain(BotTask):
+                async def tick(self, client):
+                    await client.clear_actions()
+
+            client.send = AtrinikClient.send.__get__(client)
+            plain = Plain("plain")
+            engine.set_task(plain)
+            engine.running = True
+            runner = asyncio.create_task(engine.run())
+            await asyncio.sleep(0.05)
+            engine.running = False
+            await runner
+            self.assertIsNone(engine.task)
+            self.assertEqual(plain.status, TaskStatus.FAILED)
+
         asyncio.run(scenario())
+
+    def test_autoplay_rebuilds_its_child_after_a_lost_connection(self):
+        from .autoplay import AutoplayTask
+        from .tasks import BotTask
+
+        class Child(BotTask):
+            async def tick(self, client):
+                raise ConnectionError("not connected")
+
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        autoplay = AutoplayTask(WorldGraph(), target_level=115)
+        self.assertTrue(autoplay.survives_disconnect)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay.phase = "adaptive-farming"
+        autoplay.child = Child("half-done purchase")
+        with self.assertRaises(ConnectionError):
+            asyncio.run(autoplay.tick(client))
+        self.assertIsNone(autoplay.child)
+        self.assertEqual(autoplay.status, TaskStatus.RUNNING)
+        self.assertIn("autoplay-disconnect",
+                      [entry["action"] for entry in client.decision_history])
 
     def test_transport_os_errors_are_reported_as_lost_connections(self):
         async def scenario():
@@ -477,10 +517,21 @@ class ProtocolTests(unittest.TestCase):
                 async def drain(self):
                     pass
 
+                def close(self):
+                    pass
+
+                async def wait_closed(self):
+                    raise OSError(32, "Broken pipe")
+
             client.writer = Writer()
+            client.state.phase = "playing"
             with self.assertRaises(ConnectionError) as raised:
                 await client.clear_actions()
             self.assertIsInstance(raised.exception.__cause__, OSError)
+            # The transport is detached so the read loop wakes and reconnects.
+            self.assertIsNone(client.writer)
+            self.assertEqual(client.state.phase, "disconnected")
+            self.assertTrue(client._reconnect_requested)
 
         asyncio.run(scenario())
 
@@ -7761,7 +7812,7 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(task.status, TaskStatus.COMPLETE)
         self.assertEqual(client.state.depletion_points, 0)
 
-    def test_temple_service_refunds_its_reservation_when_the_send_fails(self):
+    def test_temple_service_forgets_the_bank_balance_when_its_send_is_lost(self):
         class FakeClient:
             def __init__(self):
                 self.state = GameState(phase="playing", player_tag=7)
@@ -7788,13 +7839,11 @@ class QuestTests(unittest.TestCase):
             "Saruthar", "remove depletion", "depletion", 980)
         with self.assertRaises(ConnectionError):
             asyncio.run(task.tick(client))
-        # The kept task retries after the reconnect and pays exactly once.
-        self.assertEqual(client.state.bank_balance, 5_504)
-        client.connected = True
-        asyncio.run(task.tick(client))
-        self.assertEqual(client.talks, [("buy remove depletion", "Saruthar")])
-        self.assertEqual(client.state.bank_balance, 4_524)
-        self.assertEqual(client.persisted, [4_524, 5_504, 4_524])
+        # The server may or may not have charged: neither the reserved nor the
+        # refunded balance is trusted, so the bank is read again before the
+        # next budgeted purchase.
+        self.assertEqual(client.persisted, [4_524])
+        self.assertFalse(client.state.bank_balance_known)
 
     def test_mass_identify_pays_flat_service_and_verifies_item_updates(self):
         class FakeClient:

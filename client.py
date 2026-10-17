@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -529,6 +530,17 @@ class AtrinikClient:
             self.state.bank_balance_observed_at)
         self._persist_character_memory()
 
+    def forget_bank_balance(self) -> None:
+        """Drop a cached balance that may no longer match the server."""
+        self.state.bank_balance_known = False
+        self.state.bank_balance_observed_at = 0.0
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        record = self._runtime_memory.setdefault(character, {})
+        record["bank_balance_observed_at"] = 0.0
+        self._persist_character_memory()
+
     def set_last_bank_deposit(self, timestamp: float) -> None:
         """Persist the farm-circuit deposit cooldown across restarts."""
         self.state.last_bank_deposit_at = max(0.0, float(timestamp))
@@ -760,8 +772,15 @@ class AtrinikClient:
             self.state.phase = "disconnected"
         except OSError as exc:
             # Any other transport failure (ENETUNREACH, EPIPE, ...) ends the
-            # connection just like run() treats it; report it as one so the
-            # engine holds the task through the reconnect.
+            # connection just like run() treats it. Detach the transport, as
+            # for a stalled drain, so the read loop wakes and reconnects, and
+            # report it as a lost connection.
+            log.warning("transport send failed (%s); forcing reconnect", exc)
+            self.record_action("transport-reconnect", f"send failed: {exc}")
+            self._reconnect_requested = True
+            with contextlib.suppress(OSError):
+                await self._close_transport()
+            self.state.phase = "disconnected"
             raise ConnectionError(str(exc) or type(exc).__name__) from exc
 
     async def _dispatch(self, packet_type: int, data: bytes) -> None:

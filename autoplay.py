@@ -18,10 +18,14 @@ log = logging.getLogger(__name__)
 class AutoplayTask(BotTask):
     """Bootstrap a character and keep autonomous progression running.
 
-    This root deliberately owns child replacement.  A reconnect preserves the
-    in-memory child; a process restart reconstructs the same phase from live
-    quest and character state, so neither case needs a dashboard submission.
+    This root deliberately owns child replacement.  A reconnect between ticks
+    preserves the in-memory child; a connection lost during a child's tick
+    drops that child, and a process restart reconstructs the phase, both from
+    live quest and character state, so none needs a dashboard submission.
     """
+
+    # Rebuilds its child from the server's state after a reconnect.
+    survives_disconnect = True
 
     MANA_CRYSTAL_LEVEL = 18
     MANA_CRYSTAL_QUEST = "Gandyld's Mana Crystal"
@@ -145,7 +149,20 @@ class AutoplayTask(BotTask):
                 if self._needs_mana_crystal_recovery(client):
                     await self._start_mana_crystal_recovery(client)
                     return
-            await self.child.tick(client)
+            try:
+                await self.child.tick(client)
+            except ConnectionError as exc:
+                # The child's dialogue, transfer, or purchase may be half done;
+                # rebuild it from the server's state after the reconnect.
+                log.warning("autoplay %s child lost its connection (%s); "
+                            "rebuilding it after the reconnect",
+                            self.phase, exc or "closed")
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("autoplay-disconnect",
+                             f"{self.phase}: {self.child.name}")
+                self.child = None
+                raise
             if self.child.status not in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
                 return
