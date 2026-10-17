@@ -283,6 +283,10 @@ class GameState:
     target_name: str = ""
     combat: bool = False
     combat_force: bool = False
+    # The last actor the server reported selecting, and when (monotonic).
+    target_ack: tuple[int, float] = (0, 0.0)
+    # The actor automation is trying to select, and since when (monotonic).
+    target_request: tuple[int, float] = (0, 0.0)
     party_name: str = ""
     server_version: int = 0
     last_packet_at: float = 0.0

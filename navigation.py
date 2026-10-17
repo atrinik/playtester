@@ -26,6 +26,7 @@ except ModuleNotFoundError:
                                      load_archetypes, map_files, parse_blocks)
 
 from . import constants as c
+from .targeting import select_target
 
 from .client import AtrinikClient, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
@@ -2885,7 +2886,7 @@ class NavigateThenTask(BotTask):
                 self.task.should_training_finish(client, nearest[3])):
             _, x, y, obj = nearest
             self.task.remember_engagement(client, x, y, obj.target_id)
-            await client.target(x, y, obj.target_id)
+            await select_target(client, x, y, obj.target_id)
             if await self.task.training_finisher(client, x, y, obj):
                 self._defending = True
                 self._last_defense_action = time.monotonic()
@@ -3018,7 +3019,7 @@ class NavigateThenTask(BotTask):
                 if isinstance(self.task, FarmTask):
                     self.task.remember_engagement(
                         client, x, y, obj.target_id)
-                await client.target(x, y, obj.target_id)
+                await select_target(client, x, y, obj.target_id)
                 direction = self.task.spell_fire_direction(
                     offensive, x, y, cx, cy)
                 if direction is not None:
@@ -3091,7 +3092,7 @@ class NavigateThenTask(BotTask):
                 if isinstance(self.task, FarmTask):
                     self.task.remember_engagement(
                         client, x, y, obj.target_id)
-                await client.target(x, y, obj.target_id)
+                await select_target(client, x, y, obj.target_id)
                 semantic = f"{obj.name} {map_object_visual_name(client, obj)}"
                 force = bool(
                     isinstance(self.task, FarmTask) and

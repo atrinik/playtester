@@ -20,6 +20,7 @@ except ModuleNotFoundError:
     from world_content_audit import load_archetypes
 
 from . import constants as c
+from .targeting import select_target
 from .client import (COIN_VALUES, AtrinikClient, map_object_visual_name,
                      update_bank_balance)
 from .model import STARTER_APARTMENT, Item, MapObject
@@ -2613,7 +2614,7 @@ class FarmTask(BotTask):
             assert spell is not None
             await client.clear_actions()
             await client.set_combat(False)
-            await client.target(x, y, obj.target_id)
+            await select_target(client, x, y, obj.target_id)
             self.remember_engagement(client, x, y, obj.target_id)
             await client.fire(direction, spell.tag)
             self.commit_offensive_spell(client, spell)
@@ -2625,7 +2626,7 @@ class FarmTask(BotTask):
             else:
                 await client.clear_actions()
                 await client.set_combat(False)
-                await client.target(x, y, obj.target_id)
+                await select_target(client, x, y, obj.target_id)
                 self.remember_engagement(client, x, y, obj.target_id)
                 await client.fire(direction, launcher.tag)
                 self._last_pull_at = now
@@ -2682,7 +2683,7 @@ class FarmTask(BotTask):
             x, y, obj = breakout
             self.remember_engagement(client, x, y, obj.target_id)
             await client.clear_actions()
-            await client.target(x, y, obj.target_id)
+            await select_target(client, x, y, obj.target_id)
             await client.set_combat(True, force=True)
             self._last_action = now
             return True
@@ -2771,7 +2772,7 @@ class FarmTask(BotTask):
                 self._cornered_breakout_target = obj.target_id
                 self.remember_engagement(client, x, y, obj.target_id)
                 await client.clear_actions()
-                await client.target(x, y, obj.target_id)
+                await select_target(client, x, y, obj.target_id)
                 await client.set_combat(True, force=True)
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
@@ -2819,7 +2820,7 @@ class FarmTask(BotTask):
             await client.set_combat(False)
         else:
             x, y, obj = defensive
-            await client.target(x, y, obj.target_id)
+            await select_target(client, x, y, obj.target_id)
             await client.set_combat(True, force=True)
         # The protocol run bit is persistent directional running, not a
         # faster single step. Use one controlled step so fleeing cannot cross
@@ -3524,7 +3525,7 @@ class FarmTask(BotTask):
                     value[0]))
             self.remember_engagement(client, x, y, obj.target_id)
             if getattr(client.state, "target_id", 0) != obj.target_id:
-                await client.target(x, y, obj.target_id)
+                await select_target(client, x, y, obj.target_id)
             if not self.target_tile_walkable(client, x, y):
                 # Never land a killing blow over water/void: the corpse and
                 # rare drop would be unreachable. Keep the target selected,

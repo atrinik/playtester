@@ -726,7 +726,6 @@ class AtrinikClient:
         self._handlers.append(handler)
 
     def _reset_target_identity(self) -> None:
-        self._target_request = (0, 0.0)
         self.state.target_code = c.TARGET_SELF
         self.state.target_level = 0
         self.state.target_actor_count = 0
@@ -1470,6 +1469,8 @@ class AtrinikClient:
         self.state.target_actor_count = target_actor_count
         self.state.target_relative_depth = target_relative_depth
         self.state.target_id = target_actor_count
+        if target_actor_count:
+            self.state.target_ack = (target_actor_count, time.monotonic())
         self.state.combat = bool(combat)
         self.state.combat_force = bool(combat_force)
         await self.emit("target", target_name)
@@ -1923,9 +1924,6 @@ class AtrinikClient:
         self.record_action("clear", "cancel queued movement/actions")
         await self.send(Packet(c.S_CLEAR))
 
-    TARGET_ACK_TIMEOUT = 6.0
-    UNRESPONSIVE_TARGET_SECONDS = 120.0
-
     async def target(self, x: int, y: int, actor_count: int,
                      relative_depth: int = 0) -> None:
         if not -c.TARGET_MAX_RELATIVE_DEPTH <= relative_depth <= c.TARGET_MAX_RELATIVE_DEPTH:
@@ -1934,26 +1932,6 @@ class AtrinikClient:
                 f"{c.TARGET_MAX_RELATIVE_DEPTH}")
         if actor_count <= 0:
             raise ValueError("actor_count must be nonzero")
-        # A creature the server will not select (one whose removal never
-        # reached this view, such as a monster killed as a level-up redrew
-        # the map, or one it refuses to target) would otherwise be requested
-        # forever while the fight makes no progress. Give up on it once the
-        # server has not acknowledged it for TARGET_ACK_TIMEOUT.
-        now = time.monotonic()
-        requested, since = getattr(self, "_target_request", (0, 0.0))
-        if requested != actor_count or self.state.target_id == actor_count:
-            self._target_request = (actor_count, now)
-        elif now - since >= self.TARGET_ACK_TIMEOUT:
-            self.state.map.ignored_targets[actor_count] = (
-                now + self.UNRESPONSIVE_TARGET_SECONDS)
-            self._target_request = (0, 0.0)
-            log.warning(
-                "target %s at view %s,%s was never acknowledged in %.0fs; "
-                "ignoring it for %.0fs", actor_count, x, y, now - since,
-                self.UNRESPONSIVE_TARGET_SECONDS)
-            self.record_action("target-unresponsive",
-                               f"actor_count={actor_count} view={x},{y}")
-            return
         self.record_action(
             "target",
             f"actor_count={actor_count} view={x},{y} depth={relative_depth}")

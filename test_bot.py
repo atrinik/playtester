@@ -248,7 +248,9 @@ class ProtocolTests(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_targets_the_server_never_acknowledges_are_set_aside(self):
+        from . import targeting
         from .model import MapObject
+        from .targeting import select_target
 
         async def scenario():
             client = AtrinikClient(ClientConfig())
@@ -262,29 +264,46 @@ class ProtocolTests(unittest.TestCase):
             frog.name, frog.target_id = "giant frog", 1343754
             client.state.map.tile(8, 7).objects[5] = frog
             clock = [100.0]
-            with patch("atrinik_bot.client.time.monotonic", lambda: clock[0]), \
+
+            def ack(actor):
+                client.state.target_id = actor
+                client.state.target_ack = (actor, clock[0])
+
+            with patch("atrinik_bot.targeting.time.monotonic", lambda: clock[0]), \
                     patch("atrinik_bot.model.time.monotonic", lambda: clock[0]):
-                # Acknowledged targets are requested as often as needed.
-                for _ in range(10):
-                    client.state.target_id = 1343754
-                    await client.target(8, 7, 1343754)
-                    clock[0] += 1.0
-                self.assertEqual(len(sent), 10)
-                # Then the server stops selecting it (it now reports Sera).
+                # A fight: selected once, then fought for 30 s without asking
+                # again, until a heal targets Sera herself.
+                self.assertTrue(await select_target(client, 8, 7, 1343754))
+                ack(1343754)
+                clock[0] += 30.0
                 client.state.target_id = 0
+                # The first retry after losing it is still sent.
+                self.assertTrue(await select_target(client, 8, 7, 1343754))
+                self.assertEqual(len(sent), 2)
+                # It never comes back (it was killed, but its view lingers).
                 for _ in range(40):
-                    if client.action_history[-1]["action"] == "target-unresponsive":
-                        break
-                    await client.target(8, 7, 1343754)
                     clock[0] += 0.5
-                # Requested from 110 s to 114.5 s, set aside at 115 s: six
-                # seconds after the last acknowledgement.
-                self.assertEqual(len(sent), 10 + 10)
-                self.assertEqual(clock[0], 115.5)
+                    if not await select_target(client, 8, 7, 1343754):
+                        break
+                # Requests ran from 130 s; it is set aside six seconds later.
+                self.assertEqual(clock[0], 130.0 + targeting.TARGET_ACK_TIMEOUT)
+                self.assertEqual(len(sent), 2 + 11)
                 self.assertEqual(list(client.state.map.targets(friendly=False)), [])
+                self.assertEqual(client.action_history[-1]["action"], "target-unresponsive")
                 # It is offered again after the pause.
-                clock[0] += client.UNRESPONSIVE_TARGET_SECONDS
+                clock[0] += targeting.UNRESPONSIVE_TARGET_SECONDS
                 self.assertEqual(len(list(client.state.map.targets(friendly=False))), 1)
+
+        asyncio.run(scenario())
+
+    def test_target_replies_record_their_acknowledgement(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            with patch("atrinik_bot.client.time.monotonic", lambda: 42.0):
+                payload = (bytes([c.TARGET_ENEMY]) + b"ff0000\0giant frog\0" +
+                           bytes([5]) + (1343754).to_bytes(4, "big") + bytes([0, 1, 0]))
+                await client._handle_target(Cursor(payload), payload)
+            self.assertEqual(client.state.target_ack, (1343754, 42.0))
 
         asyncio.run(scenario())
 
