@@ -4954,6 +4954,13 @@ class TaskEngine:
                 self.client.action_context = self.task.name
                 try:
                     await self.task.tick(self.client)
+                except ConnectionError as exc:
+                    # The server went away mid-tick (live: a MAIN upgrade shut
+                    # it down while autoplay was clearing actions, and autoplay
+                    # ended for good). Hold the task through the reconnect like
+                    # a disconnect noticed between ticks.
+                    log.warning("task %s paused: connection lost (%s)",
+                                self.task.name, exc or "closed")
                 except Exception as exc:
                     log.exception("task %s failed", self.task.name)
                     self.task.fail(str(exc))
