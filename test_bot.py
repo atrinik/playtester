@@ -466,6 +466,24 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_transport_os_errors_are_reported_as_lost_connections(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+
+            class Writer:
+                def write(self, data):
+                    raise OSError(101, "Network is unreachable")
+
+                async def drain(self):
+                    pass
+
+            client.writer = Writer()
+            with self.assertRaises(ConnectionError) as raised:
+                await client.clear_actions()
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+
+        asyncio.run(scenario())
+
     def test_map2_soft_clear_and_fog_keep_remembered_geometry_like_the_client(self):
         from .model import MapObject
 
@@ -7742,6 +7760,41 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)
         self.assertEqual(client.state.depletion_points, 0)
+
+    def test_temple_service_refunds_its_reservation_when_the_send_fails(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance = 5_504
+                self.state.bank_balance_known = True
+                self.state.place_item(Item(
+                    22, item_type=c.TYPE_FORCE, quality=0,
+                    name="depletion"), 7)
+                self.persisted = []
+                self.connected = False
+                self.talks = []
+
+            def set_bank_balance(self, balance):
+                self.persisted.append(balance)
+                self.state.bank_balance = balance
+
+            async def talk(self, message, npc):
+                if not self.connected:
+                    raise ConnectionError("not connected")
+                self.talks.append((message, npc))
+
+        client = FakeClient()
+        task = TempleServiceTask(
+            "Saruthar", "remove depletion", "depletion", 980)
+        with self.assertRaises(ConnectionError):
+            asyncio.run(task.tick(client))
+        # The kept task retries after the reconnect and pays exactly once.
+        self.assertEqual(client.state.bank_balance, 5_504)
+        client.connected = True
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.talks, [("buy remove depletion", "Saruthar")])
+        self.assertEqual(client.state.bank_balance, 4_524)
+        self.assertEqual(client.persisted, [4_524, 5_504, 4_524])
 
     def test_mass_identify_pays_flat_service_and_verifies_item_updates(self):
         class FakeClient:
