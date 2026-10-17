@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import tempfile
+import shutil
 import unittest
 from unittest.mock import patch
 from contextlib import suppress
@@ -10776,6 +10777,186 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(client.moves, [])
 
 
+FAKE_ANALYZER_MAIN = """
+import json, os, sys
+args = sys.argv[1:]
+if os.path.exists(os.path.join(os.path.dirname(sys.argv[0]), "FAIL")):
+    raise SystemExit(3)
+level = int(args[0])
+need = ("--melee-damage", "--weapon-class", "--weapon-speed", "--content-root",
+        "--server-root", "--ranking", "--json")
+missing = [flag for flag in need if flag not in args]
+if missing:
+    print("missing " + " ".join(missing), file=sys.stderr)
+    raise SystemExit(2)
+def spot(name, xp, money):
+    return {"path": "/" + name, "name": name, "region": "test", "location": name,
+            "map_paths": ["maps/" + name], "monsters": ["rat L%d" % level],
+            "xp_hour": xp, "money_hour": money, "loot_hour": 1.0, "danger": 1.0,
+            "score": 1.0, "safety_score": 1.0, "aggressive_spawns": 0,
+            "max_aggro_pack": 0, "max_monster_level": level, "danger_flags": []}
+rankings = {key: [spot("grind", 900.0, 5.0), spot("gold", 100.0, 50.0)]
+            for key in ("balanced", "xp", "safety", "maneuverability", "loot")}
+rankings["money"] = [spot("gold", 100.0, 50.0), spot("grind", 900.0, 5.0)]
+print(json.dumps({"results": rankings["xp"], "rankings": rankings, "args": args}))
+"""
+
+
+class FarmAnalyzerTests(unittest.TestCase):
+    @staticmethod
+    def client(*, skill="slash weapons", level=22, dam=44, speed=0.8):
+        from .farm_analyzer import OBJECTIVES  # noqa: F401  (import check)
+
+        client = AtrinikClient(ClientConfig())
+        state = client.state
+        state.phase = "playing"
+        weapon = Item(tag=10, name="sword", required_skill_tag=11)
+        school = Item(tag=11, name=skill, item_type=c.TYPE_SKILL, extra={"level": level})
+        state.items = {10: weapon, 11: school}
+        state.equipment = {c.EQUIP_WEAPON: 10}
+        state.stats.update({"dam": dam, "wc": 31, "weapon_speed": 2.25, "level": 22,
+                            "maxhp": 188, "speed": speed, "ac": 37})
+        names = list(c.ATTACK_NAMES)
+        state.protections = {names.index("slash"): 49, names.index("weapon_magic"): 7}
+        return client
+
+    def analyzer(self, *, fail=False, clock=None):
+        from .farm_analyzer import FarmAnalyzer
+
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        package = directory / "farming_analyzer"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "__main__.py").write_text(FAKE_ANALYZER_MAIN)
+        if fail:
+            (package / "FAIL").write_text("")
+        analyzer = FarmAnalyzer(directory, directory / "content", directory / "server",
+                                clock=clock or time.time)
+        return analyzer
+
+    def test_profile_reads_the_killing_school_and_player_doll(self):
+        from .farm_analyzer import combat_profile
+
+        profile = combat_profile(self.client())
+        self.assertEqual((profile.skill, profile.skill_level, profile.attack),
+                         ("slash weapons", 22, "slash"))
+        args = profile.arguments()
+        self.assertEqual(args[0], "22")
+        for flag, value in (("--melee-damage", "44"), ("--weapon-class", "31"),
+                            ("--weapon-speed", "2.25"), ("--melee-attack", "slash=100"),
+                            ("--max-health", "188"), ("--player-ac", "37")):
+            self.assertEqual(args[args.index(flag) + 1], value, flag)
+        protections = [args[i + 1] for i, arg in enumerate(args) if arg == "--player-protection"]
+        self.assertEqual(sorted(protections), ["slash=49", "weaponmagic=7"])
+        self.assertIsNone(combat_profile(self.client(skill="wizardry spells")))
+        unarmed = self.client()
+        unarmed.state.equipment = {}
+        self.assertIsNone(combat_profile(unarmed))
+
+    def test_only_material_profile_changes_call_for_a_new_ranking(self):
+        from .farm_analyzer import combat_profile
+
+        base = combat_profile(self.client())
+        self.assertFalse(base.materially_differs(combat_profile(self.client(dam=46))))
+        self.assertTrue(base.materially_differs(combat_profile(self.client(dam=50))))
+        self.assertTrue(base.materially_differs(combat_profile(self.client(level=23))))
+        self.assertFalse(base.materially_differs(combat_profile(self.client(speed=0.82))))
+        self.assertTrue(base.materially_differs(combat_profile(self.client(speed=0.9))))
+        self.assertTrue(base.materially_differs(None))
+
+    def test_background_run_ranks_every_objective_without_blocking(self):
+        async def scenario():
+            now = [1000.0]
+            analyzer = self.analyzer(clock=lambda: now[0])
+            client = self.client()
+            self.assertTrue(analyzer.poll(client))
+            self.assertTrue(analyzer.running)
+            self.assertEqual(analyzer.status, "running")
+            self.assertFalse(analyzer.poll(client))  # one process at a time
+            await analyzer._task
+            self.assertEqual(analyzer.status, "ready", analyzer.error)
+            self.assertEqual(analyzer.best("xp")["name"], "grind")
+            self.assertEqual(analyzer.best("money")["name"], "gold")
+            snapshot = analyzer.snapshot("money")
+            self.assertEqual(snapshot["objective"], "money")
+            self.assertEqual([spot["name"] for spot in snapshot["ranking"]], ["gold", "grind"])
+            self.assertEqual(snapshot["profile"]["skill_level"], 22)
+            # An unchanged profile is not re-ranked until the result ages out.
+            now[0] += analyzer.MIN_INTERVAL_SECONDS + 1
+            self.assertFalse(analyzer.poll(client))
+            # A level-up re-ranks once the minimum interval has passed.
+            self.assertTrue(analyzer.poll(self.client(level=23)))
+            await analyzer._task
+            self.assertEqual(analyzer.profile.skill_level, 23)
+            self.assertEqual(analyzer.runs, 2)
+            # Without a supported weapon school, the last ranking stays.
+            self.assertFalse(analyzer.poll(self.client(skill="wizardry spells")))
+            self.assertEqual(analyzer.status, "ready")
+            await analyzer.close()
+
+        asyncio.run(scenario())
+
+    def test_failed_run_keeps_playing_and_backs_off(self):
+        async def scenario():
+            now = [1000.0]
+            analyzer = self.analyzer(fail=True, clock=lambda: now[0])
+            self.assertTrue(analyzer.poll(self.client()))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "failed")
+            self.assertIn("status 3", analyzer.error)
+            self.assertIsNone(analyzer.best("xp"))
+            now[0] += analyzer.MIN_INTERVAL_SECONDS + 1
+            self.assertFalse(analyzer.poll(self.client()))
+            now[0] += analyzer.RETRY_SECONDS
+            self.assertTrue(analyzer.poll(self.client()))
+            await analyzer.close()
+
+        asyncio.run(scenario())
+
+    def test_failed_refresh_retries_after_backoff_not_six_hours(self):
+        async def scenario():
+            now = [1000.0]
+            analyzer = self.analyzer(clock=lambda: now[0])
+            client = self.client()
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "ready")
+            reported_at = analyzer.reported_at
+            # The six-hour refresh of an unchanged profile fails...
+            now[0] += analyzer.REFRESH_SECONDS + 1
+            (analyzer.analyzer_root / "farming_analyzer" / "FAIL").write_text("")
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "failed")
+            self.assertEqual(analyzer.reported_at, reported_at)
+            self.assertEqual(analyzer.best("xp")["name"], "grind")  # report kept
+            # ...and is retried after the failure backoff, not six hours later.
+            (analyzer.analyzer_root / "farming_analyzer" / "FAIL").unlink()
+            now[0] += analyzer.RETRY_SECONDS - 1
+            self.assertFalse(analyzer.poll(client))
+            now[0] += 2
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "ready")
+            self.assertGreater(analyzer.reported_at, reported_at)
+            await analyzer.close()
+
+        asyncio.run(scenario())
+
+    def test_command_is_isolated_and_low_priority(self):
+        from .farm_analyzer import combat_profile
+
+        analyzer = self.analyzer()
+        command = analyzer.command(combat_profile(self.client()))
+        if command[0].endswith("nice"):
+            self.assertEqual(command[1:3], ["-n", "10"])
+            command = command[3:]
+        self.assertEqual(command[1:3], ["-E", "-s"])
+        self.assertEqual(command[command.index("--ranking") + 1], "all")
+        self.assertIn("--json", command)
+
+
 class BuildInfoTests(unittest.TestCase):
     COMMIT = "4a29be882631e570df3028c6e6ead2893b3d4723"
 
@@ -10917,6 +11098,24 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         await writer.wait_closed()
         head, payload = raw.split(b"\r\n\r\n", 1)
         return int(head.split()[1]), payload
+
+    async def test_dashboard_serves_farming_analysis_and_persists_the_objective(self):
+        status, payload = await self.request("GET", "/api/state?include=farming_analysis")
+        self.assertEqual(status, 200)
+        analysis = json.loads(payload)["farming_analysis"]
+        self.assertEqual(analysis["status"], "unavailable")
+        self.assertEqual(analysis["objective"], "xp")
+        self.assertIn("money", analysis["objectives"])
+        status, payload = await self.request(
+            "POST", "/api/action", {"type": "farm_objective", "objective": "money"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(self.client.state.farm_objective, "money")
+        status, _ = await self.request(
+            "POST", "/api/action", {"type": "farm_objective", "objective": "fame"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.client.state.farm_objective, "money")
+        status, page = await self.request("GET", "/")
+        self.assertIn(b'id="tab-farming"', page)
 
     async def test_dashboard_reports_the_running_build(self):
         from .build_info import build_info
@@ -11102,7 +11301,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=13", page)
+        self.assertIn(b"/app.js?v=14", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

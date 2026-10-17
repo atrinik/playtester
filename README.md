@@ -68,15 +68,18 @@ overridden with `--cache` or `ATRINIK_PLAYTESTER_CACHE`.
 /path/to/playtester-environment/bin/atrinik-playtester preflight
 ```
 
-`dependencies` downloads the source and Classic-runtime release archives over
-HTTPS, verifies their immutable SHA-256 coordinates, validates their bounded
-layouts, and installs both as one atomic cache generation. To seed a machine
+`dependencies` downloads the content source and Classic-runtime archives, the
+farming analyzer release asset, and the Classic server source archive over
+HTTPS. It verifies their immutable SHA-256 coordinates, validates their bounded
+layouts, and installs all four as one atomic cache generation. To seed a machine
 from already downloaded files without network access:
 
 ```sh
 atrinik-playtester dependencies \
   --source-archive /media/atrinik-content-1.14.0.tar.gz \
   --runtime-archive /media/atrinik-content-1.14.0-classic-runtime.tar.gz \
+  --analyzer-archive /media/atrinik-tools-farming-analyzer-3.8.0.tar.gz \
+  --server-archive /media/atrinik-classic-server-5.99.0.tar.gz \
   --offline
 ```
 
@@ -155,10 +158,30 @@ name the build: its release tag (with `+N` when the commit is N commits past
 it) and short commit, linked to GitHub. CMake records them from Git on every
 build; a tree without Git metadata reports an unknown build.
 
+## Farming analyzer
+
+Autoplay and the dashboard rank farm spots with the locked `atrinik/tools`
+farming analyzer instead of hard-coded level bands. The dependency installer
+caches its release asset and the Classic server source whose experience tables
+it reads. During `web` and `autoplay`, a background task checks the character
+every 30 seconds. When the killing weapon school's level, the player doll's DAM,
+WC, weapon speed, movement speed, max HP, AC or protections change materially, or the last
+ranking is six hours old, it starts one `nice` analyzer process with
+`--ranking all --json` (about 10 to 30 seconds) while the bot keeps playing.
+Runs are at least ten minutes apart, failures back off for fifteen minutes, and
+a failed run keeps the previous ranking. Only melee weapon schools are
+simulated so far.
+
+The dashboard's **Farming** tab shows the run status, the simulated profile and
+the top spots for the preferred objective: XP, money or loot per hour,
+balanced, or safety. The choice is saved per character and needs no new run,
+because one run ranks every objective. The rates are model estimates for
+comparing spots, not live measurements.
+
 ## Dependency and content boundaries
 
 The playtester source is independent of its external protocol, pathfinding,
-content-tooling, and game-runtime inputs. Their immutable coordinates and licenses are recorded
+content-tooling, farming-analyzer, and game-runtime inputs. Their immutable coordinates and licenses are recorded
 in [`dependencies.lock.json`](dependencies.lock.json) and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). In particular, a wheel or
 binary linked with GPL libatrinik pathfinding is not an MIT-only artifact and

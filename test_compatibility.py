@@ -65,7 +65,22 @@ class CompatibilityTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def make_tool_archives(self) -> dict[str, Path]:
+        analyzer = self.root / "analyzer.tar.gz"
+        server = self.root / "server.tar.gz"
+        self.make_archive(analyzer, "analyzer-root", {
+            "LICENSE": b"MIT\n",
+            "farming_analyzer/__main__.py": b"print('analyzer')\n",
+        })
+        self.make_archive(server, "server-root", {
+            "src/server/exp.c": b"/* experience */\n",
+            "src/server/skill_util.c": b"/* skills */\n",
+        })
+        self.tool_archives = {"analyzer_archive": analyzer, "server_archive": server}
+        return self.tool_archives
+
     def make_lock(self, source: Path, runtime: Path) -> dict:
+        tools = getattr(self, "tool_archives", None) or self.make_tool_archives()
         return {
             "schema_version": 2,
             "bundle_version": "test-v1",
@@ -109,6 +124,24 @@ class CompatibilityTests(unittest.TestCase):
                     "distribution": "atrinik-classic-protocol",
                     "license": "GPL-2.0-or-later",
                     "disposition": "external",
+                },
+                "farming_analyzer": {
+                    "repository": "atrinik/tools",
+                    "release": "v3.8.0",
+                    "revision": "d" * 40,
+                    "license": "MIT",
+                    "disposition": "external",
+                    **self.spec(tools["analyzer_archive"], "analyzer-root", {
+                        "LICENSE": "file", "farming_analyzer/__main__.py": "file"}),
+                },
+                "classic_server": {
+                    "repository": "atrinik/classic",
+                    "release": "v5.99.0",
+                    "revision": "e" * 40,
+                    "license": "GPL-2.0-or-later",
+                    "disposition": "external",
+                    **self.spec(tools["server_archive"], "server-root", {
+                        "src/server/exp.c": "file", "src/server/skill_util.c": "file"}),
                 },
             },
         }
@@ -169,6 +202,17 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(protocol["release"], "v5.90.0")
         self.assertEqual(protocol["sha256"],
                          "5b8dc038184ff69b78a6b790310624fa9bda9ab8b11e87bd805a1beb4ee32c39")
+        analyzer = lock["inputs"]["farming_analyzer"]
+        self.assertEqual((analyzer["repository"], analyzer["release"], analyzer["revision"]),
+                         ("atrinik/tools", "v3.8.0", "c624e500fd59ca43835022ef58e64186ee71e9d0"))
+        self.assertEqual(analyzer["sha256"],
+                         "3adcce5154e3a8c5f5a909f775c68efe7a65ffad859f1ab38a0596b8b1f1f25d")
+        server = lock["inputs"]["classic_server"]
+        self.assertEqual((server["repository"], server["release"], server["revision"]),
+                         ("atrinik/classic", "v5.99.0", "adcab31088a7ce02555d7a6f4f862034a982abbb"))
+        self.assertEqual(server["sha256"],
+                         "ea3fd518bacbad7b7f2ccc2ac1425cc32470abd1422ec91832dc07e7c63534e5")
+        self.assertIn("src/server/exp.c", server["required_paths"])
 
     def test_preflight_verifies_release_assets_and_commit(self) -> None:
         lock = compatibility.load_lock()
@@ -215,10 +259,12 @@ class CompatibilityTests(unittest.TestCase):
         result = compatibility.preflight_lock(
             lock, opener=fake_open, verify_installed_protocol=False)
         self.assertTrue(result["ok"])
-        self.assertEqual(len(result["checks"]), 4)
+        self.assertEqual(len(result["checks"]), 6)
         self.assertEqual(
-            result["checks"][-1]["artifact"],
-            "atrinik_classic_protocol-5.90.0-py3-none-any.whl",
+            [check["artifact"] for check in result["checks"]][-3:],
+            ["atrinik_classic_protocol-5.90.0-py3-none-any.whl",
+             "atrinik-tools-farming-analyzer-3.8.0.tar.gz",
+             "atrinik-classic-server-5.99.0.tar.gz"],
         )
 
         def missing_asset(request, timeout):
@@ -249,7 +295,7 @@ class CompatibilityTests(unittest.TestCase):
             return_value="5.49.0 wire 1084 sha256:candidate",
         ):
             compatible = compatibility.preflight_lock(lock, opener=fake_open)
-        self.assertEqual(len(compatible["checks"]), 5)
+        self.assertEqual(len(compatible["checks"]), 7)
         self.assertEqual(
             compatible["checks"][-1]["name"], "protocol.compatibility")
 
@@ -261,7 +307,7 @@ class CompatibilityTests(unittest.TestCase):
         ):
             incompatible = compatibility.preflight_lock(lock, opener=fake_open)
         self.assertFalse(incompatible["ok"])
-        self.assertEqual(len(incompatible["checks"]), 5)
+        self.assertEqual(len(incompatible["checks"]), 7)
         self.assertEqual(incompatible["checks"][-1]["status"], "error")
         self.assertIn("wire version 1080", incompatible["error"])
 
@@ -273,6 +319,15 @@ class CompatibilityTests(unittest.TestCase):
              "content lock is incomplete"),
             (lambda value: value["inputs"]["content"]["source"].__setitem__(
                 "sha256", "z" * 64), "content source SHA-256 is invalid"),
+            (lambda value: value["inputs"].pop("farming_analyzer"),
+             "inputs are incomplete"),
+            (lambda value: value["inputs"]["farming_analyzer"].__setitem__(
+                "revision", "v3.8.0"), "farming_analyzer revision is invalid"),
+            (lambda value: value["inputs"]["classic_server"].__setitem__(
+                "url", "http://example.invalid/server.tar.gz"),
+             "classic_server URL must use HTTPS"),
+            (lambda value: value["inputs"]["classic_server"].__setitem__(
+                "required_paths", {}), "classic_server lock has no required paths"),
         ):
             with self.subTest(message=message):
                 candidate = json.loads(json.dumps(lock))
@@ -282,21 +337,52 @@ class CompatibilityTests(unittest.TestCase):
                                             message):
                     compatibility.load_lock(location)
 
+    def test_dependencies_cli_forwards_every_offline_archive(self) -> None:
+        from . import cli
+
+        argv = ["atrinik-playtester", "dependencies", "--source-archive", "s.tar.gz",
+                "--runtime-archive", "r.tar.gz", "--analyzer-archive", "a.tar.gz",
+                "--server-archive", "c.tar.gz", "--offline"]
+        captured = {}
+
+        def fake_install(cache, lock, **kwargs):
+            captured.update(kwargs)
+            return {"root": Path("/b"), "runtime": Path("/b/runtime"),
+                    "source": Path("/b/source")}
+
+        with mock.patch.object(cli, "install_bundle", fake_install), \
+                mock.patch.object(cli, "load_lock", return_value={
+                    "inputs": {"content": {"revision": "7" * 40}}}), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch("builtins.print"):
+            cli.main()
+        self.assertEqual(captured, {
+            "source_archive": Path("s.tar.gz"), "runtime_archive": Path("r.tar.gz"),
+            "analyzer_archive": Path("a.tar.gz"), "server_archive": Path("c.tar.gz"),
+            "offline": True})
+
     def test_install_is_atomic_and_reusable_offline(self) -> None:
         source, runtime, lock = self.valid_inputs()
         cache = self.root / "cache"
         installed = compatibility.install_bundle(
-            cache, lock, source_archive=source, runtime_archive=runtime
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
         )
         self.assertEqual(
             (installed["source"] / "tools/world_content_audit.py").read_text(),
             "ROOT = 1\n",
         )
         self.assertTrue((installed["runtime"] / "lib/bmaps").is_file())
+        self.assertTrue(
+            (installed["analyzer"] / "farming_analyzer/__main__.py").is_file())
+        self.assertTrue(
+            (installed["classic_server"] / "src/server/exp.c").is_file())
         reused = compatibility.install_bundle(cache, lock, offline=True)
         self.assertEqual(reused["root"], installed["root"])
         marker = json.loads((installed["root"] / compatibility.MARKER_NAME).read_text())
         self.assertEqual(marker["content_revision"], "7" * 40)
+        self.assertEqual(marker["inputs"]["farming_analyzer"]["release"], "v3.8.0")
+        self.assertEqual(marker["inputs"]["classic_server"]["release"], "v5.99.0")
         self.assertEqual(
             sorted(path.name for path in (cache / "bundles").iterdir()),
             [installed["root"].name],
@@ -306,7 +392,8 @@ class CompatibilityTests(unittest.TestCase):
         source, runtime, lock = self.valid_inputs()
         cache = self.root / "cache"
         installed = compatibility.install_bundle(
-            cache, lock, source_archive=source, runtime_archive=runtime
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
         )
         staging = installed["root"].parent / "bundle-concurrent"
         staging.mkdir()
@@ -321,7 +408,8 @@ class CompatibilityTests(unittest.TestCase):
         cache = self.root / "cache"
         with self.assertRaisesRegex(compatibility.CompatibilityError, "SHA-256 mismatch"):
             compatibility.install_bundle(
-                cache, lock, source_archive=source, runtime_archive=runtime
+                cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
             )
         self.assertFalse(compatibility.bundle_root(cache, lock).exists())
 
@@ -329,7 +417,8 @@ class CompatibilityTests(unittest.TestCase):
         source, runtime, lock = self.valid_inputs()
         cache = self.root / "cache"
         installed = compatibility.install_bundle(
-            cache, lock, source_archive=source, runtime_archive=runtime
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
         )
         bmaps = installed["runtime"] / "lib/bmaps"
         bmaps.chmod(0o600)
@@ -345,7 +434,8 @@ class CompatibilityTests(unittest.TestCase):
         source, runtime, lock = self.valid_inputs()
         cache = self.root / "cache"
         installed = compatibility.install_bundle(
-            cache, lock, source_archive=source, runtime_archive=runtime
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
         )
         marker_path = installed["root"] / compatibility.MARKER_NAME
         marker = json.loads(marker_path.read_text())
@@ -359,7 +449,8 @@ class CompatibilityTests(unittest.TestCase):
         source, runtime, lock = self.valid_inputs()
         cache = self.root / "cache"
         compatibility.install_bundle(
-            cache, lock, source_archive=source, runtime_archive=runtime
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
         )
         distribution = self.protocol_distribution(lock)
         protocol_module = self.protocol_module()
@@ -378,7 +469,8 @@ class CompatibilityTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(
             [item["name"] for item in result["checks"]],
-            ["content-bundle", "content-tooling", "protocol", "pathfinding"],
+            ["content-bundle", "content-tooling", "farming-analyzer", "protocol",
+             "pathfinding"],
         )
 
     def test_protocol_compatibility_rejects_old_surface_and_accepts_candidate(
@@ -503,7 +595,8 @@ class CompatibilityTests(unittest.TestCase):
         self.assertFalse(missing["ok"])
         self.assertEqual(missing["checks"][0]["status"], "error")
         compatibility.install_bundle(
-            cache, lock, source_archive=source, runtime_archive=runtime
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
         )
         distribution = SimpleNamespace(version="0.0.0", read_text=lambda name: "")
         extension = SimpleNamespace(
@@ -522,7 +615,8 @@ class CompatibilityTests(unittest.TestCase):
         source, runtime, lock = self.valid_inputs()
         cache = self.root / "cache"
         compatibility.install_bundle(
-            cache, lock, source_archive=source, runtime_archive=runtime
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
         )
         with mock.patch.object(
             compatibility,
@@ -543,7 +637,8 @@ class CompatibilityTests(unittest.TestCase):
         source, runtime, lock = self.valid_inputs()
         cache = self.root / "cache"
         installed = compatibility.install_bundle(
-            cache, lock, source_archive=source, runtime_archive=runtime
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
         )
         old_path = list(sys.path)
         old_pycache_prefix = sys.pycache_prefix

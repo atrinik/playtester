@@ -68,6 +68,10 @@ def parser() -> argparse.ArgumentParser:
         "dependencies", help="install the immutable compatibility bundle")
     dependencies.add_argument("--source-archive", type=Path)
     dependencies.add_argument("--runtime-archive", type=Path)
+    dependencies.add_argument("--analyzer-archive", type=Path,
+                              help="pre-downloaded farming analyzer release asset")
+    dependencies.add_argument("--server-archive", type=Path,
+                              help="pre-downloaded Classic server source archive")
     dependencies.add_argument("--offline", action="store_true")
     dependencies.add_argument("--json", action="store_true")
     preflight = sub.add_parser(
@@ -125,6 +129,7 @@ async def main_async(args: argparse.Namespace) -> None:
     from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                       POLICIES)
     from .client import AtrinikClient, ClientConfig
+    from .farm_analyzer import FarmAnalyzer, run_periodically
     from .navigation import NavigateTask, NavigateThenTask, WorldGraph
     from .quest_tasks import EscapingDesertedIslandTask
     from .tasks import (BankTask, DepositItemsTask, FarmTask, JunkPolicy,
@@ -189,6 +194,9 @@ async def main_async(args: argparse.Namespace) -> None:
         engine.set_task(DepositItemsTask(args.container, tuple(args.item)))
     elif args.task in ("web", "autoplay"):
         graph = WorldGraph().build()
+        bundle = getattr(args, "bundle", None)
+        if bundle is not None:
+            client.farm_analyzer = FarmAnalyzer.from_bundle(bundle)
         if args.task == "autoplay":
             engine.set_task(AutoplayTask(
                 graph, target_level=args.until_level))
@@ -225,9 +233,14 @@ async def main_async(args: argparse.Namespace) -> None:
         tasks.append(asyncio.create_task(engine.run()))
     if web_server is not None:
         tasks.append(asyncio.create_task(web_server.serve()))
+    if client.farm_analyzer is not None:
+        tasks.append(asyncio.create_task(
+            run_periodically(client.farm_analyzer, client)))
     try:
         await asyncio.gather(*tasks)
     finally:
+        if client.farm_analyzer is not None:
+            await client.farm_analyzer.close()
         if web_server is not None:
             await web_server.close()
         await client.close()
@@ -264,6 +277,8 @@ def main() -> None:
                 lock,
                 source_archive=args.source_archive,
                 runtime_archive=args.runtime_archive,
+                analyzer_archive=args.analyzer_archive,
+                server_archive=args.server_archive,
                 offline=args.offline,
             )
         except CompatibilityError as error:
@@ -300,6 +315,7 @@ def main() -> None:
         ) from error
     if not args.runtime_content:
         args.runtime_content = str(installed["runtime"])
+    args.bundle = installed
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

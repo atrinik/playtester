@@ -231,6 +231,8 @@ class GameState:
     vendor_quotes: dict[str, dict[str, int | float | str]] = field(
         default_factory=dict)
     farm_zone_quarantine: dict[str, float] = field(default_factory=dict)
+    # Which farming-analyzer ranking autoplay follows (see farm_analyzer.OBJECTIVES).
+    farm_objective: str = "xp"
     farm_zone_last_checked: dict[str, float] = field(default_factory=dict)
     lore_attempt_counts: dict[str, int] = field(default_factory=dict)
     apartment_bed_bound: bool = False

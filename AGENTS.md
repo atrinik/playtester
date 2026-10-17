@@ -16,6 +16,10 @@
   CMake fetch coordinates, package metadata, CI inputs, and
   `THIRD_PARTY_NOTICES.md` synchronized. External libraries and content retain
   their own licenses; linked GPL artifacts are not MIT-only.
+- Farm-spot ranking belongs to the locked `atrinik/tools` farming analyzer
+  (`farm_analyzer.py`). Run it only out of process, so it never blocks the task
+  engine, and feed it measured character statistics. Fix ranking gaps in the
+  analyzer rather than by adding bot-side spot tables or level bands.
 - Keep credentials, certificates, databases, logs, collected content, caches,
   downloaded dependencies, and all mutable state outside the source tree.
 - Validate changes with the strict-warning native build, CTest, the complete
