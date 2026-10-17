@@ -6112,6 +6112,13 @@ class QuestTests(unittest.TestCase):
         # steers around it; her own square stays open.
         self.assertIn((11, 10), task.navigation._threat_blocked)
         self.assertNotIn((10, 10), task.navigation._threat_blocked)
+        # The click path in flight, planned without it, is cancelled once.
+        self.assertEqual(client.clears, 1)
+        self.assertIsNone(task.navigation._issued_click)
+        task.navigation._issued_click = ("/test", 12, 12)
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.clears, 1)
+        self.assertEqual(task.navigation._issued_click, ("/test", 12, 12))
 
         # Also for a committed creature beyond the nearby radius.
         far = MapObject(3, 1, 0, 0, name="sword spider", target_id=101, target_hp=55)

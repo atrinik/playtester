@@ -2466,6 +2466,8 @@ class NavigateThenTask(BotTask):
         # replans refreshes the navigation's own progress clock.
         self._last_position: tuple[str, int, int] | None = None
         self._last_moved_at = 0.0
+        # Threats the last held-fire halo was built around.
+        self._hold_fire_signature: tuple[int, ...] = ()
         self._last_danger_target = 0
         self._last_pack_signature: tuple[int, ...] = ()
         self._pack_exit_stall: tuple[
@@ -3027,8 +3029,17 @@ class NavigateThenTask(BotTask):
             self._halo_threats(client, nearby, radius=1)
             if getattr(client.state, "combat", False) and not combat_released:
                 await client.set_combat(False)
+            signature = tuple(sorted(threat[3].target_id for threat in nearby))
+            if signature != self._hold_fire_signature:
+                # A click path already in flight was planned without these
+                # threats; cancel it so the next plan steers around them.
+                self._hold_fire_signature = signature
+                await client.clear_actions()
+                self.navigation._issued_goal = None
+                self.navigation._issued_click = None
             self._defending = False
             return False
+        self._hold_fire_signature = ()
         # Only close a short gap. Chasing a merely visible target across the
         # viewport was what repeatedly pulled the character into larger packs.
         if nearest is not None and nearest[0] <= 4:
