@@ -247,6 +247,9 @@ class GameState:
     # Where the server respawns the character: the last savebed it applied.
     savebed_map: str = ""
     savebed_xy: tuple[int, int] | None = None
+    # Where leaving each apartment actually put the character: the server
+    # returns to the per-player entrance recorded at runtime.
+    apartment_returns: dict[str, tuple[str, tuple[int, int]]] = field(default_factory=dict)
     equipment: dict[int, int] = field(default_factory=dict)
     protections: dict[int, int] = field(default_factory=dict)
     items: dict[int, Item] = field(default_factory=dict)

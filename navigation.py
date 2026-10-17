@@ -3504,32 +3504,74 @@ def _route_walk(graph: WorldGraph, start_map: str, start_xy: tuple[int, int],
     return tiles
 
 
-def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
-                 spot_maps: Iterable[str]) -> int | None:
-    """Moves walked from a respawn on this bed to the nearest circuit map.
+ApartmentReturns = dict[str, tuple[str, tuple[int, int]]]
 
-    Every reachable circuit map is routed and walked along its authored
-    paths; None when none is reachable.
+
+def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
+              spot_maps: Sequence[str], returns: ApartmentReturns):
+    """Generator: yields once per exact route; returns (walk, first edge).
+
+    ``first`` is the edge the walk leaves ``bed_map`` by, so other beds in
+    the same room are priced by their own steps to it. An apartment's exit
+    returns to the per-player entrance recorded at runtime, not to the
+    graph's static alternatives, so its walk continues from the observed
+    return point in ``returns``; without one it is unknown (None).
     """
-    spot_maps = tuple(spot_maps)
     if bed_map in spot_maps:
-        return 0
+        return 0, None
+    start_map, start_xy, base, first = bed_map, point, 0, None
+    if "/apartments/" in bed_map:
+        back = returns.get(bed_map)
+        node = graph.nodes.get(bed_map)
+        if back is None or node is None:
+            return None, None
+        exits = [edge for edge in node.edges if edge.kind != "tile" and (
+            graph.local_path(bed_map, point, (edge.x, edge.y)) or
+            (edge.x, edge.y) == point)]
+        if not exits:
+            return None, None
+        first = min(exits, key=lambda edge: _segment_steps(graph, bed_map, point, edge))
+        base = _segment_steps(graph, bed_map, point, first)
+        start_map, start_xy = back[0], tuple(back[1])
+        if start_map in spot_maps:
+            return base, first
     best = None
     for spot in spot_maps:
         try:
-            edges = graph.route_points(bed_map, bed_xy, spot, [])
+            edges = graph.route_points(start_map, start_xy, spot, [])
         except (ValueError, KeyError):
+            edges = None
+        yield
+        if not edges:
             continue
-        walk = _route_walk(graph, bed_map, bed_xy, edges)
-        best = walk if best is None else min(best, walk)
-    return best
+        walk = base + _route_walk(graph, start_map, start_xy, edges)
+        if best is None or walk < best[0]:
+            best = (walk, first or edges[0])
+    return best if best is not None else (None, None)
+
+
+def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
+                 spot_maps: Iterable[str], *,
+                 returns: ApartmentReturns | None = None) -> int | None:
+    """Moves walked from a respawn on this bed to the nearest circuit map.
+
+    Every reachable circuit map is routed and walked along its authored
+    paths; None when none is reachable (or an apartment's return is unknown).
+    """
+    steps = _bed_walk(graph, bed_map, tuple(bed_xy), tuple(spot_maps), returns or {})
+    try:
+        while True:
+            next(steps)
+    except StopIteration as done:
+        return done.value[0]
 
 
 class SavebedSearch:
     """Find the usable savebed whose respawn is the shortest walk from a spot.
 
     Public beds (inns, taverns) work for anyone; private ones only in
-    ``owned`` maps. Each exact walk is a tile-level route, so ``step()``
+    ``owned`` maps, and apartments only once their runtime return point is
+    known (``returns``). Each exact walk is a tile-level route, so ``step()``
     computes at most one per call and a live caller spreads the search over
     ticks. ``result`` is (map, bed tile, walk tiles) or None; with
     ``current`` (map, tile), ``current_walk`` is that bed's walk.
@@ -3539,13 +3581,15 @@ class SavebedSearch:
                  owned: Iterable[str] = (STARTER_APARTMENT,),
                  excluded: Iterable[str] = (),
                  excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = (),
-                 current: tuple[str, tuple[int, int]] | None = None):
+                 current: tuple[str, tuple[int, int]] | None = None,
+                 returns: ApartmentReturns | None = None):
         self.result: tuple[str, tuple[int, int], int] | None = None
         self.current_walk: int | None = None
         self.done = False
         self._steps = self._search(
             graph, tuple(dict.fromkeys(spot_maps)), set(owned), set(excluded),
-            {(path, tuple(point)) for path, point in excluded_tiles}, current)
+            {(path, tuple(point)) for path, point in excluded_tiles}, current,
+            dict(returns or {}))
 
     def step(self) -> bool:
         """Advance by at most one exact route; True once the search is done."""
@@ -3566,7 +3610,9 @@ class SavebedSearch:
                 self.result[2], self.result[0], self.result[1]):
             self.result = (bed_map, point, walk)
 
-    def _search(self, graph, spot_maps, owned, excluded, excluded_tiles, current):
+    def _search(self, graph, spot_maps, owned, excluded, excluded_tiles, current,
+                returns):
+        eligible: dict[str, list[tuple[int, int]]] = {}
         hops: dict[str, int] = {}
         for bed_map in sorted(graph.savebeds):
             if bed_map in excluded or bed_map not in graph.nodes:
@@ -3574,9 +3620,23 @@ class SavebedSearch:
             if bed_map not in owned and any(
                     marker in bed_map for marker in PRIVATE_SAVEBED_MARKERS):
                 continue
-            nearest = _nearest_spot_maps(graph, bed_map, spot_maps)
+            blocked = graph.nodes[bed_map].blocked
+            tiles = [point for point in sorted(graph.savebeds[bed_map])
+                     if point not in blocked and (bed_map, point) not in excluded_tiles]
+            # Maps whose beds have all failed must not take candidate slots.
+            if not tiles:
+                continue
+            if "/apartments/" in bed_map:
+                back = returns.get(bed_map)
+                nearest = (None if back is None else
+                           _nearest_spot_maps(graph, back[0], spot_maps))
+                if nearest is not None:
+                    nearest = (nearest[0] + 1, nearest[1])
+            else:
+                nearest = _nearest_spot_maps(graph, bed_map, spot_maps)
             if nearest is not None:
                 hops[bed_map] = nearest[0]
+                eligible[bed_map] = tiles
         yield
         candidates: list[str] = []
         if hops:
@@ -3584,63 +3644,43 @@ class SavebedSearch:
             candidates = sorted((m for m in hops if hops[m] <= cutoff),
                                 key=lambda m: (hops[m], m))[:SAVEBED_CANDIDATES]
         for bed_map in sorted(candidates):
-            blocked = graph.nodes[bed_map].blocked
-            tiles = [point for point in sorted(graph.savebeds[bed_map])
-                     if point not in blocked and (bed_map, point) not in excluded_tiles]
-            if not tiles:
-                continue
-            if bed_map in spot_maps:
-                self._consider(bed_map, tiles[0], 0)
-                continue
-            for spot in spot_maps:
-                # Route once per map and leg from the first bed that routes;
-                # the other beds in the room share everything after its first
-                # exit, so each costs only its own walk to that exit.
-                anchor, edges = None, None
-                for point in tiles:
-                    try:
-                        edges = graph.route_points(bed_map, point, spot, [])
-                    except (ValueError, KeyError):
-                        edges = None
-                    yield
-                    if edges:
-                        anchor = point
-                        break
-                if anchor is None:
+            # Beds in one walkable component share everything after their
+            # first exit; beds in another component get their own route.
+            groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+            for point in eligible[bed_map]:
+                component = graph._component(bed_map, point)
+                groups.setdefault(min(component) if component else point, []).append(point)
+            for group in groups.values():
+                anchor = group[0]
+                walk, first = yield from _bed_walk(
+                    graph, bed_map, anchor, spot_maps, returns)
+                if walk is None:
                     continue
-                first = edges[0]
-                rest = (_route_walk(graph, bed_map, anchor, edges) -
-                        _segment_steps(graph, bed_map, anchor, first))
-                for point in tiles:
-                    if point != anchor and not graph.local_path(
-                            bed_map, point, (first.x, first.y)):
+                for point in group:
+                    if point == anchor or first is None:
+                        self._consider(bed_map, point, walk)
                         continue
-                    self._consider(bed_map, point,
-                                   _segment_steps(graph, bed_map, point, first) + rest)
+                    if not graph.local_path(bed_map, point, (first.x, first.y)):
+                        continue
+                    self._consider(
+                        bed_map, point,
+                        walk - _segment_steps(graph, bed_map, anchor, first) +
+                        _segment_steps(graph, bed_map, point, first))
         if current is not None and current[0] in graph.nodes:
-            if current[0] in spot_maps:
-                self.current_walk = 0
-                return
-            for spot in spot_maps:
-                try:
-                    edges = graph.route_points(current[0], current[1], spot, [])
-                except (ValueError, KeyError):
-                    edges = None
-                yield
-                if edges is not None:
-                    walk = _route_walk(graph, current[0], current[1], edges)
-                    if self.current_walk is None or walk < self.current_walk:
-                        self.current_walk = walk
+            walk, _ = yield from _bed_walk(
+                graph, current[0], tuple(current[1]), spot_maps, returns)
+            self.current_walk = walk
 
 
 def nearest_savebed(graph: WorldGraph, spot_maps: Iterable[str], *,
                     owned: Iterable[str] = (STARTER_APARTMENT,),
                     excluded: Iterable[str] = (),
-                    excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = ()
+                    excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = (),
+                    returns: ApartmentReturns | None = None
                     ) -> tuple[str, tuple[int, int], int] | None:
     """The usable savebed whose respawn is the shortest walk from the spot."""
     return SavebedSearch(graph, spot_maps, owned=owned, excluded=excluded,
-                         excluded_tiles=excluded_tiles).run().result
+                         excluded_tiles=excluded_tiles, returns=returns).run().result
 
 
 class FarmCircuitTask(BotTask):
@@ -4475,10 +4515,13 @@ class FarmCircuitTask(BotTask):
         bed_map = getattr(client.state, "savebed_map", "")
         bed_xy = getattr(client.state, "savebed_xy", None)
         current = (bed_map, tuple(bed_xy)) if bed_map and bed_xy else None
-        key = (self._spot_maps(), frozenset(self._bed_failed), current)
+        returns = dict(getattr(client.state, "apartment_returns", {}) or {})
+        key = (self._spot_maps(), frozenset(self._bed_failed), current,
+               frozenset(returns.items()))
         if self._bed_search is None or self._bed_search[0] != key:
             self._bed_search = (key, SavebedSearch(
-                self.graph, key[0], excluded_tiles=self._bed_failed, current=current))
+                self.graph, key[0], excluded_tiles=self._bed_failed, current=current,
+                returns=returns))
         return self._bed_search[1]
 
     def _needs_savebed(self, client: AtrinikClient) -> bool:

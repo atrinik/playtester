@@ -8477,25 +8477,36 @@ class QuestTests(unittest.TestCase):
         graph = self.savebed_graph()
         # Two moves to the exit on (3, 0); stepping onto it is the transfer.
         self.assertEqual(savebed_walk(graph, "/inn", (1, 0), ["/farm"]), 2)
-        self.assertEqual(savebed_walk(graph, STARTER_APARTMENT, (1, 0), ["/farm"]), 61)
+        # The apartment's exit returns to the recorded entrance, here /far.
+        returns = {STARTER_APARTMENT: ("/far", (0, 0))}
+        self.assertEqual(savebed_walk(graph, STARTER_APARTMENT, (1, 0), ["/farm"],
+                                      returns=returns), 61)
+        # Without an observed return the apartment walk is unknown.
+        self.assertIsNone(savebed_walk(graph, STARTER_APARTMENT, (1, 0), ["/farm"]))
         # The inn's other bed, one tile nearer its exit, wins; the equally
         # close private apartment belongs to someone else.
         self.assertEqual(nearest_savebed(graph, ["/farm"]), ("/inn", (2, 0), 1))
-        self.assertEqual(nearest_savebed(graph, ["/farm"], excluded={"/inn"}),
+        self.assertEqual(nearest_savebed(graph, ["/farm"], excluded={"/inn"},
+                                         returns=returns),
                          (STARTER_APARTMENT, (1, 0), 61))
+        self.assertIsNone(nearest_savebed(graph, ["/farm"], excluded={"/inn"}))
         self.assertEqual(
             nearest_savebed(graph, ["/farm"], excluded={"/inn"},
-                            owned={STARTER_APARTMENT, "/shattered_islands/x/apartments/private"}),
+                            owned={STARTER_APARTMENT, "/shattered_islands/x/apartments/private"},
+                            returns={**returns,
+                                     "/shattered_islands/x/apartments/private": ("/farm", (0, 0))}),
             ("/shattered_islands/x/apartments/private", (1, 0), 2))
         # A bed with no route to the spot is never chosen.
         graph.nodes["/inn"].edges.clear()
-        self.assertEqual(nearest_savebed(graph, ["/farm"])[0], STARTER_APARTMENT)
+        self.assertEqual(nearest_savebed(graph, ["/farm"], returns=returns)[0],
+                         STARTER_APARTMENT)
 
     def test_farm_circuit_moves_its_savebed_next_to_the_spot_before_farming(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["level"] = 8
         client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
+        client.state.apartment_returns = {STARTER_APARTMENT: ("/far", (0, 0))}
         circuit = FarmCircuitTask(self.savebed_graph(), [("/farm", "rat")])
         # The search spreads its exact routes over ticks before deciding.
         decisions = [circuit._needs_savebed(client) for _ in range(8)]
@@ -8544,12 +8555,71 @@ class QuestTests(unittest.TestCase):
         self.assertTrue(circuit._needs_savebed(client))
         self.assertEqual(circuit._new_savebed(client).navigation.destination_xy, (37, 0))
 
+    def test_savebed_search_routes_each_bed_component_and_skips_exhausted_maps(self):
+        from . import navigation
+        from .navigation import nearest_savebed
+
+        graph = WorldGraph()
+        # One map, two rooms split by a wall, each with a bed and its own
+        # exit: the east room's exit is right beside the farm.
+        rooms = MapNode("/rooms", width=21, height=1)
+        rooms.terrain = {(x, 0): 1 for x in range(21)}
+        rooms.blocked = {(10, 0)}
+        rooms.edges.append(MapEdge("/rooms", "/road", 0, 0, 0, 0))
+        rooms.edges.append(MapEdge("/rooms", "/farm", 20, 0, 0, 0))
+        road = MapNode("/road", width=30, height=1)
+        road.terrain = {(x, 0): 1 for x in range(30)}
+        road.edges.append(MapEdge("/road", "/farm", 29, 0, 0, 0))
+        farm = MapNode("/farm", width=5, height=1)
+        farm.terrain = {(x, 0): 1 for x in range(5)}
+        graph.nodes.update({"/rooms": rooms, "/road": road, "/farm": farm})
+        graph.savebeds["/rooms"] = [(1, 0), (19, 0)]
+        tavern = MapNode("/tavern", width=3, height=1)
+        tavern.terrain = {(x, 0): 1 for x in range(3)}
+        tavern.edges.append(MapEdge("/tavern", "/farm", 2, 0, 0, 0))
+        aaa = MapNode("/aaa", width=2, height=1)
+        aaa.terrain = {(0, 0): 1, (1, 0): 1}
+        aaa.edges.append(MapEdge("/aaa", "/farm", 1, 0, 0, 0))
+        graph.nodes.update({"/tavern": tavern, "/aaa": aaa})
+        graph.savebeds["/tavern"] = [(0, 0)]
+        graph.savebeds["/aaa"] = [(0, 0)]
+        self.assertEqual(nearest_savebed(graph, ["/farm"], excluded={"/tavern", "/aaa"}),
+                         ("/rooms", (19, 0), 1))
+        # With room for one candidate map, an exhausted nearer map yields
+        # its slot to the next one.
+        with patch.object(navigation, "SAVEBED_CANDIDATES", 1):
+            self.assertEqual(
+                nearest_savebed(graph, ["/farm"], excluded_tiles={("/aaa", (0, 0))},
+                                excluded={"/rooms"}),
+                ("/tavern", (0, 0), 2))
+
+    def test_apartment_exits_record_their_runtime_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            town = MapState(path="/shattered_islands/world_0_68", world_x=7, world_y=12)
+            client._observe_map_change(STARTER_APARTMENT, town)
+            client._observe_map_change("/shattered_islands/world_0_68",
+                                       MapState(path="/shattered_islands/world_0_67"))
+            self.assertEqual(client.state.apartment_returns,
+                             {STARTER_APARTMENT: ("/shattered_islands/world_0_68", (7, 12))})
+            restarted = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            restarted.state.player_name = "Sera"
+            restarted.load_character_memory("Sera")
+            self.assertEqual(restarted.state.apartment_returns,
+                             {STARTER_APARTMENT: ("/shattered_islands/world_0_68", (7, 12))})
+
     def test_farm_circuit_keeps_a_savebed_that_is_nearly_as_close(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["level"] = 8
         # The starter apartment is 16 moves out; the inn's 1 saves under 20.
         client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
+        client.state.apartment_returns = {STARTER_APARTMENT: ("/far", (0, 0))}
         circuit = FarmCircuitTask(self.savebed_graph(far_width=15), [("/farm", "rat")])
         search = circuit._savebed_search(client).run()
         self.assertEqual((search.result, search.current_walk), (("/inn", (2, 0), 1), 16))
@@ -8561,10 +8631,16 @@ class QuestTests(unittest.TestCase):
         graph = built_graph()
         spot = ["/shattered_islands/world_0_50", "/shattered_islands/world_0_51",
                 "/shattered_islands/world_1_50", "/shattered_islands/world_1_51"]
-        bed_map, _, tiles = nearest_savebed(graph, spot)
+        # Live on 2026-10-17, leaving the starter apartment returned Sera to
+        # Strakewood's world_0_68, not to the graph's static Asteria exit.
+        town = graph.nodes["/shattered_islands/world_0_68"]
+        entrance = next(point for point in sorted(town.terrain) if town.walkable(*point))
+        returns = {STARTER_APARTMENT: ("/shattered_islands/world_0_68", entrance)}
+        bed_map, _, tiles = nearest_savebed(graph, spot, returns=returns)
         self.assertNotIn("/apartments/", bed_map)
         self.assertNotIn("/house/", bed_map)
-        apartment = savebed_walk(graph, STARTER_APARTMENT, STARTER_APARTMENT_BED, spot)
+        apartment = savebed_walk(graph, STARTER_APARTMENT, STARTER_APARTMENT_BED, spot,
+                                 returns=returns)
         self.assertLessEqual(tiles + FarmCircuitTask.SAVEBED_MIN_GAIN_TILES, apartment)
 
     def test_dashboard_trace_prefers_active_service_over_dormant_farm(self):

@@ -292,6 +292,13 @@ class AtrinikClient:
             else:
                 self.state.savebed_map = ""
                 self.state.savebed_xy = None
+            returns = record.get("apartment_returns", {})
+            self.state.apartment_returns = {
+                apartment: (back[0], (back[1], back[2]))
+                for apartment, back in (returns.items() if isinstance(returns, dict) else ())
+                if isinstance(apartment, str) and isinstance(back, list) and len(back) == 3
+                and isinstance(back[0], str) and all(isinstance(v, int) for v in back[1:])
+            }
             adaptations = record.get("farm_adaptations", {})
             self.state.farm_adaptations = {
                 str(key): dict(value) for key, value in adaptations.items()
@@ -336,6 +343,7 @@ class AtrinikClient:
             self.state.apartment_bed_bound = False
             self.state.savebed_map = ""
             self.state.savebed_xy = None
+            self.state.apartment_returns = {}
             self.state.farm_objective = DEFAULT_OBJECTIVE
             self.state.farm_adaptations = {}
             self.state.bank_balance = 0
@@ -484,6 +492,31 @@ class AtrinikClient:
         record = self._runtime_memory.setdefault(character, {})
         record["savebed"] = [path, int(x), int(y)]
         record["apartment_bed_bound"] = self.state.apartment_bed_bound
+        self._persist_character_memory()
+
+    def _observe_map_change(self, old_path: str, m: MapState) -> None:
+        """Learn where leaving an apartment put the character.
+
+        The server returns to the per-player entrance recorded at runtime, so
+        the authored graph's static apartment exits are only placeholders.
+        """
+        if (old_path and old_path != m.path and "/apartments/" in old_path and
+                "/apartments/" not in m.path):
+            self.set_apartment_return(old_path, m.path, m.world_x, m.world_y)
+
+    def set_apartment_return(self, apartment: str, path: str, x: int, y: int) -> None:
+        """Persist where leaving an apartment put the character."""
+        back = (path, (int(x), int(y)))
+        if self.state.apartment_returns.get(apartment) == back:
+            return
+        self.state.apartment_returns[apartment] = back
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        record = self._runtime_memory.setdefault(character, {})
+        record["apartment_returns"] = {
+            name: [where, point[0], point[1]]
+            for name, (where, point) in self.state.apartment_returns.items()}
         self._persist_character_memory()
 
     def quarantine_farm_zone(self, path: str, until: float) -> None:
@@ -1771,6 +1804,7 @@ class AtrinikClient:
             if marker:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
+        self._observe_map_change(old_path, m)
         await self.emit("map", {"path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y, "changed_map": old_path != m.path})
 
     async def _handle_interface(self, cur: Cursor, raw: bytes) -> None:
