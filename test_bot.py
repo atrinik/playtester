@@ -10392,16 +10392,56 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         circuit.child = circuit._new_child()
         client.state.map.path = self.TREES
         farm = circuit.child.task
+        def farm_for(seconds):
+            stalled = False
+            for _ in range(int(seconds // 30)):
+                now[0] += 30
+                stalled = circuit._observe_stalled_farm(client, farm) or stalled
+            return stalled
+
         self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        now[0] += circuit.FARM_NO_PROGRESS_SECONDS - 1
-        self.assertFalse(circuit._observe_stalled_farm(client, farm))
+        self.assertFalse(farm_for(circuit.FARM_NO_PROGRESS_SECONDS - 60))
         circuit._current_exp += 10  # XP resets the watchdog
         self.assertFalse(circuit._observe_stalled_farm(client, farm))
-        now[0] += circuit.FARM_NO_PROGRESS_SECONDS + 1
-        self.assertTrue(circuit._observe_stalled_farm(client, farm))
+        self.assertTrue(farm_for(circuit.FARM_NO_PROGRESS_SECONDS + 60))
         self.assertIn(self.TREES, client.state.farm_zone_quarantine)
         explicit = FarmCircuitTask(built_graph(), [(self.TREES, "evil treant")])
         self.assertFalse(explicit.analyzer_driven)
+
+    def test_failures_from_before_the_circuit_are_not_new(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        # A persisted recall from an earlier run is replayed into the ledger.
+        client.decision_history.append({
+            "time": time.time() - 3600, "action": "emergency-recall", "detail": "",
+            "task": "", "map": self.TREES})
+        circuit = self.circuit(client, trees)
+        self.assertFalse(circuit._observe_farm_death(client))
+        self.assertNotIn(self.TREES, client.state.farm_zone_quarantine)
+
+    def test_time_away_from_the_farm_restarts_the_no_xp_clock(self):
+        now = [1000.0]
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = FarmCircuitTask(built_graph(), [(self.TREES, "evil treant")],
+                                  analyzer_driven=True, spot=trees, clock=lambda: now[0])
+        circuit.child = circuit._new_child()
+        client.state.map.path = self.TREES
+        farm = circuit.child.task
+        self.assertFalse(circuit._observe_stalled_farm(client, farm))
+        # Nine farmed minutes, then an eleven-minute maintenance trip in which
+        # the watchdog is never consulted.
+        for _ in range(9):
+            now[0] += 60
+            self.assertFalse(circuit._observe_stalled_farm(client, farm))
+        now[0] += 11 * 60
+        self.assertFalse(circuit._observe_stalled_farm(client, farm))
+        self.assertNotIn(self.TREES, client.state.farm_zone_quarantine)
+        # A full ten farmed minutes without XP after returning still counts.
+        for _ in range(10):
+            now[0] += 60
+            stalled = circuit._observe_stalled_farm(client, farm)
+        self.assertTrue(stalled)
 
     def test_unreachable_pick_is_excluded_instead_of_failing_autoplay(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])

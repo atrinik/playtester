@@ -3419,6 +3419,8 @@ class FarmCircuitTask(BotTask):
     # Live failures exclude an analyzer pick for this long; see the README.
     FARM_DEATH_QUARANTINE_SECONDS = 6 * 60 * 60
     FARM_NO_PROGRESS_SECONDS = 10 * 60
+    # Time off the farm restarts the no-XP clock instead of counting against it.
+    FARM_OBSERVATION_GAP_SECONDS = 60
     OPTIONAL_RARE_DETOUR_INTERVAL = 30 * 60
     # Margins for analyzer picks with aggressive residents, and for the rest.
     AGGRESSIVE_SAFETY = (0.80, 0.95)
@@ -3516,6 +3518,12 @@ class FarmCircuitTask(BotTask):
         self._decision_history_index = 0
         self._decision_history_time = 0.0
         self._tier_progress_at: float | None = None
+        # Last time the no-XP watchdog observed the farm; a longer gap means
+        # the character was away (maintenance, travel, reconnect).
+        self._tier_observed_at = 0.0
+        # Failures recorded before this circuit existed were handled by
+        # whichever circuit saw them; a persisted ledger replay is not new.
+        self._failure_epoch = time.time()
         self._tier_progress_exp = 0
 
     def _observe_farm_death(self, client: AtrinikClient) -> bool:
@@ -3543,7 +3551,8 @@ class FarmCircuitTask(BotTask):
                 float(history[-1].get("time", 0.0) or 0.0))
         active_paths = {path for path, _ in self.legs}
         failure = next((record for record in reversed(records)
-                        if record.get("action") in ("death", "emergency-recall")),
+                        if record.get("action") in ("death", "emergency-recall") and
+                        float(record.get("time", 0.0) or 0.0) >= self._failure_epoch),
                        None)
         if failure is None:
             return False
@@ -3589,7 +3598,9 @@ class FarmCircuitTask(BotTask):
             self._tier_progress_at = None
             return False
         now = self.clock()
-        if (self._tier_progress_at is None or
+        away = now - self._tier_observed_at > self.FARM_OBSERVATION_GAP_SECONDS
+        self._tier_observed_at = now
+        if (self._tier_progress_at is None or away or
                 self._current_exp > self._tier_progress_exp):
             self._tier_progress_at = now
             self._tier_progress_exp = self._current_exp
