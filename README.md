@@ -41,7 +41,9 @@ The installer verifies the locked repository, release tag, exact commit, asset,
 download URL, and SHA-256 digest before invoking pip. The
 `atrinik-playtester preflight` command repeats that remote availability check,
 while `doctor --preflight` reports the same check alongside local cache and
-installed-input diagnostics.
+installed-input diagnostics. When `GITHUB_TOKEN` is set, these GitHub API
+requests are authenticated (the token is sent only to `api.github.com`), which
+avoids the anonymous rate limit that shared CI runners hit.
 
 For a coordinated unreleased Classic protocol change, retain the immutable lock
 and point only the development process at that checkout's generated bindings:
