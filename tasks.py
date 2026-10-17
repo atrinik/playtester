@@ -629,7 +629,7 @@ class InventoryCapabilityTask(BotTask):
     def _feedback(self, client: AtrinikClient) -> str:
         return "\n".join(
             entry[3].casefold()
-            for entry in client.state.messages[self._feedback_start:]
+            for entry in client.state.messages_since(self._feedback_start)
             if len(entry) > 3)
 
     def _succeeded(self, client: AtrinikClient) -> bool:
@@ -659,7 +659,7 @@ class InventoryCapabilityTask(BotTask):
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
-            self._feedback_start = len(client.state.messages)
+            self._feedback_start = client.state.message_count
             policy = InventoryPolicy()
             self._unknown_tags = {
                 item.tag for item in client.state.inventory
@@ -3709,14 +3709,14 @@ class BuyGroundItemsTask(BotTask):
         await super().start(client)
         self._initial = self._inventory_quantity(client)
         self._goal = self._initial + self.quantity
-        self._feedback_start = len(client.state.messages)
+        self._feedback_start = client.state.message_count
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
         feedback = "\n".join(
             entry[3].casefold() for entry in
-            client.state.messages[self._feedback_start:] if len(entry) > 3)
+            client.state.messages_since(self._feedback_start) if len(entry) > 3)
         if re.search(r"\b(you lack|not enough money|cannot afford)\b",
                      feedback):
             # A server can place an unaffordable item in inventory but refuse
@@ -3743,7 +3743,7 @@ class BuyGroundItemsTask(BotTask):
                 self._candidate = 0
                 self._examined_at = 0.0
                 self._examine_attempts = 0
-                self._feedback_start = len(client.state.messages)
+                self._feedback_start = client.state.message_count
             elif time.monotonic() - self._attempt_at > 2.5:
                 self.fail("shop purchase produced no item or payment feedback")
                 return
@@ -3758,7 +3758,7 @@ class BuyGroundItemsTask(BotTask):
         if self.cash_reserve is not None:
             if not self._candidate:
                 self._candidate = stock.tag
-                self._feedback_start = len(client.state.messages)
+                self._feedback_start = client.state.message_count
                 await client.examine(stock.tag)
                 self._examine_attempts = 1
                 recorder = getattr(client, "record_action", None)
@@ -3768,14 +3768,14 @@ class BuyGroundItemsTask(BotTask):
                 return
             quoted = "\n".join(
                 entry[3] for entry in
-                client.state.messages[self._feedback_start:]
+                client.state.messages_since(self._feedback_start)
                 if len(entry) > 3)
             cost = BuyShopUpgradeTask.parse_cost(quoted)
             if cost is None:
                 if now - self._examined_at <= 2.0:
                     return
                 if self._examine_attempts < 3:
-                    self._feedback_start = len(client.state.messages)
+                    self._feedback_start = client.state.message_count
                     await client.examine(self._candidate)
                     self._examine_attempts += 1
                     self._examined_at = now
@@ -4154,7 +4154,7 @@ class BuyShopUpgradeTask(BotTask):
                 self.complete()
                 return
             self._candidate = candidate.tag
-            self._feedback_start = len(client.state.messages)
+            self._feedback_start = client.state.message_count
             await client.examine(candidate.tag)
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
@@ -4162,7 +4162,7 @@ class BuyShopUpgradeTask(BotTask):
             self._examined_at = now
             return
         feedback = "\n".join(
-            entry[3] for entry in client.state.messages[self._feedback_start:]
+            entry[3] for entry in client.state.messages_since(self._feedback_start)
             if len(entry) > 3)
         cost = self.parse_cost(feedback)
         if cost is None:
@@ -4505,7 +4505,7 @@ class SellJunkTask(BotTask):
             self.fail(f"{item.name} is no longer in inventory")
             return
         self._pending = item.tag
-        self._feedback_start = len(client.state.messages)
+        self._feedback_start = client.state.message_count
         await client.move_item(0, item.tag, item.quantity)
         self._last_action = time.monotonic()
 
@@ -4546,7 +4546,7 @@ class SellItemsTask(BotTask):
             self.fail(f"refusing to sell unidentified item {item.name}")
             return
         self._pending = item.tag
-        self._feedback_start = len(client.state.messages)
+        self._feedback_start = client.state.message_count
         await client.move_item(0, item.tag, item.quantity)
         self._last_action = time.monotonic()
 
@@ -4556,7 +4556,7 @@ async def _confirm_shop_sale(task: SellJunkTask | SellItemsTask,
     """Confirm shop-floor payment; recover an item dropped elsewhere."""
     feedback = "\n".join(
         entry[3].casefold() for entry in
-        client.state.messages[task._feedback_start:] if len(entry) > 3)
+        client.state.messages_since(task._feedback_start) if len(entry) > 3)
     if "you receive" in feedback or "we're not interested" in feedback:
         return True
     item = client.state.items.get(task._pending)
@@ -4645,7 +4645,7 @@ class TempleServiceTask(BotTask):
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
-            self._feedback_start = len(client.state.messages)
+            self._feedback_start = client.state.message_count
         if not self._condition_present(client):
             setter = getattr(client, "set_depletion_points", None)
             if setter is not None and self.condition == "depletion":
@@ -4654,7 +4654,7 @@ class TempleServiceTask(BotTask):
             return
         feedback = "\n".join(
             entry[3].casefold() for entry in
-            client.state.messages[self._feedback_start:] if len(entry) > 3)
+            client.state.messages_since(self._feedback_start) if len(entry) > 3)
         if client.state.interface is not None:
             feedback += "\n" + client.state.interface.text.casefold()
         if "do not have enough money" in feedback:
@@ -4695,7 +4695,7 @@ class MassIdentifyTask(BotTask):
         policy = InventoryPolicy()
         if self.status == TaskStatus.READY:
             await self.start(client)
-            self._feedback_start = len(client.state.messages)
+            self._feedback_start = client.state.message_count
             self._unknown_tags = {
                 item.tag for item in client.state.inventory
                 if not item.flags & c.ITEM_UNPAID and
@@ -4711,7 +4711,7 @@ class MassIdentifyTask(BotTask):
             return
         feedback = "\n".join(
             entry[3].casefold() for entry in
-            client.state.messages[self._feedback_start:] if len(entry) > 3)
+            client.state.messages_since(self._feedback_start) if len(entry) > 3)
         if client.state.interface is not None:
             feedback += "\n" + client.state.interface.text.casefold()
         if "don't have enough money" in feedback or \
@@ -4843,7 +4843,7 @@ class RetrieveItemsTask(BotTask):
                 # closing it. Therefore always request it once and use the
                 # authoritative item packet (or explicit close feedback
                 # below), never infer player state from the visual flag.
-                self._feedback_start = len(client.state.messages)
+                self._feedback_start = client.state.message_count
                 await client.apply(container.tag)
                 self._opened = True
                 self._opened_at = now
@@ -4852,7 +4852,7 @@ class RetrieveItemsTask(BotTask):
         if not contents_known:
             feedback = "\n".join(
                 entry[3].casefold() for entry in
-                client.state.messages[self._feedback_start:]
+                client.state.messages_since(self._feedback_start)
                 if len(entry) > 3)
             if (not self._reopen_attempted and
                     re.search(r"\byou (?:close|leave) (?:the )?chest\b",
@@ -4861,7 +4861,7 @@ class RetrieveItemsTask(BotTask):
                 # the first application closed it. Apply once more to open it
                 # and establish a fresh response window.
                 self._reopen_attempted = True
-                self._feedback_start = len(client.state.messages)
+                self._feedback_start = client.state.message_count
                 await client.apply(container.tag)
                 self._opened_at = now
                 return
@@ -4911,13 +4911,13 @@ class BindSavebedTask(BotTask):
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
-        self.message_index = len(client.state.messages)
+        self.message_index = client.state.message_count
         self.arrived_at = time.monotonic()
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
-        for entry in client.state.messages[self.message_index:]:
+        for entry in client.state.messages_since(self.message_index):
             text = entry[3] if len(entry) > 3 else ""
             if self.CONFIRM.search(text):
                 # The server binds the respawn to the tile the player stands on.
@@ -4931,7 +4931,7 @@ class BindSavebedTask(BotTask):
                     client.state.apartment_bed_bound = m.path == STARTER_APARTMENT
                 self.complete()
                 return
-        self.message_index = len(client.state.messages)
+        self.message_index = client.state.message_count
         now = time.monotonic()
         if self.applied_at:
             if now - self.applied_at > 4.0:

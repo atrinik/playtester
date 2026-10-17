@@ -178,15 +178,14 @@ class ServerGameClock:
                 elapsed / self.real_seconds_per_game_minute) % (24 * 60)
 
     async def sync(self, client: AtrinikClient) -> bool:
-        messages = client.state.messages
-        for entry in messages[self.message_index:]:
+        for entry in client.state.messages_since(self.message_index):
             if len(entry) <= 3:
                 continue
             parsed = self.parse(entry[3])
             if parsed is not None:
                 self.anchor_minute = float(parsed)
                 self.anchor_at = self.clock()
-        self.message_index = len(messages)
+        self.message_index = client.state.message_count
         now = self.clock()
         due = (self.anchor_minute is None or self.last_request_at is None or
                now - self.last_request_at >= self.resync_seconds)
@@ -4726,8 +4725,7 @@ class FarmCircuitTask(BotTask):
             destination_xy=target[1], combat_approach=True)
 
     def _observe_disease(self, client: AtrinikClient) -> None:
-        messages = client.state.messages
-        for entry in messages[self._disease_message_index:]:
+        for entry in client.state.messages_since(self._disease_message_index):
             text = (entry[3] if len(entry) > 3 else "").casefold()
             if "you are healed from disease" in text:
                 self._disease_suspected = False
@@ -4737,7 +4735,7 @@ class FarmCircuitTask(BotTask):
                     "can't control your sphincter", "cannot control your sphincter",
                     "athelete's foot hit you", "athlete's foot hit you")):
                 self._disease_suspected = True
-        self._disease_message_index = len(messages)
+        self._disease_message_index = client.state.message_count
 
     @staticmethod
     def _disease_cures(client: AtrinikClient) -> list[Item]:

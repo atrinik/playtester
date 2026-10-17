@@ -119,6 +119,9 @@ class MapState:
     # levels above the player's current map.  ``tiles`` remains the depth-zero
     # compatibility view used by the navigation policy.
     level_tiles: dict[int, dict[tuple[int, int], Tile]] = field(default_factory=dict)
+    # Actor counts the server would not select, with the monotonic time until
+    # which they are no longer offered as targets.
+    ignored_targets: dict[int, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if 0 in self.level_tiles:
@@ -157,17 +160,22 @@ class MapState:
         self.level_tiles = shifted
         self.tiles = self.level_tiles.setdefault(0, {})
 
+    def target_ignored(self, target_id: int) -> bool:
+        return self.ignored_targets.get(target_id, 0.0) > time.monotonic()
+
     def targets(self, friendly: bool | None = None):
         for (x, y), tile in self.tiles.items():
             for obj in tile.targets:
-                if friendly is None or obj.is_friend == friendly:
+                if ((friendly is None or obj.is_friend == friendly) and
+                        not self.target_ignored(obj.target_id)):
                     yield x, y, obj
 
     def depth_targets(self, friendly: bool | None = None):
         for depth, tiles in self.level_tiles.items():
             for (x, y), tile in tiles.items():
                 for obj in tile.targets:
-                    if friendly is None or obj.is_friend == friendly:
+                    if ((friendly is None or obj.is_friend == friendly) and
+                            not self.target_ignored(obj.target_id)):
                         yield depth, x, y, obj
 
 
@@ -259,6 +267,10 @@ class GameState:
     game_millis_per_minute: int = 0
     interface: InterfaceState | None = None
     messages: list[tuple[float, int, str, str]] = field(default_factory=list)
+    # Messages trimmed from the front of ``messages``. Positions count from
+    # the first message ever received, so a watcher's position stays valid
+    # once the bounded history is full.
+    message_offset: int = 0
     books: list[bytes] = field(default_factory=list)
     quests: dict[str, QuestProgress] = field(default_factory=dict)
     quests_loaded: bool = False
@@ -277,7 +289,19 @@ class GameState:
 
     def add_message(self, msg_type: int, color: str, text: str) -> None:
         self.messages.append((time.time(), msg_type, color, text))
-        del self.messages[:-500]
+        excess = len(self.messages) - 500
+        if excess > 0:
+            del self.messages[:excess]
+            self.message_offset += excess
+
+    @property
+    def message_count(self) -> int:
+        """The position after the newest message."""
+        return self.message_offset + len(self.messages)
+
+    def messages_since(self, position: int) -> list[tuple[float, int, str, str]]:
+        """Messages from ``position`` on, as far as the history still holds."""
+        return self.messages[max(0, position - self.message_offset):]
 
     @property
     def inventory(self) -> list[Item]:

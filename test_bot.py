@@ -247,6 +247,47 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_targets_the_server_never_acknowledges_are_set_aside(self):
+        from .model import MapObject
+
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            sent = []
+
+            async def send(packet):
+                sent.append(packet.encode())
+
+            client.send = send
+            frog = MapObject(5, 315, 0, 0)
+            frog.name, frog.target_id = "giant frog", 1343754
+            client.state.map.tile(8, 7).objects[5] = frog
+            clock = [100.0]
+            with patch("atrinik_bot.client.time.monotonic", lambda: clock[0]), \
+                    patch("atrinik_bot.model.time.monotonic", lambda: clock[0]):
+                # Acknowledged targets are requested as often as needed.
+                for _ in range(10):
+                    client.state.target_id = 1343754
+                    await client.target(8, 7, 1343754)
+                    clock[0] += 1.0
+                self.assertEqual(len(sent), 10)
+                # Then the server stops selecting it (it now reports Sera).
+                client.state.target_id = 0
+                for _ in range(40):
+                    if client.action_history[-1]["action"] == "target-unresponsive":
+                        break
+                    await client.target(8, 7, 1343754)
+                    clock[0] += 0.5
+                # Requested from 110 s to 114.5 s, set aside at 115 s: six
+                # seconds after the last acknowledgement.
+                self.assertEqual(len(sent), 10 + 10)
+                self.assertEqual(clock[0], 115.5)
+                self.assertEqual(list(client.state.map.targets(friendly=False)), [])
+                # It is offered again after the pause.
+                clock[0] += client.UNRESPONSIVE_TARGET_SECONDS
+                self.assertEqual(len(list(client.state.map.targets(friendly=False))), 1)
+
+        asyncio.run(scenario())
+
     def test_targeted_talk_uses_exact_actor_identity_without_selection(self):
         async def scenario():
             client = AtrinikClient(ClientConfig())
@@ -3158,7 +3199,9 @@ class QuestTests(unittest.TestCase):
                 item = Item(77, location=9, name="small axe", quantity=1)
                 self.state = type("State", (), {
                     "inventory": [item], "items": {77: item},
-                    "player_tag": 9, "messages": [],
+                    "player_tag": 9, "messages": [], "message_offset": 0,
+                    "message_count": GameState.message_count,
+                    "messages_since": GameState.messages_since,
                 })()
                 self.moves = []
 
@@ -3207,7 +3250,9 @@ class QuestTests(unittest.TestCase):
                 item = Item(78, location=10, name="axe", quantity=1)
                 self.state = type("State", (), {
                     "inventory": [item], "items": {78: item},
-                    "player_tag": 10, "messages": [],
+                    "player_tag": 10, "messages": [], "message_offset": 0,
+                    "message_count": GameState.message_count,
+                    "messages_since": GameState.messages_since,
                 })()
                 self.moves = []
 
@@ -8656,6 +8701,10 @@ class QuestTests(unittest.TestCase):
 
         client.apply = apply
         client.set_savebed = persist
+        # A long session has already filled the bounded message history, so
+        # the confirmation replaces an old message instead of growing it.
+        for i in range(600):
+            client.state.add_message(2, "ffffff", f"You hit giant frog for {i}.")
         task = BindSavebedTask()
         asyncio.run(task.tick(client))
         self.assertEqual(client.applied, [800])
