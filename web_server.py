@@ -22,8 +22,7 @@ from .build_info import build_info
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
-from .farm_spots import farm_spot_catalog
-from .navigation import (FarmCircuitTask, NavigateTask, NavigateThenTask,
+from .navigation import (analyzer_spot_legs, FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
 from .quest_tasks import EscapingDesertedIslandTask
@@ -564,7 +563,7 @@ class DashboardState:
             "task": task_data, "last_task": self.engine.last_task,
             "map": self.map(), "inventory": inventory, "ground": ground,
             "skills": sorted(skills, key=lambda skill: (-skill["level"], skill["name"])),
-            "farm_spots": farm_spot_catalog(self.graph),
+            "farm_spots": self.analyzer_farm_spots(),
             "navigation_spots": navigation_spot_catalog(self.graph),
             "actions": self.client.action_history[-200:],
             "decisions": self.client.decision_history[-500:],
@@ -575,6 +574,24 @@ class DashboardState:
             "quest_journal": self.quest_journal(),
             "farming_analysis": self.farming_analysis(),
         }
+
+    def analyzer_farm_spots(self) -> list[dict[str, Any]]:
+        """The preferred objective's ranked spots, as manual farm circuits."""
+        analyzer = getattr(self.client, "farm_analyzer", None)
+        if analyzer is None:
+            return []
+        objective = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
+        spots = []
+        for rank, spot in enumerate(analyzer.ranking(objective), 1):
+            legs = analyzer_spot_legs(spot, self.graph)
+            if legs:
+                spots.append({
+                    "id": str(spot.get("path") or rank),
+                    "name": f"#{rank} {spot.get('name', '?')}",
+                    "circuit": [{"zone": zone, "target": target}
+                                for zone, target in legs],
+                })
+        return spots
 
     def farming_analysis(self) -> dict[str, Any]:
         analyzer = getattr(self.client, "farm_analyzer", None)
@@ -744,6 +761,17 @@ class WebControlServer:
         self.engine.set_task(task)
         return {"ok": True, "task": task.name}
 
+    def _ranked_spot(self, spot_id: str) -> dict[str, Any]:
+        """A spot from the analyzer's current ranking, for any objective."""
+        analyzer = getattr(self.client, "farm_analyzer", None)
+        if analyzer is not None:
+            for objective in OBJECTIVES:
+                for spot in analyzer.ranking(objective):
+                    if str(spot.get("path")) == spot_id and analyzer_spot_legs(
+                            spot, self.graph):
+                        return spot
+        raise ValueError("analyzer spot is no longer ranked")
+
     async def _set_task(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
         if kind == "stop":
@@ -824,6 +852,13 @@ class WebControlServer:
                     self.graph, zone, task, combat_approach=True)
             return await self._replace_task(task)
         if kind == "farm_circuit":
+            spot = None
+            if data.get("analyzer_spot"):
+                spot = self._ranked_spot(str(data["analyzer_spot"]))
+                # The server's own ranking is authoritative for analyzer spots.
+                data = dict(data, legs=[
+                    {"zone": zone, "target": target}
+                    for zone, target in analyzer_spot_legs(spot, self.graph)])
             raw_legs = data.get("legs", [])
             if not isinstance(raw_legs, list) or not raw_legs:
                 raise ValueError("farm circuit requires at least one leg")
@@ -848,7 +883,8 @@ class WebControlServer:
                 combat_skill_until_level=max(0, int(data.get(
                     "combat_skill_until_level", 0))),
                 clear_hostile_route=bool(data.get(
-                    "clear_hostile_route", False))))
+                    "clear_hostile_route", False)),
+                spot=spot))
         if kind == "sell_junk":
             merchant = str(data.get("merchant", "shop-floor")).strip() or "shop-floor"
             patterns = tuple(str(value) for value in data.get("patterns", []) if value)

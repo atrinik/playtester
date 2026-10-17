@@ -178,6 +178,25 @@ balanced, or safety. The choice is saved per character and needs no new run,
 because one run ranks every objective. The rates are model estimates for
 comparing spots, not live measurements.
 
+Autoplay always farms the preferred objective's #1 spot. There are no
+level bands or curated spots: the analyzer result's map paths become the
+circuit's legs (a multi-map circuit rotates through every map), and its listed
+monsters become the targets. Spots whose residents include aggressive spawns
+get cautious recovery margins (flee at 80% HP, heal at 95%) and isolated pulls
+from squares outside other residents' detection radii; other spots use 75%
+and 90%. Until the first ranking exists, autoplay holds position safely.
+The Tasks tab's **Farm** picker lists the same ranked spots.
+
+The only exceptions are live failures. A spot is quarantined for six hours,
+and autoplay moves to the next-ranked spot, after:
+
+- a death there (including on the way there);
+- an emergency recall there;
+- ten minutes there without any character XP;
+- a route there that the world graph cannot plan.
+
+When the analyzer gets a spot wrong, the fix belongs in the analyzer.
+
 ## Dependency and content boundaries
 
 The playtester source is independent of its external protocol, pathfinding,
