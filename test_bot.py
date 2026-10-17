@@ -8258,10 +8258,14 @@ class QuestTests(unittest.TestCase):
                          "/shattered_islands/world_3_58")
         self.assertEqual(service.navigation.destination_xy, (13, 13))
         self.assertEqual(service.navigation.tolerance, 1)
-        # Every way to the temple crosses pack-hazard swamp; the trip must
-        # still go, carefully.
-        self.assertTrue(service.navigation.allow_ranged_hazard_fallback)
+        # Every way to the temple crosses pack-hazard swamp. At level 7 the
+        # trip must not take the swamp fallback; from level 18 it must.
+        self.assertFalse(service.navigation.allow_ranged_hazard_fallback)
         self.assertEqual(service.safety.heal_below, 0.85)
+        client.state.stats["level"] = FarmCircuitTask.SWAMP_TRANSIT_LEVEL
+        self.assertTrue(circuit._new_depletion_service(
+            client).navigation.allow_ranged_hazard_fallback)
+        client.state.stats["level"] = 7
         self.assertTrue(graph.nodes[service.navigation.destination].walkable(
             *service.navigation.destination_xy))
         self.assertIsInstance(service.task, TempleServiceTask)

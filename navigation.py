@@ -3871,6 +3871,8 @@ class FarmCircuitTask(BotTask):
     FOOD_RESUPPLY_NUTRITION = 10_000
     FOOD_RESUPPLY_MAX_QUANTITY = 50
     DEPLETION_SERVICE_THRESHOLD = 3
+    # The character level from which trips may cross the crocodile swamps.
+    SWAMP_TRANSIT_LEVEL = 18
     MASS_IDENTIFY_BATCH_MINIMUM = 20
     MASS_IDENTIFY_COST = 1_450
     # Hybrid progression is deliberately staged.  Level 10 wizardry improves
@@ -4818,9 +4820,14 @@ class FarmCircuitTask(BotTask):
         task.navigation.tolerance = 1
         # The temple lies south of the Strakewood swamps, whose crocodile and
         # frog packs make every way there a pack-hazard map. Depletion keeps
-        # Sera weak until it is removed, so take the careful route through
-        # them rather than give up; the stricter safety policy heals early.
-        task.navigation.allow_ranged_hazard_fallback = True
+        # Sera weak until it is removed, so from the level the regional
+        # shopping trips already cross that crocodile habitat take the
+        # careful route through them rather than give up; the stricter
+        # safety policy heals early. Below it the trip still waits for a
+        # hazard-free route, since an early character cannot survive one.
+        level = int(client.state.stats.get("level", 0) or 0)
+        task.navigation.allow_ranged_hazard_fallback = (
+            level >= self.SWAMP_TRANSIT_LEVEL)
         return task
 
     def _queue_depletion_service(self, client: AtrinikClient) -> bool:
