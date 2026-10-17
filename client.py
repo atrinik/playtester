@@ -277,6 +277,11 @@ class AtrinikClient:
                 self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = bool(
                 record.get("apartment_bed_bound", False))
+            adaptations = record.get("farm_adaptations", {})
+            self.state.farm_adaptations = {
+                str(key): dict(value) for key, value in adaptations.items()
+                if isinstance(key, str) and isinstance(value, dict)
+            } if isinstance(adaptations, dict) else {}
             objective = record.get("farm_objective", DEFAULT_OBJECTIVE)
             self.state.farm_objective = (
                 objective if objective in OBJECTIVES else DEFAULT_OBJECTIVE)
@@ -315,6 +320,7 @@ class AtrinikClient:
             self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = False
             self.state.farm_objective = DEFAULT_OBJECTIVE
+            self.state.farm_adaptations = {}
             self.state.bank_balance = 0
             self.state.bank_balance_known = False
             self.state.bank_balance_observed_at = 0.0
@@ -418,6 +424,16 @@ class AtrinikClient:
             return
         self._runtime_memory.setdefault(character, {})[
             "vendor_quotes"] = dict(self.state.vendor_quotes)
+        self._persist_character_memory()
+
+    def set_farm_adaptation(self, key: str, record: dict) -> None:
+        """Persist what the character learned at one farm spot."""
+        self.state.farm_adaptations[key] = dict(record)
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})["farm_adaptations"] = {
+            spot: dict(value) for spot, value in self.state.farm_adaptations.items()}
         self._persist_character_memory()
 
     def set_farm_objective(self, objective: str) -> None:

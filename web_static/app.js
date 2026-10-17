@@ -121,7 +121,7 @@ let lastFarmingSig = "";
 function renderFarming() {
   const fa = slow.farming_analysis;
   if (!fa) return;
-  const sig = JSON.stringify([fa.status, fa.objective, fa.finished_at, fa.error, fa.running]);
+  const sig = JSON.stringify([fa.status, fa.objective, fa.finished_at, fa.error, fa.running, fa.self_improvement]);
   const status = $("#fa-status");
   status.classList.toggle("warn-text", fa.status === "failed" || fa.status === "unsupported");
   status.textContent = fa.running ? "Analyzing…"
@@ -144,6 +144,17 @@ function renderFarming() {
       <div class="spot-metrics"><span title="Estimated XP per hour">XP ${rate(r.xp_hour)}/h</span><span title="Estimated money per hour">${coins(r.money_hour)}/h</span><span title="Estimated loot value per hour">Loot ${rate(r.loot_hour)}/h</span><span title="Estimated incoming damage per clear">Danger ${Math.round(+r.danger || 0)}</span></div>
       <small class="muted">${esc((r.monsters || []).slice(0, 5).join(", "))}${(r.monsters || []).length > 5 ? " …" : ""}</small>
     </div>`).join("") || '<span class="muted">No ranking yet.</span>';
+  const learning = fa.self_improvement || {};
+  const goals = learning.goals || {};
+  const goalText = [goals.area_spells ? "area spells for packs" : "",
+    goals.offence ? "better weapon and armour" : "", goals.healing ? "more healing" : "",
+    ...Object.keys(goals.protection || {}).map(k => `${k} protection`)].filter(Boolean).join(", ");
+  $("#fa-learning").innerHTML = ((learning.spots || []).map(s => `
+    <div class="spot">
+      <div class="spot-head"><b>${esc(s.spot.split("|")[0].replace(/^.*\//, ""))}</b><span class="flag">adaptation ${s.level}/${s.max_level}</span></div>
+      ${(s.reviews || []).slice().reverse().map(r => `<small>${new Date(r.time * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${esc(r.kind)} · <b>${esc(r.cause)}</b>: ${esc(r.detail)}${(r.remedies || []).length ? ` → ${esc(r.remedies.join(", "))}` : ""}</small>`).join("")}
+    </div>`).join("") + (goalText ? `<small class="muted">Improvement goals: ${esc(goalText)}</small>` : ""))
+    || '<span class="muted">No deaths or emergency recalls to learn from yet.</span>';
 }
 $("#fa-objectives").addEventListener("click", e => {
   const b = e.target.closest("button[data-objective]");

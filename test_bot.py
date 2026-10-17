@@ -10353,35 +10353,66 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         circuit.child = circuit._new_child()
         return circuit
 
-    def test_death_and_emergency_recall_exclude_the_pick_and_reselect(self):
+    def test_failures_at_an_analyzer_spot_teach_instead_of_excluding_it(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
         pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
-        upper = analyzer_spot("Upper", [self.UPPER], ["evil treant L16"])
-        for action, quarantined, survivor in (
-                ("death", self.TREES, "Pocket"),
-                ("emergency-recall", self.TREES, "Pocket")):
-            with self.subTest(action=action):
-                client = self.client({"xp": [trees, pocket, upper]})
-                circuit = self.circuit(client, trees)
-                farm = circuit.child.task
-                client.decision_history.append({
-                    "time": time.time() + 1, "action": action, "detail": "",
-                    "task": "", "map": quarantined})
-                self.assertTrue(circuit._observe_farm_death(client))
-                self.assertGreater(client.state.farm_zone_quarantine[quarantined], time.time())
-                self.assertTrue(circuit._upgrade_progression(client, farm))
-                self.assertEqual(circuit.spot["name"], survivor)
-                self.assertEqual(circuit.legs[0][0], self.POCKET)
-                self.assertIn("farm-spot-selected",
-                              [record["action"] for record in client.decision_history])
-        # Once the pick is reached, a failure elsewhere does not exclude it.
-        client = self.client({"xp": [trees]})
+        client = self.client({"xp": [trees, pocket]})
         circuit = self.circuit(client, trees)
-        circuit.child.navigation.complete()
+        farm = circuit.child.task
+        base = (farm.safety.flee_below, farm.safety.heal_below)
+        # Two treants hitting at once, then a death on the spot.
+        client.state.add_message(2, "ff0000", "evil treant hit you for 30 (-30) impact damage.")
+        client.state.add_message(2, "ff0000", "quickwood hit you for 20 (-20) impact damage.")
         client.decision_history.append({
             "time": time.time() + 1, "action": "death", "detail": "",
+            "task": "", "map": self.TREES})
+        self.assertFalse(circuit._observe_farm_death(client))
+        self.assertNotIn(self.TREES, client.state.farm_zone_quarantine)
+        record = client.state.farm_adaptations[trees["path"]]
+        self.assertEqual(record["level"], 1)
+        self.assertEqual(record["causes"], {"pack": 1})
+        self.assertEqual(record["reviews"][-1]["peak_attackers"], 2)
+        self.assertIn("area spells for packs", record["reviews"][-1]["remedies"])
+        rebuilt = circuit.child.task
+        self.assertIsNot(rebuilt, farm)
+        self.assertEqual((rebuilt.safety.flee_below, rebuilt.safety.heal_below),
+                         (round(base[0] + 0.03, 6), round(base[1] + 0.02, 6)))
+        self.assertIn("farm-failure-review",
+                      [entry["action"] for entry in client.decision_history])
+        # The analyzer's pick is unchanged: the spot is kept.
+        self.assertFalse(circuit._upgrade_progression(client, rebuilt))
+        self.assertEqual(circuit.spot["name"], "Trees")
+        # An emergency recall there teaches again.
+        client.decision_history.append({
+            "time": time.time() + 2, "action": "emergency-recall", "detail": "",
+            "task": "", "map": self.TREES})
+        self.assertFalse(circuit._observe_farm_death(client))
+        self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
+        # Once the pick is reached, a failure elsewhere does not count.
+        circuit.child.navigation.complete()
+        client.decision_history.append({
+            "time": time.time() + 3, "action": "death", "detail": "",
             "task": "", "map": "/elsewhere"})
         self.assertFalse(circuit._observe_farm_death(client))
+        self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
+
+    def test_repeated_failures_at_maximum_adaptation_pause_the_spot_briefly(self):
+        from . import self_improvement
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        client = self.client({"xp": [trees, pocket]})
+        now = time.time()
+        client.state.farm_adaptations = {trees["path"]: {
+            "level": self_improvement.MAX_LEVEL, "failures": [now - 600, now - 300]}}
+        circuit = self.circuit(client, trees)
+        client.decision_history.append({
+            "time": now + 1, "action": "death", "detail": "", "task": "", "map": self.TREES})
+        self.assertTrue(circuit._observe_farm_death(client))
+        until = client.state.farm_zone_quarantine[self.TREES]
+        self.assertAlmostEqual(until - now, self_improvement.PAUSE_SECONDS, delta=10)
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.spot["name"], "Pocket")
 
     def test_no_xp_for_ten_minutes_excludes_any_analyzer_pick(self):
         now = [1000.0]
@@ -10479,6 +10510,80 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual((circuit.child.task.safety.flee_below,
                           circuit.child.task.safety.heal_below),
                          FarmCircuitTask.PASSIVE_SAFETY)
+
+
+class SelfImprovementTests(unittest.TestCase):
+    SPOT = "/shattered_islands/world_1_50"
+
+    def review(self, lines, decisions=(), *, failure_map=None, action="death"):
+        from .self_improvement import review_failure
+
+        now = 1000.0
+        messages = [(now - 30 + index, 2, "ff0000", text) for index, text in enumerate(lines)]
+        failure = {"time": now, "action": action, "map": failure_map or self.SPOT}
+        return review_failure(messages, list(decisions), failure, [self.SPOT])
+
+    def test_review_classifies_what_went_wrong(self):
+        pack = self.review(["giant frog hit you for 20 (-20) slash damage.",
+                            "crocodile hit you for 25 (-25) pierce damage.",
+                            "giant frog hit you for 18 (-18) slash damage."])
+        self.assertEqual((pack.cause, pack.peak_attackers), ("pack", 2))
+        self.assertEqual(pack.attackers, {"giant frog": 2, "crocodile": 1})
+        self.assertEqual(pack.damage_taken, 63)
+        starved = self.review(
+            ["crocodile hit you for 25 (-25) pierce damage."],
+            [{"time": 990.0, "action": "emergency-disengage",
+              "detail": "hp=40/188 sp=3 next-heal=8 target=7"}])
+        self.assertEqual(starved.cause, "resources")
+        burned = self.review(["fire wyvern hit you for 60 (-60) fire damage.",
+                              "fire wyvern hit you for 20 (-20) slash damage."])
+        self.assertEqual(burned.cause, "damage-type:fire")
+        self.assertEqual(burned.damage_by_type, {"fire": 60, "slash": 20})
+        beaten = self.review(["ogre hit you for 50 (-50) impact damage."])
+        self.assertEqual(beaten.cause, "out-damaged")
+        self.assertIn("ogre", beaten.detail)
+        route = self.review(["ogre hit you for 50 (-50) impact damage."],
+                            failure_map="/shattered_islands/world_2_50")
+        self.assertEqual(route.cause, "route")
+        # Messages outside the review window are ignored.
+        from .self_improvement import review_failure
+        old = review_failure([(100.0, 2, "", "giant frog hit you for 1 (-1) slash damage.")],
+                             [], {"time": 1000.0, "action": "death", "map": self.SPOT},
+                             [self.SPOT])
+        self.assertEqual(old.damage_taken, 0)
+
+    def test_learning_raises_the_level_and_pauses_only_as_a_last_resort(self):
+        from . import self_improvement as si
+
+        review = self.review(["ogre hit you for 50 (-50) impact damage."])
+        record, pause = si.learn({}, review, now=1000.0)
+        self.assertEqual((record["level"], pause), (1, False))
+        for _ in range(si.MAX_LEVEL + 2):
+            record, pause = si.learn(record, review, now=1000.0)
+        self.assertEqual(record["level"], si.MAX_LEVEL)
+        self.assertTrue(pause)
+        self.assertLessEqual(len(record["reviews"]), si.KEEP_REVIEWS)
+        # Old failures age out of the pause window.
+        record["failures"] = [1000.0 - si.PAUSE_WINDOW_SECONDS - 1] * 2
+        _, pause = si.learn(record, review, now=1000.0)
+        self.assertFalse(pause)
+
+    def test_margins_tighten_per_level_up_to_their_caps(self):
+        from . import self_improvement as si
+
+        self.assertEqual(si.margins(0, 0.80, 0.95), (0.80, 0.95))
+        self.assertEqual(tuple(round(v, 6) for v in si.margins(2, 0.80, 0.95)),
+                         (0.86, 0.98))
+        self.assertEqual(si.margins(99, 0.80, 0.95), (si.FLEE_CAP, si.HEAL_CAP))
+
+    def test_goals_aggregate_what_to_improve_across_spots(self):
+        from .self_improvement import improvement_goals
+
+        goals = improvement_goals({
+            "a": {"causes": {"pack": 2, "damage-type:fire": 1}},
+            "b": {"causes": {"out-damaged": 3, "resources": 1, "damage-type:fire": 2}}})
+        self.assertEqual(goals, {"area_spells": True, "protection": {"fire": 3},
+                                 "offence": 3, "healing": 1})
 
 
 class BuildInfoTests(unittest.TestCase):
@@ -10645,10 +10750,21 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 400)
 
     async def test_dashboard_serves_farming_analysis_and_persists_the_objective(self):
+        self.client.state.farm_adaptations = {
+            "/old": {"level": 1, "updated_at": 1.0, "causes": {"out-damaged": 1}},
+            "/trees": {"level": 2, "updated_at": 2.0,
+                       "causes": {"pack": 2, "damage-type:fire": 1},
+                       "reviews": [{"cause": "pack"}] * 5}}
         status, payload = await self.request("GET", "/api/state?include=farming_analysis")
         self.assertEqual(status, 200)
         analysis = json.loads(payload)["farming_analysis"]
         self.assertEqual(analysis["status"], "unavailable")
+        learning = analysis["self_improvement"]
+        self.assertEqual([spot["spot"] for spot in learning["spots"]], ["/trees", "/old"])
+        self.assertEqual(learning["spots"][0]["level"], 2)
+        self.assertEqual(len(learning["spots"][0]["reviews"]), 3)
+        self.assertEqual(learning["goals"], {"area_spells": True, "protection": {"fire": 1},
+                                             "offence": 1, "healing": 0})
         self.assertEqual(analysis["objective"], "xp")
         self.assertIn("money", analysis["objectives"])
         status, payload = await self.request(
@@ -10846,7 +10962,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=16", page)
+        self.assertIn(b"/app.js?v=17", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

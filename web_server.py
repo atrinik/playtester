@@ -20,6 +20,7 @@ from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
 from .autoplay import AutoplayTask
 from .build_info import build_info
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
+from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
 from .navigation import (analyzer_spot_legs, FarmCircuitTask, NavigateTask, NavigateThenTask,
@@ -597,9 +598,23 @@ class DashboardState:
         analyzer = getattr(self.client, "farm_analyzer", None)
         objective = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
         if analyzer is None:
-            return {"status": "unavailable", "objective": objective,
-                    "objectives": OBJECTIVES, "ranking": []}
-        return analyzer.snapshot(objective)
+            snapshot = {"status": "unavailable", "objective": objective,
+                        "objectives": OBJECTIVES, "ranking": []}
+        else:
+            snapshot = dict(analyzer.snapshot(objective))
+        adaptations = getattr(self.client.state, "farm_adaptations", {}) or {}
+        recent = sorted(adaptations.items(),
+                        key=lambda item: float(item[1].get("updated_at", 0) or 0),
+                        reverse=True)[:3]
+        snapshot["self_improvement"] = {
+            "spots": [{"spot": key, "level": record.get("level", 0),
+                       "max_level": self_improvement.MAX_LEVEL,
+                       "causes": record.get("causes", {}),
+                       "reviews": list(record.get("reviews", ()))[-3:]}
+                      for key, record in recent],
+            "goals": self_improvement.improvement_goals(adaptations),
+        }
+        return snapshot
 
 
 class WebControlServer:
