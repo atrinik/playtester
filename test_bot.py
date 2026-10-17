@@ -8235,24 +8235,48 @@ class QuestTests(unittest.TestCase):
             graph.nodes[path] = node
         graph.nodes["/west"].edges.append(MapEdge("/west", "/east", 10, 5, kind="tile"))
         graph.nodes["/east"].edges.append(MapEdge("/east", "/farm", 9, 9, 0, 0))
-        # (5, 9) -> seam at (10, 9) costs 6 (5 steps + 1), arriving at
-        # east (0, 9); from there the exit at (9, 9) costs 10 (9 + 1).
-        self.assertEqual(savebed_walk(graph, "/west", (5, 9), ["/farm"]), 16)
+        # (5, 9) -> border (9, 9) is 4 moves and the seam 1 more, arriving
+        # at east (0, 9); from there the exit at (9, 9) is 9 moves.
+        self.assertEqual(savebed_walk(graph, "/west", (5, 9), ["/farm"]), 14)
+
+    def test_savebed_walk_follows_walls_and_every_circuit_leg(self):
+        from .navigation import savebed_walk
+
+        # A wall forces a detour that the straight line would miss, and the
+        # second circuit map (two transitions away) is the nearer walk.
+        graph = WorldGraph()
+        bed = MapNode("/bed", width=10, height=10)
+        bed.terrain = {(x, y): 1 for x in range(10) for y in range(10)}
+        bed.blocked = {(5, y) for y in range(9)}
+        graph.nodes["/bed"] = bed
+        for path in ("/a", "/b", "/c"):
+            node = MapNode(path, width=10, height=1)
+            node.terrain = {(x, 0): 1 for x in range(10)}
+            graph.nodes[path] = node
+        bed.edges.append(MapEdge("/bed", "/a", 9, 0, 0, 0))
+        bed.edges.append(MapEdge("/bed", "/c", 0, 1, 0, 0))
+        graph.nodes["/c"].edges.append(MapEdge("/c", "/b", 1, 0, 0, 0))
+        # To /a: around the wall at x=5 via row 9 is 9 + 9 moves (not 9).
+        self.assertEqual(savebed_walk(graph, "/bed", (0, 0), ["/a"]), 18)
+        # /b via /c is 1 + 1 moves, nearer although one transition farther.
+        self.assertEqual(savebed_walk(graph, "/bed", (0, 0), ["/a", "/b"]), 2)
 
     def test_nearest_savebed_prefers_the_shortest_usable_walk(self):
         from .navigation import nearest_savebed, savebed_walk
 
         graph = self.savebed_graph()
-        self.assertEqual(savebed_walk(graph, "/inn", (1, 0), ["/farm"]), 3)
-        self.assertEqual(savebed_walk(graph, STARTER_APARTMENT, (1, 0), ["/farm"]), 63)
-        # The equally close private apartment belongs to someone else.
-        self.assertEqual(nearest_savebed(graph, ["/farm"]), ("/inn", (1, 0), 3))
+        # Two moves to the exit on (3, 0); stepping onto it is the transfer.
+        self.assertEqual(savebed_walk(graph, "/inn", (1, 0), ["/farm"]), 2)
+        self.assertEqual(savebed_walk(graph, STARTER_APARTMENT, (1, 0), ["/farm"]), 61)
+        # The inn's other bed, one tile nearer its exit, wins; the equally
+        # close private apartment belongs to someone else.
+        self.assertEqual(nearest_savebed(graph, ["/farm"]), ("/inn", (2, 0), 1))
         self.assertEqual(nearest_savebed(graph, ["/farm"], excluded={"/inn"}),
-                         (STARTER_APARTMENT, (1, 0), 63))
+                         (STARTER_APARTMENT, (1, 0), 61))
         self.assertEqual(
             nearest_savebed(graph, ["/farm"], excluded={"/inn"},
                             owned={STARTER_APARTMENT, "/shattered_islands/x/apartments/private"}),
-            ("/shattered_islands/x/apartments/private", (1, 0), 3))
+            ("/shattered_islands/x/apartments/private", (1, 0), 2))
         # A bed with no route to the spot is never chosen.
         graph.nodes["/inn"].edges.clear()
         self.assertEqual(nearest_savebed(graph, ["/farm"])[0], STARTER_APARTMENT)
@@ -8269,9 +8293,9 @@ class QuestTests(unittest.TestCase):
         self.assertTrue(decisions[-1])
         binding = circuit._new_savebed(client)
         self.assertEqual(binding.navigation.destination, "/inn")
-        self.assertEqual(binding.navigation.destination_xy, (1, 0))
+        self.assertEqual(binding.navigation.destination_xy, (2, 0))
         self.assertIsInstance(binding.task, BindSavebedTask)
-        client.state.savebed_map, client.state.savebed_xy = "/inn", (1, 0)
+        client.state.savebed_map, client.state.savebed_xy = "/inn", (2, 0)
         circuit._savebed_search(client).run()
         self.assertFalse(circuit._needs_savebed(client))
         # Never bound yet: any reachable bed beats the default spawn.
@@ -8280,21 +8304,21 @@ class QuestTests(unittest.TestCase):
         self.assertTrue(circuit._needs_savebed(client))
         # A failed bed tile is skipped for another in the same room first,
         # then for the next-nearest map.
-        circuit._bed_failed.add(("/inn", (1, 0)))
-        self.assertEqual(circuit._savebed_search(client).run().result,
-                         ("/inn", (2, 0), 2))
         circuit._bed_failed.add(("/inn", (2, 0)))
+        self.assertEqual(circuit._savebed_search(client).run().result,
+                         ("/inn", (1, 0), 2))
+        circuit._bed_failed.add(("/inn", (1, 0)))
         self.assertEqual(circuit._savebed_search(client).run().result[0], STARTER_APARTMENT)
 
     def test_farm_circuit_keeps_a_savebed_that_is_nearly_as_close(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["level"] = 8
-        # The starter apartment is 18 tiles out; the inn's 3 saves under 20.
+        # The starter apartment is 16 moves out; the inn's 1 saves under 20.
         client.state.savebed_map, client.state.savebed_xy = STARTER_APARTMENT, (1, 0)
         circuit = FarmCircuitTask(self.savebed_graph(far_width=15), [("/farm", "rat")])
         search = circuit._savebed_search(client).run()
-        self.assertEqual((search.result, search.current_walk), (("/inn", (1, 0), 3), 18))
+        self.assertEqual((search.result, search.current_walk), (("/inn", (2, 0), 1), 16))
         self.assertFalse(circuit._needs_savebed(client))
 
     def test_real_strakewood_circuit_prefers_a_public_bed_over_the_far_apartment(self):
