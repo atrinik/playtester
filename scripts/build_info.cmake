@@ -10,19 +10,32 @@ set(describe "")
 set(commit "")
 set(dirty false)
 if (GIT_EXECUTABLE)
+    # Only this source tree's own repository counts: a copy without .git that
+    # sits inside another worktree must not report the enclosing commit.
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" rev-parse HEAD
-        OUTPUT_VARIABLE commit OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE commit_result ERROR_QUIET)
-    if (NOT commit_result EQUAL 0)
-        set(commit "")
+        COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" rev-parse --show-toplevel
+        OUTPUT_VARIABLE toplevel OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE toplevel_result ERROR_QUIET)
+    if (toplevel_result EQUAL 0)
+        file(REAL_PATH "${toplevel}" toplevel)
+        file(REAL_PATH "${SOURCE_DIR}" source_real)
+        if (toplevel STREQUAL source_real)
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" rev-parse HEAD
+                OUTPUT_VARIABLE commit OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE commit_result ERROR_QUIET)
+            if (NOT commit_result EQUAL 0)
+                set(commit "")
+            endif ()
+        endif ()
     endif ()
 endif ()
 if (commit)
     # Semantic-release tags every release commit as vMAJOR.MINOR.PATCH.
+    # --always keeps a result (and its -dirty suffix) when no tag is reachable.
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" describe --tags --long
-                --match "v[0-9]*" --abbrev=7 --dirty
+                --match "v[0-9]*" --abbrev=7 --always --dirty
         OUTPUT_VARIABLE describe OUTPUT_STRIP_TRAILING_WHITESPACE
         RESULT_VARIABLE describe_result ERROR_QUIET)
     if (NOT describe_result EQUAL 0)

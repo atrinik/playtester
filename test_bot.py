@@ -10757,8 +10757,8 @@ class BuildInfoTests(unittest.TestCase):
                      "-c", "tag.gpgsign=false", *args],
                     check=True, capture_output=True, text=True).stdout.strip()
 
-            def record():
-                subprocess.run([cmake, f"-DSOURCE_DIR={repo}", f"-DOUTPUT={output}",
+            def record(source=repo):
+                subprocess.run([cmake, f"-DSOURCE_DIR={source}", f"-DOUTPUT={output}",
                                 "-P", str(script)], check=True, capture_output=True)
                 return describe_build(json.loads(output.read_text()))
 
@@ -10766,6 +10766,20 @@ class BuildInfoTests(unittest.TestCase):
             (repo / "file").write_text("one\n")
             run("add", "file")
             run("commit", "-q", "-m", "one")
+            head = run("rev-parse", "HEAD")
+            # No release tag yet: still the commit, and local edits still show.
+            (repo / "file").write_text("edited\n")
+            build = record()
+            self.assertEqual((build["tag"], build["commit"], build["dirty"]),
+                             ("", head, True))
+            self.assertEqual(build["label"], f"unreleased · {head[:7]} (modified)")
+            run("checkout", "-q", "--", "file")
+            self.assertFalse(record()["dirty"])
+            # A copy without its own .git inside another worktree is unknown.
+            nested = repo / "vendored"
+            nested.mkdir()
+            self.assertEqual(record(nested)["label"], "unknown build")
+            nested.rmdir()
             run("tag", "v1.2.3")
             head = run("rev-parse", "HEAD")
             self.assertEqual(record()["label"], f"v1.2.3 · {head[:7]}")
