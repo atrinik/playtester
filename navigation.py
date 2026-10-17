@@ -1716,13 +1716,13 @@ class NavigateTask(BotTask):
                          if self.TILED_LEVEL_MAP.fullmatch(path)}
                 route = None
                 if tiled:
+                    # Only this retry lifts them; later tiers relax other
+                    # hazards first and keep avoiding dense tunnels.
                     try:
                         route = self.graph.route_points(*args, **{
                             **kwargs, "avoided_maps": kwargs["avoided_maps"] - tiled})
                     except ValueError:
                         route = None
-                    pack_hazards = pack_hazards - tiled
-                    protected_hazards = protected_hazards - tiled
                 if route is None and overlevel_hazards:
                     fallback_kwargs = dict(kwargs)
                     fallback_kwargs["avoided_maps"] = protected_hazards
@@ -2742,7 +2742,10 @@ class NavigateThenTask(BotTask):
         position = (m.path, m.world_x, m.world_y)
         if position != self._last_position:
             self._last_position = position
-            self._last_moved_at = time.monotonic()
+            # Steps taken while defending (kiting, closing in, retreating)
+            # are not route progress: they must not end the last resort.
+            if not self._defending:
+                self._last_moved_at = time.monotonic()
         cx, cy = m.width // 2, m.height // 2
         threats = []
         node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
@@ -2837,6 +2840,27 @@ class NavigateThenTask(BotTask):
                  (self.navigation.status == TaskStatus.FAILED or
                   time.monotonic() - self._last_moved_at >=
                   self.TRANSIT_CORNERED_SECONDS)))
+        combat_released = False
+        if hold_fire:
+            engaged = (self.task._engaged_target
+                       if isinstance(self.task, FarmTask) else None)
+            abandoned = self._last_pull_target or (engaged[0] if engaged else 0)
+            if abandoned:
+                # Drop the engagement entirely, wherever the creature is: a
+                # kept FarmTask engagement would hold patrol and steer
+                # retreats around a creature left behind on this map.
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("navigation-transit-hold-fire",
+                             f"target={abandoned}")
+                self._last_pull_target = 0
+                if engaged is not None:
+                    self.task._engaged_target = None
+                if getattr(client.state, "combat", False):
+                    await client.set_combat(False)
+                    combat_released = True
+                if getattr(client.state, "target_id", 0):
+                    await client.clear_target()
         if await self._abandon_stalled_transit_target(client, committed):
             return True
         hp = client.state.stats.get("hp", 0)
@@ -3016,27 +3040,6 @@ class NavigateThenTask(BotTask):
                 await self._retreat_step(
                     client, nearby, avoid_backtrack=True)
             return True
-        combat_released = False
-        if hold_fire:
-            engaged = (self.task._engaged_target
-                       if isinstance(self.task, FarmTask) else None)
-            abandoned = self._last_pull_target or (engaged[0] if engaged else 0)
-            if abandoned:
-                # Drop the engagement entirely, wherever the creature is: a
-                # kept FarmTask engagement would hold patrol and steer
-                # retreats around a creature left behind on this map.
-                recorder = getattr(client, "record_action", None)
-                if recorder is not None:
-                    recorder("navigation-transit-hold-fire",
-                             f"target={abandoned}")
-                self._last_pull_target = 0
-                if engaged is not None:
-                    self.task._engaged_target = None
-                if getattr(client.state, "combat", False):
-                    await client.set_combat(False)
-                    combat_released = True
-                if getattr(client.state, "target_id", 0):
-                    await client.clear_target()
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.
             self._halo_threats(client, nearby, radius=1)
