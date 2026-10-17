@@ -337,6 +337,30 @@ class CompatibilityTests(unittest.TestCase):
                                             message):
                     compatibility.load_lock(location)
 
+    def test_dependencies_cli_forwards_every_offline_archive(self) -> None:
+        from . import cli
+
+        argv = ["atrinik-playtester", "dependencies", "--source-archive", "s.tar.gz",
+                "--runtime-archive", "r.tar.gz", "--analyzer-archive", "a.tar.gz",
+                "--server-archive", "c.tar.gz", "--offline"]
+        captured = {}
+
+        def fake_install(cache, lock, **kwargs):
+            captured.update(kwargs)
+            return {"root": Path("/b"), "runtime": Path("/b/runtime"),
+                    "source": Path("/b/source")}
+
+        with mock.patch.object(cli, "install_bundle", fake_install), \
+                mock.patch.object(cli, "load_lock", return_value={
+                    "inputs": {"content": {"revision": "7" * 40}}}), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch("builtins.print"):
+            cli.main()
+        self.assertEqual(captured, {
+            "source_archive": Path("s.tar.gz"), "runtime_archive": Path("r.tar.gz"),
+            "analyzer_archive": Path("a.tar.gz"), "server_archive": Path("c.tar.gz"),
+            "offline": True})
+
     def test_install_is_atomic_and_reusable_offline(self) -> None:
         source, runtime, lock = self.valid_inputs()
         cache = self.root / "cache"

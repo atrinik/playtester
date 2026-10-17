@@ -10804,7 +10804,7 @@ print(json.dumps({"results": rankings["xp"], "rankings": rankings, "args": args}
 
 class FarmAnalyzerTests(unittest.TestCase):
     @staticmethod
-    def client(*, skill="slash weapons", level=22, dam=44):
+    def client(*, skill="slash weapons", level=22, dam=44, speed=0.8):
         from .farm_analyzer import OBJECTIVES  # noqa: F401  (import check)
 
         client = AtrinikClient(ClientConfig())
@@ -10815,7 +10815,7 @@ class FarmAnalyzerTests(unittest.TestCase):
         state.items = {10: weapon, 11: school}
         state.equipment = {c.EQUIP_WEAPON: 10}
         state.stats.update({"dam": dam, "wc": 31, "weapon_speed": 2.25, "level": 22,
-                            "maxhp": 188, "speed": 0.8, "ac": 37})
+                            "maxhp": 188, "speed": speed, "ac": 37})
         names = list(c.ATTACK_NAMES)
         state.protections = {names.index("slash"): 49, names.index("weapon_magic"): 7}
         return client
@@ -10861,6 +10861,8 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertFalse(base.materially_differs(combat_profile(self.client(dam=46))))
         self.assertTrue(base.materially_differs(combat_profile(self.client(dam=50))))
         self.assertTrue(base.materially_differs(combat_profile(self.client(level=23))))
+        self.assertFalse(base.materially_differs(combat_profile(self.client(speed=0.82))))
+        self.assertTrue(base.materially_differs(combat_profile(self.client(speed=0.9))))
         self.assertTrue(base.materially_differs(None))
 
     def test_background_run_ranks_every_objective_without_blocking(self):

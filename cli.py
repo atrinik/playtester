@@ -68,6 +68,10 @@ def parser() -> argparse.ArgumentParser:
         "dependencies", help="install the immutable compatibility bundle")
     dependencies.add_argument("--source-archive", type=Path)
     dependencies.add_argument("--runtime-archive", type=Path)
+    dependencies.add_argument("--analyzer-archive", type=Path,
+                              help="pre-downloaded farming analyzer release asset")
+    dependencies.add_argument("--server-archive", type=Path,
+                              help="pre-downloaded Classic server source archive")
     dependencies.add_argument("--offline", action="store_true")
     dependencies.add_argument("--json", action="store_true")
     preflight = sub.add_parser(
@@ -273,6 +277,8 @@ def main() -> None:
                 lock,
                 source_archive=args.source_archive,
                 runtime_archive=args.runtime_archive,
+                analyzer_archive=args.analyzer_archive,
+                server_archive=args.server_archive,
                 offline=args.offline,
             )
         except CompatibilityError as error:

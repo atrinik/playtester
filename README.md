@@ -68,15 +68,18 @@ overridden with `--cache` or `ATRINIK_PLAYTESTER_CACHE`.
 /path/to/playtester-environment/bin/atrinik-playtester preflight
 ```
 
-`dependencies` downloads the source and Classic-runtime release archives over
-HTTPS, verifies their immutable SHA-256 coordinates, validates their bounded
-layouts, and installs both as one atomic cache generation. To seed a machine
+`dependencies` downloads the content source and Classic-runtime archives, the
+farming analyzer release asset, and the Classic server source archive over
+HTTPS. It verifies their immutable SHA-256 coordinates, validates their bounded
+layouts, and installs all four as one atomic cache generation. To seed a machine
 from already downloaded files without network access:
 
 ```sh
 atrinik-playtester dependencies \
   --source-archive /media/atrinik-content-1.14.0.tar.gz \
   --runtime-archive /media/atrinik-content-1.14.0-classic-runtime.tar.gz \
+  --analyzer-archive /media/atrinik-tools-farming-analyzer-3.8.0.tar.gz \
+  --server-archive /media/atrinik-classic-server-5.99.0.tar.gz \
   --offline
 ```
 
@@ -162,7 +165,7 @@ farming analyzer instead of hard-coded level bands. The dependency installer
 caches its release asset and the Classic server source whose experience tables
 it reads. During `web` and `autoplay`, a background task checks the character
 every 30 seconds. When the killing weapon school's level, the player doll's DAM,
-WC, weapon speed, max HP, AC or protections change materially, or the last
+WC, weapon speed, movement speed, max HP, AC or protections change materially, or the last
 ranking is six hours old, it starts one `nice` analyzer process with
 `--ranking all --json` (about 10 to 30 seconds) while the bot keeps playing.
 Runs are at least ten minutes apart, failures back off for fifteen minutes, and
