@@ -161,6 +161,9 @@ class AutoplayTask(BotTask):
                 if recorder is not None:
                     recorder("autoplay-disconnect",
                              f"{self.phase}: {self.child.name}")
+                if self.phase == "mana-crystal-recovery":
+                    # The interrupted recovery never ran to an outcome.
+                    self._mana_recovery_attempted = False
                 self.child = None
                 raise
             if self.child.status not in (

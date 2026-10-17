@@ -756,8 +756,6 @@ class AtrinikClient:
             writer.write(packet.encode())
             await asyncio.wait_for(
                 writer.drain(), max(5.0, self.config.connect_timeout))
-        except ConnectionError:
-            raise
         except asyncio.TimeoutError:
             # A QUIC stream can remain nominally connected while flow-control
             # drain never completes.  That otherwise freezes the task engine
@@ -771,8 +769,8 @@ class AtrinikClient:
             await self._close_transport()
             self.state.phase = "disconnected"
         except OSError as exc:
-            # Any other transport failure (ENETUNREACH, EPIPE, ...) ends the
-            # connection just like run() treats it. Detach the transport, as
+            # Any other transport failure (ENETUNREACH, EPIPE, a reset, ...)
+            # ends the connection just like run() treats it. Detach the transport, as
             # for a stalled drain, so the read loop wakes and reconnects, and
             # report it as a lost connection.
             log.warning("transport send failed (%s); forcing reconnect", exc)
@@ -781,6 +779,8 @@ class AtrinikClient:
             with contextlib.suppress(OSError):
                 await self._close_transport()
             self.state.phase = "disconnected"
+            if isinstance(exc, ConnectionError):
+                raise
             raise ConnectionError(str(exc) or type(exc).__name__) from exc
 
     async def _dispatch(self, packet_type: int, data: bytes) -> None:

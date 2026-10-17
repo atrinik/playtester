@@ -505,6 +505,14 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(autoplay.status, TaskStatus.RUNNING)
         self.assertIn("autoplay-disconnect",
                       [entry["action"] for entry in client.decision_history])
+        # An interrupted mana-crystal recovery may be tried again.
+        autoplay._retry_at = 0.0
+        autoplay.phase = "mana-crystal-recovery"
+        autoplay._mana_recovery_attempted = True
+        autoplay.child = Child("mana-crystal recovery")
+        with self.assertRaises(ConnectionError):
+            asyncio.run(autoplay.tick(client))
+        self.assertFalse(autoplay._mana_recovery_attempted)
 
     def test_transport_os_errors_are_reported_as_lost_connections(self):
         async def scenario():
@@ -532,6 +540,22 @@ class ProtocolTests(unittest.TestCase):
             self.assertIsNone(client.writer)
             self.assertEqual(client.state.phase, "disconnected")
             self.assertTrue(client._reconnect_requested)
+
+            # Resets and broken pipes are ConnectionErrors already, and tear
+            # down the transport the same way.
+            for error in (ConnectionResetError, BrokenPipeError):
+                class Broken(Writer):
+                    def write(self, data, error=error):
+                        raise error()
+
+                client.writer = Broken()
+                client.state.phase = "playing"
+                client._reconnect_requested = False
+                with self.assertRaises(error):
+                    await client.clear_actions()
+                self.assertIsNone(client.writer, error)
+                self.assertEqual(client.state.phase, "disconnected", error)
+                self.assertTrue(client._reconnect_requested, error)
 
         asyncio.run(scenario())
 
