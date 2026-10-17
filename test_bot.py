@@ -3387,6 +3387,7 @@ class QuestTests(unittest.TestCase):
                 self.faces = {}
                 self.targets = []
                 self.combat = []
+                self.combat_force = []
                 self.moves = []
                 self.direct_moves = []
                 self.clears = 0
@@ -3398,6 +3399,7 @@ class QuestTests(unittest.TestCase):
 
             async def set_combat(self, enabled, force=False):
                 self.combat.append(enabled)
+                self.combat_force.append(force)
 
             async def move_to_view(self, x, y):
                 self.moves.append((x, y))
@@ -4485,6 +4487,47 @@ class QuestTests(unittest.TestCase):
         task.map_node = node
         asyncio.run(task.tick(client))
         self.assertEqual(client.targets[0], (11, 8, 200))
+
+    def test_peaceful_occupant_of_named_spawn_is_cleared_for_reroll(self):
+        # Live on world_14_77: Kotung's spawn rolls an unaggressive evil
+        # treant 90% of the time. Ignoring it as peaceful wildlife left the
+        # spawn occupied, so Kotung never appeared and Sera patrolled forever.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 8
+        client.state.map.world_y = 8
+        client.state.map.tile(11, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="evil treant", target_id=100, target_hp=100)
+        client.state.map.tile(15, 8).objects[3] = MapObject(
+            3, 2, 0, 0, name="quickwood", target_id=200, target_hp=100)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        node.peaceful_identities.update({"quickwood", "evil treant"})
+        # Production priorities name every candidate of the shared spawn.
+        spawns = [(11, 8, "Kotung"), (11, 8, "evil treant")]
+        task = FarmTask(zone="/test", target="Kotung", priority_spawns=spawns)
+        task.map_node = node
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.targets[0], (11, 8, 100))
+        self.assertEqual(task._visible_target_count, 1)
+        # A peaceful blocker is provoked, not merely selected.
+        self.assertTrue(client.combat_force)
+        self.assertIs(client.combat_force[-1], True)
+
+        # Off the spawn point the same species is still unrequested wildlife,
+        # even though it is one of the spawn's named candidates.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 8
+        client.state.map.world_y = 8
+        client.state.map.tile(15, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="evil treant", target_id=100, target_hp=100)
+        task = FarmTask(zone="/test", target="Kotung", priority_spawns=spawns)
+        task.map_node = node
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.targets, [])
+        self.assertEqual(task._visible_target_count, 0)
+        self.assertNotIn(True, client.combat_force)
 
     def test_committed_peaceful_target_is_finished(self):
         client = self._combat_client()
