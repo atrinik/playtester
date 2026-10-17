@@ -247,6 +247,94 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_targets_the_server_never_acknowledges_are_set_aside(self):
+        from . import targeting
+        from .model import MapObject
+        from .targeting import select_target
+
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            sent = []
+
+            async def send(packet):
+                sent.append(packet.encode())
+
+            client.send = send
+            frog = MapObject(5, 315, 0, 0)
+            frog.name, frog.target_id = "giant frog", 1343754
+            client.state.map.tile(8, 7).objects[5] = frog
+            clock = [100.0]
+
+            def ack(actor):
+                client.state.target_id = actor
+                client.state.target_ack = (actor, clock[0])
+
+            with patch("atrinik_bot.targeting.time.monotonic", lambda: clock[0]), \
+                    patch("atrinik_bot.model.time.monotonic", lambda: clock[0]):
+                # A fight: selected once, then fought for 30 s without asking
+                # again, until a heal targets Sera herself.
+                self.assertTrue(await select_target(client, 8, 7, 1343754))
+                ack(1343754)
+                clock[0] += 30.0
+                client.state.target_id = 0
+                # The first retry after losing it is still sent.
+                self.assertTrue(await select_target(client, 8, 7, 1343754))
+                self.assertEqual(len(sent), 2)
+                # It never comes back (it was killed, but its view lingers).
+                for _ in range(40):
+                    clock[0] += 0.5
+                    if not await select_target(client, 8, 7, 1343754):
+                        break
+                # Requests ran from 130 s; it is set aside six seconds later.
+                self.assertEqual(clock[0], 130.0 + targeting.TARGET_ACK_TIMEOUT)
+                self.assertEqual(len(sent), 2 + 11)
+                self.assertEqual(client.action_history[-1]["action"], "target-unresponsive")
+                self.assertTrue(client.state.map.target_ignored(1343754))
+                # It is still seen (threat detection counts it), but not
+                # requested again while set aside.
+                self.assertEqual(len(list(client.state.map.targets(friendly=False))), 1)
+                self.assertFalse(await select_target(client, 8, 7, 1343754))
+                self.assertEqual(len(sent), 13)
+                # It is offered again after the pause.
+                clock[0] += targeting.UNRESPONSIVE_TARGET_SECONDS
+                self.assertFalse(client.state.map.target_ignored(1343754))
+                # A creature that wandered out of view for a while gets a
+                # fresh window when it returns.
+                self.assertTrue(await select_target(client, 8, 7, 1343754))
+                clock[0] += targeting.TARGET_ACK_TIMEOUT + 1.0
+                self.assertTrue(await select_target(client, 8, 7, 1343754))
+
+        asyncio.run(scenario())
+
+    def test_reconnects_restart_target_windows(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.target_request = (1343754, 10.0)
+        client.state.target_ack = (1343754, 9.0)
+        client._reset_target_identity()
+        self.assertEqual(client.state.target_request, (0, 0.0, 0.0))
+        self.assertEqual(client.state.target_ack, (0, 0.0))
+
+    def test_feedback_watchers_ignore_player_chat(self):
+        state = GameState()
+        position = state.message_count
+        state.add_message(c.CHAT_TYPE_LOCAL, "ffffff", "Mallory says: It would cost you 1 copper coin.")
+        state.add_message(c.CHAT_TYPE_PRIVATE, "ffffff", "It would cost you 1 copper coin.")
+        state.add_message(2, "ffffff", "It would cost you 4 gold coins.")
+        self.assertEqual([entry[3] for entry in state.messages_since(position)],
+                         ["It would cost you 4 gold coins."])
+        self.assertEqual(len(state.messages_since(position, chat=True)), 3)
+
+    def test_target_replies_record_their_acknowledgement(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            with patch("atrinik_bot.client.time.monotonic", lambda: 42.0):
+                payload = (bytes([c.TARGET_ENEMY]) + b"ff0000\0giant frog\0" +
+                           bytes([5]) + (1343754).to_bytes(4, "big") + bytes([0, 1, 0]))
+                await client._handle_target(Cursor(payload), payload)
+            self.assertEqual(client.state.target_ack, (1343754, 42.0))
+
+        asyncio.run(scenario())
+
     def test_targeted_talk_uses_exact_actor_identity_without_selection(self):
         async def scenario():
             client = AtrinikClient(ClientConfig())
@@ -3158,7 +3246,9 @@ class QuestTests(unittest.TestCase):
                 item = Item(77, location=9, name="small axe", quantity=1)
                 self.state = type("State", (), {
                     "inventory": [item], "items": {77: item},
-                    "player_tag": 9, "messages": [],
+                    "player_tag": 9, "messages": [], "message_offset": 0,
+                    "message_count": GameState.message_count,
+                    "messages_since": GameState.messages_since,
                 })()
                 self.moves = []
 
@@ -3207,7 +3297,9 @@ class QuestTests(unittest.TestCase):
                 item = Item(78, location=10, name="axe", quantity=1)
                 self.state = type("State", (), {
                     "inventory": [item], "items": {78: item},
-                    "player_tag": 10, "messages": [],
+                    "player_tag": 10, "messages": [], "message_offset": 0,
+                    "message_count": GameState.message_count,
+                    "messages_since": GameState.messages_since,
                 })()
                 self.moves = []
 
@@ -4814,6 +4906,56 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.combat, [True])
         self.assertEqual(client.direct_moves, [])
         self.assertEqual(client.moves, [])
+
+    def test_unselectable_targets_are_not_attacked(self):
+        client = self._combat_client()
+        client.state.map.tile(11, 8).objects.clear()
+        task = FarmTask(zone="/test")
+
+        async def refuse(*args, **kwargs):
+            return False
+
+        with patch("atrinik_bot.tasks.select_target", refuse):
+            asyncio.run(task.tick(client))
+        # Combat earlier retries may have enabled is switched off.
+        self.assertEqual(client.combat, [False])
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.moves, [])
+
+    def test_unselectable_targets_release_their_engagement(self):
+        client = self._combat_client()
+        client.state.map.tile(11, 8).objects.clear()
+        task = FarmTask(zone="/test")
+
+        async def refuse(*args, **kwargs):
+            return False
+
+        with patch("atrinik_bot.tasks.select_target", refuse):
+            asyncio.run(task.tick(client))
+        self.assertIsNone(task._engaged_target)
+
+    def test_late_acknowledgements_lift_a_set_aside(self):
+        from . import targeting
+        from .targeting import target_set_aside
+
+        state = GameState()
+        now = time.monotonic()
+        state.map.ignored_targets[1343754] = now + targeting.UNRESPONSIVE_TARGET_SECONDS
+        self.assertTrue(target_set_aside(state, 1343754))
+        # The server's reply arrives just after the timeout.
+        state.target_ack = (1343754, now + 0.1)
+        self.assertFalse(target_set_aside(state, 1343754))
+        self.assertNotIn(1343754, state.map.ignored_targets)
+
+    def test_set_aside_targets_stay_threats_but_are_not_chosen(self):
+        client = self._combat_client()
+        client.state.map.tile(11, 8).objects.clear()
+        client.state.map.ignored_targets[200] = time.monotonic() + 60.0
+        self.assertEqual(len(list(client.state.map.targets(friendly=False))), 1)
+        task = FarmTask(zone="/test")
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.targets, [])
+        self.assertNotIn(True, client.combat)
 
     def test_melee_kite_steps_out_until_swing_timer_is_ready(self):
         client = self._combat_client()
@@ -8638,6 +8780,17 @@ class QuestTests(unittest.TestCase):
             quality=90, condition=100, name="ring of the ghost"), 7)
         self.assertTrue(circuit._needs_apartment_storage(rare_client))
 
+    def test_savebed_confirmation_cannot_be_forged_by_players(self):
+        state = GameState()
+        position = state.message_count
+        state.add_message(2, "ffffff", "[a=#charname]Mallory[/a] says: You save and your save bed location is updated.")
+        state.add_message(2, "ffffff", "Mallory: you save and your save bed location is updated.")
+        state.add_message(2, "ffffff", "You save and your save bed location is updated.")
+        texts = [entry[3] for entry in state.messages_since(position)]
+        self.assertEqual(len(texts), 2)  # the linked name is dropped
+        self.assertEqual([t for t in texts if BindSavebedTask.CONFIRM.fullmatch(t)],
+                         ["You save and your save bed location is updated."])
+
     def test_savebed_is_applied_verified_and_persisted_where_it_stands(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
@@ -8656,6 +8809,10 @@ class QuestTests(unittest.TestCase):
 
         client.apply = apply
         client.set_savebed = persist
+        # A long session has already filled the bounded message history, so
+        # the confirmation replaces an old message instead of growing it.
+        for i in range(600):
+            client.state.add_message(2, "ffffff", f"You hit giant frog for {i}.")
         task = BindSavebedTask()
         asyncio.run(task.tick(client))
         self.assertEqual(client.applied, [800])

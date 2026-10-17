@@ -26,6 +26,7 @@ except ModuleNotFoundError:
                                      load_archetypes, map_files, parse_blocks)
 
 from . import constants as c
+from .targeting import select_target, target_set_aside
 
 from .client import AtrinikClient, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
@@ -178,15 +179,14 @@ class ServerGameClock:
                 elapsed / self.real_seconds_per_game_minute) % (24 * 60)
 
     async def sync(self, client: AtrinikClient) -> bool:
-        messages = client.state.messages
-        for entry in messages[self.message_index:]:
+        for entry in client.state.messages_since(self.message_index):
             if len(entry) <= 3:
                 continue
             parsed = self.parse(entry[3])
             if parsed is not None:
                 self.anchor_minute = float(parsed)
                 self.anchor_at = self.clock()
-        self.message_index = len(messages)
+        self.message_index = client.state.message_count
         now = self.clock()
         due = (self.anchor_minute is None or self.last_request_at is None or
                now - self.last_request_at >= self.resync_seconds)
@@ -2763,6 +2763,8 @@ class NavigateThenTask(BotTask):
         global_peaceful = getattr(
             self.navigation.graph, "peaceful_monster_identities", set())
         for x, y, obj in m.targets(friendly=False):
+            if target_set_aside(client.state, obj.target_id):
+                continue  # cannot be selected; still counted as a threat elsewhere
             if (isinstance(self.task, FarmTask) and
                     self.task.target_temporarily_unreachable(
                         obj.target_id) and
@@ -2886,8 +2888,11 @@ class NavigateThenTask(BotTask):
                 self.task.should_training_finish(client, nearest[3])):
             _, x, y, obj = nearest
             self.task.remember_engagement(client, x, y, obj.target_id)
-            await client.target(x, y, obj.target_id)
-            if await self.task.training_finisher(client, x, y, obj):
+            selected = await select_target(client, x, y, obj.target_id)
+            if not selected:
+                self.task.release_engagement(obj.target_id)
+                await client.set_combat(False)
+            if selected and await self.task.training_finisher(client, x, y, obj):
                 self._defending = True
                 self._last_defense_action = time.monotonic()
                 return True
@@ -3019,7 +3024,11 @@ class NavigateThenTask(BotTask):
                 if isinstance(self.task, FarmTask):
                     self.task.remember_engagement(
                         client, x, y, obj.target_id)
-                await client.target(x, y, obj.target_id)
+                if not await select_target(client, x, y, obj.target_id):
+                    if isinstance(self.task, FarmTask):
+                        self.task.release_engagement(obj.target_id)
+                    await client.set_combat(False)
+                    return False
                 direction = self.task.spell_fire_direction(
                     offensive, x, y, cx, cy)
                 if direction is not None:
@@ -3092,7 +3101,11 @@ class NavigateThenTask(BotTask):
                 if isinstance(self.task, FarmTask):
                     self.task.remember_engagement(
                         client, x, y, obj.target_id)
-                await client.target(x, y, obj.target_id)
+                if not await select_target(client, x, y, obj.target_id):
+                    if isinstance(self.task, FarmTask):
+                        self.task.release_engagement(obj.target_id)
+                    await client.set_combat(False)
+                    return False
                 semantic = f"{obj.name} {map_object_visual_name(client, obj)}"
                 force = bool(
                     isinstance(self.task, FarmTask) and
@@ -4726,8 +4739,7 @@ class FarmCircuitTask(BotTask):
             destination_xy=target[1], combat_approach=True)
 
     def _observe_disease(self, client: AtrinikClient) -> None:
-        messages = client.state.messages
-        for entry in messages[self._disease_message_index:]:
+        for entry in client.state.messages_since(self._disease_message_index):
             text = (entry[3] if len(entry) > 3 else "").casefold()
             if "you are healed from disease" in text:
                 self._disease_suspected = False
@@ -4737,7 +4749,7 @@ class FarmCircuitTask(BotTask):
                     "can't control your sphincter", "cannot control your sphincter",
                     "athelete's foot hit you", "athlete's foot hit you")):
                 self._disease_suspected = True
-        self._disease_message_index = len(messages)
+        self._disease_message_index = client.state.message_count
 
     @staticmethod
     def _disease_cures(client: AtrinikClient) -> list[Item]:
