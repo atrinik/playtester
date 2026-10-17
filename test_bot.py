@@ -153,7 +153,7 @@ class ProtocolTests(unittest.TestCase):
                 self.payload = payload
 
             async def drain(self):
-                raise asyncio.TimeoutError
+                await asyncio.sleep(3600)  # flow control never drains
 
             def close(self):
                 self.closed = True
@@ -163,6 +163,7 @@ class ProtocolTests(unittest.TestCase):
 
         async def run():
             client = AtrinikClient(ClientConfig(connect_timeout=0.01))
+            client.SEND_STALL_SECONDS = 0.01
             writer = Writer()
             client.writer = writer
             client.state.phase = "playing"
@@ -513,6 +514,12 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             asyncio.run(autoplay.tick(client))
         self.assertFalse(autoplay._mana_recovery_attempted)
+        # ... and so may one whose setup lost the connection.
+        autoplay.phase = "adaptive-farming"
+        autoplay.child = None
+        with self.assertRaises(ConnectionError):
+            asyncio.run(autoplay._start_mana_crystal_recovery(client))
+        self.assertFalse(autoplay._mana_recovery_attempted)
 
     def test_transport_os_errors_are_reported_as_lost_connections(self):
         async def scenario():
@@ -541,9 +548,9 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(client.state.phase, "disconnected")
             self.assertTrue(client._reconnect_requested)
 
-            # Resets and broken pipes are ConnectionErrors already, and tear
-            # down the transport the same way.
-            for error in (ConnectionResetError, BrokenPipeError):
+            # Resets, broken pipes and transport timeouts tear down the
+            # transport the same way; ETIMEDOUT is not a stalled drain.
+            for error in (ConnectionResetError, BrokenPipeError, TimeoutError):
                 class Broken(Writer):
                     def write(self, data, error=error):
                         raise error()
@@ -551,11 +558,28 @@ class ProtocolTests(unittest.TestCase):
                 client.writer = Broken()
                 client.state.phase = "playing"
                 client._reconnect_requested = False
-                with self.assertRaises(error):
+                with self.assertRaises(ConnectionError):
                     await client.clear_actions()
                 self.assertIsNone(client.writer, error)
                 self.assertEqual(client.state.phase, "disconnected", error)
                 self.assertTrue(client._reconnect_requested, error)
+
+            # A late failure on an already replaced transport leaves the new
+            # connection alone.
+            class Late(Writer):
+                def write(self, data):
+                    client.writer = fresh
+                    raise ConnectionResetError()
+
+            fresh = Writer()
+            client.writer = Late()
+            client.state.phase = "playing"
+            client._reconnect_requested = False
+            with self.assertRaises(ConnectionError):
+                await client.clear_actions()
+            self.assertIs(client.writer, fresh)
+            self.assertEqual(client.state.phase, "playing")
+            self.assertFalse(client._reconnect_requested)
 
         asyncio.run(scenario())
 

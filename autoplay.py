@@ -89,19 +89,26 @@ class AutoplayTask(BotTask):
     async def _start_mana_crystal_recovery(
             self, client: AtrinikClient) -> None:
         self._mana_recovery_attempted = True
-        await client.clear_actions()
-        await client.set_combat(False)
-        await client.clear_target()
-        await self._set_child(
-            client, "mana-crystal-recovery",
-            NavigateThenTask(
-                self.graph,
-                "/shattered_islands/strakewood_island/apartments/"
-                "apartment_cheap",
-                RetrieveItemsTask(
-                    "chest", (r"Gandyld's Mana Crystal",),
-                    require_match=True),
-                destination_xy=(1, 3), combat_approach=True))
+        try:
+            await client.clear_actions()
+            await client.set_combat(False)
+            await client.clear_target()
+            await self._set_child(
+                client, "mana-crystal-recovery",
+                NavigateThenTask(
+                    self.graph,
+                    "/shattered_islands/strakewood_island/apartments/"
+                    "apartment_cheap",
+                    RetrieveItemsTask(
+                        "chest", (r"Gandyld's Mana Crystal",),
+                        require_match=True),
+                    destination_xy=(1, 3), combat_approach=True))
+        except ConnectionError:
+            # Setup was interrupted before the recovery ran to an outcome.
+            self._mana_recovery_attempted = False
+            if self.phase == "mana-crystal-recovery":
+                self.child = None
+            raise
 
     async def _set_child(self, client: AtrinikClient, phase: str,
                          child: BotTask) -> None:

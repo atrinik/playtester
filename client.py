@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from . import constants as c
 from .access_codes import normalize_access_code
@@ -748,40 +748,57 @@ class AtrinikClient:
                 log.exception("failed decoding packet type %d (%d bytes)", packet_type, len(payload))
                 raise
 
+    # A drain still pending after this long (or connect_timeout) is a stall.
+    SEND_STALL_SECONDS = 5.0
+
     async def send(self, packet: Packet) -> None:
         if self.writer is None:
             raise ConnectionError("not connected")
         writer = self.writer
         try:
             writer.write(packet.encode())
-            await asyncio.wait_for(
-                writer.drain(), max(5.0, self.config.connect_timeout))
-        except asyncio.TimeoutError:
+            # asyncio.wait reports an expiry without raising, so a transport
+            # TimeoutError (ETIMEDOUT, an OSError) is never mistaken for it.
+            drain = asyncio.ensure_future(writer.drain())
+            done, _ = await asyncio.wait(
+                {drain}, timeout=max(self.SEND_STALL_SECONDS,
+                                     self.config.connect_timeout))
+            if done:
+                drain.result()
+        except OSError as exc:
+            # Any transport failure (ENETUNREACH, EPIPE, a reset, ETIMEDOUT,
+            # ...) ends the connection just like run() treats it. Detach the
+            # transport, as for a stalled drain, so the read loop wakes and
+            # reconnects, and report it as a lost connection.
+            log.warning("transport send failed (%s); forcing reconnect", exc)
+            await self._detach_failed_transport(writer, f"send failed: {exc}")
+            if isinstance(exc, ConnectionError):
+                raise
+            raise ConnectionError(str(exc) or type(exc).__name__) from exc
+        if not done:
+            drain.cancel()
             # A QUIC stream can remain nominally connected while flow-control
             # drain never completes.  That otherwise freezes the task engine
             # forever on one recorded action. Detaching the transport wakes
             # the read loop and preserves the in-memory autoplay task across
             # its normal reconnect.
             log.warning("transport send stalled; forcing reconnect")
-            self.record_action(
-                "transport-reconnect", "send drain exceeded timeout")
-            self._reconnect_requested = True
+            await self._detach_failed_transport(
+                writer, "send drain exceeded timeout")
+
+    async def _detach_failed_transport(self, writer: Any, reason: str) -> None:
+        """Tear down the transport a send failed on, unless already replaced.
+
+        A send can fail late, after the read loop noticed the same outage and
+        reconnected; that fresh transport must not be closed for it.
+        """
+        if self.writer is not writer:
+            return
+        self.record_action("transport-reconnect", reason)
+        self._reconnect_requested = True
+        with contextlib.suppress(OSError):
             await self._close_transport()
-            self.state.phase = "disconnected"
-        except OSError as exc:
-            # Any other transport failure (ENETUNREACH, EPIPE, a reset, ...)
-            # ends the connection just like run() treats it. Detach the transport, as
-            # for a stalled drain, so the read loop wakes and reconnects, and
-            # report it as a lost connection.
-            log.warning("transport send failed (%s); forcing reconnect", exc)
-            self.record_action("transport-reconnect", f"send failed: {exc}")
-            self._reconnect_requested = True
-            with contextlib.suppress(OSError):
-                await self._close_transport()
-            self.state.phase = "disconnected"
-            if isinstance(exc, ConnectionError):
-                raise
-            raise ConnectionError(str(exc) or type(exc).__name__) from exc
+        self.state.phase = "disconnected"
 
     async def _dispatch(self, packet_type: int, data: bytes) -> None:
         if (self.state.phase in ("version", "access-policy", "access-auth")
