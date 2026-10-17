@@ -8,9 +8,11 @@ import random
 import re
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
+from typing import Any
 
 try:
     from tools.world_content_audit import load_archetypes
@@ -348,6 +350,12 @@ class SafetyPolicy:
 
 
 class BotTask:
+    # Whether the engine keeps this task when the connection drops in the
+    # middle of a tick. Only tasks that rebuild their in-flight work from the
+    # server's state after a reconnect may set it (autoplay does); any other
+    # task would resume with half-finished dialogues or pending transfers.
+    survives_disconnect = False
+
     def __init__(self, name: str):
         self.name = name
         self.status = TaskStatus.READY
@@ -3755,11 +3763,11 @@ class BuyGroundItemsTask(BotTask):
                 self.fail("shop stock disappeared before purchase")
                 return
         remaining = self._goal - self._inventory_quantity(client)
-        if self.cash_reserve is not None:
-            BuyShopUpgradeTask.account_purchase(client, cost)
-        await client.move_item(
-            client.state.player_tag, stock.tag,
-            min(stock.quantity, remaining))
+        await BuyShopUpgradeTask.send_purchase(
+            client, cost if self.cash_reserve is not None else 0,
+            lambda: client.move_item(
+                client.state.player_tag, stock.tag,
+                min(stock.quantity, remaining)))
         self._attempt_inventory_quantity = inventory_quantity
         self._attempt_at = now
 
@@ -3818,17 +3826,49 @@ class BuyShopUpgradeTask(BotTask):
         return total
 
     @classmethod
-    def account_purchase(cls, client: AtrinikClient, cost: int) -> None:
-        """Reserve the bank-funded portion until inventory payment lands."""
+    def account_purchase(cls, client: AtrinikClient, cost: int) -> int:
+        """Reserve the bank-funded portion until inventory payment lands.
+
+        Returns the amount reserved from the bank balance.
+        """
         bank_spend = max(0, int(cost) - cls.carried_wallet_value(client))
-        if bank_spend and getattr(client.state, "bank_balance_known", False):
-            balance = max(
-                0, int(client.state.bank_balance) - bank_spend)
-            setter = getattr(client, "set_bank_balance", None)
-            if setter is not None:
-                setter(balance)
-            else:
-                client.state.bank_balance = balance
+        if not bank_spend or not getattr(client.state, "bank_balance_known", False):
+            return 0
+        balance = int(client.state.bank_balance)
+        reserved = min(bank_spend, max(0, balance))
+        cls._set_bank_balance(client, balance - reserved)
+        return reserved
+
+    @staticmethod
+    def _set_bank_balance(client: AtrinikClient, balance: int) -> None:
+        setter = getattr(client, "set_bank_balance", None)
+        if setter is not None:
+            setter(balance)
+        else:
+            client.state.bank_balance = balance
+
+    @classmethod
+    async def send_purchase(cls, client: AtrinikClient, cost: int,
+                            send: Callable[[], Awaitable[Any]]) -> None:
+        """Reserve a purchase's bank funds, then send its request.
+
+        When the connection is lost during the send, the server may or may
+        not have processed the purchase, so the reserved balance is neither
+        kept nor refunded: it is forgotten, and the next budgeted purchase
+        reads the bank's real balance first.
+        """
+        reserved = cls.account_purchase(client, cost)
+        try:
+            await send()
+        except ConnectionError:
+            if reserved:
+                forget = getattr(client, "forget_bank_balance", None)
+                if forget is not None:
+                    forget()
+                else:
+                    client.state.bank_balance = 0
+                    client.state.bank_balance_known = False
+            raise
 
     @staticmethod
     def _prototype(client: AtrinikClient, item: Item
@@ -4143,9 +4183,9 @@ class BuyShopUpgradeTask(BotTask):
             item.tag for item in client.state.inventory}
         self._purchase_name = candidate.name.casefold()
         self._purchase_face = candidate.face
-        self.account_purchase(client, cost)
-        await client.move_item(
-            client.state.player_tag, candidate.tag, candidate.quantity)
+        await self.send_purchase(
+            client, cost, lambda: client.move_item(
+                client.state.player_tag, candidate.tag, candidate.quantity))
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder("shop-upgrade-buy",
@@ -4320,9 +4360,9 @@ class BuyDialogueStockTask(BotTask):
             self._inventory_quantity_before = sum(
                 item.quantity for item in client.state.inventory
                 if item.name.casefold() == self._item_name.casefold())
-            BuyShopUpgradeTask.account_purchase(client, total_cost)
             client.state.interface = None
-            await client.talk(quantity, self.merchant)
+            await BuyShopUpgradeTask.send_purchase(
+                client, total_cost, lambda: client.talk(quantity, self.merchant))
             self._stage = "buy"
             self._sent_at = now
             return
@@ -4589,8 +4629,9 @@ class TempleServiceTask(BotTask):
             if wallet < self.cost:
                 self.fail(f"temple service costs {self.cost}, wallet {wallet}")
                 return
-            BuyShopUpgradeTask.account_purchase(client, self.cost)
-            await client.talk(f"buy {self.service}", self.priest)
+            await BuyShopUpgradeTask.send_purchase(
+                client, self.cost,
+                lambda: client.talk(f"buy {self.service}", self.priest))
             self._sent_at = time.monotonic()
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
@@ -4658,9 +4699,10 @@ class MassIdentifyTask(BotTask):
                     f"mass identification needs {required} copper including "
                     f"reserve, wallet {wallet}")
                 return
-            BuyShopUpgradeTask.account_purchase(client, self.cost)
             client.state.interface = None
-            await client.talk("buy identify_all", self.smith)
+            await BuyShopUpgradeTask.send_purchase(
+                client, self.cost,
+                lambda: client.talk("buy identify_all", self.smith))
             self._sent_at = time.monotonic()
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
@@ -4958,6 +5000,18 @@ class TaskEngine:
                 self.client.action_context = self.task.name
                 try:
                     await self.task.tick(self.client)
+                except ConnectionError as exc:
+                    # The server went away mid-tick (live: a MAIN upgrade shut
+                    # it down while autoplay was clearing actions, and autoplay
+                    # ended for good). Hold a task that rebuilds its in-flight
+                    # work through the reconnect, like a disconnect noticed
+                    # between ticks; any other task fails as before.
+                    if getattr(self.task, "survives_disconnect", False):
+                        log.warning("task %s paused: connection lost (%s)",
+                                    self.task.name, exc or "closed")
+                    else:
+                        log.exception("task %s failed", self.task.name)
+                        self.task.fail(str(exc))
                 except Exception as exc:
                     log.exception("task %s failed", self.task.name)
                     self.task.fail(str(exc))
