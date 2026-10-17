@@ -8347,13 +8347,29 @@ class QuestTests(unittest.TestCase):
                 self.state.depletion_points = points
                 self.state.depletion_points_known = True
 
+        from .model import InterfaceState
+
         client = FakeClient()
+        # An earlier visit's paid answer is still open.
+        client.state.interface = InterfaceState(
+            title="Saruthar", text="You pay 9 silver coins and 80 copper coins.")
         task = TempleServiceTask(
             "Saruthar", "remove depletion", "depletion", 980)
         asyncio.run(task.tick(client))
         self.assertEqual(client.talks,
                          [("buy remove depletion", "Saruthar")])
         self.assertEqual(client.state.bank_balance, 4_524)
+        self.assertIsNone(client.state.interface)
+        # Unanswered, it is not taken for paid.
+        unanswered = TempleServiceTask(
+            "Saruthar", "remove depletion", "depletion", 980)
+        client.state.interface = InterfaceState(
+            title="Saruthar", text="You pay 9 silver coins and 80 copper coins.")
+        asyncio.run(unanswered.tick(client))
+        unanswered._sent_at = time.monotonic() - 9.0
+        asyncio.run(unanswered.tick(client))
+        self.assertEqual(unanswered.error,
+                         "temple service did not answer the purchase of depletion")
         client.state.remove_item(22)
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)

@@ -4691,6 +4691,9 @@ class TempleServiceTask(BotTask):
             if wallet < self.cost:
                 self.fail(f"temple service costs {self.cost}, wallet {wallet}")
                 return
+            # A dialogue left over from an earlier visit must not pass for
+            # this purchase's answer.
+            client.state.interface = None
             await BuyShopUpgradeTask.send_purchase(
                 client, self.cost,
                 lambda: client.talk(f"buy {self.service}", self.priest))
