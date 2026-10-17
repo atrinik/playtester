@@ -2891,6 +2891,7 @@ class NavigateThenTask(BotTask):
             selected = await select_target(client, x, y, obj.target_id)
             if not selected:
                 self.task.release_engagement(obj.target_id)
+                await client.set_combat(False)
             if selected and await self.task.training_finisher(client, x, y, obj):
                 self._defending = True
                 self._last_defense_action = time.monotonic()
@@ -3026,6 +3027,7 @@ class NavigateThenTask(BotTask):
                 if not await select_target(client, x, y, obj.target_id):
                     if isinstance(self.task, FarmTask):
                         self.task.release_engagement(obj.target_id)
+                    await client.set_combat(False)
                     return False
                 direction = self.task.spell_fire_direction(
                     offensive, x, y, cx, cy)
@@ -3102,6 +3104,7 @@ class NavigateThenTask(BotTask):
                 if not await select_target(client, x, y, obj.target_id):
                     if isinstance(self.task, FarmTask):
                         self.task.release_engagement(obj.target_id)
+                    await client.set_combat(False)
                     return False
                 semantic = f"{obj.name} {map_object_visual_name(client, obj)}"
                 force = bool(

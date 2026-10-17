@@ -2691,6 +2691,7 @@ class FarmTask(BotTask):
                 return True
             # The blocker cannot be selected: fall back to retreating.
             self.release_engagement(obj.target_id)
+            await client.set_combat(False)
         if self._cornered_breakout_target:
             self._cornered_breakout_target = 0
         threats = [(x, y) for x, y, _ in visible_threats]
@@ -2779,6 +2780,7 @@ class FarmTask(BotTask):
                 if not await select_target(client, x, y, obj.target_id):
                     self._cornered_breakout_target = 0
                     self.release_engagement(obj.target_id)
+                    await client.set_combat(False)
                     return False
                 await client.set_combat(True, force=True)
                 recorder = getattr(client, "record_action", None)
@@ -3543,9 +3545,11 @@ class FarmTask(BotTask):
             self.remember_engagement(client, x, y, obj.target_id)
             if (getattr(client.state, "target_id", 0) != obj.target_id and
                     not await select_target(client, x, y, obj.target_id)):
-                # Set aside as unselectable: let go of it so the next tick
-                # chooses another actor or patrols on.
+                # Set aside as unselectable: let go of it, and of the combat
+                # earlier retries enabled, so the next tick chooses another
+                # actor or patrols on without swinging at whatever it meets.
                 self.release_engagement(obj.target_id)
+                await client.set_combat(False)
                 return
             if not self.target_tile_walkable(client, x, y):
                 # Never land a killing blow over water/void: the corpse and

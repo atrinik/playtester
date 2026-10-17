@@ -4917,7 +4917,8 @@ class QuestTests(unittest.TestCase):
 
         with patch("atrinik_bot.tasks.select_target", refuse):
             asyncio.run(task.tick(client))
-        self.assertEqual(client.combat, [])
+        # Combat earlier retries may have enabled is switched off.
+        self.assertEqual(client.combat, [False])
         self.assertEqual(client.direct_moves, [])
         self.assertEqual(client.moves, [])
 
