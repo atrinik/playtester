@@ -99,6 +99,9 @@ class Tile:
 
 # DRAWINFO channels that carry player chat (constants.CHAT_TYPE_*).
 CHAT_MESSAGE_TYPES = frozenset({3, 4, 5, 7})
+# The markup naming a player, which frames speech on any channel ("[a=#
+# charname]Zoey[/a] says: ..."); server feedback never quotes a player.
+PLAYER_NAME_LINK = "[a=#charname]"
 
 
 @dataclass(slots=True)
@@ -167,19 +170,19 @@ class MapState:
     def target_ignored(self, target_id: int) -> bool:
         return self.ignored_targets.get(target_id, 0.0) > time.monotonic()
 
+    # Every visible actor, set-aside ones included: threat detection must
+    # still see them. Choosing whom to attack consults target_ignored.
     def targets(self, friendly: bool | None = None):
         for (x, y), tile in self.tiles.items():
             for obj in tile.targets:
-                if ((friendly is None or obj.is_friend == friendly) and
-                        not self.target_ignored(obj.target_id)):
+                if friendly is None or obj.is_friend == friendly:
                     yield x, y, obj
 
     def depth_targets(self, friendly: bool | None = None):
         for depth, tiles in self.level_tiles.items():
             for (x, y), tile in tiles.items():
                 for obj in tile.targets:
-                    if ((friendly is None or obj.is_friend == friendly) and
-                            not self.target_ignored(obj.target_id)):
+                    if friendly is None or obj.is_friend == friendly:
                         yield depth, x, y, obj
 
 
@@ -289,8 +292,9 @@ class GameState:
     combat_force: bool = False
     # The last actor the server reported selecting, and when (monotonic).
     target_ack: tuple[int, float] = (0, 0.0)
-    # The actor automation is trying to select, and since when (monotonic).
-    target_request: tuple[int, float] = (0, 0.0)
+    # The actor automation is trying to select, since when, and when it last
+    # asked (monotonic).
+    target_request: tuple[int, float, float] = (0, 0.0, 0.0)
     party_name: str = ""
     server_version: int = 0
     last_packet_at: float = 0.0
@@ -317,7 +321,8 @@ class GameState:
         entries = self.messages[max(0, position - self.message_offset):]
         if chat:
             return entries
-        return [entry for entry in entries if entry[1] not in CHAT_MESSAGE_TYPES]
+        return [entry for entry in entries
+                if entry[1] not in CHAT_MESSAGE_TYPES and PLAYER_NAME_LINK not in entry[3]]
 
     @property
     def inventory(self) -> list[Item]:

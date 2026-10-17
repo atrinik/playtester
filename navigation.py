@@ -2763,6 +2763,8 @@ class NavigateThenTask(BotTask):
         global_peaceful = getattr(
             self.navigation.graph, "peaceful_monster_identities", set())
         for x, y, obj in m.targets(friendly=False):
+            if m.target_ignored(obj.target_id):
+                continue  # cannot be selected; still counted as a threat elsewhere
             if (isinstance(self.task, FarmTask) and
                     self.task.target_temporarily_unreachable(
                         obj.target_id) and

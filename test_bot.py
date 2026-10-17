@@ -288,11 +288,21 @@ class ProtocolTests(unittest.TestCase):
                 # Requests ran from 130 s; it is set aside six seconds later.
                 self.assertEqual(clock[0], 130.0 + targeting.TARGET_ACK_TIMEOUT)
                 self.assertEqual(len(sent), 2 + 11)
-                self.assertEqual(list(client.state.map.targets(friendly=False)), [])
                 self.assertEqual(client.action_history[-1]["action"], "target-unresponsive")
+                self.assertTrue(client.state.map.target_ignored(1343754))
+                # It is still seen (threat detection counts it), but not
+                # requested again while set aside.
+                self.assertEqual(len(list(client.state.map.targets(friendly=False))), 1)
+                self.assertFalse(await select_target(client, 8, 7, 1343754))
+                self.assertEqual(len(sent), 13)
                 # It is offered again after the pause.
                 clock[0] += targeting.UNRESPONSIVE_TARGET_SECONDS
-                self.assertEqual(len(list(client.state.map.targets(friendly=False))), 1)
+                self.assertFalse(client.state.map.target_ignored(1343754))
+                # A creature that wandered out of view for a while gets a
+                # fresh window when it returns.
+                self.assertTrue(await select_target(client, 8, 7, 1343754))
+                clock[0] += targeting.TARGET_ACK_TIMEOUT + 1.0
+                self.assertTrue(await select_target(client, 8, 7, 1343754))
 
         asyncio.run(scenario())
 
@@ -301,7 +311,7 @@ class ProtocolTests(unittest.TestCase):
         client.state.target_request = (1343754, 10.0)
         client.state.target_ack = (1343754, 9.0)
         client._reset_target_identity()
-        self.assertEqual(client.state.target_request, (0, 0.0))
+        self.assertEqual(client.state.target_request, (0, 0.0, 0.0))
         self.assertEqual(client.state.target_ack, (0, 0.0))
 
     def test_feedback_watchers_ignore_player_chat(self):
@@ -4911,6 +4921,16 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.direct_moves, [])
         self.assertEqual(client.moves, [])
 
+    def test_set_aside_targets_stay_threats_but_are_not_chosen(self):
+        client = self._combat_client()
+        client.state.map.tile(11, 8).objects.clear()
+        client.state.map.ignored_targets[200] = time.monotonic() + 60.0
+        self.assertEqual(len(list(client.state.map.targets(friendly=False))), 1)
+        task = FarmTask(zone="/test")
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.targets, [])
+        self.assertNotIn(True, client.combat)
+
     def test_melee_kite_steps_out_until_swing_timer_is_ready(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
@@ -8733,6 +8753,17 @@ class QuestTests(unittest.TestCase):
             800, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
             quality=90, condition=100, name="ring of the ghost"), 7)
         self.assertTrue(circuit._needs_apartment_storage(rare_client))
+
+    def test_savebed_confirmation_cannot_be_forged_by_players(self):
+        state = GameState()
+        position = state.message_count
+        state.add_message(2, "ffffff", "[a=#charname]Mallory[/a] says: You save and your save bed location is updated.")
+        state.add_message(2, "ffffff", "Mallory: you save and your save bed location is updated.")
+        state.add_message(2, "ffffff", "You save and your save bed location is updated.")
+        texts = [entry[3] for entry in state.messages_since(position)]
+        self.assertEqual(len(texts), 2)  # the linked name is dropped
+        self.assertEqual([t for t in texts if BindSavebedTask.CONFIRM.fullmatch(t)],
+                         ["You save and your save bed location is updated."])
 
     def test_savebed_is_applied_verified_and_persisted_where_it_stands(self):
         client = type("Client", (), {})()

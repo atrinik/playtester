@@ -3237,6 +3237,7 @@ class FarmTask(BotTask):
             for x, y, obj in m.targets(friendly=False)
             if self.within_farm_map(client, x, y) and
             not self.target_temporarily_unreachable(obj.target_id) and
+            not m.target_ignored(obj.target_id) and
             not self.ignore_unrequested_peaceful(client, obj)
         ]
         # A kill is terminal evidence for older contact. Keep the longer raw
@@ -3384,7 +3385,8 @@ class FarmTask(BotTask):
         for x, y, obj in client.state.map.targets(friendly=False):
             if not self.within_farm_map(client, x, y):
                 continue
-            if self.target_temporarily_unreachable(obj.target_id):
+            if (self.target_temporarily_unreachable(obj.target_id) or
+                    client.state.map.target_ignored(obj.target_id)):
                 continue
             semantic = map_object_semantic(client, obj)
             world_x = client.state.map.world_x + x - cx
@@ -4906,7 +4908,7 @@ class RetrieveItemsTask(BotTask):
 class BindSavebedTask(BotTask):
     """Apply an underfoot savebed and verify server confirmation."""
 
-    CONFIRM = re.compile(r"save bed location is updated", re.I)
+    CONFIRM = re.compile(r"\s*you save and your save bed location is updated\.?\s*", re.I)
     # Ground items arrive without their type, so savebeds are recognized by
     # name: the authored name of the target bed, or any of the usual ones.
     NAME = re.compile(r"\bto reality$|^save bed$", re.I)
@@ -4928,7 +4930,7 @@ class BindSavebedTask(BotTask):
             await self.start(client)
         for entry in client.state.messages_since(self.message_index):
             text = entry[3] if len(entry) > 3 else ""
-            if self.CONFIRM.search(text):
+            if self.CONFIRM.fullmatch(text):
                 # The server binds the respawn to the tile the player stands on.
                 m = client.state.map
                 setter = getattr(client, "set_savebed", None)
