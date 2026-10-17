@@ -10914,6 +10914,36 @@ class FarmAnalyzerTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_failed_refresh_retries_after_backoff_not_six_hours(self):
+        async def scenario():
+            now = [1000.0]
+            analyzer = self.analyzer(clock=lambda: now[0])
+            client = self.client()
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "ready")
+            reported_at = analyzer.reported_at
+            # The six-hour refresh of an unchanged profile fails...
+            now[0] += analyzer.REFRESH_SECONDS + 1
+            (analyzer.analyzer_root / "farming_analyzer" / "FAIL").write_text("")
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "failed")
+            self.assertEqual(analyzer.reported_at, reported_at)
+            self.assertEqual(analyzer.best("xp")["name"], "grind")  # report kept
+            # ...and is retried after the failure backoff, not six hours later.
+            (analyzer.analyzer_root / "farming_analyzer" / "FAIL").unlink()
+            now[0] += analyzer.RETRY_SECONDS - 1
+            self.assertFalse(analyzer.poll(client))
+            now[0] += 2
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "ready")
+            self.assertGreater(analyzer.reported_at, reported_at)
+            await analyzer.close()
+
+        asyncio.run(scenario())
+
     def test_command_is_isolated_and_low_priority(self):
         from .farm_analyzer import combat_profile
 

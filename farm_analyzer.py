@@ -180,6 +180,8 @@ class FarmAnalyzer:
         self.report: dict | None = None
         self.started_at = 0.0
         self.finished_at = 0.0
+        # When the current report was produced; failures never move it.
+        self.reported_at = 0.0
         self.duration = 0.0
         self.runs = 0
         self._last_attempt_at = 0.0
@@ -217,12 +219,14 @@ class FarmAnalyzer:
         now = self.clock()
         if now - self._last_attempt_at < self.MIN_INTERVAL_SECONDS and self.runs:
             return False
-        if self.status == "failed" and now - self._last_attempt_at < self.RETRY_SECONDS:
-            return False
+        if self.status == "failed":
+            # A failed run is retried on its own backoff, whatever the age or
+            # profile of the report it failed to replace.
+            return now - self._last_attempt_at >= self.RETRY_SECONDS
         if self.report is None:
             return True
         return (profile.materially_differs(self.profile) or
-                now - self.finished_at >= self.REFRESH_SECONDS)
+                now - self.reported_at >= self.REFRESH_SECONDS)
 
     def poll(self, client) -> bool:
         """Start a background analysis if the live profile calls for one."""
@@ -278,6 +282,7 @@ class FarmAnalyzer:
             self.report = report
             self.profile = profile
             self.status = "ready"
+            self.reported_at = self.clock()
             log.info("farming analyzer finished in %.1fs; top xp spot: %s",
                      self.clock() - self.started_at,
                      (self.best("xp") or {}).get("name", "none"))
