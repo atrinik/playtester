@@ -3943,6 +3943,73 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(task._cornered_breakout_target, 200)
         self.assertEqual(len(client.direct_moves), task.PURSUIT_STAND_STEPS)
 
+    def test_pursued_stand_ends_at_the_health_floor(self):
+        client = self._combat_client()
+        client.state.stats.update(hp=100, maxhp=176)
+        task = FarmTask(zone="/test")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        for _ in range(task.PURSUIT_STAND_STEPS + 1):
+            asyncio.run(task.low_health_retreat(client))
+            task._retreat_attempt = None
+            task._last_retreat_step_at = 0.0
+        self.assertEqual(task._cornered_breakout_target, 200)
+        # The next hit drops her to 30%: she runs again.
+        client.state.stats["hp"] = 53
+        moves = len(client.direct_moves)
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(task._cornered_breakout_target, 0)
+        self.assertEqual(client.combat[-1], False)
+        self.assertEqual(len(client.direct_moves), moves + 1)
+
+    def test_pursuit_count_does_not_outlive_its_retreat(self):
+        client = self._combat_client()
+        client.state.stats.update(hp=100, maxhp=176)
+        task = FarmTask(zone="/test")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        for _ in range(task.PURSUIT_STAND_STEPS):
+            asyncio.run(task.low_health_retreat(client))
+            task._retreat_attempt = None
+            task._last_retreat_step_at = 0.0
+        # Much later, a new encounter: the first retreat is a retreat.
+        task._pursuit_last_at -= task.PURSUIT_WINDOW_SECONDS + 1
+        asyncio.run(task.low_health_retreat(client))
+        self.assertEqual(client.targets, [])
+        self.assertEqual(task._cornered_breakout_target, 0)
+
+    def test_neutral_farm_stands_only_against_the_engaged_target(self):
+        client = self._combat_client()
+        client.state.stats.update(hp=100, maxhp=176)
+        # Two adjacent giant slugs; combat text names only the species, so
+        # both pass as attackers. The more wounded (100) is a bystander; the
+        # engaged attacker is 200.
+        client.state.messages = [(time.time(), 2, "ffffff", "giant slug hit you for 9.")]
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 2, 0, 0, name="giant slug", target_id=200, target_hp=90)
+        client.state.map.tile(7, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="giant slug", target_id=100, target_hp=20)
+        task = FarmTask(zone="/test", neutral_targets=True)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        task.remember_engagement(client, 9, 8, 200)
+        for _ in range(task.PURSUIT_STAND_STEPS + 1):
+            asyncio.run(task.low_health_retreat(client))
+            task._retreat_attempt = None
+            task._last_retreat_step_at = 0.0
+        self.assertNotIn((7, 8, 100), client.targets)
+        self.assertEqual(task._cornered_breakout_target, 200)
+
     def test_critically_hurt_pursued_retreat_keeps_running(self):
         client = self._combat_client()
         client.state.stats.update(hp=50, maxhp=176)
@@ -5041,6 +5108,9 @@ class QuestTests(unittest.TestCase):
         task.remember_engagement(client, 9, 8, target.target_id)
         self.assertFalse(asyncio.run(task.melee_kite(client, 9, 8, target)))
         self.assertEqual(client.direct_moves, [])
+        # A spell finisher's line-keeping kite is not stopped by the crowd.
+        self.assertTrue(asyncio.run(task.melee_kite(
+            client, 9, 8, target, preserve_spell_line=Item(0, name="firebolt"))))
 
     def test_melee_kite_holds_adjacent_when_swing_is_imminent(self):
         client = self._combat_client()

@@ -831,8 +831,14 @@ class FarmTask(BotTask):
         self._retreat_blocked: set[tuple[str, int, int]] = set()
         self._last_retreat_step_at = 0.0
         self._cornered_breakout_target = 0
-        # Consecutive retreat steps taken with an attacker still adjacent.
+        # Consecutive retreat steps taken with an attacker still adjacent, the
+        # attackers seen adjacent on the last of them, and when it was taken.
         self._pursued_retreats = 0
+        self._pursuit_ids: set[int] = set()
+        self._pursuit_last_at = 0.0
+        # Whether the breakout latch is a pursued stand (bound by the health
+        # floor) rather than a cornered breakout.
+        self._stand_latch = False
         self._emergency_recall_source = 0
         self._emergency_recall_apply_at = 0.0
         self._emergency_recall_cast_at = 0.0
@@ -1567,7 +1573,9 @@ class FarmTask(BotTask):
                         client.state.stats.get("target_hp", 0) or 0)
         # Kiting buys free ticks against one pursuer; among others it walks
         # into fresh aggro, so with another hostile close by stand and swing.
-        crowded = any(
+        # A spell finisher's kite keeps its firing line and is not a melee
+        # cycle, so crowding does not stop it.
+        crowded = preserve_spell_line is None and any(
             other.target_id != obj.target_id and
             max(abs(ox - cx), abs(oy - cy)) <= self.KITE_CROWD_RADIUS
             for ox, oy, other in m.targets(friendly=False))
@@ -2670,6 +2678,8 @@ class FarmTask(BotTask):
     # it, and the health share below which she keeps running regardless.
     PURSUIT_STAND_STEPS = 3
     STAND_HEALTH_FLOOR = 0.35
+    # Retreat steps further apart than this are not one pursuit.
+    PURSUIT_WINDOW_SECONDS = 6.0
 
     async def low_health_retreat(self, client: AtrinikClient) -> bool:
         """Run one tile away from the visible pack, learning blocked steps."""
@@ -2691,6 +2701,17 @@ class FarmTask(BotTask):
             (x, y, obj) for x, y, obj in visible_threats
             if obj.target_id == self._cornered_breakout_target and
             max(abs(x - cx), abs(y - cy)) <= 1), None)
+        ratio = (int(client.state.stats.get("hp", 0) or 0) /
+                 max(1, int(client.state.stats.get("maxhp", 1) or 1)))
+        if (breakout is not None and self._stand_latch and
+                ratio <= self.STAND_HEALTH_FLOOR):
+            # A stand chosen over a failing retreat ends at the critical
+            # floor: run again rather than fight to the death.
+            self.release_engagement(breakout[2].target_id)
+            await client.set_combat(False)
+            breakout = None
+            self._cornered_breakout_target = 0
+            self._stand_latch = False
         if breakout is not None:
             # With no walkable escape square, repeatedly alternating one
             # forced swing with combat-off retreat ticks makes neither
@@ -2710,6 +2731,7 @@ class FarmTask(BotTask):
             await client.set_combat(False)
         if self._cornered_breakout_target:
             self._cornered_breakout_target = 0
+            self._stand_latch = False
         threats = [(x, y) for x, y, _ in visible_threats]
         origin = None
         if self._engaged_target is not None:
@@ -2816,15 +2838,26 @@ class FarmTask(BotTask):
         # them, the most wounded, through the breakout latch until it dies.
         adjacent = [(x, y, obj) for x, y, obj in visible_threats
                     if max(abs(x - cx), abs(y - cy)) <= 1]
-        ratio = (int(client.state.stats.get("hp", 0) or 0) /
-                 max(1, int(client.state.stats.get("maxhp", 1) or 1)))
-        if (adjacent and self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
+        # A pursuit is consecutive steps, close in time, against at least one
+        # of the same attackers; anything else starts a new count.
+        adjacent_ids = {obj.target_id for _, _, obj in adjacent}
+        if (now - self._pursuit_last_at > self.PURSUIT_WINDOW_SECONDS or
+                not adjacent_ids & self._pursuit_ids):
+            self._pursued_retreats = 0
+        # On a neutral farm a same-species bystander may look like the
+        # attacker; stand only against the engaged target there.
+        stand_candidates = [
+            entry for entry in adjacent
+            if not self.neutral_targets or entry[2].target_id == engaged_id]
+        if (stand_candidates and
+                self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
                 ratio > self.STAND_HEALTH_FLOOR):
-            x, y, obj = min(adjacent, key=lambda entry: (
+            x, y, obj = min(stand_candidates, key=lambda entry: (
                 int(getattr(entry[2], "target_hp", 0) or 100),
                 entry[2].target_id != engaged_id))
             self._pursued_retreats = 0
             self._cornered_breakout_target = obj.target_id
+            self._stand_latch = True
             self.remember_engagement(client, x, y, obj.target_id)
             await client.clear_actions()
             if await select_target(client, x, y, obj.target_id):
@@ -2836,9 +2869,12 @@ class FarmTask(BotTask):
                 self._last_action = now
                 return True
             self._cornered_breakout_target = 0
+            self._stand_latch = False
             self.release_engagement(obj.target_id)
             await client.set_combat(False)
         self._pursued_retreats = self._pursued_retreats + 1 if adjacent else 0
+        self._pursuit_ids = adjacent_ids
+        self._pursuit_last_at = now
         if recorder is not None:
             recorder(
                 "retreat-choice",
