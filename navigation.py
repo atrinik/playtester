@@ -1699,22 +1699,19 @@ class NavigateTask(BotTask):
 
     def _plan(self, client: AtrinikClient) -> list[MapEdge]:
         # Learned hazards are only a preference: keep a route that avoids them
-        # when it needs no threat fallback, otherwise plan exactly as without.
+        # and every other hazard outright, relaxing nothing; otherwise plan
+        # exactly as without lessons, so one can never make a route worse.
         learned = self._learned_route_hazards(client)
         if learned:
             previous_fallback = self._threat_fallback
             try:
-                # Speculative: record nothing unless this route is kept.
-                route = self._plan_avoiding(client, learned, quiet=True)
-                if not self._threat_fallback:
-                    return route
+                return self._plan_avoiding(client, learned, strict=True)
             except ValueError:
-                pass
-            self._threat_fallback = previous_fallback
+                self._threat_fallback = previous_fallback
         return self._plan_avoiding(client, set())
 
     def _plan_avoiding(self, client: AtrinikClient, learned_hazards: set[str], *,
-                       quiet: bool = False) -> list[MapEdge]:
+                       strict: bool = False) -> list[MapEdge]:
         source = client.state.map.path
         args = (
             source,
@@ -1745,6 +1742,9 @@ class NavigateTask(BotTask):
             try:
                 route = self.graph.route_points(*args, **kwargs)
             except ValueError as preferred_exc:
+                if strict:
+                    # A trial plan relaxes no hazard tier and records nothing.
+                    raise
                 # Tiled levels only joined the hazards to keep surface trips
                 # off dense tunnels. A trip that needs them (one inside the
                 # tunnels, or with no surface way round) routes through them
@@ -1777,7 +1777,7 @@ class NavigateTask(BotTask):
                         route = self.graph.route_points(
                             *args, **fallback_kwargs)
                     self._threat_fallback = True
-                    if not previous_fallback and not quiet:
+                    if not previous_fallback:
                         recorder = getattr(client, "record_action", None)
                         if recorder is not None:
                             recorder(
@@ -1791,7 +1791,7 @@ class NavigateTask(BotTask):
                     route = self.graph.route_points(
                         *args, **fallback_kwargs)
                     self._threat_fallback = True
-                    if not previous_fallback and not quiet:
+                    if not previous_fallback:
                         recorder = getattr(client, "record_action", None)
                         if recorder is not None:
                             recorder(

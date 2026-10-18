@@ -10130,6 +10130,26 @@ class NavigationTests(unittest.TestCase):
         client.record_action = lambda action, detail="": records.append(action)
         self.assertEqual([edge.destination for edge in NavigateTask(graph, farm)._plan(client)],
                          expected)
+        # The lesson never trades a known pack hazard for itself: with the
+        # learned map on the safe way and a dense tunnel on the other, she
+        # plans as she would without the lesson.
+        tunnel = "/shattered_islands/world_4_53_-2"
+        graph.nodes[tunnel] = lane(tunnel)
+        graph.named_spawns[tunnel] = []
+        graph.transit_max_aggro_pack = lambda path: 5 if path == tunnel else 0
+        graph.map_monster_levels.pop(ogre, None)
+        nodes[town].edges = [MapEdge(town, swamp, 2, 0, 0, 0), MapEdge(town, tunnel, 0, 0, 2, 0)]
+        nodes[swamp].edges = [MapEdge(swamp, farm, 2, 0, 0, 0)]
+        graph.nodes[tunnel].edges = [MapEdge(tunnel, farm, 2, 0, 0, 0)]
+        graph._world_search_snapshot = None
+        graph._component_cache.clear()
+        client.state.route_hazards = {}
+        expected = [edge.destination for edge in NavigateTask(graph, farm)._plan(client)]
+        self.assertNotIn(tunnel, expected)
+        client.state.route_hazards = {swamp: time.time() + 3600}
+        self.assertEqual([edge.destination for edge in NavigateTask(graph, farm)._plan(client)],
+                         expected)
+        graph.transit_max_aggro_pack = lambda path: 0
         # A discarded speculative plan leaves no threat-fallback record.
         nodes[town].edges.append(MapEdge(town, "/x", 0, 0, 2, 0))
         graph.nodes["/x"].edges = [MapEdge("/x", farm, 2, 0, 0, 0)]
