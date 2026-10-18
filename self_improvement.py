@@ -69,14 +69,30 @@ class FailureReview:
         }
 
 
+# Player channels (libatrinik/socket.h CHAT_TYPE_CHAT..CHAT_TYPE_OPERATOR):
+# anyone can type "<monster> hit you for N" or a death notice there.
+PLAYER_CHANNELS = frozenset({3, 4, 5, 6, 7, 8})
+
+
+def from_server(entry: tuple) -> bool:
+    """Whether a (time, type, color, text) message is the server's own.
+
+    Only server lines may teach the bot: a chat line, or one naming a player
+    with the [a=#charname] link markup, is someone typing.
+    """
+    if len(entry) >= 3 and entry[1] in PLAYER_CHANNELS:
+        return False
+    return "[a=#charname]" not in str(entry[-1])
+
+
 def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
                    failure: dict, spot_paths: Iterable[str]) -> FailureReview:
     """Classify a failure from the combat messages and decisions before it."""
     when = float(failure.get("time", 0.0) or 0.0)
     start = when - REVIEW_WINDOW_SECONDS
     # Scanned twice (hits, then starvation): a one-shot iterable must not
-    # be exhausted by the first pass.
-    messages = list(messages)
+    # be exhausted by the first pass. Player chat never counts.
+    messages = [entry for entry in messages if from_server(entry)]
     hits: list[tuple[float, str, int, str]] = []
     for entry in messages:
         stamp, text = float(entry[0]), str(entry[-1])
@@ -135,7 +151,7 @@ def hits_between(messages: Iterable[tuple], start: float, end: float) -> dict[st
     """Damage per attacker from "<who> hit you for N" messages within [start, end]."""
     hits: dict[str, int] = {}
     for entry in messages:
-        if start <= float(entry[0]) <= end:
+        if from_server(entry) and start <= float(entry[0]) <= end:
             match = _HIT.match(str(entry[-1]).strip())
             if match:
                 who = match.group("who").strip()

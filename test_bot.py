@@ -12391,6 +12391,33 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         circuit._observe_farm_death(client)
         self.assertEqual(client.state.route_hazards, {})
 
+    def test_player_chat_never_teaches_a_route_hazard(self):
+        from . import self_improvement
+
+        # Anyone can type a hit line or a death notice; only the server's own
+        # lines count, so chat cannot mark a map hazardous.
+        messages = [
+            (10.0, c.CHAT_TYPE_CHAT, "ffffff", "crocodile hit you for 25 damage"),
+            (11.0, c.CHAT_TYPE_PRIVATE, "ffffff", "crocodile hit you for 25 damage"),
+            (12.0, 2, "ffffff", "[a=#charname]Mallory[/a] hit you for 25 damage"),
+            (13.0, c.CHAT_TYPE_LOCAL, "ffffff", "Sera starved to death."),
+        ]
+        self.assertEqual(self_improvement.hits_between(messages, 0.0, 20.0), {})
+        review = self_improvement.review_failure(
+            messages, [], {"time": 14.0, "action": "death", "map": "/a"}, ["/a"])
+        self.assertEqual((review.damage_taken, review.attackers), (0, {}))
+        self.assertNotEqual(review.cause, "starvation")
+        # The server's own line still counts.
+        messages.append((13.5, 2, "ffffff", "crocodile hit you for 25 damage"))
+        self.assertEqual(self_improvement.hits_between(messages, 0.0, 20.0), {"crocodile": 25})
+        # And a chat line quoting a death notice is no death.
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        for msg_type, text in ((c.CHAT_TYPE_CHAT, "[a=#charname]Mallory[/a]: you have died"),
+                               (c.CHAT_TYPE_PRIVATE, "you have died, Sera")):
+            data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+        self.assertNotIn("death", [entry["action"] for entry in client.action_history])
+
     def test_only_this_life_explains_a_route_death(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
         client = self.client({"xp": [trees]})
