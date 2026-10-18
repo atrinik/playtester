@@ -180,10 +180,13 @@ function renderDeaths() {
     const who = Object.entries(d.attackers || {}).map(([k, n]) => `${esc(k)} ×${n}`).join(", ");
     const types = Object.entries(d.damage_by_type || {}).map(([k, n]) => `${esc(k)} ${n}`).join(", ");
     const last = (d.messages || []).slice(-6).map(m => `<small class="muted">${esc(m[1])}</small>`).join("");
+    // What the bot was doing: its last decisions before the death.
+    const did = (d.decisions || []).slice(-4).map(r =>
+      `<small>${esc(r.action)}${r.detail ? `: ${esc(r.detail)}` : ""}</small>`).join("");
     return `<div class="spot">
       <div class="spot-head"><b>${when} · ${esc(String(d.map || "").replace(/^.*\//, ""))} (${d.x}, ${d.y})</b><span class="flag">${esc(d.cause)}</span></div>
       <small>${esc(d.detail)}${d.damage_taken ? ` · ${d.damage_taken} damage${types ? ` (${types})` : ""}` : ""}${who ? ` · ${who}` : ""}</small>
-      ${vitalsChart(d)}${last}
+      ${vitalsChart(d)}${did ? `<div class="post-mortem-activity">${did}</div>` : ""}${last}
     </div>`;
   }).join("") || '<span class="muted">No deaths recorded yet.</span>';
 }

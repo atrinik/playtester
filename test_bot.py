@@ -1221,6 +1221,32 @@ class ProtocolTests(unittest.TestCase):
             say("YOU HAVE DIED.")
         self.assertEqual(len(client.post_mortems), post_mortem.KEEP)
 
+    def test_a_post_mortem_names_where_she_died_not_where_she_respawned(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        swamp, bed = "/shattered_islands/world_1_50", "/shattered_islands/world_0_68"
+        client.set_savebed = lambda *args: None
+        client.state.savebed_map, client.state.savebed_xy = bed, (4, 7)
+
+        def arrive(path, x, y):
+            m = MapState(path=path, world_x=x, world_y=y)
+            client._observe_map_change(client.state.map.path, m)
+            client.state.map = m
+
+        def die():
+            data = bytes((2,)) + b"ffffff\0YOU HAVE DIED.\0"
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+            death = client.post_mortems[-1]
+            return death["map"], death["x"], death["y"]
+
+        arrive(swamp, 9, 3)
+        arrive(swamp, 10, 3)
+        # kill_player moves her to the savebed before the death notice.
+        arrive(bed, 4, 7)
+        self.assertEqual(die(), (swamp, 10, 3))
+        # Standing on the savebed for a while, a death there is the savebed's.
+        client._location = (client._location[0] - 60, *client._location[1:])
+        self.assertEqual(die(), (bed, 4, 7))
+
     def test_post_mortem_describes_the_fight_inside_the_window(self):
         from .post_mortem import build
 

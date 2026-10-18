@@ -173,6 +173,9 @@ class AtrinikClient:
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: list[list[float]] = []
         self.post_mortems: list[dict] = []
+        # (arrived_at, path, x, y) now, and the last place on the previous map.
+        self._location: tuple[float, str, int, int] | None = None
+        self._location_before: tuple[float, str, int, int] | None = None
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -530,6 +533,13 @@ class AtrinikClient:
         if (old_path and old_path != m.path and "/apartments/" in old_path and
                 "/apartments/" not in m.path and not self._recently_moved_by_force()):
             self.set_apartment_return(old_path, m.path, m.world_x, m.world_y)
+        # Where she is, since when, and the last square on the map before it:
+        # a death report needs the fight's place, not the respawn's.
+        if self._location is None or self._location[1] != m.path:
+            self._location_before = self._location
+            self._location = (time.time(), m.path, m.world_x, m.world_y)
+        else:
+            self._location = (self._location[0], m.path, m.world_x, m.world_y)
 
     def _recently_moved_by_force(self, seconds: float = 15.0) -> bool:
         """Whether a death or recall, not an exit, may explain a map change."""
@@ -720,8 +730,15 @@ class AtrinikClient:
         now = time.time()
         previous = float(self.post_mortems[-1].get("time", 0.0) or 0.0) if self.post_mortems else 0.0
         m = self.state.map
+        path, x, y = m.path, m.world_x, m.world_y
+        # kill_player moves her to the savebed before "YOU HAVE DIED.": just
+        # moved onto the savebed means she died where she was before it.
+        arrived = self._location[0] if self._location else 0.0
+        if (self._location_before is not None and now - arrived <= post_mortem.RESPAWN_SECONDS and
+                path == self.state.savebed_map and (x, y) == self.state.savebed_xy):
+            _, path, x, y = self._location_before
         self.post_mortems.append(post_mortem.build(
-            now, m.path, m.world_x, m.world_y, self.vitals,
+            now, path, x, y, self.vitals,
             self.state.messages, self.action_history, self.decision_history,
             since=previous, name=self.state.player_name or self.config.character))
         del self.post_mortems[:-post_mortem.KEEP]

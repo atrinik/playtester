@@ -21,6 +21,8 @@ VITALS_SECONDS = 600.0
 VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 # Vital samples stored per post-mortem, spread over its whole window.
 MAX_VITALS = 120
+# The respawn transfer lands this soon before the death notice.
+RESPAWN_SECONDS = 5.0
 
 
 def spread(samples: list, limit: int = MAX_VITALS) -> list:
