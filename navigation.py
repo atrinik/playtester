@@ -1721,35 +1721,29 @@ class NavigateTask(BotTask):
         if learned:
             previous_fallback = self._threat_fallback
 
-            def avoidable_alone(path: str) -> bool:
-                # A probe only: its plan is discarded and records nothing.
+            def strict(kept: set[str]) -> list[MapEdge] | None:
                 try:
-                    self._plan_avoiding(client, {path}, strict=True)
-                    return True
+                    return self._plan_avoiding(client, kept, strict=True)
                 except ValueError:
-                    return False
-                finally:
                     self._threat_fallback = previous_fallback
+                    return None
 
-            trials = [set(learned)]
-            if len(learned) > 1:
-                # A lesson no route avoids even on its own is a bottleneck:
-                # drop every such one together and keep the rest, so two
-                # unavoidable maps never discard an avoidable third. Then each
-                # of those sets missing one, for lessons avoidable only apart.
-                kept = {path for path in sorted(learned) if avoidable_alone(path)}
-                trials += [kept] + [kept - {path} for path in sorted(kept)]
-                trials += [learned - {path} for path in sorted(learned)]
-            seen: list[set[str]] = []
-            for kept in trials:
-                if not kept or kept in seen:
-                    continue
-                seen.append(kept)
-                try:
-                    route = self._plan_avoiding(client, kept, strict=True)
-                    break
-                except ValueError:
-                    self._threat_fallback = previous_fallback
+            def probe(kept: set[str]) -> bool:
+                # Its plan is discarded and records nothing.
+                found = strict(kept) is not None
+                self._threat_fallback = previous_fallback
+                return found
+
+            # Greedy reduction: drop the lessons no route avoids even alone,
+            # then one lesson at a time until a strict route exists, so it
+            # ends with as many lessons as it can and only plans without any
+            # once no single one can be kept.
+            kept = set(learned)
+            if len(kept) > 1 and not probe(kept):
+                kept = {path for path in kept if probe({path})}
+            while kept and (route := strict(kept)) is None:
+                kept -= {next((path for path in sorted(kept) if probe(kept - {path})),
+                              sorted(kept)[0])}
         if route is None:
             route = self._plan_avoiding(client, set())
         hazardous = self._learned_route_hazards(client, avoidable=False)

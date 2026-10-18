@@ -10283,6 +10283,32 @@ class NavigationTests(unittest.TestCase):
                                       town: time.time() + 3600}
         self.assertEqual(NavigateTask(graph, farm)._learned_route_hazards(client), set())
 
+    def test_planning_keeps_as_many_lessons_as_still_route(self):
+        # Three corridors cross the lessons in pairs (A+B, A+C, B+C): each is
+        # avoidable alone, but no two together. One must still be kept.
+        lessons = {"/a", "/b", "/c"}
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(path="/town", width=17, height=17, world_x=1, world_y=0)
+                self.state.route_hazards = {path: time.time() + 3600 for path in lessons}
+
+        task = NavigateTask(WorldGraph(), "/farm")
+        tried = []
+
+        def plan_avoiding(client, kept, strict=False):
+            tried.append((frozenset(kept), strict))
+            if len(kept) > 1:
+                raise ValueError("no route avoids them together")
+            return [MapEdge("/town", "/farm", 0, 0, 0, 0, label="kept " + ",".join(sorted(kept)) or "none")]
+
+        task._plan_avoiding = plan_avoiding
+        route = task._plan(FakeClient())
+        self.assertIn(route[0].label, {"kept /a", "kept /b", "kept /c"})
+        # It never fell back to planning without any lesson.
+        self.assertNotIn((frozenset(), False), tried)
+
     def test_an_unavoidable_lesson_keeps_the_others(self):
         def lane(path, width=3):
             node = MapNode(path, width=width, height=1)
