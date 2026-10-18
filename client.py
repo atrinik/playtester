@@ -179,9 +179,6 @@ class AtrinikClient:
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: list[list[float]] = []
         self.post_mortems: list[dict] = []
-        # (time, path, x, y, previous death) of the latest death, until its
-        # post-death window closes and its record is rebuilt.
-        self._post_mortem_pending: tuple[float, str, int, int, float] | None = None
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -206,9 +203,16 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        # Newest first, stopping at KEEP valid reports: an oversized stored
+        # list is never normalized whole.
         deaths = memory.load(character, "post_mortems", [])
-        restored = [post_mortem.restore(value) for value in deaths] if isinstance(deaths, list) else []
-        self.post_mortems = [value for value in restored if value][-post_mortem.KEEP:]
+        kept: list[dict] = []
+        for value in reversed(deaths if isinstance(deaths, list) else []):
+            if len(kept) == post_mortem.KEEP:
+                break
+            if (restored := post_mortem.restore(value)) is not None:
+                kept.append(restored)
+        self.post_mortems = kept[::-1]
         if isinstance(record, dict) and "depletion_points" in record:
             self.state.depletion_points = max(
                 0, int(record.get("depletion_points", 0)))
@@ -730,37 +734,17 @@ class AtrinikClient:
 
         kill_player queues its notice before the savebed transfer's map update,
         which goes out at the end of the server tick, so the square she is on
-        now is where she fell. The record is written at once and rebuilt when
-        the post-death window closes, so lines sent after the notice are in it.
+        now is where she fell. The report is built once, here, and ends at the
+        notice: what follows a death (a respawn, the next fight) never belongs
+        to it.
         """
         previous = self.post_mortems[-1]["time"] if self.post_mortems else 0.0
         m = self.state.map
-        self._post_mortem_pending = (time.time(), m.path, m.world_x, m.world_y, previous)
-        self.post_mortems.append(self._build_post_mortem(self._post_mortem_pending))
-        del self.post_mortems[:-post_mortem.KEEP]
-        self._save_post_mortems()
-
-    def _build_post_mortem(self, death: tuple[float, str, int, int, float]) -> dict:
-        when, path, x, y, previous = death
-        return post_mortem.build(
-            when, path, x, y, self.vitals,
+        self.post_mortems.append(post_mortem.build(
+            time.time(), m.path, m.world_x, m.world_y, self.vitals,
             self.state.messages, self.action_history, self.decision_history,
-            since=previous, name=self.state.player_name or self.config.character)
-
-    def _finish_post_mortem(self, now: float | None = None) -> None:
-        """Rebuild the latest death's record once its post-death window closed.
-
-        Without ``now`` it is rebuilt at once, before the next death.
-        """
-        pending = self._post_mortem_pending
-        if pending is None or now is not None and now < pending[0] + post_mortem.AFTER_SECONDS:
-            return
-        self._post_mortem_pending = None
-        if self.post_mortems and self.post_mortems[-1]["time"] == pending[0]:
-            self.post_mortems[-1] = self._build_post_mortem(pending)
-            self._save_post_mortems()
-
-    def _save_post_mortems(self) -> None:
+            since=previous, name=self.state.player_name or self.config.character))
+        del self.post_mortems[:-post_mortem.KEEP]
         character = self.state.player_name
         if character:
             self._memory_store().save(character, "post_mortems", self.post_mortems)
@@ -982,7 +966,6 @@ class AtrinikClient:
                 and packet_type not in (c.C_VERSION, c.C_ACCESS_POLICY,
                                         c.C_ACCESS_RESULT, c.C_KEEPALIVE)):
             raise ProtocolError("application packet before access admission")
-        self._finish_post_mortem(time.time())
         handlers = {
             c.C_VERSION: self._handle_version,
             c.C_ACCESS_POLICY: self._handle_access_policy,
@@ -1175,10 +1158,6 @@ class AtrinikClient:
     async def _handle_drawinfo(self, cur: Cursor, raw: bytes) -> None:
         msg_type, color = cur.u8(), cur.cstring()
         text = cur.cstring() if cur.remaining else ""
-        if text.strip().casefold() in DEATH_NOTICES:
-            # Before this notice is recorded, so an earlier death's report
-            # never takes in the next death.
-            self._finish_post_mortem()
         self.state.add_message(msg_type, color, text)
         if update_bank_balance(self.state, text):
             self.set_bank_balance(self.state.bank_balance)

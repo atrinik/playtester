@@ -22,9 +22,6 @@ VITALS_SECONDS = 600.0
 VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 # Vital samples stored per post-mortem, spread over its whole window.
 MAX_VITALS = 120
-# Messages and samples this long after the notice still belong to the death
-# (a PvP defeat's "Local medics" line, late stat packets).
-AFTER_SECONDS = 2.0
 
 
 def spread(samples: list, limit: int = MAX_VITALS, keep: Iterable[int] = ()) -> list:
@@ -146,7 +143,8 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
     # A previous death at or after this one (a clock stepped back, a bad
     # record) bounds nothing: the normal window applies.
     since = since if since < when else 0.0
-    start, end = max(when - REVIEW_WINDOW_SECONDS, since), when + AFTER_SECONDS
+    # Up to the notice itself: after it come the respawn and the next life.
+    start, end = max(when - REVIEW_WINDOW_SECONDS, since), when
     messages = list(messages)
     decisions = list(decisions)
     # The server tells everyone "<name> starved to death." as the whole
@@ -171,8 +169,7 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
              if _within(entry[0], start, end)]
     cause, detail = review.cause, review.detail
 
-    # What she was doing before she died: the post-death grace is for the
-    # server's late lines, not for the review and respawn work that follows.
+    # What she was doing before she died.
     def recent(records: Iterable[dict]) -> list[dict]:
         return [{key: record.get(key) for key in ("time", "action", "detail", "map")}
                 for record in records

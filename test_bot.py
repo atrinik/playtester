@@ -1241,17 +1241,10 @@ class ProtocolTests(unittest.TestCase):
         say("Local medics have saved your life...")
         death = client.post_mortems[-1]
         self.assertEqual((death["map"], death["x"], death["y"]), (swamp, 10, 3))
-        # The record is rebuilt once the post-death window closes, with the
-        # lines sent after the notice, and at the same place.
-        when = client._post_mortem_pending[0]
-        client._post_mortem_pending = (when - 3, *client._post_mortem_pending[1:])
-        client.post_mortems[-1]["time"] = when - 3
-        client.state.messages.append((when - 1, 2, "Local medics have saved your life..."))
-        say("You feel much better.")
-        self.assertIsNone(client._post_mortem_pending)
-        death = client.post_mortems[-1]
-        self.assertIn("Local medics have saved your life...", [text for _, text in death["messages"]])
-        self.assertEqual((death["map"], death["x"], death["y"]), (swamp, 10, 3))
+        # Built once, ending at the notice: the medics line and anything
+        # after it (the respawn, a next fight) are not part of it.
+        self.assertNotIn("Local medics have saved your life...",
+                         [text for _, text in death["messages"]])
         say("YOU HAVE DIED.")
         death = client.post_mortems[-1]
         self.assertEqual((death["map"], death["x"], death["y"]), (bed, 4, 7))
@@ -1347,7 +1340,7 @@ class ProtocolTests(unittest.TestCase):
         report = post_mortem.build(1000.0, "/a", 1, 2, [], [(999.0, 2, "", "YOU HAVE DIED.")],
                                    [], [{"time": 10 ** 400, "action": "x"}], since=5000.0)
         self.assertEqual([text for _, text in report["messages"]], ["YOU HAVE DIED."])
-        # Downsampling keeps the fatal sample even with a recovery after it.
+        # Downsampling keeps the fatal sample among many.
         when = 1000.0
         busy = [[when - 59 + index * 0.4, 100, 155, 10, 39, 900] for index in range(140)]
         busy[-3] = [when - 0.2, 0, 155, 0, 39, 900]
@@ -1355,7 +1348,8 @@ class ProtocolTests(unittest.TestCase):
         death = post_mortem.build(when, "/a", 1, 2, busy, [], [], [])
         self.assertLessEqual(len(death["vitals"]), post_mortem.MAX_VITALS)
         self.assertIn([when - 0.2, 0, 155, 0, 39, 900], death["vitals"])
-        self.assertEqual(death["vitals"][-1][0], when + 1)
+        # The recovery after the death is not part of its report.
+        self.assertTrue(all(sample[0] <= when for sample in death["vitals"]))
 
     def test_post_mortem_describes_the_fight_inside_the_window(self):
         from .post_mortem import build
