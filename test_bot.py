@@ -1276,6 +1276,22 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual([text for _, text in report["messages"]].count("YOU HAVE DIED."), 1)
             self.assertEqual([entry["action"] for entry in report["actions"]].count("death"), 1)
 
+    def test_a_post_mortem_charts_from_a_baseline_and_stops_activity_at_death(self):
+        from .post_mortem import build
+
+        when = 1000.0
+        # Steady health long before the window, then one fatal hit.
+        vitals = [[when - 300, 155, 155, 39, 39, 900], [when - 1, 0, 155, 39, 39, 900]]
+        decisions = [{"time": when - 5, "action": "navigate", "detail": "to the farm"},
+                     {"time": when + 1, "action": "farm-failure-review", "detail": "pack"}]
+        death = build(when, "/a", 1, 2, vitals, [], decisions, decisions)
+        self.assertEqual(len(death["vitals"]), 2)
+        self.assertEqual(death["vitals"][0][1:], [155, 155, 39, 39, 900])
+        self.assertLess(death["vitals"][0][0], when - 1)
+        # The review written after the notice is not what she was doing.
+        self.assertEqual([entry["action"] for entry in death["decisions"]], ["navigate"])
+        self.assertEqual([entry["action"] for entry in death["actions"]], ["navigate"])
+
     def test_stored_post_mortems_are_validated_on_load(self):
         from . import post_mortem
 
@@ -1312,7 +1328,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(death["attackers"], {"giant slug": 2, "red ant": 1})
         self.assertEqual(death["damage_taken"], 65)
         self.assertEqual(death["damage_by_type"], {"acid": 55, "pierce": 10})
-        self.assertEqual([sample[0] for sample in death["vitals"]], [now - 20, now - 1])
+        # The steady state before the window charts from its start.
+        self.assertEqual([sample[0] for sample in death["vitals"]], [now - 60, now - 20, now - 1])
+        self.assertEqual(death["vitals"][0][1], 155)
         self.assertEqual(death["actions"], [{"time": now - 3, "action": "fire",
                                              "detail": "minor healing",
                                              "map": "/shattered_islands/world_13_73"}])

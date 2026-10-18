@@ -120,10 +120,21 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
              if _within(entry[0], start, end)]
     cause, detail = review.cause, review.detail
 
+    # What she was doing before she died: the post-death grace is for the
+    # server's late lines, not for the review and respawn work that follows.
     def recent(records: Iterable[dict]) -> list[dict]:
         return [{key: record.get(key) for key in ("time", "action", "detail", "map")}
                 for record in records
-                if isinstance(record, dict) and _within(record.get("time"), start, end)][-25:]
+                if isinstance(record, dict) and _within(record.get("time"), start, when)][-25:]
+
+    # The last sample before the window is the state at its start, so a
+    # sudden death (steady, then one fatal hit) still charts from a baseline.
+    vitals = [list(value) for value in vitals]
+    before = [value for value in vitals if _within(value[0], float("-inf"), start)
+              and float(value[0]) < start]
+    inside = [value for value in vitals if _within(value[0], start, end)]
+    if before:
+        inside.insert(0, [start, *before[-1][1:]])
 
     return {
         "time": when, "map": path, "x": x, "y": y,
@@ -131,7 +142,7 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
         "attackers": dict(review.attackers), "peak_attackers": review.peak_attackers,
         "damage_taken": review.damage_taken,
         "damage_by_type": dict(review.damage_by_type),
-        "vitals": spread([list(value) for value in vitals if _within(value[0], start, end)]),
+        "vitals": spread(inside),
         "messages": [[stamp, text] for stamp, text in texts][-40:],
         "actions": recent(actions),
         "decisions": recent(decisions),

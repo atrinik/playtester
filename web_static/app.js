@@ -172,7 +172,9 @@ function vitalsChart(pm) {
 }
 function renderDeaths() {
   const deaths = slow.post_mortems || [];
-  const sig = JSON.stringify(deaths.map(d => d.time));
+  // The whole reports: a death's record is rebuilt in place after its
+  // post-death window, under the same time.
+  const sig = JSON.stringify(deaths);
   if (sig === lastDeathsSig) return;
   lastDeathsSig = sig;
   $("#fa-deaths").innerHTML = deaths.map(d => {
