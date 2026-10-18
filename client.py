@@ -173,7 +173,6 @@ class AtrinikClient:
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: list[list[float]] = []
         self.post_mortems: list[dict] = []
-        self._last_death_notice: tuple[float, str] = (0.0, "")
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -716,35 +715,16 @@ class AtrinikClient:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
-    def _record_post_mortem(self, kind: str) -> None:
-        """Keep what happened in the minute before this death.
-
-        One death can be announced as "defeated in combat" and "YOU HAVE
-        DIED."; the second of such a pair rebuilds the first's post-mortem
-        to include what arrived in between. The same notice again is a new
-        death, however soon after respawning.
-        """
+    def _record_post_mortem(self) -> None:
+        """Keep what happened in the minute before this death."""
         now = time.time()
-        times = [0.0, 0.0] + [float(death.get("time", 0.0) or 0.0)
-                              for death in self.post_mortems[-2:]]
-        last_at, last_kind = self._last_death_notice
-        if (self.post_mortems and last_kind and last_kind != kind and
-                now - last_at < post_mortem.SAME_DEATH_SECONDS):
-            self._last_death_notice = (0.0, "")
-            death = self.post_mortems[-1]
-            self.post_mortems[-1] = post_mortem.build(
-                times[-1], death.get("map", ""), death.get("x", 0),
-                death.get("y", 0), self.vitals, self.state.messages,
-                self.action_history, self.decision_history,
-                since=times[-2], until=now)
-        else:
-            self._last_death_notice = (now, kind)
-            m = self.state.map
-            self.post_mortems.append(post_mortem.build(
-                now, m.path, m.world_x, m.world_y, self.vitals,
-                self.state.messages, self.action_history, self.decision_history,
-                since=times[-1]))
-            del self.post_mortems[:-post_mortem.KEEP]
+        previous = float(self.post_mortems[-1].get("time", 0.0) or 0.0) if self.post_mortems else 0.0
+        m = self.state.map
+        self.post_mortems.append(post_mortem.build(
+            now, m.path, m.world_x, m.world_y, self.vitals,
+            self.state.messages, self.action_history, self.decision_history,
+            since=previous))
+        del self.post_mortems[:-post_mortem.KEEP]
         character = self.state.player_name
         if character:
             self._memory_store().save(character, "post_mortems", self.post_mortems)
@@ -1195,11 +1175,15 @@ class AtrinikClient:
             m = self.state.map
             if m.path:
                 self.set_savebed(m.path, m.world_x, m.world_y)
-        died = "defeated in combat" in lowered or "you have died" in lowered
+        # kill_player (server types/player.c) sends exactly one of these, as
+        # the whole message, per defeat: a PvP-area defeat, or a death after
+        # its stat losses. Matching the whole text keeps a player's chat that
+        # quotes one from passing for a death.
+        died = normalized in ("you have been defeated in combat!",
+                              "you have died.")
         if died:
             self.record_action("death", text)
-            self._record_post_mortem(
-                "defeated" if "defeated in combat" in lowered else "died")
+            self._record_post_mortem()
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a
             # post-death window for protocol/order variants that arrive later.

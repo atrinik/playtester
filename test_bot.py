@@ -1178,38 +1178,34 @@ class ProtocolTests(unittest.TestCase):
         asyncio.run(client._handle_stats(Cursor(payload), payload))
         self.assertEqual(client.vitals[-1][1:5], [13, 155, 3, 39])
 
-        def say(text):
-            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+        def say(text, msg_type=2):
+            data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
             asyncio.run(client._handle_drawinfo(Cursor(data), data))
 
-        clock = [time.time()]
-        with patch("time.time", lambda: clock[0]):
-            for line in ("The spell heals you for 12 hp!", "Sera starved to death.",
-                         "You have been defeated in combat!"):
-                say(line)
-            self.assertEqual(len(client.post_mortems), 1)
-            # The final announcement of the same death follows a few seconds
-            # later, after its stat loss; it rebuilds the post-mortem with them.
-            clock[0] += 5
-            client.state.map.world_x = 2
-            payload = bytes((c.STAT_HP,)) + struct.pack(">" + c.STAT_FORMATS[c.STAT_HP], 0)
-            asyncio.run(client._handle_stats(Cursor(payload), payload))
-            say("You feel clumsy!")
-            say("YOU HAVE DIED.")
+        # A death sends its stat losses, then "YOU HAVE DIED." last.
+        for line in ("The spell heals you for 12 hp!", "Sera starved to death.",
+                     "You feel clumsy!", "YOU HAVE DIED."):
+            say(line)
         self.assertEqual(len(client.post_mortems), 1)
         death = client.post_mortems[0]
         self.assertEqual((death["map"], death["x"], death["y"]),
                          ("/shattered_islands/world_6_46", 12, 14))
         self.assertEqual((death["cause"], death["detail"]), ("starvation", "ran out of food"))
-        self.assertEqual(death["vitals"][-1][1:5], [0, 155, 3, 39])
+        self.assertEqual(death["vitals"][-1][1:5], [13, 155, 3, 39])
         texts = [text for _, text in death["messages"]]
         self.assertIn("Sera starved to death.", texts)
         self.assertIn("You feel clumsy!", texts)
         self.assertIn("death", [entry["action"] for entry in death["actions"]])
-        # The same announcement again is another death, however soon.
-        say("YOU HAVE DIED.")
+        # A player's chat quoting a notice is no death.
+        say("[a=#charname]Mallory[/a]: YOU HAVE DIED.", c.CHAT_TYPE_CHAT)
+        say("[a=#charname]Mallory[/a] tells you: You have been defeated in combat!",
+            c.CHAT_TYPE_PRIVATE)
+        self.assertEqual(len(client.post_mortems), 1)
+        # Each notice is its own defeat, however soon: a PvP-area defeat
+        # sends only "defeated in combat", a death only "YOU HAVE DIED.".
         say("You have been defeated in combat!")
-        self.assertEqual(len(client.post_mortems), 2)
+        say("YOU HAVE DIED.")
+        self.assertEqual(len(client.post_mortems), 3)
         # Only the latest KEEP deaths are kept.
         for index in range(post_mortem.KEEP + 3):
             say("YOU HAVE DIED.")

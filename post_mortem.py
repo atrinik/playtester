@@ -16,9 +16,6 @@ from .self_improvement import REVIEW_WINDOW_SECONDS, review_failure
 
 # Post-mortems kept per character.
 KEEP = 20
-# The two announcements of one death ("defeated in combat", then "YOU HAVE
-# DIED.") arrive this close together. The same announcement twice is two.
-SAME_DEATH_SECONDS = 10.0
 # Vital samples kept; the client samples on every health/SP/food change.
 VITALS_SECONDS = 600.0
 VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
@@ -38,16 +35,12 @@ def _within(stamp: Any, start: float, end: float) -> bool:
 
 def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
           messages: Iterable[tuple], actions: Iterable[dict],
-          decisions: Iterable[dict], *, since: float = 0.0,
-          until: float = 0.0) -> dict[str, Any]:
+          decisions: Iterable[dict], *, since: float = 0.0) -> dict[str, Any]:
     """The post-mortem of a death at ``when`` on ``path`` (x, y).
 
     ``since`` is the previous death: nothing from that earlier life counts.
-    ``until`` is a later announcement of this same death, which extends the
-    window to include what arrived before it.
     """
-    start = max(when - REVIEW_WINDOW_SECONDS, since)
-    end = max(when, until) + 2.0
+    start, end = max(when - REVIEW_WINDOW_SECONDS, since), when + 2.0
     messages = list(messages)
     decisions = list(decisions)
     # The farm decides whether a death was "on the way"; a post-mortem only
