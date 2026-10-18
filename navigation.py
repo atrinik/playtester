@@ -1686,6 +1686,17 @@ class NavigateTask(BotTask):
             estimator(path) >= 3
         }
 
+    def _learned_route_hazards(self, client: AtrinikClient) -> set[str]:
+        """Maps where a recent route death took combat damage.
+
+        Never the trip's own source or destination: those cannot be avoided.
+        """
+        now = time.time()
+        hazards = getattr(client.state, "route_hazards", None) or {}
+        return {path for path, until in hazards.items()
+                if until > now and
+                path not in (client.state.map.path, self.destination)}
+
     def _plan(self, client: AtrinikClient) -> list[MapEdge]:
         source = client.state.map.path
         args = (
@@ -1697,8 +1708,10 @@ class NavigateTask(BotTask):
         ranged_hazards = self._known_ranged_hazard_maps(client)
         overlevel_hazards = self._known_overlevel_hazard_maps(client)
         pack_hazards = self._known_pack_hazard_maps(source)
+        learned_hazards = self._learned_route_hazards(client)
         protected_hazards = (
-            ranged_hazards | pack_hazards | set(self.KNOWN_LETHAL_TRANSIT))
+            ranged_hazards | pack_hazards | learned_hazards |
+            set(self.KNOWN_LETHAL_TRANSIT))
         kwargs = {
             "allow_locked": self._allow_locked(client),
             "excluded": self._excluded_edges,
@@ -1729,6 +1742,15 @@ class NavigateTask(BotTask):
                     try:
                         route = self.graph.route_points(*args, **{
                             **kwargs, "avoided_maps": kwargs["avoided_maps"] - tiled})
+                    except ValueError:
+                        route = None
+                if route is None and learned_hazards:
+                    # A map she died crossing is avoided while another way
+                    # exists, never made unroutable: the only way goes on.
+                    try:
+                        route = self.graph.route_points(*args, **{
+                            **kwargs, "avoided_maps":
+                                kwargs["avoided_maps"] - tiled - learned_hazards})
                     except ValueError:
                         route = None
                 if route is None and overlevel_hazards:
@@ -3867,6 +3889,8 @@ class FarmCircuitTask(BotTask):
     BANK_DEPOSIT_WEALTH_OVERRIDE = 10_000
     ROUTINE_TOWN_TRIP_WEIGHT = 0.85
     MASS_IDENTIFY_WEIGHT = 0.70
+    # How long a map where a route death took combat damage is avoided.
+    ROUTE_HAZARD_SECONDS = 6 * 3600.0
     FOOD_RESUPPLY_QUANTITY = 25
     FOOD_RESUPPLY_NUTRITION = 10_000
     FOOD_RESUPPLY_MAX_QUANTITY = 50
@@ -4072,6 +4096,21 @@ class FarmCircuitTask(BotTask):
             getattr(client.state, "messages", ()),
             getattr(client, "decision_history", ()), failure,
             [leg for leg, _ in self.legs])
+        if review.cause == "route" and review.damage_taken > 0 and review.map:
+            # Killed crossing a map on the way: route around it for a while
+            # instead of walking back into the same fight after respawning.
+            until = time.time() + self.ROUTE_HAZARD_SECONDS
+            remember = getattr(client, "remember_route_hazard", None)
+            if remember is not None:
+                remember(review.map, until)
+            else:
+                client.state.route_hazards[review.map] = until
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("route-hazard-learned",
+                         f"{review.map} for {self.ROUTE_HAZARD_SECONDS / 3600:.0f} h: "
+                         f"{review.damage_taken} damage from "
+                         + ", ".join(sorted(review.attackers)))
         key = self._spot_key()
         adaptations = getattr(client.state, "farm_adaptations", {}) or {}
         record, pause = self_improvement.learn(adaptations.get(key, {}), review)

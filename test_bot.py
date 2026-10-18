@@ -10072,6 +10072,50 @@ class NavigationTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(len(client.steps), 2)
 
+    def test_learned_route_hazards_are_avoided_but_never_strand_her(self):
+        def lane(path, width=3):
+            node = MapNode(path, width=width, height=1)
+            node.terrain = {(x, 0): 1 for x in range(width)}
+            return node
+
+        graph = WorldGraph()
+        town, farm = "/shattered_islands/world_0_68", "/shattered_islands/world_1_50"
+        swamp, detour = "/shattered_islands/world_1_51", "/shattered_islands/world_2_51"
+        nodes = {path: lane(path) for path in (town, farm, swamp, detour)}
+        graph.nodes.update(nodes)
+        for path in nodes:
+            graph.named_spawns[path] = []
+        # The swamp is the short way; the detour is longer but safe.
+        nodes[town].edges.append(MapEdge(town, swamp, 2, 0, 0, 0))
+        nodes[swamp].edges.append(MapEdge(swamp, farm, 2, 0, 0, 0))
+        nodes[town].edges.append(MapEdge(town, detour, 0, 0, 2, 0))
+        nodes[detour].edges.append(MapEdge(detour, "/x", 2, 0, 0, 0))
+        graph.nodes["/x"] = lane("/x")
+        graph.named_spawns["/x"] = []
+        graph.nodes["/x"].edges.append(MapEdge("/x", farm, 2, 0, 0, 0))
+
+        class FakeClient:
+            def __init__(self, path):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(path=path, width=17, height=17,
+                                          world_x=1, world_y=0)
+
+        client = FakeClient(town)
+        route = NavigateTask(graph, farm)._plan(client)
+        self.assertIn(swamp, [edge.destination for edge in route])
+        client.state.route_hazards = {swamp: time.time() + 3600}
+        route = NavigateTask(graph, farm)._plan(client)
+        self.assertNotIn(swamp, [edge.destination for edge in route])
+        # The only way still goes through it.
+        nodes[town].edges = [edge for edge in nodes[town].edges if edge.destination == swamp]
+        graph._world_search_snapshot = None
+        route = NavigateTask(graph, farm)._plan(client)
+        self.assertEqual([edge.destination for edge in route], [swamp, farm])
+        # Expired lessons, the destination and her own map are never avoided.
+        client.state.route_hazards = {swamp: time.time() - 1, farm: time.time() + 3600,
+                                      town: time.time() + 3600}
+        self.assertEqual(NavigateTask(graph, farm)._learned_route_hazards(client), set())
+
     def test_tiled_levels_are_pack_hazards_with_a_fallback_through_them(self):
         def lane(path, width=3):
             node = MapNode(path, width=width, height=1)
@@ -11888,6 +11932,36 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
             "task": "", "map": "/elsewhere"})
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
+
+    def test_route_death_in_combat_teaches_a_route_hazard(self):
+        from .navigation import FarmCircuitTask
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        swamp = "/shattered_islands/world_1_50"
+        # Killed by a crocodile pack while still on the way to the spot.
+        client.state.add_message(2, "ff0000", "crocodile hit you for 25 (-25) pierce damage.")
+        before = time.time()
+        client.decision_history.append({
+            "time": time.time() + 1, "action": "death", "detail": "",
+            "task": "", "map": swamp})
+        circuit._observe_farm_death(client)
+        until = client.state.route_hazards[swamp]
+        self.assertAlmostEqual(until - before, FarmCircuitTask.ROUTE_HAZARD_SECONDS, delta=10)
+        self.assertIn("route-hazard-learned",
+                      [entry["action"] for entry in client.decision_history])
+
+    def test_starving_on_the_way_teaches_no_route_hazard(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        client.state.add_message(2, "ffffff", "Sera starved to death.")
+        client.decision_history.append({
+            "time": time.time() + 1, "action": "death", "detail": "",
+            "task": "", "map": "/shattered_islands/world_6_46"})
+        circuit._observe_farm_death(client)
+        self.assertEqual(client.state.route_hazards, {})
 
     def test_repeated_failures_at_maximum_adaptation_pause_the_spot_briefly(self):
         from . import self_improvement
