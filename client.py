@@ -816,6 +816,7 @@ class AtrinikClient:
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
 
     async def checkpoint_reconnect(self) -> bool:
         """Gracefully reconnect so the server persists the live character."""
@@ -828,6 +829,7 @@ class AtrinikClient:
         self._reconnect_requested = True
         await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
         return True
 
     async def run(self) -> None:
@@ -850,6 +852,7 @@ class AtrinikClient:
                 except OSError:
                     pass
                 self.state.phase = "disconnected"
+                self.progress_watch.observe(self.state)
             if not self.config.reconnect or self._closed:
                 break
             self._reconnect_requested = False
@@ -921,6 +924,7 @@ class AtrinikClient:
         with contextlib.suppress(OSError):
             await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
 
     async def _dispatch(self, packet_type: int, data: bytes) -> None:
         if (self.state.phase in ("version", "access-policy", "access-auth")

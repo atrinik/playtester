@@ -82,9 +82,14 @@ function bar(label, value, max, cls) {
   const low = cls === "hp" && pct < 30 ? " low" : "";
   return `<div class="vital"><b>${label}</b><div class="bar ${cls}${low}"><i style="width:${pct}%"></i><span>${value ?? "—"} / ${max ?? "—"}</span></div></div>`;
 }
+let lastAlertsSig = "";
 function renderAlerts() {
-  $("#alerts").innerHTML = (live.alerts || []).map(a =>
+  // The region is aria-live: rewrite it only when the alerts change.
+  const html = (live.alerts || []).map(a =>
     `<span class="alert ${esc(a.level)}" title="${esc(a.id)}">${esc(a.text)}</span>`).join("");
+  if (html === lastAlertsSig) return;
+  lastAlertsSig = html;
+  $("#alerts").innerHTML = html;
 }
 function renderHeader() {
   const s = live.stats || {}, lp = live.level_progress || {}, m = live.map || {};

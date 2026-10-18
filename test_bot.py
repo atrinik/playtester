@@ -1189,6 +1189,10 @@ class ProtocolTests(unittest.TestCase):
         state.stats["food"] = 0
         self.assertEqual(ids(now), ["starving"])
         state.stats["food"] = 300
+        # Idle before autoplay starts is not being stuck.
+        watch.observe(state, now + STUCK_SECONDS, autoplay=True)
+        self.assertEqual(ids(now + STUCK_SECONDS), [])
+        watch.exp_changed_at = watch.moved_at = now
         # No XP and no movement for the stuck window while autoplay runs.
         later = now + STUCK_SECONDS
         self.assertEqual(ids(later), ["stuck"])
@@ -1208,6 +1212,14 @@ class ProtocolTests(unittest.TestCase):
         state.phase = "playing"
         watch.observe(state, later + DISCONNECTED_SECONDS)
         self.assertIsNone(watch.disconnected_since)
+
+    def test_client_starts_the_outage_clock_when_the_connection_drops(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        before = time.time()
+        asyncio.run(client.close())
+        self.assertIsNotNone(client.progress_watch.disconnected_since)
+        self.assertGreaterEqual(client.progress_watch.disconnected_since, before)
 
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))

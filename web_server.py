@@ -456,13 +456,14 @@ class DashboardState:
     def alerts(self) -> list[dict[str, str]]:
         """Alerts for the operator: deaths, starvation, stuck, disconnected."""
         watch = self.client.progress_watch
-        # Moves and disconnects happen between stats packets.
-        watch.observe(self.client.state)
         task = self.engine.task
+        autoplay = bool(task is not None and
+                        str(getattr(task, "name", "")).startswith("autoplay"))
+        # Moves happen between stats packets; the client reports disconnects.
+        watch.observe(self.client.state, autoplay=autoplay)
         return active_alerts(
             self.client.state, self.client.decision_history, watch,
-            autoplay_running=bool(task is not None and
-                                  str(getattr(task, "name", "")).startswith("autoplay")))
+            autoplay_running=autoplay)
 
     def snapshot(self) -> dict[str, Any]:
         state, task = self.client.state, self.engine.task

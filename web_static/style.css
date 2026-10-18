@@ -163,7 +163,9 @@ details summary { cursor: pointer; color: var(--muted); margin-top: .6rem; font-
   .layout { grid-template-columns: 260px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
   .right { grid-column: 1 / -1; }
 }
-.alerts { display: flex; gap: .4rem; overflow: hidden; }
+/* Alerts keep their width; the map name gives way first on narrow screens. */
+.alerts { display: flex; gap: .4rem; flex-shrink: 0; }
+.where { min-width: 0; }
 .alert { font-size: 12px; padding: .1rem .5rem; border-radius: 999px; border: 1px solid currentColor; }
 .alert.critical { color: #ff8a8a; background: #3a1d1d; }
 .alert.warn { color: #f3c969; background: #33291a; }

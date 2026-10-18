@@ -28,9 +28,17 @@ class ProgressWatch:
         self.position: tuple | None = None
         self.moved_at = now
         self.disconnected_since: float | None = None
+        self.autoplay = False
 
-    def observe(self, state: Any, now: float | None = None) -> None:
+    def observe(self, state: Any, now: float | None = None, *,
+                autoplay: bool | None = None) -> None:
+        """Fold in the current state; ``autoplay`` when known (None: unchanged)."""
         now = time.time() if now is None else now
+        if autoplay is not None:
+            if autoplay and not self.autoplay:
+                # Inactivity before autoplay started is not being stuck.
+                self.exp_changed_at = self.moved_at = now
+            self.autoplay = autoplay
         exp = (getattr(state, "stats", {}) or {}).get("exp")
         if exp != self.exp:
             self.exp, self.exp_changed_at = exp, now
