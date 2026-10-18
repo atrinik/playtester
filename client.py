@@ -110,6 +110,12 @@ class ClientConfig:
     runtime_content_path: str = ""
 
 
+# kill_player (server types/player.c) sends exactly one of these, as the whole
+# message, per defeat: a PvP-area defeat, or a death after its stat losses.
+# Matching the whole text keeps a player's chat that quotes one from passing
+# for a death.
+DEATH_NOTICES = ("you have been defeated in combat!", "you have died.")
+
 class AtrinikClient:
     BANK_BALANCE_CACHE_SECONDS = 6 * 60 * 60
 
@@ -706,7 +712,9 @@ class AtrinikClient:
                 if previous["count"] % 5:
                     return
             else:
-                self.decision_history.append(record)
+                # A copy: coalescing updates the decision in place, which must
+                # not move the action history entry it came from.
+                self.decision_history.append(dict(record))
                 del self.decision_history[:-2000]
             # Before the player packet arrives, config.character names the
             # intended selection but its persisted history has not been
@@ -725,7 +733,6 @@ class AtrinikClient:
         now is where she fell. The record is written at once and rebuilt when
         the post-death window closes, so lines sent after the notice are in it.
         """
-        self._finish_post_mortem()
         previous = self.post_mortems[-1]["time"] if self.post_mortems else 0.0
         m = self.state.map
         self._post_mortem_pending = (time.time(), m.path, m.world_x, m.world_y, previous)
@@ -1168,6 +1175,10 @@ class AtrinikClient:
     async def _handle_drawinfo(self, cur: Cursor, raw: bytes) -> None:
         msg_type, color = cur.u8(), cur.cstring()
         text = cur.cstring() if cur.remaining else ""
+        if text.strip().casefold() in DEATH_NOTICES:
+            # Before this notice is recorded, so an earlier death's report
+            # never takes in the next death.
+            self._finish_post_mortem()
         self.state.add_message(msg_type, color, text)
         if update_bank_balance(self.state, text):
             self.set_bank_balance(self.state.bank_balance)
@@ -1205,12 +1216,7 @@ class AtrinikClient:
             m = self.state.map
             if m.path:
                 self.set_savebed(m.path, m.world_x, m.world_y)
-        # kill_player (server types/player.c) sends exactly one of these, as
-        # the whole message, per defeat: a PvP-area defeat, or a death after
-        # its stat losses. Matching the whole text keeps a player's chat that
-        # quotes one from passing for a death.
-        died = normalized in ("you have been defeated in combat!",
-                              "you have died.")
+        died = normalized in DEATH_NOTICES
         if died:
             self.record_action("death", text)
             # The server emits death stat-loss lines before its final death

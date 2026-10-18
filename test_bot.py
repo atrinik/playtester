@@ -1257,6 +1257,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual((death["map"], death["x"], death["y"]), (bed, 4, 7))
         self.assertEqual(len(client.post_mortems), 2)
 
+    def test_a_quick_second_death_stays_out_of_the_first_report(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        # The second notice lands inside the first's post-death window: the
+        # first is finished before that notice is recorded, so neither
+        # report holds both deaths.
+        say("YOU HAVE DIED.")
+        say("YOU HAVE DIED.")
+        first, second = client.post_mortems
+        for report in (first, second):
+            self.assertEqual([text for _, text in report["messages"]].count("YOU HAVE DIED."), 1)
+            self.assertEqual([entry["action"] for entry in report["actions"]].count("death"), 1)
+
     def test_stored_post_mortems_are_validated_on_load(self):
         from . import post_mortem
 
