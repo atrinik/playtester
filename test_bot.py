@@ -1208,11 +1208,12 @@ class ProtocolTests(unittest.TestCase):
         say("You have been defeated in combat!")
         say("YOU HAVE DIED.")
         bucket = client.trends.buckets[-1]
-        # Two announcements of one death count once.
-        self.assertEqual((bucket["heals"], bucket["deaths"]), (2, 1))
+        # Each notice is its own defeat: a PvP-area defeat sends only
+        # "defeated in combat", a death only "YOU HAVE DIED.".
+        self.assertEqual((bucket["heals"], bucket["deaths"]), (2, 2))
         # Dying again right after respawning is another death.
         say("YOU HAVE DIED.")
-        self.assertEqual(client.trends.buckets[-1]["deaths"], 2)
+        self.assertEqual(client.trends.buckets[-1]["deaths"], 3)
         # Depletion changes between stats packets reach the bucket.
         client.set_depletion_points(7)
         self.assertEqual(client.trends.buckets[-1]["depletion"], 7)

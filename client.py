@@ -173,8 +173,6 @@ class AtrinikClient:
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
         self.trends = Trends()
         self._trends_character = ""
-        # (time, kind) of the last counted death notice, for pairing.
-        self._last_trend_death: tuple[float, str] = (0.0, "")
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -730,21 +728,6 @@ class AtrinikClient:
         if self.trends.count(key):
             self._persist_trends()
 
-    def _trend_death(self, kind: str) -> None:
-        """Count a death notice; the other notice of the same death is not one.
-
-        One death can be announced as "defeated in combat" and "YOU HAVE
-        DIED."; the second of such a pair is skipped. The same notice again
-        is a new death, however soon after respawning.
-        """
-        now = time.time()
-        last_at, last_kind = self._last_trend_death
-        if last_kind and last_kind != kind and now - last_at < 10.0:
-            self._last_trend_death = (0.0, "")
-            return
-        self._last_trend_death = (now, kind)
-        self._trend_count("deaths")
-
     def _persist_trends(self) -> None:
         """Save the trend buckets once a minute, when a new one starts."""
         character = self.state.player_name
@@ -1204,7 +1187,9 @@ class AtrinikClient:
             self._trend_count("heals")
         if died:
             self.record_action("death", text)
-            self._trend_death("defeated" if "defeated in combat" in lowered else "died")
+            # kill_player (server types/player.c) sends one notice per defeat:
+            # "defeated in combat" in a PvP area, otherwise "YOU HAVE DIED.".
+            self._trend_count("deaths")
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a
             # post-death window for protocol/order variants that arrive later.
