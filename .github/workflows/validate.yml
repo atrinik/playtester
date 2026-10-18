@@ -2,6 +2,8 @@ name: Validate
 
 on:
   pull_request:
+  # The merge queue tests each queued merge result before it reaches main.
+  merge_group:
   push:
     branches:
       - main
