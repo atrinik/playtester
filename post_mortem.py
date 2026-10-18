@@ -22,6 +22,10 @@ VITALS_SECONDS = 600.0
 VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 # Vital samples stored per post-mortem, spread over its whole window.
 MAX_VITALS = 120
+# Attackers or damage types kept in a restored report.
+MAX_COUNTS = 25
+# Characters kept in any restored text field.
+MAX_TEXT = 500
 
 
 def spread(samples: list, limit: int = MAX_VITALS, keep: Iterable[int] = ()) -> list:
@@ -76,8 +80,8 @@ def restore(entry: Any) -> dict[str, Any] | None:
 
     def records(key: str) -> list[dict]:
         value = entry.get(key)
-        return [{"time": item["time"], "action": str(item.get("action") or ""),
-                 "detail": str(item.get("detail") or ""), "map": str(item.get("map") or "")}
+        return [{"time": item["time"], "action": text(item.get("action")),
+                 "detail": text(item.get("detail")), "map": text(item.get("map"))}
                 for item in value if isinstance(item, dict) and finite(item.get("time"))
                 ] if isinstance(value, list) else []
 
@@ -90,22 +94,28 @@ def restore(entry: Any) -> dict[str, Any] | None:
 
     def message_rows() -> list[list]:
         value = entry.get("messages")
-        return ([[item[0], str(item[1])] for item in value
+        return ([[item[0], text(item[1])] for item in value
                  if isinstance(item, (list, tuple)) and len(item) == 2 and finite(item[0])]
                 if isinstance(value, list) else [])
 
+    # Strings bounded too: no server line or report field is anywhere near this.
+    def text(value: Any) -> str:
+        return str(value or "")[:MAX_TEXT]
+
+    # Bounded like the arrays: the largest MAX_COUNTS entries, short names.
     def counts(key: str) -> dict[str, int]:
         value = entry.get(key)
-        return ({str(name): count for name, count in value.items()
-                 if finite(count)} if isinstance(value, dict) else {})
+        valid = sorted(((str(name)[:80], count) for name, count in value.items() if finite(count)),
+                       key=lambda item: -item[1]) if isinstance(value, dict) else []
+        return dict(valid[:MAX_COUNTS])
 
     def number(key: str) -> int:
         value = entry.get(key)
         return int(value) if finite(value) else 0
 
     return {
-        "time": when, "map": str(entry.get("map") or ""), "x": x, "y": y,
-        "cause": str(entry.get("cause") or ""), "detail": str(entry.get("detail") or ""),
+        "time": when, "map": text(entry.get("map")), "x": x, "y": y,
+        "cause": text(entry.get("cause")), "detail": text(entry.get("detail")),
         "attackers": counts("attackers"), "peak_attackers": number("peak_attackers"),
         "damage_taken": number("damage_taken"), "damage_by_type": counts("damage_by_type"),
         # The builder's own bounds, so a stored report can never grow larger.

@@ -1327,6 +1327,12 @@ class ProtocolTests(unittest.TestCase):
         restored = post_mortem.restore({"time": 5, "attackers": {"rat": huge}, "damage_taken": huge,
                                         "vitals": [[huge, 1, 2, 3, 4, 5]]})
         self.assertEqual((restored["attackers"], restored["damage_taken"], restored["vitals"]), ({}, 0, []))
+        # Attacker and damage maps are bounded too, keeping the largest.
+        many = post_mortem.restore({"time": 5, "attackers": {f"m{index}": index for index in range(1000)}})
+        self.assertEqual(len(many["attackers"]), post_mortem.MAX_COUNTS)
+        self.assertIn("m999", many["attackers"])
+        long = post_mortem.restore({"time": 5, "detail": "x" * 10000, "messages": [[1, "y" * 10000]]})
+        self.assertEqual((len(long["detail"]), len(long["messages"][0][1])), (post_mortem.MAX_TEXT,) * 2)
         # Restoring applies the builder's bounds.
         big = post_mortem.restore({
             "time": 5, "vitals": [[index, 1, 2, 3, 4, 5] for index in range(500)],
