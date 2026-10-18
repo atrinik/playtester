@@ -3637,6 +3637,45 @@ def analyzer_farm_selection(
     return None
 
 
+def food_reserve(client: AtrinikClient) -> int:
+    """Edible items she carries and has paid for."""
+    patterns = SafetyPolicy().food_patterns
+    return sum(item.quantity for item in client.state.inventory
+               if not item.flags & c.ITEM_UNPAID and (
+                   item.item_type == c.TYPE_FOOD or
+                   any(pattern in item.name.casefold()
+                       for pattern in patterns)))
+
+
+def hungry(client: AtrinikClient) -> bool:
+    """Low on food with nothing left to eat: she must go and get some."""
+    return (food_reserve(client) <= 1 and
+            int(client.state.stats.get("food", 1000) or 0) < 180)
+
+
+def temple_food_trip(graph: "WorldGraph",
+                     client: AtrinikClient) -> NavigateThenTask | None:
+    """Route to the nearest priest reachable without a threat fallback."""
+    ranked = []
+    for priest in graph.temple_priests:
+        navigation = NavigateTask(
+            graph, priest.map_path, (priest.x, priest.y), tolerance=2)
+        try:
+            route = navigation._plan(client)
+        except ValueError:
+            continue
+        if not navigation._threat_fallback:
+            ranked.append((len(route), priest.name.casefold(), priest))
+    if not ranked:
+        return None
+    priest = min(ranked, key=lambda entry: entry[:-1])[-1]
+    task = NavigateThenTask(
+        graph, priest.map_path, TempleFoodTask(priest.name),
+        destination_xy=(priest.x, priest.y), combat_approach=True)
+    task.navigation.tolerance = 2
+    return task
+
+
 # Paths of private savebeds: an apartment or house bed only works for its owner.
 PRIVATE_SAVEBED_MARKERS = ("/apartments/", "/house/")
 # Exact walks cost a tile-level route each (about 0.2 s on the live world), so
@@ -4644,16 +4683,10 @@ class FarmCircuitTask(BotTask):
 
     @staticmethod
     def _food_reserve(client: AtrinikClient) -> int:
-        patterns = SafetyPolicy().food_patterns
-        return sum(item.quantity for item in client.state.inventory
-                   if not item.flags & c.ITEM_UNPAID and (
-                       item.item_type == c.TYPE_FOOD or
-                       any(pattern in item.name.casefold()
-                           for pattern in patterns)))
+        return food_reserve(client)
 
     def _hungry(self, client: AtrinikClient) -> bool:
-        return (self._food_reserve(client) <= 1 and
-                int(client.state.stats.get("food", 1000) or 0) < 180)
+        return hungry(client)
 
     def _needs_food_resupply(self, client: AtrinikClient) -> bool:
         # While shop resupply backs off, a temple can still feed her.
@@ -4689,25 +4722,7 @@ class FarmCircuitTask(BotTask):
             self._resupply = None
 
     def _new_temple_food(self, client: AtrinikClient) -> NavigateThenTask | None:
-        """Route to the nearest priest reachable without a threat fallback."""
-        ranked = []
-        for priest in self.graph.temple_priests:
-            navigation = NavigateTask(
-                self.graph, priest.map_path, (priest.x, priest.y), tolerance=2)
-            try:
-                route = navigation._plan(client)
-            except ValueError:
-                continue
-            if not navigation._threat_fallback:
-                ranked.append((len(route), priest.name.casefold(), priest))
-        if not ranked:
-            return None
-        priest = min(ranked, key=lambda entry: entry[:-1])[-1]
-        task = NavigateThenTask(
-            self.graph, priest.map_path, TempleFoodTask(priest.name),
-            destination_xy=(priest.x, priest.y), combat_approach=True)
-        task.navigation.tolerance = 2
-        return task
+        return temple_food_trip(self.graph, client)
 
     def _food_resupply_quantity(
             self, client: AtrinikClient, profile: FoodProfile) -> int:
@@ -5158,10 +5173,10 @@ class FarmCircuitTask(BotTask):
             not self._busy_finishing_fight_or_loot(client, farm)
         )
 
-    def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
-        """Return whether autoplay may replace this circuit between pulls."""
-        services = (
-            self._resupply, self._storage, self._identification,
+    def _maintenance_services(self) -> tuple[BotTask | None, ...]:
+        """Every maintenance trip but food resupply; each runs to completion."""
+        return (
+            self._storage, self._identification,
             self._bed_binding, self._selling, self._banking,
             self._bank_sync, self._shopping, self._recall_shopping,
             self._utility_shopping,
@@ -5169,7 +5184,28 @@ class FarmCircuitTask(BotTask):
             self._spell_purchase, self._cure, self._restoration,
             self._expedition_return, self._capability,
         )
-        if any(service is not None for service in services) or self.child is None:
+
+    def can_feed_her(self) -> bool:
+        """Whether its own food resupply can run, with no other trip under way.
+
+        Each maintenance trip returns early until it completes, so a long one
+        (storage, banking, a temple cure) can outlast her food.
+        """
+        return not any(service is not None
+                       for service in self._maintenance_services())
+
+    def needs_outside_food(self) -> bool:
+        """Whether only a detour outside the circuit can feed her now.
+
+        Not while a hostile-route abort retraces to its safe origin: turning
+        that towards a priest could lead the attackers along.
+        """
+        return not self.can_feed_her() and self._expedition_return is None
+
+    def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
+        """Return whether autoplay may replace this circuit between pulls."""
+        if (self._resupply is not None or not self.can_feed_her() or
+                self.child is None):
             return False
         farm = self.child.task
         return (isinstance(farm, FarmTask) and
