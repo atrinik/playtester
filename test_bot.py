@@ -434,11 +434,16 @@ class ProtocolTests(unittest.TestCase):
                 (-6, self._map2_actor_tile(2, 1, 5, 101, True)),
                 (6, self._map2_actor_tile(8, 7, 5, 102)),
             ])
+            client.progress_watch.moved_at = 0.0
             await client._handle_map(Cursor(payload), payload)
 
             game_map = client.state.map
             self.assertEqual((game_map.width, game_map.height), (17, 17))
             self.assertIs(game_map.tiles, game_map.level_tiles[0])
+            # The map packet itself records movement for the stuck alert.
+            self.assertEqual(client.progress_watch.position,
+                             (game_map.path, game_map.world_x, game_map.world_y))
+            self.assertGreater(client.progress_watch.moved_at, 0.0)
             self.assertEqual(
                 [(depth, x, y, obj.target_id, obj.is_friend)
                  for depth, x, y, obj in game_map.depth_targets()],
@@ -1221,6 +1226,19 @@ class ProtocolTests(unittest.TestCase):
         state.phase = "playing"
         watch.observe(state, later + DISCONNECTED_SECONDS)
         self.assertIsNone(watch.disconnected_since)
+
+    def test_rapid_repeat_deaths_coalesced_by_the_client_still_alert(self):
+        from .alerts import death_count
+
+        client = AtrinikClient(ClientConfig())
+        client.state.map.path = "/shattered_islands/world_6_46"
+        for _ in range(2):
+            data = bytes((2,)) + b"ffffff\0" + b"YOU HAVE DIED.\0"
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+        # The client keeps one record with a count; both deaths count.
+        deaths = [record for record in client.decision_history if record["action"] == "death"]
+        self.assertEqual((len(deaths), deaths[0].get("count")), (1, 2))
+        self.assertEqual(death_count(client.decision_history, 0.0), 2)
 
     def test_client_starts_the_outage_clock_when_the_connection_drops(self):
         client = AtrinikClient(ClientConfig())

@@ -1855,6 +1855,8 @@ class AtrinikClient:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
         self._observe_map_change(old_path, m)
+        # Movement arrives in map packets, between stats packets and polls.
+        self.progress_watch.observe(self.state)
         await self.emit("map", {"path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y, "changed_map": old_path != m.path})
 
     async def _handle_interface(self, cur: Cursor, raw: bytes) -> None:

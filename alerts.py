@@ -54,12 +54,15 @@ def death_count(decisions: Iterable[dict], since: float) -> int:
     the other notice of such a pair is not another death, but the same notice
     again is, however soon after respawning.
     """
+    # The client coalesces repeats of one notice into a record with a count;
+    # each repeat of the same notice is another death.
     notices = sorted(
         (float(record.get("time", 0.0) or 0.0),
          "defeated" if "defeated in combat" in str(record.get("detail", "")).casefold() else "died")
         for record in decisions
         if isinstance(record, dict) and record.get("action") == "death" and
-        float(record.get("time", 0.0) or 0.0) >= since)
+        float(record.get("time", 0.0) or 0.0) >= since
+        for _ in range(max(1, int(record.get("count", 1) or 1))))
     deaths, unpaired = 0, None
     for stamp, kind in notices:
         if (unpaired is not None and unpaired[1] != kind and
