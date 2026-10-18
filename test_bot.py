@@ -1248,6 +1248,11 @@ class ProtocolTests(unittest.TestCase):
                       since=now - 8)
         self.assertEqual(again["cause"], "out-damaged")
         self.assertEqual((again["attackers"], again["damage_taken"]), ({"red ant": 1}, 10))
+        # A busy minute (500 samples) keeps 120 spread over all of it.
+        busy = [[now - 60 + i * 0.12, 100, 155, 30, 39, 900] for i in range(500)]
+        dense = build(now, "/shattered_islands/world_13_73", 5, 6, busy, [], [], [])
+        self.assertEqual(len(dense["vitals"]), 120)
+        self.assertEqual((dense["vitals"][0], dense["vitals"][-1]), (busy[0], busy[-1]))
 
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))

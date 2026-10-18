@@ -19,6 +19,16 @@ KEEP = 20
 # Vital samples kept; the client samples on every health/SP/food change.
 VITALS_SECONDS = 600.0
 VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
+# Vital samples stored per post-mortem, spread over its whole window.
+MAX_VITALS = 120
+
+
+def spread(samples: list, limit: int = MAX_VITALS) -> list:
+    """At most ``limit`` samples spread evenly over all of them, the last kept."""
+    if len(samples) <= limit:
+        return samples
+    step = (len(samples) - 1) / (limit - 1)
+    return [samples[round(index * step)] for index in range(limit)]
 
 
 def sample(stats: dict) -> list[float]:
@@ -76,7 +86,7 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
         "attackers": dict(review.attackers), "peak_attackers": review.peak_attackers,
         "damage_taken": review.damage_taken,
         "damage_by_type": dict(review.damage_by_type),
-        "vitals": [list(value) for value in vitals if _within(value[0], start, end)][-120:],
+        "vitals": spread([list(value) for value in vitals if _within(value[0], start, end)]),
         "messages": [[stamp, text] for stamp, text in texts][-40:],
         "actions": recent(actions),
         "decisions": recent(decisions),
