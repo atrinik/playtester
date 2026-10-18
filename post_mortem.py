@@ -35,27 +35,35 @@ def _within(stamp: Any, start: float, end: float) -> bool:
 
 def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
           messages: Iterable[tuple], actions: Iterable[dict],
-          decisions: Iterable[dict], *, since: float = 0.0) -> dict[str, Any]:
-    """The post-mortem of a death at ``when`` on ``path`` (x, y).
+          decisions: Iterable[dict], *, since: float = 0.0,
+          name: str = "") -> dict[str, Any]:
+    """The post-mortem of ``name``'s death at ``when`` on ``path`` (x, y).
 
     ``since`` is the previous death: nothing from that earlier life counts.
     """
     start, end = max(when - REVIEW_WINDOW_SECONDS, since), when + 2.0
     messages = list(messages)
     decisions = list(decisions)
+    # The server tells everyone "<name> starved to death." as the whole
+    # message. Chat quoting it, or another player starving, is not hers, so
+    # it must not reach the classifier's starvation test.
+    starved = f"{name} starved to death.".casefold()
+
+    def hers(entry: tuple) -> bool:
+        text = str(entry[-1]).strip().casefold()
+        return "starved to death" not in text or bool(name) and text == starved
+
     # The farm decides whether a death was "on the way"; a post-mortem only
     # describes the fight, so the death map counts as the spot.
     review = review_failure(
-        [entry for entry in messages if _within(entry[0], start, end)],
+        [entry for entry in messages
+         if _within(entry[0], start, end) and hers(entry)],
         [record for record in decisions
          if isinstance(record, dict) and _within(record.get("time"), start, end)],
         {"time": when, "action": "death", "map": path}, [path])
     texts = [(float(entry[0]), str(entry[-1])) for entry in messages
              if _within(entry[0], start, end)]
-    if any("starved to death" in text.casefold() for _, text in texts):
-        cause, detail = "starvation", "ran out of food"
-    else:
-        cause, detail = review.cause, review.detail
+    cause, detail = review.cause, review.detail
 
     def recent(records: Iterable[dict]) -> list[dict]:
         return [{key: record.get(key) for key in ("time", "action", "detail", "map")}

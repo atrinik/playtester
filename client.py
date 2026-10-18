@@ -723,7 +723,7 @@ class AtrinikClient:
         self.post_mortems.append(post_mortem.build(
             now, m.path, m.world_x, m.world_y, self.vitals,
             self.state.messages, self.action_history, self.decision_history,
-            since=previous))
+            since=previous, name=self.state.player_name or self.config.character))
         del self.post_mortems[:-post_mortem.KEEP]
         character = self.state.player_name
         if character:

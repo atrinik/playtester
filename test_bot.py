@@ -1168,7 +1168,7 @@ class ProtocolTests(unittest.TestCase):
         import struct
         from . import post_mortem
 
-        client = AtrinikClient(ClientConfig())
+        client = AtrinikClient(ClientConfig(character="Sera"))
         client.state.map.path = "/shattered_islands/world_6_46"
         client.state.map.world_x, client.state.map.world_y = 12, 14
 
@@ -1201,11 +1201,17 @@ class ProtocolTests(unittest.TestCase):
         say("[a=#charname]Mallory[/a] tells you: You have been defeated in combat!",
             c.CHAT_TYPE_PRIVATE)
         self.assertEqual(len(client.post_mortems), 1)
+        # Chat quoting her starvation, or another player starving, is not hers.
+        say("[a=#charname]Mallory[/a]: Sera starved to death.", c.CHAT_TYPE_CHAT)
+        say("Mallory starved to death.")
+        say("YOU HAVE DIED.")
+        self.assertEqual(len(client.post_mortems), 2)
+        self.assertNotEqual(client.post_mortems[-1]["cause"], "starvation")
         # Each notice is its own defeat, however soon: a PvP-area defeat
         # sends only "defeated in combat", a death only "YOU HAVE DIED.".
         say("You have been defeated in combat!")
         say("YOU HAVE DIED.")
-        self.assertEqual(len(client.post_mortems), 3)
+        self.assertEqual(len(client.post_mortems), 4)
         # Only the latest KEEP deaths are kept.
         for index in range(post_mortem.KEEP + 3):
             say("YOU HAVE DIED.")
