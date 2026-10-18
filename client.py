@@ -169,6 +169,8 @@ class AtrinikClient:
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
         self.decision_history: list[dict] = []
+        # (time, path) of each arrival on a new map, newest last.
+        self.map_arrivals: list[tuple[float, str]] = []
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -540,6 +542,9 @@ class AtrinikClient:
         The server returns to the per-player entrance recorded at runtime, so
         the authored graph's static apartment exits are only placeholders.
         """
+        if m.path and old_path != m.path:
+            self.map_arrivals.append((time.time(), m.path))
+            del self.map_arrivals[:-100]
         if (old_path and old_path != m.path and "/apartments/" in old_path and
                 "/apartments/" not in m.path and not self._recently_moved_by_force()):
             self.set_apartment_return(old_path, m.path, m.world_x, m.world_y)

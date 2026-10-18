@@ -1164,6 +1164,12 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             asyncio.run(client._handle_party(Cursor(malformed), malformed))
 
+    def test_client_records_map_arrivals(self):
+        client = AtrinikClient(ClientConfig())
+        client._observe_map_change("/a", MapState(path="/b"))
+        client._observe_map_change("/b", MapState(path="/b"))
+        self.assertEqual([path for _, path in client.map_arrivals], ["/b"])
+
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))
         commands = []
@@ -10164,6 +10170,51 @@ class NavigationTests(unittest.TestCase):
                                       town: time.time() + 3600}
         self.assertEqual(NavigateTask(graph, farm)._learned_route_hazards(client), set())
 
+    def test_an_unavoidable_lesson_keeps_the_others(self):
+        def lane(path, width=3):
+            node = MapNode(path, width=width, height=1)
+            node.terrain = {(x, 0): 1 for x in range(width)}
+            return node
+
+        graph = WorldGraph()
+        town, gate, hub = ("/shattered_islands/world_0_68", "/shattered_islands/world_0_69",
+                           "/shattered_islands/world_0_70")
+        swamp, detour, farm = ("/shattered_islands/world_1_70", "/shattered_islands/world_2_70",
+                               "/shattered_islands/world_1_50")
+        for path in (town, gate, hub, swamp, detour, farm):
+            graph.nodes[path] = lane(path)
+            graph.named_spawns[path] = []
+        # The gate is the only way out of town; past the hub, the swamp is
+        # the short way and the detour the safe one.
+        graph.nodes[town].edges = [MapEdge(town, gate, 2, 0, 0, 0)]
+        graph.nodes[gate].edges = [MapEdge(gate, hub, 2, 0, 0, 0)]
+        graph.nodes[hub].edges = [MapEdge(hub, swamp, 2, 0, 0, 0), MapEdge(hub, detour, 0, 0, 2, 0)]
+        graph.nodes[swamp].edges = [MapEdge(swamp, farm, 2, 0, 0, 0)]
+        graph.nodes[detour].edges = [MapEdge(detour, "/x", 2, 0, 0, 0)]
+        graph.nodes["/x"] = lane("/x")
+        graph.named_spawns["/x"] = []
+        graph.nodes["/x"].edges = [MapEdge("/x", farm, 2, 0, 0, 0)]
+
+        class FakeClient:
+            def __init__(self, path):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(path=path, width=17, height=17,
+                                          world_x=1, world_y=0)
+
+        client = FakeClient(town)
+        client.state.route_hazards = {gate: time.time() + 3600, swamp: time.time() + 3600}
+        task = NavigateTask(graph, farm)
+        route = [edge.destination for edge in task._plan(client)]
+        # The gate cannot be avoided, but the swamp lesson still holds.
+        self.assertIn(gate, route)
+        self.assertNotIn(swamp, route)
+        # Crossing a map that killed her is not threat-free for optional trips.
+        self.assertTrue(task._threat_fallback)
+        client.state.route_hazards = {}
+        task = NavigateTask(graph, farm)
+        task._plan(client)
+        self.assertFalse(task._threat_fallback)
+
     def test_tiled_levels_are_pack_hazards_with_a_fallback_through_them(self):
         def lane(path, width=3):
             node = MapNode(path, width=width, height=1)
@@ -12018,6 +12069,36 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
                                         "detail": "", "task": "", "map": meadow})
         client.decision_history.append({"time": time.time() + 1, "action": "death",
                                         "detail": "", "task": "", "map": meadow})
+        circuit._observe_farm_death(client)
+        self.assertEqual(client.state.route_hazards, {})
+
+    def test_an_immediate_route_death_is_blamed_on_the_map_she_arrived_on(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        swamp = "/shattered_islands/world_1_50"
+        now = time.time()
+        # She arrived and was killed before sending another order.
+        client.map_arrivals = [(now - 5, swamp)]
+        client.state.messages.append((now - 2, 2, "ff0000",
+                                      "crocodile hit you for 99 (-99) pierce damage."))
+        client.decision_history.append({"time": now, "action": "death", "detail": "",
+                                        "task": "", "map": swamp})
+        circuit._observe_farm_death(client)
+        self.assertIn(swamp, client.state.route_hazards)
+
+    def test_old_hits_on_the_map_teach_no_route_hazard(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        swamp = "/shattered_islands/world_1_50"
+        now = time.time()
+        # A scratch five minutes ago, then a death without a fight.
+        client.map_arrivals = [(now - 600, swamp)]
+        client.state.messages.append((now - 300, 2, "ff0000",
+                                      "crocodile hit you for 5 (-5) pierce damage."))
+        client.decision_history.append({"time": now, "action": "death", "detail": "",
+                                        "task": "", "map": swamp})
         circuit._observe_farm_death(client)
         self.assertEqual(client.state.route_hazards, {})
 

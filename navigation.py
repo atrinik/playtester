@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import logging
 import math
@@ -1697,18 +1698,37 @@ class NavigateTask(BotTask):
                 if until > now and
                 path not in (client.state.map.path, self.destination)}
 
+    # Trial plans tried while keeping as many learned hazards as possible.
+    LEARNED_PLAN_ATTEMPTS = 6
+
     def _plan(self, client: AtrinikClient) -> list[MapEdge]:
-        # Learned hazards are only a preference: keep a route that avoids them
-        # and every other hazard outright, relaxing nothing; otherwise plan
-        # exactly as without lessons, so one can never make a route worse.
+        # Learned hazards are only a preference: keep a route that avoids as
+        # many of them as still allows avoiding every other hazard outright,
+        # relaxing nothing; otherwise plan exactly as without lessons, so one
+        # can never make a route worse. One unavoidable lesson does not
+        # discard the others.
         learned = self._learned_route_hazards(client)
+        route = None
         if learned:
             previous_fallback = self._threat_fallback
-            try:
-                return self._plan_avoiding(client, learned, strict=True)
-            except ValueError:
-                self._threat_fallback = previous_fallback
-        return self._plan_avoiding(client, set())
+            ordered = sorted(learned)
+            trials = itertools.islice(
+                (set(kept) for size in range(len(ordered), 0, -1)
+                 for kept in itertools.combinations(ordered, size)),
+                self.LEARNED_PLAN_ATTEMPTS)
+            for kept in trials:
+                try:
+                    route = self._plan_avoiding(client, kept, strict=True)
+                    break
+                except ValueError:
+                    self._threat_fallback = previous_fallback
+        if route is None:
+            route = self._plan_avoiding(client, set())
+        if any(edge.destination in learned for edge in route):
+            # Re-entering a map that killed her is never "threat-free" when
+            # choosing between optional destinations.
+            self._threat_fallback = True
+        return route
 
     def _plan_avoiding(self, client: AtrinikClient, learned_hazards: set[str], *,
                        strict: bool = False) -> list[MapEdge]:
@@ -1735,6 +1755,9 @@ class NavigateTask(BotTask):
         try:
             route = self.graph.route_points(*args, **kwargs)
         except ValueError:
+            if strict:
+                # A trial plan relaxes no hazard tier and records nothing.
+                raise
             # Components are derived acceleration data. A live exceptional
             # start square (closed door, runtime map mutation, occupied seam)
             # must never make a later route permanently unroutable.
@@ -1742,9 +1765,6 @@ class NavigateTask(BotTask):
             try:
                 route = self.graph.route_points(*args, **kwargs)
             except ValueError as preferred_exc:
-                if strict:
-                    # A trial plan relaxes no hazard tier and records nothing.
-                    raise
                 # Tiled levels only joined the hazards to keep surface trips
                 # off dense tunnels. A trip that needs them (one inside the
                 # tunnels, or with no surface way round) routes through them
@@ -4094,12 +4114,18 @@ class FarmCircuitTask(BotTask):
 
     @staticmethod
     def _entered_map_at(client: AtrinikClient, path: str, before: float) -> float | None:
-        """The first record of her on ``path`` since she was last elsewhere.
+        """When she arrived on ``path``, last before ``before``.
 
-        A step is recorded on the map it leaves, so the last record elsewhere
-        is not yet proof of arrival; only a record on ``path`` itself is.
-        None when nothing shows her there before ``before``.
+        The client's map arrivals are authoritative. Without them, the first
+        record of her on ``path`` since she was last elsewhere: a step is
+        recorded on the map it leaves, so the last record elsewhere is not
+        yet proof of arrival. None when nothing shows her there.
         """
+        arrivals = [(stamp, where) for stamp, where in getattr(client, "map_arrivals", ())
+                    if stamp <= before]
+        if arrivals:
+            stamp, where = arrivals[-1]
+            return stamp if where == path else None
         records = sorted(
             ((float(record.get("time", 0.0) or 0.0), record.get("map"))
              for record in (*getattr(client, "action_history", ()),
@@ -4131,7 +4157,9 @@ class FarmCircuitTask(BotTask):
         # only damage taken on it makes that map the hazard.
         entered = self._entered_map_at(client, review.map, review.time)
         on_map = 0 if entered is None else self_improvement.damage_between(
-            getattr(client.state, "messages", ()), entered, review.time + 2.0)
+            getattr(client.state, "messages", ()),
+            max(entered, review.time - self_improvement.REVIEW_WINDOW_SECONDS),
+            review.time + 2.0)
         if review.cause == "route" and on_map > 0 and review.map:
             # Killed crossing a map on the way: route around it for a while
             # instead of walking back into the same fight after respawning.
