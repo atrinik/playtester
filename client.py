@@ -1182,13 +1182,16 @@ class AtrinikClient:
             m = self.state.map
             if m.path:
                 self.set_savebed(m.path, m.world_x, m.world_y)
-        died = "defeated in combat" in lowered or "you have died" in lowered
+        # kill_player (server types/player.c) sends exactly one of these, as
+        # the whole message, per defeat: a PvP-area defeat, or a death after
+        # its stat losses. Matching the whole text keeps a player's chat that
+        # quotes one from passing for a death.
+        died = normalized in ("you have been defeated in combat!",
+                              "you have died.")
         if lowered.startswith("the spell heals you for"):
             self._trend_count("heals")
         if died:
             self.record_action("death", text)
-            # kill_player (server types/player.c) sends one notice per defeat:
-            # "defeated in combat" in a PvP area, otherwise "YOU HAVE DIED.".
             self._trend_count("deaths")
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a

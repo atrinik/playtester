@@ -1199,14 +1199,18 @@ class ProtocolTests(unittest.TestCase):
     def test_client_counts_heals_and_deaths_into_trends(self):
         client = AtrinikClient(ClientConfig())
 
-        def say(text):
-            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+        def say(text, msg_type=2):
+            data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
             asyncio.run(client._handle_drawinfo(Cursor(data), data))
 
         say("The spell heals you for 12 hp!")
         say("The spell heals you for 9 hp!")
         say("You have been defeated in combat!")
         say("YOU HAVE DIED.")
+        # A player's chat quoting a notice is no death.
+        say("[a=#charname]Mallory[/a]: YOU HAVE DIED.", c.CHAT_TYPE_CHAT)
+        say("[a=#charname]Mallory[/a] tells you: You have been defeated in combat!",
+            c.CHAT_TYPE_PRIVATE)
         bucket = client.trends.buckets[-1]
         # Each notice is its own defeat: a PvP-area defeat sends only
         # "defeated in combat", a death only "YOU HAVE DIED.".
