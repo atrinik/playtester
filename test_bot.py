@@ -5414,7 +5414,7 @@ class QuestTests(unittest.TestCase):
         client.fire = fire
         return client
 
-    def _crowded_wizardry_farm(self):
+    def _crowded_wizardry_farm(self, spell="cause light wounds"):
         client = self._wizard_training_client(100, x=11, y=8)
         client.state.stats["sp"] = 0
         # A pair of kobolds three tiles east, and a lone one four tiles north.
@@ -5425,7 +5425,7 @@ class QuestTests(unittest.TestCase):
         task = FarmTask(
             zone="/test", target="kobold", neutral_targets=True,
             combat_skill="wizardry spells",
-            combat_spell="cause light wounds")
+            combat_spell=spell)
         return client, task
 
     def test_wizardry_training_pulls_only_isolated_targets(self):
@@ -5434,8 +5434,20 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(task._engaged_target[0], 102)
 
-    def test_firestorm_lifts_single_target_wizardry(self):
+    def test_knowing_firestorm_alone_keeps_single_target_wizardry(self):
         client, task = self._crowded_wizardry_farm()
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="firestorm",
+            extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 8}))
+        # Still casting Cause Light Wounds: one at a time.
+        self.assertTrue(task.single_target_wizardry(client))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._engaged_target[0], 102)
+
+    def test_casting_firestorm_lifts_single_target_wizardry(self):
+        client, task = self._crowded_wizardry_farm(spell="firestorm")
+        # Configured but not yet learned: still one at a time.
+        self.assertTrue(task.single_target_wizardry(client))
         client.state.inventory.append(Item(
             43, item_type=c.TYPE_SPELL, name="firestorm",
             extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 8}))

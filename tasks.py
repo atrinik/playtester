@@ -1199,15 +1199,19 @@ class FarmTask(BotTask):
     def single_target_wizardry(self, client: AtrinikClient) -> bool:
         """Whether Wizardry training must fight one creature at a time.
 
-        Until Firestorm can strike several at once, a second creature beside
-        the target only adds damage taken, never Wizardry XP.
+        Until this farm casts Firestorm, which strikes several at once, a
+        second creature beside the target only adds damage taken, never
+        Wizardry XP. Merely knowing Firestorm is not enough.
         """
+        casts_firestorm = (
+            self.combat_spell == "firestorm" and
+            any(item.item_type == c.TYPE_SPELL and
+                item.name.casefold() == "firestorm"
+                for item in client.state.inventory))
         return bool(
             "wizardry" in self.combat_skill and
             self.training_active(client) and
-            not any(item.item_type == c.TYPE_SPELL and
-                    item.name.casefold() == "firestorm"
-                    for item in client.state.inventory))
+            not casts_firestorm)
 
     def training_active(self, client: AtrinikClient) -> bool:
         skill = self.training_skill_item(client)
