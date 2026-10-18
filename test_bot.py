@@ -1288,6 +1288,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(death["vitals"]), 2)
         self.assertEqual(death["vitals"][0][1:], [155, 155, 39, 39, 900])
         self.assertLess(death["vitals"][0][0], when - 1)
+        # A death soon after the previous one takes no baseline from that
+        # earlier life: its window starts at the previous death.
+        again = build(when, "/a", 1, 2, [[when - 50, 0, 155, 0, 39, 0], [when - 1, 0, 155, 39, 39, 900]],
+                      [], [], [], since=when - 30)
+        self.assertEqual([sample[0] for sample in again["vitals"]], [when - 1])
         # The review written after the notice is not what she was doing.
         self.assertEqual([entry["action"] for entry in death["decisions"]], ["navigate"])
         self.assertEqual([entry["action"] for entry in death["actions"]], ["navigate"])

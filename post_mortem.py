@@ -129,9 +129,11 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
 
     # The last sample before the window is the state at its start, so a
     # sudden death (steady, then one fatal hit) still charts from a baseline.
+    # Only from this life: a window cut short by the previous death starts
+    # at it, and that death's own fatal sample is no baseline.
     vitals = [list(value) for value in vitals]
-    before = [value for value in vitals if _within(value[0], float("-inf"), start)
-              and float(value[0]) < start]
+    before = [value for value in vitals
+              if _within(value[0], since, start) and since < float(value[0]) < start]
     inside = [value for value in vitals if _within(value[0], start, end)]
     if before:
         inside.insert(0, [start, *before[-1][1:]])

@@ -181,7 +181,7 @@ function renderDeaths() {
     const when = new Date(d.time * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
     const who = Object.entries(d.attackers || {}).map(([k, n]) => `${esc(k)} ×${n}`).join(", ");
     const types = Object.entries(d.damage_by_type || {}).map(([k, n]) => `${esc(k)} ${n}`).join(", ");
-    const last = (d.messages || []).slice(-6).map(m => `<small class="muted">${esc(m[1])}</small>`).join("");
+    const last = (d.messages || []).slice(-6).map(m => `<small class="muted">${esc(clean(m[1]))}</small>`).join("");
     // What the bot was doing: its last decisions before the death.
     const did = (d.decisions || []).slice(-4).map(r =>
       `<small>${esc(r.action)}${r.detail ? `: ${esc(r.detail)}` : ""}</small>`).join("");
