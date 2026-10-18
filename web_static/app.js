@@ -178,7 +178,8 @@ function trendLine(points, key) {
 let lastTrendsSig = "";
 function renderTrends() {
   const points = (slow.trends || {}).points || [];
-  const sig = points.length ? `${points.length}:${points[points.length - 1].t}` : "";
+  // The current minute's values change between buckets.
+  const sig = points.length ? `${points.length}:${JSON.stringify(points[points.length - 1])}` : "";
   if (sig === lastTrendsSig) return;
   lastTrendsSig = sig;
   if (points.length < 2) { $("#fa-trends").innerHTML = '<span class="muted">Collecting samples…</span>'; return; }

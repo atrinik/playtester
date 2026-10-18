@@ -1185,6 +1185,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(last["xp_per_hour"], 6000)
         self.assertEqual((last["deaths_per_hour"], last["heals_per_hour"]), (2, 5))
         self.assertEqual((last["depletion"], last["food"], last["hp"]), (32, 840, 0.645))
+        # The hour is by time: after a five-hour gap, old deaths drop out.
+        state.stats.update(exp=8000)
+        trends.observe(state, start + 3600 + 5 * 3600)
+        late = trends.summary(start + 3600 + 5 * 3600)["points"][-1]
+        self.assertEqual((late["deaths_per_hour"], late["xp_per_hour"]), (0, None))
         # A day is kept; older buckets go.
         trends.observe(state, start + KEEP_SECONDS + 3600)
         self.assertGreaterEqual(trends.buckets[0]["t"], start + 3600 - 60)
@@ -1200,9 +1205,18 @@ class ProtocolTests(unittest.TestCase):
 
         say("The spell heals you for 12 hp!")
         say("The spell heals you for 9 hp!")
+        say("You have been defeated in combat!")
         say("YOU HAVE DIED.")
         bucket = client.trends.buckets[-1]
+        # Two announcements of one death count once.
         self.assertEqual((bucket["heals"], bucket["deaths"]), (2, 1))
+        # Closing flushes the current minute.
+        saved = []
+        client.state.player_name = "Sera"
+        client._memory_store = lambda: type("M", (), {
+            "save": lambda self, character, kind, value: saved.append((character, kind))})()
+        asyncio.run(client.close())
+        self.assertIn(("Sera", "trends"), saved)
 
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))
@@ -12325,6 +12339,12 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.client.trends.count("deaths")
         status, payload = await self.request("GET", "/api/state?include=trends")
         self.assertEqual(json.loads(payload)["trends"]["points"][-1]["deaths_per_hour"], 1)
+        # Live polls that do not ask for trends never build them.
+        built = []
+        self.client.trends.summary = lambda: built.append(1) or {"points": []}
+        status, payload = await self.request("GET", "/api/state?include=phase")
+        self.assertNotIn("trends", json.loads(payload))
+        self.assertEqual(built, [])
 
     async def test_dashboard_reports_the_running_build(self):
         from .build_info import build_info

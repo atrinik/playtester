@@ -574,7 +574,6 @@ class DashboardState:
             "quests_loaded": state.quests_loaded, "quests": self.quests(),
             "quest_journal": self.quest_journal(),
             "farming_analysis": self.farming_analysis(),
-            "trends": self.client.trends.summary(),
         }
 
     def analyzer_farm_spots(self) -> list[dict[str, Any]]:
@@ -741,6 +740,9 @@ class WebControlServer:
             include = {
                 key for value in parse_qs(query).get("include", [])
                 for key in value.split(",") if key}
+            if not include or "trends" in include:
+                # A day of buckets: built only for polls that ask for it.
+                snapshot["trends"] = self.client.trends.summary()
             if include:
                 # The live view polls a small slice; heavy lists load on demand.
                 snapshot = {key: value for key, value in snapshot.items()

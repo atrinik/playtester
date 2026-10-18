@@ -172,6 +172,7 @@ class AtrinikClient:
         self.decision_history: list[dict] = []
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
         self.trends = Trends()
+        self._last_trend_death_at = 0.0
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -713,7 +714,14 @@ class AtrinikClient:
                     character, "decisions", self.decision_history)
 
     def _trend_count(self, key: str) -> None:
-        if self.trends.count(key):
+        now = time.time()
+        if key == "deaths":
+            # One death can be announced twice ("defeated in combat", then
+            # "YOU HAVE DIED."); count it once.
+            if now - self._last_trend_death_at < 10.0:
+                return
+            self._last_trend_death_at = now
+        if self.trends.count(key, now):
             self._persist_trends()
 
     def _persist_trends(self) -> None:
@@ -825,6 +833,8 @@ class AtrinikClient:
             await writer.wait_closed()
 
     async def close(self) -> None:
+        # The current minute is otherwise saved only when the next one starts.
+        self._persist_trends()
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"

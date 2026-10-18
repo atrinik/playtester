@@ -63,10 +63,13 @@ class Trends:
         """Hourly rates and levels over the day, downsampled for drawing."""
         now = time.time() if now is None else now
         buckets = [bucket for bucket in self.buckets if bucket["t"] >= now - KEEP_SECONDS]
-        hour = 3600 // BUCKET_SECONDS
         rows = []
+        first_index = 0
         for index, bucket in enumerate(buckets):
-            window = buckets[max(0, index - hour + 1):index + 1]
+            # The trailing hour by time: a gap (offline) leaves fewer buckets.
+            while buckets[first_index]["t"] <= bucket["t"] - 3600:
+                first_index += 1
+            window = buckets[first_index:index + 1]
             first = next((b for b in window if b.get("exp") is not None), None)
             span = (bucket["t"] - first["t"]) / 3600 if first else 0
             xp_rate = (round((bucket["exp"] - first["exp"]) / span)
