@@ -1293,6 +1293,10 @@ class ProtocolTests(unittest.TestCase):
         again = build(when, "/a", 1, 2, [[when - 50, 0, 155, 0, 39, 0], [when - 1, 0, 155, 39, 39, 900]],
                       [], [], [], since=when - 30)
         self.assertEqual([sample[0] for sample in again["vitals"]], [when - 1])
+        # Nor does a decision after the death change its cause.
+        late = build(when, "/a", 1, 2, [], [], [], [
+            {"time": when + 1, "action": "emergency-disengage", "detail": "sp=0 next-heal=30"}])
+        self.assertNotEqual(late["cause"], "resources")
         # The review written after the notice is not what she was doing.
         self.assertEqual([entry["action"] for entry in death["decisions"]], ["navigate"])
         self.assertEqual([entry["action"] for entry in death["actions"]], ["navigate"])
@@ -1314,7 +1318,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(restored["damage_taken"], 0)
         self.assertEqual((len(restored["vitals"]), restored["messages"], restored["actions"]),
                          (1, [[1, "hi"]], []))
-        self.assertEqual(restored["decisions"], [{"action": "heal"}])
+        self.assertEqual(restored["decisions"], [])
+        # Nested numbers must be finite too, and records keep their shape.
+        restored = post_mortem.restore({
+            "time": 5, "vitals": [[1, float("nan"), 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]],
+            "messages": [[float("inf"), "x"], [2, "ok"]], "attackers": {"rat": float("nan")},
+            "decisions": [{"time": float("nan"), "action": "x"}, {"time": 3, "action": "heal", "extra": 1}]})
+        self.assertEqual(restored["vitals"], [[1, 2, 3, 4, 5, 6]])
+        self.assertEqual(restored["messages"], [[2, "ok"]])
+        self.assertEqual(restored["attackers"], {})
+        self.assertEqual(restored["decisions"], [{"time": 3, "action": "heal", "detail": "", "map": ""}])
+        json.dumps(restored, allow_nan=False)
 
     def test_post_mortem_describes_the_fight_inside_the_window(self):
         from .post_mortem import build

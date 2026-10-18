@@ -52,20 +52,35 @@ def restore(entry: Any) -> dict[str, Any] | None:
     if not math.isfinite(when):
         return None
 
+    # Every number must be finite: json.loads accepts NaN, and one bare NaN
+    # in the state response makes the browser reject the whole poll.
+    def finite(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
     def records(key: str) -> list[dict]:
         value = entry.get(key)
-        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+        return [{"time": item["time"], "action": str(item.get("action") or ""),
+                 "detail": str(item.get("detail") or ""), "map": str(item.get("map") or "")}
+                for item in value if isinstance(item, dict) and finite(item.get("time"))
+                ] if isinstance(value, list) else []
 
-    def rows(key: str, size: int) -> list[list]:
-        value = entry.get(key)
+    def vitals_rows() -> list[list]:
+        value = entry.get("vitals")
         return ([list(item) for item in value
-                 if isinstance(item, (list, tuple)) and len(item) >= size]
+                 if isinstance(item, (list, tuple)) and len(item) == 1 + len(VITAL_KEYS)
+                 and all(finite(part) for part in item)]
+                if isinstance(value, list) else [])
+
+    def message_rows() -> list[list]:
+        value = entry.get("messages")
+        return ([[item[0], str(item[1])] for item in value
+                 if isinstance(item, (list, tuple)) and len(item) == 2 and finite(item[0])]
                 if isinstance(value, list) else [])
 
     def counts(key: str) -> dict[str, int]:
         value = entry.get(key)
         return ({str(name): count for name, count in value.items()
-                 if isinstance(count, (int, float))} if isinstance(value, dict) else {})
+                 if finite(count)} if isinstance(value, dict) else {})
 
     def number(key: str) -> int:
         value = entry.get(key)
@@ -76,7 +91,7 @@ def restore(entry: Any) -> dict[str, Any] | None:
         "cause": str(entry.get("cause") or ""), "detail": str(entry.get("detail") or ""),
         "attackers": counts("attackers"), "peak_attackers": number("peak_attackers"),
         "damage_taken": number("damage_taken"), "damage_by_type": counts("damage_by_type"),
-        "vitals": rows("vitals", 1 + len(VITAL_KEYS)), "messages": rows("messages", 2),
+        "vitals": vitals_rows(), "messages": message_rows(),
         "actions": records("actions"), "decisions": records("decisions"),
     }
 
@@ -114,7 +129,8 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
         [entry for entry in messages
          if _within(entry[0], start, end) and hers(entry)],
         [record for record in decisions
-         if isinstance(record, dict) and _within(record.get("time"), start, end)],
+         # Decisions stop at the death: work after it never sets the cause.
+         if isinstance(record, dict) and _within(record.get("time"), start, when)],
         {"time": when, "action": "death", "map": path}, [path])
     texts = [(float(entry[0]), str(entry[-1])) for entry in messages
              if _within(entry[0], start, end)]
