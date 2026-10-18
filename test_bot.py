@@ -11829,10 +11829,15 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         client.farm_analyzer.rankings["safety"] = [pocket]
         client.state.depletion_points_known = True
         client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD
+        # A stale counter alone (cured elsewhere) is not depletion.
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
+        client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"), client.state.player_tag)
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
         client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD - 1
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
         client.state.depletion_points = 0
+        client.state.remove_item(501)
         client.state.farm_objective = "money"
         client.state.farm_objective = "xp"
         client.state.farm_zone_quarantine = {self.TREES: time.time() + 60}
@@ -11899,6 +11904,27 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
             "task": "", "map": "/elsewhere"})
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
+
+    def test_depletion_moves_the_circuit_to_safety_or_stops_it(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        client = self.client({"xp": [trees], "safety": [pocket]})
+        client.state.player_tag = 7
+        client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        client.state.depletion_points_known = True
+        client.state.depletion_points = 32
+        circuit = self.circuit(client, trees)
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.spot["name"], "Pocket")
+        selected = [entry["detail"] for entry in client.decision_history
+                    if entry["action"] == "farm-spot-selected"]
+        self.assertIn("(safety)", selected[-1])
+        # With no usable safety spot, the XP circuit stops instead of farming on.
+        client.farm_analyzer.rankings["safety"] = []
+        circuit = self.circuit(client, trees)
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.status, TaskStatus.COMPLETE)
 
     def test_repeated_failures_at_maximum_adaptation_pause_the_spot_briefly(self):
         from . import self_improvement
@@ -12285,6 +12311,9 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(analysis["objective_override"])
         self.assertIn("money", analysis["objectives"])
         # Depleted: she farms for safety, and the toggle keeps the choice.
+        self.client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
+            self.client.state.player_tag)
         self.client.state.depletion_points_known = True
         self.client.state.depletion_points = 32
         status, payload = await self.request("GET", "/api/state?include=farming_analysis")

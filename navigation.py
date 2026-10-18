@@ -3550,7 +3550,12 @@ def effective_farm_objective(state) -> str:
     safest spots until the temple removes it; then the choice applies again.
     """
     chosen = getattr(state, "farm_objective", DEFAULT_OBJECTIVE)
-    if (getattr(state, "depletion_points_known", False) and
+    # The counter can outlive a cure applied elsewhere (an item, or while
+    # offline); only the live depletion force proves she is still depleted.
+    depleted = any(item.item_type == c.TYPE_FORCE and
+                   item.name.casefold() == "depletion"
+                   for item in getattr(state, "inventory", ()))
+    if (depleted and getattr(state, "depletion_points_known", False) and
             int(getattr(state, "depletion_points", 0) or 0) >=
             FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD):
         return "safety"
@@ -4252,14 +4257,18 @@ class FarmCircuitTask(BotTask):
         if not self.analyzer_driven:
             return False
         selection = analyzer_farm_selection(client, self.graph)
+        objective = effective_farm_objective(client.state)
         if selection is None:
             # Nothing usable is ranked. Never keep farming a spot that live
-            # failures just excluded: finish, and autoplay holds position
+            # failures just excluded, nor the chosen objective's spot once
+            # depletion makes it deadly: finish, and autoplay holds position
             # safely until a usable spot is ranked again.
             quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
             now = time.time()
-            if any(float(quarantine.get(path, 0.0) or 0.0) > now
-                   for path, _ in self.legs):
+            overridden = objective != getattr(
+                client.state, "farm_objective", DEFAULT_OBJECTIVE)
+            if overridden or any(float(quarantine.get(path, 0.0) or 0.0) > now
+                                 for path, _ in self.legs):
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("farm-spots-exhausted",
@@ -4284,7 +4293,6 @@ class FarmCircuitTask(BotTask):
         self._tier_progress_exp = self._current_exp
         self.name = "farm-circuit:" + "+".join(
             path.rsplit("/", 1)[-1] for path, _ in self.legs)
-        objective = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
         log.info("farming analyzer selected %s for %s: %s",
                  spot.get("name", "?"), objective,
                  ", ".join(path.rsplit("/", 1)[-1] for path, _ in self.legs))
