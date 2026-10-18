@@ -1193,8 +1193,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(death["vitals"][-1][1:5], [13, 155, 3, 39])
         self.assertIn("Sera starved to death.", [text for _, text in death["messages"]])
         self.assertIn("death", [entry["action"] for entry in death["actions"]])
+        # A second announcement of the same death adds nothing.
+        say("You have been defeated in combat!")
+        self.assertEqual(len(client.post_mortems), 1)
         # Only the latest KEEP deaths are kept.
-        for _ in range(post_mortem.KEEP + 3):
+        for index in range(post_mortem.KEEP + 3):
+            client.post_mortems[-1]["time"] -= post_mortem.SAME_DEATH_SECONDS
             say("YOU HAVE DIED.")
         self.assertEqual(len(client.post_mortems), post_mortem.KEEP)
 
@@ -1219,6 +1223,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(death["actions"], [{"time": now - 3, "action": "fire",
                                              "detail": "minor healing",
                                              "map": "/shattered_islands/world_13_73"}])
+        # A death soon after a starvation death describes only this life.
+        again = build(now, "/shattered_islands/world_13_73", 5, 6, vitals,
+                      [(now - 40, 2, "", "Sera starved to death."), *messages], [], [],
+                      since=now - 8)
+        self.assertEqual(again["cause"], "out-damaged")
+        self.assertEqual((again["attackers"], again["damage_taken"]), ({"red ant": 1}, 10))
 
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))

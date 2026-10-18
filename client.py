@@ -717,10 +717,16 @@ class AtrinikClient:
 
     def _record_post_mortem(self) -> None:
         """Keep what happened in the minute before this death."""
+        now = time.time()
+        previous = float(self.post_mortems[-1].get("time", 0.0) or 0.0) if self.post_mortems else 0.0
+        if now - previous < post_mortem.SAME_DEATH_SECONDS:
+            # A second announcement of the same death.
+            return
         m = self.state.map
         self.post_mortems.append(post_mortem.build(
-            time.time(), m.path, m.world_x, m.world_y, self.vitals,
-            self.state.messages, self.action_history, self.decision_history))
+            now, m.path, m.world_x, m.world_y, self.vitals,
+            self.state.messages, self.action_history, self.decision_history,
+            since=previous))
         del self.post_mortems[:-post_mortem.KEEP]
         character = self.state.player_name
         if character:

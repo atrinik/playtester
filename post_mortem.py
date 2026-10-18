@@ -16,6 +16,9 @@ from .self_improvement import REVIEW_WINDOW_SECONDS, review_failure
 
 # Post-mortems kept per character.
 KEEP = 20
+# Announcements of one death ("defeated in combat", "YOU HAVE DIED.") arrive
+# this close together; they describe a single death.
+SAME_DEATH_SECONDS = 10.0
 # Vital samples kept; the client samples on every health/SP/food change.
 VITALS_SECONDS = 600.0
 VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
@@ -35,15 +38,21 @@ def _within(stamp: Any, start: float, end: float) -> bool:
 
 def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
           messages: Iterable[tuple], actions: Iterable[dict],
-          decisions: Iterable[dict]) -> dict[str, Any]:
-    """The post-mortem of a death at ``when`` on ``path`` (x, y)."""
-    start, end = when - REVIEW_WINDOW_SECONDS, when + 2.0
+          decisions: Iterable[dict], *, since: float = 0.0) -> dict[str, Any]:
+    """The post-mortem of a death at ``when`` on ``path`` (x, y).
+
+    ``since`` is the previous death: nothing from that earlier life counts.
+    """
+    start, end = max(when - REVIEW_WINDOW_SECONDS, since), when + 2.0
     messages = list(messages)
     decisions = list(decisions)
     # The farm decides whether a death was "on the way"; a post-mortem only
     # describes the fight, so the death map counts as the spot.
-    review = review_failure(messages, decisions,
-                            {"time": when, "action": "death", "map": path}, [path])
+    review = review_failure(
+        [entry for entry in messages if _within(entry[0], start, end)],
+        [record for record in decisions
+         if isinstance(record, dict) and _within(record.get("time"), start, end)],
+        {"time": when, "action": "death", "map": path}, [path])
     texts = [(float(entry[0]), str(entry[-1])) for entry in messages
              if _within(entry[0], start, end)]
     if any("starved to death" in text.casefold() for _, text in texts):
