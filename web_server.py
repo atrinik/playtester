@@ -574,6 +574,8 @@ class DashboardState:
             "quests_loaded": state.quests_loaded, "quests": self.quests(),
             "quest_journal": self.quest_journal(),
             "farming_analysis": self.farming_analysis(),
+            "post_mortems": list(reversed(
+                getattr(self.client, "post_mortems", [])[-10:])),
         }
 
     def analyzer_farm_spots(self) -> list[dict[str, Any]]:

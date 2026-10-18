@@ -20,6 +20,7 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameState,
                     InterfaceState, Item, MapObject, MapState)
 from .memory import BotMemory
+from . import post_mortem
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
 
@@ -169,6 +170,9 @@ class AtrinikClient:
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
         self.decision_history: list[dict] = []
+        # Health, SP and food samples, and the deaths reviewed from them.
+        self.vitals: list[list[float]] = []
+        self.post_mortems: list[dict] = []
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -193,6 +197,10 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        deaths = memory.load(character, "post_mortems", [])
+        self.post_mortems = [
+            value for value in deaths if isinstance(value, dict)
+        ][-post_mortem.KEEP:] if isinstance(deaths, list) else []
         if isinstance(record, dict) and "depletion_points" in record:
             self.state.depletion_points = max(
                 0, int(record.get("depletion_points", 0)))
@@ -707,6 +715,17 @@ class AtrinikClient:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
+    def _record_post_mortem(self) -> None:
+        """Keep what happened in the minute before this death."""
+        m = self.state.map
+        self.post_mortems.append(post_mortem.build(
+            time.time(), m.path, m.world_x, m.world_y, self.vitals,
+            self.state.messages, self.action_history, self.decision_history))
+        del self.post_mortems[:-post_mortem.KEEP]
+        character = self.state.player_name
+        if character:
+            self._memory_store().save(character, "post_mortems", self.post_mortems)
+
     def _load_faces(self) -> dict[int, str]:
         faces: dict[int, str] = {}
         paths = (
@@ -1156,6 +1175,7 @@ class AtrinikClient:
         died = "defeated in combat" in lowered or "you have died" in lowered
         if died:
             self.record_action("death", text)
+            self._record_post_mortem()
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a
             # post-death window for protocol/order variants that arrive later.
@@ -1519,6 +1539,11 @@ class AtrinikClient:
             self.state.stats[name] = value
             self.state.stat_observed_at[name] = time.monotonic()
             changed[name] = value
+        if any(key in changed for key in post_mortem.VITAL_KEYS):
+            self.vitals.append(post_mortem.sample(self.state.stats))
+            cutoff = time.time() - post_mortem.VITALS_SECONDS
+            while self.vitals and self.vitals[0][0] < cutoff:
+                self.vitals.pop(0)
         await self.emit("stats", changed)
 
     def _decode_item_fields(self, cur: Cursor, flags: int, item: Item) -> None:

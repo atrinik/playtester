@@ -1164,6 +1164,62 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             asyncio.run(client._handle_party(Cursor(malformed), malformed))
 
+    def test_death_records_a_post_mortem_of_the_last_minute(self):
+        import struct
+        from . import post_mortem
+
+        client = AtrinikClient(ClientConfig())
+        client.state.map.path = "/shattered_islands/world_6_46"
+        client.state.map.world_x, client.state.map.world_y = 12, 14
+
+        payload = b"".join(bytes((stat,)) + struct.pack(">" + c.STAT_FORMATS[stat], value)
+                           for stat, value in ((c.STAT_HP, 13), (c.STAT_MAXHP, 155),
+                                               (c.STAT_SP, 3), (c.STAT_MAXSP, 39)))
+        asyncio.run(client._handle_stats(Cursor(payload), payload))
+        self.assertEqual(client.vitals[-1][1:5], [13, 155, 3, 39])
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+
+        for line in ("The spell heals you for 12 hp!", "Sera starved to death.",
+                     "YOU HAVE DIED."):
+            say(line)
+        self.assertEqual(len(client.post_mortems), 1)
+        death = client.post_mortems[0]
+        self.assertEqual((death["map"], death["x"], death["y"]),
+                         ("/shattered_islands/world_6_46", 12, 14))
+        self.assertEqual((death["cause"], death["detail"]), ("starvation", "ran out of food"))
+        self.assertEqual(death["vitals"][-1][1:5], [13, 155, 3, 39])
+        self.assertIn("Sera starved to death.", [text for _, text in death["messages"]])
+        self.assertIn("death", [entry["action"] for entry in death["actions"]])
+        # Only the latest KEEP deaths are kept.
+        for _ in range(post_mortem.KEEP + 3):
+            say("YOU HAVE DIED.")
+        self.assertEqual(len(client.post_mortems), post_mortem.KEEP)
+
+    def test_post_mortem_describes_the_fight_inside_the_window(self):
+        from .post_mortem import build
+
+        now = 1000.0
+        messages = [(now - 120, 2, "", "ogre hit you for 99 (-99) impact damage."),
+                    (now - 20, 2, "", "giant slug hit you for 30 (-30) acid damage."),
+                    (now - 10, 2, "", "giant slug hit you for 25 (-25) acid damage."),
+                    (now - 5, 2, "", "red ant hit you for 10 (-10) pierce damage.")]
+        vitals = [[now - 300, 155, 155, 39, 39, 900], [now - 20, 80, 155, 10, 39, 900],
+                  [now - 1, 2, 155, 0, 39, 900]]
+        death = build(now, "/shattered_islands/world_13_73", 5, 6, vitals, messages,
+                      [{"time": now - 3, "action": "fire", "detail": "minor healing",
+                        "map": "/shattered_islands/world_13_73", "x": 5}], [])
+        self.assertEqual(death["cause"], "pack")
+        self.assertEqual(death["attackers"], {"giant slug": 2, "red ant": 1})
+        self.assertEqual(death["damage_taken"], 65)
+        self.assertEqual(death["damage_by_type"], {"acid": 55, "pierce": 10})
+        self.assertEqual([sample[0] for sample in death["vitals"]], [now - 20, now - 1])
+        self.assertEqual(death["actions"], [{"time": now - 3, "action": "fire",
+                                             "detail": "minor healing",
+                                             "map": "/shattered_islands/world_13_73"}])
+
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))
         commands = []
@@ -12281,6 +12337,11 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.state.farm_objective, "money")
         status, page = await self.request("GET", "/")
         self.assertIn(b'id="tab-farming"', page)
+        self.assertIn(b'id="fa-deaths"', page)
+        self.client.post_mortems = [{"time": 1.0, "cause": "pack"}, {"time": 2.0, "cause": "starvation"}]
+        status, payload = await self.request("GET", "/api/state?include=post_mortems")
+        self.assertEqual([death["time"] for death in json.loads(payload)["post_mortems"]],
+                         [2.0, 1.0])
 
     async def test_dashboard_reports_the_running_build(self):
         from .build_info import build_info
