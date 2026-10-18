@@ -19,6 +19,7 @@ from .access_codes import normalize_access_code
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameState,
                     InterfaceState, Item, MapObject, MapState)
+from .alerts import ProgressWatch
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
@@ -169,6 +170,8 @@ class AtrinikClient:
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
         self.decision_history: list[dict] = []
+        # When XP, position and the connection last changed, for alerts.
+        self.progress_watch = ProgressWatch()
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -1519,6 +1522,7 @@ class AtrinikClient:
             self.state.stats[name] = value
             self.state.stat_observed_at[name] = time.monotonic()
             changed[name] = value
+        self.progress_watch.observe(self.state)
         await self.emit("stats", changed)
 
     def _decode_item_fields(self, cur: Cursor, flags: int, item: Item) -> None:

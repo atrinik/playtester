@@ -1164,6 +1164,44 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             asyncio.run(client._handle_party(Cursor(malformed), malformed))
 
+    def test_alerts_flag_deaths_starvation_stuck_and_disconnects(self):
+        from .alerts import (DISCONNECTED_SECONDS, STUCK_SECONDS, ProgressWatch, active)
+
+        now = 10_000.0
+        state = GameState(phase="playing", player_tag=7)
+        state.stats.update(exp=500, food=300)
+        state.map = MapState(path="/a", world_x=1, world_y=1)
+        watch = ProgressWatch(now)
+        watch.observe(state, now)
+
+        def ids(at, decisions=(), autoplay=True):
+            return [alert["id"] for alert in active(state, decisions, watch,
+                                                    autoplay_running=autoplay, now=at)]
+
+        self.assertEqual(ids(now), [])
+        deaths = [{"action": "death", "time": now - 3000}, {"action": "death", "time": now - 60},
+                  {"action": "death", "time": now - 7200}]
+        self.assertEqual(ids(now, deaths), ["deaths"])
+        self.assertEqual(ids(now, deaths[:1]), [])
+        state.stats["food"] = 0
+        self.assertEqual(ids(now), ["starving"])
+        state.stats["food"] = 300
+        # No XP and no movement for the stuck window while autoplay runs.
+        later = now + STUCK_SECONDS
+        self.assertEqual(ids(later), ["stuck"])
+        self.assertEqual(ids(later, autoplay=False), [])
+        state.map.world_x = 2
+        watch.observe(state, later)
+        self.assertEqual(ids(later + 60), [])
+        # A lost connection, only after a grace period.
+        state.phase = "disconnected"
+        watch.observe(state, later)
+        self.assertEqual(ids(later + 60), [])
+        self.assertEqual(ids(later + DISCONNECTED_SECONDS), ["disconnected"])
+        state.phase = "playing"
+        watch.observe(state, later + DISCONNECTED_SECONDS)
+        self.assertIsNone(watch.disconnected_since)
+
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))
         commands = []
@@ -12281,6 +12319,12 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.state.farm_objective, "money")
         status, page = await self.request("GET", "/")
         self.assertIn(b'id="tab-farming"', page)
+        self.assertIn(b'id="alerts"', page)
+        now = time.time()
+        self.client.decision_history.extend([
+            {"action": "death", "time": now - 30}, {"action": "death", "time": now - 10}])
+        status, payload = await self.request("GET", "/api/state?include=alerts")
+        self.assertIn("deaths", [alert["id"] for alert in json.loads(payload)["alerts"]])
 
     async def test_dashboard_reports_the_running_build(self):
         from .build_info import build_info
