@@ -18,6 +18,10 @@ KEEP_SECONDS = 24 * 3600
 MAX_POINTS = 288
 # Last known values carried into each new minute.
 LEVELS = ("exp", "level", "food", "hp", "depletion")
+# Buckets kept: a day of minutes. Retention counts buckets rather than
+# trusting the newest timestamp, so a clock that briefly jumps ahead cannot
+# wipe the real history; the summary shows only the day before the poll.
+MAX_BUCKETS = KEEP_SECONDS // BUCKET_SECONDS
 
 
 class Trends:
@@ -37,9 +41,7 @@ class Trends:
         bucket = {"t": start, "deaths": 0, "heals": 0,
                   **{key: previous.get(key) for key in LEVELS}}
         self.buckets.insert(index, bucket)
-        cutoff = self.buckets[-1]["t"] - KEEP_SECONDS
-        while self.buckets and self.buckets[0]["t"] < cutoff:
-            self.buckets.pop(0)
+        del self.buckets[:-MAX_BUCKETS]
         return bucket, True
 
     def observe(self, state: Any, now: float | None = None) -> bool:

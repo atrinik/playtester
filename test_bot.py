@@ -1190,9 +1190,25 @@ class ProtocolTests(unittest.TestCase):
         trends.observe(state, start + 3600 + 5 * 3600)
         late = trends.summary(start + 3600 + 5 * 3600)["points"][-1]
         self.assertEqual((late["deaths_per_hour"], late["xp_per_hour"]), (0, None))
-        # A day is kept; older buckets go.
+        # The chart shows the day before the poll; older minutes drop out of it.
         trends.observe(state, start + KEEP_SECONDS + 3600)
-        self.assertGreaterEqual(trends.buckets[0]["t"], start + 3600 - 60)
+        shown = trends.summary(start + KEEP_SECONDS + 3600)["points"]
+        self.assertGreaterEqual(shown[0]["t"], start + 3600 - 60)
+        # At most a day of minute buckets is stored.
+        from .trends import MAX_BUCKETS
+        many = Trends()
+        for minute in range(MAX_BUCKETS + 5):
+            many.observe(state, start + 60 * minute)
+        self.assertEqual(len(many.buckets), MAX_BUCKETS)
+        self.assertEqual(many.buckets[0]["t"], int((start + 60 * 5) // 60 * 60))
+        # A clock that jumps two days ahead and back again keeps the history.
+        jumpy = Trends()
+        for minute in range(10):
+            jumpy.observe(state, start + 60 * minute)
+        jumpy.observe(state, start + 2 * KEEP_SECONDS)
+        jumpy.observe(state, start + 60 * 10)
+        self.assertEqual(len(jumpy.buckets), 12)
+        self.assertEqual(len(jumpy.summary(start + 60 * 10)["points"]), 11)
         # Restored buckets survive; garbage does not.
         self.assertEqual(len(Trends([{"t": 60, "exp": 1}, "x", {"exp": 2}]).buckets), 1)
 
