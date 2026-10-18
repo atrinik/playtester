@@ -59,6 +59,22 @@ class PullRequestMetadataTests(unittest.TestCase):
         self.assertIn(".github/scripts/check_pr_metadata.py", policy_workflow)
         self.assertIn("test_check_pr_metadata.py", validation_workflow)
 
+    def test_required_checks_report_on_merge_queue(self) -> None:
+        workflows = ROOT / ".github" / "workflows"
+        policy_workflow = (workflows / "pr-title.yml").read_text(encoding="utf-8")
+        validation_workflow = (workflows / "validate.yml").read_text(encoding="utf-8")
+        self.assertIn("\n  merge_group:\n", policy_workflow)
+        self.assertIn("\n  merge_group:\n", validation_workflow)
+        self.assertIn("name: Conventional PR title", policy_workflow)
+        self.assertIn("name: Playtester validation", validation_workflow)
+        # Queued merge results carry no pull-request metadata; only the
+        # pull-request run may validate the title and body.
+        guard = "if: github.event_name == 'pull_request_target'"
+        self.assertEqual(2, policy_workflow.count(guard))
+        self.assertIn(
+            guard + "\n        env:\n          PR_TITLE:", policy_workflow
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
