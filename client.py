@@ -173,7 +173,7 @@ class AtrinikClient:
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: list[list[float]] = []
         self.post_mortems: list[dict] = []
-        # (arrived_at, path, x, y) now, and the last place on the previous map.
+        # (arrived_at, path, x, y) of her square, and of the one before it.
         self._location: tuple[float, str, int, int] | None = None
         self._location_before: tuple[float, str, int, int] | None = None
         self.action_context = ""
@@ -533,13 +533,12 @@ class AtrinikClient:
         if (old_path and old_path != m.path and "/apartments/" in old_path and
                 "/apartments/" not in m.path and not self._recently_moved_by_force()):
             self.set_apartment_return(old_path, m.path, m.world_x, m.world_y)
-        # Where she is, since when, and the last square on the map before it:
-        # a death report needs the fight's place, not the respawn's.
-        if self._location is None or self._location[1] != m.path:
+        # The square she is on, since when, and the square before it: a death
+        # report needs the fight's place, not the respawn's (on any map).
+        here = (m.path, m.world_x, m.world_y)
+        if self._location is None or self._location[1:] != here:
             self._location_before = self._location
-            self._location = (time.time(), m.path, m.world_x, m.world_y)
-        else:
-            self._location = (self._location[0], m.path, m.world_x, m.world_y)
+            self._location = (time.time(), *here)
 
     def _recently_moved_by_force(self, seconds: float = 15.0) -> bool:
         """Whether a death or recall, not an exit, may explain a map change."""

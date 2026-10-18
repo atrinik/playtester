@@ -1246,6 +1246,11 @@ class ProtocolTests(unittest.TestCase):
         # Standing on the savebed for a while, a death there is the savebed's.
         client._location = (client._location[0] - 60, *client._location[1:])
         self.assertEqual(die(), (bed, 4, 7))
+        # A savebed on the death's own map: the square before the transfer.
+        client.state.savebed_map, client.state.savebed_xy = swamp, (1, 1)
+        arrive(swamp, 9, 3)
+        arrive(swamp, 1, 1)
+        self.assertEqual(die(), (swamp, 9, 3))
 
     def test_post_mortem_describes_the_fight_inside_the_window(self):
         from .post_mortem import build
