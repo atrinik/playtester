@@ -34,7 +34,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask,
                     InventoryPolicy, JunkPolicy,
                     MassIdentifyTask, RetrieveItemsTask, SafetyPolicy,
                     SellItemsTask, SellJunkTask, TaskEngine, TaskStatus,
-                    TempleServiceTask,
+                    TempleFoodTask, TempleServiceTask,
                     equipment_face_catalog)
 from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, GameState, Item, MapObject,
                     MapState)
@@ -8554,6 +8554,115 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(timed_out(""),
                          "temple service did not answer the purchase of depletion")
 
+    @staticmethod
+    def _talking_client(food):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["food"] = food
+        client.talks = []
+
+        async def talk(message, npc=None):
+            client.talks.append((message, npc))
+
+        client.talk = talk
+        return client
+
+    def test_temple_food_asks_the_priest_and_checks_she_ate(self):
+        from .model import InterfaceState
+
+        client = self._talking_client(0)
+        task = TempleFoodTask("Saruthar")
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.talks, [("food", "Saruthar")])
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        client.state.interface = InterfaceState(
+            title="Saruthar", text="Your stomach is filled again.")
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        # The raised food stat alone also proves it.
+        fed = self._talking_client(0)
+        task = TempleFoodTask("Saruthar")
+        asyncio.run(task.tick(fed))
+        fed.state.stats["food"] = 500
+        asyncio.run(task.tick(fed))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        # No answer in time fails, so the circuit can back off.
+        silent = self._talking_client(0)
+        task = TempleFoodTask("Saruthar")
+        asyncio.run(task.tick(silent))
+        task._sent_at = time.monotonic() - 9.0
+        asyncio.run(task.tick(silent))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(task.error,
+                         "Saruthar did not answer the temple food request")
+
+    def test_world_graph_compiles_temple_priests(self):
+        graph = built_graph()
+        saruthar = next(priest for priest in graph.temple_priests
+                        if priest.name == "Saruthar")
+        self.assertEqual(saruthar.map_path, "/shattered_islands/world_3_58")
+        self.assertTrue(saruthar.script.startswith("/interfaces/temples/"))
+        # Priests are services, not merchants.
+        self.assertNotIn(saruthar, graph.dialogue_vendors)
+
+    def test_hungry_circuit_falls_back_to_temple_food(self):
+        from .navigation import DialogueVendor
+
+        now = [100.0]
+        graph = WorldGraph()
+        graph.temple_priests.append(DialogueVendor(
+            "/temple", 5, 5, "Saruthar", "/interfaces/temples/elathiel.xml"))
+        circuit = FarmCircuitTask(graph, [("/a", "rat")], clock=lambda: now[0])
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["food"] = 0
+        planned = []
+
+        def new_temple_food(client):
+            planned.append(now[0])
+            return NavigateThenTask(graph, "/temple", TempleFoodTask("Saruthar"))
+
+        circuit._new_temple_food = new_temple_food
+        self.assertTrue(circuit._needs_food_resupply(client))
+        # Shop resupply backing off still leaves the temple.
+        circuit._resupply_retry_at = now[0] + 1800.0
+        self.assertTrue(circuit._needs_food_resupply(client))
+        circuit._temple_food_retry_at = now[0] + 600.0
+        self.assertFalse(circuit._needs_food_resupply(client))
+        # Fed again: no detour at all.
+        circuit._temple_food_retry_at = 0.0
+        client.state.stats["food"] = 300
+        self.assertFalse(circuit._needs_food_resupply(client))
+
+    def test_shop_resupply_that_bought_nothing_backs_off_to_the_temple(self):
+        now = [100.0]
+        graph = WorldGraph()
+        circuit = FarmCircuitTask(graph, [("/a", "rat")], clock=lambda: now[0])
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["food"] = 0
+        done = NavigateThenTask(graph, "/shop", TempleFoodTask("x"))
+        done.status = TaskStatus.COMPLETE
+
+        circuit._resupply, circuit._resupply_kind = done, "shop"
+        circuit._settle_resupply(client)
+        self.assertIsNone(circuit._resupply)
+        self.assertEqual(circuit._resupply_retry_at, now[0] + 1800.0)
+        # A shop run that did feed her sets no backoff.
+        client.state.stats["food"] = 900
+        circuit._resupply_retry_at = 0.0
+        circuit._resupply, circuit._resupply_kind = done, "shop"
+        circuit._settle_resupply(client)
+        self.assertEqual(circuit._resupply_retry_at, 0.0)
+        # A failed temple request backs off only the temple path.
+        failed = NavigateThenTask(graph, "/temple", TempleFoodTask("x"))
+        failed.status = TaskStatus.FAILED
+        circuit._resupply, circuit._resupply_kind = failed, "temple"
+        circuit._settle_resupply(client)
+        self.assertEqual(circuit._temple_food_retry_at,
+                         now[0] + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+        self.assertEqual(circuit._resupply_retry_at, 0.0)
+
     def test_paid_but_ineffective_temple_service_backs_off(self):
         # Live: Saruthar took the fee and said he would cast, but the
         # depletion force stayed; retrying every half hour drains the purse.
@@ -12041,6 +12150,13 @@ class SelfImprovementTests(unittest.TestCase):
         route = self.review(["ogre hit you for 50 (-50) impact damage."],
                             failure_map="/shattered_islands/world_2_50")
         self.assertEqual(route.cause, "route")
+        # Live: starving off the spot was filed as a route death.
+        hungry = self.review(["The spell heals you for 12 hp!", "Sera starved to death.",
+                              "YOU HAVE DIED."],
+                             failure_map="/shattered_islands/world_6_46")
+        self.assertEqual((hungry.cause, hungry.detail), ("starvation", "ran out of food"))
+        from .self_improvement import remedies
+        self.assertEqual(remedies(hungry), ("keep food stocked",))
         # Messages outside the review window are ignored.
         from .self_improvement import review_failure
         old = review_failure([(100.0, 2, "", "giant frog hit you for 1 (-1) slash damage.")],
