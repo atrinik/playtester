@@ -49,7 +49,7 @@ class AutoplayTask(BotTask):
         """Starving where nothing else will feed her.
 
         The farm circuit feeds her itself unless one of its maintenance trips
-        is under way. Any other phase can outlast her food: a slow, depleted
+        is under way, and a hostile-route abort finishes first. Any other phase can outlast her food: a slow, depleted
         character once starved to death still walking to the apartment chest.
         """
         # Login and reconnect enter "playing" before the inventory replay;
@@ -64,7 +64,7 @@ class AutoplayTask(BotTask):
         if self.phase == "temple-food":
             return False
         if isinstance(child, FarmCircuitTask):
-            return not child.can_feed_her()
+            return child.needs_outside_food()
         # Once Gandyld's quest has started, the starter is handing over the
         # crystal; replacing it then loses the reward until a checkpoint
         # reconnect, and apartment recovery would look for it in vain.

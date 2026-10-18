@@ -5074,6 +5074,14 @@ class FarmCircuitTask(BotTask):
         return not any(service is not None
                        for service in self._maintenance_services())
 
+    def needs_outside_food(self) -> bool:
+        """Whether only a detour outside the circuit can feed her now.
+
+        Not while a hostile-route abort retraces to its safe origin: turning
+        that towards a priest could lead the attackers along.
+        """
+        return not self.can_feed_her() and self._expedition_return is None
+
     def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
         """Return whether autoplay may replace this circuit between pulls."""
         if (self._resupply is not None or not self.can_feed_her() or

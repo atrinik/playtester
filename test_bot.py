@@ -7973,6 +7973,10 @@ class QuestTests(unittest.TestCase):
             self.assertFalse(autoplay._needs_temple_food(client))
             circuit._storage = Walk("navigate-then:storage")
             self.assertTrue(autoplay._needs_temple_food(client))
+            # A hostile-route abort retracing to safety finishes first.
+            circuit._expedition_return = Walk("navigate:origin")
+            self.assertFalse(autoplay._needs_temple_food(client))
+            circuit._expedition_return = None
             # A starter handing over Gandyld's crystal is left to finish.
             autoplay.phase, autoplay.child = "mana-crystal-starter", walk
             self.assertTrue(autoplay._needs_temple_food(client))
