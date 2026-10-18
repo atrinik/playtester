@@ -4025,6 +4025,8 @@ class FarmCircuitTask(BotTask):
         self._disease_suspected = False
         self._restoration: NavigateThenTask | None = None
         self._restoration_retry_at = 0.0
+        self._depleted_hold = False
+        self._depleted_hold_stopped = False
         self._expedition_origin: tuple[str, int, int] | None = None
         self._expedition_return: NavigateTask | None = None
         self._expedition_abort_reason = ""
@@ -4273,17 +4275,33 @@ class FarmCircuitTask(BotTask):
             return False
         selection = analyzer_farm_selection(client, self.graph)
         objective = effective_farm_objective(client.state)
+        overridden = objective != getattr(
+            client.state, "farm_objective", DEFAULT_OBJECTIVE)
+        # Depletion makes the chosen objective's spot deadly, yet no safety
+        # spot is usable. Hold instead of farming on, but keep this circuit:
+        # it owns depletion removal, which the hold still lets run. Autoplay
+        # would only hold in place and never cure her.
+        holding = selection is None and overridden
+        if holding and not self._depleted_hold:
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("farm-spots-exhausted",
+                         "depleted and no safety spot is usable; holding "
+                         "until depletion is removed")
+            log.warning("depleted and no safety spot is usable; holding")
+        if not holding:
+            self._depleted_hold_stopped = False
+        self._depleted_hold = holding
+        if holding:
+            return False
         if selection is None:
             # Nothing usable is ranked. Never keep farming a spot that live
-            # failures just excluded, nor the chosen objective's spot once
-            # depletion makes it deadly: finish, and autoplay holds position
+            # failures just excluded: finish, and autoplay holds position
             # safely until a usable spot is ranked again.
             quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
             now = time.time()
-            overridden = objective != getattr(
-                client.state, "farm_objective", DEFAULT_OBJECTIVE)
-            if overridden or any(float(quarantine.get(path, 0.0) or 0.0) > now
-                                 for path, _ in self.legs):
+            if any(float(quarantine.get(path, 0.0) or 0.0) > now
+                   for path, _ in self.legs):
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("farm-spots-exhausted",
@@ -4939,6 +4957,28 @@ class FarmCircuitTask(BotTask):
         if not self._needs_depletion_service(client):
             return False
         self._restoration = self._new_depletion_service(client)
+        return True
+
+    async def _hold_while_depleted(self, client: AtrinikClient,
+                                   farm: BotTask | None) -> bool:
+        """Stay put instead of farming while `_upgrade_progression` holds.
+
+        Every maintenance branch, depletion removal included, runs before
+        this. A fight or corpse already under way finishes first.
+        """
+        if not self._depleted_hold:
+            return False
+        if (isinstance(farm, FarmTask) and
+                self._busy_finishing_fight_or_loot(client, farm)):
+            # The farm finishes it below; stop again once it is over.
+            self._depleted_hold_stopped = False
+            return False
+        if not self._depleted_hold_stopped:
+            self._depleted_hold_stopped = True
+            await client.clear_actions()
+            await client.set_combat(False)
+        assert self.child is not None
+        await self.child.safety.enforce(client)
         return True
 
     @staticmethod
@@ -6073,6 +6113,8 @@ class FarmCircuitTask(BotTask):
             await client.set_combat(False)
             self._shopping = self._new_upgrade_shopping(client)
             await self._shopping.tick(client)
+            return
+        if await self._hold_while_depleted(client, farm):
             return
         # Once a leg changes, leave the respawning farm directly. The generic
         # combat-aware wrapper is intentionally biased toward clearing every

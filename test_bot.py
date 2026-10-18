@@ -120,6 +120,41 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_a_cure_outside_the_bot_resets_the_depletion_count(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.player_tag = 7
+            client._persist_character_memory = lambda: None
+            force = Item(22, item_type=c.TYPE_FORCE, name="depletion")
+            client.state.place_item(force, 7)
+            client.state.place_item(Item(23, name="apple"), 7)
+            client.set_depletion_points(32)
+            delete = Packet(0).u32(23)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 32)
+            # The force itself goes: cured by an item or the dashboard.
+            delete = Packet(0).u32(22)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 0)
+            # A new loss counted before its force arrives survives unrelated
+            # deletions, so a fresh episode starts from one.
+            client.set_depletion_points(1)
+            client.state.place_item(Item(24, name="pear"), 7)
+            delete = Packet(0).u32(24)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 1)
+            # Cured while offline: the replay on login has no force.
+            client.set_depletion_points(32)
+            replay = Packet(0).u8(1).u32(7).u32(7).u8(1)
+            await client._handle_item(
+                Cursor(bytes(replay.data)), bytes(replay.data))
+            self.assertEqual(client.state.depletion_points, 0)
+
+        asyncio.run(scenario())
+
     def test_client_checkpoint_wakes_read_loop_for_clean_reconnect(self):
         class Writer:
             def __init__(self):
@@ -12018,7 +12053,7 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
 
-    def test_depletion_moves_the_circuit_to_safety_or_stops_it(self):
+    def test_depletion_moves_the_circuit_to_safety_or_holds_it(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
         pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
         client = self.client({"xp": [trees], "safety": [pocket]})
@@ -12033,11 +12068,41 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         selected = [entry["detail"] for entry in client.decision_history
                     if entry["action"] == "farm-spot-selected"]
         self.assertIn("(safety)", selected[-1])
-        # With no usable safety spot, the XP circuit stops instead of farming on.
+        # With no usable safety spot, the XP circuit holds instead of farming
+        # on, yet stays alive: it owns depletion removal, which must still run.
         client.farm_analyzer.rankings["safety"] = []
         circuit = self.circuit(client, trees)
-        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
-        self.assertEqual(circuit.status, TaskStatus.COMPLETE)
+        farm = circuit.child.task
+        for _ in range(2):
+            self.assertFalse(circuit._upgrade_progression(client, farm))
+        self.assertTrue(circuit._depleted_hold)
+        self.assertNotEqual(circuit.status, TaskStatus.COMPLETE)
+        exhausted = [entry for entry in client.decision_history
+                     if entry["action"] == "farm-spots-exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        sent = []
+
+        async def send(packet):
+            sent.append(packet)
+
+        client.send = send
+        # A fight under way finishes first; then she stops once and holds.
+        client.state.combat, client.state.target_id = True, 99
+        client.state.stats["target_hp"] = 5
+        self.assertFalse(asyncio.run(circuit._hold_while_depleted(client, farm)))
+        self.assertEqual(sent, [])
+        client.state.combat, client.state.target_id = False, 0
+        for _ in range(3):
+            self.assertTrue(asyncio.run(circuit._hold_while_depleted(client, farm)))
+        self.assertEqual(len(sent), 2)
+        client.state.bank_balance, client.state.bank_balance_known = 50_000, True
+        self.assertTrue(circuit._queue_depletion_service(client))
+        # Once the temple removes it, the chosen objective's spot resumes.
+        client.state.remove_item(501)
+        self.assertFalse(circuit._upgrade_progression(client, farm))
+        self.assertFalse(circuit._depleted_hold)
+        self.assertFalse(asyncio.run(circuit._hold_while_depleted(client, farm)))
+        self.assertEqual(circuit.spot["name"], "Trees")
 
     def test_repeated_failures_at_maximum_adaptation_pause_the_spot_briefly(self):
         from . import self_improvement
