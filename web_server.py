@@ -460,10 +460,11 @@ class DashboardState:
         autoplay = bool(task is not None and
                         str(getattr(task, "name", "")).startswith("autoplay"))
         # Moves happen between stats packets; the client reports disconnects.
-        watch.observe(self.client.state, autoplay=autoplay)
+        watch.observe(self.client.state)
         return active_alerts(
             self.client.state, self.client.decision_history, watch,
-            autoplay_running=autoplay)
+            autoplay_started_at=(float(getattr(task, "started_at", 0.0) or 0.0)
+                                 if autoplay else None))
 
     def snapshot(self) -> dict[str, Any]:
         state, task = self.client.state, self.engine.task

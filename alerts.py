@@ -28,17 +28,9 @@ class ProgressWatch:
         self.position: tuple | None = None
         self.moved_at = now
         self.disconnected_since: float | None = None
-        self.autoplay = False
 
-    def observe(self, state: Any, now: float | None = None, *,
-                autoplay: bool | None = None) -> None:
-        """Fold in the current state; ``autoplay`` when known (None: unchanged)."""
+    def observe(self, state: Any, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        if autoplay is not None:
-            if autoplay and not self.autoplay:
-                # Inactivity before autoplay started is not being stuck.
-                self.exp_changed_at = self.moved_at = now
-            self.autoplay = autoplay
         exp = (getattr(state, "stats", {}) or {}).get("exp")
         if exp != self.exp:
             self.exp, self.exp_changed_at = exp, now
@@ -55,9 +47,37 @@ class ProgressWatch:
             self.disconnected_since = now
 
 
+def death_count(decisions: Iterable[dict], since: float) -> int:
+    """Deaths recorded since ``since``.
+
+    One death can be announced as "defeated in combat" and "YOU HAVE DIED.";
+    the other notice of such a pair is not another death, but the same notice
+    again is, however soon after respawning.
+    """
+    notices = sorted(
+        (float(record.get("time", 0.0) or 0.0),
+         "defeated" if "defeated in combat" in str(record.get("detail", "")).casefold() else "died")
+        for record in decisions
+        if isinstance(record, dict) and record.get("action") == "death" and
+        float(record.get("time", 0.0) or 0.0) >= since)
+    deaths, unpaired = 0, None
+    for stamp, kind in notices:
+        if (unpaired is not None and unpaired[1] != kind and
+                stamp - unpaired[0] < SAME_DEATH_SECONDS):
+            unpaired = None
+            continue
+        deaths += 1
+        unpaired = (stamp, kind)
+    return deaths
+
+
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
-           autoplay_running: bool, now: float | None = None) -> list[dict[str, str]]:
-    """The alerts that apply right now, most severe first."""
+           autoplay_started_at: float | None, now: float | None = None) -> list[dict[str, str]]:
+    """The alerts that apply right now, most severe first.
+
+    ``autoplay_started_at`` is when the running autoplay task started, or
+    None when autoplay is not running.
+    """
     now = time.time() if now is None else now
     alerts: list[dict[str, str]] = []
     if (watch.disconnected_since is not None and
@@ -65,13 +85,7 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
         minutes = int((now - watch.disconnected_since) // 60)
         alerts.append({"id": "disconnected", "level": "critical",
                        "text": f"Disconnected for {minutes} min"})
-    stamps = sorted(
-        float(record.get("time", 0.0) or 0.0) for record in decisions
-        if isinstance(record, dict) and record.get("action") == "death" and
-        now - float(record.get("time", 0.0) or 0.0) <= DEATH_WINDOW_SECONDS)
-    # "defeated in combat" and "YOU HAVE DIED." announce one death.
-    deaths = sum(1 for index, stamp in enumerate(stamps)
-                 if index == 0 or stamp - stamps[index - 1] >= SAME_DEATH_SECONDS)
+    deaths = death_count(decisions, now - DEATH_WINDOW_SECONDS)
     if deaths >= REPEATED_DEATHS:
         alerts.append({"id": "deaths", "level": "critical",
                        "text": f"{deaths} deaths in the last hour"})
@@ -80,10 +94,10 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
             int(stats.get("food") or 0) <= 0):
         alerts.append({"id": "starving", "level": "critical",
                        "text": "Starving: food is 0"})
-    if (autoplay_running and getattr(state, "phase", "") == "playing" and
-            now - watch.exp_changed_at >= STUCK_SECONDS and
-            now - watch.moved_at >= STUCK_SECONDS):
-        minutes = int((now - max(watch.exp_changed_at, watch.moved_at)) // 60)
-        alerts.append({"id": "stuck", "level": "warn",
-                       "text": f"No XP or movement for {minutes} min"})
+    if autoplay_started_at is not None and getattr(state, "phase", "") == "playing":
+        # Inactivity before this autoplay run started is not being stuck.
+        since = max(watch.exp_changed_at, watch.moved_at, autoplay_started_at)
+        if now - since >= STUCK_SECONDS:
+            alerts.append({"id": "stuck", "level": "warn",
+                           "text": f"No XP or movement for {int((now - since) // 60)} min"})
     return alerts

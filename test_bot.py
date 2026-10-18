@@ -1174,25 +1174,34 @@ class ProtocolTests(unittest.TestCase):
         watch = ProgressWatch(now)
         watch.observe(state, now)
 
-        def ids(at, decisions=(), autoplay=True):
-            return [alert["id"] for alert in active(state, decisions, watch,
-                                                    autoplay_running=autoplay, now=at)]
+        def ids(at, decisions=(), autoplay=True, started=0.0):
+            return [alert["id"] for alert in active(
+                state, decisions, watch, autoplay_started_at=started if autoplay else None,
+                now=at)]
 
         self.assertEqual(ids(now), [])
         deaths = [{"action": "death", "time": now - 3000}, {"action": "death", "time": now - 60},
                   {"action": "death", "time": now - 7200}]
         self.assertEqual(ids(now, deaths), ["deaths"])
         self.assertEqual(ids(now, deaths[:1]), [])
-        # Two announcements of one death are one death.
-        self.assertEqual(ids(now, [{"action": "death", "time": now - 61},
-                                   {"action": "death", "time": now - 60}]), [])
+        # Two announcements of one death are one death ...
+        self.assertEqual(ids(now, [
+            {"action": "death", "time": now - 61, "detail": "You have been defeated in combat!"},
+            {"action": "death", "time": now - 60, "detail": "YOU HAVE DIED."}]), [])
+        # ... but dying again right after respawning is not merged into it.
+        rapid = [{"action": "death", "time": now - 60 + t, "detail": d}
+                 for t, d in ((0, "You have been defeated in combat!"), (1, "YOU HAVE DIED."),
+                              (9, "You have been defeated in combat!"), (10, "YOU HAVE DIED."))]
+        self.assertEqual(ids(now, rapid), ["deaths"])
+        self.assertEqual(ids(now, [{"action": "death", "time": now - 9, "detail": "YOU HAVE DIED."},
+                                   {"action": "death", "time": now - 1, "detail": "YOU HAVE DIED."}]),
+                         ["deaths"])
         state.stats["food"] = 0
         self.assertEqual(ids(now), ["starving"])
         state.stats["food"] = 300
-        # Idle before autoplay starts is not being stuck.
-        watch.observe(state, now + STUCK_SECONDS, autoplay=True)
-        self.assertEqual(ids(now + STUCK_SECONDS), [])
-        watch.exp_changed_at = watch.moved_at = now
+        # Idle before autoplay started is not being stuck; the task's own
+        # start time anchors it, whenever the dashboard looks.
+        self.assertEqual(ids(now + STUCK_SECONDS, started=now + 60), [])
         # No XP and no movement for the stuck window while autoplay runs.
         later = now + STUCK_SECONDS
         self.assertEqual(ids(later), ["stuck"])
