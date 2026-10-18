@@ -20,6 +20,7 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameState,
                     InterfaceState, Item, MapObject, MapState)
 from .memory import BotMemory
+from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
 
@@ -169,6 +170,8 @@ class AtrinikClient:
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
         self.decision_history: list[dict] = []
+        # Per-minute XP, deaths, heals, depletion and food for the dashboard.
+        self.trends = Trends()
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -193,6 +196,8 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        buckets = memory.load(character, "trends", [])
+        self.trends = Trends(buckets if isinstance(buckets, list) else ())
         if isinstance(record, dict) and "depletion_points" in record:
             self.state.depletion_points = max(
                 0, int(record.get("depletion_points", 0)))
@@ -707,6 +712,16 @@ class AtrinikClient:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
+    def _trend_count(self, key: str) -> None:
+        if self.trends.count(key):
+            self._persist_trends()
+
+    def _persist_trends(self) -> None:
+        """Save the trend buckets once a minute, when a new one starts."""
+        character = self.state.player_name
+        if character:
+            self._memory_store().save(character, "trends", self.trends.buckets)
+
     def _load_faces(self) -> dict[int, str]:
         faces: dict[int, str] = {}
         paths = (
@@ -1154,8 +1169,11 @@ class AtrinikClient:
             if m.path:
                 self.set_savebed(m.path, m.world_x, m.world_y)
         died = "defeated in combat" in lowered or "you have died" in lowered
+        if lowered.startswith("the spell heals you for"):
+            self._trend_count("heals")
         if died:
             self.record_action("death", text)
+            self._trend_count("deaths")
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a
             # post-death window for protocol/order variants that arrive later.
@@ -1519,6 +1537,8 @@ class AtrinikClient:
             self.state.stats[name] = value
             self.state.stat_observed_at[name] = time.monotonic()
             changed[name] = value
+        if self.trends.observe(self.state):
+            self._persist_trends()
         await self.emit("stats", changed)
 
     def _decode_item_fields(self, cur: Cursor, flags: int, item: Item) -> None:

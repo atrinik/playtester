@@ -1164,6 +1164,46 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             asyncio.run(client._handle_party(Cursor(malformed), malformed))
 
+    def test_trends_bucket_by_minute_and_derive_hourly_rates(self):
+        from .trends import KEEP_SECONDS, Trends
+
+        trends = Trends()
+        state = GameState(phase="playing", player_tag=7)
+        state.depletion_points_known = True
+        state.depletion_points = 32
+        start = 1_000_020.0
+        for minute in range(61):
+            state.stats.update(exp=1000 + 100 * minute, food=900 - minute, hp=100, maxhp=155)
+            self.assertTrue(trends.observe(state, start + 60 * minute))
+            # A second sample in the same minute starts nothing new.
+            self.assertFalse(trends.observe(state, start + 60 * minute + 30))
+        trends.count("deaths", start + 60 * 30)
+        trends.count("deaths", start + 60 * 59)
+        for _ in range(5):
+            trends.count("heals", start + 60 * 60)
+        last = trends.summary(start + 3600)["points"][-1]
+        self.assertEqual(last["xp_per_hour"], 6000)
+        self.assertEqual((last["deaths_per_hour"], last["heals_per_hour"]), (2, 5))
+        self.assertEqual((last["depletion"], last["food"], last["hp"]), (32, 840, 0.645))
+        # A day is kept; older buckets go.
+        trends.observe(state, start + KEEP_SECONDS + 3600)
+        self.assertGreaterEqual(trends.buckets[0]["t"], start + 3600 - 60)
+        # Restored buckets survive; garbage does not.
+        self.assertEqual(len(Trends([{"t": 60, "exp": 1}, "x", {"exp": 2}]).buckets), 1)
+
+    def test_client_counts_heals_and_deaths_into_trends(self):
+        client = AtrinikClient(ClientConfig())
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+
+        say("The spell heals you for 12 hp!")
+        say("The spell heals you for 9 hp!")
+        say("YOU HAVE DIED.")
+        bucket = client.trends.buckets[-1]
+        self.assertEqual((bucket["heals"], bucket["deaths"]), (2, 1))
+
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))
         commands = []
@@ -12281,6 +12321,10 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.state.farm_objective, "money")
         status, page = await self.request("GET", "/")
         self.assertIn(b'id="tab-farming"', page)
+        self.assertIn(b'id="fa-trends"', page)
+        self.client.trends.count("deaths")
+        status, payload = await self.request("GET", "/api/state?include=trends")
+        self.assertEqual(json.loads(payload)["trends"]["points"][-1]["deaths_per_hour"], 1)
 
     async def test_dashboard_reports_the_running_build(self):
         from .build_info import build_info

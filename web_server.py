@@ -574,6 +574,7 @@ class DashboardState:
             "quests_loaded": state.quests_loaded, "quests": self.quests(),
             "quest_journal": self.quest_journal(),
             "farming_analysis": self.farming_analysis(),
+            "trends": self.client.trends.summary(),
         }
 
     def analyzer_farm_spots(self) -> list[dict[str, Any]]:
