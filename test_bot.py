@@ -10126,8 +10126,19 @@ class NavigationTests(unittest.TestCase):
         client.state.route_hazards = {}
         expected = [edge.destination for edge in without._plan(client)]
         client.state.route_hazards = {swamp: time.time() + 3600}
+        records = []
+        client.record_action = lambda action, detail="": records.append(action)
         self.assertEqual([edge.destination for edge in NavigateTask(graph, farm)._plan(client)],
                          expected)
+        # A discarded speculative plan leaves no threat-fallback record.
+        nodes[town].edges.append(MapEdge(town, "/x", 0, 0, 2, 0))
+        graph.nodes["/x"].edges = [MapEdge("/x", farm, 2, 0, 0, 0)]
+        graph._world_search_snapshot = None
+        graph._component_cache.clear()
+        client.state.route_hazards = {"/x": time.time() + 3600}
+        records.clear()
+        NavigateTask(graph, farm)._plan(client)
+        self.assertNotIn("navigation-threat-fallback", records)
         # Expired lessons, the destination and her own map are never avoided.
         client.state.route_hazards = {swamp: time.time() - 1, farm: time.time() + 3600,
                                       town: time.time() + 3600}
@@ -11958,8 +11969,10 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         circuit = self.circuit(client, trees)
         swamp = "/shattered_islands/world_1_50"
         # Killed by a crocodile pack while still on the way to the spot.
-        client.state.add_message(2, "ff0000", "crocodile hit you for 25 (-25) pierce damage.")
         before = time.time()
+        client.decision_history.append({"time": before - 1, "action": "step",
+                                        "detail": "", "task": "", "map": swamp})
+        client.state.add_message(2, "ff0000", "crocodile hit you for 25 (-25) pierce damage.")
         client.decision_history.append({
             "time": time.time() + 1, "action": "death", "detail": "",
             "task": "", "map": swamp})
@@ -11974,10 +11987,15 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         client = self.client({"xp": [trees]})
         circuit = self.circuit(client, trees)
         swamp, meadow = "/shattered_islands/world_1_50", "/shattered_islands/world_1_49"
+        now = time.time()
+        # The crossing step is recorded on the swamp before the server moves
+        # her, so the crocodile's hit can land after it but still on the swamp.
+        client.decision_history.append({"time": now - 0.5, "action": "step",
+                                        "detail": "", "task": "", "map": swamp})
         client.state.add_message(2, "ff0000", "crocodile hit you for 25 (-25) pierce damage.")
-        # She then walked on to the meadow and died there without a fight.
+        # Then on the meadow, she died there without a fight.
         client.decision_history.append({"time": time.time() + 0.5, "action": "step",
-                                         "detail": "", "task": "", "map": swamp})
+                                        "detail": "", "task": "", "map": meadow})
         client.decision_history.append({"time": time.time() + 1, "action": "death",
                                         "detail": "", "task": "", "map": meadow})
         circuit._observe_farm_death(client)

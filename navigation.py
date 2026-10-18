@@ -1702,16 +1702,19 @@ class NavigateTask(BotTask):
         # when it needs no threat fallback, otherwise plan exactly as without.
         learned = self._learned_route_hazards(client)
         if learned:
+            previous_fallback = self._threat_fallback
             try:
-                route = self._plan_avoiding(client, learned)
+                # Speculative: record nothing unless this route is kept.
+                route = self._plan_avoiding(client, learned, quiet=True)
                 if not self._threat_fallback:
                     return route
             except ValueError:
                 pass
+            self._threat_fallback = previous_fallback
         return self._plan_avoiding(client, set())
 
-    def _plan_avoiding(self, client: AtrinikClient,
-                       learned_hazards: set[str]) -> list[MapEdge]:
+    def _plan_avoiding(self, client: AtrinikClient, learned_hazards: set[str], *,
+                       quiet: bool = False) -> list[MapEdge]:
         source = client.state.map.path
         args = (
             source,
@@ -1774,7 +1777,7 @@ class NavigateTask(BotTask):
                         route = self.graph.route_points(
                             *args, **fallback_kwargs)
                     self._threat_fallback = True
-                    if not previous_fallback:
+                    if not previous_fallback and not quiet:
                         recorder = getattr(client, "record_action", None)
                         if recorder is not None:
                             recorder(
@@ -1788,7 +1791,7 @@ class NavigateTask(BotTask):
                     route = self.graph.route_points(
                         *args, **fallback_kwargs)
                     self._threat_fallback = True
-                    if not previous_fallback:
+                    if not previous_fallback and not quiet:
                         recorder = getattr(client, "record_action", None)
                         if recorder is not None:
                             recorder(
@@ -4090,15 +4093,27 @@ class FarmCircuitTask(BotTask):
         return self_improvement.spot_key(self.spot, self.legs)
 
     @staticmethod
-    def _entered_map_at(client: AtrinikClient, path: str, before: float) -> float:
-        """When she was last recorded elsewhere before ``before`` (0 if never)."""
-        entered = 0.0
-        for record in (*getattr(client, "action_history", ()),
-                       *getattr(client, "decision_history", ())):
-            stamp = float(record.get("time", 0.0) or 0.0)
-            where = record.get("map")
-            if stamp <= before and where and where != path:
-                entered = max(entered, stamp)
+    def _entered_map_at(client: AtrinikClient, path: str, before: float) -> float | None:
+        """The first record of her on ``path`` since she was last elsewhere.
+
+        A step is recorded on the map it leaves, so the last record elsewhere
+        is not yet proof of arrival; only a record on ``path`` itself is.
+        None when nothing shows her there before ``before``.
+        """
+        records = sorted(
+            ((float(record.get("time", 0.0) or 0.0), record.get("map"))
+             for record in (*getattr(client, "action_history", ()),
+                            *getattr(client, "decision_history", ()))
+             if record.get("map")),
+            key=lambda entry: entry[0])
+        entered = None
+        for stamp, where in records:
+            if stamp > before:
+                break
+            if where != path:
+                entered = None
+            elif entered is None:
+                entered = stamp
         return entered
 
     def _learn_from_failure(self, client: AtrinikClient, failure: dict,
@@ -4115,7 +4130,7 @@ class FarmCircuitTask(BotTask):
         # Hits stamped before she entered the death map were taken elsewhere:
         # only damage taken on it makes that map the hazard.
         entered = self._entered_map_at(client, review.map, review.time)
-        on_map = self_improvement.damage_between(
+        on_map = 0 if entered is None else self_improvement.damage_between(
             getattr(client.state, "messages", ()), entered, review.time + 2.0)
         if review.cause == "route" and on_map > 0 and review.map:
             # Killed crossing a map on the way: route around it for a while
