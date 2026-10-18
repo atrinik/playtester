@@ -1329,6 +1329,20 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(restored["attackers"], {})
         self.assertEqual(restored["decisions"], [{"time": 3, "action": "heal", "detail": "", "map": ""}])
         json.dumps(restored, allow_nan=False)
+        # An integer too large for a float is rejected, not raised.
+        huge = 10 ** 400
+        restored = post_mortem.restore({"time": 5, "attackers": {"rat": huge}, "damage_taken": huge,
+                                        "vitals": [[huge, 1, 2, 3, 4, 5]]})
+        self.assertEqual((restored["attackers"], restored["damage_taken"], restored["vitals"]), ({}, 0, []))
+        # Downsampling keeps the fatal sample even with a recovery after it.
+        when = 1000.0
+        busy = [[when - 59 + index * 0.4, 100, 155, 10, 39, 900] for index in range(140)]
+        busy[-3] = [when - 0.2, 0, 155, 0, 39, 900]
+        busy.append([when + 1, 155, 155, 39, 39, 900])
+        death = post_mortem.build(when, "/a", 1, 2, busy, [], [], [])
+        self.assertLessEqual(len(death["vitals"]), post_mortem.MAX_VITALS)
+        self.assertIn([when - 0.2, 0, 155, 0, 39, 900], death["vitals"])
+        self.assertEqual(death["vitals"][-1][0], when + 1)
 
     def test_post_mortem_describes_the_fight_inside_the_window(self):
         from .post_mortem import build

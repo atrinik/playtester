@@ -27,12 +27,27 @@ MAX_VITALS = 120
 AFTER_SECONDS = 2.0
 
 
-def spread(samples: list, limit: int = MAX_VITALS) -> list:
-    """At most ``limit`` samples spread evenly over all of them, the last kept."""
+def spread(samples: list, limit: int = MAX_VITALS, keep: Iterable[int] = ()) -> list:
+    """At most ``limit`` samples spread evenly over all of them, the last kept.
+
+    The ``keep`` indices (the fatal low, the sample at the death) are always
+    in it, in time order, in place of the nearest evenly spread ones.
+    """
     if len(samples) <= limit:
         return samples
+    keep = sorted({index for index in keep if 0 <= index < len(samples)})
     step = (len(samples) - 1) / (limit - 1)
-    return [samples[round(index * step)] for index in range(limit)]
+    chosen = {round(index * step) for index in range(limit)}
+    for index in keep:
+        if index not in chosen:
+            # Drop the nearest even point that is neither kept nor the last.
+            spare = min((point for point in chosen
+                         if point not in keep and point != len(samples) - 1),
+                        key=lambda point: abs(point - index), default=None)
+            if spare is not None:
+                chosen.discard(spare)
+            chosen.add(index)
+    return [samples[index] for index in sorted(chosen)]
 
 
 def sample(stats: dict) -> list[float]:
@@ -55,7 +70,12 @@ def restore(entry: Any) -> dict[str, Any] | None:
     # Every number must be finite: json.loads accepts NaN, and one bare NaN
     # in the state response makes the browser reject the whole poll.
     def finite(value: Any) -> bool:
-        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:  # an int too large for a float
+            return False
 
     def records(key: str) -> list[dict]:
         value = entry.get(key)
@@ -84,7 +104,7 @@ def restore(entry: Any) -> dict[str, Any] | None:
 
     def number(key: str) -> int:
         value = entry.get(key)
-        return int(value) if isinstance(value, (int, float)) and math.isfinite(value) else 0
+        return int(value) if finite(value) else 0
 
     return {
         "time": when, "map": str(entry.get("map") or ""), "x": x, "y": y,
@@ -94,6 +114,17 @@ def restore(entry: Any) -> dict[str, Any] | None:
         "vitals": vitals_rows(), "messages": message_rows(),
         "actions": records("actions"), "decisions": records("decisions"),
     }
+
+
+def _extremes(samples: list, when: float) -> list[int]:
+    """Indices of the lowest-health sample and the last one at the death."""
+    if not samples:
+        return []
+    lowest = min(range(len(samples)),
+                 key=lambda index: samples[index][1] / max(1, samples[index][2]))
+    at_death = max((index for index, sample in enumerate(samples) if float(sample[0]) <= when),
+                   default=lowest)
+    return [lowest, at_death]
 
 
 def _within(stamp: Any, start: float, end: float) -> bool:
@@ -160,7 +191,7 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
         "attackers": dict(review.attackers), "peak_attackers": review.peak_attackers,
         "damage_taken": review.damage_taken,
         "damage_by_type": dict(review.damage_by_type),
-        "vitals": spread(inside),
+        "vitals": spread(inside, keep=_extremes(inside, when)),
         "messages": [[stamp, text] for stamp, text in texts][-40:],
         "actions": recent(actions),
         "decisions": recent(decisions),
