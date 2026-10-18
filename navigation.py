@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import itertools
 import json
 import logging
 import math
@@ -1687,19 +1686,19 @@ class NavigateTask(BotTask):
             estimator(path) >= 3
         }
 
-    def _learned_route_hazards(self, client: AtrinikClient) -> set[str]:
+    def _learned_route_hazards(self, client: AtrinikClient, *,
+                               avoidable: bool = True) -> set[str]:
         """Maps where a recent route death took combat damage.
 
-        Never the trip's own source or destination: those cannot be avoided.
+        Avoidable ones exclude the trip's own source and destination, which
+        cannot be routed around; all of them still mark a route hazardous.
         """
         now = time.time()
         hazards = getattr(client.state, "route_hazards", None) or {}
+        excluded = ((client.state.map.path, self.destination) if avoidable
+                    else (client.state.map.path,))
         return {path for path, until in hazards.items()
-                if until > now and
-                path not in (client.state.map.path, self.destination)}
-
-    # Trial plans tried while keeping as many learned hazards as possible.
-    LEARNED_PLAN_ATTEMPTS = 6
+                if until > now and path not in excluded}
 
     def _plan(self, client: AtrinikClient) -> list[MapEdge]:
         # Learned hazards are only a preference: keep a route that avoids as
@@ -1711,11 +1710,10 @@ class NavigateTask(BotTask):
         route = None
         if learned:
             previous_fallback = self._threat_fallback
-            ordered = sorted(learned)
-            trials = itertools.islice(
-                (set(kept) for size in range(len(ordered), 0, -1)
-                 for kept in itertools.combinations(ordered, size)),
-                self.LEARNED_PLAN_ATTEMPTS)
+            # Every lesson, then each set missing one: an unavoidable map is
+            # dropped alone, whatever its name sorts as.
+            trials = [set(learned)] + (
+                [learned - {path} for path in sorted(learned)] if len(learned) > 1 else [])
             for kept in trials:
                 try:
                     route = self._plan_avoiding(client, kept, strict=True)
@@ -1724,9 +1722,10 @@ class NavigateTask(BotTask):
                     self._threat_fallback = previous_fallback
         if route is None:
             route = self._plan_avoiding(client, set())
-        if any(edge.destination in learned for edge in route):
-            # Re-entering a map that killed her is never "threat-free" when
-            # choosing between optional destinations.
+        hazardous = self._learned_route_hazards(client, avoidable=False)
+        if any(edge.destination in hazardous for edge in route):
+            # Entering a map that killed her, the destination included, is
+            # never "threat-free" when choosing between optional destinations.
             self._threat_fallback = True
         return route
 
@@ -1755,9 +1754,6 @@ class NavigateTask(BotTask):
         try:
             route = self.graph.route_points(*args, **kwargs)
         except ValueError:
-            if strict:
-                # A trial plan relaxes no hazard tier and records nothing.
-                raise
             # Components are derived acceleration data. A live exceptional
             # start square (closed door, runtime map mutation, occupied seam)
             # must never make a later route permanently unroutable.
@@ -1765,6 +1761,9 @@ class NavigateTask(BotTask):
             try:
                 route = self.graph.route_points(*args, **kwargs)
             except ValueError as preferred_exc:
+                if strict:
+                    # A trial plan relaxes no hazard tier and records nothing.
+                    raise
                 # Tiled levels only joined the hazards to keep surface trips
                 # off dense tunnels. A trip that needs them (one inside the
                 # tunnels, or with no surface way round) routes through them
@@ -4156,10 +4155,14 @@ class FarmCircuitTask(BotTask):
         # Hits stamped before she entered the death map were taken elsewhere:
         # only damage taken on it makes that map the hazard.
         entered = self._entered_map_at(client, review.map, review.time)
+        # Up to the death (with message slack), never past her next arrival:
+        # a hit after respawning elsewhere is not the death map's.
+        left = min((stamp for stamp, _ in getattr(client, "map_arrivals", ())
+                    if entered is not None and stamp > entered), default=review.time + 2.0)
         on_map = 0 if entered is None else self_improvement.damage_between(
             getattr(client.state, "messages", ()),
             max(entered, review.time - self_improvement.REVIEW_WINDOW_SECONDS),
-            review.time + 2.0)
+            min(review.time + 2.0, left))
         if review.cause == "route" and on_map > 0 and review.map:
             # Killed crossing a map on the way: route around it for a while
             # instead of walking back into the same fight after respawning.

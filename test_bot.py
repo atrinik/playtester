@@ -10202,7 +10202,12 @@ class NavigationTests(unittest.TestCase):
                                           world_x=1, world_y=0)
 
         client = FakeClient(town)
-        client.state.route_hazards = {gate: time.time() + 3600, swamp: time.time() + 3600}
+        # The unavoidable gate sorts first among six lessons; every single
+        # relaxation is tried, so the five avoidable ones still hold.
+        extra = [f"/shattered_islands/world_9_{n}" for n in range(4)]
+        client.state.route_hazards = {path: time.time() + 3600
+                                      for path in (gate, swamp, *extra)}
+        self.assertLess(gate, min([swamp, *extra]))
         task = NavigateTask(graph, farm)
         route = [edge.destination for edge in task._plan(client)]
         # The gate cannot be avoided, but the swamp lesson still holds.
@@ -10214,6 +10219,11 @@ class NavigationTests(unittest.TestCase):
         task = NavigateTask(graph, farm)
         task._plan(client)
         self.assertFalse(task._threat_fallback)
+        # A destination that killed her is reachable but not threat-free.
+        client.state.route_hazards = {farm: time.time() + 3600}
+        task = NavigateTask(graph, farm)
+        self.assertEqual([edge.destination for edge in task._plan(client)][-1], farm)
+        self.assertTrue(task._threat_fallback)
 
     def test_tiled_levels_are_pack_hazards_with_a_fallback_through_them(self):
         def lane(path, width=3):
@@ -12086,6 +12096,21 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
                                         "task": "", "map": swamp})
         circuit._observe_farm_death(client)
         self.assertIn(swamp, client.state.route_hazards)
+
+    def test_a_hit_after_respawning_is_not_the_death_maps(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        swamp, bed = "/shattered_islands/world_1_50", "/shattered_islands/world_0_68"
+        now = time.time()
+        client.map_arrivals = [(now - 30, swamp), (now + 0.5, bed)]
+        # A fightless death, then a hit right after respawning by the bed.
+        client.state.messages.append((now + 1, 2, "ff0000",
+                                      "rat hit you for 3 (-3) impact damage."))
+        client.decision_history.append({"time": now, "action": "death", "detail": "",
+                                        "task": "", "map": swamp})
+        circuit._observe_farm_death(client)
+        self.assertEqual(client.state.route_hazards, {})
 
     def test_old_hits_on_the_map_teach_no_route_hazard(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
