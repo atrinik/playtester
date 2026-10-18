@@ -1218,6 +1218,42 @@ class ProtocolTests(unittest.TestCase):
         asyncio.run(client.close())
         self.assertIn(("Sera", "trends"), saved)
 
+    def test_reconnect_reload_keeps_the_live_trend_minute(self):
+        client = AtrinikClient(ClientConfig())
+        start = client.trends.buckets[0]["t"] if client.trends.buckets else None
+        self.assertIsNone(start)
+
+        class Memory:
+            def __init__(self, trends):
+                self.trends = trends
+
+            def import_legacy(self, *args):
+                pass
+
+            def load(self, character, kind, default):
+                return self.trends if kind == "trends" else default
+
+            def save(self, *args):
+                pass
+
+        now = time.time()
+        minute = int(now // 60 * 60)
+        # Login: the saved snapshot has an older, partial copy of this minute.
+        client._memory_store = lambda: Memory([{"t": minute - 60, "deaths": 1, "heals": 0},
+                                               {"t": minute, "deaths": 0, "heals": 1}])
+        client.load_character_memory("Sera")
+        client.trends.count("heals", now)
+        client.trends.count("deaths", now)
+        # A reconnect reloads the same character: the live minute survives.
+        client.load_character_memory("Sera")
+        bucket = client.trends.buckets[-1]
+        self.assertEqual((bucket["t"], bucket["heals"], bucket["deaths"]), (minute, 2, 1))
+        self.assertEqual(client.trends.buckets[0]["deaths"], 1)
+        # Another character starts from its own saved snapshot.
+        client._memory_store = lambda: Memory([])
+        client.load_character_memory("Other")
+        self.assertEqual(client.trends.buckets, [])
+
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))
         commands = []

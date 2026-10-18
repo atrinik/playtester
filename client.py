@@ -172,6 +172,7 @@ class AtrinikClient:
         self.decision_history: list[dict] = []
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
         self.trends = Trends()
+        self._trends_character = ""
         self._last_trend_death_at = 0.0
         self.action_context = ""
         self._runtime_content_root = (
@@ -198,7 +199,15 @@ class AtrinikClient:
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
         buckets = memory.load(character, "trends", [])
-        self.trends = Trends(buckets if isinstance(buckets, list) else ())
+        saved = Trends(buckets if isinstance(buckets, list) else ()).buckets
+        # A reconnect reloads the same character: its live buckets are newer
+        # than the saved snapshot (the open minute is saved only when the
+        # next starts), so they win for the same minute.
+        live = self.trends.buckets if self._trends_character == character else []
+        merged = {bucket["t"]: bucket for bucket in saved}
+        merged.update((bucket["t"], bucket) for bucket in live)
+        self.trends = Trends(sorted(merged.values(), key=lambda bucket: bucket["t"]))
+        self._trends_character = character
         if isinstance(record, dict) and "depletion_points" in record:
             self.state.depletion_points = max(
                 0, int(record.get("depletion_points", 0)))
