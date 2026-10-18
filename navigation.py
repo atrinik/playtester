@@ -5053,10 +5053,10 @@ class FarmCircuitTask(BotTask):
             not self._busy_finishing_fight_or_loot(client, farm)
         )
 
-    def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
-        """Return whether autoplay may replace this circuit between pulls."""
-        services = (
-            self._resupply, self._storage, self._identification,
+    def _maintenance_services(self) -> tuple[BotTask | None, ...]:
+        """Every maintenance trip but food resupply; each runs to completion."""
+        return (
+            self._storage, self._identification,
             self._bed_binding, self._selling, self._banking,
             self._bank_sync, self._shopping, self._recall_shopping,
             self._utility_shopping,
@@ -5064,7 +5064,20 @@ class FarmCircuitTask(BotTask):
             self._spell_purchase, self._cure, self._restoration,
             self._expedition_return, self._capability,
         )
-        if any(service is not None for service in services) or self.child is None:
+
+    def can_feed_her(self) -> bool:
+        """Whether its own food resupply can run, with no other trip under way.
+
+        Each maintenance trip returns early until it completes, so a long one
+        (storage, banking, a temple cure) can outlast her food.
+        """
+        return not any(service is not None
+                       for service in self._maintenance_services())
+
+    def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
+        """Return whether autoplay may replace this circuit between pulls."""
+        if (self._resupply is not None or not self.can_feed_her() or
+                self.child is None):
             return False
         farm = self.child.task
         return (isinstance(farm, FarmTask) and

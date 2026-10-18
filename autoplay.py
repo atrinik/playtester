@@ -46,15 +46,30 @@ class AutoplayTask(BotTask):
         self.safety = SafetyPolicy()
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
-        """Starving outside the farm circuit, which feeds her itself.
+        """Starving where nothing else will feed her.
 
-        Any other phase can outlast her food: a slow, depleted character
-        once starved to death still walking to the apartment chest.
+        The farm circuit feeds her itself unless one of its maintenance trips
+        is under way. Any other phase can outlast her food: a slow, depleted
+        character once starved to death still walking to the apartment chest.
         """
-        return (not isinstance(self.child, FarmCircuitTask) and
-                self.phase != "temple-food" and
-                time.monotonic() >= self._temple_food_retry_at and
-                hungry(client))
+        # Login and reconnect enter "playing" before the inventory replay;
+        # the food she carries is unknown until it arrives.
+        if (not getattr(client.state, "inventory_replay_complete", True) or
+                time.monotonic() < self._temple_food_retry_at or
+                not hungry(client)):
+            return False
+        child = self.child
+        if child is None:
+            return True
+        if self.phase == "temple-food":
+            return False
+        if isinstance(child, FarmCircuitTask):
+            return not child.can_feed_her()
+        # Once Gandyld's quest has started, the starter is handing over the
+        # crystal; replacing it then loses the reward until a checkpoint
+        # reconnect, and apartment recovery would look for it in vain.
+        return not (self.phase == "mana-crystal-starter" and
+                    self.MANA_CRYSTAL_QUEST in client.state.quests)
 
     async def _start_temple_food(self, client: AtrinikClient) -> bool:
         """Pause the current phase for the free temple food service."""

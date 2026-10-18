@@ -7956,16 +7956,34 @@ class QuestTests(unittest.TestCase):
                       if record["action"] == "autoplay-hunger"]
             self.assertEqual(hunger, ["food 100; paused mana-crystal-recovery: "
                                       "navigate-then:retrieve:chest"])
-            # A failed trip waits before the next one.
+            # A failed trip waits before the next one, then tries again even
+            # with nothing else to schedule.
             autoplay.child.fail("no route")
             asyncio.run(autoplay.tick(client))
             self.assertIsNone(autoplay.child)
+            self.assertEqual(autoplay.phase, "temple-food")
             self.assertFalse(autoplay._needs_temple_food(client))
-            # The farm circuit feeds her itself.
             autoplay._temple_food_retry_at = 0.0
+            self.assertTrue(autoplay._needs_temple_food(client))
+            # The farm circuit feeds her itself, unless a maintenance trip
+            # (here, storage) keeps its food resupply from running.
             autoplay.phase = "adaptive-farming"
-            autoplay.child = FarmCircuitTask(graph, [("/a", "rat")])
+            circuit = FarmCircuitTask(graph, [("/a", "rat")])
+            autoplay.child = circuit
             self.assertFalse(autoplay._needs_temple_food(client))
+            circuit._storage = Walk("navigate-then:storage")
+            self.assertTrue(autoplay._needs_temple_food(client))
+            # A starter handing over Gandyld's crystal is left to finish.
+            autoplay.phase, autoplay.child = "mana-crystal-starter", walk
+            self.assertTrue(autoplay._needs_temple_food(client))
+            client.state.quests = {AutoplayTask.MANA_CRYSTAL_QUEST: QuestProgress(
+                AutoplayTask.MANA_CRYSTAL_QUEST, status="incomplete")}
+            self.assertFalse(autoplay._needs_temple_food(client))
+            client.state.quests = {}
+            # Until the inventory replay lands, her food is unknown.
+            client.state.inventory_replay_complete = False
+            self.assertFalse(autoplay._needs_temple_food(client))
+            client.state.inventory_replay_complete = True
         # No reachable priest: keep going, and look again later.
         autoplay.phase, autoplay.child = "mana-crystal-recovery", walk
         with patch.object(autoplay_module, "temple_food_trip", lambda graph, client: None):
