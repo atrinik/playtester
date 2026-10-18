@@ -1177,8 +1177,8 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(trends.observe(state, start + 60 * minute))
             # A second sample in the same minute starts nothing new.
             self.assertFalse(trends.observe(state, start + 60 * minute + 30))
-        trends.count("deaths", start + 60 * 30)
-        trends.count("deaths", start + 60 * 59)
+            if minute in (30, 59):
+                trends.count("deaths", start + 60 * minute + 40)
         for _ in range(5):
             trends.count("heals", start + 60 * 60)
         last = trends.summary(start + 3600)["points"][-1]
@@ -1201,14 +1201,18 @@ class ProtocolTests(unittest.TestCase):
             many.observe(state, start + 60 * minute)
         self.assertEqual(len(many.buckets), MAX_BUCKETS)
         self.assertEqual(many.buckets[0]["t"], int((start + 60 * 5) // 60 * 60))
-        # A clock that jumps two days ahead and back again keeps the history.
+        # A clock that jumps two days ahead and back again keeps the history,
+        # and the outlier minute is dropped rather than replayed later.
         jumpy = Trends()
         for minute in range(10):
             jumpy.observe(state, start + 60 * minute)
+        jumpy.count("deaths", start + 3600)
         jumpy.observe(state, start + 2 * KEEP_SECONDS)
         jumpy.observe(state, start + 60 * 10)
-        self.assertEqual(len(jumpy.buckets), 12)
+        self.assertEqual(len(jumpy.buckets), 11)
         self.assertEqual(len(jumpy.summary(start + 60 * 10)["points"]), 11)
+        jumpy.observe(state, start + 3600)
+        self.assertEqual(jumpy.summary(start + 3600)["points"][-1]["deaths_per_hour"], 0)
         # Restored buckets survive; garbage does not.
         self.assertEqual(len(Trends([{"t": 60, "exp": 1}, "x", {"exp": 2}]).buckets), 1)
 
@@ -1229,7 +1233,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(quiet["points"][-1]["deaths_per_hour"], 0)
         self.assertEqual(quiet["points"][-1]["food"], 500)
         # The wall clock steps back two minutes and catches up again: every
-        # minute keeps one bucket and the buckets stay in time order.
+        # minute keeps one bucket, the buckets stay in time order, and the
+        # minute the clock ran ahead to is not double counted.
         trends.observe(state, start + 600)
         trends.observe(state, start + 480)
         trends.count("heals", start + 600)

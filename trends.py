@@ -8,7 +8,6 @@ healing constantly, XP stalling, food running out) shows at a glance.
 
 from __future__ import annotations
 
-import bisect
 import time
 from typing import Any, Iterable
 
@@ -32,15 +31,17 @@ class Trends:
 
     def _bucket(self, now: float) -> tuple[dict, bool]:
         start = int(now // BUCKET_SECONDS * BUCKET_SECONDS)
-        # Kept in time order even when the wall clock steps backwards: a
-        # minute that already has a bucket reuses it wherever it is.
-        index = bisect.bisect_left([bucket["t"] for bucket in self.buckets], start)
-        if index < len(self.buckets) and self.buckets[index]["t"] == start:
-            return self.buckets[index], False
-        previous = self.buckets[index - 1] if index else {}
+        # A bucket after this minute came from a clock that ran ahead. Kept,
+        # it would replay its stale deaths and heals once real time reached
+        # it, so it is dropped and the buckets only ever grow at the end.
+        while self.buckets and self.buckets[-1]["t"] > start:
+            self.buckets.pop()
+        if self.buckets and self.buckets[-1]["t"] == start:
+            return self.buckets[-1], False
+        previous = self.buckets[-1] if self.buckets else {}
         bucket = {"t": start, "deaths": 0, "heals": 0,
                   **{key: previous.get(key) for key in LEVELS}}
-        self.buckets.insert(index, bucket)
+        self.buckets.append(bucket)
         del self.buckets[:-MAX_BUCKETS]
         return bucket, True
 
