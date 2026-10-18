@@ -14,8 +14,6 @@ DEATH_WINDOW_SECONDS = 3600.0
 REPEATED_DEATHS = 2
 STUCK_SECONDS = 20 * 60.0
 DISCONNECTED_SECONDS = 180.0
-# Announcements of one death arrive this close together.
-SAME_DEATH_SECONDS = 10.0
 
 
 class ProgressWatch:
@@ -50,28 +48,14 @@ class ProgressWatch:
 def death_count(decisions: Iterable[dict], since: float) -> int:
     """Deaths recorded since ``since``.
 
-    One death can be announced as "defeated in combat" and "YOU HAVE DIED.";
-    the other notice of such a pair is not another death, but the same notice
-    again is, however soon after respawning.
+    kill_player (server types/player.c) sends one notice per defeat, so each
+    death record is one death. The client keeps each in its own record, with
+    its own time; only a record persisted before that carries a ``count``.
     """
-    # The client coalesces repeats of one notice into a record with a count;
-    # each repeat of the same notice is another death.
-    notices = sorted(
-        (float(record.get("time", 0.0) or 0.0),
-         "defeated" if "defeated in combat" in str(record.get("detail", "")).casefold() else "died")
-        for record in decisions
-        if isinstance(record, dict) and record.get("action") == "death" and
-        float(record.get("time", 0.0) or 0.0) >= since
-        for _ in range(max(1, int(record.get("count", 1) or 1))))
-    deaths, unpaired = 0, None
-    for stamp, kind in notices:
-        if (unpaired is not None and unpaired[1] != kind and
-                stamp - unpaired[0] < SAME_DEATH_SECONDS):
-            unpaired = None
-            continue
-        deaths += 1
-        unpaired = (stamp, kind)
-    return deaths
+    return sum(max(1, int(record.get("count", 1) or 1))
+               for record in decisions
+               if isinstance(record, dict) and record.get("action") == "death" and
+               float(record.get("time", 0.0) or 0.0) >= since)
 
 
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,

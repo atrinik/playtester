@@ -1189,15 +1189,11 @@ class ProtocolTests(unittest.TestCase):
                   {"action": "death", "time": now - 7200}]
         self.assertEqual(ids(now, deaths), ["deaths"])
         self.assertEqual(ids(now, deaths[:1]), [])
-        # Two announcements of one death are one death ...
+        # Each notice is its own defeat: a PvP-area defeat sends only
+        # "defeated in combat", a death only "YOU HAVE DIED.".
         self.assertEqual(ids(now, [
             {"action": "death", "time": now - 61, "detail": "You have been defeated in combat!"},
-            {"action": "death", "time": now - 60, "detail": "YOU HAVE DIED."}]), [])
-        # ... but dying again right after respawning is not merged into it.
-        rapid = [{"action": "death", "time": now - 60 + t, "detail": d}
-                 for t, d in ((0, "You have been defeated in combat!"), (1, "YOU HAVE DIED."),
-                              (9, "You have been defeated in combat!"), (10, "YOU HAVE DIED."))]
-        self.assertEqual(ids(now, rapid), ["deaths"])
+            {"action": "death", "time": now - 60, "detail": "YOU HAVE DIED."}]), ["deaths"])
         self.assertEqual(ids(now, [{"action": "death", "time": now - 9, "detail": "YOU HAVE DIED."},
                                    {"action": "death", "time": now - 1, "detail": "YOU HAVE DIED."}]),
                          ["deaths"])
@@ -1227,17 +1223,28 @@ class ProtocolTests(unittest.TestCase):
         watch.observe(state, later + DISCONNECTED_SECONDS)
         self.assertIsNone(watch.disconnected_since)
 
-    def test_rapid_repeat_deaths_coalesced_by_the_client_still_alert(self):
+    def test_each_death_keeps_its_own_record_and_time(self):
         from .alerts import death_count
 
         client = AtrinikClient(ClientConfig())
         client.state.map.path = "/shattered_islands/world_6_46"
-        for _ in range(2):
-            data = bytes((2,)) + b"ffffff\0" + b"YOU HAVE DIED.\0"
+
+        def say(text, msg_type=2):
+            data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
             asyncio.run(client._handle_drawinfo(Cursor(data), data))
-        # The client keeps one record with a count; both deaths count.
+
+        clock = [time.time()]
+        with patch("time.time", lambda: clock[0]):
+            for _ in range(2):
+                say("YOU HAVE DIED.")
+                clock[0] += 3
+        # Rapid repeats are not coalesced: each death ages out on its own.
         deaths = [record for record in client.decision_history if record["action"] == "death"]
-        self.assertEqual((len(deaths), deaths[0].get("count")), (1, 2))
+        self.assertEqual([record.get("count") for record in deaths], [None, None])
+        self.assertEqual(death_count(client.decision_history, 0.0), 2)
+        self.assertEqual(death_count(client.decision_history, deaths[0]["time"] + 1), 1)
+        # A player's chat quoting a notice is no death.
+        say("[a=#charname]Mallory[/a]: YOU HAVE DIED.", c.CHAT_TYPE_CHAT)
         self.assertEqual(death_count(client.decision_history, 0.0), 2)
 
     def test_client_starts_the_outage_clock_when_the_connection_drops(self):
