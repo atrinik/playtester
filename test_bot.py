@@ -8571,9 +8571,13 @@ class QuestTests(unittest.TestCase):
         from .model import InterfaceState
 
         client = self._talking_client(0)
+        # An earlier visit's answer is still open; it must not count.
+        client.state.interface = InterfaceState(
+            title="Saruthar", text="Your stomach is filled again.")
         task = TempleFoodTask("Saruthar")
         asyncio.run(task.tick(client))
         self.assertEqual(client.talks, [("food", "Saruthar")])
+        self.assertIsNone(client.state.interface)
         self.assertEqual(task.status, TaskStatus.RUNNING)
         client.state.interface = InterfaceState(
             title="Saruthar", text="Your stomach is filled again.")
@@ -12155,8 +12159,13 @@ class SelfImprovementTests(unittest.TestCase):
                               "YOU HAVE DIED."],
                              failure_map="/shattered_islands/world_6_46")
         self.assertEqual((hungry.cause, hungry.detail), ("starvation", "ran out of food"))
-        from .self_improvement import remedies
+        from .self_improvement import remedies, review_failure
         self.assertEqual(remedies(hungry), ("keep food stocked",))
+        # A one-shot iterable is scanned for both hits and starvation.
+        once = review_failure(iter([(990.0, 2, "", "Sera starved to death.")]), [],
+                              {"time": 1000.0, "action": "death",
+                               "map": "/shattered_islands/world_6_46"}, [self.SPOT])
+        self.assertEqual(once.cause, "starvation")
         # Messages outside the review window are ignored.
         from .self_improvement import review_failure
         old = review_failure([(100.0, 2, "", "giant frog hit you for 1 (-1) slash damage.")],

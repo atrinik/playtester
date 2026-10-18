@@ -4876,6 +4876,17 @@ class TempleFoodTask(BotTask):
         if int(client.state.stats.get("food", 0) or 0) >= self.FED:
             self.complete()
             return
+        if not self._sent_at:
+            # Only an answer to this request counts: a dialogue left open
+            # from an earlier visit must not pass for it.
+            client.state.interface = None
+            self._feedback_start = client.state.message_count
+            await client.talk("food", self.priest)
+            self._sent_at = time.monotonic()
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("temple-food", self.priest)
+            return
         feedback = "\n".join(
             entry[3].casefold() for entry in
             client.state.messages_since(self._feedback_start) if len(entry) > 3)
@@ -4883,14 +4894,6 @@ class TempleFoodTask(BotTask):
             feedback += "\n" + client.state.interface.text.casefold()
         if "stomach is filled" in feedback or "very hungry to me" in feedback:
             self.complete()
-            return
-        if not self._sent_at:
-            client.state.interface = None
-            await client.talk("food", self.priest)
-            self._sent_at = time.monotonic()
-            recorder = getattr(client, "record_action", None)
-            if recorder is not None:
-                recorder("temple-food", self.priest)
             return
         if time.monotonic() - self._sent_at > self.TIMEOUT_SECONDS:
             self.fail(f"{self.priest} did not answer the temple food request")

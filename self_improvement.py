@@ -74,6 +74,9 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
     """Classify a failure from the combat messages and decisions before it."""
     when = float(failure.get("time", 0.0) or 0.0)
     start = when - REVIEW_WINDOW_SECONDS
+    # Scanned twice (hits, then starvation): a one-shot iterable must not
+    # be exhausted by the first pass.
+    messages = list(messages)
     hits: list[tuple[float, str, int, str]] = []
     for entry in messages:
         stamp, text = float(entry[0]), str(entry[-1])
