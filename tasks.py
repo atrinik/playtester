@@ -4853,6 +4853,52 @@ class TempleServiceTask(BotTask):
                           f"{self.condition}")
 
 
+class TempleFoodTask(BotTask):
+    """Ask a priest for the free temple food service and verify she ate.
+
+    Temple.py fills the asker's food to 500 when it is below that, so this
+    is the survival fallback while merchant food is unavailable.
+    """
+
+    FED = 400
+    TIMEOUT_SECONDS = 8.0
+
+    def __init__(self, priest: str):
+        super().__init__(f"temple:food:{priest}")
+        self.priest = priest
+        self._sent_at = 0.0
+        self._feedback_start = 0
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+            self._feedback_start = client.state.message_count
+        if int(client.state.stats.get("food", 0) or 0) >= self.FED:
+            self.complete()
+            return
+        if not self._sent_at:
+            # Only an answer to this request counts: a dialogue left open
+            # from an earlier visit must not pass for it.
+            client.state.interface = None
+            self._feedback_start = client.state.message_count
+            await client.talk("food", self.priest)
+            self._sent_at = time.monotonic()
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("temple-food", self.priest)
+            return
+        feedback = "\n".join(
+            entry[3].casefold() for entry in
+            client.state.messages_since(self._feedback_start) if len(entry) > 3)
+        if client.state.interface is not None:
+            feedback += "\n" + client.state.interface.text.casefold()
+        if "stomach is filled" in feedback or "very hungry to me" in feedback:
+            self.complete()
+            return
+        if time.monotonic() - self._sent_at > self.TIMEOUT_SECONDS:
+            self.fail(f"{self.priest} did not answer the temple food request")
+
+
 class MassIdentifyTask(BotTask):
     """Buy a smith's flat-price inventory identification service."""
 
