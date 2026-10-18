@@ -131,15 +131,21 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
         damage_by_type=damage_by_type, damage_taken=damage)
 
 
-def damage_between(messages: Iterable[tuple], start: float, end: float) -> int:
-    """Damage from "<who> hit you for N" messages stamped within [start, end]."""
-    total = 0
+def hits_between(messages: Iterable[tuple], start: float, end: float) -> dict[str, int]:
+    """Damage per attacker from "<who> hit you for N" messages within [start, end]."""
+    hits: dict[str, int] = {}
     for entry in messages:
         if start <= float(entry[0]) <= end:
             match = _HIT.match(str(entry[-1]).strip())
             if match:
-                total += int(match.group("amount"))
-    return total
+                who = match.group("who").strip()
+                hits[who] = hits.get(who, 0) + int(match.group("amount"))
+    return hits
+
+
+def damage_between(messages: Iterable[tuple], start: float, end: float) -> int:
+    """Damage from "<who> hit you for N" messages stamped within [start, end]."""
+    return sum(hits_between(messages, start, end).values())
 
 
 def spot_key(spot: dict | None, legs: Iterable[tuple[str, str]]) -> str:

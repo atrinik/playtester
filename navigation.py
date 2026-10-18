@@ -1328,12 +1328,13 @@ class WorldGraph:
                      allow_locked: bool = False,
                      excluded: set[tuple[str, str]] | None = None,
                      avoided_maps: set[str] | None = None,
-                     map_costs: dict[str, int] | None = None,
+                     penalized_maps: set[str] | None = None,
                      ) -> list[MapEdge]:
         """Route end-to-end between exact walkable components across maps.
 
-        ``map_costs`` adds a cost for entering each named map, so the route
-        crosses as few of them as it can; every other transition costs one.
+        Entering a ``penalized_maps`` map costs more than any route without
+        one, so the route crosses as few of them as it can and, among those,
+        is the shortest.
         """
         start_component = self._component(
             source, source_xy, allow_locked=allow_locked)
@@ -1398,7 +1399,7 @@ class WorldGraph:
                             positions.append(arrival)
                         targets.append(target)
                         edge_metadata.append(len(route_edges))
-                        edge_costs.append(1 + (map_costs or {}).get(edge.destination, 0))
+                        edge_costs.append(edge.destination in (penalized_maps or ()))
                         route_edges.append(adjusted)
             offsets.append(len(targets))
             cursor += 1
@@ -1406,9 +1407,12 @@ class WorldGraph:
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
                 f"{destination} {destination_points}")
+        # A simple route has fewer transitions than there are states, so one
+        # penalized entry outweighs any detour: crossings first, then length.
+        penalty = len(states) + 1
         result = graph_search(
             offsets, targets, 0, goals, metadata=edge_metadata,
-            costs=edge_costs if map_costs else None)
+            costs=[1 + penalty * flagged for flagged in edge_costs] if penalized_maps else None)
         if result.status != "found":
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
@@ -1704,10 +1708,6 @@ class NavigateTask(BotTask):
             estimator(path) >= 3
         }
 
-    # Entering a map where a recent route death took combat damage costs as
-    # much as this many ordinary map transitions.
-    ROUTE_HAZARD_PENALTY = 1000
-
     def _learned_route_hazards(self, client: AtrinikClient) -> set[str]:
         """Maps where a recent route death took combat damage."""
         now = time.time()
@@ -1745,7 +1745,7 @@ class NavigateTask(BotTask):
             "allow_locked": self._allow_locked(client),
             "excluded": self._excluded_edges,
             "avoided_maps": protected_hazards | overlevel_hazards,
-            "map_costs": {path: self.ROUTE_HAZARD_PENALTY for path in penalized},
+            "penalized_maps": set(penalized),
         }
         previous_fallback = self._threat_fallback
         self._threat_fallback = False
@@ -4187,10 +4187,18 @@ class FarmCircuitTask(BotTask):
         Returns True only for the last resort, a short pause after repeated
         failures with every tactic already at its maximum.
         """
+        decisions = list(getattr(client, "decision_history", ()))
+        when = float(failure.get("time", 0.0) or 0.0)
+        # Only this life counts: a starvation or fight before the previous
+        # death must not explain this one.
+        previous_death = max(
+            (float(record.get("time", 0.0) or 0.0) for record in decisions
+             if isinstance(record, dict) and record.get("action") == "death" and
+             float(record.get("time", 0.0) or 0.0) < when - 1.0), default=0.0)
+        messages = [entry for entry in getattr(client.state, "messages", ())
+                    if float(entry[0]) > previous_death]
         review = self_improvement.review_failure(
-            getattr(client.state, "messages", ()),
-            getattr(client, "decision_history", ()), failure,
-            [leg for leg, _ in self.legs])
+            messages, decisions, failure, [leg for leg, _ in self.legs])
         # Hits stamped before she entered the death map were taken elsewhere:
         # only damage taken on it makes that map the hazard.
         entered = self._entered_map_at(client, review.map, review.time)
@@ -4198,10 +4206,10 @@ class FarmCircuitTask(BotTask):
         # a hit after respawning elsewhere is not the death map's.
         left = min((stamp for stamp, _ in getattr(client, "map_arrivals", ())
                     if entered is not None and stamp > entered), default=review.time + 2.0)
-        on_map = 0 if entered is None else self_improvement.damage_between(
-            getattr(client.state, "messages", ()),
-            max(entered, review.time - self_improvement.REVIEW_WINDOW_SECONDS),
+        hits = {} if entered is None else self_improvement.hits_between(
+            messages, max(entered, review.time - self_improvement.REVIEW_WINDOW_SECONDS),
             min(review.time + 2.0, left))
+        on_map = sum(hits.values())
         if review.cause == "route" and on_map > 0 and review.map:
             # Killed crossing a map on the way: route around it for a while
             # instead of walking back into the same fight after respawning.
@@ -4215,8 +4223,7 @@ class FarmCircuitTask(BotTask):
             if recorder is not None:
                 recorder("route-hazard-learned",
                          f"{review.map} for {self.ROUTE_HAZARD_SECONDS / 3600:.0f} h: "
-                         f"{on_map} damage from "
-                         + ", ".join(sorted(review.attackers)))
+                         f"{on_map} damage from " + ", ".join(sorted(hits)))
         key = self._spot_key()
         adaptations = getattr(client.state, "farm_adaptations", {}) or {}
         record, pause = self_improvement.learn(adaptations.get(key, {}), review)

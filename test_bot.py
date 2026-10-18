@@ -12391,6 +12391,55 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         circuit._observe_farm_death(client)
         self.assertEqual(client.state.route_hazards, {})
 
+    def test_only_this_life_explains_a_route_death(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        swamp, meadow = "/shattered_islands/world_1_50", "/shattered_islands/world_1_49"
+        now = time.time()
+        # She starved, respawned, was bitten by a wolf on the meadow, then
+        # killed by a crocodile on the swamp within the same minute.
+        client.state.messages.append((now - 40, 2, "ffffff", "Sera starved to death."))
+        client.decision_history.append({"time": now - 39, "action": "death", "detail": "",
+                                        "task": "", "map": meadow})
+        client.state.messages.append((now - 30, 2, "ff0000", "wolf hit you for 9 (-9) bite damage."))
+        client.map_arrivals = [(now - 38, meadow), (now - 20, swamp)]
+        client.state.messages.append((now - 5, 2, "ff0000",
+                                      "crocodile hit you for 40 (-40) pierce damage."))
+        client.decision_history.append({"time": now, "action": "death", "detail": "",
+                                        "task": "", "map": swamp})
+        circuit._observe_farm_death(client)
+        # The earlier starvation does not excuse the swamp, and the lesson
+        # names only what hit her there.
+        self.assertIn(swamp, client.state.route_hazards)
+        learned = [entry["detail"] for entry in client.decision_history
+                   if entry["action"] == "route-hazard-learned"]
+        self.assertEqual(learned, [f"{swamp} for 6 h: 40 damage from crocodile"])
+
+    def test_any_detour_beats_a_learned_map(self):
+        def lane(path):
+            node = MapNode(path, width=3, height=1)
+            node.terrain = {(x, 0): 1 for x in range(3)}
+            return node
+
+        graph = WorldGraph()
+        town, swamp, farm = ("/shattered_islands/world_0_68", "/shattered_islands/world_1_50",
+                             "/shattered_islands/world_1_49")
+        detour = [f"/shattered_islands/detour_{n}" for n in range(1010)]
+        for path in (town, swamp, farm, *detour):
+            graph.nodes[path] = lane(path)
+            graph.named_spawns[path] = []
+        graph.nodes[town].edges = [MapEdge(town, swamp, 2, 0, 0, 0), MapEdge(town, detour[0], 1, 0, 0, 0)]
+        graph.nodes[swamp].edges = [MapEdge(swamp, farm, 2, 0, 0, 0)]
+        for here, there in zip(detour, [*detour[1:], farm]):
+            graph.nodes[here].edges = [MapEdge(here, there, 2, 0, 0, 0)]
+        # More than a thousand maps around one lesson is still the way.
+        route = graph.route_points(town, (1, 0), farm, [], penalized_maps={swamp})
+        self.assertNotIn(swamp, [edge.destination for edge in route])
+        self.assertEqual(len(route), 1011)
+        self.assertEqual([edge.destination for edge in graph.route_points(town, (1, 0), farm, [])],
+                         [swamp, farm])
+
     def test_repeated_failures_at_maximum_adaptation_pause_the_spot_briefly(self):
         from . import self_improvement
 
