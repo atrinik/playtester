@@ -10328,6 +10328,13 @@ class NavigationTests(unittest.TestCase):
         self.assertNotIn(swamp, route)
         # Crossing a map that killed her is not threat-free for optional trips.
         self.assertTrue(task._threat_fallback)
+        # Two unavoidable lessons (gate and hub) do not discard the avoidable
+        # swamp: every trial missing one still holds a bottleneck.
+        client.state.route_hazards = {path: time.time() + 3600 for path in (gate, hub, swamp)}
+        task = NavigateTask(graph, farm)
+        route = [edge.destination for edge in task._plan(client)]
+        self.assertTrue({gate, hub} <= set(route))
+        self.assertNotIn(swamp, route)
         client.state.route_hazards = {}
         task = NavigateTask(graph, farm)
         task._plan(client)

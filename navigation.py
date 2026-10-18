@@ -1720,11 +1720,31 @@ class NavigateTask(BotTask):
         route = None
         if learned:
             previous_fallback = self._threat_fallback
-            # Every lesson, then each set missing one: an unavoidable map is
-            # dropped alone, whatever its name sorts as.
-            trials = [set(learned)] + (
-                [learned - {path} for path in sorted(learned)] if len(learned) > 1 else [])
+
+            def avoidable_alone(path: str) -> bool:
+                # A probe only: its plan is discarded and records nothing.
+                try:
+                    self._plan_avoiding(client, {path}, strict=True)
+                    return True
+                except ValueError:
+                    return False
+                finally:
+                    self._threat_fallback = previous_fallback
+
+            trials = [set(learned)]
+            if len(learned) > 1:
+                # A lesson no route avoids even on its own is a bottleneck:
+                # drop every such one together and keep the rest, so two
+                # unavoidable maps never discard an avoidable third. Then each
+                # of those sets missing one, for lessons avoidable only apart.
+                kept = {path for path in sorted(learned) if avoidable_alone(path)}
+                trials += [kept] + [kept - {path} for path in sorted(kept)]
+                trials += [learned - {path} for path in sorted(learned)]
+            seen: list[set[str]] = []
             for kept in trials:
+                if not kept or kept in seen:
+                    continue
+                seen.append(kept)
                 try:
                     route = self._plan_avoiding(client, kept, strict=True)
                     break
