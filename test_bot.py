@@ -1183,6 +1183,9 @@ class ProtocolTests(unittest.TestCase):
                   {"action": "death", "time": now - 7200}]
         self.assertEqual(ids(now, deaths), ["deaths"])
         self.assertEqual(ids(now, deaths[:1]), [])
+        # Two announcements of one death are one death.
+        self.assertEqual(ids(now, [{"action": "death", "time": now - 61},
+                                   {"action": "death", "time": now - 60}]), [])
         state.stats["food"] = 0
         self.assertEqual(ids(now), ["starving"])
         state.stats["food"] = 300
@@ -1193,10 +1196,14 @@ class ProtocolTests(unittest.TestCase):
         state.map.world_x = 2
         watch.observe(state, later)
         self.assertEqual(ids(later + 60), [])
-        # A lost connection, only after a grace period.
+        # A lost connection, only after a grace period, through retries.
         state.phase = "disconnected"
         watch.observe(state, later)
         self.assertEqual(ids(later + 60), [])
+        state.phase = "connecting"
+        watch.observe(state, later + 90)
+        state.phase = "disconnected"
+        watch.observe(state, later + 120)
         self.assertEqual(ids(later + DISCONNECTED_SECONDS), ["disconnected"])
         state.phase = "playing"
         watch.observe(state, later + DISCONNECTED_SECONDS)

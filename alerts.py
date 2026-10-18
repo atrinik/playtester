@@ -14,6 +14,8 @@ DEATH_WINDOW_SECONDS = 3600.0
 REPEATED_DEATHS = 2
 STUCK_SECONDS = 20 * 60.0
 DISCONNECTED_SECONDS = 180.0
+# Announcements of one death arrive this close together.
+SAME_DEATH_SECONDS = 10.0
 
 
 class ProgressWatch:
@@ -36,11 +38,13 @@ class ProgressWatch:
         position = (getattr(m, "path", ""), getattr(m, "world_x", 0), getattr(m, "world_y", 0))
         if position != self.position:
             self.position, self.moved_at = position, now
-        if getattr(state, "phase", "") == "disconnected":
-            if self.disconnected_since is None:
-                self.disconnected_since = now
-        else:
+        phase = getattr(state, "phase", "")
+        if phase == "playing":
             self.disconnected_since = None
+        elif phase == "disconnected" and self.disconnected_since is None:
+            # Reconnect attempts pass through connecting/login phases; the
+            # outage lasts until she is playing again.
+            self.disconnected_since = now
 
 
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
@@ -53,9 +57,13 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
         minutes = int((now - watch.disconnected_since) // 60)
         alerts.append({"id": "disconnected", "level": "critical",
                        "text": f"Disconnected for {minutes} min"})
-    deaths = sum(1 for record in decisions
-                 if isinstance(record, dict) and record.get("action") == "death" and
-                 now - float(record.get("time", 0.0) or 0.0) <= DEATH_WINDOW_SECONDS)
+    stamps = sorted(
+        float(record.get("time", 0.0) or 0.0) for record in decisions
+        if isinstance(record, dict) and record.get("action") == "death" and
+        now - float(record.get("time", 0.0) or 0.0) <= DEATH_WINDOW_SECONDS)
+    # "defeated in combat" and "YOU HAVE DIED." announce one death.
+    deaths = sum(1 for index, stamp in enumerate(stamps)
+                 if index == 0 or stamp - stamps[index - 1] >= SAME_DEATH_SECONDS)
     if deaths >= REPEATED_DEATHS:
         alerts.append({"id": "deaths", "level": "critical",
                        "text": f"{deaths} deaths in the last hour"})
