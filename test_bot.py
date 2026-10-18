@@ -1210,6 +1210,12 @@ class ProtocolTests(unittest.TestCase):
         bucket = client.trends.buckets[-1]
         # Two announcements of one death count once.
         self.assertEqual((bucket["heals"], bucket["deaths"]), (2, 1))
+        # Dying again right after respawning is another death.
+        say("YOU HAVE DIED.")
+        self.assertEqual(client.trends.buckets[-1]["deaths"], 2)
+        # Depletion changes between stats packets reach the bucket.
+        client.set_depletion_points(7)
+        self.assertEqual(client.trends.buckets[-1]["depletion"], 7)
         # Closing flushes the current minute.
         saved = []
         client.state.player_name = "Sera"

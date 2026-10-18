@@ -173,7 +173,8 @@ class AtrinikClient:
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
         self.trends = Trends()
         self._trends_character = ""
-        self._last_trend_death_at = 0.0
+        # (time, kind) of the last counted death notice, for pairing.
+        self._last_trend_death: tuple[float, str] = (0.0, "")
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -390,6 +391,9 @@ class AtrinikClient:
     def set_depletion_points(self, points: int) -> None:
         self.state.depletion_points = max(0, int(points))
         self.state.depletion_points_known = True
+        # Death stat losses change depletion between stats packets.
+        if self.trends.observe(self.state):
+            self._persist_trends()
         character = self.state.player_name or self.config.character
         if not character:
             return
@@ -723,15 +727,23 @@ class AtrinikClient:
                     character, "decisions", self.decision_history)
 
     def _trend_count(self, key: str) -> None:
-        now = time.time()
-        if key == "deaths":
-            # One death can be announced twice ("defeated in combat", then
-            # "YOU HAVE DIED."); count it once.
-            if now - self._last_trend_death_at < 10.0:
-                return
-            self._last_trend_death_at = now
-        if self.trends.count(key, now):
+        if self.trends.count(key):
             self._persist_trends()
+
+    def _trend_death(self, kind: str) -> None:
+        """Count a death notice; the other notice of the same death is not one.
+
+        One death can be announced as "defeated in combat" and "YOU HAVE
+        DIED."; the second of such a pair is skipped. The same notice again
+        is a new death, however soon after respawning.
+        """
+        now = time.time()
+        last_at, last_kind = self._last_trend_death
+        if last_kind and last_kind != kind and now - last_at < 10.0:
+            self._last_trend_death = (0.0, "")
+            return
+        self._last_trend_death = (now, kind)
+        self._trend_count("deaths")
 
     def _persist_trends(self) -> None:
         """Save the trend buckets once a minute, when a new one starts."""
@@ -1192,7 +1204,7 @@ class AtrinikClient:
             self._trend_count("heals")
         if died:
             self.record_action("death", text)
-            self._trend_count("deaths")
+            self._trend_death("defeated" if "defeated in combat" in lowered else "died")
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a
             # post-death window for protocol/order variants that arrive later.
