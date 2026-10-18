@@ -29,14 +29,17 @@ class ProgressWatch:
 
     def observe(self, state: Any, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        exp = (getattr(state, "stats", {}) or {}).get("exp")
-        if exp != self.exp:
-            self.exp, self.exp_changed_at = exp, now
-        m = getattr(state, "map", None)
-        position = (getattr(m, "path", ""), getattr(m, "world_x", 0), getattr(m, "world_y", 0))
-        if position != self.position:
-            self.position, self.moved_at = position, now
         phase = getattr(state, "phase", "")
+        m = getattr(state, "map", None)
+        # A reconnect swaps in an empty placeholder map and clears stats; only
+        # a playing character on a real map can move or gain experience.
+        if phase == "playing" and getattr(m, "path", ""):
+            exp = (getattr(state, "stats", {}) or {}).get("exp")
+            if exp != self.exp:
+                self.exp, self.exp_changed_at = exp, now
+            position = (m.path, getattr(m, "world_x", 0), getattr(m, "world_y", 0))
+            if position != self.position:
+                self.position, self.moved_at = position, now
         if phase == "playing":
             self.disconnected_since = None
         elif phase == "disconnected" and self.disconnected_since is None:

@@ -434,6 +434,7 @@ class ProtocolTests(unittest.TestCase):
                 (-6, self._map2_actor_tile(2, 1, 5, 101, True)),
                 (6, self._map2_actor_tile(8, 7, 5, 102)),
             ])
+            client.state.phase = "playing"
             client.progress_watch.moved_at = 0.0
             await client._handle_map(Cursor(payload), payload)
 
@@ -1222,6 +1223,17 @@ class ProtocolTests(unittest.TestCase):
         state.phase = "playing"
         watch.observe(state, later + DISCONNECTED_SECONDS)
         self.assertIsNone(watch.disconnected_since)
+        # A failed reconnect's empty placeholder map and cleared stats are no
+        # movement or progress, nor is the real map coming back unchanged.
+        moved, gained = watch.moved_at, watch.exp_changed_at
+        real_map, real_stats = state.map, dict(state.stats)
+        state.phase, state.map, state.stats = "connecting", MapState(), {}
+        watch.observe(state, later + 400)
+        state.phase = "disconnected"
+        watch.observe(state, later + 410)
+        state.phase, state.map, state.stats = "playing", real_map, real_stats
+        watch.observe(state, later + 500)
+        self.assertEqual((watch.moved_at, watch.exp_changed_at), (moved, gained))
 
     def test_each_death_keeps_its_own_record_and_time(self):
         from .alerts import death_count
