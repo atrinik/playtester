@@ -4197,8 +4197,10 @@ class FarmCircuitTask(BotTask):
              float(record.get("time", 0.0) or 0.0) < when - 1.0), default=0.0)
         messages = [entry for entry in getattr(client.state, "messages", ())
                     if float(entry[0]) > previous_death]
+        this_life = [record for record in decisions if isinstance(record, dict) and
+                     float(record.get("time", 0.0) or 0.0) > previous_death]
         review = self_improvement.review_failure(
-            messages, decisions, failure, [leg for leg, _ in self.legs])
+            messages, this_life, failure, [leg for leg, _ in self.legs])
         # Hits stamped before she entered the death map were taken elsewhere:
         # only damage taken on it makes that map the hazard.
         entered = self._entered_map_at(client, review.map, review.time)

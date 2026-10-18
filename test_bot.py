@@ -12416,6 +12416,28 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
                    if entry["action"] == "route-hazard-learned"]
         self.assertEqual(learned, [f"{swamp} for 6 h: 40 damage from crocodile"])
 
+    def test_the_previous_lifes_decisions_do_not_explain_this_death(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        now = time.time()
+        # Out of heals in the previous life, which ended 40 s ago.
+        client.decision_history.append({"time": now - 45, "action": "emergency-disengage",
+                                        "detail": "hp=20/134 sp=1 next-heal=4 target=0",
+                                        "task": "", "map": self.TREES})
+        client.decision_history.append({"time": now - 40, "action": "death", "detail": "",
+                                        "task": "", "map": self.TREES})
+        # This life: one treant out-damages her at the spot.
+        client.state.messages.append((now - 5, 2, "ff0000",
+                                      "evil treant hit you for 90 (-90) impact damage."))
+        client.decision_history.append({"time": now, "action": "death", "detail": "",
+                                        "task": "", "map": self.TREES})
+        circuit._observe_farm_death(client)
+        reviews = [entry["detail"] for entry in client.decision_history
+                   if entry["action"] == "farm-failure-review"]
+        self.assertIn("out-damaged", reviews[-1])
+        self.assertNotIn("resources", reviews[-1])
+
     def test_any_detour_beats_a_learned_map(self):
         def lane(path):
             node = MapNode(path, width=3, height=1)
