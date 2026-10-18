@@ -23,8 +23,9 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
-from .navigation import (analyzer_spot_legs, effective_farm_objective, FarmCircuitTask,
-                         NavigateTask, NavigateThenTask, ShopUpgradeSweepTask, WorldGraph)
+from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_farm_objective,
+                         FarmCircuitTask, NavigateTask, NavigateThenTask,
+                         ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
 from .quest_tasks import EscapingDesertedIslandTask
 from .quests import QuestDefinition, QuestObjective, flatten_parts, load_catalog
@@ -581,7 +582,7 @@ class DashboardState:
         analyzer = getattr(self.client, "farm_analyzer", None)
         if analyzer is None:
             return []
-        objective = effective_farm_objective(self.client.state)
+        objective = self._farmed_objective()
         spots = []
         for rank, spot in enumerate(analyzer.ranking(objective), 1):
             legs = analyzer_spot_legs(spot, self.graph)
@@ -594,10 +595,16 @@ class DashboardState:
                 })
         return spots
 
+    def _farmed_objective(self) -> str:
+        """The objective she farms now, after depletion and its fallback."""
+        choice = analyzer_farm_choice(self.client, self.graph)
+        return (choice[0] if choice is not None
+                else effective_farm_objective(self.client.state))
+
     def farming_analysis(self) -> dict[str, Any]:
         analyzer = getattr(self.client, "farm_analyzer", None)
         chosen = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
-        objective = effective_farm_objective(self.client.state)
+        objective = self._farmed_objective()
         if analyzer is None:
             snapshot = {"status": "unavailable", "objective": objective,
                         "objectives": OBJECTIVES, "ranking": []}

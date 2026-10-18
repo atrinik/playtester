@@ -12053,7 +12053,9 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
 
-    def test_depletion_moves_the_circuit_to_safety_or_holds_it(self):
+    def test_depletion_prefers_safety_spots_then_falls_back_to_the_choice(self):
+        from .navigation import analyzer_farm_selection
+
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
         pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
         client = self.client({"xp": [trees], "safety": [pocket]})
@@ -12068,41 +12070,24 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         selected = [entry["detail"] for entry in client.decision_history
                     if entry["action"] == "farm-spot-selected"]
         self.assertIn("(safety)", selected[-1])
-        # With no usable safety spot, the XP circuit holds instead of farming
-        # on, yet stays alive: it owns depletion removal, which must still run.
+        # With no usable safety spot, the chosen objective's spot applies: the
+        # circuit keeps it, removing depletion before any farming, instead of
+        # ending and leaving autoplay to hold where nothing can cure her.
         client.farm_analyzer.rankings["safety"] = []
         circuit = self.circuit(client, trees)
-        farm = circuit.child.task
-        for _ in range(2):
-            self.assertFalse(circuit._upgrade_progression(client, farm))
-        self.assertTrue(circuit._depleted_hold)
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
         self.assertNotEqual(circuit.status, TaskStatus.COMPLETE)
-        exhausted = [entry for entry in client.decision_history
-                     if entry["action"] == "farm-spots-exhausted"]
-        self.assertEqual(len(exhausted), 1)
-        sent = []
-
-        async def send(packet):
-            sent.append(packet)
-
-        client.send = send
-        # A fight under way finishes first; then she stops once and holds.
-        client.state.combat, client.state.target_id = True, 99
-        client.state.stats["target_hp"] = 5
-        self.assertFalse(asyncio.run(circuit._hold_while_depleted(client, farm)))
-        self.assertEqual(sent, [])
-        client.state.combat, client.state.target_id = False, 0
-        for _ in range(3):
-            self.assertTrue(asyncio.run(circuit._hold_while_depleted(client, farm)))
-        self.assertEqual(len(sent), 2)
-        client.state.bank_balance, client.state.bank_balance_known = 50_000, True
-        self.assertTrue(circuit._queue_depletion_service(client))
-        # Once the temple removes it, the chosen objective's spot resumes.
-        client.state.remove_item(501)
-        self.assertFalse(circuit._upgrade_progression(client, farm))
-        self.assertFalse(circuit._depleted_hold)
-        self.assertFalse(asyncio.run(circuit._hold_while_depleted(client, farm)))
         self.assertEqual(circuit.spot["name"], "Trees")
+        # Autoplay starting depleted still gets a circuit to cure her from.
+        self.assertEqual(analyzer_farm_selection(client, built_graph())[1]["name"],
+                         "Trees")
+        # A safety circuit whose spot became unusable returns to the choice.
+        circuit = self.circuit(client, pocket)
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.spot["name"], "Trees")
+        selected = [entry["detail"] for entry in client.decision_history
+                    if entry["action"] == "farm-spot-selected"]
+        self.assertIn("(xp)", selected[-1])
 
     def test_repeated_failures_at_maximum_adaptation_pause_the_spot_briefly(self):
         from . import self_improvement
@@ -12512,6 +12497,15 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
                          ("safety", "xp"))
         self.assertEqual(analysis["objective_override"],
                          {"reason": "depletion", "points": 32})
+        # No usable safety spot: she farms the choice, and the page says so.
+        self.client.farm_analyzer = StubAnalyzer({"xp": [analyzer_spot(
+            "Trees", ["/shattered_islands/world_14_79"], ["evil treant L13"])]})
+        self.server.dashboard.graph = built_graph()
+        status, payload = await self.request("GET", "/api/state?include=farming_analysis")
+        analysis = json.loads(payload)["farming_analysis"]
+        self.assertEqual(analysis["objective"], "xp")
+        self.assertIsNone(analysis["objective_override"])
+        self.client.farm_analyzer = None
         self.client.state.depletion_points = 0
         status, payload = await self.request(
             "POST", "/api/action", {"type": "farm_objective", "objective": "money"})
