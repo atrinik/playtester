@@ -1334,6 +1334,19 @@ class ProtocolTests(unittest.TestCase):
         restored = post_mortem.restore({"time": 5, "attackers": {"rat": huge}, "damage_taken": huge,
                                         "vitals": [[huge, 1, 2, 3, 4, 5]]})
         self.assertEqual((restored["attackers"], restored["damage_taken"], restored["vitals"]), ({}, 0, []))
+        # Restoring applies the builder's bounds.
+        big = post_mortem.restore({
+            "time": 5, "vitals": [[index, 1, 2, 3, 4, 5] for index in range(500)],
+            "messages": [[index, "x"] for index in range(500)],
+            "decisions": [{"time": index} for index in range(500)],
+            "actions": [{"time": index} for index in range(500)]})
+        self.assertEqual([len(big[key]) for key in ("vitals", "messages", "decisions", "actions")],
+                         [post_mortem.MAX_VITALS, 40, 25, 25])
+        # A previous death in the future bounds nothing, and an oversized
+        # decision time is simply outside the window.
+        report = post_mortem.build(1000.0, "/a", 1, 2, [], [(999.0, 2, "", "YOU HAVE DIED.")],
+                                   [], [{"time": 10 ** 400, "action": "x"}], since=5000.0)
+        self.assertEqual([text for _, text in report["messages"]], ["YOU HAVE DIED."])
         # Downsampling keeps the fatal sample even with a recovery after it.
         when = 1000.0
         busy = [[when - 59 + index * 0.4, 100, 155, 10, 39, 900] for index in range(140)]

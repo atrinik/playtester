@@ -111,8 +111,9 @@ def restore(entry: Any) -> dict[str, Any] | None:
         "cause": str(entry.get("cause") or ""), "detail": str(entry.get("detail") or ""),
         "attackers": counts("attackers"), "peak_attackers": number("peak_attackers"),
         "damage_taken": number("damage_taken"), "damage_by_type": counts("damage_by_type"),
-        "vitals": vitals_rows(), "messages": message_rows(),
-        "actions": records("actions"), "decisions": records("decisions"),
+        # The builder's own bounds, so a stored report can never grow larger.
+        "vitals": spread(vitals_rows()), "messages": message_rows()[-40:],
+        "actions": records("actions")[-25:], "decisions": records("decisions")[-25:],
     }
 
 
@@ -130,7 +131,7 @@ def _extremes(samples: list, when: float) -> list[int]:
 def _within(stamp: Any, start: float, end: float) -> bool:
     try:
         return start <= float(stamp) <= end
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
 
 
@@ -142,6 +143,9 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
 
     ``since`` is the previous death: nothing from that earlier life counts.
     """
+    # A previous death at or after this one (a clock stepped back, a bad
+    # record) bounds nothing: the normal window applies.
+    since = since if since < when else 0.0
     start, end = max(when - REVIEW_WINDOW_SECONDS, since), when + AFTER_SECONDS
     messages = list(messages)
     decisions = list(decisions)
