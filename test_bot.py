@@ -10111,6 +10111,23 @@ class NavigationTests(unittest.TestCase):
         graph._world_search_snapshot = None
         route = NavigateTask(graph, farm)._plan(client)
         self.assertEqual([edge.destination for edge in route], [swamp, farm])
+        # Never worse than before: when the only way also crosses an
+        # over-levelled map, the planner still routes as it did without lessons.
+        ogre = "/shattered_islands/world_1_52"
+        graph.nodes[ogre] = lane(ogre)
+        graph.named_spawns[ogre] = []
+        nodes[town].edges = [MapEdge(town, swamp, 2, 0, 0, 0)]
+        nodes[swamp].edges = [MapEdge(swamp, ogre, 2, 0, 0, 0)]
+        graph.nodes[ogre].edges = [MapEdge(ogre, farm, 2, 0, 0, 0)]
+        graph.map_monster_levels[ogre] = {"ogre": 99}
+        graph._world_search_snapshot = None
+        graph._component_cache.clear()
+        without = NavigateTask(graph, farm)
+        client.state.route_hazards = {}
+        expected = [edge.destination for edge in without._plan(client)]
+        client.state.route_hazards = {swamp: time.time() + 3600}
+        self.assertEqual([edge.destination for edge in NavigateTask(graph, farm)._plan(client)],
+                         expected)
         # Expired lessons, the destination and her own map are never avoided.
         client.state.route_hazards = {swamp: time.time() - 1, farm: time.time() + 3600,
                                       town: time.time() + 3600}
@@ -11951,6 +11968,20 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertAlmostEqual(until - before, FarmCircuitTask.ROUTE_HAZARD_SECONDS, delta=10)
         self.assertIn("route-hazard-learned",
                       [entry["action"] for entry in client.decision_history])
+
+    def test_hits_taken_on_an_earlier_map_teach_no_route_hazard(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        swamp, meadow = "/shattered_islands/world_1_50", "/shattered_islands/world_1_49"
+        client.state.add_message(2, "ff0000", "crocodile hit you for 25 (-25) pierce damage.")
+        # She then walked on to the meadow and died there without a fight.
+        client.decision_history.append({"time": time.time() + 0.5, "action": "step",
+                                         "detail": "", "task": "", "map": swamp})
+        client.decision_history.append({"time": time.time() + 1, "action": "death",
+                                        "detail": "", "task": "", "map": meadow})
+        circuit._observe_farm_death(client)
+        self.assertEqual(client.state.route_hazards, {})
 
     def test_starving_on_the_way_teaches_no_route_hazard(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])

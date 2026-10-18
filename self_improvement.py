@@ -121,6 +121,17 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
         damage_by_type=damage_by_type, damage_taken=damage)
 
 
+def damage_between(messages: Iterable[tuple], start: float, end: float) -> int:
+    """Damage from "<who> hit you for N" messages stamped within [start, end]."""
+    total = 0
+    for entry in messages:
+        if start <= float(entry[0]) <= end:
+            match = _HIT.match(str(entry[-1]).strip())
+            if match:
+                total += int(match.group("amount"))
+    return total
+
+
 def spot_key(spot: dict | None, legs: Iterable[tuple[str, str]]) -> str:
     """A stable identity for a farm spot across rankings and restarts."""
     if spot and spot.get("path"):
