@@ -8,6 +8,7 @@ excluding it:
 * ``pack``: two or more creatures were attacking at once;
 * ``resources``: healing ran out (not enough spell points for the next heal);
 * ``damage-type``: one non-physical damage type did most of the damage;
+* ``starvation``: she starved to death (no food);
 * ``route``: the failure happened on the way to the spot, not on it;
 * ``out-damaged``: a single creature out-damaged the character.
 
@@ -73,6 +74,9 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
     """Classify a failure from the combat messages and decisions before it."""
     when = float(failure.get("time", 0.0) or 0.0)
     start = when - REVIEW_WINDOW_SECONDS
+    # Scanned twice (hits, then starvation): a one-shot iterable must not
+    # be exhausted by the first pass.
+    messages = list(messages)
     hits: list[tuple[float, str, int, str]] = []
     for entry in messages:
         stamp, text = float(entry[0]), str(entry[-1])
@@ -103,7 +107,13 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
                  if kind not in PHYSICAL and kind != "physical"}
     top_elemental = max(elemental.items(), key=lambda item: item[1], default=None)
     failure_map = str(failure.get("map", ""))
-    if failure_map and failure_map not in set(spot_paths):
+    starved_to_death = any(
+        start <= float(entry[0]) <= when + 2.0 and
+        "starved to death" in str(entry[-1]).casefold()
+        for entry in messages)
+    if starved_to_death:
+        cause, detail = "starvation", "ran out of food"
+    elif failure_map and failure_map not in set(spot_paths):
         cause, detail = "route", f"failed on {failure_map}, on the way to the spot"
     elif peak >= 2:
         cause, detail = "pack", f"{peak} attackers at once: " + ", ".join(sorted(attackers))
@@ -156,6 +166,8 @@ def remedies(review: FailureReview) -> tuple[str, ...]:
         return (f"protection against {review.cause.split(':', 1)[1]}",)
     if review.cause == "out-damaged":
         return ("better weapon and armour",)
+    if review.cause == "starvation":
+        return ("keep food stocked",)
     return ("cautious route",)
 
 
