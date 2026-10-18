@@ -10367,36 +10367,54 @@ class NavigationTests(unittest.TestCase):
         records.clear()
         NavigateTask(graph, farm)._plan(client)
         self.assertNotIn("navigation-threat-fallback", records)
-        # Expired lessons, the destination and her own map are never avoided.
+        # Expired lessons are gone; live ones count wherever they are, the
+        # destination and her own map included (as costs, never walls).
         client.state.route_hazards = {swamp: time.time() - 1, farm: time.time() + 3600,
                                       town: time.time() + 3600}
-        self.assertEqual(NavigateTask(graph, farm)._learned_route_hazards(client), set())
+        self.assertEqual(NavigateTask(graph, farm)._learned_route_hazards(client), {farm, town})
 
-    def test_planning_keeps_as_many_lessons_as_still_route(self):
-        # Three corridors cross the lessons in pairs (A+B, A+C, B+C): each is
-        # avoidable alone, but no two together. One must still be kept.
-        lessons = {"/a", "/b", "/c"}
+    def test_route_lessons_are_costs_that_pick_the_fewest_crossings(self):
+        town, farm = "/shattered_islands/world_0_68", "/shattered_islands/world_1_50"
+
+        def build(edges):
+            graph = WorldGraph()
+            for path in {farm, *(edge.source for edge in edges), *(edge.destination for edge in edges)}:
+                width = 5 if path == town else 3
+                node = MapNode(path, width=width, height=1)
+                # Town is split by a wall at x=2; she stands in its west part.
+                node.terrain = {(x, 0): 1 for x in range(width) if not (path == town and x == 2)}
+                graph.nodes[path] = node
+                graph.named_spawns[path] = []
+            for edge in edges:
+                graph.nodes[edge.source].edges.append(edge)
+            return graph
 
         class FakeClient:
-            def __init__(self):
+            def __init__(self, hazards):
                 self.state = GameState(phase="playing", player_tag=7)
-                self.state.map = MapState(path="/town", width=17, height=17, world_x=1, world_y=0)
-                self.state.route_hazards = {path: time.time() + 3600 for path in lessons}
+                self.state.map = MapState(path=town, width=17, height=17, world_x=1, world_y=0)
+                self.state.route_hazards = {path: time.time() + 3600 for path in hazards}
 
-        task = NavigateTask(WorldGraph(), "/farm")
-        tried = []
-
-        def plan_avoiding(client, kept, strict=False):
-            tried.append((frozenset(kept), strict))
-            if len(kept) > 1:
-                raise ValueError("no route avoids them together")
-            return [MapEdge("/town", "/farm", 0, 0, 0, 0, label="kept " + ",".join(sorted(kept)) or "none")]
-
-        task._plan_avoiding = plan_avoiding
-        route = task._plan(FakeClient())
-        self.assertIn(route[0].label, {"kept /a", "kept /b", "kept /c"})
-        # It never fell back to planning without any lesson.
-        self.assertNotIn((frozenset(), False), tried)
+        a, b, c, e, f = (f"/shattered_islands/world_5_{n}" for n in range(5))
+        # Two lessons on the short corridor, one on the long one: one search
+        # crosses the fewest, whatever subsets would route.
+        graph = build([MapEdge(town, a, 0, 0, 0, 0), MapEdge(a, b, 2, 0, 0, 0), MapEdge(b, farm, 2, 0, 0, 0),
+                       MapEdge(town, c, 1, 0, 0, 0), MapEdge(c, e, 2, 0, 0, 0), MapEdge(e, f, 2, 0, 0, 0),
+                       MapEdge(f, farm, 2, 0, 0, 0)])
+        task = NavigateTask(graph, farm)
+        self.assertEqual([edge.destination for edge in task._plan(FakeClient({a, b, c}))], [c, e, f, farm])
+        self.assertTrue(task._threat_fallback)
+        # Leaving the map she stands on is free, but a shortcut that re-enters
+        # it (through its other, walled-off part) pays like any other lesson.
+        d, p, q, r = (f"/shattered_islands/world_6_{n}" for n in range(4))
+        graph = build([MapEdge(town, d, 0, 0, 0, 0), MapEdge(d, town, 2, 0, 4, 0), MapEdge(town, farm, 4, 0, 0, 0),
+                       MapEdge(town, p, 1, 0, 0, 0), MapEdge(p, q, 2, 0, 0, 0), MapEdge(q, r, 2, 0, 0, 0),
+                       MapEdge(r, farm, 2, 0, 0, 0)])
+        task = NavigateTask(graph, farm)
+        self.assertEqual([edge.destination for edge in task._plan(FakeClient(set()))], [d, town, farm])
+        task = NavigateTask(graph, farm)
+        self.assertEqual([edge.destination for edge in task._plan(FakeClient({town}))], [p, q, r, farm])
+        self.assertFalse(task._threat_fallback)
 
     def test_an_unavoidable_lesson_keeps_the_others(self):
         def lane(path, width=3):

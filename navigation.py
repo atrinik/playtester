@@ -1328,8 +1328,13 @@ class WorldGraph:
                      allow_locked: bool = False,
                      excluded: set[tuple[str, str]] | None = None,
                      avoided_maps: set[str] | None = None,
+                     map_costs: dict[str, int] | None = None,
                      ) -> list[MapEdge]:
-        """Route end-to-end between exact walkable components across maps."""
+        """Route end-to-end between exact walkable components across maps.
+
+        ``map_costs`` adds a cost for entering each named map, so the route
+        crosses as few of them as it can; every other transition costs one.
+        """
         start_component = self._component(
             source, source_xy, allow_locked=allow_locked)
         if not start_component:
@@ -1341,6 +1346,7 @@ class WorldGraph:
         offsets = [0]
         targets: list[int] = []
         edge_metadata: list[int] = []
+        edge_costs: list[int] = []
         route_edges: list[MapEdge] = []
         goals: list[int] = []
         cursor = 0
@@ -1392,6 +1398,7 @@ class WorldGraph:
                             positions.append(arrival)
                         targets.append(target)
                         edge_metadata.append(len(route_edges))
+                        edge_costs.append(1 + (map_costs or {}).get(edge.destination, 0))
                         route_edges.append(adjusted)
             offsets.append(len(targets))
             cursor += 1
@@ -1400,7 +1407,8 @@ class WorldGraph:
                 f"no component route from {source} {source_xy} to "
                 f"{destination} {destination_points}")
         result = graph_search(
-            offsets, targets, 0, goals, metadata=edge_metadata)
+            offsets, targets, 0, goals, metadata=edge_metadata,
+            costs=edge_costs if map_costs else None)
         if result.status != "found":
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
@@ -1696,65 +1704,31 @@ class NavigateTask(BotTask):
             estimator(path) >= 3
         }
 
-    def _learned_route_hazards(self, client: AtrinikClient, *,
-                               avoidable: bool = True) -> set[str]:
-        """Maps where a recent route death took combat damage.
+    # Entering a map where a recent route death took combat damage costs as
+    # much as this many ordinary map transitions.
+    ROUTE_HAZARD_PENALTY = 1000
 
-        Avoidable ones exclude the trip's own source and destination, which
-        cannot be routed around; all of them still mark a route hazardous.
-        """
+    def _learned_route_hazards(self, client: AtrinikClient) -> set[str]:
+        """Maps where a recent route death took combat damage."""
         now = time.time()
         hazards = getattr(client.state, "route_hazards", None) or {}
-        excluded = ((client.state.map.path, self.destination) if avoidable
-                    else (client.state.map.path,))
-        return {path for path, until in hazards.items()
-                if until > now and path not in excluded}
+        return {path for path, until in hazards.items() if until > now}
 
     def _plan(self, client: AtrinikClient) -> list[MapEdge]:
-        # Learned hazards are only a preference: keep a route that avoids as
-        # many of them as still allows avoiding every other hazard outright,
-        # relaxing nothing; otherwise plan exactly as without lessons, so one
-        # can never make a route worse. One unavoidable lesson does not
-        # discard the others.
+        # Learned hazards are a cost, never a wall: one search finds the route
+        # that enters as few of them as it can. They never make a trip
+        # unroutable or change which other hazards are relaxed, and leaving
+        # the map she stands on is free while re-entering it is not.
         learned = self._learned_route_hazards(client)
-        route = None
-        if learned:
-            previous_fallback = self._threat_fallback
-
-            def strict(kept: set[str]) -> list[MapEdge] | None:
-                try:
-                    return self._plan_avoiding(client, kept, strict=True)
-                except ValueError:
-                    self._threat_fallback = previous_fallback
-                    return None
-
-            def probe(kept: set[str]) -> bool:
-                # Its plan is discarded and records nothing.
-                found = strict(kept) is not None
-                self._threat_fallback = previous_fallback
-                return found
-
-            # Greedy reduction: drop the lessons no route avoids even alone,
-            # then one lesson at a time until a strict route exists, so it
-            # ends with as many lessons as it can and only plans without any
-            # once no single one can be kept.
-            kept = set(learned)
-            if len(kept) > 1 and not probe(kept):
-                kept = {path for path in kept if probe({path})}
-            while kept and (route := strict(kept)) is None:
-                kept -= {next((path for path in sorted(kept) if probe(kept - {path})),
-                              sorted(kept)[0])}
-        if route is None:
-            route = self._plan_avoiding(client, set())
-        hazardous = self._learned_route_hazards(client, avoidable=False)
-        if any(edge.destination in hazardous for edge in route):
+        route = self._plan_avoiding(client, learned)
+        if any(edge.destination in learned for edge in route):
             # Entering a map that killed her, the destination included, is
             # never "threat-free" when choosing between optional destinations.
             self._threat_fallback = True
         return route
 
-    def _plan_avoiding(self, client: AtrinikClient, learned_hazards: set[str], *,
-                       strict: bool = False) -> list[MapEdge]:
+    def _plan_avoiding(self, client: AtrinikClient,
+                       penalized: set[str]) -> list[MapEdge]:
         source = client.state.map.path
         args = (
             source,
@@ -1766,12 +1740,12 @@ class NavigateTask(BotTask):
         overlevel_hazards = self._known_overlevel_hazard_maps(client)
         pack_hazards = self._known_pack_hazard_maps(source)
         protected_hazards = (
-            ranged_hazards | pack_hazards | learned_hazards |
-            set(self.KNOWN_LETHAL_TRANSIT))
+            ranged_hazards | pack_hazards | set(self.KNOWN_LETHAL_TRANSIT))
         kwargs = {
             "allow_locked": self._allow_locked(client),
             "excluded": self._excluded_edges,
             "avoided_maps": protected_hazards | overlevel_hazards,
+            "map_costs": {path: self.ROUTE_HAZARD_PENALTY for path in penalized},
         }
         previous_fallback = self._threat_fallback
         self._threat_fallback = False
@@ -1785,9 +1759,6 @@ class NavigateTask(BotTask):
             try:
                 route = self.graph.route_points(*args, **kwargs)
             except ValueError as preferred_exc:
-                if strict:
-                    # A trial plan relaxes no hazard tier and records nothing.
-                    raise
                 # Tiled levels only joined the hazards to keep surface trips
                 # off dense tunnels. A trip that needs them (one inside the
                 # tunnels, or with no surface way round) routes through them
