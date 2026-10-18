@@ -240,6 +240,12 @@ class AtrinikClient:
                         "last_utility_shop_check_at", 0.0)))
             except (TypeError, ValueError):
                 self.state.last_utility_shop_check_at = 0.0
+            try:
+                self.state.paid_restoration_retry_until = max(
+                    0.0, float(record.get(
+                        "paid_restoration_retry_until", 0.0)))
+            except (TypeError, ValueError):
+                self.state.paid_restoration_retry_until = 0.0
             quotes = record.get("vendor_quotes", {})
             self.state.vendor_quotes = {
                 str(key): dict(value)
@@ -336,6 +342,7 @@ class AtrinikClient:
             self.state.active_upgrade_shop_sweep_cursor = 0
             self.state.last_recall_shop_check_at = 0.0
             self.state.last_utility_shop_check_at = 0.0
+            self.state.paid_restoration_retry_until = 0.0
             self.state.vendor_quotes = {}
             self.state.farm_zone_quarantine = {}
             self.state.farm_zone_last_checked = {}
@@ -431,6 +438,18 @@ class AtrinikClient:
         self._runtime_memory.setdefault(character, {})[
             "last_utility_shop_check_at"] = (
                 self.state.last_utility_shop_check_at)
+        self._persist_character_memory()
+
+    def defer_paid_restoration(self, until: float) -> None:
+        """Persist the wall-clock time before which a paid temple service
+        that did not work is not bought again, across restarts."""
+        self.state.paid_restoration_retry_until = max(0.0, float(until))
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})[
+            "paid_restoration_retry_until"] = (
+                self.state.paid_restoration_retry_until)
         self._persist_character_memory()
 
     def record_vendor_quote(

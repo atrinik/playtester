@@ -4796,6 +4796,18 @@ class FarmCircuitTask(BotTask):
                    item.name.casefold() == "depletion"
                    for item in client.state.inventory)
 
+    # Seconds before retrying a failed depletion removal. A service the
+    # priest was paid for that still left the depletion force waits much
+    # longer: retrying it every half hour only spends the purse.
+    RESTORATION_RETRY_SECONDS = 1800.0
+    PAID_RESTORATION_RETRY_SECONDS = 6 * 3600.0
+
+    @classmethod
+    def restoration_backoff(cls, error: str) -> float:
+        if error.startswith("temple service took payment"):
+            return cls.PAID_RESTORATION_RETRY_SECONDS
+        return cls.RESTORATION_RETRY_SECONDS
+
     @staticmethod
     def _depletion_service_cost(client: AtrinikClient) -> int:
         level = int(client.state.stats.get("level", 0) or 0)
@@ -4808,7 +4820,9 @@ class FarmCircuitTask(BotTask):
                 self.DEPLETION_SERVICE_THRESHOLD and
                 BuyShopUpgradeTask.wallet_value(client) >=
                 self._depletion_service_cost(client) and
-                self.clock() >= self._restoration_retry_at)
+                self.clock() >= self._restoration_retry_at and
+                time.time() >= float(getattr(
+                    client.state, "paid_restoration_retry_until", 0.0) or 0.0))
 
     def _new_depletion_service(self, client: AtrinikClient) -> NavigateThenTask:
         task = NavigateThenTask(
@@ -5561,7 +5575,13 @@ class FarmCircuitTask(BotTask):
                 if self._restoration.status == TaskStatus.FAILED:
                     log.warning("depletion removal failed: %s",
                                 self._restoration.error)
-                    self._restoration_retry_at = self.clock() + 1800.0
+                    backoff = self.restoration_backoff(self._restoration.error)
+                    self._restoration_retry_at = self.clock() + backoff
+                    if backoff == self.PAID_RESTORATION_RETRY_SECONDS:
+                        # Survives restarts, which rebuild this task.
+                        deferrer = getattr(client, "defer_paid_restoration", None)
+                        if deferrer is not None:
+                            deferrer(time.time() + backoff)
                 else:
                     log.info("depletion removed; returning to farm")
                     self._restoration_retry_at = self.clock() + 30.0
