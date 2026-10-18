@@ -5414,6 +5414,64 @@ class QuestTests(unittest.TestCase):
         client.fire = fire
         return client
 
+    def _crowded_wizardry_farm(self):
+        client = self._wizard_training_client(100, x=11, y=8)
+        client.state.stats["sp"] = 0
+        # A pair of kobolds three tiles east, and a lone one four tiles north.
+        client.state.map.tile(12, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
+        client.state.map.tile(8, 4).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=102, target_hp=100)
+        task = FarmTask(
+            zone="/test", target="kobold", neutral_targets=True,
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds")
+        return client, task
+
+    def test_wizardry_training_pulls_only_isolated_targets(self):
+        client, task = self._crowded_wizardry_farm()
+        self.assertTrue(task.single_target_wizardry(client))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._engaged_target[0], 102)
+
+    def test_firestorm_lifts_single_target_wizardry(self):
+        client, task = self._crowded_wizardry_farm()
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="firestorm",
+            extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 8}))
+        self.assertFalse(task.single_target_wizardry(client))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._engaged_target[0], 100)
+
+    def test_wizardry_gear_weighs_int_pow_and_mana(self):
+        def ring(name):
+            return Item(1, item_type=c.TYPE_RING, name=name, quality=80,
+                        condition=100)
+        generic = InventoryPolicy()
+        caster = InventoryPolicy(caster_stats=True)
+        pow_ring = ring("copper ring (Pow+1) (item power+1)")
+        mana_ring = ring("bronze ring (mana+5)")
+        plus_ring = ring("silver ring +2")
+        # Generic scoring is unchanged: every "+N" counts the same.
+        self.assertEqual(generic.gear_score(pow_ring), 260 + 16)
+        self.assertEqual(generic.gear_score(mana_ring), 260 + 40)
+        # A caster prefers one point of Pow over five mana or a plain +2.
+        self.assertGreater(caster.gear_score(pow_ring), caster.gear_score(mana_ring))
+        self.assertGreater(caster.gear_score(pow_ring), caster.gear_score(plus_ring))
+        self.assertGreater(caster.gear_score(ring("ring (Int+2)")),
+                           caster.gear_score(pow_ring))
+        self.assertLess(caster.gear_score(ring("ring (Int-1)")),
+                        caster.gear_score(ring("plain ring")))
+
+    def test_wizardry_training_scores_gear_as_a_caster(self):
+        client = self._wizard_training_client(100)
+        task = FarmTask(zone="/test", combat_skill="wizardry spells")
+        asyncio.run(task.maintain_inventory(client))
+        self.assertTrue(task.inventory_policy.caster_stats)
+        melee = FarmTask(zone="/test", combat_skill="slash weapons")
+        asyncio.run(melee.maintain_inventory(client))
+        self.assertFalse(melee.inventory_policy.caster_stats)
+
     def test_skill_training_keeps_spell_pressure_before_finisher_window(self):
         client = self._wizard_training_client(50, x=9, y=8)
         task = FarmTask(

@@ -406,9 +406,16 @@ class LootPolicy:
         return self.take_all or any(re.search(pattern, name) for pattern in self.include)
 
 
+# Gear-score value of one point of each caster bonus while training Wizardry.
+CASTER_STAT_WEIGHTS = {"int": 60, "pow": 60, "mana": 4}
+
+
 @dataclass(slots=True)
 class InventoryPolicy:
     """Conservative local valuation used before equip/sell/deposit decisions."""
+
+    # Score gear for a Wizardry caster (Int, Pow, mana) rather than generically.
+    caster_stats: bool = False
 
     reserve_words: tuple[str, ...] = (
         "quest", "key", "talisman", "artifact", "unique", "exceptional",
@@ -536,9 +543,21 @@ class InventoryPolicy:
             return -1
         quality = 50 if item.quality == 255 else item.quality
         condition = 100 if item.condition == 255 else item.condition
+        name = item.name
+        caster = 0
+        if self.caster_stats:
+            # Wizardry scales with Int and Pow and spends mana: weigh those
+            # bonuses well above a generic "+N", which they no longer count as.
+            def weigh(match: re.Match) -> str:
+                nonlocal caster
+                caster += (int(match.group(2)) *
+                           CASTER_STAT_WEIGHTS[match.group(1).casefold()])
+                return ""
+            name = re.sub(r"\b(Int|Pow|mana)([+-]\d+)", weigh, name,
+                          flags=re.I)
         named_bonus = sum(
-            int(value) for value in re.findall(r"[+]([0-9]+)", item.name))
-        return (quality * 2 + condition + named_bonus * 8 +
+            int(value) for value in re.findall(r"[+]([0-9]+)", name))
+        return (quality * 2 + condition + named_bonus * 8 + caster +
                 (120 if item.flags & c.ITEM_MAGICAL else 0))
 
     def weight_ratio(self, client: AtrinikClient) -> float:
@@ -1176,6 +1195,19 @@ class FarmTask(BotTask):
             item for item in client.state.inventory
             if item.item_type == c.TYPE_SKILL and
             self.combat_skill in item.name.casefold()), None)
+
+    def single_target_wizardry(self, client: AtrinikClient) -> bool:
+        """Whether Wizardry training must fight one creature at a time.
+
+        Until Firestorm can strike several at once, a second creature beside
+        the target only adds damage taken, never Wizardry XP.
+        """
+        return bool(
+            "wizardry" in self.combat_skill and
+            self.training_active(client) and
+            not any(item.item_type == c.TYPE_SPELL and
+                    item.name.casefold() == "firestorm"
+                    for item in client.state.inventory))
 
     def training_active(self, client: AtrinikClient) -> bool:
         skill = self.training_skill_item(client)
@@ -2043,6 +2075,8 @@ class FarmTask(BotTask):
         # cannot postpone shield-safe combat readiness.
         if await self.restore_combat_loadout(client):
             return True
+        self.inventory_policy.caster_stats = bool(
+            "wizardry" in self.combat_skill and self.training_active(client))
         for item in client.state.inventory:
             lore_attempted = getattr(client, "lore_book_attempted", None)
             if (item.item_type == c.TYPE_BOOK and
@@ -3600,6 +3634,16 @@ class FarmTask(BotTask):
                     targets = active
             else:
                 targets = threats
+        if engaged is None and self.single_target_wizardry(client):
+            # Pull only a creature with nobody else within two tiles of it;
+            # one already beside her is fought regardless.
+            others = list(client.state.map.targets(friendly=False))
+            targets = [
+                entry for entry in targets
+                if entry[0] <= 1 or not any(
+                    other.target_id != entry[3].target_id and
+                    max(abs(ox - entry[1]), abs(oy - entry[2])) <= 2
+                    for ox, oy, other in others)]
         if (engaged is None and nearest_threat is not None and
                 nearest_threat[0] > 2):
             pull_candidate = min(
