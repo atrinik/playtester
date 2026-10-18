@@ -39,7 +39,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy,
                     SellJunkTask, TaskStatus,
-                    TempleServiceTask,
+                    TempleFoodTask, TempleServiceTask,
                     corpse_tile_standable, movement_ack_timeout,
                     recent_hostile_attackers,
                     recent_hostile_contact,
@@ -395,6 +395,9 @@ class WorldGraph:
         self._landmarks_by_name: dict[str, list[Waypoint]] = defaultdict(list)
         self.named_spawns: dict[str, list[NamedSpawn]] = defaultdict(list)
         self.dialogue_vendors: list[DialogueVendor] = []
+        # Temple priests (an /interfaces/temples/ dialogue), for services
+        # such as the free food a starving character can ask for.
+        self.temple_priests: list[DialogueVendor] = []
         self.food_profiles: dict[str, FoodProfile] = {}
         self.shop_stocks: dict[str, list[tuple[int, int]]] = defaultdict(list)
         # Savebed ("bed to reality") tiles per map, public and private.
@@ -600,6 +603,13 @@ class WorldGraph:
                         script = str(one(
                             event["attrs"], "race",
                             event_base.get("race")) or "")
+                        if script.startswith("/interfaces/temples/"):
+                            priest = DialogueVendor(
+                                source, x, y, str(name or obj["arch"]),
+                                script, level=spawn_level)
+                            if priest not in self.temple_priests:
+                                self.temple_priests.append(priest)
+                            continue
                         generic_seller = script.endswith((
                             "/generic/merchant.py",
                             "/generic/bartender.py",
@@ -3867,6 +3877,8 @@ class FarmCircuitTask(BotTask):
     BANK_DEPOSIT_WEALTH_OVERRIDE = 10_000
     ROUTINE_TOWN_TRIP_WEIGHT = 0.85
     MASS_IDENTIFY_WEIGHT = 0.70
+    # After a failed temple food request, wait this long before another.
+    TEMPLE_FOOD_RETRY_SECONDS = 600.0
     FOOD_RESUPPLY_QUANTITY = 25
     FOOD_RESUPPLY_NUTRITION = 10_000
     FOOD_RESUPPLY_MAX_QUANTITY = 50
@@ -3954,6 +3966,9 @@ class FarmCircuitTask(BotTask):
         self._unreachable_targets: dict[int, float] = {}
         self._resupply: NavigateThenTask | None = None
         self._resupply_retry_at = 0.0
+        # Whether the running resupply is a shop purchase or temple food.
+        self._resupply_kind = ""
+        self._temple_food_retry_at = 0.0
         self._storage: NavigateThenTask | None = None
         self._storage_retry_at = 0.0
         self._identification: NavigateThenTask | None = None
@@ -4516,10 +4531,63 @@ class FarmCircuitTask(BotTask):
                        any(pattern in item.name.casefold()
                            for pattern in patterns)))
 
-    def _needs_food_resupply(self, client: AtrinikClient) -> bool:
+    def _hungry(self, client: AtrinikClient) -> bool:
         return (self._food_reserve(client) <= 1 and
-                int(client.state.stats.get("food", 1000) or 0) < 180 and
-                self.clock() >= self._resupply_retry_at)
+                int(client.state.stats.get("food", 1000) or 0) < 180)
+
+    def _needs_food_resupply(self, client: AtrinikClient) -> bool:
+        # While shop resupply backs off, a temple can still feed her.
+        now = self.clock()
+        return self._hungry(client) and (
+            now >= self._resupply_retry_at or
+            bool(self.graph.temple_priests) and now >= self._temple_food_retry_at)
+
+    def _settle_resupply(self, client: AtrinikClient) -> None:
+        """Record a finished food resupply and when the next may start."""
+        if self._resupply is None:
+            return
+        temple = self._resupply_kind == "temple"
+        if self._resupply.status == TaskStatus.FAILED:
+            log.warning("%s failed: %s",
+                        "temple food" if temple else "food resupply",
+                        self._resupply.error)
+            if temple:
+                self._temple_food_retry_at = (
+                    self.clock() + self.TEMPLE_FOOD_RETRY_SECONDS)
+            else:
+                self._resupply_retry_at = self.clock() + 1800.0
+            self._resupply = None
+        elif self._resupply.status == TaskStatus.COMPLETE:
+            if not temple and self._hungry(client):
+                # A merchant that offered no matching stock completes without
+                # selling anything; back off so a temple feeds her instead.
+                log.warning("food resupply bought no food; trying a temple")
+                self._resupply_retry_at = self.clock() + 1800.0
+            else:
+                log.info("%s complete; returning to farm circuit",
+                         "temple food" if temple else "food resupply")
+            self._resupply = None
+
+    def _new_temple_food(self, client: AtrinikClient) -> NavigateThenTask | None:
+        """Route to the nearest priest reachable without a threat fallback."""
+        ranked = []
+        for priest in self.graph.temple_priests:
+            navigation = NavigateTask(
+                self.graph, priest.map_path, (priest.x, priest.y), tolerance=2)
+            try:
+                route = navigation._plan(client)
+            except ValueError:
+                continue
+            if not navigation._threat_fallback:
+                ranked.append((len(route), priest.name.casefold(), priest))
+        if not ranked:
+            return None
+        priest = min(ranked, key=lambda entry: entry[:-1])[-1]
+        task = NavigateThenTask(
+            self.graph, priest.map_path, TempleFoodTask(priest.name),
+            destination_xy=(priest.x, priest.y), combat_approach=True)
+        task.navigation.tolerance = 2
+        return task
 
     def _food_resupply_quantity(
             self, client: AtrinikClient, profile: FoodProfile) -> int:
@@ -5817,13 +5885,7 @@ class FarmCircuitTask(BotTask):
             return
         if self._resupply is not None:
             await self._resupply.tick(client)
-            if self._resupply.status == TaskStatus.FAILED:
-                log.warning("food resupply failed: %s", self._resupply.error)
-                self._resupply_retry_at = self.clock() + 1800.0
-                self._resupply = None
-            elif self._resupply.status == TaskStatus.COMPLETE:
-                log.info("food resupply complete; returning to farm circuit")
-                self._resupply = None
+            self._settle_resupply(client)
             return
         farm = self.child.task
         # All active maintenance branches returned above. Checkpoint only at
@@ -5880,11 +5942,19 @@ class FarmCircuitTask(BotTask):
         # carrying pressure; discretionary shopping is always last.
         if (isinstance(farm, FarmTask) and self._needs_food_resupply(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
-            await client.clear_actions()
-            await client.set_combat(False)
-            self._resupply = self._new_food_resupply(client)
-            await self._resupply.tick(client)
-            return
+            if self.clock() >= self._resupply_retry_at:
+                resupply, kind = self._new_food_resupply(client), "shop"
+            else:
+                resupply, kind = self._new_temple_food(client), "temple"
+                if resupply is None:
+                    self._temple_food_retry_at = (
+                        self.clock() + self.TEMPLE_FOOD_RETRY_SECONDS)
+            if resupply is not None:
+                await client.clear_actions()
+                await client.set_combat(False)
+                self._resupply, self._resupply_kind = resupply, kind
+                await self._resupply.tick(client)
+                return
         if (isinstance(farm, FarmTask) and
                 not self._busy_finishing_fight_or_loot(client, farm) and
                 self._queue_inventory_capability(
