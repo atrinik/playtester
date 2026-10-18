@@ -8,7 +8,7 @@ import time
 from .client import AtrinikClient
 from .catalog_quest_tasks import CatalogQuestTask, POLICIES
 from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
-                         analyzer_farm_selection)
+                         analyzer_farm_selection, hungry, temple_food_trip)
 from .quest_tasks import EscapingDesertedIslandTask
 from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
 
@@ -42,7 +42,58 @@ class AutoplayTask(BotTask):
         self._retry_at = 0.0
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
+        self._temple_food_retry_at = 0.0
         self.safety = SafetyPolicy()
+
+    def _needs_temple_food(self, client: AtrinikClient) -> bool:
+        """Starving where nothing else will feed her.
+
+        The farm circuit feeds her itself unless one of its maintenance trips
+        is under way, and a hostile-route abort finishes first. Any other phase can outlast her food: a slow, depleted
+        character once starved to death still walking to the apartment chest.
+        """
+        # Login and reconnect enter "playing" before the inventory replay;
+        # the food she carries is unknown until it arrives.
+        if (not getattr(client.state, "inventory_replay_complete", True) or
+                time.monotonic() < self._temple_food_retry_at or
+                not hungry(client)):
+            return False
+        child = self.child
+        if child is None:
+            return True
+        if self.phase == "temple-food":
+            return False
+        if isinstance(child, FarmCircuitTask):
+            return child.needs_outside_food()
+        # Once Gandyld's quest has started, the starter is handing over the
+        # crystal; replacing it then loses the reward until a checkpoint
+        # reconnect, and apartment recovery would look for it in vain.
+        return not (self.phase == "mana-crystal-starter" and
+                    self.MANA_CRYSTAL_QUEST in client.state.quests)
+
+    async def _start_temple_food(self, client: AtrinikClient) -> bool:
+        """Pause the current phase for the free temple food service."""
+        trip = temple_food_trip(self.graph, client)
+        if trip is None:
+            self._temple_food_retry_at = (
+                time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+            log.warning("starving, but no temple priest is reachable")
+            return False
+        paused = f"{self.phase}: {self.child.name}" if self.child else "idle"
+        if self.phase == "mana-crystal-recovery":
+            # Interrupted before an outcome; it runs again once she has eaten.
+            self._mana_recovery_attempted = False
+        await client.clear_actions()
+        await client.set_combat(False)
+        await client.clear_target()
+        await self._set_child(client, "temple-food", trip)
+        self._retry_at = 0.0
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("autoplay-hunger",
+                     f"food {int(client.state.stats.get('food', 0) or 0)}; "
+                     f"paused {paused}")
+        return True
 
     def _needs_mana_crystal_start(self, client: AtrinikClient) -> bool:
         """Collect Gandyld's safe 50-SP opening reward exactly once."""
@@ -142,6 +193,10 @@ class AutoplayTask(BotTask):
         if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
             return
 
+        if (self._needs_temple_food(client) and
+                await self._start_temple_food(client)):
+            return
+
         if time.monotonic() < self._retry_at:
             await self.safety.enforce(client)
             return
@@ -177,6 +232,10 @@ class AutoplayTask(BotTask):
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
                 return
             if self.child.status == TaskStatus.FAILED:
+                if self.phase == "temple-food":
+                    self._temple_food_retry_at = (
+                        time.monotonic() +
+                        FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
                 await self._recover_child_failure(client)
                 return
             completed_phase = self.phase
