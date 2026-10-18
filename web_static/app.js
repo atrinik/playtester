@@ -121,7 +121,7 @@ let lastFarmingSig = "";
 function renderFarming() {
   const fa = slow.farming_analysis;
   if (!fa) return;
-  const sig = JSON.stringify([fa.status, fa.objective, fa.finished_at, fa.error, fa.running, fa.self_improvement, fa.savebed]);
+  const sig = JSON.stringify([fa.status, fa.objective, fa.selected_objective, fa.objective_override, fa.finished_at, fa.error, fa.running, fa.self_improvement, fa.savebed]);
   const status = $("#fa-status");
   status.classList.toggle("warn-text", fa.status === "failed" || fa.status === "unsupported");
   status.textContent = fa.running ? "Analyzing…"
@@ -131,12 +131,16 @@ function renderFarming() {
     : fa.status === "unavailable" ? "Analyzer unavailable" : "Waiting for the first run";
   if (sig === lastFarmingSig) return;
   lastFarmingSig = sig;
+  const chosen = fa.selected_objective || fa.objective;
   $("#fa-objectives").innerHTML = Object.entries(fa.objectives || {}).map(([key, label]) =>
-    `<button role="radio" aria-checked="${key === fa.objective}" class="${key === fa.objective ? "active" : ""}" data-objective="${esc(key)}">${esc(label)}</button>`).join("");
+    `<button role="radio" aria-checked="${key === chosen}" class="${key === chosen ? "active" : ""}" data-objective="${esc(key)}">${esc(label)}</button>`).join("");
   const p = fa.profile;
-  $("#fa-profile").textContent = p
-    ? `Simulating ${p.skill} ${p.skill_level} · DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing · HP ${p.max_health} · AC ${p.armour_class}`
+  const override = fa.objective_override
+    ? `Farming for ${(fa.objectives || {})[fa.objective] || fa.objective} while depleted (${fa.objective_override.points} points); back to ${(fa.objectives || {})[chosen] || chosen} once cured. `
     : "";
+  $("#fa-profile").textContent = override + (p
+    ? `Simulating ${p.skill} ${p.skill_level} · DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing · HP ${p.max_health} · AC ${p.armour_class}`
+    : "");
   $("#fa-ranking").innerHTML = (fa.ranking || []).map((r, i) => `
     <div class="spot${i === 0 ? " top" : ""}">
       <div class="spot-head"><b>#${i + 1} ${esc(r.name)}</b><span class="flag">${esc(String(r.region || "").replace(/_/g, " "))}</span></div>

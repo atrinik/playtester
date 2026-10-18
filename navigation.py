@@ -3542,6 +3542,21 @@ def analyzer_spot_legs(spot: dict, graph: "WorldGraph") -> tuple[tuple[str, str]
     return tuple(legs)
 
 
+def effective_farm_objective(state) -> str:
+    """The objective farming follows right now.
+
+    While depletion is at the temple-service threshold, its lowered stats
+    make the chosen objective's spots deadly, so farming falls back to the
+    safest spots until the temple removes it; then the choice applies again.
+    """
+    chosen = getattr(state, "farm_objective", DEFAULT_OBJECTIVE)
+    if (getattr(state, "depletion_points_known", False) and
+            int(getattr(state, "depletion_points", 0) or 0) >=
+            FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD):
+        return "safety"
+    return chosen
+
+
 def analyzer_farm_selection(
         client: AtrinikClient, graph: "WorldGraph"
 ) -> tuple[tuple[tuple[str, str], ...], dict] | None:
@@ -3554,7 +3569,7 @@ def analyzer_farm_selection(
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
         return None
-    objective = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
+    objective = effective_farm_objective(client.state)
     quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
     now = time.time()
     for spot in analyzer.ranking(objective):

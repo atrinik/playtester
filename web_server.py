@@ -23,8 +23,8 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
-from .navigation import (analyzer_spot_legs, FarmCircuitTask, NavigateTask, NavigateThenTask,
-                         ShopUpgradeSweepTask, WorldGraph)
+from .navigation import (analyzer_spot_legs, effective_farm_objective, FarmCircuitTask,
+                         NavigateTask, NavigateThenTask, ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
 from .quest_tasks import EscapingDesertedIslandTask
 from .quests import QuestDefinition, QuestObjective, flatten_parts, load_catalog
@@ -581,7 +581,7 @@ class DashboardState:
         analyzer = getattr(self.client, "farm_analyzer", None)
         if analyzer is None:
             return []
-        objective = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
+        objective = effective_farm_objective(self.client.state)
         spots = []
         for rank, spot in enumerate(analyzer.ranking(objective), 1):
             legs = analyzer_spot_legs(spot, self.graph)
@@ -596,12 +596,19 @@ class DashboardState:
 
     def farming_analysis(self) -> dict[str, Any]:
         analyzer = getattr(self.client, "farm_analyzer", None)
-        objective = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
+        chosen = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
+        objective = effective_farm_objective(self.client.state)
         if analyzer is None:
             snapshot = {"status": "unavailable", "objective": objective,
                         "objectives": OBJECTIVES, "ranking": []}
         else:
             snapshot = dict(analyzer.snapshot(objective))
+        # The ranking follows what she farms now; the toggle shows the choice.
+        snapshot["selected_objective"] = chosen
+        snapshot["objective_override"] = (
+            {"reason": "depletion",
+             "points": int(self.client.state.depletion_points)}
+            if objective != chosen else None)
         adaptations = getattr(self.client.state, "farm_adaptations", {}) or {}
         recent = sorted(adaptations.items(),
                         key=lambda item: float(item[1].get("updated_at", 0) or 0),

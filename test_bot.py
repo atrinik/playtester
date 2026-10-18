@@ -11823,6 +11823,17 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
         client.state.farm_objective = "money"
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Gold")
+        # Depleted at the temple threshold: the safest ranking applies until
+        # the temple removes it, then the chosen objective again.
+        client.state.farm_objective = "xp"
+        client.farm_analyzer.rankings["safety"] = [pocket]
+        client.state.depletion_points_known = True
+        client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
+        client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD - 1
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
+        client.state.depletion_points = 0
+        client.state.farm_objective = "money"
         client.state.farm_objective = "xp"
         client.state.farm_zone_quarantine = {self.TREES: time.time() + 60}
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
@@ -12270,7 +12281,19 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(learning["goals"], {"area_spells": True, "protection": {"fire": 1},
                                              "offence": 1, "healing": 0})
         self.assertEqual(analysis["objective"], "xp")
+        self.assertEqual(analysis["selected_objective"], "xp")
+        self.assertIsNone(analysis["objective_override"])
         self.assertIn("money", analysis["objectives"])
+        # Depleted: she farms for safety, and the toggle keeps the choice.
+        self.client.state.depletion_points_known = True
+        self.client.state.depletion_points = 32
+        status, payload = await self.request("GET", "/api/state?include=farming_analysis")
+        analysis = json.loads(payload)["farming_analysis"]
+        self.assertEqual((analysis["objective"], analysis["selected_objective"]),
+                         ("safety", "xp"))
+        self.assertEqual(analysis["objective_override"],
+                         {"reason": "depletion", "points": 32})
+        self.client.state.depletion_points = 0
         status, payload = await self.request(
             "POST", "/api/action", {"type": "farm_objective", "objective": "money"})
         self.assertEqual(status, 200, payload)
