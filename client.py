@@ -1183,7 +1183,6 @@ class AtrinikClient:
                               "you have died.")
         if died:
             self.record_action("death", text)
-            self._record_post_mortem()
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a
             # post-death window for protocol/order variants that arrive later.
@@ -1197,6 +1196,8 @@ class AtrinikClient:
                     "depletion",
                     f"point {self.state.depletion_points}: {message}")
             self._death_depletion_until = now + 8.0
+            # After the bookkeeping above, so its depletion records are in it.
+            self._record_post_mortem()
         death_loss = normalized in death_losses
         direct_drain = any(normalized == marker for marker in direct_drains)
         if death_loss and now > self._death_depletion_until:

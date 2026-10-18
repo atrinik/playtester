@@ -1196,6 +1196,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("Sera starved to death.", texts)
         self.assertIn("You feel clumsy!", texts)
         self.assertIn("death", [entry["action"] for entry in death["actions"]])
+        # The stat loss buffered before the death is counted with it, and the
+        # post-mortem includes that bookkeeping.
+        self.assertIn("depletion", [entry["action"] for entry in death["actions"]])
+        self.assertIn("depletion", [entry["action"] for entry in death["decisions"]])
         # A player's chat quoting a notice is no death.
         say("[a=#charname]Mallory[/a]: YOU HAVE DIED.", c.CHAT_TYPE_CHAT)
         say("[a=#charname]Mallory[/a] tells you: You have been defeated in combat!",
