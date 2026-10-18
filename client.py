@@ -173,9 +173,9 @@ class AtrinikClient:
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: list[list[float]] = []
         self.post_mortems: list[dict] = []
-        # (arrived_at, path, x, y) of her square, and of the one before it.
-        self._location: tuple[float, str, int, int] | None = None
-        self._location_before: tuple[float, str, int, int] | None = None
+        # (time, path, x, y, previous death) of the latest death, until its
+        # post-death window closes and its record is rebuilt.
+        self._post_mortem_pending: tuple[float, str, int, int, float] | None = None
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -201,9 +201,8 @@ class AtrinikClient:
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
         deaths = memory.load(character, "post_mortems", [])
-        self.post_mortems = [
-            value for value in deaths if isinstance(value, dict)
-        ][-post_mortem.KEEP:] if isinstance(deaths, list) else []
+        restored = [post_mortem.restore(value) for value in deaths] if isinstance(deaths, list) else []
+        self.post_mortems = [value for value in restored if value][-post_mortem.KEEP:]
         if isinstance(record, dict) and "depletion_points" in record:
             self.state.depletion_points = max(
                 0, int(record.get("depletion_points", 0)))
@@ -533,12 +532,6 @@ class AtrinikClient:
         if (old_path and old_path != m.path and "/apartments/" in old_path and
                 "/apartments/" not in m.path and not self._recently_moved_by_force()):
             self.set_apartment_return(old_path, m.path, m.world_x, m.world_y)
-        # The square she is on, since when, and the square before it: a death
-        # report needs the fight's place, not the respawn's (on any map).
-        here = (m.path, m.world_x, m.world_y)
-        if self._location is None or self._location[1:] != here:
-            self._location_before = self._location
-            self._location = (time.time(), *here)
 
     def _recently_moved_by_force(self, seconds: float = 15.0) -> bool:
         """Whether a death or recall, not an exit, may explain a map change."""
@@ -725,22 +718,42 @@ class AtrinikClient:
                     character, "decisions", self.decision_history)
 
     def _record_post_mortem(self) -> None:
-        """Keep what happened in the minute before this death."""
-        now = time.time()
-        previous = float(self.post_mortems[-1].get("time", 0.0) or 0.0) if self.post_mortems else 0.0
+        """Keep what happened in the minute before this death.
+
+        kill_player queues its notice before the savebed transfer's map update,
+        which goes out at the end of the server tick, so the square she is on
+        now is where she fell. The record is written at once and rebuilt when
+        the post-death window closes, so lines sent after the notice are in it.
+        """
+        self._finish_post_mortem()
+        previous = self.post_mortems[-1]["time"] if self.post_mortems else 0.0
         m = self.state.map
-        path, x, y = m.path, m.world_x, m.world_y
-        # kill_player moves her to the savebed before "YOU HAVE DIED.": just
-        # moved onto the savebed means she died where she was before it.
-        arrived = self._location[0] if self._location else 0.0
-        if (self._location_before is not None and now - arrived <= post_mortem.RESPAWN_SECONDS and
-                path == self.state.savebed_map and (x, y) == self.state.savebed_xy):
-            _, path, x, y = self._location_before
-        self.post_mortems.append(post_mortem.build(
-            now, path, x, y, self.vitals,
-            self.state.messages, self.action_history, self.decision_history,
-            since=previous, name=self.state.player_name or self.config.character))
+        self._post_mortem_pending = (time.time(), m.path, m.world_x, m.world_y, previous)
+        self.post_mortems.append(self._build_post_mortem(self._post_mortem_pending))
         del self.post_mortems[:-post_mortem.KEEP]
+        self._save_post_mortems()
+
+    def _build_post_mortem(self, death: tuple[float, str, int, int, float]) -> dict:
+        when, path, x, y, previous = death
+        return post_mortem.build(
+            when, path, x, y, self.vitals,
+            self.state.messages, self.action_history, self.decision_history,
+            since=previous, name=self.state.player_name or self.config.character)
+
+    def _finish_post_mortem(self, now: float | None = None) -> None:
+        """Rebuild the latest death's record once its post-death window closed.
+
+        Without ``now`` it is rebuilt at once, before the next death.
+        """
+        pending = self._post_mortem_pending
+        if pending is None or now is not None and now < pending[0] + post_mortem.AFTER_SECONDS:
+            return
+        self._post_mortem_pending = None
+        if self.post_mortems and self.post_mortems[-1]["time"] == pending[0]:
+            self.post_mortems[-1] = self._build_post_mortem(pending)
+            self._save_post_mortems()
+
+    def _save_post_mortems(self) -> None:
         character = self.state.player_name
         if character:
             self._memory_store().save(character, "post_mortems", self.post_mortems)
@@ -962,6 +975,7 @@ class AtrinikClient:
                 and packet_type not in (c.C_VERSION, c.C_ACCESS_POLICY,
                                         c.C_ACCESS_RESULT, c.C_KEEPALIVE)):
             raise ProtocolError("application packet before access admission")
+        self._finish_post_mortem(time.time())
         handlers = {
             c.C_VERSION: self._handle_version,
             c.C_ACCESS_POLICY: self._handle_access_policy,

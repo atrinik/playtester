@@ -9,6 +9,7 @@ without trawling the logs.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Iterable
 
@@ -21,8 +22,9 @@ VITALS_SECONDS = 600.0
 VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 # Vital samples stored per post-mortem, spread over its whole window.
 MAX_VITALS = 120
-# The respawn transfer lands this soon before the death notice.
-RESPAWN_SECONDS = 5.0
+# Messages and samples this long after the notice still belong to the death
+# (a PvP defeat's "Local medics" line, late stat packets).
+AFTER_SECONDS = 2.0
 
 
 def spread(samples: list, limit: int = MAX_VITALS) -> list:
@@ -36,6 +38,47 @@ def spread(samples: list, limit: int = MAX_VITALS) -> list:
 def sample(stats: dict) -> list[float]:
     """One vitals sample: [time, hp, maxhp, sp, maxsp, food]."""
     return [time.time(), *(int(stats.get(key, 0) or 0) for key in VITAL_KEYS)]
+
+
+def restore(entry: Any) -> dict[str, Any] | None:
+    """A stored post-mortem in the shape the client and dashboard read, or None."""
+    if not isinstance(entry, dict):
+        return None
+    try:
+        when = float(entry["time"])
+        x, y = int(entry.get("x", 0)), int(entry.get("y", 0))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(when):
+        return None
+
+    def records(key: str) -> list[dict]:
+        value = entry.get(key)
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    def rows(key: str, size: int) -> list[list]:
+        value = entry.get(key)
+        return ([list(item) for item in value
+                 if isinstance(item, (list, tuple)) and len(item) >= size]
+                if isinstance(value, list) else [])
+
+    def counts(key: str) -> dict[str, int]:
+        value = entry.get(key)
+        return ({str(name): count for name, count in value.items()
+                 if isinstance(count, (int, float))} if isinstance(value, dict) else {})
+
+    def number(key: str) -> int:
+        value = entry.get(key)
+        return int(value) if isinstance(value, (int, float)) and math.isfinite(value) else 0
+
+    return {
+        "time": when, "map": str(entry.get("map") or ""), "x": x, "y": y,
+        "cause": str(entry.get("cause") or ""), "detail": str(entry.get("detail") or ""),
+        "attackers": counts("attackers"), "peak_attackers": number("peak_attackers"),
+        "damage_taken": number("damage_taken"), "damage_by_type": counts("damage_by_type"),
+        "vitals": rows("vitals", 1 + len(VITAL_KEYS)), "messages": rows("messages", 2),
+        "actions": records("actions"), "decisions": records("decisions"),
+    }
 
 
 def _within(stamp: Any, start: float, end: float) -> bool:
@@ -53,7 +96,7 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
 
     ``since`` is the previous death: nothing from that earlier life counts.
     """
-    start, end = max(when - REVIEW_WINDOW_SECONDS, since), when + 2.0
+    start, end = max(when - REVIEW_WINDOW_SECONDS, since), when + AFTER_SECONDS
     messages = list(messages)
     decisions = list(decisions)
     # The server tells everyone "<name> starved to death." as the whole

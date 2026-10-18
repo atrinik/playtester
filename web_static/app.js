@@ -186,7 +186,7 @@ function renderDeaths() {
     return `<div class="spot">
       <div class="spot-head"><b>${when} · ${esc(String(d.map || "").replace(/^.*\//, ""))} (${d.x}, ${d.y})</b><span class="flag">${esc(d.cause)}</span></div>
       <small>${esc(d.detail)}${d.damage_taken ? ` · ${d.damage_taken} damage${types ? ` (${types})` : ""}` : ""}${who ? ` · ${who}` : ""}</small>
-      ${vitalsChart(d)}${did ? `<div class="post-mortem-activity">${did}</div>` : ""}${last}
+      ${vitalsChart(d)}${did}${last}
     </div>`;
   }).join("") || '<span class="muted">No deaths recorded yet.</span>';
 }

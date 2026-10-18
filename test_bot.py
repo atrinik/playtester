@@ -1221,36 +1221,60 @@ class ProtocolTests(unittest.TestCase):
             say("YOU HAVE DIED.")
         self.assertEqual(len(client.post_mortems), post_mortem.KEEP)
 
-    def test_a_post_mortem_names_where_she_died_not_where_she_respawned(self):
+    def test_a_post_mortem_names_the_square_of_the_death_notice(self):
         client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
         swamp, bed = "/shattered_islands/world_1_50", "/shattered_islands/world_0_68"
         client.set_savebed = lambda *args: None
         client.state.savebed_map, client.state.savebed_xy = bed, (4, 7)
 
-        def arrive(path, x, y):
-            m = MapState(path=path, world_x=x, world_y=y)
-            client._observe_map_change(client.state.map.path, m)
-            client.state.map = m
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
 
-        def die():
-            data = bytes((2,)) + b"ffffff\0YOU HAVE DIED.\0"
-            asyncio.run(client._handle_drawinfo(Cursor(data), data))
-            death = client.post_mortems[-1]
-            return death["map"], death["x"], death["y"]
+        # kill_player queues the notice before the savebed transfer's map
+        # update, so the square at the notice is where she fell, even one she
+        # just walked onto, the savebed included.
+        client.state.map = MapState(path=swamp, world_x=10, world_y=3)
+        say("You have been defeated in combat!")
+        client.state.map = MapState(path=bed, world_x=4, world_y=7)
+        say("Local medics have saved your life...")
+        death = client.post_mortems[-1]
+        self.assertEqual((death["map"], death["x"], death["y"]), (swamp, 10, 3))
+        # The record is rebuilt once the post-death window closes, with the
+        # lines sent after the notice, and at the same place.
+        when = client._post_mortem_pending[0]
+        client._post_mortem_pending = (when - 3, *client._post_mortem_pending[1:])
+        client.post_mortems[-1]["time"] = when - 3
+        client.state.messages.append((when - 1, 2, "Local medics have saved your life..."))
+        say("You feel much better.")
+        self.assertIsNone(client._post_mortem_pending)
+        death = client.post_mortems[-1]
+        self.assertIn("Local medics have saved your life...", [text for _, text in death["messages"]])
+        self.assertEqual((death["map"], death["x"], death["y"]), (swamp, 10, 3))
+        say("YOU HAVE DIED.")
+        death = client.post_mortems[-1]
+        self.assertEqual((death["map"], death["x"], death["y"]), (bed, 4, 7))
+        self.assertEqual(len(client.post_mortems), 2)
 
-        arrive(swamp, 9, 3)
-        arrive(swamp, 10, 3)
-        # kill_player moves her to the savebed before the death notice.
-        arrive(bed, 4, 7)
-        self.assertEqual(die(), (swamp, 10, 3))
-        # Standing on the savebed for a while, a death there is the savebed's.
-        client._location = (client._location[0] - 60, *client._location[1:])
-        self.assertEqual(die(), (bed, 4, 7))
-        # A savebed on the death's own map: the square before the transfer.
-        client.state.savebed_map, client.state.savebed_xy = swamp, (1, 1)
-        arrive(swamp, 9, 3)
-        arrive(swamp, 1, 1)
-        self.assertEqual(die(), (swamp, 9, 3))
+    def test_stored_post_mortems_are_validated_on_load(self):
+        from . import post_mortem
+
+        self.assertIsNone(post_mortem.restore({"time": "invalid"}))
+        self.assertIsNone(post_mortem.restore({"time": float("nan")}))
+        self.assertIsNone(post_mortem.restore("x"))
+        restored = post_mortem.restore({
+            "time": "12.5", "map": None, "x": "3", "y": 4, "cause": 7,
+            "attackers": {"rat": 2, "bad": "x"}, "damage_taken": "lots",
+            "vitals": [[1, 2, 3, 4, 5, 6], [1]], "messages": [[1, "hi"], "x"],
+            "decisions": [{"action": "heal"}, None], "actions": "x"})
+        self.assertEqual((restored["time"], restored["map"], restored["x"], restored["cause"]),
+                         (12.5, "", 3, "7"))
+        self.assertEqual(restored["attackers"], {"rat": 2})
+        self.assertEqual(restored["damage_taken"], 0)
+        self.assertEqual((len(restored["vitals"]), restored["messages"], restored["actions"]),
+                         (1, [[1, "hi"]], []))
+        self.assertEqual(restored["decisions"], [{"action": "heal"}])
 
     def test_post_mortem_describes_the_fight_inside_the_window(self):
         from .post_mortem import build
