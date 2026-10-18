@@ -729,10 +729,18 @@ class AtrinikClient:
             self._persist_trends()
 
     def _persist_trends(self) -> None:
-        """Save the trend buckets once a minute, when a new one starts."""
+        """Save the trend buckets once a minute, when a new one starts.
+
+        Best effort: a full or read-only disk, or a locked database, must
+        never stop play or abort a clean shutdown for dashboard telemetry.
+        """
         character = self.state.player_name
-        if character:
+        if not character:
+            return
+        try:
             self._memory_store().save(character, "trends", self.trends.buckets)
+        except Exception as error:
+            log.warning("could not save trends for %s: %s", character, error)
 
     def _load_faces(self) -> dict[int, str]:
         faces: dict[int, str] = {}

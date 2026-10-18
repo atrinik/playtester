@@ -1196,6 +1196,43 @@ class ProtocolTests(unittest.TestCase):
         # Restored buckets survive; garbage does not.
         self.assertEqual(len(Trends([{"t": 60, "exp": 1}, "x", {"exp": 2}]).buckets), 1)
 
+    def test_trend_rates_age_with_the_poll_and_survive_clock_steps(self):
+        from .trends import Trends
+
+        trends = Trends()
+        state = GameState(phase="playing", player_tag=7)
+        state.stats.update(exp=1000, food=500, hp=100, maxhp=100)
+        start = 2_000_040.0
+        trends.observe(state, start)
+        trends.count("deaths", start + 10)
+        self.assertEqual(trends.summary(start + 30)["points"][-1]["deaths_per_hour"], 1)
+        # No new minute is recorded for two hours: the latest point is the
+        # poll time's minute, and the death has aged out of its hour.
+        quiet = trends.summary(start + 2 * 3600)
+        self.assertEqual(quiet["points"][-1]["t"], int((start + 2 * 3600) // 60 * 60))
+        self.assertEqual(quiet["points"][-1]["deaths_per_hour"], 0)
+        self.assertEqual(quiet["points"][-1]["food"], 500)
+        # The wall clock steps back two minutes and catches up again: every
+        # minute keeps one bucket and the buckets stay in time order.
+        trends.observe(state, start + 600)
+        trends.observe(state, start + 480)
+        trends.count("heals", start + 600)
+        times = [bucket["t"] for bucket in trends.buckets]
+        self.assertEqual(times, sorted(set(times)))
+        self.assertEqual(sum(bucket["heals"] for bucket in trends.buckets), 1)
+
+    def test_a_failed_trend_save_never_stops_the_client(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.player_name = "Sera"
+
+        class FullDisk:
+            def save(self, *args):
+                raise OSError(28, "No space left on device")
+
+        client._memory_store = lambda: FullDisk()
+        with self.assertLogs("atrinik_bot.client", "WARNING"):
+            client._persist_trends()
+
     def test_client_counts_heals_and_deaths_into_trends(self):
         client = AtrinikClient(ClientConfig())
 

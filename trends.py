@@ -8,6 +8,7 @@ healing constantly, XP stalling, food running out) shows at a glance.
 
 from __future__ import annotations
 
+import bisect
 import time
 from typing import Any, Iterable
 
@@ -15,23 +16,28 @@ BUCKET_SECONDS = 60
 KEEP_SECONDS = 24 * 3600
 # Points drawn per series: one per five minutes over the day.
 MAX_POINTS = 288
+# Last known values carried into each new minute.
+LEVELS = ("exp", "level", "food", "hp", "depletion")
 
 
 class Trends:
     def __init__(self, buckets: Iterable[dict] | None = None):
-        self.buckets: list[dict] = [
-            dict(bucket) for bucket in (buckets or ()) if isinstance(bucket, dict) and
-            isinstance(bucket.get("t"), (int, float))]
+        self.buckets: list[dict] = sorted(
+            (dict(bucket) for bucket in (buckets or ()) if isinstance(bucket, dict) and
+             isinstance(bucket.get("t"), (int, float))), key=lambda bucket: bucket["t"])
 
     def _bucket(self, now: float) -> tuple[dict, bool]:
         start = int(now // BUCKET_SECONDS * BUCKET_SECONDS)
-        if self.buckets and self.buckets[-1]["t"] == start:
-            return self.buckets[-1], False
-        previous = self.buckets[-1] if self.buckets else {}
+        # Kept in time order even when the wall clock steps backwards: a
+        # minute that already has a bucket reuses it wherever it is.
+        index = bisect.bisect_left([bucket["t"] for bucket in self.buckets], start)
+        if index < len(self.buckets) and self.buckets[index]["t"] == start:
+            return self.buckets[index], False
+        previous = self.buckets[index - 1] if index else {}
         bucket = {"t": start, "deaths": 0, "heals": 0,
-                  **{key: previous.get(key) for key in ("exp", "level", "food", "hp", "depletion")}}
-        self.buckets.append(bucket)
-        cutoff = start - KEEP_SECONDS
+                  **{key: previous.get(key) for key in LEVELS}}
+        self.buckets.insert(index, bucket)
+        cutoff = self.buckets[-1]["t"] - KEEP_SECONDS
         while self.buckets and self.buckets[0]["t"] < cutoff:
             self.buckets.pop(0)
         return bucket, True
@@ -62,7 +68,14 @@ class Trends:
     def summary(self, now: float | None = None) -> dict[str, Any]:
         """Hourly rates and levels over the day, downsampled for drawing."""
         now = time.time() if now is None else now
-        buckets = [bucket for bucket in self.buckets if bucket["t"] >= now - KEEP_SECONDS]
+        buckets = [bucket for bucket in self.buckets
+                   if now - KEEP_SECONDS <= bucket["t"] <= now]
+        # The latest row is always the current minute, so the hourly rates
+        # age against the poll time even when no new minute was recorded.
+        current = int(now // BUCKET_SECONDS * BUCKET_SECONDS)
+        if buckets and buckets[-1]["t"] < current:
+            buckets.append({"t": current, "deaths": 0, "heals": 0,
+                            **{key: buckets[-1].get(key) for key in LEVELS}})
         rows = []
         first_index = 0
         for index, bucket in enumerate(buckets):
