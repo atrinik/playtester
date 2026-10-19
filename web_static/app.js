@@ -175,7 +175,11 @@ function vitalsChart(pm) {
   const t0 = pm.time - 60, w = 240, h = 48;
   // The window is the 60 seconds ending at the death.
   const x = t => Math.max(0, Math.min(w, ((t - t0) / 60) * w)).toFixed(1);
-  const line = (pick, cls) => `<polyline class="${cls}" points="${v.map(s => `${x(s[0])},${(h - Math.max(0, Math.min(1, pick(s))) * h).toFixed(1)}`).join(" ")}"/>`;
+  // Samples are taken only when a vital changes: it holds its value until
+  // the next one, so each trace is drawn as steps, not interpolated.
+  const y = (pick, s) => (h - Math.max(0, Math.min(1, pick(s))) * h).toFixed(1);
+  const line = (pick, cls) => `<polyline class="${cls}" points="${v.map((s, i) =>
+    (i ? `${x(s[0])},${y(pick, v[i - 1])} ` : "") + `${x(s[0])},${y(pick, s)}`).join(" ")}"/>`;
   return `<svg class="vitals-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Health, spell points and food over the last minute">`
     + line(s => s[1] / Math.max(1, s[2]), "hp") + line(s => s[3] / Math.max(1, s[4]), "sp")
     + line(s => s[5] / 1000, "food") + "</svg>";

@@ -1245,6 +1245,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(death["damage_taken"], 520)
         self.assertEqual(death["attackers"], {"giant rat": 520})
 
+    def test_restoring_post_mortems_inspects_a_bounded_number_of_candidates(self):
+        from . import post_mortem
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client._memory_store().save("Sera", "post_mortems", [{"time": "invalid"}] * 10000)
+            calls = []
+            original = post_mortem.restore
+            with patch.object(post_mortem, "restore", lambda value: calls.append(1) or original(value)):
+                client.load_character_memory("Sera")
+            self.assertLessEqual(len(calls), 4 * post_mortem.KEEP)
+            self.assertEqual(client.post_mortems, [])
+
     def test_switching_characters_drops_the_previous_ones_transient_history(self):
         with tempfile.TemporaryDirectory() as directory:
             client = AtrinikClient(ClientConfig(
@@ -1407,6 +1420,24 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn([when - 0.2, 0, 155, 0, 39, 900], death["vitals"])
         # The recovery after the death is not part of its report.
         self.assertTrue(all(sample[0] <= when for sample in death["vitals"]))
+        # Every charted vital keeps its low: a brief SP and food dip survives.
+        dips = [[when - 59 + index * 0.4, 100, 155, 30, 39, 900] for index in range(140)]
+        dips[37] = [dips[37][0], 100, 155, 0, 39, 900]
+        dips[71] = [dips[71][0], 100, 155, 30, 39, 5]
+        kept = post_mortem.build(when, "/a", 1, 2, dips, [], [], [])["vitals"]
+        self.assertIn(dips[37], kept)
+        self.assertIn(dips[71], kept)
+        # Only textual scalars are restored as text: a stored list never is.
+        self.assertEqual(post_mortem.restore({"time": 5, "detail": list(range(100000))})["detail"], "")
+        self.assertEqual(post_mortem.restore({"time": 5, "cause": 7})["cause"], "7")
+        # The most distinct attackers inside any pack window, in time order.
+        from .self_improvement import PACK_WINDOW_SECONDS, review_failure
+        fight = [(when - 40, 2, "", "rat hit you for 1 (-1) impact damage."),
+                 (when - 39, 2, "", "ant hit you for 1 (-1) impact damage."),
+                 (when - 38, 2, "", "slug hit you for 1 (-1) impact damage."),
+                 (when - 38 + PACK_WINDOW_SECONDS + 5, 2, "", "rat hit you for 1 (-1) impact damage.")]
+        review = review_failure(fight, [], {"time": when, "action": "death"}, [])
+        self.assertEqual(review.peak_attackers, 3)
 
     def test_post_mortem_describes_the_fight_inside_the_window(self):
         from .post_mortem import build

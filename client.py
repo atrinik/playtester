@@ -217,11 +217,12 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
-        # Newest first, stopping at KEEP valid reports: an oversized stored
-        # list is never normalized whole.
+        # Newest first, stopping at KEEP valid reports, and looking at no more
+        # than a few times KEEP candidates: an oversized stored list, valid or
+        # not, is never normalized whole.
         deaths = memory.load(character, "post_mortems", [])
         kept: list[dict] = []
-        for value in reversed(deaths if isinstance(deaths, list) else []):
+        for value in reversed((deaths if isinstance(deaths, list) else [])[-4 * post_mortem.KEEP:]):
             if len(kept) == post_mortem.KEEP:
                 break
             if (restored := post_mortem.restore(value)) is not None:

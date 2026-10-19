@@ -111,8 +111,12 @@ def restore(entry: Any) -> dict[str, Any] | None:
     # Strings bounded too: no server line or report field is anywhere near this.
     # And encodable: JSON allows a lone surrogate ("\ud800") that UTF-8 cannot
     # carry, which would fail every response that includes it.
+    # Only textual scalars: a stored list or object is never stringified
+    # whole before truncation.
     def text(value: Any, limit: int = MAX_TEXT) -> str:
-        return str(value or "")[:limit].encode("utf-8", "replace").decode("utf-8")
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            return ""
+        return str(value)[:limit].encode("utf-8", "replace").decode("utf-8")
 
     # Bounded like the arrays: the largest MAX_COUNTS of a bounded slice of
     # entries, short names; never a sort of an oversized map.
@@ -140,14 +144,17 @@ def restore(entry: Any) -> dict[str, Any] | None:
 
 
 def _extremes(samples: list, when: float) -> list[int]:
-    """Indices of the lowest-health sample and the last one at the death."""
+    """Indices of each charted vital's lowest sample (health, spell points,
+    food) and of the last one at the death."""
     if not samples:
         return []
-    lowest = min(range(len(samples)),
-                 key=lambda index: samples[index][1] / max(1, samples[index][2]))
+    indices = range(len(samples))
+    lowest = [min(indices, key=lambda index: samples[index][1] / max(1, samples[index][2])),
+              min(indices, key=lambda index: samples[index][3] / max(1, samples[index][4])),
+              min(indices, key=lambda index: samples[index][5])]
     at_death = max((index for index, sample in enumerate(samples) if float(sample[0]) <= when),
-                   default=lowest)
-    return [lowest, at_death]
+                   default=lowest[0])
+    return [*lowest, at_death]
 
 
 def _within(stamp: Any, start: float, end: float) -> bool:
