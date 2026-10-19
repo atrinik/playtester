@@ -30,6 +30,9 @@ VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 MAX_VITALS = 120
 # Attackers or damage types kept in a restored report.
 MAX_COUNTS = 25
+# Other characters whose live reports a client keeps while it plays another:
+# the names come from the server, so the cache is capped, oldest out first.
+MAX_CACHED_CHARACTERS = 8
 # The most live vitals samples held at once: the window is time-based, but a
 # burst of stats packets must never grow it without bound.
 MAX_LIVE_VITALS = 6000

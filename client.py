@@ -226,7 +226,11 @@ class AtrinikClient:
             self._death_depletion_until = 0.0
             # Kept for that character, not dropped: a report whose save failed
             # is still merged when she comes back.
-            self._live_post_mortems[self._memory_character] = self.post_mortems
+            if self.post_mortems:
+                self._live_post_mortems.pop(self._memory_character, None)
+                self._live_post_mortems[self._memory_character] = self.post_mortems
+                while len(self._live_post_mortems) > post_mortem.MAX_CACHED_CHARACTERS:
+                    del self._live_post_mortems[next(iter(self._live_post_mortems))]
             self.post_mortems = []
         self._memory_character = character
         memory = self._memory_store()

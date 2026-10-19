@@ -1536,6 +1536,24 @@ class ProtocolTests(unittest.TestCase):
         client = AtrinikClient(ClientConfig(character="Sera"))
         self.assertEqual(client.vitals.maxlen, post_mortem.MAX_LIVE_VITALS)
 
+    def test_the_other_characters_cache_is_capped(self):
+        from . import post_mortem
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            # A hostile server switching through many distinct names.
+            for index in range(50):
+                client.post_mortems = [{"time": float(index)}]
+                client.load_character_memory(f"name-{index}")
+            self.assertEqual(len(client._live_post_mortems), post_mortem.MAX_CACHED_CHARACTERS)
+            self.assertIn("name-48", client._live_post_mortems)
+            self.assertNotIn("Sera", client._live_post_mortems)
+            # A character with no reports takes no slot.
+            client.post_mortems = []
+            client.load_character_memory("empty")
+            self.assertNotIn("name-49", client._live_post_mortems)
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80
