@@ -167,3 +167,9 @@ details summary { cursor: pointer; color: var(--muted); margin-top: .6rem; font-
 .trend { background: #121719; border-radius: 6px; padding: .35rem .55rem; display: grid; gap: .15rem; }
 .trend-chart { width: 100%; height: 32px; }
 .trend-chart polyline { fill: none; stroke: #7fb8a4; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+/* Alerts keep their width; the map name gives way first on narrow screens. */
+.alerts { display: flex; gap: .4rem; flex-shrink: 0; }
+.where { min-width: 0; }
+.alert { font-size: 12px; padding: .1rem .5rem; border-radius: 999px; border: 1px solid currentColor; }
+.alert.critical { color: #ff8a8a; background: #3a1d1d; }
+.alert.warn { color: #f3c969; background: #33291a; }

@@ -8,7 +8,7 @@ const $$ = s => [...document.querySelectorAll(s)];
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
 
-const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party";
+const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts";
 const SLOW_KEYS = "build,farming_analysis,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
@@ -81,6 +81,15 @@ function bar(label, value, max, cls) {
   const pct = Math.max(0, Math.min(100, ((+value || 0) / Math.max(1, +max || 1)) * 100));
   const low = cls === "hp" && pct < 30 ? " low" : "";
   return `<div class="vital"><b>${label}</b><div class="bar ${cls}${low}"><i style="width:${pct}%"></i><span>${value ?? "—"} / ${max ?? "—"}</span></div></div>`;
+}
+let lastAlertsSig = "";
+function renderAlerts() {
+  // The region is aria-live: rewrite it only when the alerts change.
+  const html = (live.alerts || []).map(a =>
+    `<span class="alert ${esc(a.level)}" title="${esc(a.id)}">${esc(a.text)}</span>`).join("");
+  if (html === lastAlertsSig) return;
+  lastAlertsSig = html;
+  $("#alerts").innerHTML = html;
 }
 function renderHeader() {
   const s = live.stats || {}, lp = live.level_progress || {}, m = live.map || {};
@@ -482,7 +491,7 @@ async function pollLive() {
     const r = await fetch(`/api/state?include=${LIVE_KEYS}`, { cache: "no-store" });
     if (!r.ok) throw Error(`${r.status} ${r.statusText}`);
     live = await r.json();
-    renderHeader(); renderVitals(); renderTask(); renderCharacter(); drawMap(); renderGround(); renderInventory(); renderChat(); renderSlowLists();
+    renderHeader(); renderAlerts(); renderVitals(); renderTask(); renderCharacter(); drawMap(); renderGround(); renderInventory(); renderChat(); renderSlowLists();
   } catch (e) {
     $("#connection").textContent = `Dashboard offline (${e.message})`;
     $("#connection-dot").classList.remove("on");

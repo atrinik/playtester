@@ -19,6 +19,7 @@ from .access_codes import normalize_access_code
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameState,
                     InterfaceState, Item, MapObject, MapState)
+from .alerts import ProgressWatch
 from .memory import BotMemory
 from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
@@ -173,6 +174,8 @@ class AtrinikClient:
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
         self.trends = Trends()
         self._trends_character = ""
+        # When XP, position and the connection last changed, for alerts.
+        self.progress_watch = ProgressWatch()
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -702,7 +705,10 @@ class AtrinikClient:
         if action not in noisy:
             previous = (self.decision_history[-1]
                         if self.decision_history else None)
+            # Each death keeps its own record and time, so alerts can age
+            # deaths out of their window one by one.
             repeated = bool(
+                action != "death" and
                 previous and record["time"] - previous.get("time", 0) <= 5.0
                 and all(previous.get(key) == record[key]
                         for key in ("action", "detail", "task", "map")))
@@ -850,6 +856,7 @@ class AtrinikClient:
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
 
     async def checkpoint_reconnect(self) -> bool:
         """Gracefully reconnect so the server persists the live character."""
@@ -862,6 +869,7 @@ class AtrinikClient:
         self._reconnect_requested = True
         await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
         return True
 
     async def run(self) -> None:
@@ -884,6 +892,7 @@ class AtrinikClient:
                 except OSError:
                     pass
                 self.state.phase = "disconnected"
+                self.progress_watch.observe(self.state)
             if not self.config.reconnect or self._closed:
                 break
             self._reconnect_requested = False
@@ -955,6 +964,7 @@ class AtrinikClient:
         with contextlib.suppress(OSError):
             await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
 
     async def _dispatch(self, packet_type: int, data: bytes) -> None:
         if (self.state.phase in ("version", "access-policy", "access-auth")
@@ -1566,6 +1576,7 @@ class AtrinikClient:
             changed[name] = value
         if self.trends.observe(self.state):
             self._persist_trends()
+        self.progress_watch.observe(self.state)
         await self.emit("stats", changed)
 
     def _decode_item_fields(self, cur: Cursor, flags: int, item: Item) -> None:
@@ -1894,6 +1905,8 @@ class AtrinikClient:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
         self._observe_map_change(old_path, m)
+        # Movement arrives in map packets, between stats packets and polls.
+        self.progress_watch.observe(self.state)
         await self.emit("map", {"path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y, "changed_map": old_path != m.path})
 
     async def _handle_interface(self, cur: Cursor, raw: bytes) -> None:
