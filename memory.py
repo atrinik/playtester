@@ -41,8 +41,8 @@ class BotMemory:
                    )""")
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=10.0)
+    def _connect(self, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
+        db = sqlite3.connect(self.path, timeout=timeout)
         try:
             yield db
         except Exception:
@@ -70,9 +70,10 @@ class BotMemory:
                         kind, character, self.server)
             return default
 
-    def save(self, character: str, kind: str, value: Any) -> None:
+    def save(self, character: str, kind: str, value: Any, *, timeout: float = 10.0) -> None:
+        """Store ``value``; ``timeout`` bounds the wait for a locked database."""
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        with self._connect() as db:
+        with self._connect(timeout) as db:
             db.execute(
                 """INSERT INTO memory
                        (server, account, character, kind, value_json, updated_at)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 from collections import deque
 import contextlib
 import copy
@@ -28,6 +27,8 @@ from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
 
+# The longest a death waits for a locked memory database (seconds).
+POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
 EventHandler = Callable[[Event], Awaitable[None] | None]
 
@@ -190,9 +191,6 @@ class AtrinikClient:
         self.vitals: deque[list[float]] = deque()
         # When the last death's bookkeeping ended (its records are its own).
         self._post_mortem_booked = 0.0
-        # One worker: post-mortem saves leave the event loop, in order.
-        self._post_mortem_saver = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="post-mortem-save")
         self.post_mortems: list[dict] = []
         # (time, path) of each arrival on a new map, newest last.
         self.map_arrivals: list[tuple[float, str]] = []
@@ -830,26 +828,17 @@ class AtrinikClient:
         self._post_mortem_booked = time.time()
         del self.post_mortems[:-post_mortem.KEEP]
         # Best effort, like the trends: a full or read-only disk, or a locked
-        # database (SQLite waits up to ten seconds), must never stop or stall
-        # play for dashboard telemetry, so on the event loop the save runs on
-        # the one saver thread, a snapshot at a time and in order.
+        # database, must never stop or stall play for dashboard telemetry. The
+        # save waits at most a quarter second for a lock (not SQLite's usual
+        # ten) and is otherwise skipped; the report stays in memory, and the
+        # next death's save carries it.
         character = self.state.player_name
-        if not character:
-            return
-        snapshot = list(self.post_mortems)
-
-        def save() -> None:
+        if character:
             try:
-                self._memory_store().save(character, "post_mortems", snapshot)
+                self._memory_store().save(character, "post_mortems", self.post_mortems,
+                                          timeout=POST_MORTEM_SAVE_TIMEOUT)
             except Exception as error:
                 log.warning("could not save post-mortems for %s: %s", character, error)
-
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            save()
-        else:
-            self._post_mortem_saver.submit(save)
 
     def _trend_count(self, key: str) -> None:
         if self.trends.count(key):

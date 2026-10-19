@@ -1312,7 +1312,7 @@ class ProtocolTests(unittest.TestCase):
         client.state.phase = "playing"
 
         class LockedDatabase:
-            def save(self, *args):
+            def save(self, *args, **kwargs):
                 raise sqlite3.OperationalError("database is locked")
 
         client._memory_store = lambda: LockedDatabase()
@@ -1377,31 +1377,28 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(report["decisions"][-1]["action"], "emergency-disengage")
         self.assertLessEqual(len(report["decisions"][-1]["detail"]), post_mortem.MAX_TEXT)
 
-    def test_a_post_mortem_save_leaves_the_event_loop(self):
-        import threading
-        client = AtrinikClient(ClientConfig(character="Sera"))
-        client.state.player_name = "Sera"
-        client.state.phase = "playing"
-        release, saved = threading.Event(), []
-
-        class SlowDatabase:
-            def save(self, character, kind, value):
-                release.wait(5)
-                saved.append((character, kind, len(value)))
-
-        client._memory_store = lambda: SlowDatabase()
-
-        async def die():
-            started = time.monotonic()
-            client._record_post_mortem()
-            return time.monotonic() - started
-
-        # The handler returns at once while the database is still busy.
-        self.assertLess(asyncio.run(die()), 1.0)
-        self.assertEqual(saved, [])
-        release.set()
-        client._post_mortem_saver.submit(lambda: None).result(5)
-        self.assertEqual(saved, [("Sera", "post_mortems", 1)])
+    def test_a_locked_database_delays_a_death_at_most_briefly(self):
+        import sqlite3
+        from . import client as client_module
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            # Another process holds the write lock.
+            holder = sqlite3.connect(client._memory_store().path)
+            holder.execute("BEGIN IMMEDIATE")
+            try:
+                started = time.monotonic()
+                with self.assertLogs("atrinik_bot.client", "WARNING"):
+                    client._record_post_mortem()
+                elapsed = time.monotonic() - started
+            finally:
+                holder.rollback()
+                holder.close()
+            self.assertLess(elapsed, client_module.POST_MORTEM_SAVE_TIMEOUT + 1.0)
+            self.assertEqual(len(client.post_mortems), 1)
 
     def test_a_reconnect_keeps_a_post_mortem_whose_save_failed(self):
         import sqlite3
@@ -1414,7 +1411,7 @@ class ProtocolTests(unittest.TestCase):
             store = client._memory_store
 
             class LockedDatabase:
-                def save(self, *args):
+                def save(self, *args, **kwargs):
                     raise sqlite3.OperationalError("database is locked")
 
             client._memory_store = lambda: LockedDatabase()
@@ -1733,7 +1730,7 @@ class ProtocolTests(unittest.TestCase):
         client.state.player_name = "Sera"
 
         class FullDisk:
-            def save(self, *args):
+            def save(self, *args, **kwargs):
                 raise OSError(28, "No space left on device")
 
         client._memory_store = lambda: FullDisk()
@@ -1788,7 +1785,7 @@ class ProtocolTests(unittest.TestCase):
             def load(self, character, kind, default):
                 return self.trends if kind == "trends" else default
 
-            def save(self, *args):
+            def save(self, *args, **kwargs):
                 pass
 
         now = time.time()
