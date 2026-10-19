@@ -1227,6 +1227,38 @@ class ProtocolTests(unittest.TestCase):
             say("YOU HAVE DIED.")
         self.assertEqual(len(client.post_mortems), post_mortem.KEEP)
 
+    def test_a_busy_minute_is_reviewed_whole_past_the_message_buffer(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        # More hits than the dashboard's 500-message buffer holds.
+        for _ in range(520):
+            say("giant rat hit you for 1 (-1) impact damage.")
+        say("YOU HAVE DIED.")
+        self.assertEqual(len(client.state.messages), 500)
+        death = client.post_mortems[-1]
+        self.assertEqual(death["damage_taken"], 520)
+        self.assertEqual(death["attackers"], {"giant rat": 520})
+
+    def test_switching_characters_drops_the_previous_ones_transient_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.vitals.append([time.time(), 10, 155, 0, 39, 900])
+            client.review_messages.append((time.time(), 2, "", "ogre hit you for 99 (-99) impact damage."))
+            client.action_history.append({"time": time.time(), "action": "fire"})
+            # The same character again keeps them; another one starts clean.
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.vitals), 1)
+            client.load_character_memory("Mallory")
+            self.assertEqual((client.vitals, client.review_messages, client.action_history), ([], [], []))
+
     def test_a_post_mortem_names_the_square_of_the_death_notice(self):
         client = AtrinikClient(ClientConfig(character="Sera"))
         client.state.phase = "playing"
@@ -1352,6 +1384,14 @@ class ProtocolTests(unittest.TestCase):
             "actions": [{"time": index} for index in range(500)]})
         self.assertEqual([len(big[key]) for key in ("vitals", "messages", "decisions", "actions")],
                          [post_mortem.MAX_VITALS, 40, 25, 25])
+        # An oversized stored collection is never traversed whole: only a
+        # bounded tail is looked at, so a huge value restores as quickly.
+        class Huge(list):
+            def __iter__(self):
+                raise AssertionError("iterated the whole list")
+        huge = Huge([[1, "x"]] * 100000)
+        restored = post_mortem.restore({"time": 5, "messages": huge})
+        self.assertEqual(len(restored["messages"]), 40)
         # A previous death in the future bounds nothing, and an oversized
         # decision time is simply outside the window.
         report = post_mortem.build(1000.0, "/a", 1, 2, [], [(999.0, 2, "", "YOU HAVE DIED.")],

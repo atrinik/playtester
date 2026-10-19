@@ -176,6 +176,10 @@ class AtrinikClient:
         self.memory: BotMemory | None = None
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
+        # Every message of the last review window, for post-mortems: the UI's
+        # 500-message buffer can drop a busy minute's oldest hits.
+        self.review_messages: list[tuple] = []
+        self._memory_character = ""
         self.decision_history: list[dict] = []
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: list[list[float]] = []
@@ -195,6 +199,13 @@ class AtrinikClient:
         self.farm_analyzer = None
 
     def load_character_memory(self, character: str) -> None:
+        # Switching characters on a long-lived client: the previous one's
+        # vitals, messages and actions must not explain this one's death.
+        if self._memory_character and self._memory_character != character:
+            self.vitals.clear()
+            self.review_messages.clear()
+            self.action_history.clear()
+        self._memory_character = character
         memory = self._memory_store()
         memory.import_legacy(
             self._legacy_runtime_state_path,
@@ -748,7 +759,7 @@ class AtrinikClient:
         m = self.state.map
         self.post_mortems.append(post_mortem.build(
             time.time(), m.path, m.world_x, m.world_y, self.vitals,
-            self.state.messages, self.action_history, self.decision_history,
+            self.review_messages, self.action_history, self.decision_history,
             since=previous, name=self.state.player_name or self.config.character))
         del self.post_mortems[:-post_mortem.KEEP]
         character = self.state.player_name
@@ -1169,6 +1180,11 @@ class AtrinikClient:
         msg_type, color = cur.u8(), cur.cstring()
         text = cur.cstring() if cur.remaining else ""
         self.state.add_message(msg_type, color, text)
+        self.review_messages.append(self.state.messages[-1])
+        cutoff = self.state.messages[-1][0] - post_mortem.REVIEW_HISTORY_SECONDS
+        while self.review_messages and (self.review_messages[0][0] < cutoff or
+                                        len(self.review_messages) > post_mortem.REVIEW_HISTORY_LIMIT):
+            self.review_messages.pop(0)
         if update_bank_balance(self.state, text):
             self.set_bank_balance(self.state.bank_balance)
         lowered = text.casefold()

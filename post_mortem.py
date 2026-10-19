@@ -9,6 +9,8 @@ without trawling the logs.
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import math
 import time
 from typing import Any, Iterable
@@ -19,11 +21,18 @@ from .self_improvement import REVIEW_WINDOW_SECONDS, review_failure
 KEEP = 20
 # Vital samples kept; the client samples on every health/SP/food change.
 VITALS_SECONDS = 600.0
+# The client keeps every message of this span (bounded in count too) for the
+# review, independent of the dashboard's 500-message buffer.
+REVIEW_HISTORY_SECONDS = REVIEW_WINDOW_SECONDS + 5.0
+REVIEW_HISTORY_LIMIT = 20000
 VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 # Vital samples stored per post-mortem, spread over its whole window.
 MAX_VITALS = 120
 # Attackers or damage types kept in a restored report.
 MAX_COUNTS = 25
+# Kept messages and action or decision records per report, and how many
+# attacker or damage entries a restore looks at.
+MAX_MESSAGES, MAX_RECORDS, MAX_COUNT_SCAN = 40, 25, 4096
 # Characters kept in any restored text field.
 MAX_TEXT = 500
 
@@ -78,25 +87,26 @@ def restore(entry: Any) -> dict[str, Any] | None:
         except OverflowError:  # an int too large for a float
             return False
 
-    def records(key: str) -> list[dict]:
+    # Only a bounded tail of each stored list is ever traversed (a few times
+    # what is kept, for invalid entries), so an oversized value costs no more
+    # than a well-formed one.
+    def tail(key: str, keep: int) -> list:
         value = entry.get(key)
+        return value[-4 * keep:] if isinstance(value, list) else []
+
+    def records(key: str) -> list[dict]:
         return [{"time": item["time"], "action": text(item.get("action")),
                  "detail": text(item.get("detail")), "map": text(item.get("map"))}
-                for item in value if isinstance(item, dict) and finite(item.get("time"))
-                ] if isinstance(value, list) else []
+                for item in tail(key, MAX_RECORDS) if isinstance(item, dict) and finite(item.get("time"))]
 
     def vitals_rows() -> list[list]:
-        value = entry.get("vitals")
-        return ([list(item) for item in value
-                 if isinstance(item, (list, tuple)) and len(item) == 1 + len(VITAL_KEYS)
-                 and all(finite(part) for part in item)]
-                if isinstance(value, list) else [])
+        return [list(item) for item in tail("vitals", MAX_VITALS)
+                if isinstance(item, (list, tuple)) and len(item) == 1 + len(VITAL_KEYS)
+                and all(finite(part) for part in item)]
 
     def message_rows() -> list[list]:
-        value = entry.get("messages")
-        return ([[item[0], text(item[1])] for item in value
-                 if isinstance(item, (list, tuple)) and len(item) == 2 and finite(item[0])]
-                if isinstance(value, list) else [])
+        return [[item[0], text(item[1])] for item in tail("messages", MAX_MESSAGES)
+                if isinstance(item, (list, tuple)) and len(item) == 2 and finite(item[0])]
 
     # Strings bounded too: no server line or report field is anywhere near this.
     # And encodable: JSON allows a lone surrogate ("\ud800") that UTF-8 cannot
@@ -104,12 +114,15 @@ def restore(entry: Any) -> dict[str, Any] | None:
     def text(value: Any, limit: int = MAX_TEXT) -> str:
         return str(value or "")[:limit].encode("utf-8", "replace").decode("utf-8")
 
-    # Bounded like the arrays: the largest MAX_COUNTS entries, short names.
+    # Bounded like the arrays: the largest MAX_COUNTS of a bounded slice of
+    # entries, short names; never a sort of an oversized map.
     def counts(key: str) -> dict[str, int]:
         value = entry.get(key)
-        valid = sorted(((text(name, 80), count) for name, count in value.items() if finite(count)),
-                       key=lambda item: -item[1]) if isinstance(value, dict) else []
-        return dict(valid[:MAX_COUNTS])
+        if not isinstance(value, dict):
+            return {}
+        scanned = itertools.islice(value.items(), MAX_COUNT_SCAN)
+        return dict(heapq.nlargest(MAX_COUNTS, ((text(name, 80), count) for name, count in scanned
+                                                if finite(count)), key=lambda item: item[1]))
 
     def number(key: str) -> int:
         value = entry.get(key)
@@ -121,8 +134,8 @@ def restore(entry: Any) -> dict[str, Any] | None:
         "attackers": counts("attackers"), "peak_attackers": number("peak_attackers"),
         "damage_taken": number("damage_taken"), "damage_by_type": counts("damage_by_type"),
         # The builder's own bounds, so a stored report can never grow larger.
-        "vitals": spread(vitals_rows()), "messages": message_rows()[-40:],
-        "actions": records("actions")[-25:], "decisions": records("decisions")[-25:],
+        "vitals": spread(vitals_rows()), "messages": message_rows()[-MAX_MESSAGES:],
+        "actions": records("actions")[-MAX_RECORDS:], "decisions": records("decisions")[-MAX_RECORDS:],
     }
 
 
