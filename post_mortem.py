@@ -49,26 +49,36 @@ MAX_TEXT = 500
 
 
 def spread(samples: list, limit: int = MAX_VITALS, keep: Iterable[int] = ()) -> list:
-    """At most ``limit`` samples spread evenly over all of them, the first
-    (the window's baseline) and the last kept.
+    """At most ``limit`` samples spread over the window's time, in time order.
 
-    The ``keep`` indices (the fatal low, the sample at the death) are always
-    in it, in time order, in place of the nearest evenly spread ones.
+    The first (the window's baseline), the last and the ``keep`` indices (the
+    fatal lows) are always in it. The rest is the first sample of each equal
+    slice of time, so a burst of samples never crowds out a long plateau.
     """
     if len(samples) <= limit:
         return samples
-    keep = sorted({index for index in keep if 0 <= index < len(samples)})
-    step = (len(samples) - 1) / (limit - 1)
-    chosen = {round(index * step) for index in range(limit)}
-    for index in keep:
-        if index not in chosen:
-            # Drop the nearest even point that is neither kept nor an end.
-            spare = min((point for point in chosen
-                         if point not in keep and point not in (0, len(samples) - 1)),
-                        key=lambda point: abs(point - index), default=None)
-            if spare is not None:
-                chosen.discard(spare)
+    count = len(samples)
+    chosen = {index for index in keep if 0 <= index < count} | {0, count - 1}
+    # The first sample always lands in the first slice, already chosen.
+    slots = max(1, limit - len(chosen) + 1)
+    start, end = float(samples[0][0]), float(samples[-1][0])
+    span = end - start
+    taken: set[int] = set()
+    for index, value in enumerate(samples):
+        if len(chosen) >= limit:
+            break
+        # Equal time slices; with no time span, equal index slices.
+        share = (float(value[0]) - start) / span if span > 0 else index / (count - 1)
+        slot = min(slots - 1, int(share * slots))
+        if slot not in taken:
+            taken.add(slot)
             chosen.add(index)
+    # Slices without a sample leave room: fill it evenly by index.
+    step = (count - 1) / (limit - 1)
+    for position in range(limit):
+        if len(chosen) >= limit:
+            break
+        chosen.add(round(position * step))
     return [samples[index] for index in sorted(chosen)]
 
 
@@ -237,6 +247,10 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
     texts = [(float(entry[0]), str(entry[-1])) for entry in messages
              if _within(entry[0], start, end)]
     cause, detail = review.cause, review.detail
+    # No hit, starvation or exhaustion seen: the classifier's fallback would
+    # claim a combat cause the report never observed.
+    if cause == "out-damaged" and not review.damage_taken and not review.attackers:
+        cause, detail = "unclassified", "no hits, starvation or exhaustion seen before the death"
 
     # What she was doing before she died.
     def recent(records: Iterable[dict]) -> list[dict]:

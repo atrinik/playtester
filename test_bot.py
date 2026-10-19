@@ -1565,6 +1565,35 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(text), post_mortem.MAX_TEXT)
         self.assertEqual((stamp, msg_type), tuple(client.state.messages[-1][:2]))
 
+    def test_downsampling_follows_time_not_sample_count(self):
+        from . import post_mortem
+        # Baseline at 0 s, a plateau from 30 s, then a burst in the last second.
+        samples = [[0.0, 100, 100, 50, 50, 900], [30.0, 80, 100, 50, 50, 900]]
+        samples += [[59.0 + index / 1000, 80 - index % 2, 100, 50, 50, 900] for index in range(500)]
+        kept = post_mortem.spread(samples)
+        self.assertLessEqual(len(kept), post_mortem.MAX_VITALS)
+        self.assertIn(samples[1], kept)
+        self.assertEqual((kept[0], kept[-1]), (samples[0], samples[-1]))
+
+    def test_a_death_without_evidence_is_unclassified(self):
+        from . import post_mortem
+        when = time.time()
+        report = post_mortem.build(when, "/a", 1, 2, [], [], [], [], name="Sera")
+        self.assertEqual(report["cause"], "unclassified")
+        report = post_mortem.build(when, "/a", 1, 2, [],
+                                   [(when - 5, 2, "giant rat hit you for 9 (-9) impact damage.")], [], [],
+                                   name="Sera")
+        self.assertEqual(report["cause"], "out-damaged")
+
+    def test_a_character_switch_resets_the_previous_death_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client._post_mortem_booked = time.time()
+            client.load_character_memory("Mallory")
+            self.assertEqual(client._post_mortem_booked, 0.0)
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80
