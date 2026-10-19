@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from collections import deque
 import contextlib
 import copy
@@ -187,6 +188,9 @@ class AtrinikClient:
         self.decision_history: list[dict] = []
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: deque[list[float]] = deque()
+        # One worker: post-mortem saves leave the event loop, in order.
+        self._post_mortem_saver = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="post-mortem-save")
         self.post_mortems: list[dict] = []
         # (time, path) of each arrival on a new map, newest last.
         self.map_arrivals: list[tuple[float, str]] = []
@@ -818,13 +822,26 @@ class AtrinikClient:
             since=previous, name=self.state.player_name or self.config.character))
         del self.post_mortems[:-post_mortem.KEEP]
         # Best effort, like the trends: a full or read-only disk, or a locked
-        # database, must never stop play for dashboard telemetry.
+        # database (SQLite waits up to ten seconds), must never stop or stall
+        # play for dashboard telemetry, so on the event loop the save runs on
+        # the one saver thread, a snapshot at a time and in order.
         character = self.state.player_name
-        if character:
+        if not character:
+            return
+        snapshot = list(self.post_mortems)
+
+        def save() -> None:
             try:
-                self._memory_store().save(character, "post_mortems", self.post_mortems)
+                self._memory_store().save(character, "post_mortems", snapshot)
             except Exception as error:
                 log.warning("could not save post-mortems for %s: %s", character, error)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            save()
+        else:
+            self._post_mortem_saver.submit(save)
 
     def _trend_count(self, key: str) -> None:
         if self.trends.count(key):
@@ -1679,8 +1696,10 @@ class AtrinikClient:
             self.vitals.append(post_mortem.sample(self.state.stats))
             cutoff = time.time() - post_mortem.VITALS_SECONDS
             # A deque: each expired sample leaves from the front in O(1), so
-            # a full window costs the same per packet as an empty one.
-            while self.vitals and self.vitals[0][0] < cutoff:
+            # a full window costs the same per packet as an empty one. The
+            # newest expired sample stays: samples come only on change, so it
+            # is the state until the next one, the baseline of a sudden death.
+            while len(self.vitals) > 1 and self.vitals[1][0] < cutoff:
                 self.vitals.popleft()
         if self.trends.observe(self.state):
             self._persist_trends()

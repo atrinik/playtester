@@ -1221,9 +1221,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(client.vitals[-1][1:5], [13, 155, 3, 39])
         # A rolling window: expired samples leave from the front in O(1).
         self.assertIsInstance(client.vitals, collections.deque)
-        client.vitals.appendleft([time.time() - post_mortem.VITALS_SECONDS - 5, 1, 155, 0, 39, 900])
+        stale = time.time() - post_mortem.VITALS_SECONDS - 5
+        client.vitals.appendleft([stale - 5, 1, 155, 0, 39, 900])
+        client.vitals.appendleft([stale - 10, 2, 155, 0, 39, 900])
         asyncio.run(client._handle_stats(Cursor(payload), payload))
-        self.assertTrue(all(sample[0] >= time.time() - post_mortem.VITALS_SECONDS for sample in client.vitals))
+        # Older expired samples go; the newest expired one stays as the
+        # baseline (samples come only on change).
+        cutoff = time.time() - post_mortem.VITALS_SECONDS
+        self.assertEqual(sum(sample[0] < cutoff for sample in client.vitals), 1)
+        self.assertLess(client.vitals[0][0], cutoff)
 
         def say(text, msg_type=2):
             data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
@@ -1313,6 +1319,61 @@ class ProtocolTests(unittest.TestCase):
         with self.assertLogs("atrinik_bot.client", "WARNING"):
             client._record_post_mortem()
         self.assertEqual(len(client.post_mortems), 1)
+
+    def test_a_sudden_death_after_a_long_steady_spell_keeps_its_baseline(self):
+        import struct
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        # Healthy for longer than the window, then one fatal packet.
+        client.vitals.append([time.time() - 900, 155, 155, 39, 39, 900])
+        payload = b"".join(bytes((stat,)) + struct.pack(">" + c.STAT_FORMATS[stat], value)
+                           for stat, value in ((c.STAT_HP, 0), (c.STAT_MAXHP, 155)))
+        asyncio.run(client._handle_stats(Cursor(payload), payload))
+        data = bytes((2,)) + b"ffffff\0" + b"YOU HAVE DIED.\0"
+        asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        vitals = client.post_mortems[-1]["vitals"]
+        # Charted from the healthy state at the window start to the fatal hit.
+        self.assertEqual(vitals[0][1], 155)
+        self.assertEqual(vitals[-1][1], 0)
+
+    def test_report_fields_from_the_decision_ledger_are_sanitized(self):
+        from . import post_mortem
+        when = time.time()
+        report = post_mortem.build(
+            when, "/a", 1, 2, [], [], [],
+            [{"time": when - 5, "action": float("nan"), "detail": "\ud800", "map": ["x"]}],
+            name="Sera")
+        decision = report["decisions"][-1]
+        self.assertEqual(decision["action"], "nan")
+        json.dumps(report, allow_nan=False).encode("utf-8")
+        self.assertEqual(decision["map"], "")
+
+    def test_a_post_mortem_save_leaves_the_event_loop(self):
+        import threading
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.player_name = "Sera"
+        client.state.phase = "playing"
+        release, saved = threading.Event(), []
+
+        class SlowDatabase:
+            def save(self, character, kind, value):
+                release.wait(5)
+                saved.append((character, kind, len(value)))
+
+        client._memory_store = lambda: SlowDatabase()
+
+        async def die():
+            started = time.monotonic()
+            client._record_post_mortem()
+            return time.monotonic() - started
+
+        # The handler returns at once while the database is still busy.
+        self.assertLess(asyncio.run(die()), 1.0)
+        self.assertEqual(saved, [])
+        release.set()
+        client._post_mortem_saver.submit(lambda: None).result(5)
+        self.assertEqual(saved, [("Sera", "post_mortems", 1)])
 
     def test_a_reconnect_keeps_a_post_mortem_whose_save_failed(self):
         import sqlite3

@@ -218,7 +218,10 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
     if before:
         inside.insert(0, [start, *before[-1][1:]])
 
-    return {
+    # Through the same normalizer as a stored report: every field it carries,
+    # including the separately persisted decision ledger's, is finite,
+    # encodable and bounded.
+    return restore({
         "time": when, "map": path, "x": x, "y": y,
         "cause": cause, "detail": detail,
         "attackers": dict(review.attackers), "peak_attackers": review.peak_attackers,
@@ -228,4 +231,4 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
         "messages": [[stamp, text] for stamp, text in texts][-40:],
         "actions": recent(actions),
         "decisions": recent(decisions),
-    }
+    })
