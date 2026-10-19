@@ -1293,6 +1293,21 @@ class ProtocolTests(unittest.TestCase):
             self.assertLessEqual(len(calls), 4 * post_mortem.KEEP)
             self.assertEqual(client.post_mortems, [])
 
+    def test_a_failed_post_mortem_save_never_stops_the_client(self):
+        import sqlite3
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.player_name = "Sera"
+        client.state.phase = "playing"
+
+        class LockedDatabase:
+            def save(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+        client._memory_store = lambda: LockedDatabase()
+        with self.assertLogs("atrinik_bot.client", "WARNING"):
+            client._record_post_mortem()
+        self.assertEqual(len(client.post_mortems), 1)
+
     def test_switching_characters_drops_the_previous_ones_transient_history(self):
         with tempfile.TemporaryDirectory() as directory:
             client = AtrinikClient(ClientConfig(
@@ -1305,7 +1320,7 @@ class ProtocolTests(unittest.TestCase):
             client.load_character_memory("Sera")
             self.assertEqual(len(client.vitals), 1)
             client.load_character_memory("Mallory")
-            self.assertEqual((client.vitals, client.review_messages, client.action_history), ([], [], []))
+            self.assertEqual((client.vitals, list(client.review_messages), client.action_history), ([], [], []))
 
     def test_a_post_mortem_names_the_square_of_the_death_notice(self):
         client = AtrinikClient(ClientConfig(character="Sera"))

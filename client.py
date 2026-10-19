@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import contextlib
 import copy
 import json
@@ -179,7 +180,9 @@ class AtrinikClient:
         self.action_history: list[dict] = []
         # Every message of the last review window, for post-mortems: the UI's
         # 500-message buffer can drop a busy minute's oldest hits.
-        self.review_messages: list[tuple] = []
+        # Bounded, and pruned from the front in O(1): a busy minute's 20,000
+        # messages after a long gap cost no shifting.
+        self.review_messages: deque[tuple] = deque(maxlen=post_mortem.REVIEW_HISTORY_LIMIT)
         self._memory_character = ""
         self.decision_history: list[dict] = []
         # Health, SP and food samples, and the deaths reviewed from them.
@@ -777,12 +780,17 @@ class AtrinikClient:
         m = self.state.map
         self.post_mortems.append(post_mortem.build(
             time.time(), m.path, m.world_x, m.world_y, self.vitals,
-            self.review_messages, self.action_history, self.decision_history,
+            list(self.review_messages), self.action_history, self.decision_history,
             since=previous, name=self.state.player_name or self.config.character))
         del self.post_mortems[:-post_mortem.KEEP]
+        # Best effort, like the trends: a full or read-only disk, or a locked
+        # database, must never stop play for dashboard telemetry.
         character = self.state.player_name
         if character:
-            self._memory_store().save(character, "post_mortems", self.post_mortems)
+            try:
+                self._memory_store().save(character, "post_mortems", self.post_mortems)
+            except Exception as error:
+                log.warning("could not save post-mortems for %s: %s", character, error)
 
     def _trend_count(self, key: str) -> None:
         if self.trends.count(key):
@@ -1220,9 +1228,8 @@ class AtrinikClient:
         self.state.add_message(msg_type, color, text)
         self.review_messages.append(self.state.messages[-1])
         cutoff = self.state.messages[-1][0] - post_mortem.REVIEW_HISTORY_SECONDS
-        while self.review_messages and (self.review_messages[0][0] < cutoff or
-                                        len(self.review_messages) > post_mortem.REVIEW_HISTORY_LIMIT):
-            self.review_messages.pop(0)
+        while self.review_messages and self.review_messages[0][0] < cutoff:
+            self.review_messages.popleft()
         if update_bank_balance(self.state, text):
             self.set_bank_balance(self.state.bank_balance)
         lowered = text.casefold()
