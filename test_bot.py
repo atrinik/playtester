@@ -1594,6 +1594,29 @@ class ProtocolTests(unittest.TestCase):
             client.load_character_memory("Mallory")
             self.assertEqual(client._post_mortem_booked, 0.0)
 
+    def test_extreme_restored_times_never_break_downsampling(self):
+        from . import post_mortem
+        rows = [[-1e308 + index * 1e306, 100, 100, 50, 50, 900] for index in range(200)]
+        rows[-1][0] = 1e308
+        restored = post_mortem.restore({"time": 1000.0, "vitals": rows})
+        self.assertLessEqual(len(restored["vitals"]), post_mortem.MAX_VITALS)
+
+    def test_the_ledger_death_bounds_a_life_without_its_report(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        now = time.time()
+        # An earlier death (no report for it) after an earlier life's disengage.
+        client.decision_history = [
+            {"time": now - 40, "action": "emergency-disengage", "detail": "sp=1 next-heal=9", "map": "/a"},
+            {"time": now - 30, "action": "death", "detail": "YOU HAVE DIED.", "map": "/a"},
+        ]
+        data = bytes((2,)) + b"ffffff\0YOU HAVE DIED.\0"
+        asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        death = client.post_mortems[-1]
+        self.assertNotEqual(death["cause"], "resources")
+        self.assertNotIn("emergency-disengage", [entry["action"] for entry in death["decisions"]])
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80

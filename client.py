@@ -8,6 +8,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -833,11 +834,18 @@ class AtrinikClient:
         """
         # The previous life ends with its death's bookkeeping, which comes
         # after its notice; a restored report has only its notice time.
-        previous = max(self._post_mortem_booked,
+        notice = time.time() if when is None else when
+        # Without a report or a booking for it (an upgrade, a discarded store),
+        # the persisted ledger's latest earlier death still ends that life.
+        ledger_death = next((float(record["time"]) for record in reversed(self.decision_history[-200:])
+                             if isinstance(record, dict) and record.get("action") == "death"
+                             and isinstance(record.get("time"), (int, float))
+                             and math.isfinite(record["time"]) and record["time"] < notice), 0.0)
+        previous = max(self._post_mortem_booked, ledger_death,
                        self.post_mortems[-1]["time"] if self.post_mortems else 0.0)
         m = self.state.map
         self.post_mortems.append(post_mortem.build(
-            time.time() if when is None else when, m.path, m.world_x, m.world_y, self.vitals,
+            notice, m.path, m.world_x, m.world_y, self.vitals,
             list(self.review_messages), self.action_history, self.decision_history,
             since=previous, name=self.state.player_name or self.config.character,
             recorded=time.time()))

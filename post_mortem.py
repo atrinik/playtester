@@ -68,7 +68,10 @@ def spread(samples: list, limit: int = MAX_VITALS, keep: Iterable[int] = ()) -> 
         if len(chosen) >= limit:
             break
         # Equal time slices; with no time span, equal index slices.
-        share = (float(value[0]) - start) / span if span > 0 else index / (count - 1)
+        # Extreme stored times can overflow the span: then by index too.
+        share = ((float(value[0]) - start) / span if span > 0 and math.isfinite(span)
+                 else index / (count - 1))
+        share = min(1.0, max(0.0, share)) if math.isfinite(share) else index / (count - 1)
         slot = min(slots - 1, int(share * slots))
         if slot not in taken:
             taken.add(slot)
