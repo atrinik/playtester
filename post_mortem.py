@@ -106,6 +106,10 @@ def _finite(value: Any) -> bool:
 # carry, which would fail every response that includes it.
 # Only textual scalars: a stored list or object is never stringified
 # whole before truncation.
+# The overflow-safe check, for callers outside this module.
+finite = _finite
+
+
 def _text(value: Any, limit: int = MAX_TEXT) -> str:
     if not isinstance(value, (str, int, float)) or isinstance(value, bool):
         return ""

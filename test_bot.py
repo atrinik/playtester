@@ -1617,6 +1617,47 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotEqual(death["cause"], "resources")
         self.assertNotIn("emergency-disengage", [entry["action"] for entry in death["decisions"]])
 
+    def test_a_death_notice_on_a_player_channel_is_no_death(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        for channel in (3, 4, 5, 6, 7, 8):
+            for notice in (b"YOU HAVE DIED.", b"You have been defeated in combat!"):
+                data = bytes((channel,)) + b"ffffff\0" + notice + b"\0"
+                asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        self.assertEqual(client.post_mortems, [])
+        self.assertNotIn("death", [entry["action"] for entry in client.action_history])
+
+    def test_an_oversized_ledger_death_time_never_breaks_a_death(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.decision_history = [{"time": 10 ** 1000, "action": "death", "detail": "", "map": "/a"}]
+        data = bytes((2,)) + b"ffffff\0YOU HAVE DIED.\0"
+        asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        self.assertEqual(len(client.post_mortems), 1)
+
+    def test_the_current_death_is_never_its_own_boundary(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        clock = [1000.0]
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+                asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        say("giant rat hit you for 9 (-9) impact damage.")
+        clock[0] = 1040.0
+        original = client.record_action
+
+        def stepped_back(*args, **kwargs):
+            clock[0] = 1030.0  # the wall clock steps back during the bookkeeping
+            return original(*args, **kwargs)
+
+        client.record_action = stepped_back
+        say("YOU HAVE DIED.")
+        self.assertEqual(client.post_mortems[-1]["attackers"], {"giant rat": 1})
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80

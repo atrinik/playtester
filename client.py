@@ -8,7 +8,6 @@ import contextlib
 import copy
 import json
 import logging
-import math
 import os
 import re
 import time
@@ -24,6 +23,7 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameSta
 from .alerts import ProgressWatch
 from .memory import BotMemory
 from . import post_mortem
+from .self_improvement import PLAYER_CHANNELS
 from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
@@ -822,7 +822,16 @@ class AtrinikClient:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
-    def _record_post_mortem(self, when: float | None = None) -> None:
+    def _latest_ledger_death(self) -> float:
+        """The persisted ledger's latest death (0 if none), overflow-safe."""
+        for record in reversed(self.decision_history[-200:]):
+            if isinstance(record, dict) and record.get("action") == "death" \
+                    and post_mortem.finite(record.get("time")):
+                return float(record["time"])
+        return 0.0
+
+    def _record_post_mortem(self, when: float | None = None,
+                            ledger_death: float | None = None) -> None:
         """Keep what happened in the minute before this death.
 
         kill_player queues its notice before the savebed transfer's map update,
@@ -837,10 +846,10 @@ class AtrinikClient:
         notice = time.time() if when is None else when
         # Without a report or a booking for it (an upgrade, a discarded store),
         # the persisted ledger's latest earlier death still ends that life.
-        ledger_death = next((float(record["time"]) for record in reversed(self.decision_history[-200:])
-                             if isinstance(record, dict) and record.get("action") == "death"
-                             and isinstance(record.get("time"), (int, float))
-                             and math.isfinite(record["time"]) and record["time"] < notice), 0.0)
+        # The handler reads it before this death's own record is written, so
+        # it is never this death, whatever the wall clock does.
+        if ledger_death is None:
+            ledger_death = self._latest_ledger_death()
         previous = max(self._post_mortem_booked, ledger_death,
                        self.post_mortems[-1]["time"] if self.post_mortems else 0.0)
         m = self.state.map
@@ -1357,11 +1366,14 @@ class AtrinikClient:
         # kill_player (server types/player.c) sends exactly one of these, as
         # the whole message, per defeat: a PvP-area defeat, or a death after
         # its stat losses. Matching the whole text keeps a player's chat that
-        # quotes one from passing for a death.
-        died = normalized in DEATH_NOTICES
+        # quotes one from passing for a death, and a player channel (where
+        # anyone can type the exact notice) never carries a real one.
+        died = normalized in DEATH_NOTICES and msg_type not in PLAYER_CHANNELS
         if lowered.startswith("the spell heals you for"):
             self._trend_count("heals")
         if died:
+            # Before this death's own record: the previous life's end.
+            previous_death = self._latest_ledger_death()
             self.record_action("death", text)
             self._trend_count("deaths")
             # The server emits death stat-loss lines before its final death
@@ -1379,7 +1391,7 @@ class AtrinikClient:
             self._death_depletion_until = now + 8.0
             # After the bookkeeping above, so its depletion records are in it,
             # but dated at the notice's arrival.
-            self._record_post_mortem(arrived)
+            self._record_post_mortem(arrived, previous_death)
         death_loss = normalized in death_losses
         direct_drain = any(normalized == marker for marker in direct_drains)
         if death_loss and now > self._death_depletion_until:
