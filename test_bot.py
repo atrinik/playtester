@@ -120,6 +120,41 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_a_cure_outside_the_bot_resets_the_depletion_count(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.player_tag = 7
+            client._persist_character_memory = lambda: None
+            force = Item(22, item_type=c.TYPE_FORCE, name="depletion")
+            client.state.place_item(force, 7)
+            client.state.place_item(Item(23, name="apple"), 7)
+            client.set_depletion_points(32)
+            delete = Packet(0).u32(23)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 32)
+            # The force itself goes: cured by an item or the dashboard.
+            delete = Packet(0).u32(22)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 0)
+            # A new loss counted before its force arrives survives unrelated
+            # deletions, so a fresh episode starts from one.
+            client.set_depletion_points(1)
+            client.state.place_item(Item(24, name="pear"), 7)
+            delete = Packet(0).u32(24)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 1)
+            # Cured while offline: the replay on login has no force.
+            client.set_depletion_points(32)
+            replay = Packet(0).u8(1).u32(7).u32(7).u8(1)
+            await client._handle_item(
+                Cursor(bytes(replay.data)), bytes(replay.data))
+            self.assertEqual(client.state.depletion_points, 0)
+
+        asyncio.run(scenario())
+
     def test_client_checkpoint_wakes_read_loop_for_clean_reconnect(self):
         class Writer:
             def __init__(self):
@@ -12128,6 +12163,22 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
         client.state.farm_objective = "money"
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Gold")
+        # Depleted at the temple threshold: the safest ranking applies until
+        # the temple removes it, then the chosen objective again.
+        client.state.farm_objective = "xp"
+        client.farm_analyzer.rankings["safety"] = [pocket]
+        client.state.depletion_points_known = True
+        client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD
+        # A stale counter alone (cured elsewhere) is not depletion.
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
+        client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"), client.state.player_tag)
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
+        client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD - 1
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
+        client.state.depletion_points = 0
+        client.state.remove_item(501)
+        client.state.farm_objective = "money"
         client.state.farm_objective = "xp"
         client.state.farm_zone_quarantine = {self.TREES: time.time() + 60}
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
@@ -12193,6 +12244,42 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
             "task": "", "map": "/elsewhere"})
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
+
+    def test_depletion_prefers_safety_spots_then_falls_back_to_the_choice(self):
+        from .navigation import analyzer_farm_selection
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        client = self.client({"xp": [trees], "safety": [pocket]})
+        client.state.player_tag = 7
+        client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        client.state.depletion_points_known = True
+        client.state.depletion_points = 32
+        circuit = self.circuit(client, trees)
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.spot["name"], "Pocket")
+        selected = [entry["detail"] for entry in client.decision_history
+                    if entry["action"] == "farm-spot-selected"]
+        self.assertIn("(safety)", selected[-1])
+        # With no usable safety spot, the chosen objective's spot applies: the
+        # circuit keeps it, removing depletion before any farming, instead of
+        # ending and leaving autoplay to hold where nothing can cure her.
+        client.farm_analyzer.rankings["safety"] = []
+        circuit = self.circuit(client, trees)
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertNotEqual(circuit.status, TaskStatus.COMPLETE)
+        self.assertEqual(circuit.spot["name"], "Trees")
+        # Autoplay starting depleted still gets a circuit to cure her from.
+        self.assertEqual(analyzer_farm_selection(client, built_graph())[1]["name"],
+                         "Trees")
+        # A safety circuit whose spot became unusable returns to the choice.
+        circuit = self.circuit(client, pocket)
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.spot["name"], "Trees")
+        selected = [entry["detail"] for entry in client.decision_history
+                    if entry["action"] == "farm-spot-selected"]
+        self.assertIn("(xp)", selected[-1])
 
     def test_repeated_failures_at_maximum_adaptation_pause_the_spot_briefly(self):
         from . import self_improvement
@@ -12587,7 +12674,31 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(learning["goals"], {"area_spells": True, "protection": {"fire": 1},
                                              "offence": 1, "healing": 0})
         self.assertEqual(analysis["objective"], "xp")
+        self.assertEqual(analysis["selected_objective"], "xp")
+        self.assertIsNone(analysis["objective_override"])
         self.assertIn("money", analysis["objectives"])
+        # Depleted: she farms for safety, and the toggle keeps the choice.
+        self.client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
+            self.client.state.player_tag)
+        self.client.state.depletion_points_known = True
+        self.client.state.depletion_points = 32
+        status, payload = await self.request("GET", "/api/state?include=farming_analysis")
+        analysis = json.loads(payload)["farming_analysis"]
+        self.assertEqual((analysis["objective"], analysis["selected_objective"]),
+                         ("safety", "xp"))
+        self.assertEqual(analysis["objective_override"],
+                         {"reason": "depletion", "points": 32})
+        # No usable safety spot: she farms the choice, and the page says so.
+        self.client.farm_analyzer = StubAnalyzer({"xp": [analyzer_spot(
+            "Trees", ["/shattered_islands/world_14_79"], ["evil treant L13"])]})
+        self.server.dashboard.graph = built_graph()
+        status, payload = await self.request("GET", "/api/state?include=farming_analysis")
+        analysis = json.loads(payload)["farming_analysis"]
+        self.assertEqual(analysis["objective"], "xp")
+        self.assertIsNone(analysis["objective_override"])
+        self.client.farm_analyzer = None
+        self.client.state.depletion_points = 0
         status, payload = await self.request(
             "POST", "/api/action", {"type": "farm_objective", "objective": "money"})
         self.assertEqual(status, 200, payload)

@@ -180,8 +180,16 @@ balanced, or safety. The choice is saved per character and needs no new run,
 because one run ranks every objective. The rates are model estimates for
 comparing spots, not live measurements.
 
-Autoplay always farms the preferred objective's #1 spot. There are no
-level bands or curated spots: the analyzer result's map paths become the
+Autoplay farms the preferred objective's #1 usable spot. The exception is
+depletion: while the live depletion force is present and her depletion count
+is at the temple-service threshold (3), it farms the **safety** ranking
+instead, until the depletion is removed. If no safety spot is usable, it keeps
+the preferred objective's spot, because the circuit removes depletion before
+any farming whenever an item or the temple fee allows, and farming is what pays
+that fee. The Farming tab then shows the ranking she actually farms, and notes
+the depletion override; the objective toggle keeps showing your choice.
+
+There are no level bands or curated spots: the analyzer result's map paths become the
 circuit's legs (a multi-map circuit rotates through every map), and its listed
 monsters become the targets. Spots whose residents include aggressive spawns
 get cautious recovery margins (flee at 80% HP, heal at 95%) and isolated pulls
