@@ -75,7 +75,8 @@ class BotMemory:
             return default
         try:
             return json.loads(row[0])
-        except (TypeError, ValueError):
+        # RecursionError: a small value nested too deep for the decoder.
+        except (TypeError, ValueError, RecursionError):
             log.warning("invalid %s memory for %s on %s",
                         kind, character, self.server)
             return default

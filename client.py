@@ -188,7 +188,7 @@ class AtrinikClient:
         self._memory_character = ""
         self.decision_history: list[dict] = []
         # Health, SP and food samples, and the deaths reviewed from them.
-        self.vitals: deque[list[float]] = deque()
+        self.vitals: deque[list[float]] = deque(maxlen=post_mortem.MAX_LIVE_VITALS)
         # Each other character's live reports, while this client plays another.
         self._live_post_mortems: dict[str, list[dict]] = {}
         # When the last death's bookkeeping ended (its records are its own).

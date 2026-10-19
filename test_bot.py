@@ -1515,6 +1515,27 @@ class ProtocolTests(unittest.TestCase):
             client.load_character_memory("Sera")
             self.assertEqual(len(client.post_mortems), 1)
 
+    def test_a_deeply_nested_stored_value_is_invalid_not_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            store = client._memory_store()
+            with store._connect() as db:
+                db.execute("UPDATE memory SET value_json = ? WHERE kind = 'post_mortems'", ("[" * 100000 + "]" * 100000,))
+                db.execute(
+                    "INSERT OR REPLACE INTO memory (server, account, character, kind, value_json, updated_at) "
+                    "VALUES (?, ?, ?, 'post_mortems', ?, 0)",
+                    (store.server, store.account, "sera", "[" * 100000 + "]" * 100000))
+            with self.assertLogs("atrinik_bot.memory", "WARNING"):
+                client.load_character_memory("Sera")
+            self.assertEqual(client.post_mortems, [])
+
+    def test_live_vitals_are_bounded_by_count(self):
+        from . import post_mortem
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        self.assertEqual(client.vitals.maxlen, post_mortem.MAX_LIVE_VITALS)
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80

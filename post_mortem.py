@@ -30,6 +30,9 @@ VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 MAX_VITALS = 120
 # Attackers or damage types kept in a restored report.
 MAX_COUNTS = 25
+# The most live vitals samples held at once: the window is time-based, but a
+# burst of stats packets must never grow it without bound.
+MAX_LIVE_VITALS = 6000
 # The largest stored post-mortem list ever decoded: KEEP bounded reports are a
 # few megabytes at most, so anything larger is not one of ours.
 MAX_STORED_BYTES = 8 * 1024 * 1024
