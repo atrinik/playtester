@@ -39,10 +39,14 @@ PAUSE_FAILURES, PAUSE_WINDOW_SECONDS = 3, 3600.0
 PAUSE_SECONDS = 3600.0
 KEEP_REVIEWS = 10
 
+# Bounded digits: a server line with an oversized amount never reaches
+# int()'s digit limit; it is not a hit we count.
 _HIT = re.compile(
-    r"^(?P<who>.+?) hit you for (?P<amount>\d+)(?: \(-?\d+\))?"
+    r"^(?P<who>.+?) hit you for (?P<amount>\d{1,9})(?: \(-?\d{1,9}\))?"
     r"(?: (?:(?P<type>[a-z][a-z ]*?) )?damage)?[.!]?$", re.I)
-_DISENGAGE = re.compile(r"sp=(?P<sp>\d+) next-heal=(?P<heal>\d+)")
+# Bounded digits: a stored detail with an oversized number never reaches
+# int()'s digit limit; it just does not match.
+_DISENGAGE = re.compile(r"sp=(?P<sp>\d{1,9}) next-heal=(?P<heal>\d{1,9})(?!\d)")
 
 
 @dataclass
@@ -107,11 +111,18 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
     for _, who, amount, kind in hits:
         attackers[who] = attackers.get(who, 0) + 1
         damage_by_type[kind] = damage_by_type.get(kind, 0) + amount
-    peak = 0
-    for index, (stamp, _, _, _) in enumerate(hits):
-        window = {who for when_hit, who, _, _ in hits[index:]
-                  if when_hit - stamp <= PACK_WINDOW_SECONDS}
-        peak = max(peak, len(window))
+    # The most distinct attackers within any PACK_WINDOW_SECONDS: one sliding
+    # window over the hits in time order (linear, however busy the fight).
+    peak, present, end = 0, {}, 0
+    ordered = sorted(hits, key=lambda hit: hit[0])
+    for stamp, who, _, _ in ordered:
+        while end < len(ordered) and ordered[end][0] - stamp <= PACK_WINDOW_SECONDS:
+            present[ordered[end][1]] = present.get(ordered[end][1], 0) + 1
+            end += 1
+        peak = max(peak, len(present))
+        present[who] -= 1
+        if not present[who]:
+            del present[who]
     damage = sum(damage_by_type.values())
     starved = any(
         record.get("action") == "emergency-disengage" and

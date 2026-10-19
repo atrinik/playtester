@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import contextlib
 import copy
 import json
@@ -21,10 +22,14 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameSta
                     InterfaceState, Item, MapObject, MapState)
 from .alerts import ProgressWatch
 from .memory import BotMemory
+from . import post_mortem
+from .self_improvement import PLAYER_CHANNELS
 from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
 
+# The longest a death waits for a locked memory database (seconds).
+POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
 EventHandler = Callable[[Event], Awaitable[None] | None]
 
@@ -111,6 +116,24 @@ class ClientConfig:
     runtime_content_path: str = ""
 
 
+# kill_player (server types/player.c) sends exactly one of these, as the whole
+# message, per defeat: a PvP-area defeat, or a death after its stat losses.
+# Matching the whole text keeps a player's chat that quotes one from passing
+# for a death.
+DEATH_NOTICES = ("you have been defeated in combat!", "you have died.")
+
+def _after(records: list, mark: Any) -> list:
+    """The records after ``mark``: found by identity, or by value in a
+    reloaded history (a decoded record equals the one saved); all of them
+    when it is gone (trimmed away)."""
+    if mark is not None:
+        for same in (lambda record: record is mark, lambda record: record == mark):
+            for index in range(len(records) - 1, -1, -1):
+                if same(records[index]):
+                    return records[index + 1:]
+    return records
+
+
 class AtrinikClient:
     BANK_BALANCE_CACHE_SECONDS = 6 * 60 * 60
 
@@ -170,7 +193,23 @@ class AtrinikClient:
         self.memory: BotMemory | None = None
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
+        # Every message of the last review window, for post-mortems: the UI's
+        # 500-message buffer can drop a busy minute's oldest hits.
+        # Bounded, and pruned from the front in O(1): a busy minute's 20,000
+        # messages after a long gap cost no shifting.
+        self.review_messages: deque[tuple] = deque(maxlen=post_mortem.REVIEW_HISTORY_LIMIT)
+        self._memory_character = ""
         self.decision_history: list[dict] = []
+        # Health, SP and food samples, and the deaths reviewed from them.
+        self.vitals: deque[list[float]] = deque(maxlen=post_mortem.MAX_LIVE_VITALS)
+        # Each other character's live reports, while this client plays another.
+        self._live_post_mortems: dict[str, list[dict]] = {}
+        # The last record of each history at the previous report: the next
+        # report reads only what follows (identity, not time).
+        self._life_marks: dict[str, Any] = {}
+        # When the last death's bookkeeping ended (its records are its own).
+        self._post_mortem_booked = 0.0
+        self.post_mortems: list[dict] = []
         # (time, path) of each arrival on a new map, newest last.
         self.map_arrivals: list[tuple[float, str]] = []
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
@@ -191,6 +230,27 @@ class AtrinikClient:
         self.farm_analyzer = None
 
     def load_character_memory(self, character: str) -> None:
+        # Switching characters on a long-lived client: the previous one's
+        # vitals, messages and actions must not explain this one's death.
+        same_character = self._memory_character == character
+        if self._memory_character and not same_character:
+            self.vitals.clear()
+            self.review_messages.clear()
+            self.action_history.clear()
+            # A loss buffered for the previous character's death is not hers.
+            self._pending_death_losses.clear()
+            self._death_depletion_until = 0.0
+            # Another character's death bounds nothing in this one's life.
+            self._post_mortem_booked = 0.0
+            # Kept for that character, not dropped: a report whose save failed
+            # is still merged when she comes back.
+            if self.post_mortems:
+                self._live_post_mortems.pop(self._memory_character, None)
+                self._live_post_mortems[self._memory_character] = self.post_mortems
+                while len(self._live_post_mortems) > post_mortem.MAX_CACHED_CHARACTERS:
+                    del self._live_post_mortems[next(iter(self._live_post_mortems))]
+            self.post_mortems = []
+        self._memory_character = character
         memory = self._memory_store()
         memory.import_legacy(
             self._legacy_runtime_state_path,
@@ -202,6 +262,32 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        # The life boundary in this (possibly reloaded) ledger: the previous
+        # report's mark, found by value, or, in a fresh process with no mark,
+        # the restored ledger's last death.
+        mark = self._life_marks.get("decisions")
+        if mark is None or mark not in self.decision_history:
+            self._life_marks["decisions"] = next(
+                (record for record in reversed(self.decision_history) if record.get("action") == "death"), None)
+        # Newest first, stopping at KEEP valid reports, and looking at no more
+        # than a few times KEEP candidates: an oversized stored list, valid or
+        # not, is never normalized whole.
+        deaths = memory.load(character, "post_mortems", [], max_bytes=post_mortem.MAX_STORED_BYTES)
+        kept: list[dict] = []
+        for value in reversed((deaths if isinstance(deaths, list) else [])[-4 * post_mortem.KEEP:]):
+            if len(kept) == post_mortem.KEEP:
+                break
+            if (restored := post_mortem.restore(value)) is not None:
+                kept.append(restored)
+        # A reconnect reloads the same character: its live reports may be
+        # newer than the store (a save can fail), so they win for the same
+        # death and are never dropped for the older saved list. Order is the
+        # order they were recorded, live last (never wall time, which can
+        # step back), so the cap drops the oldest saved ones first.
+        live = self.post_mortems if same_character else self._live_post_mortems.pop(character, [])
+        live_times = {death["time"] for death in live}
+        self.post_mortems = ([death for death in kept[::-1] if death["time"] not in live_times]
+                             + list(live))[-post_mortem.KEEP:]
         buckets = memory.load(character, "trends", [])
         saved = Trends(buckets if isinstance(buckets, list) else ()).buckets
         # A reconnect reloads the same character: its live buckets are newer
@@ -745,7 +831,9 @@ class AtrinikClient:
                 if previous["count"] % 5:
                     return
             else:
-                self.decision_history.append(record)
+                # A copy: coalescing updates the decision in place, which must
+                # not move the action history entry it came from.
+                self.decision_history.append(dict(record))
                 del self.decision_history[:-2000]
             # Before the player packet arrives, config.character names the
             # intended selection but its persisted history has not been
@@ -755,6 +843,72 @@ class AtrinikClient:
             if character:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
+
+    def _latest_ledger_death(self) -> float:
+        """The persisted ledger's latest death (0 if none), overflow-safe."""
+        for record in reversed(self.decision_history[-200:]):
+            if isinstance(record, dict) and record.get("action") == "death" \
+                    and post_mortem.finite(record.get("time")):
+                return float(record["time"])
+        return 0.0
+
+    def _record_post_mortem(self, when: float | None = None,
+                            ledger_death: float | None = None) -> None:
+        """Keep what happened in the minute before this death.
+
+        kill_player queues its notice before the savebed transfer's map update,
+        which goes out at the end of the server tick, so the square she is on
+        now is where she fell. The report is built once, here, and ends at the
+        notice: what follows a death (a respawn, the next fight) never belongs
+        to it. `when` is the notice's arrival, taken before any bookkeeping
+        (whose saves can wait on a locked database) can delay it.
+        """
+        # The previous life ends with its death's bookkeeping, which comes
+        # after its notice; a restored report has only its notice time.
+        notice = time.time() if when is None else when
+        # Without a report or a booking for it (an upgrade, a discarded store),
+        # the persisted ledger's latest earlier death still ends that life.
+        # The handler reads it before this death's own record is written, so
+        # it is never this death, whatever the wall clock does.
+        if ledger_death is None:
+            ledger_death = self._latest_ledger_death()
+        previous = max(self._post_mortem_booked, ledger_death,
+                       self.post_mortems[-1]["time"] if self.post_mortems else 0.0)
+        m = self.state.map
+        # Lives are separated by position as well as by time: only what was
+        # recorded since the previous report counts, so no wall-clock step,
+        # backward or forward, lets the last life into this one.
+        self.post_mortems.append(post_mortem.build(
+            notice, m.path, m.world_x, m.world_y, self.vitals,
+            list(self.review_messages),
+            _after(self.action_history, self._life_marks.get("actions")),
+            _after(self.decision_history, self._life_marks.get("decisions")),
+            since=previous, name=self.state.player_name or self.config.character,
+            recorded=time.time()))
+        self._post_mortem_booked = time.time()
+        # The next life starts here: its messages afresh, its vitals from the
+        # latest sample (the state it starts in), its records after these.
+        self.review_messages.clear()
+        while len(self.vitals) > 1:
+            self.vitals.popleft()
+        self._life_marks = {"actions": self.action_history[-1] if self.action_history else None,
+                            "decisions": self.decision_history[-1] if self.decision_history else None}
+        del self.post_mortems[:-post_mortem.KEEP]
+        # Best effort, like the trends: a full or read-only disk, or a locked
+        # database, must never stop or stall play for dashboard telemetry. The
+        # save waits at most a quarter second for a lock (not SQLite's usual
+        # ten) and is otherwise skipped; the report stays in memory, and the
+        # next death's save carries it.
+        character = self.state.player_name
+        if character:
+            self._save_post_mortems(character, self.post_mortems)
+
+    def _save_post_mortems(self, character: str, reports: list[dict]) -> None:
+        try:
+            self._memory_store().save(character, "post_mortems", reports,
+                                      timeout=POST_MORTEM_SAVE_TIMEOUT)
+        except Exception as error:
+            log.warning("could not save post-mortems for %s: %s", character, error)
 
     def _trend_count(self, key: str) -> None:
         if self.trends.count(key):
@@ -879,6 +1033,14 @@ class AtrinikClient:
     async def close(self) -> None:
         # The current minute is otherwise saved only when the next one starts.
         self._persist_trends()
+        # A report whose save failed lives only in memory: one more try, for
+        # this character and any other this client played.
+        current = self._memory_character or self.state.player_name
+        if current and self.post_mortems:
+            self._save_post_mortems(current, self.post_mortems)
+        for character, reports in self._live_post_mortems.items():
+            if reports:
+                self._save_post_mortems(character, reports)
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"
@@ -1190,6 +1352,15 @@ class AtrinikClient:
         msg_type, color = cur.u8(), cur.cstring()
         text = cur.cstring() if cur.remaining else ""
         self.state.add_message(msg_type, color, text)
+        # Only what a review reads (time, type, text), bounded in size as well
+        # as count: a report's own text length of each line, and no other
+        # server field (a frame can be megabytes).
+        stamp, msg_type, *_, line = self.state.messages[-1]
+        self.review_messages.append((stamp, msg_type, str(line)[:post_mortem.MAX_TEXT]))
+        arrived = time.time()
+        cutoff = self.state.messages[-1][0] - post_mortem.REVIEW_HISTORY_SECONDS
+        while self.review_messages and self.review_messages[0][0] < cutoff:
+            self.review_messages.popleft()
         if update_bank_balance(self.state, text):
             self.set_bank_balance(self.state.bank_balance)
         lowered = text.casefold()
@@ -1229,12 +1400,14 @@ class AtrinikClient:
         # kill_player (server types/player.c) sends exactly one of these, as
         # the whole message, per defeat: a PvP-area defeat, or a death after
         # its stat losses. Matching the whole text keeps a player's chat that
-        # quotes one from passing for a death.
-        died = normalized in ("you have been defeated in combat!",
-                              "you have died.")
+        # quotes one from passing for a death, and a player channel (where
+        # anyone can type the exact notice) never carries a real one.
+        died = normalized in DEATH_NOTICES and msg_type not in PLAYER_CHANNELS
         if lowered.startswith("the spell heals you for"):
             self._trend_count("heals")
         if died:
+            # Before this death's own record: the previous life's end.
+            previous_death = self._latest_ledger_death()
             self.record_action("death", text)
             self._trend_count("deaths")
             # The server emits death stat-loss lines before its final death
@@ -1250,6 +1423,9 @@ class AtrinikClient:
                     "depletion",
                     f"point {self.state.depletion_points}: {message}")
             self._death_depletion_until = now + 8.0
+            # After the bookkeeping above, so its depletion records are in it,
+            # but dated at the notice's arrival.
+            self._record_post_mortem(arrived, previous_death)
         death_loss = normalized in death_losses
         direct_drain = any(normalized == marker for marker in direct_drains)
         if death_loss and now > self._death_depletion_until:
@@ -1600,6 +1776,15 @@ class AtrinikClient:
             self.state.stats[name] = value
             self.state.stat_observed_at[name] = time.monotonic()
             changed[name] = value
+        if any(key in changed for key in post_mortem.VITAL_KEYS):
+            self.vitals.append(post_mortem.sample(self.state.stats))
+            cutoff = time.time() - post_mortem.VITALS_SECONDS
+            # A deque: each expired sample leaves from the front in O(1), so
+            # a full window costs the same per packet as an empty one. The
+            # newest expired sample stays: samples come only on change, so it
+            # is the state until the next one, the baseline of a sudden death.
+            while len(self.vitals) > 1 and self.vitals[1][0] < cutoff:
+                self.vitals.popleft()
         if self.trends.observe(self.state):
             self._persist_trends()
         self.progress_watch.observe(self.state)

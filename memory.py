@@ -41,8 +41,8 @@ class BotMemory:
                    )""")
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=10.0)
+    def _connect(self, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
+        db = sqlite3.connect(self.path, timeout=timeout)
         try:
             yield db
         except Exception:
@@ -53,26 +53,38 @@ class BotMemory:
         finally:
             db.close()
 
-    def load(self, character: str, kind: str, default: Any) -> Any:
+    def load(self, character: str, kind: str, default: Any, *,
+             max_bytes: int | None = None) -> Any:
+        """The stored value, or ``default``. With ``max_bytes``, a larger
+        stored value is never fetched or decoded (SQLite checks its length)."""
         with self._connect() as db:
             row = db.execute(
-                """SELECT value_json FROM memory
+                """SELECT CASE WHEN ? IS NULL OR length(CAST(value_json AS BLOB)) <= ?
+                               THEN value_json END,
+                          length(CAST(value_json AS BLOB))
+                   FROM memory
                    WHERE server = ? AND account = ? AND character = ?
                      AND kind = ?""",
-                (self.server, self.account, character.casefold(), kind),
+                (max_bytes, max_bytes, self.server, self.account, character.casefold(), kind),
             ).fetchone()
         if row is None:
             return default
+        if row[0] is None:
+            log.warning("ignoring %s memory for %s on %s: %s bytes is over %s",
+                        kind, character, self.server, row[1], max_bytes)
+            return default
         try:
             return json.loads(row[0])
-        except (TypeError, ValueError):
+        # RecursionError: a small value nested too deep for the decoder.
+        except (TypeError, ValueError, RecursionError):
             log.warning("invalid %s memory for %s on %s",
                         kind, character, self.server)
             return default
 
-    def save(self, character: str, kind: str, value: Any) -> None:
+    def save(self, character: str, kind: str, value: Any, *, timeout: float = 10.0) -> None:
+        """Store ``value``; ``timeout`` bounds the wait for a locked database."""
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        with self._connect() as db:
+        with self._connect(timeout) as db:
             db.execute(
                 """INSERT INTO memory
                        (server, account, character, kind, value_json, updated_at)

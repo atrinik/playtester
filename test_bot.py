@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import json
 import time
 import tempfile
@@ -1205,6 +1206,802 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             asyncio.run(client._handle_party(Cursor(malformed), malformed))
 
+    def test_death_records_a_post_mortem_of_the_last_minute(self):
+        import struct
+        from . import post_mortem
+
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.map.path = "/shattered_islands/world_6_46"
+        client.state.map.world_x, client.state.map.world_y = 12, 14
+
+        payload = b"".join(bytes((stat,)) + struct.pack(">" + c.STAT_FORMATS[stat], value)
+                           for stat, value in ((c.STAT_HP, 13), (c.STAT_MAXHP, 155),
+                                               (c.STAT_SP, 3), (c.STAT_MAXSP, 39)))
+        asyncio.run(client._handle_stats(Cursor(payload), payload))
+        self.assertEqual(client.vitals[-1][1:5], [13, 155, 3, 39])
+        # A rolling window: expired samples leave from the front in O(1).
+        self.assertIsInstance(client.vitals, collections.deque)
+        stale = time.time() - post_mortem.VITALS_SECONDS - 5
+        client.vitals.appendleft([stale - 5, 1, 155, 0, 39, 900])
+        client.vitals.appendleft([stale - 10, 2, 155, 0, 39, 900])
+        asyncio.run(client._handle_stats(Cursor(payload), payload))
+        # Older expired samples go; the newest expired one stays as the
+        # baseline (samples come only on change).
+        cutoff = time.time() - post_mortem.VITALS_SECONDS
+        self.assertEqual(sum(sample[0] < cutoff for sample in client.vitals), 1)
+        self.assertLess(client.vitals[0][0], cutoff)
+
+        def say(text, msg_type=2):
+            data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+
+        # A death sends its stat losses, then "YOU HAVE DIED." last.
+        for line in ("The spell heals you for 12 hp!", "Sera starved to death.",
+                     "You feel clumsy!", "YOU HAVE DIED."):
+            say(line)
+        self.assertEqual(len(client.post_mortems), 1)
+        death = client.post_mortems[0]
+        self.assertEqual((death["map"], death["x"], death["y"]),
+                         ("/shattered_islands/world_6_46", 12, 14))
+        self.assertEqual((death["cause"], death["detail"]), ("starvation", "ran out of food"))
+        self.assertEqual(death["vitals"][-1][1:5], [13, 155, 3, 39])
+        texts = [text for _, text in death["messages"]]
+        self.assertIn("Sera starved to death.", texts)
+        self.assertIn("You feel clumsy!", texts)
+        self.assertIn("death", [entry["action"] for entry in death["actions"]])
+        # The stat loss buffered before the death is counted with it, and the
+        # post-mortem includes that bookkeeping.
+        self.assertIn("depletion", [entry["action"] for entry in death["actions"]])
+        self.assertIn("depletion", [entry["action"] for entry in death["decisions"]])
+        # A player's chat quoting a notice is no death.
+        say("[a=#charname]Mallory[/a]: YOU HAVE DIED.", c.CHAT_TYPE_CHAT)
+        say("[a=#charname]Mallory[/a] tells you: You have been defeated in combat!",
+            c.CHAT_TYPE_PRIVATE)
+        self.assertEqual(len(client.post_mortems), 1)
+        # Chat quoting her starvation, or another player starving, is not hers.
+        say("[a=#charname]Mallory[/a]: Sera starved to death.", c.CHAT_TYPE_CHAT)
+        say("Mallory starved to death.")
+        say("YOU HAVE DIED.")
+        self.assertEqual(len(client.post_mortems), 2)
+        self.assertNotEqual(client.post_mortems[-1]["cause"], "starvation")
+        # Each notice is its own defeat, however soon: a PvP-area defeat
+        # sends only "defeated in combat", a death only "YOU HAVE DIED.".
+        say("You have been defeated in combat!")
+        say("YOU HAVE DIED.")
+        self.assertEqual(len(client.post_mortems), 4)
+        # Only the latest KEEP deaths are kept.
+        for index in range(post_mortem.KEEP + 3):
+            say("YOU HAVE DIED.")
+        self.assertEqual(len(client.post_mortems), post_mortem.KEEP)
+
+    def test_a_busy_minute_is_reviewed_whole_past_the_message_buffer(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        # More hits than the dashboard's 500-message buffer holds.
+        for _ in range(520):
+            say("giant rat hit you for 1 (-1) impact damage.")
+        say("YOU HAVE DIED.")
+        self.assertEqual(len(client.state.messages), 500)
+        death = client.post_mortems[-1]
+        self.assertEqual(death["damage_taken"], 520)
+        self.assertEqual(death["attackers"], {"giant rat": 520})
+
+    def test_restoring_post_mortems_inspects_a_bounded_number_of_candidates(self):
+        from . import post_mortem
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client._memory_store().save("Sera", "post_mortems", [{"time": "invalid"}] * 10000)
+            calls = []
+            original = post_mortem.restore
+            with patch.object(post_mortem, "restore", lambda value: calls.append(1) or original(value)):
+                client.load_character_memory("Sera")
+            self.assertLessEqual(len(calls), 4 * post_mortem.KEEP)
+            self.assertEqual(client.post_mortems, [])
+
+    def test_a_failed_post_mortem_save_never_stops_the_client(self):
+        import sqlite3
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.player_name = "Sera"
+        client.state.phase = "playing"
+
+        class LockedDatabase:
+            def save(self, *args, **kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+        client._memory_store = lambda: LockedDatabase()
+        with self.assertLogs("atrinik_bot.client", "WARNING"):
+            client._record_post_mortem()
+        self.assertEqual(len(client.post_mortems), 1)
+
+    def test_a_sudden_death_after_a_long_steady_spell_keeps_its_baseline(self):
+        import struct
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        # Healthy for longer than the window, then one fatal packet.
+        client.vitals.append([time.time() - 900, 155, 155, 39, 39, 900])
+        payload = b"".join(bytes((stat,)) + struct.pack(">" + c.STAT_FORMATS[stat], value)
+                           for stat, value in ((c.STAT_HP, 0), (c.STAT_MAXHP, 155)))
+        asyncio.run(client._handle_stats(Cursor(payload), payload))
+        data = bytes((2,)) + b"ffffff\0" + b"YOU HAVE DIED.\0"
+        asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        vitals = client.post_mortems[-1]["vitals"]
+        # Charted from the healthy state at the window start to the fatal hit.
+        self.assertEqual(vitals[0][1], 155)
+        self.assertEqual(vitals[-1][1], 0)
+
+    def test_report_fields_from_the_decision_ledger_are_sanitized(self):
+        from . import post_mortem
+        when = time.time()
+        report = post_mortem.build(
+            when, "/a", 1, 2, [], [], [],
+            [{"time": when - 5, "action": float("nan"), "detail": "\ud800", "map": ["x"]}],
+            name="Sera")
+        decision = report["decisions"][-1]
+        self.assertEqual(decision["action"], "nan")
+        json.dumps(report, allow_nan=False).encode("utf-8")
+        self.assertEqual(decision["map"], "")
+
+    def test_a_slow_bookkeeping_save_never_moves_the_death_time(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        clock = [1000.0]
+        original = client.record_action
+
+        def slow_record(*args, **kwargs):
+            clock[0] += 30.0  # a locked database's wait, on the wall clock
+            return original(*args, **kwargs)
+
+        client.record_action = slow_record
+        data = bytes((2,)) + b"ffffff\0" + b"YOU HAVE DIED.\0"
+        with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        self.assertEqual(client.post_mortems[-1]["time"], 1000.0)
+
+    def test_an_oversized_hit_amount_never_breaks_the_death_review(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        # A malicious server line: an amount past int()'s digit limit.
+        say("giant rat hit you for " + "9" * 5000 + " (-1) impact damage.")
+        say("giant rat hit you for 3 (-3) impact damage.")
+        say("YOU HAVE DIED.")
+        death = client.post_mortems[-1]
+        self.assertEqual((death["damage_taken"], death["attackers"]), (3, {"giant rat": 1}))
+
+    def test_an_oversized_ledger_number_never_breaks_the_death_review(self):
+        from . import post_mortem
+        when = time.time()
+        report = post_mortem.build(
+            when, "/a", 1, 2, [], [], [],
+            [{"time": when - 5, "action": "emergency-disengage",
+              "detail": "sp=" + "9" * 5000 + " next-heal=" + "9" * 5000}],
+            name="Sera")
+        self.assertEqual(report["decisions"][-1]["action"], "emergency-disengage")
+        self.assertLessEqual(len(report["decisions"][-1]["detail"]), post_mortem.MAX_TEXT)
+
+    def test_a_locked_database_delays_a_death_at_most_briefly(self):
+        import sqlite3
+        from . import client as client_module
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            # Another process holds the write lock.
+            holder = sqlite3.connect(client._memory_store().path)
+            holder.execute("BEGIN IMMEDIATE")
+            try:
+                started = time.monotonic()
+                with self.assertLogs("atrinik_bot.client", "WARNING"):
+                    client._record_post_mortem()
+                elapsed = time.monotonic() - started
+            finally:
+                holder.rollback()
+                holder.close()
+            self.assertLess(elapsed, client_module.POST_MORTEM_SAVE_TIMEOUT + 1.0)
+            self.assertEqual(len(client.post_mortems), 1)
+
+    def test_a_reconnect_keeps_a_post_mortem_whose_save_failed(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            store = client._memory_store
+
+            class LockedDatabase:
+                def save(self, *args, **kwargs):
+                    raise sqlite3.OperationalError("database is locked")
+
+            client._memory_store = lambda: LockedDatabase()
+            with self.assertLogs("atrinik_bot.client", "WARNING"):
+                client._record_post_mortem()
+            client._memory_store = store
+            # The same character reconnects: the unsaved report survives.
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.post_mortems), 1)
+            # Another character starts with none of hers.
+            client.load_character_memory("Mallory")
+            self.assertEqual(client.post_mortems, [])
+
+    def test_an_unsaved_report_survives_a_switch_to_another_character_and_back(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            store = client._memory_store
+
+            class LockedDatabase:
+                def save(self, *args, **kwargs):
+                    raise sqlite3.OperationalError("database is locked")
+
+            client._memory_store = lambda: LockedDatabase()
+            with self.assertLogs("atrinik_bot.client", "WARNING"):
+                client._record_post_mortem()
+            client._memory_store = store
+            client.load_character_memory("Mallory")
+            self.assertEqual(client.post_mortems, [])
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.post_mortems), 1)
+
+    def test_colliding_attacker_labels_add_their_counts(self):
+        from . import post_mortem
+        long = "a" * 80
+        restored = post_mortem.restore({
+            "time": 1000.0, "attackers": {long + "x": 9, long + "y": 2, "\ud800": 3, "\udfff": 4}})
+        self.assertEqual(restored["attackers"][long], 11)
+        self.assertEqual(sum(restored["attackers"].values()), 18)
+
+    def test_a_clean_shutdown_retries_unsaved_post_mortems(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            store = client._memory_store
+
+            class LockedDatabase:
+                def save(self, *args, **kwargs):
+                    raise sqlite3.OperationalError("database is locked")
+
+            client._memory_store = lambda: LockedDatabase()
+            with self.assertLogs("atrinik_bot.client", "WARNING"):
+                client._record_post_mortem()
+            # Mallory's unsaved report waits in the per-character cache too.
+            client._live_post_mortems["Mallory"] = [dict(client.post_mortems[0], time=5.0)]
+            client._memory_store = store
+            asyncio.run(client.close())
+            self.assertEqual(len(store().load("Sera", "post_mortems", [])), 1)
+            self.assertEqual(len(store().load("Mallory", "post_mortems", [])), 1)
+
+    def test_an_oversized_stored_post_mortem_list_is_never_decoded(self):
+        from . import post_mortem
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client._memory_store().save("Sera", "post_mortems", ["x" * 1024] * 9000)
+            decoded = []
+            original = json.loads
+            with patch("atrinik_bot.memory.json.loads", lambda text, *a, **k: decoded.append(len(text)) or original(text, *a, **k)), \
+                    self.assertLogs("atrinik_bot.memory", "WARNING"):
+                client.load_character_memory("Sera")
+            self.assertFalse([size for size in decoded if size > post_mortem.MAX_STORED_BYTES])
+            self.assertEqual(client.post_mortems, [])
+            # A normal list still loads.
+            client._memory_store().save("Sera", "post_mortems", [{"time": 1000.0}])
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.post_mortems), 1)
+
+    def test_a_deeply_nested_stored_value_is_invalid_not_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            store = client._memory_store()
+            with store._connect() as db:
+                db.execute("UPDATE memory SET value_json = ? WHERE kind = 'post_mortems'", ("[" * 100000 + "]" * 100000,))
+                db.execute(
+                    "INSERT OR REPLACE INTO memory (server, account, character, kind, value_json, updated_at) "
+                    "VALUES (?, ?, ?, 'post_mortems', ?, 0)",
+                    (store.server, store.account, "sera", "[" * 100000 + "]" * 100000))
+            with self.assertLogs("atrinik_bot.memory", "WARNING"):
+                client.load_character_memory("Sera")
+            self.assertEqual(client.post_mortems, [])
+
+    def test_live_vitals_are_bounded_by_count(self):
+        from . import post_mortem
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        self.assertEqual(client.vitals.maxlen, post_mortem.MAX_LIVE_VITALS)
+
+    def test_the_other_characters_cache_is_capped(self):
+        from . import post_mortem
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            # A hostile server switching through many distinct names.
+            for index in range(50):
+                client.post_mortems = [{"time": float(index)}]
+                client.load_character_memory(f"name-{index}")
+            self.assertEqual(len(client._live_post_mortems), post_mortem.MAX_CACHED_CHARACTERS)
+            self.assertIn("name-48", client._live_post_mortems)
+            self.assertNotIn("Sera", client._live_post_mortems)
+            # A character with no reports takes no slot.
+            client.post_mortems = []
+            client.load_character_memory("empty")
+            self.assertNotIn("name-49", client._live_post_mortems)
+
+    def test_review_messages_are_bounded_in_size(self):
+        from . import post_mortem
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        # A huge colour field and a huge text: neither is retained whole.
+        data = bytes((2,)) + b"f" * 100000 + b"\0" + b"x" * 100000 + b"\0"
+        asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        stamp, msg_type, text = client.review_messages[-1]
+        self.assertEqual(len(text), post_mortem.MAX_TEXT)
+        self.assertEqual((stamp, msg_type), tuple(client.state.messages[-1][:2]))
+
+    def test_downsampling_follows_time_not_sample_count(self):
+        from . import post_mortem
+        # Baseline at 0 s, a plateau from 30 s, then a burst in the last second.
+        samples = [[0.0, 100, 100, 50, 50, 900], [30.0, 80, 100, 50, 50, 900]]
+        samples += [[59.0 + index / 1000, 80 - index % 2, 100, 50, 50, 900] for index in range(500)]
+        kept = post_mortem.spread(samples)
+        self.assertLessEqual(len(kept), post_mortem.MAX_VITALS)
+        self.assertIn(samples[1], kept)
+        self.assertEqual((kept[0], kept[-1]), (samples[0], samples[-1]))
+
+    def test_a_death_without_evidence_is_unclassified(self):
+        from . import post_mortem
+        when = time.time()
+        report = post_mortem.build(when, "/a", 1, 2, [], [], [], [], name="Sera")
+        self.assertEqual(report["cause"], "unclassified")
+        report = post_mortem.build(when, "/a", 1, 2, [],
+                                   [(when - 5, 2, "giant rat hit you for 9 (-9) impact damage.")], [], [],
+                                   name="Sera")
+        self.assertEqual(report["cause"], "out-damaged")
+
+    def test_a_character_switch_resets_the_previous_death_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client._post_mortem_booked = time.time()
+            client.load_character_memory("Mallory")
+            self.assertEqual(client._post_mortem_booked, 0.0)
+
+    def test_extreme_restored_times_never_break_downsampling(self):
+        from . import post_mortem
+        rows = [[-1e308 + index * 1e306, 100, 100, 50, 50, 900] for index in range(200)]
+        rows[-1][0] = 1e308
+        restored = post_mortem.restore({"time": 1000.0, "vitals": rows})
+        self.assertLessEqual(len(restored["vitals"]), post_mortem.MAX_VITALS)
+
+    def test_the_ledger_death_bounds_a_life_without_its_report(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        now = time.time()
+        # An earlier death (no report for it) after an earlier life's disengage.
+        client.decision_history = [
+            {"time": now - 40, "action": "emergency-disengage", "detail": "sp=1 next-heal=9", "map": "/a"},
+            {"time": now - 30, "action": "death", "detail": "YOU HAVE DIED.", "map": "/a"},
+        ]
+        data = bytes((2,)) + b"ffffff\0YOU HAVE DIED.\0"
+        asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        death = client.post_mortems[-1]
+        self.assertNotEqual(death["cause"], "resources")
+        self.assertNotIn("emergency-disengage", [entry["action"] for entry in death["decisions"]])
+
+    def test_a_death_notice_on_a_player_channel_is_no_death(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        for channel in (3, 4, 5, 6, 7, 8):
+            for notice in (b"YOU HAVE DIED.", b"You have been defeated in combat!"):
+                data = bytes((channel,)) + b"ffffff\0" + notice + b"\0"
+                asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        self.assertEqual(client.post_mortems, [])
+        self.assertNotIn("death", [entry["action"] for entry in client.action_history])
+
+    def test_an_oversized_ledger_death_time_never_breaks_a_death(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.decision_history = [{"time": 10 ** 1000, "action": "death", "detail": "", "map": "/a"}]
+        data = bytes((2,)) + b"ffffff\0YOU HAVE DIED.\0"
+        asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        self.assertEqual(len(client.post_mortems), 1)
+
+    def test_the_current_death_is_never_its_own_boundary(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        clock = [1000.0]
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+                asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        say("giant rat hit you for 9 (-9) impact damage.")
+        clock[0] = 1040.0
+        original = client.record_action
+
+        def stepped_back(*args, **kwargs):
+            clock[0] = 1030.0  # the wall clock steps back during the bookkeeping
+            return original(*args, **kwargs)
+
+        client.record_action = stepped_back
+        say("YOU HAVE DIED.")
+        self.assertEqual(client.post_mortems[-1]["attackers"], {"giant rat": 1})
+
+    def test_a_clock_corrected_back_past_a_death_never_mixes_lives(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        clock = [960.0]
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+                asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        say("ogre hit you for 50 (-50) impact damage.")
+        clock[0] = 1000.0
+        say("YOU HAVE DIED.")
+        # The clock is corrected back past that death; the next life dies at 990.
+        clock[0] = 975.0
+        say("giant rat hit you for 3 (-3) impact damage.")
+        clock[0] = 990.0
+        say("YOU HAVE DIED.")
+        self.assertEqual(client.post_mortems[-1]["attackers"], {"giant rat": 1})
+        self.assertEqual(client.post_mortems[-1]["damage_taken"], 3)
+
+    def test_a_reload_keeps_the_life_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+            clock = [960.0]
+
+            def say(text):
+                data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+                with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+                    asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+            with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+                client.record_action("emergency-disengage", "sp=1 next-heal=9")
+            clock[0] = 1000.0
+            say("YOU HAVE DIED.")
+            # A reconnect reloads the ledger as new objects; then the clock
+            # is corrected back past that death.
+            client.load_character_memory("Sera")
+            clock[0] = 990.0
+            say("YOU HAVE DIED.")
+            report = client.post_mortems[-1]
+            self.assertNotEqual(report["cause"], "resources")
+            self.assertNotIn("emergency-disengage", [entry["action"] for entry in report["decisions"]])
+
+    def test_a_restarted_client_starts_the_life_after_the_ledger_death(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            first = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            first.load_character_memory("Sera")
+            first._memory_store().save("Sera", "decisions", [
+                {"time": 960.0, "action": "emergency-disengage", "detail": "sp=1 next-heal=9", "map": "/a"},
+                {"time": 1000.0, "action": "death", "detail": "YOU HAVE DIED.", "map": "/a"}])
+            # A new process; the clock is then corrected back past that death.
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+            data = bytes((2,)) + b"ffffff\0YOU HAVE DIED.\0"
+            with patch("atrinik_bot.client.time.time", lambda: 990.0):
+                asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+            report = client.post_mortems[-1]
+            self.assertNotEqual(report["cause"], "resources")
+            self.assertNotIn("emergency-disengage", [entry["action"] for entry in report["decisions"]])
+
+    def test_restored_counts_are_never_negative(self):
+        from . import post_mortem
+        long = "a" * 80
+        restored = post_mortem.restore({"time": 1000.0, "damage_taken": -5, "peak_attackers": -1,
+                                        "attackers": {long + "x": 7, long + "y": -9, "rat": -2}})
+        self.assertEqual(restored["attackers"][long], 7)
+        self.assertEqual(restored["attackers"]["rat"], 0)
+        self.assertEqual((restored["damage_taken"], restored["peak_attackers"]), (0, 0))
+
+    def test_a_live_report_survives_a_clock_step_back(self):
+        from . import post_mortem
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            stored = [{"time": 2000.0 + index} for index in range(post_mortem.KEEP)]
+            client._memory_store().save("Sera", "post_mortems", stored)
+            # The newest, unsaved report, recorded after the clock stepped back.
+            client.post_mortems = [{"time": 1500.0, "map": "/a"}]
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.post_mortems), post_mortem.KEEP)
+            self.assertEqual(client.post_mortems[-1]["time"], 1500.0)
+
+    def test_merged_counts_stay_finite(self):
+        from . import post_mortem
+        long = "a" * 80
+        restored = post_mortem.restore({"time": 1000.0, "attackers": {long + "x": 1e308, long + "y": 1e308}})
+        self.assertEqual(restored["attackers"][long], post_mortem.MAX_COUNT_VALUE)
+        json.dumps(restored, allow_nan=False)
+
+    def test_a_character_switch_drops_the_previous_ones_buffered_death_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            payload = bytes([2]) + b"ffffff\0You feel less potent!\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            # Sera disconnects before her notice; Mallory dies at once.
+            client.load_character_memory("Mallory")
+            client.state.player_name = "Mallory"
+            payload = bytes([2]) + b"ffffff\0YOU HAVE DIED.\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            self.assertEqual(client.state.depletion_points, 0)
+            self.assertNotIn("depletion", [entry["action"] for entry in client.action_history])
+
+    def test_downsampling_keeps_the_window_baseline(self):
+        from . import post_mortem
+        samples = [[float(index), 100, 100, 50, 50, 900] for index in range(300)]
+        # Every minimum sits right after the baseline.
+        samples[1] = [1.0, 1, 100, 1, 50, 1]
+        kept = post_mortem.spread(samples, keep=[1, 1, 1, 299])
+        self.assertEqual(kept[0], samples[0])
+        self.assertIn(samples[1], kept)
+        self.assertEqual(kept[-1], samples[-1])
+        self.assertLessEqual(len(kept), post_mortem.MAX_VITALS)
+
+    def test_switching_characters_drops_the_previous_ones_transient_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.vitals.append([time.time(), 10, 155, 0, 39, 900])
+            client.review_messages.append((time.time(), 2, "", "ogre hit you for 99 (-99) impact damage."))
+            client.action_history.append({"time": time.time(), "action": "fire"})
+            # The same character again keeps them; another one starts clean.
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.vitals), 1)
+            client.load_character_memory("Mallory")
+            self.assertEqual((list(client.vitals), list(client.review_messages), client.action_history), ([], [], []))
+
+    def test_a_post_mortem_names_the_square_of_the_death_notice(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        swamp, bed = "/shattered_islands/world_1_50", "/shattered_islands/world_0_68"
+        client.set_savebed = lambda *args: None
+        client.state.savebed_map, client.state.savebed_xy = bed, (4, 7)
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        # kill_player queues the notice before the savebed transfer's map
+        # update, so the square at the notice is where she fell, even one she
+        # just walked onto, the savebed included.
+        client.state.map = MapState(path=swamp, world_x=10, world_y=3)
+        say("You have been defeated in combat!")
+        client.state.map = MapState(path=bed, world_x=4, world_y=7)
+        say("Local medics have saved your life...")
+        death = client.post_mortems[-1]
+        self.assertEqual((death["map"], death["x"], death["y"]), (swamp, 10, 3))
+        # Built once, ending at the notice: the medics line and anything
+        # after it (the respawn, a next fight) are not part of it.
+        self.assertNotIn("Local medics have saved your life...",
+                         [text for _, text in death["messages"]])
+        say("YOU HAVE DIED.")
+        death = client.post_mortems[-1]
+        self.assertEqual((death["map"], death["x"], death["y"]), (bed, 4, 7))
+        self.assertEqual(len(client.post_mortems), 2)
+
+    def test_a_quick_second_death_stays_out_of_the_first_report(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        # The second notice lands inside the first's post-death window: the
+        # first is finished before that notice is recorded, so neither
+        # report holds both deaths.
+        say("YOU HAVE DIED.")
+        say("YOU HAVE DIED.")
+        first, second = client.post_mortems
+        for report in (first, second):
+            self.assertEqual([text for _, text in report["messages"]].count("YOU HAVE DIED."), 1)
+            self.assertEqual([entry["action"] for entry in report["actions"]].count("death"), 1)
+
+    def test_a_post_mortem_charts_from_a_baseline_and_stops_activity_at_death(self):
+        from .post_mortem import build
+
+        when = 1000.0
+        # Steady health long before the window, then one fatal hit.
+        vitals = [[when - 300, 155, 155, 39, 39, 900], [when - 1, 0, 155, 39, 39, 900]]
+        decisions = [{"time": when - 5, "action": "navigate", "detail": "to the farm"},
+                     {"time": when + 1, "action": "farm-failure-review", "detail": "pack"}]
+        death = build(when, "/a", 1, 2, vitals, [], decisions, decisions)
+        self.assertEqual(len(death["vitals"]), 2)
+        self.assertEqual(death["vitals"][0][1:], [155, 155, 39, 39, 900])
+        self.assertLess(death["vitals"][0][0], when - 1)
+        # A death soon after the previous one takes no baseline from that
+        # earlier life: its window starts at the previous death.
+        again = build(when, "/a", 1, 2, [[when - 50, 0, 155, 0, 39, 0], [when - 1, 0, 155, 39, 39, 900]],
+                      [], [], [], since=when - 30)
+        self.assertEqual([sample[0] for sample in again["vitals"]], [when - 1])
+        # Nor does a decision after the death change its cause.
+        late = build(when, "/a", 1, 2, [], [], [], [
+            {"time": when + 1, "action": "emergency-disengage", "detail": "sp=0 next-heal=30"}])
+        self.assertNotEqual(late["cause"], "resources")
+        # The review written after the notice is not what she was doing.
+        self.assertEqual([entry["action"] for entry in death["decisions"]], ["navigate"])
+        self.assertEqual([entry["action"] for entry in death["actions"]], ["navigate"])
+
+    def test_stored_post_mortems_are_validated_on_load(self):
+        from . import post_mortem
+
+        self.assertIsNone(post_mortem.restore({"time": "invalid"}))
+        self.assertIsNone(post_mortem.restore({"time": float("nan")}))
+        self.assertIsNone(post_mortem.restore("x"))
+        restored = post_mortem.restore({
+            "time": "12.5", "map": None, "x": "3", "y": 4, "cause": 7,
+            "attackers": {"rat": 2, "bad": "x"}, "damage_taken": "lots",
+            "vitals": [[1, 2, 3, 4, 5, 6], [1]], "messages": [[1, "hi"], "x"],
+            "decisions": [{"action": "heal"}, None], "actions": "x"})
+        self.assertEqual((restored["time"], restored["map"], restored["x"], restored["cause"]),
+                         (12.5, "", 3, "7"))
+        self.assertEqual(restored["attackers"], {"rat": 2})
+        self.assertEqual(restored["damage_taken"], 0)
+        self.assertEqual((len(restored["vitals"]), restored["messages"], restored["actions"]),
+                         (1, [[1, "hi"]], []))
+        self.assertEqual(restored["decisions"], [])
+        # Nested numbers must be finite too, and records keep their shape.
+        restored = post_mortem.restore({
+            "time": 5, "vitals": [[1, float("nan"), 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]],
+            "messages": [[float("inf"), "x"], [2, "ok"]], "attackers": {"rat": float("nan")},
+            "decisions": [{"time": float("nan"), "action": "x"}, {"time": 3, "action": "heal", "extra": 1}]})
+        self.assertEqual(restored["vitals"], [[1, 2, 3, 4, 5, 6]])
+        self.assertEqual(restored["messages"], [[2, "ok"]])
+        self.assertEqual(restored["attackers"], {})
+        self.assertEqual(restored["decisions"], [{"time": 3, "action": "heal", "detail": "", "map": ""}])
+        json.dumps(restored, allow_nan=False)
+        # An integer too large for a float is rejected, not raised.
+        huge = 10 ** 400
+        restored = post_mortem.restore({"time": 5, "attackers": {"rat": huge}, "damage_taken": huge,
+                                        "vitals": [[huge, 1, 2, 3, 4, 5]]})
+        self.assertEqual((restored["attackers"], restored["damage_taken"], restored["vitals"]), ({}, 0, []))
+        # Attacker and damage maps are bounded too, keeping the largest.
+        many = post_mortem.restore({"time": 5, "attackers": {f"m{index}": index for index in range(1000)}})
+        self.assertEqual(len(many["attackers"]), post_mortem.MAX_COUNTS)
+        self.assertIn("m999", many["attackers"])
+        # Text JSON allows but UTF-8 cannot carry (a lone surrogate) is replaced.
+        odd = post_mortem.restore(json.loads('{"time": 5, "detail": "\\ud800", "attackers": {"\\udfff": 1},'
+                                             ' "messages": [[1, "a\\ud800b"]]}'))
+        json.dumps(odd, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(odd["detail"], "?")
+        long = post_mortem.restore({"time": 5, "detail": "x" * 10000, "messages": [[1, "y" * 10000]]})
+        self.assertEqual((len(long["detail"]), len(long["messages"][0][1])), (post_mortem.MAX_TEXT,) * 2)
+        # Restoring applies the builder's bounds.
+        big = post_mortem.restore({
+            "time": 5, "vitals": [[index, 1, 2, 3, 4, 5] for index in range(500)],
+            "messages": [[index, "x"] for index in range(500)],
+            "decisions": [{"time": index} for index in range(500)],
+            "actions": [{"time": index} for index in range(500)]})
+        self.assertEqual([len(big[key]) for key in ("vitals", "messages", "decisions", "actions")],
+                         [post_mortem.MAX_VITALS, 40, 25, 25])
+        # An oversized stored collection is never traversed whole: only a
+        # bounded tail is looked at, so a huge value restores as quickly.
+        class Huge(list):
+            def __iter__(self):
+                raise AssertionError("iterated the whole list")
+        huge = Huge([[1, "x"]] * 100000)
+        restored = post_mortem.restore({"time": 5, "messages": huge})
+        self.assertEqual(len(restored["messages"]), 40)
+        # A previous death in the future bounds nothing, and an oversized
+        # decision time is simply outside the window.
+        report = post_mortem.build(1000.0, "/a", 1, 2, [], [(999.0, 2, "", "YOU HAVE DIED.")],
+                                   [], [{"time": 10 ** 400, "action": "x"}], since=5000.0)
+        self.assertEqual([text for _, text in report["messages"]], ["YOU HAVE DIED."])
+        # Downsampling keeps the fatal sample among many.
+        when = 1000.0
+        busy = [[when - 59 + index * 0.4, 100, 155, 10, 39, 900] for index in range(140)]
+        busy[-3] = [when - 0.2, 0, 155, 0, 39, 900]
+        busy.append([when + 1, 155, 155, 39, 39, 900])
+        death = post_mortem.build(when, "/a", 1, 2, busy, [], [], [])
+        self.assertLessEqual(len(death["vitals"]), post_mortem.MAX_VITALS)
+        self.assertIn([when - 0.2, 0, 155, 0, 39, 900], death["vitals"])
+        # The recovery after the death is not part of its report.
+        self.assertTrue(all(sample[0] <= when for sample in death["vitals"]))
+        # Every charted vital keeps its low: a brief SP and food dip survives.
+        dips = [[when - 59 + index * 0.4, 100, 155, 30, 39, 900] for index in range(140)]
+        dips[37] = [dips[37][0], 100, 155, 0, 39, 900]
+        dips[71] = [dips[71][0], 100, 155, 30, 39, 5]
+        kept = post_mortem.build(when, "/a", 1, 2, dips, [], [], [])["vitals"]
+        self.assertIn(dips[37], kept)
+        self.assertIn(dips[71], kept)
+        # Only textual scalars are restored as text: a stored list never is.
+        self.assertEqual(post_mortem.restore({"time": 5, "detail": list(range(100000))})["detail"], "")
+        self.assertEqual(post_mortem.restore({"time": 5, "cause": 7})["cause"], "7")
+        # The most distinct attackers inside any pack window, in time order.
+        from .self_improvement import PACK_WINDOW_SECONDS, review_failure
+        fight = [(when - 40, 2, "", "rat hit you for 1 (-1) impact damage."),
+                 (when - 39, 2, "", "ant hit you for 1 (-1) impact damage."),
+                 (when - 38, 2, "", "slug hit you for 1 (-1) impact damage."),
+                 (when - 38 + PACK_WINDOW_SECONDS + 5, 2, "", "rat hit you for 1 (-1) impact damage.")]
+        review = review_failure(fight, [], {"time": when, "action": "death"}, [])
+        self.assertEqual(review.peak_attackers, 3)
+
+    def test_post_mortem_describes_the_fight_inside_the_window(self):
+        from .post_mortem import build
+
+        now = 1000.0
+        messages = [(now - 120, 2, "", "ogre hit you for 99 (-99) impact damage."),
+                    (now - 20, 2, "", "giant slug hit you for 30 (-30) acid damage."),
+                    (now - 10, 2, "", "giant slug hit you for 25 (-25) acid damage."),
+                    (now - 5, 2, "", "red ant hit you for 10 (-10) pierce damage.")]
+        vitals = [[now - 300, 155, 155, 39, 39, 900], [now - 20, 80, 155, 10, 39, 900],
+                  [now - 1, 2, 155, 0, 39, 900]]
+        death = build(now, "/shattered_islands/world_13_73", 5, 6, vitals, messages,
+                      [{"time": now - 3, "action": "fire", "detail": "minor healing",
+                        "map": "/shattered_islands/world_13_73", "x": 5}], [])
+        self.assertEqual(death["cause"], "pack")
+        self.assertEqual(death["attackers"], {"giant slug": 2, "red ant": 1})
+        self.assertEqual(death["damage_taken"], 65)
+        self.assertEqual(death["damage_by_type"], {"acid": 55, "pierce": 10})
+        # The steady state before the window charts from its start.
+        self.assertEqual([sample[0] for sample in death["vitals"]], [now - 60, now - 20, now - 1])
+        self.assertEqual(death["vitals"][0][1], 155)
+        self.assertEqual(death["actions"], [{"time": now - 3, "action": "fire",
+                                             "detail": "minor healing",
+                                             "map": "/shattered_islands/world_13_73"}])
+        # A death soon after a starvation death describes only this life.
+        again = build(now, "/shattered_islands/world_13_73", 5, 6, vitals,
+                      [(now - 40, 2, "", "Sera starved to death."), *messages], [], [],
+                      since=now - 8)
+        self.assertEqual(again["cause"], "out-damaged")
+        self.assertEqual((again["attackers"], again["damage_taken"]), ({"red ant": 1}, 10))
+        # A busy minute (500 samples) keeps 120 spread over all of it.
+        busy = [[now - 60 + i * 0.12, 100, 155, 30, 39, 900] for i in range(500)]
+        dense = build(now, "/shattered_islands/world_13_73", 5, 6, busy, [], [], [])
+        self.assertEqual(len(dense["vitals"]), 120)
+        self.assertEqual((dense["vitals"][0], dense["vitals"][-1]), (busy[0], busy[-1]))
+
     def test_client_records_map_arrivals(self):
         client = AtrinikClient(ClientConfig())
         client._observe_map_change("/a", MapState(path="/b"))
@@ -1294,7 +2091,7 @@ class ProtocolTests(unittest.TestCase):
         client.state.player_name = "Sera"
 
         class FullDisk:
-            def save(self, *args):
+            def save(self, *args, **kwargs):
                 raise OSError(28, "No space left on device")
 
         client._memory_store = lambda: FullDisk()
@@ -1346,10 +2143,10 @@ class ProtocolTests(unittest.TestCase):
             def import_legacy(self, *args):
                 pass
 
-            def load(self, character, kind, default):
+            def load(self, character, kind, default, **kwargs):
                 return self.trends if kind == "trends" else default
 
-            def save(self, *args):
+            def save(self, *args, **kwargs):
                 pass
 
         now = time.time()
@@ -13323,6 +14120,11 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.state.farm_objective, "money")
         status, page = await self.request("GET", "/")
         self.assertIn(b'id="tab-farming"', page)
+        self.assertIn(b'id="fa-deaths"', page)
+        self.client.post_mortems = [{"time": 1.0, "cause": "pack"}, {"time": 2.0, "cause": "starvation"}]
+        status, payload = await self.request("GET", "/api/state?include=post_mortems")
+        self.assertEqual([death["time"] for death in json.loads(payload)["post_mortems"]],
+                         [2.0, 1.0])
         self.assertIn(b'id="fa-trends"', page)
         self.client.trends.count("deaths")
         status, payload = await self.request("GET", "/api/state?include=trends")
@@ -13524,10 +14326,14 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=18", page)
+        self.assertIn(b"/app.js?v=19", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
+        # Post-mortem traces hold the last sample through the death, and one
+        # sample draws a flat trace.
+        self.assertIn(b"${x(pm.time)},${y(pick, v[v.length - 1])}", script)
+        self.assertIn(b'if (!v.length) return "";', script)
         self.assertIn(b"Raw orders", page)
         self.assertNotIn(b'||"<p class="', script)
         status, payload = await self.request("GET", "/api/state")

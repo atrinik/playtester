@@ -9,7 +9,7 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts";
-const SLOW_KEYS = "build,farming_analysis,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
+const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -170,6 +170,48 @@ function renderFarming() {
       ${(s.reviews || []).slice().reverse().map(r => `<small>${new Date(r.time * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${esc(r.kind)} · <b>${esc(r.cause)}</b>: ${esc(r.detail)}${(r.remedies || []).length ? ` → ${esc(r.remedies.join(", "))}` : ""}</small>`).join("")}
     </div>`).join("") + (goalText ? `<small class="muted">Improvement goals: ${esc(goalText)}</small>` : ""))
     || '<span class="muted">No deaths or emergency recalls to learn from yet.</span>';
+}
+// Death post-mortems: the minute before each recent death.
+let lastDeathsSig = "";
+function vitalsChart(pm) {
+  const v = pm.vitals || [];
+  if (!v.length) return "";
+  const t0 = pm.time - 60, w = 240, h = 48;
+  // The window is the 60 seconds ending at the death.
+  const x = t => Math.max(0, Math.min(w, ((t - t0) / 60) * w)).toFixed(1);
+  // Samples are taken only when a vital changes: it holds its value until
+  // the next one, and the last until the death, so each trace is drawn as
+  // steps (not interpolated) through the death time; one sample is flat.
+  const y = (pick, s) => (h - Math.max(0, Math.min(1, pick(s))) * h).toFixed(1);
+  const line = (pick, cls) => `<polyline class="${cls}" points="${v.map((s, i) =>
+    (i ? `${x(s[0])},${y(pick, v[i - 1])} ` : "") + `${x(s[0])},${y(pick, s)}`).join(" ")} ${x(pm.time)},${y(pick, v[v.length - 1])}"/>`;
+  return `<svg class="vitals-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Health, spell points and food over the last minute">`
+    + line(s => s[1] / Math.max(1, s[2]), "hp") + line(s => s[3] / Math.max(1, s[4]), "sp")
+    + line(s => s[5] / 1000, "food") + "</svg>";
+}
+function renderDeaths() {
+  const deaths = slow.post_mortems || [];
+  // The whole reports: a death's record is rebuilt in place after its
+  // post-death window, under the same time.
+  const sig = JSON.stringify(deaths);
+  if (sig === lastDeathsSig) return;
+  lastDeathsSig = sig;
+  $("#fa-deaths").innerHTML = deaths.map(d => {
+    const when = new Date(d.time * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const who = Object.entries(d.attackers || {}).map(([k, n]) => `${esc(k)} ×${n}`).join(", ");
+    const types = Object.entries(d.damage_by_type || {}).map(([k, n]) => `${esc(k)} ${n}`).join(", ");
+    const last = (d.messages || []).slice(-6).map(m => `<small class="muted">${esc(clean(m[1]))}</small>`).join("");
+    // What the bot was doing: its last decisions before the death.
+    // The death's own bookkeeping (the death, its depletion points) is not
+    // a decision that explains it.
+    const did = (d.decisions || []).filter(r => r.action !== "death" && r.action !== "depletion").slice(-4).map(r =>
+      `<small>${esc(r.action)}${r.detail ? `: ${esc(r.detail)}` : ""}</small>`).join("");
+    return `<div class="spot">
+      <div class="spot-head"><b>${when} · ${esc(String(d.map || "").replace(/^.*\//, ""))} (${d.x}, ${d.y})</b><span class="flag">${esc(d.cause)}</span></div>
+      <small>${esc(d.detail)}${d.damage_taken ? ` · ${d.damage_taken} damage${types ? ` (${types})` : ""}` : ""}${who ? ` · ${who}` : ""}</small>
+      ${vitalsChart(d)}${did}${last}
+    </div>`;
+  }).join("") || '<span class="muted">No deaths recorded yet.</span>';
 }
 // Day-long trends: hourly rates and levels from per-minute samples.
 const TREND_SERIES = [
@@ -506,7 +548,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderTrends(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
   } finally { slowBusy = false; }
 }
 pollLive(); pollSlow();
