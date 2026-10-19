@@ -1558,10 +1558,12 @@ class ProtocolTests(unittest.TestCase):
         from . import post_mortem
         client = AtrinikClient(ClientConfig(character="Sera"))
         client.state.phase = "playing"
-        data = bytes((2,)) + b"ffffff\0" + b"x" * 100000 + b"\0"
+        # A huge colour field and a huge text: neither is retained whole.
+        data = bytes((2,)) + b"f" * 100000 + b"\0" + b"x" * 100000 + b"\0"
         asyncio.run(client._dispatch(c.C_DRAWINFO, data))
-        self.assertEqual(len(client.review_messages[-1][-1]), post_mortem.MAX_TEXT)
-        self.assertEqual(client.review_messages[-1][:-1], tuple(client.state.messages[-1][:-1]))
+        stamp, msg_type, text = client.review_messages[-1]
+        self.assertEqual(len(text), post_mortem.MAX_TEXT)
+        self.assertEqual((stamp, msg_type), tuple(client.state.messages[-1][:2]))
 
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
