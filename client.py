@@ -1644,8 +1644,12 @@ class AtrinikClient:
         if any(key in changed for key in post_mortem.VITAL_KEYS):
             self.vitals.append(post_mortem.sample(self.state.stats))
             cutoff = time.time() - post_mortem.VITALS_SECONDS
-            while self.vitals and self.vitals[0][0] < cutoff:
-                self.vitals.pop(0)
+            # The stale prefix goes in one deletion: no shifting per sample,
+            # however long the gap since the last update.
+            stale = 0
+            while stale < len(self.vitals) and self.vitals[stale][0] < cutoff:
+                stale += 1
+            del self.vitals[:stale]
         if self.trends.observe(self.state):
             self._persist_trends()
         self.progress_watch.observe(self.state)
