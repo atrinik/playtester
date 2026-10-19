@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import json
 import time
 import tempfile
@@ -1218,6 +1219,11 @@ class ProtocolTests(unittest.TestCase):
                                                (c.STAT_SP, 3), (c.STAT_MAXSP, 39)))
         asyncio.run(client._handle_stats(Cursor(payload), payload))
         self.assertEqual(client.vitals[-1][1:5], [13, 155, 3, 39])
+        # A rolling window: expired samples leave from the front in O(1).
+        self.assertIsInstance(client.vitals, collections.deque)
+        client.vitals.appendleft([time.time() - post_mortem.VITALS_SECONDS - 5, 1, 155, 0, 39, 900])
+        asyncio.run(client._handle_stats(Cursor(payload), payload))
+        self.assertTrue(all(sample[0] >= time.time() - post_mortem.VITALS_SECONDS for sample in client.vitals))
 
         def say(text, msg_type=2):
             data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
@@ -1320,7 +1326,7 @@ class ProtocolTests(unittest.TestCase):
             client.load_character_memory("Sera")
             self.assertEqual(len(client.vitals), 1)
             client.load_character_memory("Mallory")
-            self.assertEqual((client.vitals, list(client.review_messages), client.action_history), ([], [], []))
+            self.assertEqual((list(client.vitals), list(client.review_messages), client.action_history), ([], [], []))
 
     def test_a_post_mortem_names_the_square_of_the_death_notice(self):
         client = AtrinikClient(ClientConfig(character="Sera"))

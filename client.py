@@ -186,7 +186,7 @@ class AtrinikClient:
         self._memory_character = ""
         self.decision_history: list[dict] = []
         # Health, SP and food samples, and the deaths reviewed from them.
-        self.vitals: list[list[float]] = []
+        self.vitals: deque[list[float]] = deque()
         self.post_mortems: list[dict] = []
         # (time, path) of each arrival on a new map, newest last.
         self.map_arrivals: list[tuple[float, str]] = []
@@ -1670,12 +1670,10 @@ class AtrinikClient:
         if any(key in changed for key in post_mortem.VITAL_KEYS):
             self.vitals.append(post_mortem.sample(self.state.stats))
             cutoff = time.time() - post_mortem.VITALS_SECONDS
-            # The stale prefix goes in one deletion: no shifting per sample,
-            # however long the gap since the last update.
-            stale = 0
-            while stale < len(self.vitals) and self.vitals[stale][0] < cutoff:
-                stale += 1
-            del self.vitals[:stale]
+            # A deque: each expired sample leaves from the front in O(1), so
+            # a full window costs the same per packet as an empty one.
+            while self.vitals and self.vitals[0][0] < cutoff:
+                self.vitals.popleft()
         if self.trends.observe(self.state):
             self._persist_trends()
         self.progress_watch.observe(self.state)
