@@ -171,6 +171,8 @@ class AtrinikClient:
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
         self.decision_history: list[dict] = []
+        # (time, path) of each arrival on a new map, newest last.
+        self.map_arrivals: list[tuple[float, str]] = []
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
         self.trends = Trends()
         self._trends_character = ""
@@ -263,6 +265,11 @@ class AtrinikClient:
                         "paid_restoration_retry_until", 0.0)))
             except (TypeError, ValueError):
                 self.state.paid_restoration_retry_until = 0.0
+            hazards = record.get("route_hazards", {})
+            self.state.route_hazards = {
+                str(path): float(until)
+                for path, until in (hazards.items() if isinstance(hazards, dict) else ())
+                if isinstance(until, (int, float))}
             quotes = record.get("vendor_quotes", {})
             self.state.vendor_quotes = {
                 str(key): dict(value)
@@ -360,6 +367,7 @@ class AtrinikClient:
             self.state.last_recall_shop_check_at = 0.0
             self.state.last_utility_shop_check_at = 0.0
             self.state.paid_restoration_retry_until = 0.0
+            self.state.route_hazards = {}
             self.state.vendor_quotes = {}
             self.state.farm_zone_quarantine = {}
             self.state.farm_zone_last_checked = {}
@@ -472,6 +480,21 @@ class AtrinikClient:
                 self.state.paid_restoration_retry_until)
         self._persist_character_memory()
 
+    def remember_route_hazard(self, path: str, until: float) -> None:
+        """Persist a map navigation avoids until ``until`` (wall clock)."""
+        now = time.time()
+        self.state.route_hazards = {
+            key: value for key, value in self.state.route_hazards.items()
+            if value > now}
+        self.state.route_hazards[path] = max(
+            float(until), self.state.route_hazards.get(path, 0.0))
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})[
+            "route_hazards"] = dict(self.state.route_hazards)
+        self._persist_character_memory()
+
     def record_vendor_quote(
             self, key: str, item: str, unit_cost: int) -> None:
         """Persist an exact dialogue quote in this character's namespace."""
@@ -539,6 +562,9 @@ class AtrinikClient:
         The server returns to the per-player entrance recorded at runtime, so
         the authored graph's static apartment exits are only placeholders.
         """
+        if m.path and old_path != m.path:
+            self.map_arrivals.append((time.time(), m.path))
+            del self.map_arrivals[:-100]
         if (old_path and old_path != m.path and "/apartments/" in old_path and
                 "/apartments/" not in m.path and not self._recently_moved_by_force()):
             self.set_apartment_return(old_path, m.path, m.world_x, m.world_y)

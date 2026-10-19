@@ -252,6 +252,9 @@ class GameState:
     # Wall-clock time before which a paid-but-ineffective temple restoration
     # is not attempted again.
     paid_restoration_retry_until: float = 0.0
+    # Maps where a route death took combat damage, by wall-clock time until
+    # which navigation avoids them.
+    route_hazards: dict[str, float] = field(default_factory=dict)
     vendor_quotes: dict[str, dict[str, int | float | str]] = field(
         default_factory=dict)
     farm_zone_quarantine: dict[str, float] = field(default_factory=dict)
