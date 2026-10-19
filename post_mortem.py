@@ -144,12 +144,14 @@ def restore(entry: Any) -> dict[str, Any] | None:
         for name, count in itertools.islice(value.items(), MAX_COUNT_SCAN):
             if finite(count):
                 label = text(name, 80)
-                totals[label] = min(MAX_COUNT_VALUE, totals.get(label, 0) + min(MAX_COUNT_VALUE, int(count)))
+                # Never negative: a hit count cannot be, nor subtract.
+                totals[label] = min(MAX_COUNT_VALUE,
+                                    totals.get(label, 0) + min(MAX_COUNT_VALUE, max(0, int(count))))
         return dict(heapq.nlargest(MAX_COUNTS, totals.items(), key=lambda item: item[1]))
 
     def number(key: str) -> int:
         value = entry.get(key)
-        return int(value) if finite(value) else 0
+        return min(MAX_COUNT_VALUE, max(0, int(value))) if finite(value) else 0
 
     return {
         "time": when, "map": text(entry.get("map")), "x": x, "y": y,

@@ -252,11 +252,13 @@ class AtrinikClient:
                 kept.append(restored)
         # A reconnect reloads the same character: its live reports may be
         # newer than the store (a save can fail), so they win for the same
-        # death and are never dropped for the older saved list.
+        # death and are never dropped for the older saved list. Order is the
+        # order they were recorded, live last (never wall time, which can
+        # step back), so the cap drops the oldest saved ones first.
         live = self.post_mortems if same_character else self._live_post_mortems.pop(character, [])
-        merged = {death["time"]: death for death in kept}
-        merged.update((death["time"], death) for death in live)
-        self.post_mortems = sorted(merged.values(), key=lambda death: death["time"])[-post_mortem.KEEP:]
+        live_times = {death["time"] for death in live}
+        self.post_mortems = ([death for death in kept[::-1] if death["time"] not in live_times]
+                             + list(live))[-post_mortem.KEEP:]
         buckets = memory.load(character, "trends", [])
         saved = Trends(buckets if isinstance(buckets, list) else ()).buckets
         # A reconnect reloads the same character: its live buckets are newer

@@ -1480,6 +1480,29 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(len(store().load("Sera", "post_mortems", [])), 1)
             self.assertEqual(len(store().load("Mallory", "post_mortems", [])), 1)
 
+    def test_restored_counts_are_never_negative(self):
+        from . import post_mortem
+        long = "a" * 80
+        restored = post_mortem.restore({"time": 1000.0, "damage_taken": -5, "peak_attackers": -1,
+                                        "attackers": {long + "x": 7, long + "y": -9, "rat": -2}})
+        self.assertEqual(restored["attackers"][long], 7)
+        self.assertEqual(restored["attackers"]["rat"], 0)
+        self.assertEqual((restored["damage_taken"], restored["peak_attackers"]), (0, 0))
+
+    def test_a_live_report_survives_a_clock_step_back(self):
+        from . import post_mortem
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            stored = [{"time": 2000.0 + index} for index in range(post_mortem.KEEP)]
+            client._memory_store().save("Sera", "post_mortems", stored)
+            # The newest, unsaved report, recorded after the clock stepped back.
+            client.post_mortems = [{"time": 1500.0, "map": "/a"}]
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.post_mortems), post_mortem.KEEP)
+            self.assertEqual(client.post_mortems[-1]["time"], 1500.0)
+
     def test_merged_counts_stay_finite(self):
         from . import post_mortem
         long = "a" * 80
