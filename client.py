@@ -122,6 +122,16 @@ class ClientConfig:
 # for a death.
 DEATH_NOTICES = ("you have been defeated in combat!", "you have died.")
 
+def _after(records: list, mark: Any) -> list:
+    """The records after ``mark`` (by identity), or all of them when it is
+    gone (trimmed, or a reloaded history)."""
+    if mark is not None:
+        for index in range(len(records) - 1, -1, -1):
+            if records[index] is mark:
+                return records[index + 1:]
+    return records
+
+
 class AtrinikClient:
     BANK_BALANCE_CACHE_SECONDS = 6 * 60 * 60
 
@@ -192,6 +202,9 @@ class AtrinikClient:
         self.vitals: deque[list[float]] = deque(maxlen=post_mortem.MAX_LIVE_VITALS)
         # Each other character's live reports, while this client plays another.
         self._live_post_mortems: dict[str, list[dict]] = {}
+        # The last record of each history at the previous report: the next
+        # report reads only what follows (identity, not time).
+        self._life_marks: dict[str, Any] = {}
         # When the last death's bookkeeping ended (its records are its own).
         self._post_mortem_booked = 0.0
         self.post_mortems: list[dict] = []
@@ -853,12 +866,24 @@ class AtrinikClient:
         previous = max(self._post_mortem_booked, ledger_death,
                        self.post_mortems[-1]["time"] if self.post_mortems else 0.0)
         m = self.state.map
+        # Lives are separated by position as well as by time: only what was
+        # recorded since the previous report counts, so no wall-clock step,
+        # backward or forward, lets the last life into this one.
         self.post_mortems.append(post_mortem.build(
             notice, m.path, m.world_x, m.world_y, self.vitals,
-            list(self.review_messages), self.action_history, self.decision_history,
+            list(self.review_messages),
+            _after(self.action_history, self._life_marks.get("actions")),
+            _after(self.decision_history, self._life_marks.get("decisions")),
             since=previous, name=self.state.player_name or self.config.character,
             recorded=time.time()))
         self._post_mortem_booked = time.time()
+        # The next life starts here: its messages afresh, its vitals from the
+        # latest sample (the state it starts in), its records after these.
+        self.review_messages.clear()
+        while len(self.vitals) > 1:
+            self.vitals.popleft()
+        self._life_marks = {"actions": self.action_history[-1] if self.action_history else None,
+                            "decisions": self.decision_history[-1] if self.decision_history else None}
         del self.post_mortems[:-post_mortem.KEEP]
         # Best effort, like the trends: a full or read-only disk, or a locked
         # database, must never stop or stall play for dashboard telemetry. The

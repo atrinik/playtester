@@ -1658,6 +1658,28 @@ class ProtocolTests(unittest.TestCase):
         say("YOU HAVE DIED.")
         self.assertEqual(client.post_mortems[-1]["attackers"], {"giant rat": 1})
 
+    def test_a_clock_corrected_back_past_a_death_never_mixes_lives(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        clock = [960.0]
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+                asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        say("ogre hit you for 50 (-50) impact damage.")
+        clock[0] = 1000.0
+        say("YOU HAVE DIED.")
+        # The clock is corrected back past that death; the next life dies at 990.
+        clock[0] = 975.0
+        say("giant rat hit you for 3 (-3) impact damage.")
+        clock[0] = 990.0
+        say("YOU HAVE DIED.")
+        self.assertEqual(client.post_mortems[-1]["attackers"], {"giant rat": 1})
+        self.assertEqual(client.post_mortems[-1]["damage_taken"], 3)
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80
