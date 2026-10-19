@@ -262,6 +262,13 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        # The life boundary in this (possibly reloaded) ledger: the previous
+        # report's mark, found by value, or, in a fresh process with no mark,
+        # the restored ledger's last death.
+        mark = self._life_marks.get("decisions")
+        if mark is None or mark not in self.decision_history:
+            self._life_marks["decisions"] = next(
+                (record for record in reversed(self.decision_history) if record.get("action") == "death"), None)
         # Newest first, stopping at KEEP valid reports, and looking at no more
         # than a few times KEEP candidates: an oversized stored list, valid or
         # not, is never normalized whole.

@@ -1708,6 +1708,27 @@ class ProtocolTests(unittest.TestCase):
             self.assertNotEqual(report["cause"], "resources")
             self.assertNotIn("emergency-disengage", [entry["action"] for entry in report["decisions"]])
 
+    def test_a_restarted_client_starts_the_life_after_the_ledger_death(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            first = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            first.load_character_memory("Sera")
+            first._memory_store().save("Sera", "decisions", [
+                {"time": 960.0, "action": "emergency-disengage", "detail": "sp=1 next-heal=9", "map": "/a"},
+                {"time": 1000.0, "action": "death", "detail": "YOU HAVE DIED.", "map": "/a"}])
+            # A new process; the clock is then corrected back past that death.
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+            data = bytes((2,)) + b"ffffff\0YOU HAVE DIED.\0"
+            with patch("atrinik_bot.client.time.time", lambda: 990.0):
+                asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+            report = client.post_mortems[-1]
+            self.assertNotEqual(report["cause"], "resources")
+            self.assertNotIn("emergency-disengage", [entry["action"] for entry in report["decisions"]])
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80
