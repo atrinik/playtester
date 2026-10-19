@@ -23,6 +23,7 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
+from .alerts import active as active_alerts
 from .navigation import (analyzer_spot_legs, FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
@@ -452,6 +453,19 @@ class DashboardState:
             "y": game_map.world_y, "tiles": tiles,
         }
 
+    def alerts(self) -> list[dict[str, str]]:
+        """Alerts for the operator: deaths, starvation, stuck, disconnected."""
+        watch = self.client.progress_watch
+        task = self.engine.task
+        autoplay = bool(task is not None and
+                        str(getattr(task, "name", "")).startswith("autoplay"))
+        # Moves happen between stats packets; the client reports disconnects.
+        watch.observe(self.client.state)
+        return active_alerts(
+            self.client.state, self.client.decision_history, watch,
+            autoplay_started_at=(float(getattr(task, "started_at", 0.0) or 0.0)
+                                 if autoplay else None))
+
     def snapshot(self) -> dict[str, Any]:
         state, task = self.client.state, self.engine.task
         inventory = []
@@ -576,6 +590,7 @@ class DashboardState:
             "farming_analysis": self.farming_analysis(),
             "post_mortems": list(reversed(
                 getattr(self.client, "post_mortems", [])[-10:])),
+            "alerts": self.alerts(),
         }
 
     def analyzer_farm_spots(self) -> list[dict[str, Any]]:

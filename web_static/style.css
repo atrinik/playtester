@@ -168,3 +168,9 @@ details summary { cursor: pointer; color: var(--muted); margin-top: .6rem; font-
 .vitals-chart .hp { stroke: #e05555; }
 .vitals-chart .sp { stroke: #5b8def; }
 .vitals-chart .food { stroke: #d9a441; }
+/* Alerts keep their width; the map name gives way first on narrow screens. */
+.alerts { display: flex; gap: .4rem; flex-shrink: 0; }
+.where { min-width: 0; }
+.alert { font-size: 12px; padding: .1rem .5rem; border-radius: 999px; border: 1px solid currentColor; }
+.alert.critical { color: #ff8a8a; background: #3a1d1d; }
+.alert.warn { color: #f3c969; background: #33291a; }
