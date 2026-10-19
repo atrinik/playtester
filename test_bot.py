@@ -1366,6 +1366,22 @@ class ProtocolTests(unittest.TestCase):
             asyncio.run(client._dispatch(c.C_DRAWINFO, data))
         self.assertEqual(client.post_mortems[-1]["time"], 1000.0)
 
+    def test_an_oversized_hit_amount_never_breaks_the_death_review(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+
+        def say(text):
+            data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+        # A malicious server line: an amount past int()'s digit limit.
+        say("giant rat hit you for " + "9" * 5000 + " (-1) impact damage.")
+        say("giant rat hit you for 3 (-3) impact damage.")
+        say("YOU HAVE DIED.")
+        death = client.post_mortems[-1]
+        self.assertEqual((death["damage_taken"], death["attackers"]), (3, {"giant rat": 1}))
+
     def test_an_oversized_ledger_number_never_breaks_the_death_review(self):
         from . import post_mortem
         when = time.time()

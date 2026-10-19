@@ -39,8 +39,10 @@ PAUSE_FAILURES, PAUSE_WINDOW_SECONDS = 3, 3600.0
 PAUSE_SECONDS = 3600.0
 KEEP_REVIEWS = 10
 
+# Bounded digits: a server line with an oversized amount never reaches
+# int()'s digit limit; it is not a hit we count.
 _HIT = re.compile(
-    r"^(?P<who>.+?) hit you for (?P<amount>\d+)(?: \(-?\d+\))?"
+    r"^(?P<who>.+?) hit you for (?P<amount>\d{1,9})(?: \(-?\d{1,9}\))?"
     r"(?: (?:(?P<type>[a-z][a-z ]*?) )?damage)?[.!]?$", re.I)
 # Bounded digits: a stored detail with an oversized number never reaches
 # int()'s digit limit; it just does not match.
