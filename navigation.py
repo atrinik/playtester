@@ -1328,8 +1328,14 @@ class WorldGraph:
                      allow_locked: bool = False,
                      excluded: set[tuple[str, str]] | None = None,
                      avoided_maps: set[str] | None = None,
+                     penalized_maps: set[str] | None = None,
                      ) -> list[MapEdge]:
-        """Route end-to-end between exact walkable components across maps."""
+        """Route end-to-end between exact walkable components across maps.
+
+        Entering a ``penalized_maps`` map costs more than any route without
+        one, so the route crosses as few of them as it can and, among those,
+        is the shortest.
+        """
         start_component = self._component(
             source, source_xy, allow_locked=allow_locked)
         if not start_component:
@@ -1341,6 +1347,7 @@ class WorldGraph:
         offsets = [0]
         targets: list[int] = []
         edge_metadata: list[int] = []
+        edge_costs: list[int] = []
         route_edges: list[MapEdge] = []
         goals: list[int] = []
         cursor = 0
@@ -1392,6 +1399,7 @@ class WorldGraph:
                             positions.append(arrival)
                         targets.append(target)
                         edge_metadata.append(len(route_edges))
+                        edge_costs.append(edge.destination in (penalized_maps or ()))
                         route_edges.append(adjusted)
             offsets.append(len(targets))
             cursor += 1
@@ -1399,8 +1407,12 @@ class WorldGraph:
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
                 f"{destination} {destination_points}")
+        # A simple route has fewer transitions than there are states, so one
+        # penalized entry outweighs any detour: crossings first, then length.
+        penalty = len(states) + 1
         result = graph_search(
-            offsets, targets, 0, goals, metadata=edge_metadata)
+            offsets, targets, 0, goals, metadata=edge_metadata,
+            costs=[1 + penalty * flagged for flagged in edge_costs] if penalized_maps else None)
         if result.status != "found":
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
@@ -1696,7 +1708,27 @@ class NavigateTask(BotTask):
             estimator(path) >= 3
         }
 
+    def _learned_route_hazards(self, client: AtrinikClient) -> set[str]:
+        """Maps where a recent route death took combat damage."""
+        now = time.time()
+        hazards = getattr(client.state, "route_hazards", None) or {}
+        return {path for path, until in hazards.items() if until > now}
+
     def _plan(self, client: AtrinikClient) -> list[MapEdge]:
+        # Learned hazards are a cost, never a wall: one search finds the route
+        # that enters as few of them as it can. They never make a trip
+        # unroutable or change which other hazards are relaxed, and leaving
+        # the map she stands on is free while re-entering it is not.
+        learned = self._learned_route_hazards(client)
+        route = self._plan_avoiding(client, learned)
+        if any(edge.destination in learned for edge in route):
+            # Entering a map that killed her, the destination included, is
+            # never "threat-free" when choosing between optional destinations.
+            self._threat_fallback = True
+        return route
+
+    def _plan_avoiding(self, client: AtrinikClient,
+                       penalized: set[str]) -> list[MapEdge]:
         source = client.state.map.path
         args = (
             source,
@@ -1713,9 +1745,19 @@ class NavigateTask(BotTask):
             "allow_locked": self._allow_locked(client),
             "excluded": self._excluded_edges,
             "avoided_maps": protected_hazards | overlevel_hazards,
+            "penalized_maps": set(penalized),
         }
         previous_fallback = self._threat_fallback
         self._threat_fallback = False
+
+        def relaxed(avoided: set[str]) -> dict:
+            # A hazard a fallback tier stops avoiding is still a known threat:
+            # it joins the penalized maps, so the route enters as few known
+            # threats as it can, learned or relaxed alike, never trading one
+            # learned map for several relaxed ones.
+            return {**kwargs, "avoided_maps": avoided,
+                    "penalized_maps": kwargs["penalized_maps"] | (kwargs["avoided_maps"] - avoided)}
+
         try:
             route = self.graph.route_points(*args, **kwargs)
         except ValueError:
@@ -1737,13 +1779,11 @@ class NavigateTask(BotTask):
                     # Only this retry lifts them; later tiers relax other
                     # hazards first and keep avoiding dense tunnels.
                     try:
-                        route = self.graph.route_points(*args, **{
-                            **kwargs, "avoided_maps": kwargs["avoided_maps"] - tiled})
+                        route = self.graph.route_points(*args, **relaxed(kwargs["avoided_maps"] - tiled))
                     except ValueError:
                         route = None
                 if route is None and overlevel_hazards:
-                    fallback_kwargs = dict(kwargs)
-                    fallback_kwargs["avoided_maps"] = protected_hazards
+                    fallback_kwargs = relaxed(protected_hazards)
                     try:
                         route = self.graph.route_points(
                             *args, **fallback_kwargs)
@@ -1753,8 +1793,7 @@ class NavigateTask(BotTask):
                             raise ValueError(
                                 f"{preferred_exc}; excluded edges: "
                                 f"{excluded}") from preferred_exc
-                        fallback_kwargs["avoided_maps"] = set(
-                            self.KNOWN_LETHAL_TRANSIT)
+                        fallback_kwargs = relaxed(set(self.KNOWN_LETHAL_TRANSIT))
                         route = self.graph.route_points(
                             *args, **fallback_kwargs)
                     self._threat_fallback = True
@@ -1766,9 +1805,7 @@ class NavigateTask(BotTask):
                                 f"no threat-free route to {self.destination}")
                 elif (route is None and self.allow_ranged_hazard_fallback and
                       (ranged_hazards or pack_hazards)):
-                    fallback_kwargs = dict(kwargs)
-                    fallback_kwargs["avoided_maps"] = set(
-                        self.KNOWN_LETHAL_TRANSIT)
+                    fallback_kwargs = relaxed(set(self.KNOWN_LETHAL_TRANSIT))
                     route = self.graph.route_points(
                         *args, **fallback_kwargs)
                     self._threat_fallback = True
@@ -3951,6 +3988,8 @@ class FarmCircuitTask(BotTask):
     BANK_DEPOSIT_WEALTH_OVERRIDE = 10_000
     ROUTINE_TOWN_TRIP_WEIGHT = 0.85
     MASS_IDENTIFY_WEIGHT = 0.70
+    # How long a map where a route death took combat damage is avoided.
+    ROUTE_HAZARD_SECONDS = 6 * 3600.0
     # After a failed temple food request, wait this long before another.
     TEMPLE_FOOD_RETRY_SECONDS = 600.0
     FOOD_RESUPPLY_QUANTITY = 25
@@ -4150,6 +4189,36 @@ class FarmCircuitTask(BotTask):
     def _spot_key(self) -> str:
         return self_improvement.spot_key(self.spot, self.legs)
 
+    @staticmethod
+    def _entered_map_at(client: AtrinikClient, path: str, before: float) -> float | None:
+        """When she arrived on ``path``, last before ``before``.
+
+        The client's map arrivals are authoritative. Without them, the first
+        record of her on ``path`` since she was last elsewhere: a step is
+        recorded on the map it leaves, so the last record elsewhere is not
+        yet proof of arrival. None when nothing shows her there.
+        """
+        arrivals = [(stamp, where) for stamp, where in getattr(client, "map_arrivals", ())
+                    if stamp <= before]
+        if arrivals:
+            stamp, where = arrivals[-1]
+            return stamp if where == path else None
+        records = sorted(
+            ((float(record.get("time", 0.0) or 0.0), record.get("map"))
+             for record in (*getattr(client, "action_history", ()),
+                            *getattr(client, "decision_history", ()))
+             if record.get("map")),
+            key=lambda entry: entry[0])
+        entered = None
+        for stamp, where in records:
+            if stamp > before:
+                break
+            if where != path:
+                entered = None
+            elif entered is None:
+                entered = stamp
+        return entered
+
     def _learn_from_failure(self, client: AtrinikClient, failure: dict,
                             path: str, what: str) -> bool:
         """Review a failure at an analyzer spot and adapt instead of leaving it.
@@ -4157,10 +4226,48 @@ class FarmCircuitTask(BotTask):
         Returns True only for the last resort, a short pause after repeated
         failures with every tactic already at its maximum.
         """
+        decisions = list(getattr(client, "decision_history", ()))
+        when = float(failure.get("time", 0.0) or 0.0)
+        # Only this life counts: a starvation or fight before the previous
+        # death must not explain this one. Every earlier death record splits
+        # lives, however soon before this failure; only this failure's own
+        # record is left out.
+        previous_death = max(
+            (float(record.get("time", 0.0) or 0.0) for record in decisions
+             if isinstance(record, dict) and record.get("action") == "death" and
+             record is not failure and record != failure and
+             float(record.get("time", 0.0) or 0.0) <= when), default=0.0)
+        messages = [entry for entry in getattr(client.state, "messages", ())
+                    if float(entry[0]) > previous_death]
+        this_life = [record for record in decisions if isinstance(record, dict) and
+                     float(record.get("time", 0.0) or 0.0) > previous_death]
         review = self_improvement.review_failure(
-            getattr(client.state, "messages", ()),
-            getattr(client, "decision_history", ()), failure,
-            [leg for leg, _ in self.legs])
+            messages, this_life, failure, [leg for leg, _ in self.legs])
+        # Hits stamped before she entered the death map were taken elsewhere:
+        # only damage taken on it makes that map the hazard.
+        entered = self._entered_map_at(client, review.map, review.time)
+        # Up to the death (with message slack), never past her next arrival:
+        # a hit after respawning elsewhere is not the death map's.
+        left = min((stamp for stamp, _ in getattr(client, "map_arrivals", ())
+                    if entered is not None and stamp > entered), default=review.time + 2.0)
+        hits = {} if entered is None else self_improvement.hits_between(
+            messages, max(entered, review.time - self_improvement.REVIEW_WINDOW_SECONDS),
+            min(review.time + 2.0, left))
+        on_map = sum(hits.values())
+        if review.cause == "route" and on_map > 0 and review.map:
+            # Killed crossing a map on the way: route around it for a while
+            # instead of walking back into the same fight after respawning.
+            until = time.time() + self.ROUTE_HAZARD_SECONDS
+            remember = getattr(client, "remember_route_hazard", None)
+            if remember is not None:
+                remember(review.map, until)
+            else:
+                client.state.route_hazards[review.map] = until
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("route-hazard-learned",
+                         f"{review.map} for {self.ROUTE_HAZARD_SECONDS / 3600:.0f} h: "
+                         f"{on_map} damage from " + ", ".join(sorted(hits)))
         key = self._spot_key()
         adaptations = getattr(client.state, "farm_adaptations", {}) or {}
         record, pause = self_improvement.learn(adaptations.get(key, {}), review)
