@@ -19,6 +19,7 @@ from .access_codes import normalize_access_code
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameState,
                     InterfaceState, Item, MapObject, MapState)
+from .alerts import ProgressWatch
 from .memory import BotMemory
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
@@ -169,6 +170,8 @@ class AtrinikClient:
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
         self.decision_history: list[dict] = []
+        # When XP, position and the connection last changed, for alerts.
+        self.progress_watch = ProgressWatch()
         self.action_context = ""
         self._runtime_content_root = (
             Path(config.runtime_content_path) if config.runtime_content_path else
@@ -685,7 +688,10 @@ class AtrinikClient:
         if action not in noisy:
             previous = (self.decision_history[-1]
                         if self.decision_history else None)
+            # Each death keeps its own record and time, so alerts can age
+            # deaths out of their window one by one.
             repeated = bool(
+                action != "death" and
                 previous and record["time"] - previous.get("time", 0) <= 5.0
                 and all(previous.get(key) == record[key]
                         for key in ("action", "detail", "task", "map")))
@@ -813,6 +819,7 @@ class AtrinikClient:
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
 
     async def checkpoint_reconnect(self) -> bool:
         """Gracefully reconnect so the server persists the live character."""
@@ -825,6 +832,7 @@ class AtrinikClient:
         self._reconnect_requested = True
         await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
         return True
 
     async def run(self) -> None:
@@ -847,6 +855,7 @@ class AtrinikClient:
                 except OSError:
                     pass
                 self.state.phase = "disconnected"
+                self.progress_watch.observe(self.state)
             if not self.config.reconnect or self._closed:
                 break
             self._reconnect_requested = False
@@ -918,6 +927,7 @@ class AtrinikClient:
         with contextlib.suppress(OSError):
             await self._close_transport()
         self.state.phase = "disconnected"
+        self.progress_watch.observe(self.state)
 
     async def _dispatch(self, packet_type: int, data: bytes) -> None:
         if (self.state.phase in ("version", "access-policy", "access-auth")
@@ -1153,7 +1163,12 @@ class AtrinikClient:
             m = self.state.map
             if m.path:
                 self.set_savebed(m.path, m.world_x, m.world_y)
-        died = "defeated in combat" in lowered or "you have died" in lowered
+        # kill_player (server types/player.c) sends exactly one of these, as
+        # the whole message, per defeat: a PvP-area defeat, or a death after
+        # its stat losses. Matching the whole text keeps a player's chat that
+        # quotes one from passing for a death.
+        died = normalized in ("you have been defeated in combat!",
+                              "you have died.")
         if died:
             self.record_action("death", text)
             # The server emits death stat-loss lines before its final death
@@ -1519,6 +1534,7 @@ class AtrinikClient:
             self.state.stats[name] = value
             self.state.stat_observed_at[name] = time.monotonic()
             changed[name] = value
+        self.progress_watch.observe(self.state)
         await self.emit("stats", changed)
 
     def _decode_item_fields(self, cur: Cursor, flags: int, item: Item) -> None:
@@ -1847,6 +1863,8 @@ class AtrinikClient:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
         self._observe_map_change(old_path, m)
+        # Movement arrives in map packets, between stats packets and polls.
+        self.progress_watch.observe(self.state)
         await self.emit("map", {"path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y, "changed_map": old_path != m.path})
 
     async def _handle_interface(self, cur: Cursor, raw: bytes) -> None:

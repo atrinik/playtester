@@ -434,11 +434,17 @@ class ProtocolTests(unittest.TestCase):
                 (-6, self._map2_actor_tile(2, 1, 5, 101, True)),
                 (6, self._map2_actor_tile(8, 7, 5, 102)),
             ])
+            client.state.phase = "playing"
+            client.progress_watch.moved_at = 0.0
             await client._handle_map(Cursor(payload), payload)
 
             game_map = client.state.map
             self.assertEqual((game_map.width, game_map.height), (17, 17))
             self.assertIs(game_map.tiles, game_map.level_tiles[0])
+            # The map packet itself records movement for the stuck alert.
+            self.assertEqual(client.progress_watch.position,
+                             (game_map.path, game_map.world_x, game_map.world_y))
+            self.assertGreater(client.progress_watch.moved_at, 0.0)
             self.assertEqual(
                 [(depth, x, y, obj.target_id, obj.is_friend)
                  for depth, x, y, obj in game_map.depth_targets()],
@@ -1163,6 +1169,103 @@ class ProtocolTests(unittest.TestCase):
         malformed = bytes((c.CMD_PARTY_JOIN,)) + b"unterminated"
         with self.assertRaises(ProtocolError):
             asyncio.run(client._handle_party(Cursor(malformed), malformed))
+
+    def test_alerts_flag_deaths_starvation_stuck_and_disconnects(self):
+        from .alerts import (DISCONNECTED_SECONDS, STUCK_SECONDS, ProgressWatch, active)
+
+        now = 10_000.0
+        state = GameState(phase="playing", player_tag=7)
+        state.stats.update(exp=500, food=300)
+        state.map = MapState(path="/a", world_x=1, world_y=1)
+        watch = ProgressWatch(now)
+        watch.observe(state, now)
+
+        def ids(at, decisions=(), autoplay=True, started=0.0):
+            return [alert["id"] for alert in active(
+                state, decisions, watch, autoplay_started_at=started if autoplay else None,
+                now=at)]
+
+        self.assertEqual(ids(now), [])
+        deaths = [{"action": "death", "time": now - 3000}, {"action": "death", "time": now - 60},
+                  {"action": "death", "time": now - 7200}]
+        self.assertEqual(ids(now, deaths), ["deaths"])
+        self.assertEqual(ids(now, deaths[:1]), [])
+        # Each notice is its own defeat: a PvP-area defeat sends only
+        # "defeated in combat", a death only "YOU HAVE DIED.".
+        self.assertEqual(ids(now, [
+            {"action": "death", "time": now - 61, "detail": "You have been defeated in combat!"},
+            {"action": "death", "time": now - 60, "detail": "YOU HAVE DIED."}]), ["deaths"])
+        self.assertEqual(ids(now, [{"action": "death", "time": now - 9, "detail": "YOU HAVE DIED."},
+                                   {"action": "death", "time": now - 1, "detail": "YOU HAVE DIED."}]),
+                         ["deaths"])
+        state.stats["food"] = 0
+        self.assertEqual(ids(now), ["starving"])
+        state.stats["food"] = 300
+        # Idle before autoplay started is not being stuck; the task's own
+        # start time anchors it, whenever the dashboard looks.
+        self.assertEqual(ids(now + STUCK_SECONDS, started=now + 60), [])
+        # No XP and no movement for the stuck window while autoplay runs.
+        later = now + STUCK_SECONDS
+        self.assertEqual(ids(later), ["stuck"])
+        self.assertEqual(ids(later, autoplay=False), [])
+        state.map.world_x = 2
+        watch.observe(state, later)
+        self.assertEqual(ids(later + 60), [])
+        # A lost connection, only after a grace period, through retries.
+        state.phase = "disconnected"
+        watch.observe(state, later)
+        self.assertEqual(ids(later + 60), [])
+        state.phase = "connecting"
+        watch.observe(state, later + 90)
+        state.phase = "disconnected"
+        watch.observe(state, later + 120)
+        self.assertEqual(ids(later + DISCONNECTED_SECONDS), ["disconnected"])
+        state.phase = "playing"
+        watch.observe(state, later + DISCONNECTED_SECONDS)
+        self.assertIsNone(watch.disconnected_since)
+        # A failed reconnect's empty placeholder map and cleared stats are no
+        # movement or progress, nor is the real map coming back unchanged.
+        moved, gained = watch.moved_at, watch.exp_changed_at
+        real_map, real_stats = state.map, dict(state.stats)
+        state.phase, state.map, state.stats = "connecting", MapState(), {}
+        watch.observe(state, later + 400)
+        state.phase = "disconnected"
+        watch.observe(state, later + 410)
+        state.phase, state.map, state.stats = "playing", real_map, real_stats
+        watch.observe(state, later + 500)
+        self.assertEqual((watch.moved_at, watch.exp_changed_at), (moved, gained))
+
+    def test_each_death_keeps_its_own_record_and_time(self):
+        from .alerts import death_count
+
+        client = AtrinikClient(ClientConfig())
+        client.state.map.path = "/shattered_islands/world_6_46"
+
+        def say(text, msg_type=2):
+            data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+
+        clock = [time.time()]
+        with patch("time.time", lambda: clock[0]):
+            for _ in range(2):
+                say("YOU HAVE DIED.")
+                clock[0] += 3
+        # Rapid repeats are not coalesced: each death ages out on its own.
+        deaths = [record for record in client.decision_history if record["action"] == "death"]
+        self.assertEqual([record.get("count") for record in deaths], [None, None])
+        self.assertEqual(death_count(client.decision_history, 0.0), 2)
+        self.assertEqual(death_count(client.decision_history, deaths[0]["time"] + 1), 1)
+        # A player's chat quoting a notice is no death.
+        say("[a=#charname]Mallory[/a]: YOU HAVE DIED.", c.CHAT_TYPE_CHAT)
+        self.assertEqual(death_count(client.decision_history, 0.0), 2)
+
+    def test_client_starts_the_outage_clock_when_the_connection_drops(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        before = time.time()
+        asyncio.run(client.close())
+        self.assertIsNotNone(client.progress_watch.disconnected_since)
+        self.assertGreaterEqual(client.progress_watch.disconnected_since, before)
 
     def test_configured_party_forms_then_rejoins_existing_open_party(self):
         client = AtrinikClient(ClientConfig(party_name="Sera"))
@@ -12495,6 +12598,12 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.state.farm_objective, "money")
         status, page = await self.request("GET", "/")
         self.assertIn(b'id="tab-farming"', page)
+        self.assertIn(b'id="alerts"', page)
+        now = time.time()
+        self.client.decision_history.extend([
+            {"action": "death", "time": now - 30}, {"action": "death", "time": now - 10}])
+        status, payload = await self.request("GET", "/api/state?include=alerts")
+        self.assertIn("deaths", [alert["id"] for alert in json.loads(payload)["alerts"]])
 
     async def test_dashboard_reports_the_running_build(self):
         from .build_info import build_info
