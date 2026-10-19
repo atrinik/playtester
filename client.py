@@ -221,6 +221,9 @@ class AtrinikClient:
             self.vitals.clear()
             self.review_messages.clear()
             self.action_history.clear()
+            # A loss buffered for the previous character's death is not hers.
+            self._pending_death_losses.clear()
+            self._death_depletion_until = 0.0
             # Kept for that character, not dropped: a report whose save failed
             # is still merged when she comes back.
             self._live_post_mortems[self._memory_character] = self.post_mortems

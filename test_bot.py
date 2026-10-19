@@ -1456,6 +1456,29 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(restored["attackers"][long], 11)
         self.assertEqual(sum(restored["attackers"].values()), 18)
 
+    def test_merged_counts_stay_finite(self):
+        from . import post_mortem
+        long = "a" * 80
+        restored = post_mortem.restore({"time": 1000.0, "attackers": {long + "x": 1e308, long + "y": 1e308}})
+        self.assertEqual(restored["attackers"][long], post_mortem.MAX_COUNT_VALUE)
+        json.dumps(restored, allow_nan=False)
+
+    def test_a_character_switch_drops_the_previous_ones_buffered_death_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            payload = bytes([2]) + b"ffffff\0You feel less potent!\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            # Sera disconnects before her notice; Mallory dies at once.
+            client.load_character_memory("Mallory")
+            client.state.player_name = "Mallory"
+            payload = bytes([2]) + b"ffffff\0YOU HAVE DIED.\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            self.assertEqual(client.state.depletion_points, 0)
+            self.assertNotIn("depletion", [entry["action"] for entry in client.action_history])
+
     def test_downsampling_keeps_the_window_baseline(self):
         from . import post_mortem
         samples = [[float(index), 100, 100, 50, 50, 900] for index in range(300)]

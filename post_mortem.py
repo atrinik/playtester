@@ -30,6 +30,8 @@ VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 MAX_VITALS = 120
 # Attackers or damage types kept in a restored report.
 MAX_COUNTS = 25
+# A count is a whole number of hits; a merged total never exceeds this.
+MAX_COUNT_VALUE = 10**9
 # Kept messages and action or decision records per report, and how many
 # attacker or damage entries a restore looks at.
 MAX_MESSAGES, MAX_RECORDS, MAX_COUNT_SCAN = 40, 25, 4096
@@ -137,11 +139,12 @@ def restore(entry: Any) -> dict[str, Any] | None:
             return {}
         # Names that become equal once shortened or made encodable are one
         # label: their counts add up, never overwrite each other.
-        totals: dict[str, int | float] = {}
+        # Whole numbers, capped: a sum of finite floats can overflow to inf.
+        totals: dict[str, int] = {}
         for name, count in itertools.islice(value.items(), MAX_COUNT_SCAN):
             if finite(count):
                 label = text(name, 80)
-                totals[label] = totals.get(label, 0) + count
+                totals[label] = min(MAX_COUNT_VALUE, totals.get(label, 0) + min(MAX_COUNT_VALUE, int(count)))
         return dict(heapq.nlargest(MAX_COUNTS, totals.items(), key=lambda item: item[1]))
 
     def number(key: str) -> int:
