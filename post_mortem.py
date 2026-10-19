@@ -99,13 +99,15 @@ def restore(entry: Any) -> dict[str, Any] | None:
                 if isinstance(value, list) else [])
 
     # Strings bounded too: no server line or report field is anywhere near this.
-    def text(value: Any) -> str:
-        return str(value or "")[:MAX_TEXT]
+    # And encodable: JSON allows a lone surrogate ("\ud800") that UTF-8 cannot
+    # carry, which would fail every response that includes it.
+    def text(value: Any, limit: int = MAX_TEXT) -> str:
+        return str(value or "")[:limit].encode("utf-8", "replace").decode("utf-8")
 
     # Bounded like the arrays: the largest MAX_COUNTS entries, short names.
     def counts(key: str) -> dict[str, int]:
         value = entry.get(key)
-        valid = sorted(((str(name)[:80], count) for name, count in value.items() if finite(count)),
+        valid = sorted(((text(name, 80), count) for name, count in value.items() if finite(count)),
                        key=lambda item: -item[1]) if isinstance(value, dict) else []
         return dict(valid[:MAX_COUNTS])
 

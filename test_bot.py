@@ -1337,6 +1337,11 @@ class ProtocolTests(unittest.TestCase):
         many = post_mortem.restore({"time": 5, "attackers": {f"m{index}": index for index in range(1000)}})
         self.assertEqual(len(many["attackers"]), post_mortem.MAX_COUNTS)
         self.assertIn("m999", many["attackers"])
+        # Text JSON allows but UTF-8 cannot carry (a lone surrogate) is replaced.
+        odd = post_mortem.restore(json.loads('{"time": 5, "detail": "\\ud800", "attackers": {"\\udfff": 1},'
+                                             ' "messages": [[1, "a\\ud800b"]]}'))
+        json.dumps(odd, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(odd["detail"], "?")
         long = post_mortem.restore({"time": 5, "detail": "x" * 10000, "messages": [[1, "y" * 10000]]})
         self.assertEqual((len(long["detail"]), len(long["messages"][0][1])), (post_mortem.MAX_TEXT,) * 2)
         # Restoring applies the builder's bounds.
