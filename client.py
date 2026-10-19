@@ -243,7 +243,7 @@ class AtrinikClient:
         # Newest first, stopping at KEEP valid reports, and looking at no more
         # than a few times KEEP candidates: an oversized stored list, valid or
         # not, is never normalized whole.
-        deaths = memory.load(character, "post_mortems", [])
+        deaths = memory.load(character, "post_mortems", [], max_bytes=post_mortem.MAX_STORED_BYTES)
         kept: list[dict] = []
         for value in reversed((deaths if isinstance(deaths, list) else [])[-4 * post_mortem.KEEP:]):
             if len(kept) == post_mortem.KEEP:

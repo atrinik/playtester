@@ -30,6 +30,9 @@ VITAL_KEYS = ("hp", "maxhp", "sp", "maxsp", "food")
 MAX_VITALS = 120
 # Attackers or damage types kept in a restored report.
 MAX_COUNTS = 25
+# The largest stored post-mortem list ever decoded: KEEP bounded reports are a
+# few megabytes at most, so anything larger is not one of ours.
+MAX_STORED_BYTES = 8 * 1024 * 1024
 # A count is a whole number of hits; a merged total never exceeds this.
 MAX_COUNT_VALUE = 10**9
 # Kept messages and action or decision records per report, and how many

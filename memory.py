@@ -53,15 +53,25 @@ class BotMemory:
         finally:
             db.close()
 
-    def load(self, character: str, kind: str, default: Any) -> Any:
+    def load(self, character: str, kind: str, default: Any, *,
+             max_bytes: int | None = None) -> Any:
+        """The stored value, or ``default``. With ``max_bytes``, a larger
+        stored value is never fetched or decoded (SQLite checks its length)."""
         with self._connect() as db:
             row = db.execute(
-                """SELECT value_json FROM memory
+                """SELECT CASE WHEN ? IS NULL OR length(CAST(value_json AS BLOB)) <= ?
+                               THEN value_json END,
+                          length(CAST(value_json AS BLOB))
+                   FROM memory
                    WHERE server = ? AND account = ? AND character = ?
                      AND kind = ?""",
-                (self.server, self.account, character.casefold(), kind),
+                (max_bytes, max_bytes, self.server, self.account, character.casefold(), kind),
             ).fetchone()
         if row is None:
+            return default
+        if row[0] is None:
+            log.warning("ignoring %s memory for %s on %s: %s bytes is over %s",
+                        kind, character, self.server, row[1], max_bytes)
             return default
         try:
             return json.loads(row[0])

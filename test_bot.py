@@ -1480,6 +1480,25 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(len(store().load("Sera", "post_mortems", [])), 1)
             self.assertEqual(len(store().load("Mallory", "post_mortems", [])), 1)
 
+    def test_an_oversized_stored_post_mortem_list_is_never_decoded(self):
+        from . import post_mortem
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client._memory_store().save("Sera", "post_mortems", ["x" * 1024] * 9000)
+            decoded = []
+            original = json.loads
+            with patch("atrinik_bot.memory.json.loads", lambda text, *a, **k: decoded.append(len(text)) or original(text, *a, **k)), \
+                    self.assertLogs("atrinik_bot.memory", "WARNING"):
+                client.load_character_memory("Sera")
+            self.assertFalse([size for size in decoded if size > post_mortem.MAX_STORED_BYTES])
+            self.assertEqual(client.post_mortems, [])
+            # A normal list still loads.
+            client._memory_store().save("Sera", "post_mortems", [{"time": 1000.0}])
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.post_mortems), 1)
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80
@@ -1894,7 +1913,7 @@ class ProtocolTests(unittest.TestCase):
             def import_legacy(self, *args):
                 pass
 
-            def load(self, character, kind, default):
+            def load(self, character, kind, default, **kwargs):
                 return self.trends if kind == "trends" else default
 
             def save(self, *args, **kwargs):
