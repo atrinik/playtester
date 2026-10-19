@@ -1349,6 +1349,34 @@ class ProtocolTests(unittest.TestCase):
         json.dumps(report, allow_nan=False).encode("utf-8")
         self.assertEqual(decision["map"], "")
 
+    def test_a_slow_bookkeeping_save_never_moves_the_death_time(self):
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+        clock = [1000.0]
+        original = client.record_action
+
+        def slow_record(*args, **kwargs):
+            clock[0] += 30.0  # a locked database's wait, on the wall clock
+            return original(*args, **kwargs)
+
+        client.record_action = slow_record
+        data = bytes((2,)) + b"ffffff\0" + b"YOU HAVE DIED.\0"
+        with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+            asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        self.assertEqual(client.post_mortems[-1]["time"], 1000.0)
+
+    def test_an_oversized_ledger_number_never_breaks_the_death_review(self):
+        from . import post_mortem
+        when = time.time()
+        report = post_mortem.build(
+            when, "/a", 1, 2, [], [], [],
+            [{"time": when - 5, "action": "emergency-disengage",
+              "detail": "sp=" + "9" * 5000 + " next-heal=" + "9" * 5000}],
+            name="Sera")
+        self.assertEqual(report["decisions"][-1]["action"], "emergency-disengage")
+        self.assertLessEqual(len(report["decisions"][-1]["detail"]), post_mortem.MAX_TEXT)
+
     def test_a_post_mortem_save_leaves_the_event_loop(self):
         import threading
         client = AtrinikClient(ClientConfig(character="Sera"))

@@ -188,6 +188,8 @@ class AtrinikClient:
         self.decision_history: list[dict] = []
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: deque[list[float]] = deque()
+        # When the last death's bookkeeping ended (its records are its own).
+        self._post_mortem_booked = 0.0
         # One worker: post-mortem saves leave the event loop, in order.
         self._post_mortem_saver = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="post-mortem-save")
@@ -805,21 +807,27 @@ class AtrinikClient:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
-    def _record_post_mortem(self) -> None:
+    def _record_post_mortem(self, when: float | None = None) -> None:
         """Keep what happened in the minute before this death.
 
         kill_player queues its notice before the savebed transfer's map update,
         which goes out at the end of the server tick, so the square she is on
         now is where she fell. The report is built once, here, and ends at the
         notice: what follows a death (a respawn, the next fight) never belongs
-        to it.
+        to it. `when` is the notice's arrival, taken before any bookkeeping
+        (whose saves can wait on a locked database) can delay it.
         """
-        previous = self.post_mortems[-1]["time"] if self.post_mortems else 0.0
+        # The previous life ends with its death's bookkeeping, which comes
+        # after its notice; a restored report has only its notice time.
+        previous = max(self._post_mortem_booked,
+                       self.post_mortems[-1]["time"] if self.post_mortems else 0.0)
         m = self.state.map
         self.post_mortems.append(post_mortem.build(
-            time.time(), m.path, m.world_x, m.world_y, self.vitals,
+            time.time() if when is None else when, m.path, m.world_x, m.world_y, self.vitals,
             list(self.review_messages), self.action_history, self.decision_history,
-            since=previous, name=self.state.player_name or self.config.character))
+            since=previous, name=self.state.player_name or self.config.character,
+            recorded=time.time()))
+        self._post_mortem_booked = time.time()
         del self.post_mortems[:-post_mortem.KEEP]
         # Best effort, like the trends: a full or read-only disk, or a locked
         # database (SQLite waits up to ten seconds), must never stop or stall
@@ -1278,6 +1286,7 @@ class AtrinikClient:
         text = cur.cstring() if cur.remaining else ""
         self.state.add_message(msg_type, color, text)
         self.review_messages.append(self.state.messages[-1])
+        arrived = time.time()
         cutoff = self.state.messages[-1][0] - post_mortem.REVIEW_HISTORY_SECONDS
         while self.review_messages and self.review_messages[0][0] < cutoff:
             self.review_messages.popleft()
@@ -1340,8 +1349,9 @@ class AtrinikClient:
                     "depletion",
                     f"point {self.state.depletion_points}: {message}")
             self._death_depletion_until = now + 8.0
-            # After the bookkeeping above, so its depletion records are in it.
-            self._record_post_mortem()
+            # After the bookkeeping above, so its depletion records are in it,
+            # but dated at the notice's arrival.
+            self._record_post_mortem(arrived)
         death_loss = normalized in death_losses
         direct_drain = any(normalized == marker for marker in direct_drains)
         if death_loss and now > self._death_depletion_until:

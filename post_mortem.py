@@ -65,6 +65,36 @@ def sample(stats: dict) -> list[float]:
     return [time.time(), *(int(stats.get(key, 0) or 0) for key in VITAL_KEYS)]
 
 
+# Every number must be finite: json.loads accepts NaN, and one bare NaN
+# in the state response makes the browser reject the whole poll.
+def _finite(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        return False
+
+
+# Strings bounded too: no server line or report field is anywhere near this.
+# And encodable: JSON allows a lone surrogate ("\ud800") that UTF-8 cannot
+# carry, which would fail every response that includes it.
+# Only textual scalars: a stored list or object is never stringified
+# whole before truncation.
+def _text(value: Any, limit: int = MAX_TEXT) -> str:
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return ""
+    return str(value)[:limit].encode("utf-8", "replace").decode("utf-8")
+
+
+def _records(items: Iterable[Any]) -> list[dict]:
+    """Action or decision records in their reported shape: a finite time and
+    bounded, encodable text, whatever a persisted ledger held."""
+    return [{"time": item["time"], "action": _text(item.get("action")),
+             "detail": _text(item.get("detail")), "map": _text(item.get("map"))}
+            for item in items if isinstance(item, dict) and _finite(item.get("time"))]
+
+
 def restore(entry: Any) -> dict[str, Any] | None:
     """A stored post-mortem in the shape the client and dashboard read, or None."""
     if not isinstance(entry, dict):
@@ -77,15 +107,7 @@ def restore(entry: Any) -> dict[str, Any] | None:
     if not math.isfinite(when):
         return None
 
-    # Every number must be finite: json.loads accepts NaN, and one bare NaN
-    # in the state response makes the browser reject the whole poll.
-    def finite(value: Any) -> bool:
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            return False
-        try:
-            return math.isfinite(value)
-        except OverflowError:  # an int too large for a float
-            return False
+    finite, text = _finite, _text
 
     # Only a bounded tail of each stored list is ever traversed (a few times
     # what is kept, for invalid entries), so an oversized value costs no more
@@ -95,9 +117,7 @@ def restore(entry: Any) -> dict[str, Any] | None:
         return value[-4 * keep:] if isinstance(value, list) else []
 
     def records(key: str) -> list[dict]:
-        return [{"time": item["time"], "action": text(item.get("action")),
-                 "detail": text(item.get("detail")), "map": text(item.get("map"))}
-                for item in tail(key, MAX_RECORDS) if isinstance(item, dict) and finite(item.get("time"))]
+        return _records(tail(key, MAX_RECORDS))
 
     def vitals_rows() -> list[list]:
         return [list(item) for item in tail("vitals", MAX_VITALS)
@@ -107,16 +127,6 @@ def restore(entry: Any) -> dict[str, Any] | None:
     def message_rows() -> list[list]:
         return [[item[0], text(item[1])] for item in tail("messages", MAX_MESSAGES)
                 if isinstance(item, (list, tuple)) and len(item) == 2 and finite(item[0])]
-
-    # Strings bounded too: no server line or report field is anywhere near this.
-    # And encodable: JSON allows a lone surrogate ("\ud800") that UTF-8 cannot
-    # carry, which would fail every response that includes it.
-    # Only textual scalars: a stored list or object is never stringified
-    # whole before truncation.
-    def text(value: Any, limit: int = MAX_TEXT) -> str:
-        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-            return ""
-        return str(value)[:limit].encode("utf-8", "replace").decode("utf-8")
 
     # Bounded like the arrays: the largest MAX_COUNTS of a bounded slice of
     # entries, short names; never a sort of an oversized map.
@@ -167,16 +177,19 @@ def _within(stamp: Any, start: float, end: float) -> bool:
 def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
           messages: Iterable[tuple], actions: Iterable[dict],
           decisions: Iterable[dict], *, since: float = 0.0,
-          name: str = "") -> dict[str, Any]:
+          name: str = "", recorded: float | None = None) -> dict[str, Any]:
     """The post-mortem of ``name``'s death at ``when`` on ``path`` (x, y).
 
     ``since`` is the previous death: nothing from that earlier life counts.
+    ``recorded`` is when the death's own bookkeeping (its death and depletion
+    records, written after the notice) ended: records count up to it.
     """
     # A previous death at or after this one (a clock stepped back, a bad
     # record) bounds nothing: the normal window applies.
     since = since if since < when else 0.0
     # Up to the notice itself: after it come the respawn and the next life.
     start, end = max(when - REVIEW_WINDOW_SECONDS, since), when
+    booked = when if recorded is None else max(when, recorded)
     messages = list(messages)
     decisions = list(decisions)
     # The server tells everyone "<name> starved to death." as the whole
@@ -188,6 +201,10 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
         text = str(entry[-1]).strip().casefold()
         return "starved to death" not in text or bool(name) and text == starved
 
+    # The ledgers are normalized (bounded, finite, encodable) before anything
+    # reads them, the death classifier included: a persisted ledger can hold
+    # anything.
+    actions, decisions = _records(actions), _records(decisions)
     # The farm decides whether a death was "on the way"; a post-mortem only
     # describes the fight, so the death map counts as the spot.
     review = review_failure(
@@ -195,7 +212,7 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
          if _within(entry[0], start, end) and hers(entry)],
         [record for record in decisions
          # Decisions stop at the death: work after it never sets the cause.
-         if isinstance(record, dict) and _within(record.get("time"), start, when)],
+         if isinstance(record, dict) and _within(record.get("time"), start, booked)],
         {"time": when, "action": "death", "map": path}, [path])
     texts = [(float(entry[0]), str(entry[-1])) for entry in messages
              if _within(entry[0], start, end)]
@@ -205,7 +222,7 @@ def build(when: float, path: str, x: int, y: int, vitals: Iterable[list],
     def recent(records: Iterable[dict]) -> list[dict]:
         return [{key: record.get(key) for key in ("time", "action", "detail", "map")}
                 for record in records
-                if isinstance(record, dict) and _within(record.get("time"), start, when)][-25:]
+                if isinstance(record, dict) and _within(record.get("time"), start, booked)][-25:]
 
     # The last sample before the window is the state at its start, so a
     # sudden death (steady, then one fatal hit) still charts from a baseline.

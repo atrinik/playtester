@@ -42,7 +42,9 @@ KEEP_REVIEWS = 10
 _HIT = re.compile(
     r"^(?P<who>.+?) hit you for (?P<amount>\d+)(?: \(-?\d+\))?"
     r"(?: (?:(?P<type>[a-z][a-z ]*?) )?damage)?[.!]?$", re.I)
-_DISENGAGE = re.compile(r"sp=(?P<sp>\d+) next-heal=(?P<heal>\d+)")
+# Bounded digits: a stored detail with an oversized number never reaches
+# int()'s digit limit; it just does not match.
+_DISENGAGE = re.compile(r"sp=(?P<sp>\d{1,9}) next-heal=(?P<heal>\d{1,9})(?!\d)")
 
 
 @dataclass
