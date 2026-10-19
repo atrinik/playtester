@@ -1680,6 +1680,34 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(client.post_mortems[-1]["attackers"], {"giant rat": 1})
         self.assertEqual(client.post_mortems[-1]["damage_taken"], 3)
 
+    def test_a_reload_keeps_the_life_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            client.state.map = MapState(path="/shattered_islands/world_1_50", world_x=10, world_y=3)
+            clock = [960.0]
+
+            def say(text):
+                data = bytes((2,)) + b"ffffff\0" + text.encode() + b"\0"
+                with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+                    asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+
+            with patch("atrinik_bot.client.time.time", lambda: clock[0]):
+                client.record_action("emergency-disengage", "sp=1 next-heal=9")
+            clock[0] = 1000.0
+            say("YOU HAVE DIED.")
+            # A reconnect reloads the ledger as new objects; then the clock
+            # is corrected back past that death.
+            client.load_character_memory("Sera")
+            clock[0] = 990.0
+            say("YOU HAVE DIED.")
+            report = client.post_mortems[-1]
+            self.assertNotEqual(report["cause"], "resources")
+            self.assertNotIn("emergency-disengage", [entry["action"] for entry in report["decisions"]])
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80

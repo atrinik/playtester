@@ -123,12 +123,14 @@ class ClientConfig:
 DEATH_NOTICES = ("you have been defeated in combat!", "you have died.")
 
 def _after(records: list, mark: Any) -> list:
-    """The records after ``mark`` (by identity), or all of them when it is
-    gone (trimmed, or a reloaded history)."""
+    """The records after ``mark``: found by identity, or by value in a
+    reloaded history (a decoded record equals the one saved); all of them
+    when it is gone (trimmed away)."""
     if mark is not None:
-        for index in range(len(records) - 1, -1, -1):
-            if records[index] is mark:
-                return records[index + 1:]
+        for same in (lambda record: record is mark, lambda record: record == mark):
+            for index in range(len(records) - 1, -1, -1):
+                if same(records[index]):
+                    return records[index + 1:]
     return records
 
 
