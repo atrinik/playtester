@@ -842,11 +842,14 @@ class AtrinikClient:
         # next death's save carries it.
         character = self.state.player_name
         if character:
-            try:
-                self._memory_store().save(character, "post_mortems", self.post_mortems,
-                                          timeout=POST_MORTEM_SAVE_TIMEOUT)
-            except Exception as error:
-                log.warning("could not save post-mortems for %s: %s", character, error)
+            self._save_post_mortems(character, self.post_mortems)
+
+    def _save_post_mortems(self, character: str, reports: list[dict]) -> None:
+        try:
+            self._memory_store().save(character, "post_mortems", reports,
+                                      timeout=POST_MORTEM_SAVE_TIMEOUT)
+        except Exception as error:
+            log.warning("could not save post-mortems for %s: %s", character, error)
 
     def _trend_count(self, key: str) -> None:
         if self.trends.count(key):
@@ -971,6 +974,14 @@ class AtrinikClient:
     async def close(self) -> None:
         # The current minute is otherwise saved only when the next one starts.
         self._persist_trends()
+        # A report whose save failed lives only in memory: one more try, for
+        # this character and any other this client played.
+        current = self._memory_character or self.state.player_name
+        if current and self.post_mortems:
+            self._save_post_mortems(current, self.post_mortems)
+        for character, reports in self._live_post_mortems.items():
+            if reports:
+                self._save_post_mortems(character, reports)
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"

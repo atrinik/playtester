@@ -1456,6 +1456,30 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(restored["attackers"][long], 11)
         self.assertEqual(sum(restored["attackers"].values()), 18)
 
+    def test_a_clean_shutdown_retries_unsaved_post_mortems(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            store = client._memory_store
+
+            class LockedDatabase:
+                def save(self, *args, **kwargs):
+                    raise sqlite3.OperationalError("database is locked")
+
+            client._memory_store = lambda: LockedDatabase()
+            with self.assertLogs("atrinik_bot.client", "WARNING"):
+                client._record_post_mortem()
+            # Mallory's unsaved report waits in the per-character cache too.
+            client._live_post_mortems["Mallory"] = [dict(client.post_mortems[0], time=5.0)]
+            client._memory_store = store
+            asyncio.run(client.close())
+            self.assertEqual(len(store().load("Sera", "post_mortems", [])), 1)
+            self.assertEqual(len(store().load("Mallory", "post_mortems", [])), 1)
+
     def test_merged_counts_stay_finite(self):
         from . import post_mortem
         long = "a" * 80
