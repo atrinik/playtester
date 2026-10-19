@@ -3589,27 +3589,62 @@ def analyzer_spot_legs(spot: dict, graph: "WorldGraph") -> tuple[tuple[str, str]
     return tuple(legs)
 
 
-def analyzer_farm_selection(
+def effective_farm_objective(state) -> str:
+    """The objective farming follows right now.
+
+    While depletion is at the temple-service threshold, its lowered stats
+    make the chosen objective's spots deadly, so farming prefers the safest
+    spots until the temple removes it; then the choice applies again.
+    """
+    chosen = getattr(state, "farm_objective", DEFAULT_OBJECTIVE)
+    # The counter can outlive a cure applied elsewhere (an item, or while
+    # offline); only the live depletion force proves she is still depleted.
+    depleted = any(item.item_type == c.TYPE_FORCE and
+                   item.name.casefold() == "depletion"
+                   for item in getattr(state, "inventory", ()))
+    if (depleted and getattr(state, "depletion_points_known", False) and
+            int(getattr(state, "depletion_points", 0) or 0) >=
+            FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD):
+        return "safety"
+    return chosen
+
+
+def analyzer_farm_choice(
         client: AtrinikClient, graph: "WorldGraph"
-) -> tuple[tuple[tuple[str, str], ...], dict] | None:
-    """The preferred objective's highest-ranked spot that is usable right now.
+) -> tuple[str, tuple[tuple[str, str], ...], dict] | None:
+    """The objective farmed now, with its highest-ranked usable spot.
 
     The farming analyzer is the source of truth. The only exceptions are live
     failures: a spot quarantined after a death, an emergency recall, ten minutes
     without XP, or an unreachable route is skipped until its quarantine ends.
+
+    If depletion prefers safety but no safety spot is usable, the chosen
+    objective's spot applies. The circuit removes depletion before any farming
+    whenever an item or the temple fee allows, and farming is what pays that
+    fee; holding instead could leave her depleted for good.
     """
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
         return None
-    objective = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
+    chosen = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
     quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
     now = time.time()
-    for spot in analyzer.ranking(objective):
-        legs = analyzer_spot_legs(spot, graph)
-        if legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
-                        for path, _ in legs):
-            return legs, spot
+    for objective in dict.fromkeys(
+            (effective_farm_objective(client.state), chosen)):
+        for spot in analyzer.ranking(objective):
+            legs = analyzer_spot_legs(spot, graph)
+            if legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
+                            for path, _ in legs):
+                return objective, legs, spot
     return None
+
+
+def analyzer_farm_selection(
+        client: AtrinikClient, graph: "WorldGraph"
+) -> tuple[tuple[tuple[str, str], ...], dict] | None:
+    """The legs and spot of `analyzer_farm_choice`."""
+    choice = analyzer_farm_choice(client, graph)
+    return None if choice is None else choice[1:]
 
 
 def food_reserve(client: AtrinikClient) -> int:
@@ -4397,8 +4432,8 @@ class FarmCircuitTask(BotTask):
         self._progression_level = level
         if not self.analyzer_driven:
             return False
-        selection = analyzer_farm_selection(client, self.graph)
-        if selection is None:
+        choice = analyzer_farm_choice(client, self.graph)
+        if choice is None:
             # Nothing usable is ranked. Never keep farming a spot that live
             # failures just excluded: finish, and autoplay holds position
             # safely until a usable spot is ranked again.
@@ -4414,7 +4449,7 @@ class FarmCircuitTask(BotTask):
                 self.complete()
                 return True
             return False
-        desired, spot = selection
+        objective, desired, spot = choice
         if desired == self.legs:
             self.spot = spot
             return False
@@ -4430,7 +4465,6 @@ class FarmCircuitTask(BotTask):
         self._tier_progress_exp = self._current_exp
         self.name = "farm-circuit:" + "+".join(
             path.rsplit("/", 1)[-1] for path, _ in self.legs)
-        objective = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
         log.info("farming analyzer selected %s for %s: %s",
                  spot.get("name", "?"), objective,
                  ", ".join(path.rsplit("/", 1)[-1] for path, _ in self.legs))

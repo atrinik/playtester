@@ -9,7 +9,7 @@ const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts";
-const SLOW_KEYS = "build,farming_analysis,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
+const SLOW_KEYS = "build,farming_analysis,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -130,7 +130,7 @@ let lastFarmingSig = "";
 function renderFarming() {
   const fa = slow.farming_analysis;
   if (!fa) return;
-  const sig = JSON.stringify([fa.status, fa.objective, fa.finished_at, fa.error, fa.running, fa.self_improvement, fa.savebed]);
+  const sig = JSON.stringify([fa.status, fa.objective, fa.selected_objective, fa.objective_override, fa.finished_at, fa.error, fa.running, fa.self_improvement, fa.savebed]);
   const status = $("#fa-status");
   status.classList.toggle("warn-text", fa.status === "failed" || fa.status === "unsupported");
   status.textContent = fa.running ? "Analyzing…"
@@ -140,12 +140,16 @@ function renderFarming() {
     : fa.status === "unavailable" ? "Analyzer unavailable" : "Waiting for the first run";
   if (sig === lastFarmingSig) return;
   lastFarmingSig = sig;
+  const chosen = fa.selected_objective || fa.objective;
   $("#fa-objectives").innerHTML = Object.entries(fa.objectives || {}).map(([key, label]) =>
-    `<button role="radio" aria-checked="${key === fa.objective}" class="${key === fa.objective ? "active" : ""}" data-objective="${esc(key)}">${esc(label)}</button>`).join("");
+    `<button role="radio" aria-checked="${key === chosen}" class="${key === chosen ? "active" : ""}" data-objective="${esc(key)}">${esc(label)}</button>`).join("");
   const p = fa.profile;
-  $("#fa-profile").textContent = p
-    ? `Simulating ${p.skill} ${p.skill_level} · DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing · HP ${p.max_health} · AC ${p.armour_class}`
+  const override = fa.objective_override
+    ? `Farming for ${(fa.objectives || {})[fa.objective] || fa.objective} while depleted (${fa.objective_override.points} points); back to ${(fa.objectives || {})[chosen] || chosen} once cured. `
     : "";
+  $("#fa-profile").textContent = override + (p
+    ? `Simulating ${p.skill} ${p.skill_level} · DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing · HP ${p.max_health} · AC ${p.armour_class}`
+    : "");
   $("#fa-ranking").innerHTML = (fa.ranking || []).map((r, i) => `
     <div class="spot${i === 0 ? " top" : ""}">
       <div class="spot-head"><b>#${i + 1} ${esc(r.name)}</b><span class="flag">${esc(String(r.region || "").replace(/_/g, " "))}</span></div>
@@ -166,6 +170,37 @@ function renderFarming() {
       ${(s.reviews || []).slice().reverse().map(r => `<small>${new Date(r.time * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${esc(r.kind)} · <b>${esc(r.cause)}</b>: ${esc(r.detail)}${(r.remedies || []).length ? ` → ${esc(r.remedies.join(", "))}` : ""}</small>`).join("")}
     </div>`).join("") + (goalText ? `<small class="muted">Improvement goals: ${esc(goalText)}</small>` : ""))
     || '<span class="muted">No deaths or emergency recalls to learn from yet.</span>';
+}
+// Day-long trends: hourly rates and levels from per-minute samples.
+const TREND_SERIES = [
+  ["xp_per_hour", "XP per hour", v => rate(v)],
+  ["deaths_per_hour", "Deaths per hour", v => `${v}`],
+  ["heals_per_hour", "Heals per hour", v => `${v}`],
+  ["depletion", "Depletion points", v => `${v}`],
+  ["food", "Food", v => `${v}`],
+];
+function trendLine(points, key) {
+  const vals = points.map(p => p[key]).filter(v => v !== null && v !== undefined);
+  if (vals.length < 2) return "";
+  const t0 = points[0].t, t1 = points[points.length - 1].t || t0 + 1;
+  const max = Math.max(1, ...vals), w = 240, h = 32;
+  const pts = points.filter(p => p[key] !== null && p[key] !== undefined)
+    .map(p => `${(((p.t - t0) / Math.max(1, t1 - t0)) * w).toFixed(1)},${(h - (p[key] / max) * h).toFixed(1)}`).join(" ");
+  return `<svg class="trend-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="${esc(key)} over the last day"><polyline points="${pts}"/></svg>`;
+}
+let lastTrendsSig = "";
+function renderTrends() {
+  const points = (slow.trends || {}).points || [];
+  // The current minute's values change between buckets.
+  const sig = points.length ? `${points.length}:${JSON.stringify(points[points.length - 1])}` : "";
+  if (sig === lastTrendsSig) return;
+  lastTrendsSig = sig;
+  if (points.length < 2) { $("#fa-trends").innerHTML = '<span class="muted">Collecting samples…</span>'; return; }
+  const last = points[points.length - 1];
+  $("#fa-trends").innerHTML = TREND_SERIES.map(([key, label, fmt]) => {
+    const value = last[key];
+    return `<div class="trend"><div class="spot-head"><small>${label}</small><b>${value === null || value === undefined ? "–" : esc(fmt(value))}</b></div>${trendLine(points, key)}</div>`;
+  }).join("");
 }
 $("#fa-objectives").addEventListener("click", e => {
   const b = e.target.closest("button[data-objective]");
@@ -471,7 +506,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderTrends(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
   } finally { slowBusy = false; }
 }
 pollLive(); pollSlow();

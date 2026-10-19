@@ -21,6 +21,7 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameSta
                     InterfaceState, Item, MapObject, MapState)
 from .alerts import ProgressWatch
 from .memory import BotMemory
+from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
 
@@ -172,6 +173,9 @@ class AtrinikClient:
         self.decision_history: list[dict] = []
         # (time, path) of each arrival on a new map, newest last.
         self.map_arrivals: list[tuple[float, str]] = []
+        # Per-minute XP, deaths, heals, depletion and food for the dashboard.
+        self.trends = Trends()
+        self._trends_character = ""
         # When XP, position and the connection last changed, for alerts.
         self.progress_watch = ProgressWatch()
         self.action_context = ""
@@ -198,6 +202,16 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        buckets = memory.load(character, "trends", [])
+        saved = Trends(buckets if isinstance(buckets, list) else ()).buckets
+        # A reconnect reloads the same character: its live buckets are newer
+        # than the saved snapshot (the open minute is saved only when the
+        # next starts), so they win for the same minute.
+        live = self.trends.buckets if self._trends_character == character else []
+        merged = {bucket["t"]: bucket for bucket in saved}
+        merged.update((bucket["t"], bucket) for bucket in live)
+        self.trends = Trends(sorted(merged.values(), key=lambda bucket: bucket["t"]))
+        self._trends_character = character
         if isinstance(record, dict) and "depletion_points" in record:
             self.state.depletion_points = max(
                 0, int(record.get("depletion_points", 0)))
@@ -386,6 +400,9 @@ class AtrinikClient:
     def set_depletion_points(self, points: int) -> None:
         self.state.depletion_points = max(0, int(points))
         self.state.depletion_points_known = True
+        # Death stat losses change depletion between stats packets.
+        if self.trends.observe(self.state):
+            self._persist_trends()
         character = self.state.player_name or self.config.character
         if not character:
             return
@@ -739,6 +756,24 @@ class AtrinikClient:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
+    def _trend_count(self, key: str) -> None:
+        if self.trends.count(key):
+            self._persist_trends()
+
+    def _persist_trends(self) -> None:
+        """Save the trend buckets once a minute, when a new one starts.
+
+        Best effort: a full or read-only disk, or a locked database, must
+        never stop play or abort a clean shutdown for dashboard telemetry.
+        """
+        character = self.state.player_name
+        if not character:
+            return
+        try:
+            self._memory_store().save(character, "trends", self.trends.buckets)
+        except Exception as error:
+            log.warning("could not save trends for %s: %s", character, error)
+
     def _load_faces(self) -> dict[int, str]:
         faces: dict[int, str] = {}
         paths = (
@@ -842,6 +877,8 @@ class AtrinikClient:
             await writer.wait_closed()
 
     async def close(self) -> None:
+        # The current minute is otherwise saved only when the next one starts.
+        self._persist_trends()
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"
@@ -1195,8 +1232,11 @@ class AtrinikClient:
         # quotes one from passing for a death.
         died = normalized in ("you have been defeated in combat!",
                               "you have died.")
+        if lowered.startswith("the spell heals you for"):
+            self._trend_count("heals")
         if died:
             self.record_action("death", text)
+            self._trend_count("deaths")
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a
             # post-death window for protocol/order variants that arrive later.
@@ -1560,6 +1600,8 @@ class AtrinikClient:
             self.state.stats[name] = value
             self.state.stat_observed_at[name] = time.monotonic()
             changed[name] = value
+        if self.trends.observe(self.state):
+            self._persist_trends()
         self.progress_watch.observe(self.state)
         await self.emit("stats", changed)
 
@@ -1615,6 +1657,7 @@ class AtrinikClient:
             if not cur.remaining:
                 if completes_player_replay:
                     self.state.inventory_replay_complete = True
+                    self._forget_cured_depletion()
                 return
         location, append = cur.u32(), bool(cur.u8())
         changed: list[Item] = []
@@ -1636,6 +1679,7 @@ class AtrinikClient:
             changed.append(item)
         if completes_player_replay:
             self.state.inventory_replay_complete = True
+            self._forget_cured_depletion()
         await self.emit("items", changed)
 
     async def _handle_item_update(self, cur: Cursor, raw: bytes) -> None:
@@ -1649,11 +1693,36 @@ class AtrinikClient:
 
     async def _handle_item_delete(self, cur: Cursor, raw: bytes) -> None:
         deleted = []
+        lost_depletion = False
         while cur.remaining:
             tag = cur.u32()
+            item = self.state.items.get(tag)
+            lost_depletion = lost_depletion or (
+                item is not None and self._is_depletion_force(item) and
+                tag in self.state.inventories.get(self.state.player_tag, []))
             self.state.remove_item(tag)
             deleted.append(tag)
+        if lost_depletion:
+            self._forget_cured_depletion()
         await self.emit("items_deleted", deleted)
+
+    @staticmethod
+    def _is_depletion_force(item: Item) -> bool:
+        return (item.item_type == c.TYPE_FORCE and
+                item.name.casefold() == "depletion")
+
+    def _forget_cured_depletion(self) -> None:
+        """Reset the depletion count once the authoritative bag lacks the force.
+
+        Only a full replay or the force's own removal proves a cure: a cure
+        from the dashboard or while offline otherwise leaves the old count
+        for the next single loss to extend past the service threshold.
+        """
+        if self.state.depletion_points and not any(
+                self._is_depletion_force(item)
+                for item in self.state.inventory):
+            self.set_depletion_points(0)
+            self.record_action("depletion", "cleared: the depletion force is gone")
 
     async def _handle_mapstats(self, cur: Cursor, raw: bytes) -> None:
         # Publish metadata and time together only after the complete payload

@@ -120,6 +120,41 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_a_cure_outside_the_bot_resets_the_depletion_count(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.player_tag = 7
+            client._persist_character_memory = lambda: None
+            force = Item(22, item_type=c.TYPE_FORCE, name="depletion")
+            client.state.place_item(force, 7)
+            client.state.place_item(Item(23, name="apple"), 7)
+            client.set_depletion_points(32)
+            delete = Packet(0).u32(23)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 32)
+            # The force itself goes: cured by an item or the dashboard.
+            delete = Packet(0).u32(22)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 0)
+            # A new loss counted before its force arrives survives unrelated
+            # deletions, so a fresh episode starts from one.
+            client.set_depletion_points(1)
+            client.state.place_item(Item(24, name="pear"), 7)
+            delete = Packet(0).u32(24)
+            await client._handle_item_delete(
+                Cursor(bytes(delete.data)), bytes(delete.data))
+            self.assertEqual(client.state.depletion_points, 1)
+            # Cured while offline: the replay on login has no force.
+            client.set_depletion_points(32)
+            replay = Packet(0).u8(1).u32(7).u32(7).u8(1)
+            await client._handle_item(
+                Cursor(bytes(replay.data)), bytes(replay.data))
+            self.assertEqual(client.state.depletion_points, 0)
+
+        asyncio.run(scenario())
+
     def test_client_checkpoint_wakes_read_loop_for_clean_reconnect(self):
         class Writer:
             def __init__(self):
@@ -1175,6 +1210,166 @@ class ProtocolTests(unittest.TestCase):
         client._observe_map_change("/a", MapState(path="/b"))
         client._observe_map_change("/b", MapState(path="/b"))
         self.assertEqual([path for _, path in client.map_arrivals], ["/b"])
+
+    def test_trends_bucket_by_minute_and_derive_hourly_rates(self):
+        from .trends import KEEP_SECONDS, Trends
+
+        trends = Trends()
+        state = GameState(phase="playing", player_tag=7)
+        state.depletion_points_known = True
+        state.depletion_points = 32
+        start = 1_000_020.0
+        for minute in range(61):
+            state.stats.update(exp=1000 + 100 * minute, food=900 - minute, hp=100, maxhp=155)
+            self.assertTrue(trends.observe(state, start + 60 * minute))
+            # A second sample in the same minute starts nothing new.
+            self.assertFalse(trends.observe(state, start + 60 * minute + 30))
+            if minute in (30, 59):
+                trends.count("deaths", start + 60 * minute + 40)
+        for _ in range(5):
+            trends.count("heals", start + 60 * 60)
+        last = trends.summary(start + 3600)["points"][-1]
+        self.assertEqual(last["xp_per_hour"], 6000)
+        self.assertEqual((last["deaths_per_hour"], last["heals_per_hour"]), (2, 5))
+        self.assertEqual((last["depletion"], last["food"], last["hp"]), (32, 840, 0.645))
+        # The hour is by time: after a five-hour gap, old deaths drop out.
+        state.stats.update(exp=8000)
+        trends.observe(state, start + 3600 + 5 * 3600)
+        late = trends.summary(start + 3600 + 5 * 3600)["points"][-1]
+        self.assertEqual((late["deaths_per_hour"], late["xp_per_hour"]), (0, None))
+        # The chart shows the day before the poll; older minutes drop out of it.
+        trends.observe(state, start + KEEP_SECONDS + 3600)
+        shown = trends.summary(start + KEEP_SECONDS + 3600)["points"]
+        self.assertGreaterEqual(shown[0]["t"], start + 3600 - 60)
+        # At most a day of minute buckets is stored.
+        from .trends import MAX_BUCKETS
+        many = Trends()
+        for minute in range(MAX_BUCKETS + 5):
+            many.observe(state, start + 60 * minute)
+        self.assertEqual(len(many.buckets), MAX_BUCKETS)
+        self.assertEqual(many.buckets[0]["t"], int((start + 60 * 5) // 60 * 60))
+        # A clock that jumps two days ahead and back again keeps the history,
+        # and the outlier minute is dropped rather than replayed later.
+        jumpy = Trends()
+        for minute in range(10):
+            jumpy.observe(state, start + 60 * minute)
+        jumpy.count("deaths", start + 3600)
+        jumpy.observe(state, start + 2 * KEEP_SECONDS)
+        jumpy.observe(state, start + 60 * 10)
+        self.assertEqual(len(jumpy.buckets), 11)
+        self.assertEqual(len(jumpy.summary(start + 60 * 10)["points"]), 11)
+        jumpy.observe(state, start + 3600)
+        self.assertEqual(jumpy.summary(start + 3600)["points"][-1]["deaths_per_hour"], 0)
+        # Restored buckets survive; garbage does not.
+        self.assertEqual(len(Trends([{"t": 60, "exp": 1}, "x", {"exp": 2}]).buckets), 1)
+
+    def test_trend_rates_age_with_the_poll_and_survive_clock_steps(self):
+        from .trends import Trends
+
+        trends = Trends()
+        state = GameState(phase="playing", player_tag=7)
+        state.stats.update(exp=1000, food=500, hp=100, maxhp=100)
+        start = 2_000_040.0
+        trends.observe(state, start)
+        trends.count("deaths", start + 10)
+        self.assertEqual(trends.summary(start + 30)["points"][-1]["deaths_per_hour"], 1)
+        # No new minute is recorded for two hours: the latest point is the
+        # poll time's minute, and the death has aged out of its hour.
+        quiet = trends.summary(start + 2 * 3600)
+        self.assertEqual(quiet["points"][-1]["t"], int((start + 2 * 3600) // 60 * 60))
+        self.assertEqual(quiet["points"][-1]["deaths_per_hour"], 0)
+        self.assertEqual(quiet["points"][-1]["food"], 500)
+        # The wall clock steps back two minutes and catches up again: every
+        # minute keeps one bucket, the buckets stay in time order, and the
+        # minute the clock ran ahead to is not double counted.
+        trends.observe(state, start + 600)
+        trends.observe(state, start + 480)
+        trends.count("heals", start + 600)
+        times = [bucket["t"] for bucket in trends.buckets]
+        self.assertEqual(times, sorted(set(times)))
+        self.assertEqual(sum(bucket["heals"] for bucket in trends.buckets), 1)
+
+    def test_a_failed_trend_save_never_stops_the_client(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.player_name = "Sera"
+
+        class FullDisk:
+            def save(self, *args):
+                raise OSError(28, "No space left on device")
+
+        client._memory_store = lambda: FullDisk()
+        with self.assertLogs("atrinik_bot.client", "WARNING"):
+            client._persist_trends()
+
+    def test_client_counts_heals_and_deaths_into_trends(self):
+        client = AtrinikClient(ClientConfig())
+
+        def say(text, msg_type=2):
+            data = bytes((msg_type,)) + b"ffffff\0" + text.encode() + b"\0"
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+
+        say("The spell heals you for 12 hp!")
+        say("The spell heals you for 9 hp!")
+        say("You have been defeated in combat!")
+        say("YOU HAVE DIED.")
+        # A player's chat quoting a notice is no death.
+        say("[a=#charname]Mallory[/a]: YOU HAVE DIED.", c.CHAT_TYPE_CHAT)
+        say("[a=#charname]Mallory[/a] tells you: You have been defeated in combat!",
+            c.CHAT_TYPE_PRIVATE)
+        bucket = client.trends.buckets[-1]
+        # Each notice is its own defeat: a PvP-area defeat sends only
+        # "defeated in combat", a death only "YOU HAVE DIED.".
+        self.assertEqual((bucket["heals"], bucket["deaths"]), (2, 2))
+        # Dying again right after respawning is another death.
+        say("YOU HAVE DIED.")
+        self.assertEqual(client.trends.buckets[-1]["deaths"], 3)
+        # Depletion changes between stats packets reach the bucket.
+        client.set_depletion_points(7)
+        self.assertEqual(client.trends.buckets[-1]["depletion"], 7)
+        # Closing flushes the current minute.
+        saved = []
+        client.state.player_name = "Sera"
+        client._memory_store = lambda: type("M", (), {
+            "save": lambda self, character, kind, value: saved.append((character, kind))})()
+        asyncio.run(client.close())
+        self.assertIn(("Sera", "trends"), saved)
+
+    def test_reconnect_reload_keeps_the_live_trend_minute(self):
+        client = AtrinikClient(ClientConfig())
+        start = client.trends.buckets[0]["t"] if client.trends.buckets else None
+        self.assertIsNone(start)
+
+        class Memory:
+            def __init__(self, trends):
+                self.trends = trends
+
+            def import_legacy(self, *args):
+                pass
+
+            def load(self, character, kind, default):
+                return self.trends if kind == "trends" else default
+
+            def save(self, *args):
+                pass
+
+        now = time.time()
+        minute = int(now // 60 * 60)
+        # Login: the saved snapshot has an older, partial copy of this minute.
+        client._memory_store = lambda: Memory([{"t": minute - 60, "deaths": 1, "heals": 0},
+                                               {"t": minute, "deaths": 0, "heals": 1}])
+        client.load_character_memory("Sera")
+        client.trends.count("heals", now)
+        client.trends.count("deaths", now)
+        # A reconnect reloads the same character: the live minute survives.
+        client.load_character_memory("Sera")
+        bucket = client.trends.buckets[-1]
+        self.assertEqual((bucket["t"], bucket["heals"], bucket["deaths"]), (minute, 2, 1))
+        self.assertEqual(client.trends.buckets[0]["deaths"], 1)
+        # Another character starts from its own saved snapshot.
+        client._memory_store = lambda: Memory([])
+        client.load_character_memory("Other")
+        self.assertEqual(client.trends.buckets, [])
+
     def test_alerts_flag_deaths_starvation_stuck_and_disconnects(self):
         from .alerts import (DISCONNECTED_SECONDS, STUCK_SECONDS, ProgressWatch, active)
 
@@ -12367,6 +12562,22 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
         client.state.farm_objective = "money"
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Gold")
+        # Depleted at the temple threshold: the safest ranking applies until
+        # the temple removes it, then the chosen objective again.
+        client.state.farm_objective = "xp"
+        client.farm_analyzer.rankings["safety"] = [pocket]
+        client.state.depletion_points_known = True
+        client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD
+        # A stale counter alone (cured elsewhere) is not depletion.
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
+        client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"), client.state.player_tag)
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
+        client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD - 1
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Trees")
+        client.state.depletion_points = 0
+        client.state.remove_item(501)
+        client.state.farm_objective = "money"
         client.state.farm_objective = "xp"
         client.state.farm_zone_quarantine = {self.TREES: time.time() + 60}
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
@@ -12647,6 +12858,42 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual(len(route), 1011)
         self.assertEqual([edge.destination for edge in graph.route_points(town, (1, 0), farm, [])],
                          [swamp, farm])
+
+    def test_depletion_prefers_safety_spots_then_falls_back_to_the_choice(self):
+        from .navigation import analyzer_farm_selection
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        client = self.client({"xp": [trees], "safety": [pocket]})
+        client.state.player_tag = 7
+        client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        client.state.depletion_points_known = True
+        client.state.depletion_points = 32
+        circuit = self.circuit(client, trees)
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.spot["name"], "Pocket")
+        selected = [entry["detail"] for entry in client.decision_history
+                    if entry["action"] == "farm-spot-selected"]
+        self.assertIn("(safety)", selected[-1])
+        # With no usable safety spot, the chosen objective's spot applies: the
+        # circuit keeps it, removing depletion before any farming, instead of
+        # ending and leaving autoplay to hold where nothing can cure her.
+        client.farm_analyzer.rankings["safety"] = []
+        circuit = self.circuit(client, trees)
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertNotEqual(circuit.status, TaskStatus.COMPLETE)
+        self.assertEqual(circuit.spot["name"], "Trees")
+        # Autoplay starting depleted still gets a circuit to cure her from.
+        self.assertEqual(analyzer_farm_selection(client, built_graph())[1]["name"],
+                         "Trees")
+        # A safety circuit whose spot became unusable returns to the choice.
+        circuit = self.circuit(client, pocket)
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.spot["name"], "Trees")
+        selected = [entry["detail"] for entry in client.decision_history
+                    if entry["action"] == "farm-spot-selected"]
+        self.assertIn("(xp)", selected[-1])
 
     def test_repeated_failures_at_maximum_adaptation_pause_the_spot_briefly(self):
         from . import self_improvement
@@ -13041,7 +13288,31 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(learning["goals"], {"area_spells": True, "protection": {"fire": 1},
                                              "offence": 1, "healing": 0})
         self.assertEqual(analysis["objective"], "xp")
+        self.assertEqual(analysis["selected_objective"], "xp")
+        self.assertIsNone(analysis["objective_override"])
         self.assertIn("money", analysis["objectives"])
+        # Depleted: she farms for safety, and the toggle keeps the choice.
+        self.client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
+            self.client.state.player_tag)
+        self.client.state.depletion_points_known = True
+        self.client.state.depletion_points = 32
+        status, payload = await self.request("GET", "/api/state?include=farming_analysis")
+        analysis = json.loads(payload)["farming_analysis"]
+        self.assertEqual((analysis["objective"], analysis["selected_objective"]),
+                         ("safety", "xp"))
+        self.assertEqual(analysis["objective_override"],
+                         {"reason": "depletion", "points": 32})
+        # No usable safety spot: she farms the choice, and the page says so.
+        self.client.farm_analyzer = StubAnalyzer({"xp": [analyzer_spot(
+            "Trees", ["/shattered_islands/world_14_79"], ["evil treant L13"])]})
+        self.server.dashboard.graph = built_graph()
+        status, payload = await self.request("GET", "/api/state?include=farming_analysis")
+        analysis = json.loads(payload)["farming_analysis"]
+        self.assertEqual(analysis["objective"], "xp")
+        self.assertIsNone(analysis["objective_override"])
+        self.client.farm_analyzer = None
+        self.client.state.depletion_points = 0
         status, payload = await self.request(
             "POST", "/api/action", {"type": "farm_objective", "objective": "money"})
         self.assertEqual(status, 200, payload)
@@ -13052,6 +13323,16 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.state.farm_objective, "money")
         status, page = await self.request("GET", "/")
         self.assertIn(b'id="tab-farming"', page)
+        self.assertIn(b'id="fa-trends"', page)
+        self.client.trends.count("deaths")
+        status, payload = await self.request("GET", "/api/state?include=trends")
+        self.assertEqual(json.loads(payload)["trends"]["points"][-1]["deaths_per_hour"], 1)
+        # Live polls that do not ask for trends never build them.
+        built = []
+        self.client.trends.summary = lambda: built.append(1) or {"points": []}
+        status, payload = await self.request("GET", "/api/state?include=phase")
+        self.assertNotIn("trends", json.loads(payload))
+        self.assertEqual(built, [])
         self.assertIn(b'id="alerts"', page)
         now = time.time()
         self.client.decision_history.extend([
