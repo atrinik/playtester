@@ -10382,6 +10382,42 @@ class NavigationTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(len(client.steps), 2)
 
+    def test_a_lesson_never_trades_one_learned_map_for_more_relaxed_hazards(self):
+        def lane(path):
+            node = MapNode(path, width=3, height=1)
+            node.terrain = {(x, 0): 1 for x in range(3)}
+            return node
+
+        graph = WorldGraph()
+        town, farm = "/shattered_islands/world_0_68", "/shattered_islands/world_1_50"
+        swamp, ogre = "/shattered_islands/world_1_51", "/shattered_islands/world_1_52"
+        detour = [f"/shattered_islands/world_3_{n}" for n in range(3)]
+        for path in (town, farm, swamp, ogre, *detour):
+            graph.nodes[path] = lane(path)
+            graph.named_spawns[path] = []
+        # Every way crosses over-levelled maps: the short one, the learned swamp
+        # and one ogre map; the detour, three ogre maps.
+        graph.nodes[town].edges = [MapEdge(town, swamp, 2, 0, 0, 0), MapEdge(town, detour[0], 0, 0, 2, 0)]
+        graph.nodes[swamp].edges = [MapEdge(swamp, ogre, 2, 0, 0, 0)]
+        graph.nodes[ogre].edges = [MapEdge(ogre, farm, 2, 0, 0, 0)]
+        graph.nodes[detour[0]].edges = [MapEdge(detour[0], detour[1], 2, 0, 0, 0)]
+        graph.nodes[detour[1]].edges = [MapEdge(detour[1], detour[2], 2, 0, 0, 0)]
+        graph.nodes[detour[2]].edges = [MapEdge(detour[2], farm, 2, 0, 0, 0)]
+        for path in (ogre, *detour):
+            graph.map_monster_levels[path] = {"ogre": 99}
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(path=town, width=17, height=17, world_x=1, world_y=0)
+                self.record_action = lambda action, detail="": None
+
+        client = FakeClient()
+        client.state.route_hazards = {swamp: time.time() + 3600}
+        route = [edge.destination for edge in NavigateTask(graph, farm)._plan(client)]
+        # Two known threats (the lesson and one ogre map) beat three ogre maps.
+        self.assertEqual(route, [swamp, ogre, farm])
+
     def test_learned_route_hazards_are_avoided_but_never_strand_her(self):
         def lane(path, width=3):
             node = MapNode(path, width=width, height=1)
@@ -12544,6 +12580,27 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         learned = [entry["detail"] for entry in client.decision_history
                    if entry["action"] == "route-hazard-learned"]
         self.assertEqual(learned, [f"{swamp} for 6 h: 40 damage from crocodile"])
+
+    def test_a_death_within_a_second_of_the_last_still_splits_lives(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        now = time.time()
+        # Out of heals in the previous life, which ended under a second ago.
+        client.decision_history.append({"time": now - 0.8, "action": "emergency-disengage",
+                                        "detail": "hp=20/134 sp=1 next-heal=4 target=0",
+                                        "task": "", "map": self.TREES})
+        client.decision_history.append({"time": now - 0.5, "action": "death", "detail": "",
+                                        "task": "", "map": self.TREES})
+        # This life: one treant out-damages her at the spot.
+        client.state.messages.append((now - 0.2, 2, "ff0000",
+                                      "evil treant hit you for 90 (-90) impact damage."))
+        client.decision_history.append({"time": now, "action": "death", "detail": "",
+                                        "task": "", "map": self.TREES})
+        circuit._observe_farm_death(client)
+        reviews = [entry["detail"] for entry in client.decision_history
+                   if entry["action"] == "farm-failure-review"]
+        self.assertNotIn("resources", reviews[-1])
 
     def test_the_previous_lifes_decisions_do_not_explain_this_death(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])

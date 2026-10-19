@@ -1749,6 +1749,15 @@ class NavigateTask(BotTask):
         }
         previous_fallback = self._threat_fallback
         self._threat_fallback = False
+
+        def relaxed(avoided: set[str]) -> dict:
+            # A hazard a fallback tier stops avoiding is still a known threat:
+            # it joins the penalized maps, so the route enters as few known
+            # threats as it can, learned or relaxed alike, never trading one
+            # learned map for several relaxed ones.
+            return {**kwargs, "avoided_maps": avoided,
+                    "penalized_maps": kwargs["penalized_maps"] | (kwargs["avoided_maps"] - avoided)}
+
         try:
             route = self.graph.route_points(*args, **kwargs)
         except ValueError:
@@ -1770,13 +1779,11 @@ class NavigateTask(BotTask):
                     # Only this retry lifts them; later tiers relax other
                     # hazards first and keep avoiding dense tunnels.
                     try:
-                        route = self.graph.route_points(*args, **{
-                            **kwargs, "avoided_maps": kwargs["avoided_maps"] - tiled})
+                        route = self.graph.route_points(*args, **relaxed(kwargs["avoided_maps"] - tiled))
                     except ValueError:
                         route = None
                 if route is None and overlevel_hazards:
-                    fallback_kwargs = dict(kwargs)
-                    fallback_kwargs["avoided_maps"] = protected_hazards
+                    fallback_kwargs = relaxed(protected_hazards)
                     try:
                         route = self.graph.route_points(
                             *args, **fallback_kwargs)
@@ -1786,8 +1793,7 @@ class NavigateTask(BotTask):
                             raise ValueError(
                                 f"{preferred_exc}; excluded edges: "
                                 f"{excluded}") from preferred_exc
-                        fallback_kwargs["avoided_maps"] = set(
-                            self.KNOWN_LETHAL_TRANSIT)
+                        fallback_kwargs = relaxed(set(self.KNOWN_LETHAL_TRANSIT))
                         route = self.graph.route_points(
                             *args, **fallback_kwargs)
                     self._threat_fallback = True
@@ -1799,9 +1805,7 @@ class NavigateTask(BotTask):
                                 f"no threat-free route to {self.destination}")
                 elif (route is None and self.allow_ranged_hazard_fallback and
                       (ranged_hazards or pack_hazards)):
-                    fallback_kwargs = dict(kwargs)
-                    fallback_kwargs["avoided_maps"] = set(
-                        self.KNOWN_LETHAL_TRANSIT)
+                    fallback_kwargs = relaxed(set(self.KNOWN_LETHAL_TRANSIT))
                     route = self.graph.route_points(
                         *args, **fallback_kwargs)
                     self._threat_fallback = True
@@ -4190,11 +4194,14 @@ class FarmCircuitTask(BotTask):
         decisions = list(getattr(client, "decision_history", ()))
         when = float(failure.get("time", 0.0) or 0.0)
         # Only this life counts: a starvation or fight before the previous
-        # death must not explain this one.
+        # death must not explain this one. Every earlier death record splits
+        # lives, however soon before this failure; only this failure's own
+        # record is left out.
         previous_death = max(
             (float(record.get("time", 0.0) or 0.0) for record in decisions
              if isinstance(record, dict) and record.get("action") == "death" and
-             float(record.get("time", 0.0) or 0.0) < when - 1.0), default=0.0)
+             record is not failure and record != failure and
+             float(record.get("time", 0.0) or 0.0) <= when), default=0.0)
         messages = [entry for entry in getattr(client.state, "messages", ())
                     if float(entry[0]) > previous_death]
         this_life = [record for record in decisions if isinstance(record, dict) and
