@@ -1314,6 +1314,31 @@ class ProtocolTests(unittest.TestCase):
             client._record_post_mortem()
         self.assertEqual(len(client.post_mortems), 1)
 
+    def test_a_reconnect_keeps_a_post_mortem_whose_save_failed(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            store = client._memory_store
+
+            class LockedDatabase:
+                def save(self, *args):
+                    raise sqlite3.OperationalError("database is locked")
+
+            client._memory_store = lambda: LockedDatabase()
+            with self.assertLogs("atrinik_bot.client", "WARNING"):
+                client._record_post_mortem()
+            client._memory_store = store
+            # The same character reconnects: the unsaved report survives.
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.post_mortems), 1)
+            # Another character starts with none of hers.
+            client.load_character_memory("Mallory")
+            self.assertEqual(client.post_mortems, [])
+
     def test_switching_characters_drops_the_previous_ones_transient_history(self):
         with tempfile.TemporaryDirectory() as directory:
             client = AtrinikClient(ClientConfig(

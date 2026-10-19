@@ -210,10 +210,12 @@ class AtrinikClient:
     def load_character_memory(self, character: str) -> None:
         # Switching characters on a long-lived client: the previous one's
         # vitals, messages and actions must not explain this one's death.
-        if self._memory_character and self._memory_character != character:
+        same_character = self._memory_character == character
+        if self._memory_character and not same_character:
             self.vitals.clear()
             self.review_messages.clear()
             self.action_history.clear()
+            self.post_mortems = []
         self._memory_character = character
         memory = self._memory_store()
         memory.import_legacy(
@@ -236,7 +238,13 @@ class AtrinikClient:
                 break
             if (restored := post_mortem.restore(value)) is not None:
                 kept.append(restored)
-        self.post_mortems = kept[::-1]
+        # A reconnect reloads the same character: its live reports may be
+        # newer than the store (a save can fail), so they win for the same
+        # death and are never dropped for the older saved list.
+        live = self.post_mortems if same_character else []
+        merged = {death["time"]: death for death in kept}
+        merged.update((death["time"], death) for death in live)
+        self.post_mortems = sorted(merged.values(), key=lambda death: death["time"])[-post_mortem.KEEP:]
         buckets = memory.load(character, "trends", [])
         saved = Trends(buckets if isinstance(buckets, list) else ()).buckets
         # A reconnect reloads the same character: its live buckets are newer
