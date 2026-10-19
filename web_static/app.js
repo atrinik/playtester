@@ -175,15 +175,16 @@ function renderFarming() {
 let lastDeathsSig = "";
 function vitalsChart(pm) {
   const v = pm.vitals || [];
-  if (v.length < 2) return "";
+  if (!v.length) return "";
   const t0 = pm.time - 60, w = 240, h = 48;
   // The window is the 60 seconds ending at the death.
   const x = t => Math.max(0, Math.min(w, ((t - t0) / 60) * w)).toFixed(1);
   // Samples are taken only when a vital changes: it holds its value until
-  // the next one, so each trace is drawn as steps, not interpolated.
+  // the next one, and the last until the death, so each trace is drawn as
+  // steps (not interpolated) through the death time; one sample is flat.
   const y = (pick, s) => (h - Math.max(0, Math.min(1, pick(s))) * h).toFixed(1);
   const line = (pick, cls) => `<polyline class="${cls}" points="${v.map((s, i) =>
-    (i ? `${x(s[0])},${y(pick, v[i - 1])} ` : "") + `${x(s[0])},${y(pick, s)}`).join(" ")}"/>`;
+    (i ? `${x(s[0])},${y(pick, v[i - 1])} ` : "") + `${x(s[0])},${y(pick, s)}`).join(" ")} ${x(pm.time)},${y(pick, v[v.length - 1])}"/>`;
   return `<svg class="vitals-chart" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Health, spell points and food over the last minute">`
     + line(s => s[1] / Math.max(1, s[2]), "hp") + line(s => s[3] / Math.max(1, s[4]), "sp")
     + line(s => s[5] / 1000, "food") + "</svg>";

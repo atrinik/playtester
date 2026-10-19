@@ -13879,10 +13879,14 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=18", page)
+        self.assertIn(b"/app.js?v=19", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
+        # Post-mortem traces hold the last sample through the death, and one
+        # sample draws a flat trace.
+        self.assertIn(b"${x(pm.time)},${y(pick, v[v.length - 1])}", script)
+        self.assertIn(b'if (!v.length) return "";', script)
         self.assertIn(b"Raw orders", page)
         self.assertNotIn(b'||"<p class="', script)
         status, payload = await self.request("GET", "/api/state")
