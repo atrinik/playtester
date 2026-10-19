@@ -1554,6 +1554,15 @@ class ProtocolTests(unittest.TestCase):
             client.load_character_memory("empty")
             self.assertNotIn("name-49", client._live_post_mortems)
 
+    def test_review_messages_are_bounded_in_size(self):
+        from . import post_mortem
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase = "playing"
+        data = bytes((2,)) + b"ffffff\0" + b"x" * 100000 + b"\0"
+        asyncio.run(client._dispatch(c.C_DRAWINFO, data))
+        self.assertEqual(len(client.review_messages[-1][-1]), post_mortem.MAX_TEXT)
+        self.assertEqual(client.review_messages[-1][:-1], tuple(client.state.messages[-1][:-1]))
+
     def test_restored_counts_are_never_negative(self):
         from . import post_mortem
         long = "a" * 80

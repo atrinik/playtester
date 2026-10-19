@@ -1299,7 +1299,10 @@ class AtrinikClient:
         msg_type, color = cur.u8(), cur.cstring()
         text = cur.cstring() if cur.remaining else ""
         self.state.add_message(msg_type, color, text)
-        self.review_messages.append(self.state.messages[-1])
+        # Bounded in size as well as count: only a report's own text length
+        # of each line is kept (a frame can be megabytes).
+        *head, line = self.state.messages[-1]
+        self.review_messages.append((*head, str(line)[:post_mortem.MAX_TEXT]))
         arrived = time.time()
         cutoff = self.state.messages[-1][0] - post_mortem.REVIEW_HISTORY_SECONDS
         while self.review_messages and self.review_messages[0][0] < cutoff:
