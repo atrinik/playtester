@@ -21,6 +21,7 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameSta
                     InterfaceState, Item, MapObject, MapState)
 from .alerts import ProgressWatch
 from .memory import BotMemory
+from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
 
@@ -170,6 +171,9 @@ class AtrinikClient:
         self._runtime_memory: dict[str, dict[str, int]] = {}
         self.action_history: list[dict] = []
         self.decision_history: list[dict] = []
+        # Per-minute XP, deaths, heals, depletion and food for the dashboard.
+        self.trends = Trends()
+        self._trends_character = ""
         # When XP, position and the connection last changed, for alerts.
         self.progress_watch = ProgressWatch()
         self.action_context = ""
@@ -196,6 +200,16 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        buckets = memory.load(character, "trends", [])
+        saved = Trends(buckets if isinstance(buckets, list) else ()).buckets
+        # A reconnect reloads the same character: its live buckets are newer
+        # than the saved snapshot (the open minute is saved only when the
+        # next starts), so they win for the same minute.
+        live = self.trends.buckets if self._trends_character == character else []
+        merged = {bucket["t"]: bucket for bucket in saved}
+        merged.update((bucket["t"], bucket) for bucket in live)
+        self.trends = Trends(sorted(merged.values(), key=lambda bucket: bucket["t"]))
+        self._trends_character = character
         if isinstance(record, dict) and "depletion_points" in record:
             self.state.depletion_points = max(
                 0, int(record.get("depletion_points", 0)))
@@ -378,6 +392,9 @@ class AtrinikClient:
     def set_depletion_points(self, points: int) -> None:
         self.state.depletion_points = max(0, int(points))
         self.state.depletion_points_known = True
+        # Death stat losses change depletion between stats packets.
+        if self.trends.observe(self.state):
+            self._persist_trends()
         character = self.state.player_name or self.config.character
         if not character:
             return
@@ -713,6 +730,24 @@ class AtrinikClient:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
+    def _trend_count(self, key: str) -> None:
+        if self.trends.count(key):
+            self._persist_trends()
+
+    def _persist_trends(self) -> None:
+        """Save the trend buckets once a minute, when a new one starts.
+
+        Best effort: a full or read-only disk, or a locked database, must
+        never stop play or abort a clean shutdown for dashboard telemetry.
+        """
+        character = self.state.player_name
+        if not character:
+            return
+        try:
+            self._memory_store().save(character, "trends", self.trends.buckets)
+        except Exception as error:
+            log.warning("could not save trends for %s: %s", character, error)
+
     def _load_faces(self) -> dict[int, str]:
         faces: dict[int, str] = {}
         paths = (
@@ -816,6 +851,8 @@ class AtrinikClient:
             await writer.wait_closed()
 
     async def close(self) -> None:
+        # The current minute is otherwise saved only when the next one starts.
+        self._persist_trends()
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"
@@ -1169,8 +1206,11 @@ class AtrinikClient:
         # quotes one from passing for a death.
         died = normalized in ("you have been defeated in combat!",
                               "you have died.")
+        if lowered.startswith("the spell heals you for"):
+            self._trend_count("heals")
         if died:
             self.record_action("death", text)
+            self._trend_count("deaths")
             # The server emits death stat-loss lines before its final death
             # announcement. Commit the short buffered group now, then retain a
             # post-death window for protocol/order variants that arrive later.
@@ -1534,6 +1574,8 @@ class AtrinikClient:
             self.state.stats[name] = value
             self.state.stat_observed_at[name] = time.monotonic()
             changed[name] = value
+        if self.trends.observe(self.state):
+            self._persist_trends()
         self.progress_watch.observe(self.state)
         await self.emit("stats", changed)
 
