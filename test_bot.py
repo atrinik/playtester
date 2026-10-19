@@ -1425,6 +1425,48 @@ class ProtocolTests(unittest.TestCase):
             client.load_character_memory("Mallory")
             self.assertEqual(client.post_mortems, [])
 
+    def test_an_unsaved_report_survives_a_switch_to_another_character_and_back(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            client.state.phase = "playing"
+            store = client._memory_store
+
+            class LockedDatabase:
+                def save(self, *args, **kwargs):
+                    raise sqlite3.OperationalError("database is locked")
+
+            client._memory_store = lambda: LockedDatabase()
+            with self.assertLogs("atrinik_bot.client", "WARNING"):
+                client._record_post_mortem()
+            client._memory_store = store
+            client.load_character_memory("Mallory")
+            self.assertEqual(client.post_mortems, [])
+            client.load_character_memory("Sera")
+            self.assertEqual(len(client.post_mortems), 1)
+
+    def test_colliding_attacker_labels_add_their_counts(self):
+        from . import post_mortem
+        long = "a" * 80
+        restored = post_mortem.restore({
+            "time": 1000.0, "attackers": {long + "x": 9, long + "y": 2, "\ud800": 3, "\udfff": 4}})
+        self.assertEqual(restored["attackers"][long], 11)
+        self.assertEqual(sum(restored["attackers"].values()), 18)
+
+    def test_downsampling_keeps_the_window_baseline(self):
+        from . import post_mortem
+        samples = [[float(index), 100, 100, 50, 50, 900] for index in range(300)]
+        # Every minimum sits right after the baseline.
+        samples[1] = [1.0, 1, 100, 1, 50, 1]
+        kept = post_mortem.spread(samples, keep=[1, 1, 1, 299])
+        self.assertEqual(kept[0], samples[0])
+        self.assertIn(samples[1], kept)
+        self.assertEqual(kept[-1], samples[-1])
+        self.assertLessEqual(len(kept), post_mortem.MAX_VITALS)
+
     def test_switching_characters_drops_the_previous_ones_transient_history(self):
         with tempfile.TemporaryDirectory() as directory:
             client = AtrinikClient(ClientConfig(

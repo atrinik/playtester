@@ -38,7 +38,8 @@ MAX_TEXT = 500
 
 
 def spread(samples: list, limit: int = MAX_VITALS, keep: Iterable[int] = ()) -> list:
-    """At most ``limit`` samples spread evenly over all of them, the last kept.
+    """At most ``limit`` samples spread evenly over all of them, the first
+    (the window's baseline) and the last kept.
 
     The ``keep`` indices (the fatal low, the sample at the death) are always
     in it, in time order, in place of the nearest evenly spread ones.
@@ -50,9 +51,9 @@ def spread(samples: list, limit: int = MAX_VITALS, keep: Iterable[int] = ()) -> 
     chosen = {round(index * step) for index in range(limit)}
     for index in keep:
         if index not in chosen:
-            # Drop the nearest even point that is neither kept nor the last.
+            # Drop the nearest even point that is neither kept nor an end.
             spare = min((point for point in chosen
-                         if point not in keep and point != len(samples) - 1),
+                         if point not in keep and point not in (0, len(samples) - 1)),
                         key=lambda point: abs(point - index), default=None)
             if spare is not None:
                 chosen.discard(spare)
@@ -134,9 +135,14 @@ def restore(entry: Any) -> dict[str, Any] | None:
         value = entry.get(key)
         if not isinstance(value, dict):
             return {}
-        scanned = itertools.islice(value.items(), MAX_COUNT_SCAN)
-        return dict(heapq.nlargest(MAX_COUNTS, ((text(name, 80), count) for name, count in scanned
-                                                if finite(count)), key=lambda item: item[1]))
+        # Names that become equal once shortened or made encodable are one
+        # label: their counts add up, never overwrite each other.
+        totals: dict[str, int | float] = {}
+        for name, count in itertools.islice(value.items(), MAX_COUNT_SCAN):
+            if finite(count):
+                label = text(name, 80)
+                totals[label] = totals.get(label, 0) + count
+        return dict(heapq.nlargest(MAX_COUNTS, totals.items(), key=lambda item: item[1]))
 
     def number(key: str) -> int:
         value = entry.get(key)

@@ -189,6 +189,8 @@ class AtrinikClient:
         self.decision_history: list[dict] = []
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: deque[list[float]] = deque()
+        # Each other character's live reports, while this client plays another.
+        self._live_post_mortems: dict[str, list[dict]] = {}
         # When the last death's bookkeeping ended (its records are its own).
         self._post_mortem_booked = 0.0
         self.post_mortems: list[dict] = []
@@ -219,6 +221,9 @@ class AtrinikClient:
             self.vitals.clear()
             self.review_messages.clear()
             self.action_history.clear()
+            # Kept for that character, not dropped: a report whose save failed
+            # is still merged when she comes back.
+            self._live_post_mortems[self._memory_character] = self.post_mortems
             self.post_mortems = []
         self._memory_character = character
         memory = self._memory_store()
@@ -245,7 +250,7 @@ class AtrinikClient:
         # A reconnect reloads the same character: its live reports may be
         # newer than the store (a save can fail), so they win for the same
         # death and are never dropped for the older saved list.
-        live = self.post_mortems if same_character else []
+        live = self.post_mortems if same_character else self._live_post_mortems.pop(character, [])
         merged = {death["time"]: death for death in kept}
         merged.update((death["time"], death) for death in live)
         self.post_mortems = sorted(merged.values(), key=lambda death: death["time"])[-post_mortem.KEEP:]
