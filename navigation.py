@@ -3191,7 +3191,12 @@ class NavigateThenTask(BotTask):
         if self._defending:
             maxsp = int(client.state.stats.get("maxsp", 0) or 0)
             sp = int(client.state.stats.get("sp", 0) or 0)
-            recovered = (
+            # Starving, resting is futile: hunger drains health faster than
+            # she recovers it, so she must keep walking, to food above all.
+            # Live: Sera held four squares from Saruthar with food 0 until
+            # starvation killed her.
+            starving = int(client.state.stats.get("food", 1) or 0) <= 0
+            recovered = starving or (
                 ratio > self.safety.heal_below and
                 (maxsp <= 0 or sp / maxsp >= 0.80))
             if not recovered:

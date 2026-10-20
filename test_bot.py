@@ -8083,6 +8083,25 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(task._recovering_after_combat)
         self.assertEqual(client.direct_moves[-1], (0, False))
 
+    def test_navigation_never_rests_while_starving(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        # Low mana would hold her (live: 83/102 HP, 18/26 SP), but she is
+        # starving: health only drains from here.
+        client.state.stats.update(hp=80, maxhp=100, sp=5, maxsp=47, food=0)
+        client.state.combat = False
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node}
+        farm = FarmTask(zone="/farm", target="ice golem")
+        task = NavigateThenTask(graph, "/farm", farm, combat_approach=True, safety=farm.safety)
+        task._defending = True
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertFalse(task._defending)
+        self.assertFalse(task._recovering_after_combat)
+        self.assertEqual(client.direct_moves[-1], (0, False))
+
     def test_combat_approach_retreats_from_pack(self):
         client = self._combat_client()
         client.state.map.world_x = 12
