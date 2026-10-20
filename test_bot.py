@@ -8101,6 +8101,26 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(task._defending)
         self.assertFalse(task._recovering_after_combat)
         self.assertEqual(client.direct_moves[-1], (0, False))
+        # With safe food on her, the hold stands: safety eats it, and no
+        # cleanup cancels the meal.
+        client.state.inventory.append(Item(980, item_type=c.TYPE_FOOD, quality=100,
+                                           name="wholemeal bread"))
+        task._defending = True
+        moves = len(client.direct_moves)
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertTrue(task._defending)
+        self.assertEqual(len(client.direct_moves), moves)
+
+    def test_starving_without_food_skips_the_safety_hold(self):
+        from .navigation import starving_without_food
+        client = self._combat_client()
+        client.state.stats.update(hp=20, maxhp=100, sp=0, maxsp=47, food=0)
+        self.assertTrue(starving_without_food(client))
+        bread = Item(981, item_type=c.TYPE_FOOD, quality=100, name="wholemeal bread")
+        client.state.inventory.append(bread)
+        self.assertFalse(starving_without_food(client))
+        bread.flags = c.ITEM_CURSED
+        self.assertTrue(starving_without_food(client))
 
     def test_combat_approach_retreats_from_pack(self):
         client = self._combat_client()

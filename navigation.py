@@ -3113,7 +3113,10 @@ class NavigateThenTask(BotTask):
         if (overwhelmed and pack_offensive is None and
                 await self._bypass_pack_blocked_exit(client)):
             return False
-        if not safe or (overwhelmed and not hold_fire):
+        # Safety's own hold (low health, a heal she cannot cast) is futile
+        # too when she is starving with nothing to eat: only food helps.
+        if ((not safe and not starving_without_food(client)) or
+                (overwhelmed and not hold_fire)):
             if safety_action_issued:
                 # FIRE/APPLY was just sent by SafetyPolicy. Clearing in this
                 # same tick cancels it and creates an endless heal/food retry
@@ -3191,12 +3194,12 @@ class NavigateThenTask(BotTask):
         if self._defending:
             maxsp = int(client.state.stats.get("maxsp", 0) or 0)
             sp = int(client.state.stats.get("sp", 0) or 0)
-            # Starving, resting is futile: hunger drains health faster than
-            # she recovers it, so she must keep walking, to food above all.
-            # Live: Sera held four squares from Saruthar with food 0 until
-            # starvation killed her.
-            starving = int(client.state.stats.get("food", 1) or 0) <= 0
-            recovered = starving or (
+            # Starving with nothing to eat, resting is futile: hunger drains
+            # health faster than she recovers it, so she keeps walking, to
+            # food above all. Live: Sera held four squares from Saruthar with
+            # food 0 until starvation killed her. With food on her, safety
+            # eats it and the hold stands.
+            recovered = starving_without_food(client) or (
                 ratio > self.safety.heal_below and
                 (maxsp <= 0 or sp / maxsp >= 0.80))
             if not recovered:
@@ -3703,6 +3706,12 @@ def unidentified_food(client: AtrinikClient) -> list:
     return [item for item in client.state.inventory
             if item.item_type == c.TYPE_FOOD and not policy.identified(item) and
             not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID)]
+
+
+def starving_without_food(client: AtrinikClient) -> bool:
+    """Food 0 and nothing safe to eat: no rest can help, only food."""
+    return (int(client.state.stats.get("food", 1) or 0) <= 0 and
+            not any(safe_food(item) for item in client.state.inventory))
 
 
 def hungry(client: AtrinikClient) -> bool:
