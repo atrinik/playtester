@@ -37,7 +37,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
                     BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
-                    InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy,
+                    InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
                     SellJunkTask, TaskStatus,
                     TempleFoodTask, TempleServiceTask,
                     corpse_tile_standable, movement_ack_timeout,
@@ -3648,13 +3648,22 @@ def analyzer_farm_selection(
 
 
 def food_reserve(client: AtrinikClient) -> int:
-    """Edible items she carries and has paid for."""
+    """Edible items she carries and may eat (safe_food: identified, paid,
+    not cursed or damned)."""
     patterns = SafetyPolicy().food_patterns
     return sum(item.quantity for item in client.state.inventory
-               if not item.flags & c.ITEM_UNPAID and (
+               if safe_food(item) and (
                    item.item_type == c.TYPE_FOOD or
                    any(pattern in item.name.casefold()
                        for pattern in patterns)))
+
+
+def unidentified_food(client: AtrinikClient) -> list:
+    """Carried food that may be cursed until it is identified."""
+    policy = InventoryPolicy()
+    return [item for item in client.state.inventory
+            if item.item_type in (c.TYPE_FOOD, c.TYPE_DRINK, c.TYPE_FLESH) and
+            not policy.identified(item) and not item.flags & c.ITEM_APPLIED]
 
 
 def hungry(client: AtrinikClient) -> bool:
@@ -3993,6 +4002,9 @@ class FarmCircuitTask(BotTask):
     # After a failed temple food request, wait this long before another.
     TEMPLE_FOOD_RETRY_SECONDS = 600.0
     FOOD_RESUPPLY_QUANTITY = 25
+    # Fewer safe food items than this and she restocks from the nearest
+    # merchant, before she is hungry, so she always carries food.
+    FOOD_RESERVE_LOW = 3
     FOOD_RESUPPLY_NUTRITION = 10_000
     FOOD_RESUPPLY_MAX_QUANTITY = 50
     DEPLETION_SERVICE_THRESHOLD = 3
@@ -4710,8 +4722,12 @@ class FarmCircuitTask(BotTask):
         return hungry(client)
 
     def _needs_food_resupply(self, client: AtrinikClient) -> bool:
-        # While shop resupply backs off, a temple can still feed her.
+        # While shop resupply backs off, a temple can still feed her; a low
+        # reserve alone waits for the shop, she is not hungry yet.
         now = self.clock()
+        if (now >= self._resupply_retry_at and
+                self._food_reserve(client) < self.FOOD_RESERVE_LOW):
+            return True
         return self._hungry(client) and (
             now >= self._resupply_retry_at or
             bool(self.graph.temple_priests) and now >= self._temple_food_retry_at)
@@ -4732,10 +4748,11 @@ class FarmCircuitTask(BotTask):
                 self._resupply_retry_at = self.clock() + 1800.0
             self._resupply = None
         elif self._resupply.status == TaskStatus.COMPLETE:
-            if not temple and self._hungry(client):
+            if not temple and (self._hungry(client) or
+                               self._food_reserve(client) < self.FOOD_RESERVE_LOW):
                 # A merchant that offered no matching stock completes without
-                # selling anything; back off so a temple feeds her instead.
-                log.warning("food resupply bought no food; trying a temple")
+                # selling anything; back off (a temple feeds her if hungry).
+                log.warning("food resupply bought no food; backing off")
                 self._resupply_retry_at = self.clock() + 1800.0
             else:
                 log.info("%s complete; returning to farm circuit",
@@ -4871,7 +4888,8 @@ class FarmCircuitTask(BotTask):
         if self.clock() < self._capability_retry_at.get(purpose, 0.0):
             return False
         if purpose == InventoryCapabilityTask.PURPOSE_IDENTIFY:
-            needed = bool(self._unidentified_items(client))
+            # Found food too: identified, it shows whether it is safe to eat.
+            needed = bool(self._unidentified_items(client) or unidentified_food(client))
         elif purpose == InventoryCapabilityTask.PURPOSE_DISEASE:
             needed = self._disease_suspected
         elif purpose == InventoryCapabilityTask.PURPOSE_DEPLETION:

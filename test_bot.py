@@ -3487,6 +3487,8 @@ class QuestTests(unittest.TestCase):
             def __init__(self):
                 self.state = GameState(phase="playing")
                 self.state.map.path = "/a"
+                self.state.place_item(
+                    Item(990, name="staple food", quantity=10), self.state.player_tag)
                 self.clears = 0
                 self.combat = []
 
@@ -3762,7 +3764,7 @@ class QuestTests(unittest.TestCase):
                 self.state.bank_balance = 5_000
                 self.state.bank_balance_known = True
                 self.food = Item(
-                    30, item_type=c.TYPE_FOOD,
+                    30, item_type=c.TYPE_FOOD, quality=100,
                     name="free-range chicken leg", quantity=2)
                 self.state.place_item(self.food, 7)
                 self.talks = []
@@ -4181,6 +4183,8 @@ class QuestTests(unittest.TestCase):
             def __init__(self):
                 self.state = GameState(phase="playing")
                 self.state.map.path = "/a"
+                self.state.place_item(
+                    Item(990, name="staple food", quantity=10), self.state.player_tag)
                 self.clears = 0
                 self.combat = []
 
@@ -4239,6 +4243,8 @@ class QuestTests(unittest.TestCase):
             def __init__(self):
                 self.state = GameState(phase="playing")
                 self.state.map.path = "/a"
+                self.state.place_item(
+                    Item(990, name="staple food", quantity=10), self.state.player_tag)
                 self.clears = 0
                 self.combat = []
 
@@ -4293,12 +4299,17 @@ class QuestTests(unittest.TestCase):
         client.state.inventory_replay_complete = False
         self.assertFalse(task._inventory_ready(client))
         client.state.inventory_replay_complete = True
+        # Not hungry, but one item is below the reserve she carries.
         client.state.stats["food"] = 300
-        self.assertFalse(task._needs_food_resupply(client))
+        self.assertTrue(task._needs_food_resupply(client))
         client.state.stats["food"] = 150
+        # Unidentified found food is no reserve: it may be cursed.
         for tag in range(93, 96):
             client.state.place_item(Item(
                 tag, item_type=c.TYPE_FOOD, name=f"fruit {tag}"), 7)
+        self.assertTrue(task._needs_food_resupply(client))
+        for tag in range(93, 96):
+            client.state.items[tag].quality = 100
         self.assertFalse(task._needs_food_resupply(client))
         detour = task._new_food_resupply(client)
         self.assertEqual(detour.navigation.destination,
@@ -4739,7 +4750,7 @@ class QuestTests(unittest.TestCase):
                 self.state = type("State", (), {
                     "stats": {"hp": 32, "maxhp": 32, "food": 50},
                     "inventory": [Item(
-                        43, item_type=c.TYPE_FOOD,
+                        43, item_type=c.TYPE_FOOD, quality=100,
                         name="peeled rambutan")],
                 })()
                 self.applied = []
@@ -4751,6 +4762,36 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(asyncio.run(SafetyPolicy().enforce(client)))
         self.assertEqual(client.applied, [43])
 
+    def test_safety_never_eats_unidentified_food(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = type("State", (), {
+                    "stats": {"hp": 32, "maxhp": 32, "food": 50},
+                    "inventory": [Item(45, item_type=c.TYPE_FOOD, name="mystery stew")],
+                })()
+                self.applied = []
+
+            async def apply(self, tag):
+                self.applied.append(tag)
+
+        client = FakeClient()
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertEqual(client.applied, [])
+
+    def test_farm_circuit_identifies_found_food_with_a_device(self):
+        from .navigation import unidentified_food
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.place_item(Item(46, item_type=c.TYPE_FOOD, name="mystery stew"), 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        self.assertEqual([item.tag for item in unidentified_food(client)], [46])
+        with patch.object(InventoryCapabilityTask, "candidates", return_value=[object()]):
+            self.assertTrue(circuit._needs_inventory_capability(
+                client, InventoryCapabilityTask.PURPOSE_IDENTIFY))
+        with patch.object(InventoryCapabilityTask, "candidates", return_value=[]):
+            self.assertFalse(circuit._needs_inventory_capability(
+                client, InventoryCapabilityTask.PURPOSE_IDENTIFY))
+
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:
             def __init__(self):
@@ -4758,9 +4799,9 @@ class QuestTests(unittest.TestCase):
                     "stats": {"hp": 32, "maxhp": 32, "food": 50},
                     "inventory": [
                         Item(43, flags=c.ITEM_CURSED,
-                             item_type=c.TYPE_FOOD,
+                             item_type=c.TYPE_FOOD, quality=100,
                              name="staple food of poison"),
-                        Item(44, item_type=c.TYPE_FOOD,
+                        Item(44, item_type=c.TYPE_FOOD, quality=100,
                              name="peeled rambutan"),
                     ],
                 })()
@@ -9841,8 +9882,9 @@ class QuestTests(unittest.TestCase):
         circuit._settle_resupply(client)
         self.assertIsNone(circuit._resupply)
         self.assertEqual(circuit._resupply_retry_at, now[0] + 1800.0)
-        # A shop run that did feed her sets no backoff.
+        # A shop run that did feed her (and filled her reserve) sets no backoff.
         client.state.stats["food"] = 900
+        client.state.place_item(Item(970, name="staple food", quantity=10), 7)
         circuit._resupply_retry_at = 0.0
         circuit._resupply, circuit._resupply_kind = done, "shop"
         circuit._settle_resupply(client)
