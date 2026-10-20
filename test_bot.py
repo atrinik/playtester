@@ -8121,6 +8121,11 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(starving_without_food(client))
         bread.flags = c.ITEM_CURSED
         self.assertTrue(starving_without_food(client))
+        # Only food counts: coins or a key are nothing to eat.
+        client.state.inventory = [
+            Item(982, item_type=c.TYPE_MONEY, quality=100, name="gold coin", quantity=5),
+            Item(983, quality=100, name="Incuna Tavern Barn Key")]
+        self.assertTrue(starving_without_food(client))
 
     def test_combat_approach_retreats_from_pack(self):
         client = self._combat_client()

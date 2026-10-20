@@ -3113,6 +3113,10 @@ class NavigateThenTask(BotTask):
         if (overwhelmed and pack_offensive is None and
                 await self._bypass_pack_blocked_exit(client)):
             return False
+        if not safe and safety_action_issued:
+            # FIRE/APPLY was just sent by SafetyPolicy. Clearing in this
+            # same tick cancels it, starving or not.
+            return True
         # Safety's own hold (low health, a heal she cannot cast) is futile
         # too when she is starving with nothing to eat: only food helps.
         if ((not safe and not starving_without_food(client)) or
@@ -3709,9 +3713,10 @@ def unidentified_food(client: AtrinikClient) -> list:
 
 
 def starving_without_food(client: AtrinikClient) -> bool:
-    """Food 0 and nothing safe to eat: no rest can help, only food."""
+    """Food 0 and no safe food carried (food_reserve: edible items only):
+    no rest can help, only food."""
     return (int(client.state.stats.get("food", 1) or 0) <= 0 and
-            not any(safe_food(item) for item in client.state.inventory))
+            food_reserve(client) == 0)
 
 
 def hungry(client: AtrinikClient) -> bool:
