@@ -9057,15 +9057,17 @@ class QuestTests(unittest.TestCase):
         client.state.target_code = c.TARGET_ENEMY
         asyncio.run(autoplay.tick(client))
         client.state.target_code = c.TARGET_SELF
-        client.state.stats["hp"] = 40
+        # At the safety policy's heal trigger it heals instead.
+        client.state.stats["hp"] = 70
         asyncio.run(autoplay.tick(client))
         self.assertEqual(moved, [])
         client.state.stats["hp"] = 100
         for _ in range(8):
             autoplay._shed_at = 0.0
             asyncio.run(autoplay.tick(client))
-        # Heaviest first, only positively classified junk.
-        self.assertEqual(moved, [8, 3, 4, 13])
+        # Heaviest first, only read library books and spare ammunition; the
+        # torch and throwing hammers are equipment and stay.
+        self.assertEqual(moved, [3, 4])
         self.assertIn("overload-shed", [record["action"] for record in client.decision_history])
         # Attempts are kept only for items still carried.
         self.assertEqual(set(autoplay._shed_attempts), set())

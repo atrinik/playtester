@@ -52,8 +52,8 @@ class AutoplayTask(BotTask):
 
     # Seconds between drops: the server must take one before the next.
     SHED_INTERVAL = 2.0
-    # Shedding never preempts survival: only at this health or above, and
-    # never with an enemy targeted.
+    # Shedding never preempts survival: only above this health (and above
+    # the safety policy's own heal trigger), never with an enemy targeted.
     SHED_MIN_HEALTH = 0.70
     # Generated library books carry a material prefix; letters and other
     # quest documents do not.
@@ -61,8 +61,9 @@ class AutoplayTask(BotTask):
 
     def _sheddable(self, client: AtrinikClient) -> list:
         """Positively classified junk she may drop when overloaded, heaviest
-        first: generated library books, spare ammunition (none while she
-        wields a missile weapon), throwing weapons and light sources. Only
+        first: generated library books and spare ammunition (none while she
+        wields a missile weapon). Equipment (throwing weapons, lights) is
+        never shed here: it may be an upgrade or her only one. Only
         identified, unlocked, unworn, paid items the inventory policy does not
         preserve (magical, high quality), and books only once read (reading
         one grants its literacy XP); anything else, quest objectives
@@ -83,9 +84,7 @@ class AutoplayTask(BotTask):
             junk = (
                 item.item_type == c.TYPE_BOOK and bool(self.LIBRARY_BOOK.match(name)) and
                 attempted is not None and attempted(item) or
-                item.item_type == c.TYPE_ARROW and not shooting or
-                item.item_type == c.TYPE_WEAPON and "throwing" in name or
-                item.item_type == c.TYPE_LIGHT_APPLY)
+                item.item_type == c.TYPE_ARROW and not shooting)
             if junk:
                 candidates.append(item)
         return sorted(candidates, key=lambda item: -item.weight * item.quantity)
@@ -110,7 +109,7 @@ class AutoplayTask(BotTask):
         stats = client.state.stats
         health = (float(stats.get("hp", 0) or 0) /
                   max(1.0, float(stats.get("maxhp", 0) or 0)))
-        if (health < self.SHED_MIN_HEALTH or
+        if (health <= max(self.SHED_MIN_HEALTH, self.safety.heal_below) or
                 getattr(client.state, "target_code", c.TARGET_SELF) == c.TARGET_ENEMY):
             return False
         now = time.monotonic()
