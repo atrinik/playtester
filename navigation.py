@@ -10,8 +10,9 @@ import multiprocessing
 import os
 import posixpath
 import re
+import statistics
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
@@ -1562,6 +1563,14 @@ class NavigateTask(BotTask):
     """Follow the authored path one verified protocol move at a time."""
 
     STALL_RETRY_SECONDS = 0.65
+    # A stall is measured against her own pace: twice her recent median
+    # step time, from STALL_RETRY_SECONDS up to this. Live: heavy depletion
+    # left Sera about a second per step, so every 0.65 s wait read as a
+    # stall; she learned the square she was stepping onto as blocked,
+    # cancelled the step for another and zigzagged in place until she
+    # starved, map after map.
+    STALL_RETRY_MAX_SECONDS = 6.0
+    STEP_SAMPLES = 8
     # Learned stall blockers are guesses. Once they leave no route at all and
     # the character has not moved for this long, they are the trap.
     LEARNED_BLOCK_RESET_SECONDS = 5.0
@@ -1589,6 +1598,7 @@ class NavigateTask(BotTask):
         self._approach_index = 0
         self._last_position: tuple[str, int, int] | None = None
         self._last_progress = 0.0
+        self._step_times: deque[float] = deque(maxlen=self.STEP_SAMPLES)
         self._issued_goal: tuple[str, int, int] | None = None
         self._issued_click: tuple[str, int, int] | None = None
         self._excluded_edges: set[tuple[str, str]] = set()
@@ -1917,12 +1927,23 @@ class NavigateTask(BotTask):
         position = (client.state.map.path, client.state.map.world_x,
                     client.state.map.world_y)
         if position != self._last_position:
+            now = time.monotonic()
             if (self._last_position is not None and
                 position[0] != self._last_position[0]):
                 self._runtime_blocked.clear()
                 self._threat_blocked.clear()
+            elif self._last_position is not None and self._last_progress:
+                # One step on the same map: how long her steps take.
+                self._step_times.append(now - self._last_progress)
             self._last_position = position
-            self._last_progress = time.monotonic()
+            self._last_progress = now
+
+    def _stall_seconds(self) -> float:
+        """How long without a step counts as a stall, at her own pace."""
+        if not self._step_times:
+            return self.STALL_RETRY_SECONDS
+        return min(self.STALL_RETRY_MAX_SECONDS,
+                   max(self.STALL_RETRY_SECONDS, 2.0 * statistics.median(self._step_times)))
 
     def _movement_blockers(self, client: AtrinikClient) -> set[tuple[int, int]]:
         """Combine learned fixtures with currently visible living occupants."""
@@ -1967,7 +1988,7 @@ class NavigateTask(BotTask):
             return True
         if (goal == self._issued_goal and
                 position != self._issued_click and
-                now - self._last_progress < self.STALL_RETRY_SECONDS):
+                now - self._last_progress < self._stall_seconds()):
             return True
         if (goal == self._issued_goal and
                 position != self._issued_click and

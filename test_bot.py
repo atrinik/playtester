@@ -11711,6 +11711,55 @@ class NavigationTests(unittest.TestCase):
         self.assertIn((11, 16), task._runtime_blocked)
         self.assertEqual(len(client.steps), 2)
 
+    def test_a_slow_walker_is_not_stalled_between_her_own_steps(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = type("State", (), {})()
+                self.state.phase = "playing"
+                self.state.inventory = []
+                self.state.map = type("Map", (), {
+                    "path": "/shattered_islands/world_3_81_-1",
+                    "world_x": 10, "world_y": 16,
+                    "width": 17, "height": 17,
+                })()
+                self.steps = []
+
+            async def move_to_view(self, x, y):
+                pass
+
+            async def clear_actions(self):
+                pass
+
+            async def move(self, direction):
+                self.steps.append(direction)
+
+        client = FakeClient()
+        task = NavigateTask(
+            self.graph, "/shattered_islands/world_3_81_-1", (23, 5),
+            allow_locked=False)
+        # She has been taking about a second per step.
+        task._step_times.extend([1.0, 1.1, 0.9, 1.0])
+        self.assertAlmostEqual(task._stall_seconds(), 2.0)
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.steps), 1)
+        # A second without a step is her normal pace, not a stall.
+        task._last_progress -= 1.0
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._runtime_blocked, set())
+        self.assertEqual(len(client.steps), 1)
+        # Past twice her pace it is a stall again.
+        task._last_progress -= 1.2
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertIn((11, 16), task._runtime_blocked)
+        # And the threshold never exceeds its cap, nor drops below the base.
+        task._step_times.extend([30.0] * 8)
+        self.assertEqual(task._stall_seconds(), task.STALL_RETRY_MAX_SECONDS)
+        task._step_times.clear()
+        task._step_times.extend([0.1] * 8)
+        self.assertEqual(task._stall_seconds(), task.STALL_RETRY_SECONDS)
+
     def test_navigation_waits_for_living_occupant_in_only_corridor(self):
         graph = WorldGraph()
         node = MapNode("/test/corridor", width=3, height=3)
