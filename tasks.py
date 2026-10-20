@@ -254,6 +254,12 @@ class TaskStatus(str, Enum):
     PAUSED = "paused"
 
 
+def safe_food(item: Item) -> bool:
+    """Food she may eat: identified, and not cursed, damned or unpaid."""
+    return (not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED) and
+            InventoryPolicy().identified(item))
+
+
 @dataclass(slots=True)
 class SafetyPolicy:
     heal_below: float = 0.70
@@ -276,11 +282,13 @@ class SafetyPolicy:
         return None
 
     def _food(self, items: list[Item]) -> Item | None:
-        """Prefer familiar staples, then any server-typed paid food."""
-        safe = [
-            item for item in items
-            if not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)
-        ]
+        """Prefer familiar staples, then any server-typed paid food.
+
+        Only food known to be safe: identified (a curse shows only once it
+        is) and neither cursed, damned nor unpaid. Merchant stock is sold
+        identified; found food waits for an identify device.
+        """
+        safe = [item for item in items if safe_food(item)]
         familiar = self._find(safe, self.food_patterns)
         if familiar is not None:
             return familiar

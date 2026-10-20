@@ -9,6 +9,7 @@ import math
 import multiprocessing
 import os
 import posixpath
+import dataclasses
 import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -37,7 +38,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
                     BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
-                    InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy,
+                    InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
                     SellJunkTask, TaskStatus,
                     TempleFoodTask, TempleServiceTask,
                     corpse_tile_standable, movement_ack_timeout,
@@ -3671,14 +3672,32 @@ def analyzer_farm_selection(
     return None if choice is None else choice[1:]
 
 
-def food_reserve(client: AtrinikClient) -> int:
-    """Edible items she carries and has paid for."""
+def food_reserve(client: AtrinikClient, *, include_unpaid: bool = False) -> int:
+    """Edible items she carries and may eat (safe_food: identified, paid,
+    not cursed or damned). With include_unpaid, also food just picked up on
+    a shop floor, paid for when she leaves the shop."""
     patterns = SafetyPolicy().food_patterns
+
+    def edible(item) -> bool:
+        if include_unpaid and item.flags & c.ITEM_UNPAID:
+            return safe_food(dataclasses.replace(item, flags=item.flags & ~c.ITEM_UNPAID))
+        return safe_food(item)
+
     return sum(item.quantity for item in client.state.inventory
-               if not item.flags & c.ITEM_UNPAID and (
+               if edible(item) and (
                    item.item_type == c.TYPE_FOOD or
                    any(pattern in item.name.casefold()
                        for pattern in patterns)))
+
+
+def unidentified_food(client: AtrinikClient) -> list:
+    """Carried food she would eat once identified (it may be cursed until
+    then): server-typed food she owns, the kind safety eats. Unpaid items are
+    left out, as the identify capability leaves them out."""
+    policy = InventoryPolicy()
+    return [item for item in client.state.inventory
+            if item.item_type == c.TYPE_FOOD and not policy.identified(item) and
+            not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID)]
 
 
 def hungry(client: AtrinikClient) -> bool:
@@ -4017,6 +4036,14 @@ class FarmCircuitTask(BotTask):
     # After a failed temple food request, wait this long before another.
     TEMPLE_FOOD_RETRY_SECONDS = 600.0
     FOOD_RESUPPLY_QUANTITY = 25
+    # Fewer safe food items than this and she restocks from the nearest
+    # merchant, before she is hungry, so she always carries food.
+    FOOD_RESERVE_LOW = 3
+    # A proactive restock only with room and money for it: under this share of
+    # the carrying limit, and with more than the purchases' protected cash.
+    FOOD_RESERVE_MAX_LOAD = 0.80
+    FOOD_RESERVE_CASH = 1_000
+
     FOOD_RESUPPLY_NUTRITION = 10_000
     FOOD_RESUPPLY_MAX_QUANTITY = 50
     DEPLETION_SERVICE_THRESHOLD = 3
@@ -4111,6 +4138,8 @@ class FarmCircuitTask(BotTask):
         self._identification: NavigateThenTask | None = None
         self._identification_retry_at = 0.0
         self._capability: InventoryCapabilityTask | None = None
+        # Purposes whose last use succeeded (their cooldown is a short pause).
+        self._capability_succeeded: set[str] = set()
         self._capability_retry_at: dict[str, float] = {}
         self._bed_binding: NavigateThenTask | None = None
         self._bed_retry_at = 0.0
@@ -4733,9 +4762,37 @@ class FarmCircuitTask(BotTask):
     def _hungry(self, client: AtrinikClient) -> bool:
         return hungry(client)
 
+    def _food_order_cost(self) -> int:
+        """What a usual restock order costs at the cheapest authored merchant
+        food (its value per item, times the usual quantity)."""
+        values = [profile.value for vendor in self.graph.dialogue_vendors
+                  for profile in self.graph.dialogue_food_stock(vendor)
+                  if profile.stackable and profile.value > 0]
+        return self.FOOD_RESUPPLY_QUANTITY * min(values, default=0)
+
+    def _food_identification_pending(self, client: AtrinikClient) -> bool:
+        """Carried food an identify device will reveal now or within the
+        short cooldown after a success (not the failure backoff)."""
+        purpose = InventoryCapabilityTask.PURPOSE_IDENTIFY
+        ready = (self.clock() >= self._capability_retry_at.get(purpose, 0.0) or
+                 purpose in self._capability_succeeded)
+        return bool(unidentified_food(client) and ready and
+                    InventoryCapabilityTask.candidates(client, purpose))
+
     def _needs_food_resupply(self, client: AtrinikClient) -> bool:
-        # While shop resupply backs off, a temple can still feed her.
+        # While shop resupply backs off, a temple can still feed her; a low
+        # reserve alone waits for the shop, she is not hungry yet. Carried
+        # food she can identify on the spot comes first: it may already be
+        # the reserve (a failed identification backs off, and then she goes).
+        if self._food_identification_pending(client):
+            return False
         now = self.clock()
+        if (now >= self._resupply_retry_at and
+                self._food_reserve(client) < self.FOOD_RESERVE_LOW and
+                InventoryPolicy().weight_ratio(client) < self.FOOD_RESERVE_MAX_LOAD and
+                BuyShopUpgradeTask.wallet_value(client) >=
+                self.FOOD_RESERVE_CASH + self._food_order_cost()):
+            return True
         return self._hungry(client) and (
             now >= self._resupply_retry_at or
             bool(self.graph.temple_priests) and now >= self._temple_food_retry_at)
@@ -4756,10 +4813,12 @@ class FarmCircuitTask(BotTask):
                 self._resupply_retry_at = self.clock() + 1800.0
             self._resupply = None
         elif self._resupply.status == TaskStatus.COMPLETE:
-            if not temple and self._hungry(client):
+            bought = food_reserve(client, include_unpaid=True)
+            if not temple and (self._hungry(client) and bought <= 1 or
+                               bought < self.FOOD_RESERVE_LOW):
                 # A merchant that offered no matching stock completes without
-                # selling anything; back off so a temple feeds her instead.
-                log.warning("food resupply bought no food; trying a temple")
+                # selling anything; back off (a temple feeds her if hungry).
+                log.warning("food resupply bought no food; backing off")
                 self._resupply_retry_at = self.clock() + 1800.0
             else:
                 log.info("%s complete; returning to farm circuit",
@@ -4895,7 +4954,8 @@ class FarmCircuitTask(BotTask):
         if self.clock() < self._capability_retry_at.get(purpose, 0.0):
             return False
         if purpose == InventoryCapabilityTask.PURPOSE_IDENTIFY:
-            needed = bool(self._unidentified_items(client))
+            # Found food too: identified, it shows whether it is safe to eat.
+            needed = bool(self._unidentified_items(client) or unidentified_food(client))
         elif purpose == InventoryCapabilityTask.PURPOSE_DISEASE:
             needed = self._disease_suspected
         elif purpose == InventoryCapabilityTask.PURPOSE_DEPLETION:
@@ -5243,9 +5303,13 @@ class FarmCircuitTask(BotTask):
         """Whether only a detour outside the circuit can feed her now.
 
         Not while a hostile-route abort retraces to its safe origin: turning
-        that towards a priest could lead the attackers along.
+        that towards a priest could lead the attackers along. A running
+        inventory capability (seconds long, such as identifying the food she
+        carries) is no such trip: it finishes first.
         """
-        return not self.can_feed_her() and self._expedition_return is None
+        blocking = [service for service in self._maintenance_services()
+                    if service is not None and service is not self._capability]
+        return bool(blocking) and self._expedition_return is None
 
     def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
         """Return whether autoplay may replace this circuit between pulls."""
@@ -5812,6 +5876,9 @@ class FarmCircuitTask(BotTask):
                 if self._capability.status == TaskStatus.COMPLETE:
                     log.info("%s maintenance capability succeeded", purpose)
                     self._capability_retry_at[purpose] = self.clock() + 1.0
+                    # A pause after a success, not a backoff: carried food
+                    # still waits for the next use.
+                    self._capability_succeeded.add(purpose)
                     if purpose == InventoryCapabilityTask.PURPOSE_DISEASE:
                         self._disease_suspected = False
                     elif purpose == InventoryCapabilityTask.PURPOSE_DEPLETION:
@@ -5821,6 +5888,7 @@ class FarmCircuitTask(BotTask):
                 else:
                     log.warning("%s maintenance capability failed: %s",
                                 purpose, self._capability.error)
+                    self._capability_succeeded.discard(purpose)
                     self._capability_retry_at[purpose] = (
                         self.clock() + 30 * 60)
                 self._capability = None
