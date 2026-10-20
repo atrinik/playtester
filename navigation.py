@@ -10,9 +10,8 @@ import multiprocessing
 import os
 import posixpath
 import re
-import statistics
 import xml.etree.ElementTree as ET
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
@@ -1563,14 +1562,12 @@ class NavigateTask(BotTask):
     """Follow the authored path one verified protocol move at a time."""
 
     STALL_RETRY_SECONDS = 0.65
-    # A stall is measured against her own pace: twice her recent median
-    # step time, from STALL_RETRY_SECONDS up to this. Live: heavy depletion
-    # left Sera about a second per step, so every 0.65 s wait read as a
-    # stall; she learned the square she was stepping onto as blocked,
-    # cancelled the step for another and zigzagged in place until she
-    # starved, map after map.
+    # A stall waits at least one movement acknowledgement at her speed
+    # (movement_ack_timeout), up to this. Live: heavy depletion slowed Sera,
+    # so every 0.65 s wait read as a stall; she learned the square she was
+    # stepping onto as blocked, cancelled the step for another and zigzagged
+    # in place until she starved, map after map.
     STALL_RETRY_MAX_SECONDS = 6.0
-    STEP_SAMPLES = 8
     # Learned stall blockers are guesses. Once they leave no route at all and
     # the character has not moved for this long, they are the trap.
     LEARNED_BLOCK_RESET_SECONDS = 5.0
@@ -1598,7 +1595,6 @@ class NavigateTask(BotTask):
         self._approach_index = 0
         self._last_position: tuple[str, int, int] | None = None
         self._last_progress = 0.0
-        self._step_times: deque[float] = deque(maxlen=self.STEP_SAMPLES)
         self._issued_goal: tuple[str, int, int] | None = None
         self._issued_click: tuple[str, int, int] | None = None
         self._excluded_edges: set[tuple[str, str]] = set()
@@ -1932,31 +1928,22 @@ class NavigateTask(BotTask):
                 position[0] != self._last_position[0]):
                 self._runtime_blocked.clear()
                 self._threat_blocked.clear()
-            elif self._last_position is not None and self._last_progress:
-                # One step on the same map: how long it took from the move
-                # that produced it (a wait before issuing it is no step time).
-                issued = max(self._last_progress, self._last_action)
-                if now > issued:
-                    self._step_times.append(now - issued)
             self._last_position = position
             self._last_progress = now
 
     def _stall_seconds(self, client: AtrinikClient | None = None) -> float:
         """How long without a step counts as a stall, at her own pace.
 
-        Twice her recent median step time; and, below speed 1.0, at least one
-        step at her speed (1 / speed), so the first slow step, or the first
-        after she slowed, can finish and be measured instead of being
-        cancelled as a stall. From STALL_RETRY_SECONDS up to the cap.
+        At least one movement acknowledgement at her speed and action time
+        (movement_ack_timeout), so a slow step finishes instead of being
+        cancelled as a stall; STALL_RETRY_SECONDS when her speed is not known
+        yet, and never above the cap.
         """
-        seconds = self.STALL_RETRY_SECONDS
-        if self._step_times:
-            seconds = max(seconds, 2.0 * statistics.median(self._step_times))
-        stats = getattr(getattr(client, "state", None), "stats", None) or {}
-        speed = float(stats.get("speed", 0) or 0)
-        if 0 < speed < 1.0:
-            seconds = max(seconds, 1.0 / speed)
-        return min(self.STALL_RETRY_MAX_SECONDS, seconds)
+        stats = getattr(getattr(client, "state", None), "stats", None)
+        if not stats or not float(stats.get("speed", 0) or 0):
+            return self.STALL_RETRY_SECONDS
+        return min(self.STALL_RETRY_MAX_SECONDS,
+                   max(self.STALL_RETRY_SECONDS, movement_ack_timeout(client)))
 
     def _movement_blockers(self, client: AtrinikClient) -> set[tuple[int, int]]:
         """Combine learned fixtures with currently visible living occupants."""
@@ -2447,7 +2434,9 @@ class NavigateTask(BotTask):
                 if not self._approach:
                     self._approach = self._approach_candidates()
                 elif (time.monotonic() - self._last_progress >
-                      max(1.5, self._stall_seconds(client))):
+                      max(1.5, self._stall_seconds(client) + 1.0)):
+                    # Later than the stall deadline: the current goal's stall
+                    # is learned (its blocker, the cancelled move) first.
                     # An authored wall, counter, or NPC can occupy a candidate.
                     # Try the next perimeter square only after movement stalls,
                     # so a long valid path is not repeatedly cleared.
