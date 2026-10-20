@@ -63,8 +63,10 @@ class AutoplayTask(BotTask):
         """Positively classified junk she may drop when overloaded, heaviest
         first: generated library books, spare ammunition (none while she
         wields a missile weapon), throwing weapons and light sources. Only
-        identified, unlocked, unworn, paid items; anything else, quest
-        objectives included, stays.
+        identified, unlocked, unworn, paid items the inventory policy does not
+        preserve (magical, high quality), and books only once read (reading
+        one grants its literacy XP); anything else, quest objectives
+        included, stays.
         """
         policy = InventoryPolicy()
         shooting = any(item.item_type == c.TYPE_BOW and item.flags & c.ITEM_APPLIED
@@ -74,11 +76,13 @@ class AutoplayTask(BotTask):
             name = item.name.casefold()
             if (item.weight * item.quantity <= 0 or
                     item.flags & (c.ITEM_APPLIED | c.ITEM_LOCKED | c.ITEM_UNPAID) or
-                    not policy.identified(item) or
+                    not policy.identified(item) or policy.preserve(item) or
                     self._shed_attempts.get(item.tag, 0) >= 2):
                 continue
+            attempted = getattr(client, "lore_book_attempted", None)
             junk = (
-                item.item_type == c.TYPE_BOOK and self.LIBRARY_BOOK.match(name) or
+                item.item_type == c.TYPE_BOOK and bool(self.LIBRARY_BOOK.match(name)) and
+                attempted is not None and attempted(item) or
                 item.item_type == c.TYPE_ARROW and not shooting or
                 item.item_type == c.TYPE_WEAPON and "throwing" in name or
                 item.item_type == c.TYPE_LIGHT_APPLY)
@@ -116,9 +120,10 @@ class AutoplayTask(BotTask):
         if not candidates:
             return False
         item = candidates[0]
-        self._shed_attempts[item.tag] = self._shed_attempts.get(item.tag, 0) + 1
         await client.clear_actions()
         await client.move_item(0, item.tag, item.quantity)
+        # Counted once the drop is sent: a connection lost before it is no try.
+        self._shed_attempts[item.tag] = self._shed_attempts.get(item.tag, 0) + 1
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder("overload-shed",

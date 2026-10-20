@@ -9024,6 +9024,8 @@ class QuestTests(unittest.TestCase):
             return None
 
         client.move_item, client.clear_actions, client.send = move_item, nothing, nothing
+        # Book 4 has been read; book 14 has not (its literacy XP is still to come).
+        client.lore_book_attempted = lambda item: item.tag == 4
         q = dict(quality=80)
         for item in [
             Item(1, name="gargoyle leather cuirass", weight=8.45, flags=c.ITEM_APPLIED, **q),
@@ -9041,6 +9043,11 @@ class QuestTests(unittest.TestCase):
             Item(12, name="shipment of Charob Beer", weight=15.0, **q),
             Item(10, name="throwing daggers", item_type=c.TYPE_WEAPON, weight=20.0),
             Item(13, name="iron throwing hammers", item_type=c.TYPE_WEAPON, weight=0.7, **q),
+            Item(14, name="vellum guide of creatures", item_type=c.TYPE_BOOK, weight=0.75, **q),
+            # Valuable by the inventory policy: magical, or quality 90 and up.
+            Item(15, name="pine arrows of slaying", item_type=c.TYPE_ARROW, weight=3.0,
+                 flags=c.ITEM_MAGICAL, **q),
+            Item(16, name="iron throwing stars", item_type=c.TYPE_WEAPON, weight=2.0, quality=95),
         ]:
             client.state.place_item(item, 7)
         autoplay = AutoplayTask(WorldGraph(), target_level=115)
