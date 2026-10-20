@@ -4007,6 +4007,13 @@ class FarmCircuitTask(BotTask):
     # Fewer safe food items than this and she restocks from the nearest
     # merchant, before she is hungry, so she always carries food.
     FOOD_RESERVE_LOW = 3
+    # A proactive restock only with room and money for it: under this share of
+    # the carrying limit, and with more than the purchases' protected cash.
+    FOOD_RESERVE_MAX_LOAD = 0.80
+    FOOD_RESERVE_CASH = 1_000
+    # A capability cooldown at most this long is the short pause after a
+    # success, not the failure backoff: carried food still waits for it.
+    CAPABILITY_SHORT_COOLDOWN = 60.0
     FOOD_RESUPPLY_NUTRITION = 10_000
     FOOD_RESUPPLY_MAX_QUANTITY = 50
     DEPLETION_SERVICE_THRESHOLD = 3
@@ -4723,17 +4730,27 @@ class FarmCircuitTask(BotTask):
     def _hungry(self, client: AtrinikClient) -> bool:
         return hungry(client)
 
+    def _food_identification_pending(self, client: AtrinikClient) -> bool:
+        """Carried food an identify device will reveal now or within the
+        short cooldown after a success (not the failure backoff)."""
+        purpose = InventoryCapabilityTask.PURPOSE_IDENTIFY
+        retry_in = self._capability_retry_at.get(purpose, 0.0) - self.clock()
+        return bool(unidentified_food(client) and
+                    retry_in <= self.CAPABILITY_SHORT_COOLDOWN and
+                    InventoryCapabilityTask.candidates(client, purpose))
+
     def _needs_food_resupply(self, client: AtrinikClient) -> bool:
         # While shop resupply backs off, a temple can still feed her; a low
         # reserve alone waits for the shop, she is not hungry yet. Carried
         # food she can identify on the spot comes first: it may already be
         # the reserve (a failed identification backs off, and then she goes).
-        if (unidentified_food(client) and self._needs_inventory_capability(
-                client, InventoryCapabilityTask.PURPOSE_IDENTIFY)):
+        if self._food_identification_pending(client):
             return False
         now = self.clock()
         if (now >= self._resupply_retry_at and
-                self._food_reserve(client) < self.FOOD_RESERVE_LOW):
+                self._food_reserve(client) < self.FOOD_RESERVE_LOW and
+                InventoryPolicy().weight_ratio(client) < self.FOOD_RESERVE_MAX_LOAD and
+                BuyShopUpgradeTask.wallet_value(client) > self.FOOD_RESERVE_CASH):
             return True
         return self._hungry(client) and (
             now >= self._resupply_retry_at or
@@ -4869,7 +4886,9 @@ class FarmCircuitTask(BotTask):
         ) and self.clock() >= self._storage_retry_at
 
     def _needs_mass_identification(self, client: AtrinikClient) -> bool:
-        unknown = self._unidentified_items(client)
+        # Found food she cannot eat until identified joins the paid batch:
+        # without an identify device it has no other way to become food.
+        unknown = self._unidentified_items(client) + unidentified_food(client)
         # An unknown wand/rod may be the emergency recall capability which a
         # hands-off character otherwise cannot discover until an arbitrary
         # carrying threshold. Pay for one immediate reveal while recall is

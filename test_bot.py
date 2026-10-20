@@ -4294,6 +4294,8 @@ class QuestTests(unittest.TestCase):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["food"] = 150
+        # Spendable money above the protected cash: a restock can buy.
+        client.state.bank_balance = 5_000
         client.state.place_item(Item(92, name="staple food"), 7)
         self.assertTrue(task._needs_food_resupply(client))
         client.state.inventory_replay_complete = False
@@ -4809,9 +4811,31 @@ class QuestTests(unittest.TestCase):
             circuit._capability = InventoryCapabilityTask(InventoryCapabilityTask.PURPOSE_IDENTIFY)
             self.assertFalse(circuit.needs_outside_food())
             circuit._capability = None
+            # The short pause after a success still waits for the device;
+            # the failure backoff does not.
+            circuit._capability_retry_at[InventoryCapabilityTask.PURPOSE_IDENTIFY] = 11.0
+            self.assertFalse(circuit._needs_food_resupply(client))
+            circuit._capability_retry_at[InventoryCapabilityTask.PURPOSE_IDENTIFY] = 10.0 + 1800
+            self.assertTrue(circuit._needs_food_resupply(client))
+            circuit._capability_retry_at.clear()
         # Without a device, or once it backs off, the food trip goes ahead.
         with patch.object(InventoryCapabilityTask, "candidates", return_value=[]):
             self.assertTrue(circuit._needs_food_resupply(client))
+
+    def test_proactive_restock_needs_money_and_room(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats.update({"food": 900, "weight_limit": 100})
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], clock=lambda: 10.0)
+        # Not hungry, no reserve: only with spendable money and room.
+        self.assertFalse(circuit._needs_food_resupply(client))
+        client.state.bank_balance = 5_000
+        self.assertTrue(circuit._needs_food_resupply(client))
+        client.state.place_item(Item(60, name="iron ingots", weight=85.0, quality=80), 7)
+        self.assertFalse(circuit._needs_food_resupply(client))
+        # Hungry, the old fallback still applies.
+        client.state.stats["food"] = 100
+        self.assertTrue(circuit._needs_food_resupply(client))
 
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:
