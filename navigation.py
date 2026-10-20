@@ -9,6 +9,7 @@ import math
 import multiprocessing
 import os
 import posixpath
+import dataclasses
 import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -3647,12 +3648,19 @@ def analyzer_farm_selection(
     return None if choice is None else choice[1:]
 
 
-def food_reserve(client: AtrinikClient) -> int:
+def food_reserve(client: AtrinikClient, *, include_unpaid: bool = False) -> int:
     """Edible items she carries and may eat (safe_food: identified, paid,
-    not cursed or damned)."""
+    not cursed or damned). With include_unpaid, also food just picked up on
+    a shop floor, paid for when she leaves the shop."""
     patterns = SafetyPolicy().food_patterns
+
+    def edible(item) -> bool:
+        if include_unpaid and item.flags & c.ITEM_UNPAID:
+            return safe_food(dataclasses.replace(item, flags=item.flags & ~c.ITEM_UNPAID))
+        return safe_food(item)
+
     return sum(item.quantity for item in client.state.inventory
-               if safe_food(item) and (
+               if edible(item) and (
                    item.item_type == c.TYPE_FOOD or
                    any(pattern in item.name.casefold()
                        for pattern in patterns)))
@@ -4011,9 +4019,7 @@ class FarmCircuitTask(BotTask):
     # the carrying limit, and with more than the purchases' protected cash.
     FOOD_RESERVE_MAX_LOAD = 0.80
     FOOD_RESERVE_CASH = 1_000
-    # A capability cooldown at most this long is the short pause after a
-    # success, not the failure backoff: carried food still waits for it.
-    CAPABILITY_SHORT_COOLDOWN = 60.0
+
     FOOD_RESUPPLY_NUTRITION = 10_000
     FOOD_RESUPPLY_MAX_QUANTITY = 50
     DEPLETION_SERVICE_THRESHOLD = 3
@@ -4108,6 +4114,8 @@ class FarmCircuitTask(BotTask):
         self._identification: NavigateThenTask | None = None
         self._identification_retry_at = 0.0
         self._capability: InventoryCapabilityTask | None = None
+        # Purposes whose last use succeeded (their cooldown is a short pause).
+        self._capability_succeeded: set[str] = set()
         self._capability_retry_at: dict[str, float] = {}
         self._bed_binding: NavigateThenTask | None = None
         self._bed_retry_at = 0.0
@@ -4730,13 +4738,21 @@ class FarmCircuitTask(BotTask):
     def _hungry(self, client: AtrinikClient) -> bool:
         return hungry(client)
 
+    def _food_order_cost(self) -> int:
+        """What a usual restock order costs at the cheapest authored merchant
+        food (its value per item, times the usual quantity)."""
+        values = [profile.value for vendor in self.graph.dialogue_vendors
+                  for profile in self.graph.dialogue_food_stock(vendor)
+                  if profile.stackable and profile.value > 0]
+        return self.FOOD_RESUPPLY_QUANTITY * min(values, default=0)
+
     def _food_identification_pending(self, client: AtrinikClient) -> bool:
         """Carried food an identify device will reveal now or within the
         short cooldown after a success (not the failure backoff)."""
         purpose = InventoryCapabilityTask.PURPOSE_IDENTIFY
-        retry_in = self._capability_retry_at.get(purpose, 0.0) - self.clock()
-        return bool(unidentified_food(client) and
-                    retry_in <= self.CAPABILITY_SHORT_COOLDOWN and
+        ready = (self.clock() >= self._capability_retry_at.get(purpose, 0.0) or
+                 purpose in self._capability_succeeded)
+        return bool(unidentified_food(client) and ready and
                     InventoryCapabilityTask.candidates(client, purpose))
 
     def _needs_food_resupply(self, client: AtrinikClient) -> bool:
@@ -4750,7 +4766,8 @@ class FarmCircuitTask(BotTask):
         if (now >= self._resupply_retry_at and
                 self._food_reserve(client) < self.FOOD_RESERVE_LOW and
                 InventoryPolicy().weight_ratio(client) < self.FOOD_RESERVE_MAX_LOAD and
-                BuyShopUpgradeTask.wallet_value(client) > self.FOOD_RESERVE_CASH):
+                BuyShopUpgradeTask.wallet_value(client) >=
+                self.FOOD_RESERVE_CASH + self._food_order_cost()):
             return True
         return self._hungry(client) and (
             now >= self._resupply_retry_at or
@@ -4772,8 +4789,9 @@ class FarmCircuitTask(BotTask):
                 self._resupply_retry_at = self.clock() + 1800.0
             self._resupply = None
         elif self._resupply.status == TaskStatus.COMPLETE:
-            if not temple and (self._hungry(client) or
-                               self._food_reserve(client) < self.FOOD_RESERVE_LOW):
+            bought = food_reserve(client, include_unpaid=True)
+            if not temple and (self._hungry(client) and bought <= 1 or
+                               bought < self.FOOD_RESERVE_LOW):
                 # A merchant that offered no matching stock completes without
                 # selling anything; back off (a temple feeds her if hungry).
                 log.warning("food resupply bought no food; backing off")
@@ -5836,6 +5854,9 @@ class FarmCircuitTask(BotTask):
                 if self._capability.status == TaskStatus.COMPLETE:
                     log.info("%s maintenance capability succeeded", purpose)
                     self._capability_retry_at[purpose] = self.clock() + 1.0
+                    # A pause after a success, not a backoff: carried food
+                    # still waits for the next use.
+                    self._capability_succeeded.add(purpose)
                     if purpose == InventoryCapabilityTask.PURPOSE_DISEASE:
                         self._disease_suspected = False
                     elif purpose == InventoryCapabilityTask.PURPOSE_DEPLETION:
@@ -5845,6 +5866,7 @@ class FarmCircuitTask(BotTask):
                 else:
                     log.warning("%s maintenance capability failed: %s",
                                 purpose, self._capability.error)
+                    self._capability_succeeded.discard(purpose)
                     self._capability_retry_at[purpose] = (
                         self.clock() + 30 * 60)
                 self._capability = None

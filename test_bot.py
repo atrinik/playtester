@@ -4812,10 +4812,13 @@ class QuestTests(unittest.TestCase):
             self.assertFalse(circuit.needs_outside_food())
             circuit._capability = None
             # The short pause after a success still waits for the device;
-            # the failure backoff does not.
-            circuit._capability_retry_at[InventoryCapabilityTask.PURPOSE_IDENTIFY] = 11.0
+            # a failure backoff does not, even in its last minute.
+            purpose = InventoryCapabilityTask.PURPOSE_IDENTIFY
+            circuit._capability_retry_at[purpose] = 11.0
+            circuit._capability_succeeded.add(purpose)
             self.assertFalse(circuit._needs_food_resupply(client))
-            circuit._capability_retry_at[InventoryCapabilityTask.PURPOSE_IDENTIFY] = 10.0 + 1800
+            circuit._capability_succeeded.clear()
+            circuit._capability_retry_at[purpose] = 40.0
             self.assertTrue(circuit._needs_food_resupply(client))
             circuit._capability_retry_at.clear()
         # Without a device, or once it backs off, the food trip goes ahead.
@@ -4827,10 +4830,14 @@ class QuestTests(unittest.TestCase):
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats.update({"food": 900, "weight_limit": 100})
         circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], clock=lambda: 10.0)
-        # Not hungry, no reserve: only with spendable money and room.
+        # Not hungry, no reserve: only with money for the whole order and room.
         self.assertFalse(circuit._needs_food_resupply(client))
+        with patch.object(FarmCircuitTask, "_food_order_cost", return_value=500):
+            client.state.bank_balance = 1_001
+            self.assertFalse(circuit._needs_food_resupply(client))
+            client.state.bank_balance = 1_500
+            self.assertTrue(circuit._needs_food_resupply(client))
         client.state.bank_balance = 5_000
-        self.assertTrue(circuit._needs_food_resupply(client))
         client.state.place_item(Item(60, name="iron ingots", weight=85.0, quality=80), 7)
         self.assertFalse(circuit._needs_food_resupply(client))
         # Hungry, the old fallback still applies.
@@ -9927,6 +9934,16 @@ class QuestTests(unittest.TestCase):
         circuit._settle_resupply(client)
         self.assertIsNone(circuit._resupply)
         self.assertEqual(circuit._resupply_retry_at, now[0] + 1800.0)
+        # Food just bought on a shop floor (unpaid until she leaves) counts.
+        client.state.stats["food"] = 900
+        circuit._resupply_retry_at = 0.0
+        client.state.place_item(Item(971, name="staple food", quantity=5,
+                                     flags=c.ITEM_UNPAID), 7)
+        circuit._resupply, circuit._resupply_kind = done, "shop"
+        circuit._settle_resupply(client)
+        self.assertEqual(circuit._resupply_retry_at, 0.0)
+        client.state.items.pop(971)
+        client.state.inventories[7].remove(971)
         # A shop run that did feed her (and filled her reserve) sets no backoff.
         client.state.stats["food"] = 900
         client.state.place_item(Item(970, name="staple food", quantity=10), 7)
