@@ -3659,11 +3659,13 @@ def food_reserve(client: AtrinikClient) -> int:
 
 
 def unidentified_food(client: AtrinikClient) -> list:
-    """Carried food that may be cursed until it is identified."""
+    """Carried food she would eat once identified (it may be cursed until
+    then): server-typed food she owns, the kind safety eats. Unpaid items are
+    left out, as the identify capability leaves them out."""
     policy = InventoryPolicy()
     return [item for item in client.state.inventory
-            if item.item_type in (c.TYPE_FOOD, c.TYPE_DRINK, c.TYPE_FLESH) and
-            not policy.identified(item) and not item.flags & c.ITEM_APPLIED]
+            if item.item_type == c.TYPE_FOOD and not policy.identified(item) and
+            not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID)]
 
 
 def hungry(client: AtrinikClient) -> bool:

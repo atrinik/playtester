@@ -4783,6 +4783,10 @@ class QuestTests(unittest.TestCase):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.place_item(Item(46, item_type=c.TYPE_FOOD, name="mystery stew"), 7)
+        # Not food she eats (drink, flesh), or not yet hers (unpaid): no trigger.
+        client.state.place_item(Item(47, item_type=c.TYPE_FLESH, name="rat tail"), 7)
+        client.state.place_item(Item(48, item_type=c.TYPE_FOOD, name="shop bread",
+                                     flags=c.ITEM_UNPAID), 7)
         circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
         self.assertEqual([item.tag for item in unidentified_food(client)], [46])
         with patch.object(InventoryCapabilityTask, "candidates", return_value=[object()]):
