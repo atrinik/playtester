@@ -9007,6 +9007,60 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(autoplay.phase, "adaptive-farming")
         self.assertEqual(autoplay.child.legs[0][0], "/shattered_islands/world_14_79")
 
+    def test_overloaded_autoplay_sheds_loose_junk_heaviest_first(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.player_tag = 7
+        client.state.stats.update({"level": 26, "hp": 100, "maxhp": 100, "food": 900,
+                                   "weight_limit": 25.0, "speed": 0.1})
+        moved = []
+
+        async def move_item(destination, tag, quantity=0):
+            moved.append(tag)
+            client.state.items.pop(tag)
+            client.state.inventories[7].remove(tag)
+
+        async def nothing(*args, **kwargs):
+            return None
+
+        client.move_item, client.clear_actions = move_item, nothing
+        items = [
+            Item(1, name="gargoyle leather cuirass", weight=8.45, flags=c.ITEM_APPLIED, quality=80),
+            Item(2, name="copper coin", item_type=c.TYPE_MONEY, weight=0.01, quantity=851, quality=80),
+            Item(3, name="pine arrows", item_type=c.TYPE_ARROW, weight=0.075, quantity=19, quality=80),
+            Item(4, name="paper volume of things", item_type=c.TYPE_BOOK, weight=0.75, quality=80),
+            Item(5, name="paper listing of lost artifacts", item_type=c.TYPE_BOOK, weight=0.75,
+                 flags=c.ITEM_LOCKED, quality=80),
+            Item(6, name="wool sack", item_type=c.TYPE_CONTAINER, weight=6.0, quality=80),
+            Item(7, name="Incuna Tavern Barn Key", weight=0.1, quality=80),
+            Item(8, name="torch", item_type=c.TYPE_LIGHT_APPLY, weight=12.0, quality=80),
+            Item(9, name="minor healing", item_type=c.TYPE_SPELL),
+        ]
+        for item in items:
+            client.state.place_item(item, 7)
+        # Unidentified loot stays: it may be valuable.
+        client.state.place_item(Item(10, name="throwing daggers", item_type=c.TYPE_WEAPON, weight=20.0), 7)
+        autoplay = AutoplayTask(WorldGraph(), target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay._intro_complete = True
+        for _ in range(6):
+            autoplay._shed_at = 0.0
+            asyncio.run(autoplay.tick(client))
+        # Heaviest first, only identified unlocked junk; then nothing more to shed.
+        self.assertEqual(moved, [8, 3, 4])
+        self.assertTrue({1, 2, 5, 6, 7, 9, 10}.isdisjoint(moved))
+        self.assertIn("overload-shed", [record["action"] for record in client.decision_history])
+
+    def test_hunger_rises_as_she_slows(self):
+        from .navigation import hungry
+        client = AtrinikClient(ClientConfig())
+        client.state.stats.update({"food": 400, "speed": 1.0})
+        self.assertFalse(hungry(client))
+        client.state.stats["speed"] = 0.1
+        self.assertTrue(hungry(client))
+        client.state.stats.update({"food": 170, "speed": 0})
+        self.assertTrue(hungry(client))
+
     def test_autoplay_pauses_any_phase_to_eat_at_a_temple_when_starving(self):
         from . import autoplay as autoplay_module
         from .tasks import BotTask

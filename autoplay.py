@@ -10,7 +10,9 @@ from .catalog_quest_tasks import CatalogQuestTask, POLICIES
 from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
                          analyzer_farm_selection, hungry, temple_food_trip)
 from .quest_tasks import EscapingDesertedIslandTask
-from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
+from . import constants as c
+from .tasks import (BotTask, InventoryPolicy, JunkPolicy, RetrieveItemsTask,
+                    SafetyPolicy, TaskStatus)
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +45,75 @@ class AutoplayTask(BotTask):
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
         self._temple_food_retry_at = 0.0
+        self._shed_at = 0.0
+        self._shed_attempts: dict[int, int] = {}
         self.safety = SafetyPolicy()
+
+    # Never shed these: money, food, containers (their contents would go too),
+    # consumables and devices, jewellery and valuables, and non-objects.
+    SHED_KEEP_TYPES = frozenset({
+        c.TYPE_MONEY, c.TYPE_FOOD, c.TYPE_CONTAINER, c.TYPE_POTION,
+        c.TYPE_SCROLL, c.TYPE_WAND, c.TYPE_ROD, c.TYPE_RING, c.TYPE_AMULET,
+        c.TYPE_GEM, c.TYPE_JEWEL, c.TYPE_NUGGET, c.TYPE_SKILL, c.TYPE_SPELL,
+        c.TYPE_FORCE, c.TYPE_SPELLBOOK})
+    # Seconds between drops: the server must take one before the next.
+    SHED_INTERVAL = 2.0
+
+    def _sheddable(self, client: AtrinikClient) -> list:
+        """Loose items she may drop when overloaded, heaviest first.
+
+        Only unlocked ones: anything she or the operator locked stays, as do
+        the keep classes above, keys and quest items, food by name, and
+        ammunition for a missile weapon she wields.
+        """
+        policy, keep = InventoryPolicy(), JunkPolicy().keep_patterns
+        food_words = SafetyPolicy().food_patterns
+        shooting = any(item.item_type == c.TYPE_BOW and item.flags & c.ITEM_APPLIED
+                       for item in client.state.inventory)
+        candidates = []
+        for item in client.state.inventory:
+            name = item.name.casefold()
+            if (item.weight * item.quantity <= 0 or
+                    item.flags & (c.ITEM_APPLIED | c.ITEM_LOCKED | c.ITEM_UNPAID) or
+                    item.item_type in self.SHED_KEEP_TYPES or
+                    item.item_type == c.TYPE_ARROW and shooting or
+                    policy.preserve(item) or
+                    any(word in name for word in keep) or
+                    any(word in name for word in food_words) or
+                    self._shed_attempts.get(item.tag, 0) >= 2):
+                continue
+            candidates.append(item)
+        return sorted(candidates, key=lambda item: -item.weight * item.quantity)
+
+    async def _shed_overload(self, client: AtrinikClient) -> bool:
+        """Over her carrying limit she crawls: drop loose junk where she stands.
+
+        Live: 59 depletion points left Sera strength 1, a 25 kg limit and
+        50 kg carried; at speed 0.1 every food trip ended in starvation, and
+        each death's depletion made her weaker still. One drop per tick, the
+        rest of the tick held, so navigation cannot cancel the queued move.
+        """
+        if (not getattr(client.state, "inventory_replay_complete", True) or
+                InventoryPolicy().weight_ratio(client) <= 1.0):
+            return False
+        now = time.monotonic()
+        if now < self._shed_at:
+            return True
+        candidates = self._sheddable(client)
+        if not candidates:
+            return False
+        item = candidates[0]
+        self._shed_attempts[item.tag] = self._shed_attempts.get(item.tag, 0) + 1
+        await client.clear_actions()
+        await client.move_item(0, item.tag, item.quantity)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("overload-shed",
+                     f"{item.name} x{item.quantity} "
+                     f"({item.weight * item.quantity:.2f} kg; "
+                     f"load {InventoryPolicy().weight_ratio(client):.2f} of the limit)")
+        self._shed_at = now + self.SHED_INTERVAL
+        return True
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
         """Starving where nothing else will feed her.
@@ -193,6 +263,8 @@ class AutoplayTask(BotTask):
         if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
             return
 
+        if await self._shed_overload(client):
+            return
         if (self._needs_temple_food(client) and
                 await self._start_temple_food(client)):
             return

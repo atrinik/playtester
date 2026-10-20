@@ -3657,10 +3657,23 @@ def food_reserve(client: AtrinikClient) -> int:
                        for pattern in patterns)))
 
 
+# Food below which she leaves to get more, at full speed (1.0 or faster).
+HUNGER_FOOD = 180
+
+
 def hungry(client: AtrinikClient) -> bool:
-    """Low on food with nothing left to eat: she must go and get some."""
+    """Low on food with nothing left to eat: she must go and get some.
+
+    The walk to food takes longer the slower she moves (heavy depletion and
+    a load over her carrying limit once held Sera at speed 0.1, so she
+    starved on every trip), and food drains at the same rate whatever her
+    speed: the threshold rises in proportion, so a crawling character leaves
+    as soon as she can.
+    """
+    speed = float(client.state.stats.get("speed", 0) or 0)
+    slowdown = 1.0 / min(1.0, max(0.1, speed)) if speed > 0 else 1.0
     return (food_reserve(client) <= 1 and
-            int(client.state.stats.get("food", 1000) or 0) < 180)
+            int(client.state.stats.get("food", 1000) or 0) < HUNGER_FOOD * slowdown)
 
 
 def temple_food_trip(graph: "WorldGraph",
