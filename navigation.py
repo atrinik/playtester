@@ -1933,17 +1933,30 @@ class NavigateTask(BotTask):
                 self._runtime_blocked.clear()
                 self._threat_blocked.clear()
             elif self._last_position is not None and self._last_progress:
-                # One step on the same map: how long her steps take.
-                self._step_times.append(now - self._last_progress)
+                # One step on the same map: how long it took from the move
+                # that produced it (a wait before issuing it is no step time).
+                issued = max(self._last_progress, self._last_action)
+                if now > issued:
+                    self._step_times.append(now - issued)
             self._last_position = position
             self._last_progress = now
 
-    def _stall_seconds(self) -> float:
-        """How long without a step counts as a stall, at her own pace."""
-        if not self._step_times:
-            return self.STALL_RETRY_SECONDS
-        return min(self.STALL_RETRY_MAX_SECONDS,
-                   max(self.STALL_RETRY_SECONDS, 2.0 * statistics.median(self._step_times)))
+    def _stall_seconds(self, client: AtrinikClient | None = None) -> float:
+        """How long without a step counts as a stall, at her own pace.
+
+        Twice her recent median step time; and, below speed 1.0, at least one
+        step at her speed (1 / speed), so the first slow step, or the first
+        after she slowed, can finish and be measured instead of being
+        cancelled as a stall. From STALL_RETRY_SECONDS up to the cap.
+        """
+        seconds = self.STALL_RETRY_SECONDS
+        if self._step_times:
+            seconds = max(seconds, 2.0 * statistics.median(self._step_times))
+        stats = getattr(getattr(client, "state", None), "stats", None) or {}
+        speed = float(stats.get("speed", 0) or 0)
+        if 0 < speed < 1.0:
+            seconds = max(seconds, 1.0 / speed)
+        return min(self.STALL_RETRY_MAX_SECONDS, seconds)
 
     def _movement_blockers(self, client: AtrinikClient) -> set[tuple[int, int]]:
         """Combine learned fixtures with currently visible living occupants."""
@@ -1988,7 +2001,7 @@ class NavigateTask(BotTask):
             return True
         if (goal == self._issued_goal and
                 position != self._issued_click and
-                now - self._last_progress < self._stall_seconds()):
+                now - self._last_progress < self._stall_seconds(client)):
             return True
         if (goal == self._issued_goal and
                 position != self._issued_click and
@@ -2433,7 +2446,8 @@ class NavigateTask(BotTask):
             if self.tolerance:
                 if not self._approach:
                     self._approach = self._approach_candidates()
-                elif time.monotonic() - self._last_progress > 1.5:
+                elif (time.monotonic() - self._last_progress >
+                      max(1.5, self._stall_seconds(client))):
                     # An authored wall, counter, or NPC can occupy a candidate.
                     # Try the next perimeter square only after movement stalls,
                     # so a long valid path is not repeatedly cleared.

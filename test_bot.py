@@ -11753,6 +11753,23 @@ class NavigationTests(unittest.TestCase):
         task._last_action = 0.0
         asyncio.run(task.tick(client))
         self.assertIn((11, 16), task._runtime_blocked)
+        # A slow speed stat raises it before any step is measured, so the
+        # first slow step is not cancelled as a stall.
+        task._step_times.clear()
+        client.state.stats = {"speed": 0.4}
+        self.assertAlmostEqual(task._stall_seconds(client), 2.5)
+        client.state.stats = {"speed": 0.05}
+        self.assertEqual(task._stall_seconds(client), task.STALL_RETRY_MAX_SECONDS)
+        client.state.stats = {"speed": 1.4}
+        self.assertEqual(task._stall_seconds(client), task.STALL_RETRY_SECONDS)
+        # A step is timed from the move that produced it, not from the wait
+        # before it was issued.
+        task._last_position = ("/shattered_islands/world_3_81_-1", 10, 16)
+        task._last_progress = time.monotonic() - 5.0
+        task._last_action = time.monotonic() - 1.0
+        client.state.map.world_x = 11
+        task._record_progress(client)
+        self.assertLess(task._step_times[-1], 1.5)
         # And the threshold never exceeds its cap, nor drops below the base.
         task._step_times.extend([30.0] * 8)
         self.assertEqual(task._stall_seconds(), task.STALL_RETRY_MAX_SECONDS)
