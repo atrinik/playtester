@@ -4904,9 +4904,7 @@ class FarmCircuitTask(BotTask):
         ) and self.clock() >= self._storage_retry_at
 
     def _needs_mass_identification(self, client: AtrinikClient) -> bool:
-        # Found food she cannot eat until identified joins the paid batch:
-        # without an identify device it has no other way to become food.
-        unknown = self._unidentified_items(client) + unidentified_food(client)
+        unknown = self._unidentified_items(client)
         # An unknown wand/rod may be the emergency recall capability which a
         # hands-off character otherwise cannot discover until an arbitrary
         # carrying threshold. Pay for one immediate reveal while recall is
