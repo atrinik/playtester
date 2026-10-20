@@ -1563,6 +1563,12 @@ class NavigateTask(BotTask):
     """Follow the authored path one verified protocol move at a time."""
 
     STALL_RETRY_SECONDS = 0.65
+    # A stall waits at least one movement acknowledgement at her speed
+    # (movement_ack_timeout), up to this. Live: heavy depletion slowed Sera,
+    # so every 0.65 s wait read as a stall; she learned the square she was
+    # stepping onto as blocked, cancelled the step for another and zigzagged
+    # in place until she starved, map after map.
+    STALL_RETRY_MAX_SECONDS = 6.0
     # Learned stall blockers are guesses. Once they leave no route at all and
     # the character has not moved for this long, they are the trap.
     LEARNED_BLOCK_RESET_SECONDS = 5.0
@@ -1918,12 +1924,27 @@ class NavigateTask(BotTask):
         position = (client.state.map.path, client.state.map.world_x,
                     client.state.map.world_y)
         if position != self._last_position:
+            now = time.monotonic()
             if (self._last_position is not None and
                 position[0] != self._last_position[0]):
                 self._runtime_blocked.clear()
                 self._threat_blocked.clear()
             self._last_position = position
-            self._last_progress = time.monotonic()
+            self._last_progress = now
+
+    def _stall_seconds(self, client: AtrinikClient | None = None) -> float:
+        """How long without a step counts as a stall, at her own pace.
+
+        At least one movement acknowledgement at her speed and action time
+        (movement_ack_timeout), so a slow step finishes instead of being
+        cancelled as a stall; STALL_RETRY_SECONDS when her speed is not known
+        yet, and never above the cap.
+        """
+        stats = getattr(getattr(client, "state", None), "stats", None)
+        if not stats or not float(stats.get("speed", 0) or 0):
+            return self.STALL_RETRY_SECONDS
+        return min(self.STALL_RETRY_MAX_SECONDS,
+                   max(self.STALL_RETRY_SECONDS, movement_ack_timeout(client)))
 
     def _movement_blockers(self, client: AtrinikClient) -> set[tuple[int, int]]:
         """Combine learned fixtures with currently visible living occupants."""
@@ -1968,7 +1989,7 @@ class NavigateTask(BotTask):
             return True
         if (goal == self._issued_goal and
                 position != self._issued_click and
-                now - self._last_progress < self.STALL_RETRY_SECONDS):
+                now - self._last_progress < self._stall_seconds(client)):
             return True
         if (goal == self._issued_goal and
                 position != self._issued_click and
@@ -2413,7 +2434,10 @@ class NavigateTask(BotTask):
             if self.tolerance:
                 if not self._approach:
                     self._approach = self._approach_candidates()
-                elif time.monotonic() - self._last_progress > 1.5:
+                elif (time.monotonic() - self._last_progress >
+                      max(1.5, self._stall_seconds(client) + 1.0)):
+                    # Later than the stall deadline: the current goal's stall
+                    # is learned (its blocker, the cancelled move) first.
                     # An authored wall, counter, or NPC can occupy a candidate.
                     # Try the next perimeter square only after movement stalls,
                     # so a long valid path is not repeatedly cleared.
