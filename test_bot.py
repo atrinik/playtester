@@ -9023,43 +9023,59 @@ class QuestTests(unittest.TestCase):
         async def nothing(*args, **kwargs):
             return None
 
-        client.move_item, client.clear_actions = move_item, nothing
-        items = [
-            Item(1, name="gargoyle leather cuirass", weight=8.45, flags=c.ITEM_APPLIED, quality=80),
-            Item(2, name="copper coin", item_type=c.TYPE_MONEY, weight=0.01, quantity=851, quality=80),
-            Item(3, name="pine arrows", item_type=c.TYPE_ARROW, weight=0.075, quantity=19, quality=80),
-            Item(4, name="paper volume of things", item_type=c.TYPE_BOOK, weight=0.75, quality=80),
+        client.move_item, client.clear_actions, client.send = move_item, nothing, nothing
+        q = dict(quality=80)
+        for item in [
+            Item(1, name="gargoyle leather cuirass", weight=8.45, flags=c.ITEM_APPLIED, **q),
+            Item(2, name="copper coin", item_type=c.TYPE_MONEY, weight=0.01, quantity=851, **q),
+            Item(3, name="pine arrows", item_type=c.TYPE_ARROW, weight=0.075, quantity=19, **q),
+            Item(4, name="paper volume of things", item_type=c.TYPE_BOOK, weight=0.75, **q),
             Item(5, name="paper listing of lost artifacts", item_type=c.TYPE_BOOK, weight=0.75,
-                 flags=c.ITEM_LOCKED, quality=80),
-            Item(6, name="wool sack", item_type=c.TYPE_CONTAINER, weight=6.0, quality=80),
-            Item(7, name="Incuna Tavern Barn Key", weight=0.1, quality=80),
-            Item(8, name="torch", item_type=c.TYPE_LIGHT_APPLY, weight=12.0, quality=80),
+                 flags=c.ITEM_LOCKED, **q),
+            Item(6, name="wool sack", item_type=c.TYPE_CONTAINER, weight=6.0, **q),
+            Item(7, name="Incuna Tavern Barn Key", weight=0.1, **q),
+            Item(8, name="torch", item_type=c.TYPE_LIGHT_APPLY, weight=12.0, **q),
             Item(9, name="minor healing", item_type=c.TYPE_SPELL),
-        ]
-        for item in items:
+            # Quest objectives and unidentified loot are never junk.
+            Item(11, name="Letter from Nyhelobo", item_type=c.TYPE_BOOK, weight=5.0, **q),
+            Item(12, name="shipment of Charob Beer", weight=15.0, **q),
+            Item(10, name="throwing daggers", item_type=c.TYPE_WEAPON, weight=20.0),
+            Item(13, name="iron throwing hammers", item_type=c.TYPE_WEAPON, weight=0.7, **q),
+        ]:
             client.state.place_item(item, 7)
-        # Unidentified loot stays: it may be valuable.
-        client.state.place_item(Item(10, name="throwing daggers", item_type=c.TYPE_WEAPON, weight=20.0), 7)
         autoplay = AutoplayTask(WorldGraph(), target_level=115)
         autoplay.status = TaskStatus.RUNNING
         autoplay._intro_complete = True
-        for _ in range(6):
+        # Never in a fight, nor below the health floor.
+        client.state.target_code = c.TARGET_ENEMY
+        asyncio.run(autoplay.tick(client))
+        client.state.target_code = c.TARGET_SELF
+        client.state.stats["hp"] = 40
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(moved, [])
+        client.state.stats["hp"] = 100
+        for _ in range(8):
             autoplay._shed_at = 0.0
             asyncio.run(autoplay.tick(client))
-        # Heaviest first, only identified unlocked junk; then nothing more to shed.
-        self.assertEqual(moved, [8, 3, 4])
-        self.assertTrue({1, 2, 5, 6, 7, 9, 10}.isdisjoint(moved))
+        # Heaviest first, only positively classified junk.
+        self.assertEqual(moved, [8, 3, 4, 13])
         self.assertIn("overload-shed", [record["action"] for record in client.decision_history])
+        # Attempts are kept only for items still carried.
+        self.assertEqual(set(autoplay._shed_attempts), set())
 
     def test_hunger_rises_as_she_slows(self):
         from .navigation import hungry
         client = AtrinikClient(ClientConfig())
-        client.state.stats.update({"food": 400, "speed": 1.0})
+        client.state.stats.update({"food": 300, "speed": 1.0})
         self.assertFalse(hungry(client))
         client.state.stats["speed"] = 0.1
         self.assertTrue(hungry(client))
         client.state.stats.update({"food": 170, "speed": 0})
         self.assertTrue(hungry(client))
+        # Never above a temple meal's "fed" level: no meal-after-meal loop.
+        from .tasks import TempleFoodTask
+        client.state.stats.update({"food": TempleFoodTask.FED, "speed": 0.1})
+        self.assertFalse(hungry(client))
 
     def test_autoplay_pauses_any_phase_to_eat_at_a_temple_when_starving(self):
         from . import autoplay as autoplay_module

@@ -3659,6 +3659,10 @@ def food_reserve(client: AtrinikClient) -> int:
 
 # Food below which she leaves to get more, at full speed (1.0 or faster).
 HUNGER_FOOD = 180
+# The scaled threshold stays below what a temple meal counts as fed
+# (TempleFoodTask.FED, 400, of a fill to 500): above it, every completed meal
+# would still read as hungry and start another trip.
+HUNGER_FOOD_MAX = 350
 
 
 def hungry(client: AtrinikClient) -> bool:
@@ -3672,8 +3676,9 @@ def hungry(client: AtrinikClient) -> bool:
     """
     speed = float(client.state.stats.get("speed", 0) or 0)
     slowdown = 1.0 / min(1.0, max(0.1, speed)) if speed > 0 else 1.0
+    threshold = min(HUNGER_FOOD_MAX, HUNGER_FOOD * slowdown)
     return (food_reserve(client) <= 1 and
-            int(client.state.stats.get("food", 1000) or 0) < HUNGER_FOOD * slowdown)
+            int(client.state.stats.get("food", 1000) or 0) < threshold)
 
 
 def temple_food_trip(graph: "WorldGraph",

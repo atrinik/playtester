@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from .client import AtrinikClient
@@ -11,8 +12,8 @@ from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
                          analyzer_farm_selection, hungry, temple_food_trip)
 from .quest_tasks import EscapingDesertedIslandTask
 from . import constants as c
-from .tasks import (BotTask, InventoryPolicy, JunkPolicy, RetrieveItemsTask,
-                    SafetyPolicy, TaskStatus)
+from .tasks import (BotTask, InventoryPolicy, RetrieveItemsTask, SafetyPolicy,
+                    TaskStatus)
 
 log = logging.getLogger(__name__)
 
@@ -49,25 +50,23 @@ class AutoplayTask(BotTask):
         self._shed_attempts: dict[int, int] = {}
         self.safety = SafetyPolicy()
 
-    # Never shed these: money, food, containers (their contents would go too),
-    # consumables and devices, jewellery and valuables, and non-objects.
-    SHED_KEEP_TYPES = frozenset({
-        c.TYPE_MONEY, c.TYPE_FOOD, c.TYPE_CONTAINER, c.TYPE_POTION,
-        c.TYPE_SCROLL, c.TYPE_WAND, c.TYPE_ROD, c.TYPE_RING, c.TYPE_AMULET,
-        c.TYPE_GEM, c.TYPE_JEWEL, c.TYPE_NUGGET, c.TYPE_SKILL, c.TYPE_SPELL,
-        c.TYPE_FORCE, c.TYPE_SPELLBOOK})
     # Seconds between drops: the server must take one before the next.
     SHED_INTERVAL = 2.0
+    # Shedding never preempts survival: only at this health or above, and
+    # never with an enemy targeted.
+    SHED_MIN_HEALTH = 0.70
+    # Generated library books carry a material prefix; letters and other
+    # quest documents do not.
+    LIBRARY_BOOK = re.compile(r"^(?:rice paper|paper|vellum|parchment) ")
 
     def _sheddable(self, client: AtrinikClient) -> list:
-        """Loose items she may drop when overloaded, heaviest first.
-
-        Only unlocked ones: anything she or the operator locked stays, as do
-        the keep classes above, keys and quest items, food by name, and
-        ammunition for a missile weapon she wields.
+        """Positively classified junk she may drop when overloaded, heaviest
+        first: generated library books, spare ammunition (none while she
+        wields a missile weapon), throwing weapons and light sources. Only
+        identified, unlocked, unworn, paid items; anything else, quest
+        objectives included, stays.
         """
-        policy, keep = InventoryPolicy(), JunkPolicy().keep_patterns
-        food_words = SafetyPolicy().food_patterns
+        policy = InventoryPolicy()
         shooting = any(item.item_type == c.TYPE_BOW and item.flags & c.ITEM_APPLIED
                        for item in client.state.inventory)
         candidates = []
@@ -75,14 +74,16 @@ class AutoplayTask(BotTask):
             name = item.name.casefold()
             if (item.weight * item.quantity <= 0 or
                     item.flags & (c.ITEM_APPLIED | c.ITEM_LOCKED | c.ITEM_UNPAID) or
-                    item.item_type in self.SHED_KEEP_TYPES or
-                    item.item_type == c.TYPE_ARROW and shooting or
-                    policy.preserve(item) or
-                    any(word in name for word in keep) or
-                    any(word in name for word in food_words) or
+                    not policy.identified(item) or
                     self._shed_attempts.get(item.tag, 0) >= 2):
                 continue
-            candidates.append(item)
+            junk = (
+                item.item_type == c.TYPE_BOOK and self.LIBRARY_BOOK.match(name) or
+                item.item_type == c.TYPE_ARROW and not shooting or
+                item.item_type == c.TYPE_WEAPON and "throwing" in name or
+                item.item_type == c.TYPE_LIGHT_APPLY)
+            if junk:
+                candidates.append(item)
         return sorted(candidates, key=lambda item: -item.weight * item.quantity)
 
     async def _shed_overload(self, client: AtrinikClient) -> bool:
@@ -90,11 +91,23 @@ class AutoplayTask(BotTask):
 
         Live: 59 depletion points left Sera strength 1, a 25 kg limit and
         50 kg carried; at speed 0.1 every food trip ended in starvation, and
-        each death's depletion made her weaker still. One drop per tick, the
-        rest of the tick held, so navigation cannot cancel the queued move.
+        each death's depletion made her weaker still. Only when safe, one drop
+        per tick, the rest of that tick held so navigation cannot cancel the
+        queued move.
         """
+        # Attempts are for live items only: a tag gone from her inventory
+        # (dropped, sold, used) is forgotten.
+        live = {item.tag for item in client.state.inventory}
+        for tag in [tag for tag in self._shed_attempts if tag not in live]:
+            del self._shed_attempts[tag]
         if (not getattr(client.state, "inventory_replay_complete", True) or
                 InventoryPolicy().weight_ratio(client) <= 1.0):
+            return False
+        stats = client.state.stats
+        health = (float(stats.get("hp", 0) or 0) /
+                  max(1.0, float(stats.get("maxhp", 0) or 0)))
+        if (health < self.SHED_MIN_HEALTH or
+                getattr(client.state, "target_code", c.TARGET_SELF) == c.TARGET_ENEMY):
             return False
         now = time.monotonic()
         if now < self._shed_at:
