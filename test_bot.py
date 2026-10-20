@@ -11711,6 +11711,57 @@ class NavigationTests(unittest.TestCase):
         self.assertIn((11, 16), task._runtime_blocked)
         self.assertEqual(len(client.steps), 2)
 
+    def test_a_slow_walker_is_not_stalled_between_her_own_steps(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = type("State", (), {})()
+                self.state.phase = "playing"
+                self.state.inventory = []
+                self.state.stats = {"speed": 0.5}
+                self.state.map = type("Map", (), {
+                    "path": "/shattered_islands/world_3_81_-1",
+                    "world_x": 10, "world_y": 16,
+                    "width": 17, "height": 17,
+                })()
+                self.steps = []
+
+            async def move_to_view(self, x, y):
+                pass
+
+            async def clear_actions(self):
+                pass
+
+            async def move(self, direction):
+                self.steps.append(direction)
+
+        client = FakeClient()
+        task = NavigateTask(
+            self.graph, "/shattered_islands/world_3_81_-1", (23, 5),
+            allow_locked=False)
+        # At speed 0.5 one movement acknowledgement takes 1 / 0.5 + 0.5 s.
+        self.assertAlmostEqual(task._stall_seconds(client), 2.5)
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.steps), 1)
+        # Two seconds without a step is her normal pace, not a stall.
+        task._last_progress -= 2.0
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._runtime_blocked, set())
+        self.assertEqual(len(client.steps), 1)
+        # Past one acknowledgement it is a stall again.
+        task._last_progress -= 0.7
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertIn((11, 16), task._runtime_blocked)
+        # Every speed gets its acknowledgement (speed 1.0: the 1.5 s floor),
+        # never above the cap; an unknown speed keeps the base.
+        client.state.stats = {"speed": 1.0}
+        self.assertEqual(task._stall_seconds(client), 1.5)
+        client.state.stats = {"speed": 0.05}
+        self.assertEqual(task._stall_seconds(client), task.STALL_RETRY_MAX_SECONDS)
+        client.state.stats = {}
+        self.assertEqual(task._stall_seconds(client), task.STALL_RETRY_SECONDS)
+
     def test_navigation_waits_for_living_occupant_in_only_corridor(self):
         graph = WorldGraph()
         node = MapNode("/test/corridor", width=3, height=3)
