@@ -4725,7 +4725,12 @@ class FarmCircuitTask(BotTask):
 
     def _needs_food_resupply(self, client: AtrinikClient) -> bool:
         # While shop resupply backs off, a temple can still feed her; a low
-        # reserve alone waits for the shop, she is not hungry yet.
+        # reserve alone waits for the shop, she is not hungry yet. Carried
+        # food she can identify on the spot comes first: it may already be
+        # the reserve (a failed identification backs off, and then she goes).
+        if (unidentified_food(client) and self._needs_inventory_capability(
+                client, InventoryCapabilityTask.PURPOSE_IDENTIFY)):
+            return False
         now = self.clock()
         if (now >= self._resupply_retry_at and
                 self._food_reserve(client) < self.FOOD_RESERVE_LOW):
@@ -5239,9 +5244,13 @@ class FarmCircuitTask(BotTask):
         """Whether only a detour outside the circuit can feed her now.
 
         Not while a hostile-route abort retraces to its safe origin: turning
-        that towards a priest could lead the attackers along.
+        that towards a priest could lead the attackers along. A running
+        inventory capability (seconds long, such as identifying the food she
+        carries) is no such trip: it finishes first.
         """
-        return not self.can_feed_her() and self._expedition_return is None
+        blocking = [service for service in self._maintenance_services()
+                    if service is not None and service is not self._capability]
+        return bool(blocking) and self._expedition_return is None
 
     def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
         """Return whether autoplay may replace this circuit between pulls."""

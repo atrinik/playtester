@@ -4796,6 +4796,23 @@ class QuestTests(unittest.TestCase):
             self.assertFalse(circuit._needs_inventory_capability(
                 client, InventoryCapabilityTask.PURPOSE_IDENTIFY))
 
+    def test_carried_food_is_identified_before_a_food_trip(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["food"] = 100
+        client.state.place_item(Item(49, item_type=c.TYPE_FOOD, name="mystery stew"), 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], clock=lambda: 10.0)
+        with patch.object(InventoryCapabilityTask, "candidates", return_value=[object()]):
+            # Identification first: no shop or temple trip yet.
+            self.assertFalse(circuit._needs_food_resupply(client))
+            # A running identification is no trip that blocks feeding her.
+            circuit._capability = InventoryCapabilityTask(InventoryCapabilityTask.PURPOSE_IDENTIFY)
+            self.assertFalse(circuit.needs_outside_food())
+            circuit._capability = None
+        # Without a device, or once it backs off, the food trip goes ahead.
+        with patch.object(InventoryCapabilityTask, "candidates", return_value=[]):
+            self.assertTrue(circuit._needs_food_resupply(client))
+
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:
             def __init__(self):
