@@ -4971,18 +4971,21 @@ class FarmCircuitTask(BotTask):
                 int(client.state.stats.get("food", 1000) or 0) < self.FOOD_URGENT)
 
     def _food_trip(self, client: AtrinikClient) -> tuple[NavigateThenTask | None, str]:
-        """The food trip to start now: the shop, or a temple priest.
+        """The food trip to start now: a temple priest, the shop, or none.
 
-        Hungry and unable to afford a merchant order above the protected
-        cash, she goes straight to a temple: walking to the shop only to be
-        refused there cost every hungry cycle a wasted trip.
+        Hungry, she asks a temple priest first: the food is free, so no
+        wallet ever turns her away (live, a broke character walked to the
+        shop each hungry cycle only to be refused). The shop restocks the
+        carried reserve before she is hungry, and feeds her when no temple
+        is available. Each honours its own retry deadline.
         """
-        affordable = (BuyShopUpgradeTask.wallet_value(client) >=
-                      self.FOOD_RESERVE_CASH + self._food_order_cost())
-        if self.clock() >= self._resupply_retry_at and (
-                affordable or not self._hungry(client)):
+        now = self.clock()
+        temple_ready = bool(self.graph.temple_priests) and now >= self._temple_food_retry_at
+        if self._hungry(client) and temple_ready:
+            return self._new_temple_food(client), "temple"
+        if now >= self._resupply_retry_at:
             return self._new_food_resupply(client), "shop"
-        return self._new_temple_food(client), "temple"
+        return None, ""
 
     def _food_order_cost(self) -> int:
         """What a usual restock order costs at the cheapest authored merchant
@@ -5006,7 +5009,8 @@ class FarmCircuitTask(BotTask):
         # reserve alone waits for the shop, she is not hungry yet. Carried
         # food she can identify on the spot comes first: it may already be
         # the reserve (a failed identification backs off, and then she goes).
-        if self._food_identification_pending(client):
+        if (self._food_identification_pending(client) and
+                not self._food_urgent(client)):
             return False
         now = self.clock()
         if (now >= self._resupply_retry_at and
