@@ -4870,6 +4870,12 @@ class QuestTests(unittest.TestCase):
         client = FakeClient([spell])
         self.assertFalse(asyncio.run(SafetyPolicy().enforce(client)))
         self.assertEqual(client.clears, 0)
+        # Below the heal trigger but not critical, the same holds: the meal
+        # is eaten, nothing is cleared, and she waits for SP (not safe).
+        client = FakeClient([spell, bread])
+        client.state.stats["hp"] = 50
+        self.assertFalse(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertEqual((client.applied, client.clears), ([53], 0))
 
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:
