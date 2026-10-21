@@ -171,7 +171,7 @@ class CompatibilityTests(unittest.TestCase):
         return SimpleNamespace(version=version, read_text=lambda name: direct)
 
     @staticmethod
-    def protocol_module(*, version: int = 1084):
+    def protocol_module(*, version: int = 1085):
         return SimpleNamespace(
             PROTOCOL_VERSION=version,
             ClientToServerCommand=SimpleNamespace(ACCESS_AUTH=23),
@@ -199,9 +199,9 @@ class CompatibilityTests(unittest.TestCase):
                          "a1af490e841891648015610a3418b0f5ba6daafb")
         protocol = lock["inputs"]["protocol"]
         self.assertEqual(protocol["distribution"], "atrinik-classic-protocol")
-        self.assertEqual(protocol["release"], "v5.90.0")
+        self.assertEqual(protocol["release"], "v5.106.0")
         self.assertEqual(protocol["sha256"],
-                         "5b8dc038184ff69b78a6b790310624fa9bda9ab8b11e87bd805a1beb4ee32c39")
+                         "d6567006ce0f815c6b1816fe19b5f3cc1739db755a6e77b899513359ad418368")
         analyzer = lock["inputs"]["farming_analyzer"]
         self.assertEqual((analyzer["repository"], analyzer["release"], analyzer["revision"]),
                          ("atrinik/tools", "v3.8.0", "c624e500fd59ca43835022ef58e64186ee71e9d0"))
@@ -292,7 +292,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(len(result["checks"]), 6)
         self.assertEqual(
             [check["artifact"] for check in result["checks"]][-3:],
-            ["atrinik_classic_protocol-5.90.0-py3-none-any.whl",
+            ["atrinik_classic_protocol-5.106.0-py3-none-any.whl",
              "atrinik-tools-farming-analyzer-3.8.0.tar.gz",
              "atrinik-classic-server-5.99.0.tar.gz"],
         )
@@ -322,7 +322,7 @@ class CompatibilityTests(unittest.TestCase):
 
         with mock.patch.object(
             compatibility, "protocol_compatibility",
-            return_value="5.49.0 wire 1084 sha256:candidate",
+            return_value="5.49.0 wire 1085 sha256:candidate",
         ):
             compatible = compatibility.preflight_lock(lock, opener=fake_open)
         self.assertEqual(len(compatible["checks"]), 7)
@@ -332,7 +332,7 @@ class CompatibilityTests(unittest.TestCase):
         with mock.patch.object(
             compatibility, "protocol_compatibility",
             side_effect=compatibility.CompatibilityError(
-                "installed protocol is incompatible: wire version 1080, expected 1084"
+                "installed protocol is incompatible: wire version 1080, expected 1085"
             ),
         ):
             incompatible = compatibility.preflight_lock(lock, opener=fake_open)
@@ -535,7 +535,7 @@ class CompatibilityTests(unittest.TestCase):
             compatibility.importlib, "import_module", return_value=candidate,
         ):
             detail = compatibility.protocol_compatibility(lock)
-        self.assertIn("wire 1084", detail)
+        self.assertIn("wire 1085", detail)
         self.assertIn(lock["inputs"]["protocol"]["sha256"], detail)
 
         for name, value in (("NPC_TARGET", 8),
@@ -551,14 +551,14 @@ class CompatibilityTests(unittest.TestCase):
             ), self.assertRaisesRegex(compatibility.CompatibilityError, name):
                 compatibility.protocol_compatibility(lock)
 
-    def test_protocol_source_override_requires_the_configured_1084_package(self) -> None:
+    def test_protocol_source_override_requires_the_configured_1085_package(self) -> None:
         _, _, lock = self.valid_inputs()
         source = self.root / "generated"
         package = source / "atrinik_protocol"
         package.mkdir(parents=True)
         (package / "__init__.py").write_text(
             "from enum import IntEnum\n"
-            "PROTOCOL_VERSION = 1084\n"
+            "PROTOCOL_VERSION = 1085\n"
             "class ClientToServerCommand(IntEnum): ACCESS_AUTH = 23\n"
             "class ServerToClientCommand(IntEnum):\n"
             "    ACCESS_RESULT = 29\n"
@@ -570,7 +570,7 @@ class CompatibilityTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                     "ATRINIK_PLAYTESTER_PROTOCOL_SOURCE": str(source)}):
                 detail = compatibility.protocol_compatibility(lock)
-            self.assertIn("wire 1084", detail)
+            self.assertIn("wire 1085", detail)
             self.assertIn(str(source), detail)
         finally:
             sys.modules.pop("atrinik_protocol", None)
@@ -586,9 +586,9 @@ class CompatibilityTests(unittest.TestCase):
         shadow = source / "shadow" / "atrinik_protocol"
         expected.mkdir(parents=True)
         shadow.mkdir(parents=True)
-        (expected / "__init__.py").write_text("PROTOCOL_VERSION = 1084\n")
+        (expected / "__init__.py").write_text("PROTOCOL_VERSION = 1085\n")
         shadow_file = shadow / "__init__.py"
-        shadow_file.write_text("PROTOCOL_VERSION = 1084\n")
+        shadow_file.write_text("PROTOCOL_VERSION = 1085\n")
         previous = sys.modules.get("atrinik_protocol")
         fake = SimpleNamespace(__file__=str(shadow_file))
         sys.modules["atrinik_protocol"] = fake

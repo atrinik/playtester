@@ -1957,7 +1957,7 @@ class AtrinikClient:
         known_flags2 = (c.MAP_FLAG2_ALPHA | c.MAP_FLAG2_ROTATE | c.MAP_FLAG2_ZOOM |
                         c.MAP_FLAG2_TARGET | c.MAP_FLAG2_PROBE | c.MAP_FLAG2_PRIORITY |
                         c.MAP_FLAG2_SECONDPASS | c.MAP_FLAG2_GLOW | c.MAP_FLAG2_ROOF |
-                        c.MAP_FLAG2_DOOR | c.MAP_FLAG2_EXIT)
+                        c.MAP_FLAG2_DOOR | c.MAP_FLAG2_EXIT | c.MAP_FLAG2_EMITTER)
         while body.remaining:
             mask = body.u16(); x, y = (mask >> 11) & 31, (mask >> 6) & 31
             values = mask & 63
@@ -1984,9 +1984,10 @@ class AtrinikClient:
                 fog_value = body.u8()
                 if fog_value > 1: raise ProtocolError("invalid MAP2 fow")
                 fogged = bool(fog_value)
-            if values & c.MAP2_MASK_LIGHT_LEVEL: tile.darkness[0] = body.u16()
+            # Signed Q4.11 environment radiance (2048 is daylight).
+            if values & c.MAP2_MASK_LIGHT_LEVEL: tile.darkness[0] = body.i16()
             if values & c.MAP2_MASK_LIGHT_LEVEL_MORE:
-                for sub in range(1, 7): tile.darkness[sub] = body.u16()
+                for sub in range(1, 7): tile.darkness[sub] = body.i16()
             count = body.u8()
             if count > c.MAP2_REAL_LAYERS: raise ProtocolError("too many MAP2 layers")
             seen=set()
@@ -2026,23 +2027,21 @@ class AtrinikClient:
                         obj.target_hp=body.u8()
                         if obj.target_hp > 100: raise ProtocolError("invalid MAP2 target hp")
                     if flags2 & c.MAP_FLAG2_GLOW: self._map_string(body,6); body.u8()
+                    if flags2 & c.MAP_FLAG2_EMITTER:
+                        # Darkness (negative radius) is achromatic and never
+                        # flickers; zero is never sent.
+                        radius, emitter=body.i8(), body.u8(); rgb=(body.u8(), body.u8(), body.u8())
+                        if (not radius or emitter & c.MAP2_EMITTER_RESERVED or
+                                radius < 0 and (emitter & c.MAP2_EMITTER_FLICKER or any(rgb))):
+                            raise ProtocolError("invalid MAP2 emitter")
                 tile.objects[layer]=obj
             ext=body.u8()
-            if ext & ~(c.MAP_EXT_ANIM|c.MAP_EXT_LIGHT_RGB|c.MAP_EXT_LIGHT_KEYFRAME): raise ProtocolError("unknown MAP2 tile flags")
+            if ext & ~(c.MAP_EXT_ANIM|c.MAP_EXT_LIGHT_RGB|c.MAP_EXT_LOCAL_LIGHT|c.MAP_EXT_OCCLUDER): raise ProtocolError("unknown MAP2 tile flags")
             if ext & c.MAP_EXT_LIGHT_RGB:
                 bitmap=body.u8()
                 if bitmap & ~127: raise ProtocolError("invalid MAP2 rgb bitmap")
                 for sub in range(7):
                     if bitmap & (1<<sub): body.u16(); body.u16(); body.u16()
-            if ext & c.MAP_EXT_LIGHT_KEYFRAME:
-                scalar=body.u8()
-                if scalar & ~127: raise ProtocolError("invalid MAP2 keyframe bitmap")
-                for sub in range(7):
-                    if scalar & (1<<sub): body.u16()
-                rgb=body.u8()
-                if rgb & ~scalar: raise ProtocolError("invalid MAP2 keyframe rgb")
-                for sub in range(7):
-                    if rgb & (1<<sub): body.u16(); body.u16(); body.u16()
             if ext & c.MAP_EXT_ANIM:
                 animations=body.u8(); seen_sub=set()
                 if animations > 7: raise ProtocolError("too many MAP2 animations")
@@ -2050,6 +2049,21 @@ class AtrinikClient:
                     sub, kind=body.u8(), body.u8(); body.i16()
                     if sub >= 7 or sub in seen_sub or kind not in (1,2): raise ProtocolError("invalid MAP2 animation")
                     seen_sub.add(sub)
+            if ext & c.MAP_EXT_LOCAL_LIGHT:
+                # Coarse per-sublayer local light: a signed 5-bit level
+                # (-16 is invalid), the tli bit, a reserved bit, vision floor.
+                levels=body.u8()
+                if not 1 <= levels <= 7: raise ProtocolError("invalid MAP2 local light")
+                for _ in range(levels):
+                    value=body.u8()
+                    if (value & c.MAP2_LOCAL_LIGHT_RESERVED or
+                            value & c.MAP2_LOCAL_LIGHT_LEVEL_MASK == 0x10):
+                        raise ProtocolError("invalid MAP2 local light")
+            if ext & c.MAP_EXT_OCCLUDER:
+                occluder, _horizontal, vertical=body.u16(), body.u16(), body.u8()
+                if (occluder & c.MAP2_OCCLUDER_RESERVED or
+                        vertical & c.MAP2_OCCLUDER_VERTICAL_RESERVED):
+                    raise ProtocolError("invalid MAP2 occluder")
             # Fog applies after the record: remembered geometry may remain,
             # but it must never remain an actionable target identity.
             if fogged:
@@ -2106,13 +2120,12 @@ class AtrinikClient:
             raise ProtocolError("MAP2 player position outside map")
         if update == c.MAP_SAME:
             m.scroll(px - m.world_x, py - m.world_y)
-        timed=marker & c.MAP2_CONTINUATION_TIMED_LIGHT; marker &= ~c.MAP2_CONTINUATION_TIMED_LIGHT
+        if marker & c.MAP2_CONTINUATION_TIMED_LIGHT:
+            # The timed-light descriptor was retired in protocol 1085.
+            raise ProtocolError("reserved MAP2 marker bit")
         if update == c.MAP_PARTIAL:
-            if timed or not marker or marker != sequence or (px,py,sublayer)!=(pending[3],pending[4],pending[5]): raise ProtocolError("invalid MAP2 continuation")
+            if not marker or marker != sequence or (px,py,sublayer)!=(pending[3],pending[4],pending[5]): raise ProtocolError("invalid MAP2 continuation")
         elif marker>4096: raise ProtocolError("too many MAP2 continuations")
-        if timed:
-            generation,start,end,flags=cur.u64(),cur.u64(),cur.u64(),cur.u8()
-            if not generation or end<=start or end-start!=3600 or not flags or flags & ~3: raise ProtocolError("invalid MAP2 timed light")
         count=cur.u8()
         if not 1<=count<=13: raise ProtocolError("invalid MAP2 level count")
         depths=set()

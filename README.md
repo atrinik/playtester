@@ -53,8 +53,8 @@ export ATRINIK_PLAYTESTER_PROTOCOL_SOURCE=/path/to/classic/protocol/generated/py
 ```
 
 The source directory must contain `atrinik_protocol`. Playtester requires the
-protocol revision 1084 and rejects an older installed wheel. The immutable
-`v5.90.0` lock identifies the matching released wire-1084 wheel, so normal
+protocol revision 1085 and rejects an older installed wheel. The immutable
+`v5.106.0` lock identifies the matching released wire-1085 wheel, so normal
 installation and `doctor` require no source override. Do not use the override
 for a released run; it validates the exact generated-source module origin
 rather than relabeling an installed artifact.

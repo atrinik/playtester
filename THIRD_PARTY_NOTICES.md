@@ -8,9 +8,9 @@ or Atrinik game content.
 
 ## Direct dependencies
 
-- `atrinik-classic-protocol` v5.90.0 is GPL-2.0-or-later. It is downloaded as
+- `atrinik-classic-protocol` v5.106.0 is GPL-2.0-or-later. It is downloaded as
   a checksum-pinned wheel from `atrinik/classic`
-  (`sha256:5b8dc038184ff69b78a6b790310624fa9bda9ab8b11e87bd805a1beb4ee32c39`)
+  (`sha256:d6567006ce0f815c6b1816fe19b5f3cc1739db755a6e77b899513359ad418368`)
   and is not vendored here.
 - `libatrinik` v5.48.0 is GPL-2.0-or-later. Its checksum-pinned source archive
   (`sha256:2b85b0ed3e122f1cfdb0d1aee1d5fcad3e906dfe51e4dbd5d7b9a5aac80f5c4d`)

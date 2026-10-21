@@ -31,7 +31,7 @@ ServerToClientCommand = _protocol.ServerToClientCommand
 SOCKET_VERSION = PROTOCOL_VERSION
 
 # TARGET's depth-aware framing was introduced by this protocol revision.
-REQUIRED_PROTOCOL_VERSION = 1084
+REQUIRED_PROTOCOL_VERSION = 1085
 if SOCKET_VERSION != REQUIRED_PROTOCOL_VERSION:
     raise RuntimeError(
         f"playtester requires Classic protocol {REQUIRED_PROTOCOL_VERSION}; "
@@ -124,7 +124,7 @@ CMD_PARTY_REMOVE_MEMBER = 7
 SETUP_SOUND = 0
 SETUP_MAPSIZE = 1
 SETUP_DATA_URL = 2
-# Reserved legacy setup subtype. Classic protocol 1084 does not negotiate a
+# Reserved legacy setup subtype. Classic protocol 1085 does not negotiate a
 # join password and the server rejects this subtype.
 SETUP_JOIN_PASSWORD = 3
 SETUP_ASSET_TRANSPORT = 4
@@ -160,6 +160,8 @@ MAP_PARTIAL = 3
 MAP2_MAX_DEPTH = 6
 MAP2_SUB_LAYERS = 7
 MAP2_REAL_LAYERS = 49
+# Protocol 1085 retired the timed-light descriptor; this marker bit is
+# reserved and rejected in every MAP2 header.
 MAP2_CONTINUATION_TIMED_LIGHT = 0x8000
 MAP2_ENVELOPE_MAX = 65_534
 MAP2_LEVEL_PAYLOAD_MAX = MAP2_ENVELOPE_MAX - 7 - 5
@@ -200,9 +202,21 @@ MAP_FLAG2_GLOW = 0x80
 MAP_FLAG2_ROOF = 0x100
 MAP_FLAG2_DOOR = 0x200
 MAP_FLAG2_EXIT = 0x400
+# Protocol 1085 client lighting: a per-object light emitter, 5 bytes after
+# the GLOW payload (i8 radius, u8 flags, u8 red, green, blue).
+MAP_FLAG2_EMITTER = 0x800
+MAP2_EMITTER_FLICKER = 0x01
+MAP2_EMITTER_RESERVED = 0xFE
 MAP_EXT_ANIM = 0x01
 MAP_EXT_LIGHT_RGB = 0x02
-MAP_EXT_LIGHT_KEYFRAME = 0x04
+# Protocol 1085 retired the light keyframe (0x04) and added coarse local
+# light levels and occluder faces.
+MAP_EXT_LOCAL_LIGHT = 0x08
+MAP_EXT_OCCLUDER = 0x10
+MAP2_LOCAL_LIGHT_LEVEL_MASK = 0x1F
+MAP2_LOCAL_LIGHT_RESERVED = 0x40
+MAP2_OCCLUDER_RESERVED = 0xC0F0
+MAP2_OCCLUDER_VERTICAL_RESERVED = 0xF0
 MAP_EXT_RGB16 = MAP_EXT_LIGHT_RGB
 ANIM_MOVING = 0x01
 
