@@ -39,7 +39,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
-                    SellJunkTask, TaskStatus,
+                    RetrieveItemsTask, SellJunkTask, TaskStatus,
                     TempleFoodTask, TempleServiceTask,
                     corpse_tile_standable, movement_ack_timeout,
                     recent_hostile_attackers,
@@ -1611,6 +1611,10 @@ class NavigateTask(BotTask):
         self._route_threat_maps: set[str] = set()
         self._threat_fallback = False
         self.allow_ranged_hazard_fallback = False
+        # Avoid every known hazard, the maps that killed her included, with
+        # no fallback tier: no safe route means no trip (the task fails and
+        # is retried later), never a dangerous one.
+        self.strict_safety = False
         self._failed_tile_crossings: set[tuple[str, str, int, int]] = set()
 
     async def start(self, client: AtrinikClient) -> None:
@@ -1644,10 +1648,11 @@ class NavigateTask(BotTask):
             return self._approach
         return [self.destination_xy]
 
-    def _known_ranged_hazard_maps(self, client: AtrinikClient) -> set[str]:
+    def _known_ranged_hazard_maps(self, client: AtrinikClient, *,
+                                  any_level: bool = False) -> set[str]:
         """Avoid authored ranged/caster transit maps while Sera is fragile."""
         stats = getattr(client.state, "stats", {})
-        if int(stats.get("level", 0) or 0) >= 18:
+        if not any_level and int(stats.get("level", 0) or 0) >= 18:
             return set()
         hazards = set()
         for path, identities in self.graph.map_monster_levels.items():
@@ -1727,11 +1732,54 @@ class NavigateTask(BotTask):
         # unroutable or change which other hazards are relaxed, and leaving
         # the map she stands on is free while re-entering it is not.
         learned = self._learned_route_hazards(client)
+        if self.strict_safety:
+            return self._plan_strict(client, learned)
         route = self._plan_avoiding(client, learned)
         if any(edge.destination in learned for edge in route):
             # Entering a map that killed her, the destination included, is
             # never "threat-free" when choosing between optional destinations.
             self._threat_fallback = True
+        return route
+
+    def _plan_strict(self, client: AtrinikClient,
+                     learned: set[str]) -> list[MapEdge]:
+        """Route around every known hazard, or raise ValueError.
+
+        Ranged maps count at any level here: a depleted character is fragile
+        whatever her level. The map she stands on and the destination itself
+        are exempt; leaving one or arriving cannot be avoided.
+        """
+        source = client.state.map.path
+        avoided = (
+            self._known_ranged_hazard_maps(client, any_level=True) |
+            self._known_overlevel_hazard_maps(client) |
+            self._known_pack_hazard_maps(source) |
+            set(self.KNOWN_LETHAL_TRANSIT) | learned
+        ) - {source, self.destination}
+        args = (
+            source,
+            (client.state.map.world_x, client.state.map.world_y),
+            self.destination,
+            self._goal_points(),
+        )
+        kwargs = {
+            "allow_locked": self._allow_locked(client),
+            "excluded": self._excluded_edges,
+            "avoided_maps": avoided,
+        }
+        try:
+            route = self.graph.route_points(*args, **kwargs)
+        except ValueError:
+            # Components are derived data; retry once with a fresh cache.
+            self.graph._component_cache.clear()
+            try:
+                route = self.graph.route_points(*args, **kwargs)
+            except ValueError as exc:
+                raise ValueError(
+                    f"no route to {self.destination} avoiding every known "
+                    f"hazard: {exc}") from exc
+        self._threat_fallback = False
+        self._route_threat_maps = set()
         return route
 
     def _plan_avoiding(self, client: AtrinikClient,
@@ -4168,6 +4216,13 @@ class FarmCircuitTask(BotTask):
         self._bed_search: tuple[tuple, SavebedSearch] | None = None
         self._selling: NavigateThenTask | None = None
         self._selling_retry_at = 0.0
+        # Raising money for the depletion cure from apartment stock: the
+        # retrieval trip, its retry time, and the sale and identification it
+        # leaves pending (each run on strictly safe routes).
+        self._cure_funding: NavigateThenTask | None = None
+        self._cure_funding_retry_at = 0.0
+        self._cure_sale_pending = False
+        self._cure_identify_pending = False
         self._banking: NavigateThenTask | None = None
         self._banking_retry_at = 0.0
         self._force_bank_deposit = False
@@ -4941,10 +4996,12 @@ class FarmCircuitTask(BotTask):
         unknown = self._unidentified_items(client)
         valuables = [item for item in client.state.inventory
                      if policy.apartment_valuable(item)]
+        # Stock taken out for a cure identify-all stays out until then.
         return bool(unknown or valuables) and (
             bool(valuables) or
             policy.weight_ratio(client) >= self.ROUTINE_TOWN_TRIP_WEIGHT
-        ) and self.clock() >= self._storage_retry_at
+        ) and self.clock() >= self._storage_retry_at and (
+            not self._cure_identify_pending)
 
     def _needs_mass_identification(self, client: AtrinikClient) -> bool:
         unknown = self._unidentified_items(client)
@@ -4959,13 +5016,15 @@ class FarmCircuitTask(BotTask):
             any(item.item_type in (c.TYPE_ROD, c.TYPE_WAND)
                 for item in unknown))
         return (
-            (urgent_recall_candidate or (
+            (urgent_recall_candidate or
+             (self._cure_identify_pending and bool(unknown)) or (
                 len(unknown) >= self.MASS_IDENTIFY_BATCH_MINIMUM and
                 InventoryPolicy().weight_ratio(client) >=
                 self.MASS_IDENTIFY_WEIGHT)) and
             BuyShopUpgradeTask.wallet_value(client) >=
             self.MASS_IDENTIFY_COST + 1_000 and
-            self.clock() >= self._identification_retry_at
+            (self._cure_identify_pending or
+             self.clock() >= self._identification_retry_at)
         )
 
     def _needs_inventory_capability(
@@ -4997,6 +5056,7 @@ class FarmCircuitTask(BotTask):
             MassIdentifyTask("Kulgar", self.MASS_IDENTIFY_COST),
             destination_xy=(4, 9), combat_approach=True)
         task.navigation.tolerance = 1
+        task.navigation.strict_safety = self._cure_identify_pending
         return task
 
     def _new_apartment_storage(self) -> NavigateThenTask:
@@ -5169,6 +5229,9 @@ class FarmCircuitTask(BotTask):
         level = int(client.state.stats.get("level", 0) or 0)
         task.navigation.allow_ranged_hazard_fallback = (
             level >= self.SWAMP_TRANSIT_LEVEL)
+        # While depleted she is fragile whatever her level, so the cure trip
+        # never crosses a known hazard; with no safe route it waits.
+        task.navigation.strict_safety = True
         return task
 
     def _queue_depletion_service(self, client: AtrinikClient) -> bool:
@@ -5176,6 +5239,85 @@ class FarmCircuitTask(BotTask):
             return False
         self._restoration = self._new_depletion_service(client)
         return True
+
+    # Seconds before another funding trip once one found nothing to take, or
+    # failed; after a productive one the follow-up sale decides.
+    CURE_FUNDING_RETRY_SECONDS = 6 * 3600.0
+    # Stop taking stock out of the chest at this share of the weight limit:
+    # an overloaded, depleted character is slow and easy to kill.
+    CURE_FUNDING_WEIGHT = 0.80
+
+    def _cure_shortfall(self, client: AtrinikClient) -> bool:
+        """Depleted enough to need the priest, but unable to pay him."""
+        return (self._has_depletion(client) and
+                client.state.depletion_points_known and
+                client.state.depletion_points >=
+                self.DEPLETION_SERVICE_THRESHOLD and
+                client.state.bank_balance_known and
+                BuyShopUpgradeTask.wallet_value(client) <
+                self._depletion_service_cost(client))
+
+    def _needs_cure_funding(self, client: AtrinikClient) -> bool:
+        return (self._cure_shortfall(client) and
+                not self._cure_sale_pending and
+                not self._cure_identify_pending and
+                self.clock() >= self._cure_funding_retry_at)
+
+    def _cure_funding_wants(self, client: AtrinikClient) -> Callable[[Item], bool]:
+        """What to take from the chest: identified sellable junk, and the
+        unidentified stock too once identify-all is affordable."""
+        policy = InventoryPolicy()
+        identify = (BuyShopUpgradeTask.wallet_value(client) >=
+                    self.MASS_IDENTIFY_COST + 1_000)
+        return lambda item: (
+            policy.sellable_junk(item) or
+            (identify and policy.apartment_unidentified(item)))
+
+    def _new_cure_funding(self, client: AtrinikClient) -> NavigateThenTask:
+        task = NavigateThenTask(
+            self.graph,
+            "/shattered_islands/strakewood_island/apartments/apartment_cheap",
+            RetrieveItemsTask(
+                "chest", predicate=self._cure_funding_wants(client),
+                max_weight_ratio=self.CURE_FUNDING_WEIGHT),
+            destination_xy=(1, 3), combat_approach=True)
+        task.navigation.strict_safety = True
+        return task
+
+    def _settle_cure_funding(self, client: AtrinikClient) -> None:
+        """After the chest trip, queue the sale and identification it enables."""
+        task = self._cure_funding
+        self._cure_funding = None
+        retrieve = task.task if task is not None else None
+        if task is None or task.status == TaskStatus.FAILED:
+            log.warning("cure funding trip failed: %s",
+                        task.error if task is not None else "lost")
+            self._cure_funding_retry_at = (
+                self.clock() + self.CURE_FUNDING_RETRY_SECONDS)
+            return
+        policy = InventoryPolicy()
+        carried = client.state.inventory
+        self._cure_sale_pending = any(policy.sellable_junk(item) for item in carried)
+        self._cure_identify_pending = any(
+            item.tag in retrieve.retrieved and not policy.identified(item)
+            for item in carried)
+        log.info("cure funding: took %d item(s) from the apartment; sale %s, "
+                 "identify %s", len(retrieve.retrieved),
+                 self._cure_sale_pending, self._cure_identify_pending)
+        if not (self._cure_sale_pending or self._cure_identify_pending):
+            self._cure_funding_retry_at = (
+                self.clock() + self.CURE_FUNDING_RETRY_SECONDS)
+
+    def _reconcile_cure_funding(self, client: AtrinikClient) -> None:
+        """Drop a pending cure step that can no longer run, so it never
+        blocks storage or the next funding trip."""
+        if self._cure_identify_pending and (
+                not self._unidentified_items(client) or
+                BuyShopUpgradeTask.wallet_value(client) <
+                self.MASS_IDENTIFY_COST + 1_000):
+            self._cure_identify_pending = False
+        if self._cure_sale_pending and not self._identified_junk(client):
+            self._cure_sale_pending = False
 
     @staticmethod
     def _junk_policy(tags=()) -> JunkPolicy:
@@ -5236,18 +5378,21 @@ class FarmCircuitTask(BotTask):
     def _needs_junk_sale(self, client: AtrinikClient) -> bool:
         junk = self._identified_junk(client)
         return bool(junk) and (
+            self._cure_sale_pending or
             InventoryPolicy().weight_ratio(client) >=
             self.ROUTINE_TOWN_TRIP_WEIGHT
         ) and self.clock() >= self._selling_retry_at
 
     def _new_junk_sale(self, client: AtrinikClient) -> NavigateThenTask:
         surplus = self._surplus_equipment(client)
-        return NavigateThenTask(
+        task = NavigateThenTask(
             self.graph, "/shattered_islands/world_0_69",
             SellJunkTask(
                 "Brynknot shop floor",
                 self._junk_policy(item.tag for item in surplus)),
             destination_xy=(15, 7), combat_approach=True)
+        task.navigation.strict_safety = self._cure_sale_pending
+        return task
 
     def _needs_bank_sync(self, client: AtrinikClient) -> bool:
         # Persistent balance knowledge is needed only before a budgeted
@@ -5300,7 +5445,7 @@ class FarmCircuitTask(BotTask):
     def _maintenance_services(self) -> tuple[BotTask | None, ...]:
         """Every maintenance trip but food resupply; each runs to completion."""
         return (
-            self._storage, self._identification,
+            self._storage, self._identification, self._cure_funding,
             self._bed_binding, self._selling, self._banking,
             self._bank_sync, self._shopping, self._recall_shopping,
             self._utility_shopping,
@@ -6110,6 +6255,7 @@ class FarmCircuitTask(BotTask):
                 log.warning("identified junk sale failed: %s",
                             self._selling.error)
                 self._selling_retry_at = self.clock() + 1800.0
+                self._cure_sale_pending = False
                 self._selling = None
             elif self._selling.status == TaskStatus.COMPLETE:
                 log.info("identified junk sale complete; returning to farm")
@@ -6123,6 +6269,7 @@ class FarmCircuitTask(BotTask):
                     client.state.last_bank_deposit_at = 0.0
                 self._banking_retry_at = 0.0
                 self._force_bank_deposit = True
+                self._cure_sale_pending = False
                 self._selling = None
             return
         if self._identification is not None:
@@ -6131,6 +6278,7 @@ class FarmCircuitTask(BotTask):
                 log.warning("mass identification failed: %s",
                             self._identification.error)
                 self._identification_retry_at = self.clock() + 1800.0
+                self._cure_identify_pending = False
                 self._identification = None
             elif self._identification.status == TaskStatus.COMPLETE:
                 # Evaluate the newly revealed batch before returning to a
@@ -6142,7 +6290,19 @@ class FarmCircuitTask(BotTask):
                     return
                 log.info("mass identification complete; returning to farm")
                 self._identification_retry_at = self.clock() + 3600.0
+                if self._cure_identify_pending:
+                    # Sell what identification showed to be sellable junk.
+                    self._cure_identify_pending = False
+                    self._cure_sale_pending = any(
+                        InventoryPolicy().sellable_junk(item)
+                        for item in client.state.inventory)
                 self._identification = None
+            return
+        if self._cure_funding is not None:
+            await self._cure_funding.tick(client)
+            if self._cure_funding.status in (TaskStatus.FAILED,
+                                             TaskStatus.COMPLETE):
+                self._settle_cure_funding(client)
             return
         if self._storage is not None:
             await self._storage.tick(client)
@@ -6176,6 +6336,7 @@ class FarmCircuitTask(BotTask):
             self._settle_resupply(client)
             return
         farm = self.child.task
+        self._reconcile_cure_funding(client)
         # All active maintenance branches returned above. Checkpoint only at
         # this boundary so reconnect cannot split a bank, shop, storage, or
         # resupply transaction in addition to the fight/corpse safety gate.
@@ -6225,6 +6386,12 @@ class FarmCircuitTask(BotTask):
                 await client.clear_actions()
                 await client.set_combat(False)
                 await self._restoration.tick(client)
+                return
+            if self._needs_cure_funding(client):
+                await client.clear_actions()
+                await client.set_combat(False)
+                self._cure_funding = self._new_cure_funding(client)
+                await self._cure_funding.tick(client)
                 return
         # Survival supplies first, then clear unknown/cursed-item risk and
         # carrying pressure; discretionary shopping is always last.

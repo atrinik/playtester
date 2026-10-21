@@ -483,6 +483,36 @@ class InventoryPolicy:
         # same sentinel while parsing an inventory item.
         return not self.needs_identification(item) or item.quality != 255
 
+    # Item types whose + (magic) raises nothing: they have no AC, WC or
+    # damage for it to add to. A bare "+N" ends the identified name; any
+    # real bonus follows it as a title ("of strength").
+    WORTHLESS_PLUS_TYPES: tuple[int, ...] = (c.TYPE_LIGHT_APPLY,)
+
+    def worthless_plus(self, item: Item) -> bool:
+        """An identified +N item whose + does nothing, such as a +1 torch:
+        junk, though shops still pay for it."""
+        return (
+            item.item_type in self.WORTHLESS_PLUS_TYPES and
+            self.identified(item) and
+            re.search(r"\s[+-]\d+$", item.name) is not None
+        )
+
+    def sellable_junk(self, item: Item) -> bool:
+        """Identified books and worthless-plus items: always worth selling.
+
+        Shops pay only a few copper for unidentified stock, so nothing
+        unidentified ever qualifies. Books are read once for literacy
+        before any sale (FarmTask.maintain_inventory runs first).
+        """
+        name = item.name.casefold()
+        return (
+            self.identified(item) and
+            not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID) and
+            not any(word in name for word in
+                    ("quest", "key", "formula", "recipe", "unique")) and
+            (item.item_type == c.TYPE_BOOK or self.worthless_plus(item))
+        )
+
     def apartment_unidentified(self, item: Item) -> bool:
         """Return an unknown item worth interrupting a farm to preserve."""
         # Ordinary food/flesh and ammunition commonly omit identification
@@ -502,6 +532,8 @@ class InventoryPolicy:
 
     def preserve(self, item: Item) -> bool:
         name = item.name.casefold()
+        if self.sellable_junk(item):
+            return False
         return (
             not self.identified(item) or
             item.item_type in (c.TYPE_SPELL, c.TYPE_SKILL, c.TYPE_SPELLBOOK) or
@@ -533,6 +565,7 @@ class InventoryPolicy:
         """Return a safely storable identified trophy or rare item."""
         name = item.name.casefold()
         if (not self.identified(item) or self.stackable(item) or
+                self.worthless_plus(item) or
                 item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID) or
                 item.item_type in (c.TYPE_SPELL, c.TYPE_SKILL, c.TYPE_MONEY) or
                 # Power crystals are renewable combat-mana reserves, not
@@ -4638,6 +4671,8 @@ class JunkPolicy:
             return False
         if not InventoryPolicy().identified(item):
             return False
+        if InventoryPolicy().sellable_junk(item):
+            return True
         if InventoryPolicy().preserve(item):
             return False
         if any(re.search(pattern, name) for pattern in self.keep_patterns):
@@ -5043,12 +5078,20 @@ class DepositItemsTask(BotTask):
 class RetrieveItemsTask(BotTask):
     """Retrieve matching items from an already visible house container."""
 
-    def __init__(self, container_name: str, patterns: tuple[str, ...], *,
-                 require_match: bool = False):
+    def __init__(self, container_name: str, patterns: tuple[str, ...] = (), *,
+                 require_match: bool = False,
+                 predicate: Callable[[Item], bool] | None = None,
+                 max_weight_ratio: float | None = None):
         super().__init__(f"retrieve:{container_name}")
         self.container_name = container_name.casefold()
         self.patterns = tuple(re.compile(pattern, re.I) for pattern in patterns)
         self.require_match = bool(require_match)
+        # Items matching either a name pattern or this predicate are taken.
+        self.predicate = predicate
+        # Stop taking more once carrying this share of the weight limit.
+        self.max_weight_ratio = max_weight_ratio
+        # Tags moved out of the container (requested; the server confirms).
+        self.retrieved: set[int] = set()
         self._matched = False
         self._opened = False
         self._opened_at = 0.0
@@ -5114,8 +5157,12 @@ class RetrieveItemsTask(BotTask):
         items = [
             item for tag in client.state.inventories.get(container.tag, [])
             if (item := client.state.items.get(tag)) is not None and
-            any(pattern.search(item.name) for pattern in self.patterns)
+            (any(pattern.search(item.name) for pattern in self.patterns) or
+             (self.predicate is not None and self.predicate(item)))
         ]
+        if (items and self.max_weight_ratio is not None and
+                InventoryPolicy().weight_ratio(client) >= self.max_weight_ratio):
+            items = []
         if not items:
             if self.require_match and not self._matched:
                 self.fail("required storage item was not found")
@@ -5124,6 +5171,7 @@ class RetrieveItemsTask(BotTask):
             return
         self._matched = True
         for item in items[:5]:
+            self.retrieved.add(item.tag)
             await client.move_item(
                 client.state.player_tag, item.tag, item.quantity)
 
