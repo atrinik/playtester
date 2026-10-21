@@ -16,6 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
+import types
 from collections.abc import Callable, Iterable, Sequence
 
 try:
@@ -3680,6 +3681,20 @@ def analyzer_spot_legs(spot: dict, graph: "WorldGraph") -> tuple[tuple[str, str]
     return tuple(legs)
 
 
+def depleted_for_temple(state) -> bool:
+    """Depleted at the temple-service threshold, by the live depletion force.
+
+    The counter can outlive a cure applied elsewhere (an item, or while
+    offline); only the live force proves she is still depleted.
+    """
+    depleted = any(item.item_type == c.TYPE_FORCE and
+                   item.name.casefold() == "depletion"
+                   for item in getattr(state, "inventory", ()))
+    return bool(depleted and getattr(state, "depletion_points_known", False) and
+                int(getattr(state, "depletion_points", 0) or 0) >=
+                FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD)
+
+
 def effective_farm_objective(state) -> str:
     """The objective farming follows right now.
 
@@ -3688,16 +3703,62 @@ def effective_farm_objective(state) -> str:
     spots until the temple removes it; then the choice applies again.
     """
     chosen = getattr(state, "farm_objective", DEFAULT_OBJECTIVE)
-    # The counter can outlive a cure applied elsewhere (an item, or while
-    # offline); only the live depletion force proves she is still depleted.
-    depleted = any(item.item_type == c.TYPE_FORCE and
-                   item.name.casefold() == "depletion"
-                   for item in getattr(state, "inventory", ()))
-    if (depleted and getattr(state, "depletion_points_known", False) and
-            int(getattr(state, "depletion_points", 0) or 0) >=
-            FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD):
-        return "safety"
-    return chosen
+    return "safety" if depleted_for_temple(state) else chosen
+
+
+# Services a depleted character must reach for her cure and its funding: the
+# bank, the apartment chest, the Brynknot shop floor and Saruthar's temple.
+TOWN_SERVICES: tuple[tuple[str, tuple[int, int]], ...] = (
+    ("/shattered_islands/world_0_67", (19, 15)),
+    ("/shattered_islands/strakewood_island/apartments/apartment_cheap", (1, 3)),
+    ("/shattered_islands/world_0_69", (15, 7)),
+    ("/shattered_islands/world_3_58", (13, 13)),
+)
+_town_reach_cache: dict[tuple, bool] = {}
+
+
+def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
+                          path: str) -> bool:
+    """Whether every town service is strictly reachable from ``path``.
+
+    Economy trips plan with strict_safety, so from a map where this fails her
+    selling and cure trips cannot start. Planned from the map's most central
+    walkable square; cached per map, level and learned hazards.
+    """
+    stats = getattr(client.state, "stats", {})
+    level = int(stats.get("level", 0) or 0)
+    now = time.time()
+    learned = {map_path: until for map_path, until in
+               (getattr(client.state, "route_hazards", None) or {}).items()
+               if until > now}
+    key = (id(graph), path, level, frozenset(learned))
+    if key in _town_reach_cache:
+        return _town_reach_cache[key]
+    node = graph.nodes.get(path)
+    points = [] if node is None else [
+        (x, y) for x in range(node.width) for y in range(node.height)
+        if node.walkable(x, y)]
+    reachable = False
+    if points:
+        start = min(points, key=lambda point: (
+            (point[0] - node.width / 2) ** 2 + (point[1] - node.height / 2) ** 2))
+        proxy = types.SimpleNamespace(state=types.SimpleNamespace(
+            stats={"level": level}, route_hazards=learned,
+            inventory=list(getattr(client.state, "inventory", ())),
+            map=types.SimpleNamespace(path=path, world_x=start[0], world_y=start[1])))
+        reachable = True
+        for destination, xy in TOWN_SERVICES:
+            navigation = NavigateTask(graph, destination, destination_xy=xy)
+            navigation.strict_safety = True
+            try:
+                navigation._plan(proxy)
+            except ValueError:
+                reachable = False
+                break
+    if len(_town_reach_cache) > 512:
+        _town_reach_cache.clear()
+    _town_reach_cache[key] = reachable
+    return reachable
 
 
 def analyzer_farm_choice(
@@ -3708,6 +3769,10 @@ def analyzer_farm_choice(
     The farming analyzer is the source of truth. The only exceptions are live
     failures: a spot quarantined after a death, an emergency recall, ten minutes
     without XP, or an unreachable route is skipped until its quarantine ends.
+
+    While depleted, a safety spot is usable only if every map on it reaches
+    each town service on a strictly safe route (town_safely_reachable): her
+    selling and cure trips plan strictly, so she farms where they can start.
 
     If depletion prefers safety but no safety spot is usable, the chosen
     objective's spot applies. The circuit removes depletion before any farming
@@ -3725,7 +3790,10 @@ def analyzer_farm_choice(
         for spot in analyzer.ranking(objective):
             legs = analyzer_spot_legs(spot, graph)
             if legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
-                            for path, _ in legs):
+                            for path, _ in legs) and (
+                    not depleted_for_temple(client.state) or
+                    all(town_safely_reachable(client, graph, path)
+                        for path in dict.fromkeys(path for path, _ in legs))):
                 return objective, legs, spot
     return None
 

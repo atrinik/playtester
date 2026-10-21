@@ -13848,6 +13848,35 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         unknown = analyzer_spot("Nowhere", [self.TREES, "/no/such/map"], ["rat L1"])
         self.assertEqual(analyzer_spot_legs(unknown, graph), ())
 
+    def test_depleted_farming_picks_a_spot_whose_town_trips_route_strictly(self):
+        from .navigation import analyzer_farm_selection, town_safely_reachable
+
+        # Live case: depleted at level 27, the safety ranking led to the
+        # Morliana circuit, from which no strictly safe route reaches the
+        # bank, the shop or the temple, so no selling or cure trip could
+        # start. The Strakewood Island circuit reaches all of them.
+        graph = built_graph()
+        morliana = analyzer_spot("Morliana circuit", [
+            "/shattered_islands/world_11_4", "/shattered_islands/world_11_5",
+            "/shattered_islands/world_11_6"], ["rat L1"])
+        strakewood = analyzer_spot("Strakewood Island circuit", [
+            "/shattered_islands/world_0_51", "/shattered_islands/world_1_51"], ["rat L1"])
+        client = self.client({"xp": [morliana], "safety": [morliana, strakewood]})
+        client.state.stats["level"] = 27
+        self.assertFalse(town_safely_reachable(client, graph, "/shattered_islands/world_11_4"))
+        self.assertTrue(town_safely_reachable(client, graph, "/shattered_islands/world_0_51"))
+        client.state.depletion_points_known = True
+        client.state.depletion_points = 67
+        client.state.place_item(Item(
+            502, item_type=c.TYPE_FORCE, quality=0, name="depletion"), client.state.player_tag)
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Strakewood Island circuit")
+        # Not depleted, the analyzer's ranking applies unfiltered.
+        client.state.remove_item(502)
+        client.state.farm_objective = "safety"
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Morliana circuit")
+
     def test_selection_follows_the_objective_and_skips_live_failures(self):
         from .navigation import analyzer_farm_selection
 
