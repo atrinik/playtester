@@ -139,7 +139,7 @@ class AccessAdmissionTests(unittest.TestCase):
                 env=environment, text=True, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, check=False, timeout=10, cwd=directory)
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "1084")
+        self.assertEqual(completed.stdout.strip(), "1085")
 
     def test_access_code_is_not_in_config_representation(self):
         config = ClientConfig(access_code="0123456789ABCDEF")

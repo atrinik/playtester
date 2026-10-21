@@ -254,10 +254,10 @@ class ProtocolTests(unittest.TestCase):
                          "bollard_tied_e_1.101")
 
     def test_packet(self):
-        self.assertEqual(c.SOCKET_VERSION, 1084)
+        self.assertEqual(c.SOCKET_VERSION, 1085)
         self.assertEqual(
             Packet(c.S_VERSION).add("I", c.SOCKET_VERSION).encode(),
-            b"\x00\x05\x03\x00\x00\x04\x3c",
+            b"\x00\x05\x03\x00\x00\x04\x3d",
         )
 
     def test_target_select_uses_depth_aware_exact_payload(self):
@@ -433,8 +433,7 @@ class ProtocolTests(unittest.TestCase):
 
     @staticmethod
     def _map2_packet(update, levels, *, marker=0, world_x=4, world_y=5,
-                     sublayer=0, width=11, height=9, connected=None,
-                     timed=False):
+                     sublayer=0, width=11, height=9, connected=None):
         """Build a MAP2 packet directly from protocol constants and fields."""
         packet = bytearray((update,))
         if update not in (c.MAP_PARTIAL, c.MAP_SAME):
@@ -449,12 +448,7 @@ class ProtocolTests(unittest.TestCase):
                 tile, xoff, yoff, zoff = connected
                 packet.extend((tile, xoff & 0xff, yoff & 0xff, zoff & 0xff))
         packet.extend((world_x, world_y, sublayer))
-        packet.extend((marker | (c.MAP2_CONTINUATION_TIMED_LIGHT if timed else 0)).to_bytes(2, "big"))
-        if timed:
-            packet.extend((1).to_bytes(8, "big"))
-            packet.extend((7200).to_bytes(8, "big"))
-            packet.extend((10800).to_bytes(8, "big"))
-            packet.append(1)
+        packet.extend(marker.to_bytes(2, "big"))
         packet.append(len(levels))
         for depth, body in levels:
             packet.extend(depth.to_bytes(1, "big", signed=True))
@@ -991,23 +985,45 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_map2_complete_depth_range_timed_extensions_and_rejections(self):
+    @staticmethod
+    def _map2_emitter_tile(x, y, layer, actor_count, emitter, ext=b"\x00"):
+        """A target-bearing object that also carries a 1085 light emitter."""
+        mask = (x << 11) | (y << 6)
+        return (
+            mask.to_bytes(2, "big") + bytes((1, layer)) +
+            (321).to_bytes(2, "big") + bytes((0, c.MAP_FLAG_MORE)) +
+            (c.MAP_FLAG2_TARGET | c.MAP_FLAG2_EMITTER).to_bytes(4, "big") +
+            actor_count.to_bytes(4, "big") + bytes((0,)) + emitter + ext
+        )
+
+    def test_map2_complete_depth_range_lighting_extensions_and_rejections(self):
         async def scenario():
             client = AtrinikClient(ClientConfig())
-            rgb = self._map2_actor_tile(5, 4, 5, 100)
-            rgb = (rgb[:-1] + bytes((c.MAP_EXT_LIGHT_RGB |
-                                      c.MAP_EXT_LIGHT_KEYFRAME, 1)) +
+            # Signed environment light on the tile, a flickering emitter, then
+            # RGB16, ANIM, LOCAL_LIGHT and OCCLUDER in protocol order.
+            ext = (bytes((c.MAP_EXT_LIGHT_RGB | c.MAP_EXT_ANIM |
+                          c.MAP_EXT_LOCAL_LIGHT | c.MAP_EXT_OCCLUDER, 1)) +
                    b"\x00\x01\x00\x02\x00\x03" +
-                   b"\x01\x00\x04\x01\x00\x05\x00\x06\x00\x07")
+                   bytes((1, 0, 1)) + (-5).to_bytes(2, "big", signed=True) +
+                   bytes((2, 0x05, 0x80 | 0x1B)) +
+                   (0x0101).to_bytes(2, "big") + (0x1234).to_bytes(2, "big") + bytes((0x03,)))
+            tile = self._map2_emitter_tile(5, 4, 5, 100, bytes((3, 1, 255, 200, 100)), ext)
+            lit = ((5 << 11) | (4 << 6) | c.MAP2_MASK_LIGHT_LEVEL).to_bytes(2, "big")
+            tile = lit + (-300).to_bytes(2, "big", signed=True) + tile[2:]
             complete = self._map2_packet(
                 c.MAP_NEW,
-                [(depth, rgb if depth == 0 else b"")
-                 for depth in range(-c.MAP2_MAX_DEPTH, c.MAP2_MAX_DEPTH + 1)],
-                timed=True)
+                [(depth, tile if depth == 0 else b"")
+                 for depth in range(-c.MAP2_MAX_DEPTH, c.MAP2_MAX_DEPTH + 1)])
             await client._handle_map(Cursor(complete), complete)
             self.assertEqual(set(client.state.map.level_tiles), set(range(-6, 7)))
             self.assertEqual([obj.target_id for _, _, obj in client.state.map.targets()],
                              [100])
+            self.assertEqual(client.state.map.level_tiles[0][(5, 4)].darkness[0], -300)
+            # A remembered tile may arrive as a light-only record.
+            light_only = (((6 << 11) | (4 << 6) | c.MAP2_MASK_LIGHT_LEVEL).to_bytes(2, "big") +
+                          (2048).to_bytes(2, "big") + bytes((0, 0)))
+            packet = self._map2_packet(c.MAP_SAME, [(0, light_only)])
+            await client._handle_map(Cursor(packet), packet)
 
             published = client.state.map
             async def rejected(packet):
@@ -1016,6 +1032,10 @@ class ProtocolTests(unittest.TestCase):
                 self.assertIs(client.state.map, published)
 
             await rejected(self._map2_packet(c.MAP_NEW, [(0, b"")], marker=4097))
+            # The retired timed-light marker bit and keyframe extension.
+            await rejected(self._map2_packet(c.MAP_NEW, [(0, b"")], marker=0x8000))
+            plain = self._map2_actor_tile(5, 4, 5, 201)
+            await rejected(self._map2_packet(c.MAP_NEW, [(0, plain[:-1] + bytes((0x04, 0, 1)))]))
             first = self._map2_actor_tile(5, 4, 5, 101)
             second = self._map2_actor_tile(5, 4, 5, 102)
             duplicate_layer = first[:2] + b"\x02" + first[3:] + second[3:]
@@ -1030,10 +1050,18 @@ class ProtocolTests(unittest.TestCase):
             await rejected(self._map2_packet(c.MAP_NEW, [(0, b"")]) +
                            b"\0" * (c.MAP2_ENVELOPE_MAX + 1))
             await rejected(complete[:-1])
-            bad_keyframe = self._map2_actor_tile(5, 4, 5, 201)
-            bad_keyframe = (bad_keyframe[:-1] +
-                            bytes((c.MAP_EXT_LIGHT_KEYFRAME, 0, 1)))
-            await rejected(self._map2_packet(c.MAP_NEW, [(0, bad_keyframe)]))
+            for emitter in (bytes((0, 0, 0, 0, 0)),            # zero radius
+                            bytes((3, 2, 0, 0, 0)),            # reserved flag
+                            bytes((0xFD, 1, 0, 0, 0)),         # flickering darkness
+                            bytes((0xFD, 0, 9, 0, 0))):        # coloured darkness
+                await rejected(self._map2_packet(
+                    c.MAP_NEW, [(0, self._map2_emitter_tile(5, 4, 5, 202, emitter))]))
+            for ext in (bytes((c.MAP_EXT_LOCAL_LIGHT, 0)),            # no levels
+                        bytes((c.MAP_EXT_LOCAL_LIGHT, 1, 0x40)),      # reserved bit
+                        bytes((c.MAP_EXT_LOCAL_LIGHT, 1, 0x10)),      # level -16
+                        bytes((c.MAP_EXT_OCCLUDER, 0x00, 0x10, 0, 0, 0)),   # reserved
+                        bytes((c.MAP_EXT_OCCLUDER, 0, 0, 0, 0, 0x10))):     # vertical
+                await rejected(self._map2_packet(c.MAP_NEW, [(0, plain[:-1] + ext)]))
 
         asyncio.run(scenario())
 
