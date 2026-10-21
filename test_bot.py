@@ -2967,7 +2967,8 @@ class QuestTests(unittest.TestCase):
         self.assertTrue(asyncio.run(task.maintain_inventory(client)))
         self.assertTrue(asyncio.run(task.maintain_inventory(client)))
         self.assertEqual(client.applied, [21, 22])
-        self.assertEqual(client.locked, [21])
+        # Read lore is sellable junk, never locked; the spellbook is kept.
+        self.assertEqual(client.locked, [22])
         self.assertEqual(task._lore_book_attempts, {21})
         self.assertEqual(task._spellbook_attempts, {22})
 
@@ -3018,12 +3019,12 @@ class QuestTests(unittest.TestCase):
 
         client = FakeClient()
         task = FarmTask()
-        # Valuable books may still be locked for preservation, but the
-        # authoritative server flag prevents reapplying already-read lore.
+        # The authoritative server flag prevents reapplying already-read
+        # lore, and an identified book is sellable junk, so never locked.
         while asyncio.run(task.maintain_inventory(client)):
             pass
         self.assertEqual(client.applied, [])
-        self.assertEqual(client.locked, [31])
+        self.assertEqual(client.locked, [])
 
     def test_circuit_reconciles_inventory_at_fight_safe_boundary(self):
         class FakeClient:
@@ -9835,6 +9836,235 @@ class QuestTests(unittest.TestCase):
         self.assertEqual([item.tag for item in disease], [20, 21])
         self.assertEqual([item.tag for item in depletion], [22, 23])
 
+    def test_only_identified_books_and_worthless_plus_items_are_sellable_junk(self):
+        policy = InventoryPolicy()
+        torch = Item(1, item_type=c.TYPE_LIGHT_APPLY, quality=80,
+                     flags=c.ITEM_MAGICAL, name="torch +1")
+        titled = Item(2, item_type=c.TYPE_LIGHT_APPLY, quality=80,
+                      flags=c.ITEM_MAGICAL, name="torch +1 of brilliance")
+        unknown = Item(3, item_type=c.TYPE_LIGHT_APPLY, quality=255, name="torch")
+        book = Item(4, item_type=c.TYPE_BOOK, quality=80, name="book of tales")
+        unread = Item(5, item_type=c.TYPE_BOOK, quality=255, name="book")
+        quest = Item(6, item_type=c.TYPE_BOOK, quality=80, name="paper quest formula")
+        sword = Item(7, item_type=c.TYPE_WEAPON, quality=80,
+                     flags=c.ITEM_MAGICAL, name="steel sword +1")
+        self.assertTrue(policy.worthless_plus(torch))
+        self.assertFalse(policy.preserve(torch))
+        fine = Item(8, item_type=c.TYPE_BOOK, quality=95, name="fine book")
+        # Never locked away from the sale by its quality.
+        self.assertFalse(policy.should_lock(fine))
+        self.assertFalse(policy.apartment_valuable(torch))
+        self.assertEqual(
+            [item.tag for item in (torch, titled, unknown, book, unread, quest, sword)
+             if policy.sellable_junk(item)], [1, 4])
+        # Shops pay only a few copper for unidentified stock: never junk.
+        self.assertEqual(
+            [item.tag for item in (torch, unknown, book, unread, sword)
+             if JunkPolicy(sell_identified_junk=True).junk(item)], [1, 4])
+        # An operator's targeted sale sells only what it names.
+        self.assertEqual(
+            [item.tag for item in (torch, book)
+             if JunkPolicy((r"^steel ",)).junk(item)], [])
+
+    def test_economy_trips_route_strictly_and_storage_brings_back_sellable_stock(self):
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        client = self._depleted_client(100_000)
+        for trip in (circuit._new_apartment_storage(), circuit._new_junk_sale(client),
+                     circuit._new_mass_identification(), circuit._new_bank_sync(),
+                     circuit._new_bank_deposit(client), circuit._new_cure_funding(client),
+                     circuit._new_depletion_service(client)):
+            self.assertTrue(trip.navigation.strict_safety, trip.name)
+        follow = circuit._new_apartment_storage().task.then_retrieve
+        self.assertIsInstance(follow, RetrieveItemsTask)
+        self.assertEqual(follow.max_weight_ratio, circuit.STOCK_RETRIEVAL_WEIGHT)
+        book = Item(1, item_type=c.TYPE_BOOK, quality=80, name="book of tales")
+        self.assertTrue(follow.predicate(book))
+        # Books are never stored, even unidentified: they are sold.
+        unread = Item(2, item_type=c.TYPE_BOOK, quality=255, name="book")
+        self.assertFalse(InventoryPolicy().apartment_unidentified(unread))
+
+    def test_deposit_then_retrieves_in_the_same_visit(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.stats["weight_limit"] = 100
+                chest = Item(90, flags=c.ITEM_CONTAINER_OPEN, name="chest")
+                self.state.place_item(chest, 0)
+                self.state.place_item(Item(91, item_type=c.TYPE_BOOK, quality=80,
+                                           name="book of tales"), chest.tag)
+                self.moves = []
+
+            async def move_item(self, destination, tag, quantity=0):
+                self.moves.append((destination, tag))
+
+            async def apply(self, tag):
+                pass
+
+        client = FakeClient()
+        task = DepositItemsTask("chest", unidentified_only=True, then_retrieve=RetrieveItemsTask(
+            "chest", predicate=InventoryPolicy().sellable_junk))
+        task._opened = True
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.moves, [(7, 91)])
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+
+    def test_retrieve_items_takes_predicate_matches_up_to_a_weight_limit(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.stats["weight_limit"] = 100
+                chest = Item(90, flags=c.ITEM_CONTAINER_OPEN, name="chest")
+                self.state.place_item(chest, 0)
+                self.state.place_item(Item(91, item_type=c.TYPE_BOOK, quality=80,
+                                           name="book of tales"), chest.tag)
+                self.state.place_item(Item(92, item_type=c.TYPE_RING, quality=80,
+                                           name="ring"), chest.tag)
+                self.moves = []
+
+            async def move_item(self, destination, tag, quantity=0):
+                self.moves.append(tag)
+
+        client = FakeClient()
+        task = RetrieveItemsTask("chest", predicate=InventoryPolicy().sellable_junk,
+                                 max_weight_ratio=0.8)
+        asyncio.run(task.tick(client))
+        self.assertEqual((client.moves, task.retrieved), ([91], {91}))
+        # A stack that would cross the cap is not taken, however light she is.
+        client = FakeClient()
+        client.state.items[91].weight = 90.0
+        task = RetrieveItemsTask("chest", predicate=InventoryPolicy().sellable_junk,
+                                 max_weight_ratio=0.8)
+        asyncio.run(task.tick(client))
+        self.assertEqual((client.moves, task.status), ([], TaskStatus.COMPLETE))
+        # At the weight limit nothing more is taken.
+        client = FakeClient()
+        client.state.place_item(Item(93, item_type=c.TYPE_INORGANIC, quality=80,
+                                     weight=90.0, name="anvil"), 7)
+        task = RetrieveItemsTask("chest", predicate=InventoryPolicy().sellable_junk,
+                                 max_weight_ratio=0.8)
+        asyncio.run(task.tick(client))
+        self.assertEqual((client.moves, task.status), ([], TaskStatus.COMPLETE))
+
+    @staticmethod
+    def _depleted_client(bank: int):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats.update(level=27, weight_limit=100)
+        client.state.bank_balance = bank
+        client.state.bank_balance_known = True
+        client.state.depletion_points = 67
+        client.state.depletion_points_known = True
+        client.state.place_item(Item(
+            22, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        return client
+
+    def test_cure_shortfall_funds_the_cure_from_apartment_stock(self):
+        now = [1_000.0]
+        client = self._depleted_client(851)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")],
+                                  clock=lambda: now[0])
+        self.assertFalse(circuit._needs_depletion_service(client))
+        self.assertTrue(circuit._needs_cure_funding(client))
+        trip = circuit._new_cure_funding(client)
+        self.assertTrue(trip.navigation.strict_safety)
+        self.assertEqual(trip.navigation.destination,
+                         "/shattered_islands/strakewood_island/apartments/apartment_cheap")
+        unknown_ring = Item(30, item_type=c.TYPE_RING, quality=255, name="ring")
+        book = Item(31, item_type=c.TYPE_BOOK, quality=80, name="book of tales")
+        # Identify-all (1,450 plus the 1,000 reserve) is out of reach: only
+        # identified sellable junk comes out of the chest.
+        self.assertEqual([trip.task.predicate(item) for item in (unknown_ring, book)],
+                         [False, True])
+        client.state.bank_balance = 2_450
+        richer = circuit._new_cure_funding(client)
+        self.assertEqual([richer.task.predicate(item) for item in (unknown_ring, book)],
+                         [True, True])
+        client.state.bank_balance = 851
+
+        # A trip that found nothing waits six hours.
+        trip.task.status = TaskStatus.COMPLETE
+        circuit._cure_funding = trip
+        circuit._settle_cure_funding(client)
+        self.assertFalse(circuit._needs_cure_funding(client))
+        now[0] += circuit.CURE_FUNDING_RETRY_SECONDS
+        self.assertTrue(circuit._needs_cure_funding(client))
+
+        # Carried sellable junk is sold at once, without carrying pressure,
+        # on a strictly safe route, and no chest trip runs meanwhile.
+        client.state.place_item(book, 7)
+        self.assertFalse(circuit._needs_cure_funding(client))
+        self.assertTrue(circuit._needs_junk_sale(client))
+        self.assertTrue(circuit._new_junk_sale(client).navigation.strict_safety)
+        # Nothing is held in memory: a restarted circuit sells it too.
+        restarted = FarmCircuitTask(WorldGraph(), [("/farm", "rat")],
+                                    clock=lambda: now[0])
+        self.assertTrue(restarted._needs_junk_sale(client))
+        # Sold: the next chest trip may run.
+        client.state.items.pop(31)
+        client.state.inventories[7].remove(31)
+        self.assertTrue(circuit._needs_cure_funding(client))
+        # Able to pay, nothing about funding applies.
+        client.state.bank_balance = 5_000
+        self.assertFalse(circuit._needs_cure_funding(client))
+        self.assertFalse(circuit._needs_junk_sale(client))
+
+    def test_cure_identify_all_needs_a_batch_and_keeps_it_out_of_storage(self):
+        client = self._depleted_client(2_450)
+        # From level 30 the cure (2,540 here) costs more than identify-all
+        # with its reserve (2,450); below that she simply buys the cure.
+        client.state.stats["level"] = 31
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        client.state.place_item(Item(40, item_type=c.TYPE_RING, quality=255, name="ring"), 7)
+        # One stray unknown never buys a 1,450 identify-all.
+        self.assertFalse(circuit._cure_identify_due(client))
+        for tag in range(41, 41 + circuit.MASS_IDENTIFY_BATCH_MINIMUM):
+            client.state.place_item(Item(tag, item_type=c.TYPE_RING, quality=255,
+                                         name="ring"), 7)
+        # A batch is identified without carrying pressure, and storage leaves
+        # it carried (valuables would still be stored, unknowns kept).
+        self.assertTrue(circuit._cure_identify_due(client))
+        self.assertTrue(circuit._needs_mass_identification(client))
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        self.assertTrue(circuit._new_mass_identification().navigation.strict_safety)
+        self.assertFalse(circuit._new_apartment_storage(keep_unknown=True).task.unidentified_only)
+        self.assertFalse(circuit._needs_cure_funding(client))
+        # Unaffordable: nothing is due and the next chest trip may run.
+        client.state.bank_balance = 1_000
+        self.assertFalse(circuit._cure_identify_due(client))
+        self.assertTrue(circuit._needs_cure_funding(client))
+
+    def test_strict_navigation_treats_a_map_that_killed_her_as_a_wall(self):
+        graph = built_graph()
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 27
+        client.state.map = MapState(
+            path="/shattered_islands/strakewood_island/apartments/apartment_cheap",
+            world_x=1, world_y=3)
+        nav = NavigateTask(graph, "/shattered_islands/world_0_69", destination_xy=(15, 7))
+        nav.strict_safety = True
+        route = [edge.destination for edge in nav._plan(client)]
+        self.assertEqual(route[-1], "/shattered_islands/world_0_69")
+        transit = [path for path in route if path not in (
+            client.state.map.path, "/shattered_islands/world_0_69")]
+        self.assertTrue(transit)
+        if transit:
+            client.state.route_hazards = {transit[-1]: time.time() + 3600}
+            try:
+                avoided = [edge.destination for edge in nav._plan(client)]
+            except ValueError as exc:
+                self.assertIn("avoiding every known hazard", str(exc))
+            else:
+                self.assertNotIn(transit[-1], avoided)
+        # Starting on a map that killed her, she may still leave it.
+        client.state.route_hazards = {client.state.map.path: time.time() + 3600}
+        self.assertEqual(nav._plan(client)[-1].destination,
+                         "/shattered_islands/world_0_69")
+        # A destination that killed her is refused, not entered.
+        client.state.route_hazards = {"/shattered_islands/world_0_69": time.time() + 3600}
+        with self.assertRaisesRegex(ValueError, "itself a known hazard"):
+            nav._plan(client)
+
     def test_farm_circuit_routes_depletion_to_real_aris_temple(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
@@ -12175,25 +12405,35 @@ class NavigationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             task._plan(client)
 
-    def test_depletion_trip_crosses_the_swamps_carefully(self):
-        # Live failure: from world_4_45 every way south to Saruthar crosses
-        # the Strakewood swamp packs, so a hazard-free plan does not exist.
+    def test_depletion_trip_never_crosses_a_known_hazard(self):
+        # From world_4_45 every way south to Saruthar crosses the Strakewood
+        # swamp packs. A depleted character is fragile whatever her level, so
+        # the cure trip refuses that route and waits; from the apartment,
+        # which the funding trip visits, a hazard-free route exists.
         graph = built_graph()
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["level"] = 23
         client.state.map = MapState(
             path="/shattered_islands/world_4_45", world_x=19, world_y=4)
-        strict = NavigateTask(graph, "/shattered_islands/world_3_58", destination_xy=(13, 13))
-        strict.tolerance = 1
-        with self.assertRaisesRegex(ValueError, "no component route"):
-            strict._plan(client)
         circuit = FarmCircuitTask(graph, [("/farm", "rat")])
+        service = circuit._new_depletion_service(client)
+        self.assertTrue(service.navigation.strict_safety)
+        with self.assertRaisesRegex(ValueError, "avoiding every known hazard"):
+            service.navigation._plan(client)
+        client.state.map = MapState(
+            path="/shattered_islands/strakewood_island/apartments/apartment_cheap",
+            world_x=1, world_y=3)
         service = circuit._new_depletion_service(client)
         route = service.navigation._plan(client)
         self.assertEqual(route[-1].destination, "/shattered_islands/world_3_58")
-        self.assertFalse({edge.destination for edge in route} &
-                         set(NavigateTask.KNOWN_LETHAL_TRANSIT))
+        nav = service.navigation
+        hazards = (nav._known_ranged_hazard_maps(client, any_level=True) |
+                   nav._known_overlevel_hazard_maps(client) |
+                   nav._known_pack_hazard_maps(client.state.map.path) |
+                   set(NavigateTask.KNOWN_LETHAL_TRANSIT))
+        self.assertFalse(
+            {edge.destination for edge in route[:-1]} & hazards)
 
     def test_navigation_never_uses_known_lethal_mixed_map_as_transit(self):
         graph = built_graph()
