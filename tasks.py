@@ -254,6 +254,14 @@ class TaskStatus(str, Enum):
     PAUSED = "paused"
 
 
+def _protect(client: AtrinikClient, seconds: float) -> None:
+    """Keep the meal or heal just sent from being cleared off the server's
+    queue (client.protect_queued_actions)."""
+    protect = getattr(client, "protect_queued_actions", None)
+    if protect is not None:
+        protect(seconds)
+
+
 def safe_food(item: Item) -> bool:
     """Food she may eat: identified, and not cursed, damned or unpaid."""
     return (not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED) and
@@ -307,8 +315,10 @@ class SafetyPolicy:
             # with the spell object's tag. Applying a spell merely readies or
             # unreadies it and was the reason Sera never recovered health.
             await client.fire(0, heal.tag)
+            _protect(client, self.heal_cooldown)
         else:
             await client.apply(heal.tag)
+            _protect(client, self.heal_cooldown)
         return True
 
     async def enforce(self, client: AtrinikClient) -> bool:
@@ -335,6 +345,7 @@ class SafetyPolicy:
                     # Applied; awaiting the food stat. Nothing may clear it.
                     return True
                 await client.apply(food.tag)
+                _protect(client, self.food_retry_seconds)
                 self._last_food = now
                 self._food_attempt_level = food_level
                 return False
@@ -384,6 +395,7 @@ class SafetyPolicy:
             food = self._food(client.state.inventory)
             if food:
                 await client.apply(food.tag)
+                _protect(client, self.food_retry_seconds)
                 self._last_food = now
                 self._food_attempt_level = food_level
                 return False

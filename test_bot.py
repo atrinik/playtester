@@ -4869,6 +4869,28 @@ class QuestTests(unittest.TestCase):
         self.assertTrue(asyncio.run(policy.enforce(client)))
         self.assertEqual((client.applied, client.clears), ([50], 0))
 
+    def test_a_queued_meal_survives_clears_from_any_caller(self):
+        client = AtrinikClient(ClientConfig())
+        sent = []
+
+        async def send(packet):
+            sent.append(packet)
+
+        client.send = send
+        client.state.stats.update({"hp": 10, "maxhp": 100, "food": 0})
+        client.state.player_tag = 7
+        client.state.place_item(Item(51, item_type=c.TYPE_FOOD, quality=100,
+                                     name="wholemeal bread"), 7)
+        asyncio.run(SafetyPolicy().enforce(client))
+        applied = len(sent)
+        # Any caller's clear inside the window is skipped: the APPLY stays queued.
+        asyncio.run(client.clear_actions())
+        self.assertEqual(len(sent), applied)
+        # After it, clears work again.
+        client._queue_protected_until = 0.0
+        asyncio.run(client.clear_actions())
+        self.assertEqual(len(sent), applied + 1)
+
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:
             def __init__(self):

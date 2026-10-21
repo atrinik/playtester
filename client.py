@@ -2239,8 +2239,22 @@ class AtrinikClient:
         self.record_action("pathfind", f"view={x},{y}")
         await self.send(Packet(c.S_MOVE_PATH).u8(x).u8(y))
 
+    def protect_queued_actions(self, seconds: float) -> None:
+        """Keep clear_actions from wiping the server queue for ``seconds``.
+
+        The server queues APPLY and FIRE behind the player's speed, and an
+        empty CLEAR drops the whole queue. A meal or heal that safety just
+        sent would be thrown away by the next clear, from whichever caller,
+        so for this short window clears are skipped (callers clear again on
+        later ticks).
+        """
+        self._queue_protected_until = max(
+            getattr(self, "_queue_protected_until", 0.0), time.monotonic() + seconds)
+
     async def clear_actions(self) -> None:
         """Cancel buffered commands, queued click paths and persistent run."""
+        if time.monotonic() < getattr(self, "_queue_protected_until", 0.0):
+            return
         self.record_action("clear", "cancel queued movement/actions")
         await self.send(Packet(c.S_CLEAR))
 
