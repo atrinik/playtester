@@ -295,14 +295,20 @@ class SafetyPolicy:
         return next((item for item in safe
                      if item.item_type == c.TYPE_FOOD), None)
 
-    async def _heal(self, client: AtrinikClient) -> bool:
+    def _usable_heal(self, client: AtrinikClient) -> Item | None:
+        """A healing item, or a healing spell she can afford, if any."""
         heal = self._find(client.state.inventory, self.healing_patterns)
+        if heal is not None and heal.item_type == c.TYPE_SPELL:
+            cost = int(heal.extra.get("cost", 0) or 0)
+            if cost > int(client.state.stats.get("sp", 0) or 0):
+                return None
+        return heal
+
+    async def _heal(self, client: AtrinikClient) -> bool:
+        heal = self._usable_heal(client)
         if heal is None:
             return False
         if heal.item_type == c.TYPE_SPELL:
-            cost = int(heal.extra.get("cost", 0) or 0)
-            if cost > int(client.state.stats.get("sp", 0) or 0):
-                return False
             # The official client's `/cast <spell>` sends FIRE direction 0
             # with the spell object's tag. Applying a spell merely readies or
             # unreadies it and was the reason Sera never recovered health.
@@ -321,38 +327,37 @@ class SafetyPolicy:
         if maxhp <= 0:
             return True
         ratio = hp / maxhp
-        if ratio <= self.flee_below:
+        heal = self._usable_heal(client) if ratio <= self.heal_below else None
+        if heal is not None:
             now = time.monotonic()
             if now - self._last_heal >= self.heal_cooldown:
+                # Cancel navigation before firing, so Clear Actions cannot
+                # cancel the heal which follows it in the same tick, and a
+                # queued click-to-move path cannot carry a low-health
+                # character deeper into the same hostile pack.
                 await client.clear_actions()
                 if await self._heal(client):
                     self._last_heal = now
             # Keep combat enabled while healing. Turning it off without a
             # real retreat left surrounded characters defenseless between
             # spell cooldowns.
-            if now - self._last_warning >= 2.0:
+            if ratio <= self.flee_below and now - self._last_warning >= 2.0:
                 log.warning("safety heal: health %.0f%%", ratio * 100)
                 self._last_warning = now
             return False
-        if ratio <= self.heal_below:
+        # No heal she can use. Never clear: that only wipes the move that
+        # might save her (live: a starving Sera had every step towards food
+        # cleared), and food may still help. She is not safe while critical,
+        # or while a known healing spell waits for SP: regeneration, not
+        # walking deeper into the next encounter below the recovery margin.
+        waiting = ratio <= self.flee_below or (
+            ratio <= self.heal_below and
+            self._find(client.state.inventory, self.healing_patterns) is not None)
+        if ratio <= self.flee_below:
             now = time.monotonic()
-            if now - self._last_heal < self.heal_cooldown:
-                return False
-            # Cancel navigation before firing, so Clear Actions cannot cancel
-            # the healing spell which follows it in the same tick.
-            await client.clear_actions()
-            if await self._heal(client):
-                self._last_heal = now
-                # Cancel a queued click-to-move path while the healing cast is
-                # processed. Otherwise route following can immediately carry
-                # a low-health character deeper into the same hostile pack.
-                return False
-            if self._find(client.state.inventory,
-                          self.healing_patterns) is not None:
-                # A known healing spell with temporarily insufficient SP is a
-                # reason to wait for regeneration, not permission to walk
-                # deeper into the next encounter below the recovery margin.
-                return False
+            if now - self._last_warning >= 2.0:
+                log.warning("critical health %.0f%% and no usable heal", ratio * 100)
+                self._last_warning = now
         food_level = int(stats.get("food", 1000) or 0)
         if food_level >= self.min_food:
             self._food_attempt_level = -1
@@ -363,14 +368,14 @@ class SafetyPolicy:
                 # The application is already in flight. Do not make travel
                 # treat this acknowledgment window as an emergency and clear
                 # the very action whose stat update we are awaiting.
-                return True
+                return not waiting
             food = self._food(client.state.inventory)
             if food:
                 await client.apply(food.tag)
                 self._last_food = now
                 self._food_attempt_level = food_level
                 return False
-        return True
+        return not waiting
 
 
 class BotTask:

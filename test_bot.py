@@ -4844,6 +4844,39 @@ class QuestTests(unittest.TestCase):
         client.state.stats["food"] = 100
         self.assertTrue(circuit._needs_food_resupply(client))
 
+    def test_critical_health_without_a_heal_eats_and_never_clears(self):
+        class FakeClient:
+            def __init__(self, inventory):
+                self.state = type("State", (), {
+                    "stats": {"hp": 10, "maxhp": 100, "sp": 0, "food": 0},
+                    "inventory": inventory,
+                })()
+                self.applied, self.clears = [], 0
+
+            async def apply(self, tag):
+                self.applied.append(tag)
+
+            async def clear_actions(self):
+                self.clears += 1
+
+        # A heal spell she cannot afford is no heal: the carried meal is eaten,
+        # and nothing clears the move that may save her.
+        spell = Item(52, item_type=c.TYPE_SPELL, name="minor healing", extra={"cost": 5})
+        bread = Item(53, item_type=c.TYPE_FOOD, quality=100, name="wholemeal bread")
+        client = FakeClient([spell, bread])
+        self.assertFalse(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertEqual((client.applied, client.clears), ([53], 0))
+        # Nothing to eat either: still not safe, still no clear.
+        client = FakeClient([spell])
+        self.assertFalse(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertEqual(client.clears, 0)
+        # Below the heal trigger but not critical, the same holds: the meal
+        # is eaten, nothing is cleared, and she waits for SP (not safe).
+        client = FakeClient([spell, bread])
+        client.state.stats["hp"] = 50
+        self.assertFalse(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertEqual((client.applied, client.clears), ([53], 0))
+
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:
             def __init__(self):
@@ -8082,6 +8115,50 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(task._defending)
         self.assertFalse(task._recovering_after_combat)
         self.assertEqual(client.direct_moves[-1], (0, False))
+
+    def test_navigation_never_rests_while_starving(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        # Low mana would hold her (live: 83/102 HP, 18/26 SP), but she is
+        # starving: health only drains from here.
+        client.state.stats.update(hp=80, maxhp=100, sp=5, maxsp=47, food=0)
+        client.state.combat = False
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node}
+        farm = FarmTask(zone="/farm", target="ice golem")
+        task = NavigateThenTask(graph, "/farm", farm, combat_approach=True, safety=farm.safety)
+        task._defending = True
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertFalse(task._defending)
+        self.assertFalse(task._recovering_after_combat)
+        self.assertEqual(client.direct_moves[-1], (0, False))
+        # With safe food on her, the hold stands: safety eats it, and no
+        # cleanup cancels the meal.
+        client.state.inventory.append(Item(980, item_type=c.TYPE_FOOD, quality=100,
+                                           name="wholemeal bread"))
+        task._defending = True
+        moves = len(client.direct_moves)
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertTrue(task._defending)
+        self.assertEqual(len(client.direct_moves), moves)
+
+    def test_starving_without_food_skips_the_safety_hold(self):
+        from .navigation import starving_without_food
+        client = self._combat_client()
+        client.state.stats.update(hp=20, maxhp=100, sp=0, maxsp=47, food=0)
+        self.assertTrue(starving_without_food(client))
+        bread = Item(981, item_type=c.TYPE_FOOD, quality=100, name="wholemeal bread")
+        client.state.inventory.append(bread)
+        self.assertFalse(starving_without_food(client))
+        bread.flags = c.ITEM_CURSED
+        self.assertTrue(starving_without_food(client))
+        # Only food counts: coins or a key are nothing to eat.
+        client.state.inventory = [
+            Item(982, item_type=c.TYPE_MONEY, quality=100, name="gold coin", quantity=5),
+            Item(983, quality=100, name="Incuna Tavern Barn Key")]
+        self.assertTrue(starving_without_food(client))
 
     def test_combat_approach_retreats_from_pack(self):
         client = self._combat_client()
