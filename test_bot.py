@@ -4865,9 +4865,10 @@ class QuestTests(unittest.TestCase):
         policy = SafetyPolicy()
         self.assertFalse(asyncio.run(policy.enforce(client)))
         self.assertEqual((client.applied, client.clears), ([50], 0))
-        # While the stat update is pending, nothing clears it.
-        self.assertTrue(asyncio.run(policy.enforce(client)))
-        self.assertEqual((client.applied, client.clears), ([50], 0))
+        # While the stat update is pending she is not reported safe: critical
+        # health is still handled (no second meal is sent).
+        self.assertFalse(asyncio.run(policy.enforce(client)))
+        self.assertEqual(client.applied, [50])
 
     def test_a_queued_meal_survives_clears_from_any_caller(self):
         client = AtrinikClient(ClientConfig())
@@ -4883,13 +4884,19 @@ class QuestTests(unittest.TestCase):
                                      name="wholemeal bread"), 7)
         asyncio.run(SafetyPolicy().enforce(client))
         applied = len(sent)
-        # Any caller's clear inside the window is skipped: the APPLY stays queued.
-        asyncio.run(client.clear_actions())
-        self.assertEqual(len(sent), applied)
-        # After it, clears work again.
-        client._queue_protected_until = 0.0
-        asyncio.run(client.clear_actions())
-        self.assertEqual(len(sent), applied + 1)
+        async def scenario():
+            # Any caller's clear inside the window is deferred, not dropped.
+            client._queue_protected_until = time.monotonic() + 0.05
+            await client.clear_actions()
+            self.assertEqual(len(sent), applied)
+            await asyncio.sleep(0.1)
+            self.assertEqual(len(sent), applied + 1)
+            # An operator stop clears at once.
+            client._queue_protected_until = time.monotonic() + 5
+            await client.clear_actions(force=True)
+            self.assertEqual(len(sent), applied + 2)
+
+        asyncio.run(scenario())
 
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:

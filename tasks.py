@@ -340,15 +340,15 @@ class SafetyPolicy:
             food = self._food(client.state.inventory)
             if food is not None:
                 now = time.monotonic()
-                if (self._food_attempt_level == food_level and
+                if not (self._food_attempt_level == food_level and
                         now - self._last_food < self.food_retry_seconds):
-                    # Applied; awaiting the food stat. Nothing may clear it.
-                    return True
-                await client.apply(food.tag)
-                _protect(client, self.food_retry_seconds)
-                self._last_food = now
-                self._food_attempt_level = food_level
-                return False
+                    await client.apply(food.tag)
+                    _protect(client, self.food_retry_seconds)
+                    self._last_food = now
+                    self._food_attempt_level = food_level
+                    return False
+                # Applied and awaiting the food stat (protected from clears):
+                # critical health is still handled below, never reported safe.
         if ratio <= self.flee_below:
             now = time.monotonic()
             if now - self._last_heal >= self.heal_cooldown:
