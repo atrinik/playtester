@@ -9860,7 +9860,53 @@ class QuestTests(unittest.TestCase):
         # Shops pay only a few copper for unidentified stock: never junk.
         self.assertEqual(
             [item.tag for item in (torch, unknown, book, unread, sword)
-             if JunkPolicy().junk(item)], [1, 4])
+             if JunkPolicy(sell_identified_junk=True).junk(item)], [1, 4])
+        # An operator's targeted sale sells only what it names.
+        self.assertEqual(
+            [item.tag for item in (torch, book)
+             if JunkPolicy((r"^steel ",)).junk(item)], [])
+
+    def test_economy_trips_route_strictly_and_storage_brings_back_sellable_stock(self):
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        client = self._depleted_client(100_000)
+        for trip in (circuit._new_apartment_storage(), circuit._new_junk_sale(client),
+                     circuit._new_mass_identification(), circuit._new_bank_sync(),
+                     circuit._new_bank_deposit(client), circuit._new_cure_funding(client),
+                     circuit._new_depletion_service(client)):
+            self.assertTrue(trip.navigation.strict_safety, trip.name)
+        follow = circuit._new_apartment_storage().task.then_retrieve
+        self.assertIsInstance(follow, RetrieveItemsTask)
+        self.assertEqual(follow.max_weight_ratio, circuit.STOCK_RETRIEVAL_WEIGHT)
+        book = Item(1, item_type=c.TYPE_BOOK, quality=80, name="book of tales")
+        self.assertTrue(follow.predicate(book))
+        # Books are never stored, even unidentified: they are sold.
+        unread = Item(2, item_type=c.TYPE_BOOK, quality=255, name="book")
+        self.assertFalse(InventoryPolicy().apartment_unidentified(unread))
+
+    def test_deposit_then_retrieves_in_the_same_visit(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.stats["weight_limit"] = 100
+                chest = Item(90, flags=c.ITEM_CONTAINER_OPEN, name="chest")
+                self.state.place_item(chest, 0)
+                self.state.place_item(Item(91, item_type=c.TYPE_BOOK, quality=80,
+                                           name="book of tales"), chest.tag)
+                self.moves = []
+
+            async def move_item(self, destination, tag, quantity=0):
+                self.moves.append((destination, tag))
+
+            async def apply(self, tag):
+                pass
+
+        client = FakeClient()
+        task = DepositItemsTask("chest", unidentified_only=True, then_retrieve=RetrieveItemsTask(
+            "chest", predicate=InventoryPolicy().sellable_junk))
+        task._opened = True
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.moves, [(7, 91)])
+        self.assertEqual(task.status, TaskStatus.RUNNING)
 
     def test_retrieve_items_takes_predicate_matches_up_to_a_weight_limit(self):
         class FakeClient:
@@ -9883,6 +9929,13 @@ class QuestTests(unittest.TestCase):
                                  max_weight_ratio=0.8)
         asyncio.run(task.tick(client))
         self.assertEqual((client.moves, task.retrieved), ([91], {91}))
+        # A stack that would cross the cap is not taken, however light she is.
+        client = FakeClient()
+        client.state.items[91].weight = 90.0
+        task = RetrieveItemsTask("chest", predicate=InventoryPolicy().sellable_junk,
+                                 max_weight_ratio=0.8)
+        asyncio.run(task.tick(client))
+        self.assertEqual((client.moves, task.status), ([], TaskStatus.COMPLETE))
         # At the weight limit nothing more is taken.
         client = FakeClient()
         client.state.place_item(Item(93, item_type=c.TYPE_INORGANIC, quality=80,
@@ -9892,17 +9945,22 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual((client.moves, task.status), ([], TaskStatus.COMPLETE))
 
-    def test_cure_shortfall_funds_the_cure_from_apartment_stock(self):
-        now = [1_000.0]
+    @staticmethod
+    def _depleted_client(bank: int):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats.update(level=27, weight_limit=100)
-        client.state.bank_balance = 851
+        client.state.bank_balance = bank
         client.state.bank_balance_known = True
         client.state.depletion_points = 67
         client.state.depletion_points_known = True
         client.state.place_item(Item(
             22, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        return client
+
+    def test_cure_shortfall_funds_the_cure_from_apartment_stock(self):
+        now = [1_000.0]
+        client = self._depleted_client(851)
         circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")],
                                   clock=lambda: now[0])
         self.assertFalse(circuit._needs_depletion_service(client))
@@ -9927,51 +9985,53 @@ class QuestTests(unittest.TestCase):
         trip.task.status = TaskStatus.COMPLETE
         circuit._cure_funding = trip
         circuit._settle_cure_funding(client)
-        self.assertFalse(circuit._cure_sale_pending)
         self.assertFalse(circuit._needs_cure_funding(client))
         now[0] += circuit.CURE_FUNDING_RETRY_SECONDS
         self.assertTrue(circuit._needs_cure_funding(client))
 
-        # Retrieved books are sold at once, without carrying pressure, on a
-        # strictly safe route.
-        trip = circuit._new_cure_funding(client)
+        # Carried sellable junk is sold at once, without carrying pressure,
+        # on a strictly safe route, and no chest trip runs meanwhile.
         client.state.place_item(book, 7)
-        trip.task.retrieved.add(31)
-        trip.task.status = TaskStatus.COMPLETE
-        circuit._cure_funding = trip
-        circuit._settle_cure_funding(client)
-        self.assertTrue(circuit._cure_sale_pending)
         self.assertFalse(circuit._needs_cure_funding(client))
         self.assertTrue(circuit._needs_junk_sale(client))
-        sale = circuit._new_junk_sale(client)
-        self.assertTrue(sale.navigation.strict_safety)
-        # Sold: nothing pending, and the next shortfall check may run again.
+        self.assertTrue(circuit._new_junk_sale(client).navigation.strict_safety)
+        # Nothing is held in memory: a restarted circuit sells it too.
+        restarted = FarmCircuitTask(WorldGraph(), [("/farm", "rat")],
+                                    clock=lambda: now[0])
+        self.assertTrue(restarted._needs_junk_sale(client))
+        # Sold: the next chest trip may run.
         client.state.items.pop(31)
         client.state.inventories[7].remove(31)
-        circuit._reconcile_cure_funding(client)
-        self.assertFalse(circuit._cure_sale_pending)
         self.assertTrue(circuit._needs_cure_funding(client))
+        # Able to pay, nothing about funding applies.
+        client.state.bank_balance = 5_000
+        self.assertFalse(circuit._needs_cure_funding(client))
+        self.assertFalse(circuit._needs_junk_sale(client))
 
-    def test_cure_identify_all_runs_before_storage_and_then_sells(self):
-        client = type("Client", (), {})()
-        client.state = GameState(phase="playing", player_tag=7)
-        client.state.stats.update(level=27, weight_limit=100)
-        client.state.bank_balance = 2_450
-        client.state.bank_balance_known = True
+    def test_cure_identify_all_needs_a_batch_and_keeps_it_out_of_storage(self):
+        client = self._depleted_client(2_450)
+        # From level 30 the cure (2,540 here) costs more than identify-all
+        # with its reserve (2,450); below that she simply buys the cure.
+        client.state.stats["level"] = 31
         circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
         client.state.place_item(Item(40, item_type=c.TYPE_RING, quality=255, name="ring"), 7)
-        circuit._identification_retry_at = circuit.clock() + 3600
-        self.assertFalse(circuit._needs_mass_identification(client))
-        circuit._cure_identify_pending = True
-        # One unknown item and a recent identify-all are no obstacle; the
-        # stock stays out of the chest until it is identified.
+        # One stray unknown never buys a 1,450 identify-all.
+        self.assertFalse(circuit._cure_identify_due(client))
+        for tag in range(41, 41 + circuit.MASS_IDENTIFY_BATCH_MINIMUM):
+            client.state.place_item(Item(tag, item_type=c.TYPE_RING, quality=255,
+                                         name="ring"), 7)
+        # A batch is identified without carrying pressure, and storage leaves
+        # it carried (valuables would still be stored, unknowns kept).
+        self.assertTrue(circuit._cure_identify_due(client))
         self.assertTrue(circuit._needs_mass_identification(client))
         self.assertFalse(circuit._needs_apartment_storage(client))
         self.assertTrue(circuit._new_mass_identification().navigation.strict_safety)
-        # Unaffordable now (food bought on the way): the step is dropped.
+        self.assertFalse(circuit._new_apartment_storage(keep_unknown=True).task.unidentified_only)
+        self.assertFalse(circuit._needs_cure_funding(client))
+        # Unaffordable: nothing is due and the next chest trip may run.
         client.state.bank_balance = 1_000
-        circuit._reconcile_cure_funding(client)
-        self.assertFalse(circuit._cure_identify_pending)
+        self.assertFalse(circuit._cure_identify_due(client))
+        self.assertTrue(circuit._needs_cure_funding(client))
 
     def test_strict_navigation_treats_a_map_that_killed_her_as_a_wall(self):
         graph = built_graph()
@@ -9996,6 +10056,10 @@ class QuestTests(unittest.TestCase):
                 self.assertIn("avoiding every known hazard", str(exc))
             else:
                 self.assertNotIn(transit[-1], avoided)
+        # Starting on a map that killed her, she may still leave it.
+        client.state.route_hazards = {client.state.map.path: time.time() + 3600}
+        self.assertEqual(nav._plan(client)[-1].destination,
+                         "/shattered_islands/world_0_69")
 
     def test_farm_circuit_routes_depletion_to_real_aris_temple(self):
         client = type("Client", (), {})()

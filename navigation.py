@@ -1746,8 +1746,9 @@ class NavigateTask(BotTask):
         """Route around every known hazard, or raise ValueError.
 
         Ranged maps count at any level here: a depleted character is fragile
-        whatever her level. The map she stands on and the destination itself
-        are exempt; leaving one or arriving cannot be avoided.
+        whatever her level. Avoidance applies to entering a map, so leaving a
+        hazardous map she stands on stays possible while re-entering it as
+        transit does not; only the destination itself is exempt.
         """
         source = client.state.map.path
         avoided = (
@@ -1755,7 +1756,7 @@ class NavigateTask(BotTask):
             self._known_overlevel_hazard_maps(client) |
             self._known_pack_hazard_maps(source) |
             set(self.KNOWN_LETHAL_TRANSIT) | learned
-        ) - {source, self.destination}
+        ) - {self.destination}
         args = (
             source,
             (client.state.map.world_x, client.state.map.world_y),
@@ -4217,12 +4218,10 @@ class FarmCircuitTask(BotTask):
         self._selling: NavigateThenTask | None = None
         self._selling_retry_at = 0.0
         # Raising money for the depletion cure from apartment stock: the
-        # retrieval trip, its retry time, and the sale and identification it
-        # leaves pending (each run on strictly safe routes).
+        # chest trip and its retry time. The sale and identify-all it leads
+        # to follow from what she carries, so a restart loses nothing.
         self._cure_funding: NavigateThenTask | None = None
         self._cure_funding_retry_at = 0.0
-        self._cure_sale_pending = False
-        self._cure_identify_pending = False
         self._banking: NavigateThenTask | None = None
         self._banking_retry_at = 0.0
         self._force_bank_deposit = False
@@ -4993,15 +4992,15 @@ class FarmCircuitTask(BotTask):
 
     def _needs_apartment_storage(self, client: AtrinikClient) -> bool:
         policy = InventoryPolicy()
-        unknown = self._unidentified_items(client)
+        # Unknown stock waiting for a cure identify-all stays carried.
+        unknown = ([] if self._cure_identify_due(client)
+                   else self._unidentified_items(client))
         valuables = [item for item in client.state.inventory
                      if policy.apartment_valuable(item)]
-        # Stock taken out for a cure identify-all stays out until then.
         return bool(unknown or valuables) and (
             bool(valuables) or
             policy.weight_ratio(client) >= self.ROUTINE_TOWN_TRIP_WEIGHT
-        ) and self.clock() >= self._storage_retry_at and (
-            not self._cure_identify_pending)
+        ) and self.clock() >= self._storage_retry_at
 
     def _needs_mass_identification(self, client: AtrinikClient) -> bool:
         unknown = self._unidentified_items(client)
@@ -5016,15 +5015,13 @@ class FarmCircuitTask(BotTask):
             any(item.item_type in (c.TYPE_ROD, c.TYPE_WAND)
                 for item in unknown))
         return (
-            (urgent_recall_candidate or
-             (self._cure_identify_pending and bool(unknown)) or (
+            (urgent_recall_candidate or self._cure_identify_due(client) or (
                 len(unknown) >= self.MASS_IDENTIFY_BATCH_MINIMUM and
                 InventoryPolicy().weight_ratio(client) >=
                 self.MASS_IDENTIFY_WEIGHT)) and
             BuyShopUpgradeTask.wallet_value(client) >=
             self.MASS_IDENTIFY_COST + 1_000 and
-            (self._cure_identify_pending or
-             self.clock() >= self._identification_retry_at)
+            self.clock() >= self._identification_retry_at
         )
 
     def _needs_inventory_capability(
@@ -5033,7 +5030,12 @@ class FarmCircuitTask(BotTask):
             return False
         if purpose == InventoryCapabilityTask.PURPOSE_IDENTIFY:
             # Found food too: identified, it shows whether it is safe to eat.
-            needed = bool(self._unidentified_items(client) or unidentified_food(client))
+            # And books, which are sold once identified rather than stored.
+            policy = InventoryPolicy()
+            needed = bool(
+                self._unidentified_items(client) or unidentified_food(client) or
+                any(item.item_type == c.TYPE_BOOK and not policy.identified(item)
+                    for item in client.state.inventory))
         elif purpose == InventoryCapabilityTask.PURPOSE_DISEASE:
             needed = self._disease_suspected
         elif purpose == InventoryCapabilityTask.PURPOSE_DEPLETION:
@@ -5056,16 +5058,23 @@ class FarmCircuitTask(BotTask):
             MassIdentifyTask("Kulgar", self.MASS_IDENTIFY_COST),
             destination_xy=(4, 9), combat_approach=True)
         task.navigation.tolerance = 1
-        task.navigation.strict_safety = self._cure_identify_pending
+        task.navigation.strict_safety = True
         return task
 
-    def _new_apartment_storage(self) -> NavigateThenTask:
-        return NavigateThenTask(
+    def _new_apartment_storage(self, *, keep_unknown: bool = False) -> NavigateThenTask:
+        # Every visit also takes sellable stock (books, worthless-plus items)
+        # back out of the chest for the next sale.
+        task = NavigateThenTask(
             self.graph,
             "/shattered_islands/strakewood_island/apartments/apartment_cheap",
             DepositItemsTask(
-                "chest", unidentified_only=True, valuable_only=True),
+                "chest", unidentified_only=not keep_unknown, valuable_only=True,
+                then_retrieve=RetrieveItemsTask(
+                    "chest", predicate=InventoryPolicy().sellable_junk,
+                    max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT)),
             destination_xy=(1, 3), combat_approach=True)
+        task.navigation.strict_safety = True
+        return task
 
     def _spot_maps(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(path for path, _ in self.legs))
@@ -5244,8 +5253,8 @@ class FarmCircuitTask(BotTask):
     # failed; after a productive one the follow-up sale decides.
     CURE_FUNDING_RETRY_SECONDS = 6 * 3600.0
     # Stop taking stock out of the chest at this share of the weight limit:
-    # an overloaded, depleted character is slow and easy to kill.
-    CURE_FUNDING_WEIGHT = 0.80
+    # an overloaded character is slow and easy to kill.
+    STOCK_RETRIEVAL_WEIGHT = 0.80
 
     def _cure_shortfall(self, client: AtrinikClient) -> bool:
         """Depleted enough to need the priest, but unable to pay him."""
@@ -5257,10 +5266,23 @@ class FarmCircuitTask(BotTask):
                 BuyShopUpgradeTask.wallet_value(client) <
                 self._depletion_service_cost(client))
 
-    def _needs_cure_funding(self, client: AtrinikClient) -> bool:
+    def _cure_identify_due(self, client: AtrinikClient) -> bool:
+        """Short of the cure, with an identify-all batch carried and affordable.
+
+        The batch minimum is the routine one: identify-all costs 1,450, so a
+        stray unknown drop never buys it; only the carrying condition goes.
+        """
         return (self._cure_shortfall(client) and
-                not self._cure_sale_pending and
-                not self._cure_identify_pending and
+                len(self._unidentified_items(client)) >=
+                self.MASS_IDENTIFY_BATCH_MINIMUM and
+                BuyShopUpgradeTask.wallet_value(client) >=
+                self.MASS_IDENTIFY_COST + 1_000)
+
+    def _needs_cure_funding(self, client: AtrinikClient) -> bool:
+        """Short of the cure, with nothing carried to sell or identify."""
+        return (self._cure_shortfall(client) and
+                not self._identified_junk(client) and
+                not self._cure_identify_due(client) and
                 self.clock() >= self._cure_funding_retry_at)
 
     def _cure_funding_wants(self, client: AtrinikClient) -> Callable[[Item], bool]:
@@ -5279,52 +5301,31 @@ class FarmCircuitTask(BotTask):
             "/shattered_islands/strakewood_island/apartments/apartment_cheap",
             RetrieveItemsTask(
                 "chest", predicate=self._cure_funding_wants(client),
-                max_weight_ratio=self.CURE_FUNDING_WEIGHT),
+                max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT),
             destination_xy=(1, 3), combat_approach=True)
         task.navigation.strict_safety = True
         return task
 
     def _settle_cure_funding(self, client: AtrinikClient) -> None:
-        """After the chest trip, queue the sale and identification it enables."""
+        """After the chest trip: what it brought is sold or identified by
+        the ordinary checks; an empty or failed trip waits."""
         task = self._cure_funding
         self._cure_funding = None
-        retrieve = task.task if task is not None else None
-        if task is None or task.status == TaskStatus.FAILED:
-            log.warning("cure funding trip failed: %s",
-                        task.error if task is not None else "lost")
+        if task is None or task.status == TaskStatus.FAILED or not task.task.retrieved:
+            if task is not None and task.status == TaskStatus.FAILED:
+                log.warning("cure funding trip failed: %s", task.error)
             self._cure_funding_retry_at = (
                 self.clock() + self.CURE_FUNDING_RETRY_SECONDS)
             return
-        policy = InventoryPolicy()
-        carried = client.state.inventory
-        self._cure_sale_pending = any(policy.sellable_junk(item) for item in carried)
-        self._cure_identify_pending = any(
-            item.tag in retrieve.retrieved and not policy.identified(item)
-            for item in carried)
-        log.info("cure funding: took %d item(s) from the apartment; sale %s, "
-                 "identify %s", len(retrieve.retrieved),
-                 self._cure_sale_pending, self._cure_identify_pending)
-        if not (self._cure_sale_pending or self._cure_identify_pending):
-            self._cure_funding_retry_at = (
-                self.clock() + self.CURE_FUNDING_RETRY_SECONDS)
-
-    def _reconcile_cure_funding(self, client: AtrinikClient) -> None:
-        """Drop a pending cure step that can no longer run, so it never
-        blocks storage or the next funding trip."""
-        if self._cure_identify_pending and (
-                not self._unidentified_items(client) or
-                BuyShopUpgradeTask.wallet_value(client) <
-                self.MASS_IDENTIFY_COST + 1_000):
-            self._cure_identify_pending = False
-        if self._cure_sale_pending and not self._identified_junk(client):
-            self._cure_sale_pending = False
+        log.info("cure funding: took %d item(s) from the apartment",
+                 len(task.task.retrieved))
 
     @staticmethod
     def _junk_policy(tags=()) -> JunkPolicy:
         return JunkPolicy((
             r"^paper ",
             r"^(?:iron|bronze|steel|wooden|spruce|soft leather) .*(?:sword|axe|mace|club|spear|bow|shield|armour|skirt|sandals|boots|gloves|helmet)$",
-        ), tags=frozenset(tags))
+        ), tags=frozenset(tags), sell_identified_junk=True)
 
     @staticmethod
     def _surplus_equipment(client: AtrinikClient) -> list[Item]:
@@ -5378,7 +5379,7 @@ class FarmCircuitTask(BotTask):
     def _needs_junk_sale(self, client: AtrinikClient) -> bool:
         junk = self._identified_junk(client)
         return bool(junk) and (
-            self._cure_sale_pending or
+            self._cure_shortfall(client) or
             InventoryPolicy().weight_ratio(client) >=
             self.ROUTINE_TOWN_TRIP_WEIGHT
         ) and self.clock() >= self._selling_retry_at
@@ -5391,7 +5392,7 @@ class FarmCircuitTask(BotTask):
                 "Brynknot shop floor",
                 self._junk_policy(item.tag for item in surplus)),
             destination_xy=(15, 7), combat_approach=True)
-        task.navigation.strict_safety = self._cure_sale_pending
+        task.navigation.strict_safety = True
         return task
 
     def _needs_bank_sync(self, client: AtrinikClient) -> bool:
@@ -5409,10 +5410,12 @@ class FarmCircuitTask(BotTask):
                 self.clock() >= self._bank_sync_retry_at)
 
     def _new_bank_sync(self) -> NavigateThenTask:
-        return NavigateThenTask(
+        task = NavigateThenTask(
             self.graph, "/shattered_islands/world_0_67",
             BankBalanceTask("Tolmir"), destination_xy=(19, 15),
             combat_approach=True)
+        task.navigation.strict_safety = True
+        return task
 
     def _needs_bank_deposit(self, client: AtrinikClient) -> bool:
         # Cross-world banking costs enough farm uptime that carrying one stray
@@ -5506,10 +5509,12 @@ class FarmCircuitTask(BotTask):
         return True
 
     def _new_bank_deposit(self, client: AtrinikClient) -> NavigateThenTask:
-        return NavigateThenTask(
+        task = NavigateThenTask(
             self.graph, "/shattered_islands/world_0_67",
             BankTask("Tolmir", "all"), destination_xy=(19, 15),
             combat_approach=True)
+        task.navigation.strict_safety = True
+        return task
 
     def _needs_upgrade_shopping(self, client: AtrinikClient) -> bool:
         level = int(client.state.stats.get("level", 0) or 0)
@@ -6255,7 +6260,6 @@ class FarmCircuitTask(BotTask):
                 log.warning("identified junk sale failed: %s",
                             self._selling.error)
                 self._selling_retry_at = self.clock() + 1800.0
-                self._cure_sale_pending = False
                 self._selling = None
             elif self._selling.status == TaskStatus.COMPLETE:
                 log.info("identified junk sale complete; returning to farm")
@@ -6269,7 +6273,6 @@ class FarmCircuitTask(BotTask):
                     client.state.last_bank_deposit_at = 0.0
                 self._banking_retry_at = 0.0
                 self._force_bank_deposit = True
-                self._cure_sale_pending = False
                 self._selling = None
             return
         if self._identification is not None:
@@ -6278,7 +6281,6 @@ class FarmCircuitTask(BotTask):
                 log.warning("mass identification failed: %s",
                             self._identification.error)
                 self._identification_retry_at = self.clock() + 1800.0
-                self._cure_identify_pending = False
                 self._identification = None
             elif self._identification.status == TaskStatus.COMPLETE:
                 # Evaluate the newly revealed batch before returning to a
@@ -6290,12 +6292,6 @@ class FarmCircuitTask(BotTask):
                     return
                 log.info("mass identification complete; returning to farm")
                 self._identification_retry_at = self.clock() + 3600.0
-                if self._cure_identify_pending:
-                    # Sell what identification showed to be sellable junk.
-                    self._cure_identify_pending = False
-                    self._cure_sale_pending = any(
-                        InventoryPolicy().sellable_junk(item)
-                        for item in client.state.inventory)
                 self._identification = None
             return
         if self._cure_funding is not None:
@@ -6336,7 +6332,6 @@ class FarmCircuitTask(BotTask):
             self._settle_resupply(client)
             return
         farm = self.child.task
-        self._reconcile_cure_funding(client)
         # All active maintenance branches returned above. Checkpoint only at
         # this boundary so reconnect cannot split a bank, shop, storage, or
         # resupply transaction in addition to the fight/corpse safety gate.
@@ -6431,7 +6426,8 @@ class FarmCircuitTask(BotTask):
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
-            self._storage = self._new_apartment_storage()
+            self._storage = self._new_apartment_storage(
+                keep_unknown=self._cure_identify_due(client))
             await self._storage.tick(client)
             return
         if (isinstance(farm, FarmTask) and
