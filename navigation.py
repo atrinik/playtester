@@ -3706,24 +3706,54 @@ def effective_farm_objective(state) -> str:
     return "safety" if depleted_for_temple(state) else chosen
 
 
-# Services a depleted character must reach for her cure and its funding: the
-# bank, the apartment chest, the Brynknot shop floor and Saruthar's temple.
+# Services a depleted character must reach for her cure and its funding, all
+# planned with strict_safety: the bank, the apartment chest, the Brynknot shop
+# floor, Kulgar's identify-all and Saruthar's temple.
 TOWN_SERVICES: tuple[tuple[str, tuple[int, int]], ...] = (
     ("/shattered_islands/world_0_67", (19, 15)),
     ("/shattered_islands/strakewood_island/apartments/apartment_cheap", (1, 3)),
     ("/shattered_islands/world_0_69", (15, 7)),
+    ("/shattered_islands/world_8_79", (4, 9)),
     ("/shattered_islands/world_3_58", (13, 13)),
 )
-_town_reach_cache: dict[tuple, bool] = {}
+# Strict town routes already planned: per (graph, map, level, learned hazards,
+# access items), the result of each (start, service) pair.
+_town_reach_cache: dict[tuple, dict[tuple, bool]] = {}
+
+
+def _farm_starts(graph: "WorldGraph", path: str) -> list[tuple[int, int]]:
+    """One square per walkable component holding the map's hostile spawns,
+    where a farm on it fights; the most central walkable square without any."""
+    node = graph.nodes.get(path)
+    if node is None:
+        return []
+    starts, seen = [], set()
+    for spawn in graph.named_spawns.get(path, ()):
+        point = (spawn.x, spawn.y)
+        if spawn.peaceful or not node.walkable(*point):
+            continue
+        component = graph._component(path, point)
+        if component and not component & seen:
+            seen |= component
+            starts.append(point)
+    if starts:
+        return starts
+    points = [(x, y) for x in range(node.width) for y in range(node.height)
+              if node.walkable(x, y)]
+    return [min(points, key=lambda point: (
+        (point[0] - node.width / 2) ** 2 +
+        (point[1] - node.height / 2) ** 2))] if points else []
 
 
 def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
-                          path: str) -> bool:
-    """Whether every town service is strictly reachable from ``path``.
+                          path: str, budget: list[int]) -> bool | None:
+    """Whether every town service is strictly reachable from where she
+    farms on ``path``; None while still undecided.
 
     Economy trips plan with strict_safety, so from a map where this fails her
-    selling and cure trips cannot start. Planned from the map's most central
-    walkable square; cached per map, level and learned hazards.
+    selling and cure trips cannot start. Each strict plan is a whole-world
+    search, so at most ``budget[0]`` new ones run per call (the caller's
+    shared budget); results are cached.
     """
     stats = getattr(client.state, "stats", {})
     level = int(stats.get("level", 0) or 0)
@@ -3731,34 +3761,36 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
     learned = {map_path: until for map_path, until in
                (getattr(client.state, "route_hazards", None) or {}).items()
                if until > now}
-    key = (id(graph), path, level, frozenset(learned))
-    if key in _town_reach_cache:
-        return _town_reach_cache[key]
-    node = graph.nodes.get(path)
-    points = [] if node is None else [
-        (x, y) for x in range(node.width) for y in range(node.height)
-        if node.walkable(x, y)]
-    reachable = False
-    if points:
-        start = min(points, key=lambda point: (
-            (point[0] - node.width / 2) ** 2 + (point[1] - node.height / 2) ** 2))
-        proxy = types.SimpleNamespace(state=types.SimpleNamespace(
-            stats={"level": level}, route_hazards=learned,
-            inventory=list(getattr(client.state, "inventory", ())),
-            map=types.SimpleNamespace(path=path, world_x=start[0], world_y=start[1])))
-        reachable = True
-        for destination, xy in TOWN_SERVICES:
-            navigation = NavigateTask(graph, destination, destination_xy=xy)
-            navigation.strict_safety = True
-            try:
-                navigation._plan(proxy)
-            except ValueError:
-                reachable = False
-                break
-    if len(_town_reach_cache) > 512:
+    inventory = list(getattr(client.state, "inventory", ()))
+    proxy = types.SimpleNamespace(state=types.SimpleNamespace(
+        stats={"level": level}, route_hazards=learned, inventory=inventory,
+        map=types.SimpleNamespace(path=path, world_x=0, world_y=0)))
+    access = NavigateTask(graph, path)._allow_locked(proxy)
+    key = (id(graph), path, level, frozenset(learned), access)
+    if key not in _town_reach_cache and len(_town_reach_cache) > 512:
         _town_reach_cache.clear()
-    _town_reach_cache[key] = reachable
-    return reachable
+    results = _town_reach_cache.setdefault(key, {})
+    for start in _farm_starts(graph, path) or [None]:
+        for destination, xy in TOWN_SERVICES:
+            pair = (start, destination)
+            if pair not in results:
+                if budget[0] <= 0:
+                    return None
+                budget[0] -= 1
+                if start is None:
+                    results[pair] = False
+                else:
+                    proxy.state.map.world_x, proxy.state.map.world_y = start
+                    navigation = NavigateTask(graph, destination, destination_xy=xy)
+                    navigation.strict_safety = True
+                    try:
+                        navigation._plan(proxy)
+                        results[pair] = True
+                    except ValueError:
+                        results[pair] = False
+            if not results[pair]:
+                return False
+    return True
 
 
 def analyzer_farm_choice(
@@ -3770,14 +3802,18 @@ def analyzer_farm_choice(
     failures: a spot quarantined after a death, an emergency recall, ten minutes
     without XP, or an unreachable route is skipped until its quarantine ends.
 
-    While depleted, a safety spot is usable only if every map on it reaches
-    each town service on a strictly safe route (town_safely_reachable): her
-    selling and cure trips plan strictly, so she farms where they can start.
+    While depleted, a safety spot is skipped once any map on it is known not
+    to reach every town service on a strictly safe route
+    (town_safely_reachable): her selling and cure trips plan strictly, so she
+    farms where they can start. At most one such route is planned per call;
+    a spot still being checked counts until it is shown to fail, so callers
+    always get a spot and move off it on a later call.
 
-    If depletion prefers safety but no safety spot is usable, the chosen
-    objective's spot applies. The circuit removes depletion before any farming
-    whenever an item or the temple fee allows, and farming is what pays that
-    fee; holding instead could leave her depleted for good.
+    If depletion prefers safety but no safety spot qualifies, the chosen
+    objective's spot applies, and failing that the best usable safety spot.
+    The circuit removes depletion before any farming whenever an item or the
+    temple fee allows, and farming is what pays that fee; holding instead
+    could leave her depleted for good.
     """
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
@@ -3785,17 +3821,28 @@ def analyzer_farm_choice(
     chosen = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
     quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
     now = time.time()
+    usable = []
     for objective in dict.fromkeys(
             (effective_farm_objective(client.state), chosen)):
         for spot in analyzer.ranking(objective):
             legs = analyzer_spot_legs(spot, graph)
             if legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
-                            for path, _ in legs) and (
-                    not depleted_for_temple(client.state) or
-                    all(town_safely_reachable(client, graph, path)
-                        for path in dict.fromkeys(path for path, _ in legs))):
-                return objective, legs, spot
-    return None
+                            for path, _ in legs):
+                usable.append((objective, legs, spot))
+    if not depleted_for_temple(client.state):
+        return usable[0] if usable else None
+    budget = [1]
+    for objective, legs, spot in usable:
+        if objective != "safety":
+            return objective, legs, spot
+        verdict: bool | None = True
+        for path in dict.fromkeys(path for path, _ in legs):
+            verdict = town_safely_reachable(client, graph, path, budget)
+            if verdict is not True:
+                break
+        if verdict is not False:
+            return objective, legs, spot
+    return usable[0] if usable else None
 
 
 def analyzer_farm_selection(

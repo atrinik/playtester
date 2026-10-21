@@ -13849,7 +13849,8 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual(analyzer_spot_legs(unknown, graph), ())
 
     def test_depleted_farming_picks_a_spot_whose_town_trips_route_strictly(self):
-        from .navigation import analyzer_farm_selection, town_safely_reachable
+        from .navigation import (_town_reach_cache, analyzer_farm_selection,
+                                 town_safely_reachable)
 
         # Live case: depleted at level 27, the safety ranking led to the
         # Morliana circuit, from which no strictly safe route reaches the
@@ -13861,19 +13862,44 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
             "/shattered_islands/world_11_6"], ["rat L1"])
         strakewood = analyzer_spot("Strakewood Island circuit", [
             "/shattered_islands/world_0_51", "/shattered_islands/world_1_51"], ["rat L1"])
-        client = self.client({"xp": [morliana], "safety": [morliana, strakewood]})
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees], "safety": [morliana, strakewood]})
         client.state.stats["level"] = 27
-        self.assertFalse(town_safely_reachable(client, graph, "/shattered_islands/world_11_4"))
-        self.assertTrue(town_safely_reachable(client, graph, "/shattered_islands/world_0_51"))
+        _town_reach_cache.clear()
+        # Each call plans at most its budget of strict routes.
+        self.assertIsNone(town_safely_reachable(
+            client, graph, "/shattered_islands/world_0_51", [0]))
+        self.assertFalse(town_safely_reachable(
+            client, graph, "/shattered_islands/world_11_4", [99]))
+        self.assertTrue(town_safely_reachable(
+            client, graph, "/shattered_islands/world_0_51", [99]))
+        _town_reach_cache.clear()
         client.state.depletion_points_known = True
         client.state.depletion_points = 67
         client.state.place_item(Item(
             502, item_type=c.TYPE_FORCE, quality=0, name="depletion"), client.state.player_tag)
+
+        def settle():
+            # One strict route per call; an undecided spot counts until it
+            # fails, so the answer settles over a few calls.
+            names = [analyzer_farm_selection(client, graph)[1]["name"]
+                     for _ in range(60)]
+            return names[-1]
+
+        # The first call's one route (Morliana to the bank) already fails, so
+        # the next spot, still undecided, is returned; checking it confirms it.
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
                          "Strakewood Island circuit")
-        # Not depleted, the analyzer's ranking applies unfiltered.
-        client.state.remove_item(502)
+        self.assertEqual(settle(), "Strakewood Island circuit")
+        # No safety spot qualifies: the chosen objective's spot applies...
+        client.farm_analyzer.rankings["safety"] = [morliana]
+        self.assertEqual(settle(), "Trees")
+        # ...and with safety chosen too, the best usable safety spot.
         client.state.farm_objective = "safety"
+        self.assertEqual(settle(), "Morliana circuit")
+        # Not depleted, the analyzer's ranking applies unfiltered.
+        client.farm_analyzer.rankings["safety"] = [morliana, strakewood]
+        client.state.remove_item(502)
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
                          "Morliana circuit")
 
