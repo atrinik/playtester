@@ -10060,6 +10060,10 @@ class QuestTests(unittest.TestCase):
         client.state.route_hazards = {client.state.map.path: time.time() + 3600}
         self.assertEqual(nav._plan(client)[-1].destination,
                          "/shattered_islands/world_0_69")
+        # A destination that killed her is refused, not entered.
+        client.state.route_hazards = {"/shattered_islands/world_0_69": time.time() + 3600}
+        with self.assertRaisesRegex(ValueError, "itself a known hazard"):
+            nav._plan(client)
 
     def test_farm_circuit_routes_depletion_to_real_aris_temple(self):
         client = type("Client", (), {})()

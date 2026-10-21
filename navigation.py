@@ -1748,7 +1748,9 @@ class NavigateTask(BotTask):
         Ranged maps count at any level here: a depleted character is fragile
         whatever her level. Avoidance applies to entering a map, so leaving a
         hazardous map she stands on stays possible while re-entering it as
-        transit does not; only the destination itself is exempt.
+        transit does not. A hazardous destination is refused outright (the
+        graph would otherwise enter it): the trip waits, for example until a
+        map that killed her stops counting.
         """
         source = client.state.map.path
         avoided = (
@@ -1756,7 +1758,10 @@ class NavigateTask(BotTask):
             self._known_overlevel_hazard_maps(client) |
             self._known_pack_hazard_maps(source) |
             set(self.KNOWN_LETHAL_TRANSIT) | learned
-        ) - {self.destination}
+        )
+        if self.destination != source and self.destination in avoided:
+            raise ValueError(
+                f"{self.destination} is itself a known hazard")
         args = (
             source,
             (client.state.map.world_x, client.state.map.world_y),
