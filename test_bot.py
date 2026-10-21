@@ -4844,14 +4844,12 @@ class QuestTests(unittest.TestCase):
         client.state.stats["food"] = 100
         self.assertTrue(circuit._needs_food_resupply(client))
 
-    def test_safety_eats_before_healing_when_starving(self):
+    def test_critical_health_without_a_heal_eats_and_never_clears(self):
         class FakeClient:
-            def __init__(self):
-                # Critical health and food 0, a safe meal carried, no heal.
+            def __init__(self, inventory):
                 self.state = type("State", (), {
-                    "stats": {"hp": 10, "maxhp": 100, "food": 0},
-                    "inventory": [Item(50, item_type=c.TYPE_FOOD, quality=100,
-                                       name="wholemeal bread")],
+                    "stats": {"hp": 10, "maxhp": 100, "sp": 0, "food": 0},
+                    "inventory": inventory,
                 })()
                 self.applied, self.clears = [], 0
 
@@ -4861,42 +4859,17 @@ class QuestTests(unittest.TestCase):
             async def clear_actions(self):
                 self.clears += 1
 
-        client = FakeClient()
-        policy = SafetyPolicy()
-        self.assertFalse(asyncio.run(policy.enforce(client)))
-        self.assertEqual((client.applied, client.clears), ([50], 0))
-        # While the stat update is pending she is not reported safe: critical
-        # health is still handled (no second meal is sent).
-        self.assertFalse(asyncio.run(policy.enforce(client)))
-        self.assertEqual(client.applied, [50])
-
-    def test_a_queued_meal_survives_clears_from_any_caller(self):
-        client = AtrinikClient(ClientConfig())
-        sent = []
-
-        async def send(packet):
-            sent.append(packet)
-
-        client.send = send
-        client.state.stats.update({"hp": 10, "maxhp": 100, "food": 0})
-        client.state.player_tag = 7
-        client.state.place_item(Item(51, item_type=c.TYPE_FOOD, quality=100,
-                                     name="wholemeal bread"), 7)
-        asyncio.run(SafetyPolicy().enforce(client))
-        applied = len(sent)
-        async def scenario():
-            # Any caller's clear inside the window is deferred, not dropped.
-            client._queue_protected_until = time.monotonic() + 0.05
-            await client.clear_actions()
-            self.assertEqual(len(sent), applied)
-            await asyncio.sleep(0.1)
-            self.assertEqual(len(sent), applied + 1)
-            # An operator stop clears at once.
-            client._queue_protected_until = time.monotonic() + 5
-            await client.clear_actions(force=True)
-            self.assertEqual(len(sent), applied + 2)
-
-        asyncio.run(scenario())
+        # A heal spell she cannot afford is no heal: the carried meal is eaten,
+        # and nothing clears the move that may save her.
+        spell = Item(52, item_type=c.TYPE_SPELL, name="minor healing", extra={"cost": 5})
+        bread = Item(53, item_type=c.TYPE_FOOD, quality=100, name="wholemeal bread")
+        client = FakeClient([spell, bread])
+        self.assertFalse(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertEqual((client.applied, client.clears), ([53], 0))
+        # Nothing to eat either: still not safe, still no clear.
+        client = FakeClient([spell])
+        self.assertFalse(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertEqual(client.clears, 0)
 
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:

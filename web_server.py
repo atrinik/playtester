@@ -808,7 +808,7 @@ class WebControlServer:
         if previous is not None:
             previous.fail("replaced by operator")
         if self.client.state.phase == "playing":
-            await self.client.clear_actions(force=True)
+            await self.client.clear_actions()
             await self.client.set_combat(False)
             await self.client.clear_target()
         self.engine.set_task(task)
@@ -838,7 +838,7 @@ class WebControlServer:
                 }
             self.engine.set_task(None)
             if self.client.state.phase == "playing":
-                await self.client.clear_actions(force=True)
+                await self.client.clear_actions()
                 await self.client.set_combat(False)
                 await self.client.clear_target()
             return {"ok": True, "task": None}

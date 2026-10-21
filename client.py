@@ -2239,42 +2239,10 @@ class AtrinikClient:
         self.record_action("pathfind", f"view={x},{y}")
         await self.send(Packet(c.S_MOVE_PATH).u8(x).u8(y))
 
-    def protect_queued_actions(self, seconds: float) -> None:
-        """Keep clear_actions from wiping the server queue for ``seconds``.
-
-        The server queues APPLY and FIRE behind the player's speed, and an
-        empty CLEAR drops the whole queue. A meal or heal that safety just
-        sent would be thrown away by the next clear, from whichever caller,
-        so for this short window a clear is deferred: it is sent as soon as
-        the window ends, never dropped.
-        """
-        self._queue_protected_until = max(
-            getattr(self, "_queue_protected_until", 0.0), time.monotonic() + seconds)
-
-    async def clear_actions(self, *, force: bool = False) -> None:
-        """Cancel buffered commands, queued click paths and persistent run.
-
-        Inside a protect_queued_actions window the clear is deferred to the
-        window's end (one pending clear at most), unless forced: an operator
-        stop or task replacement clears at once.
-        """
-        remaining = getattr(self, "_queue_protected_until", 0.0) - time.monotonic()
-        if remaining > 0 and not force:
-            if not getattr(self, "_clear_deferred", False):
-                self._clear_deferred = True
-                asyncio.get_running_loop().call_later(
-                    remaining, lambda: asyncio.ensure_future(self._send_deferred_clear()))
-            return
-        self._clear_deferred = False
+    async def clear_actions(self) -> None:
+        """Cancel buffered commands, queued click paths and persistent run."""
         self.record_action("clear", "cancel queued movement/actions")
         await self.send(Packet(c.S_CLEAR))
-
-    async def _send_deferred_clear(self) -> None:
-        if getattr(self, "_clear_deferred", False):
-            try:
-                await self.clear_actions()
-            except ConnectionError:
-                self._clear_deferred = False
 
     async def target(self, x: int, y: int, actor_count: int,
                      relative_depth: int = 0) -> None:

@@ -254,14 +254,6 @@ class TaskStatus(str, Enum):
     PAUSED = "paused"
 
 
-def _protect(client: AtrinikClient, seconds: float) -> None:
-    """Keep the meal or heal just sent from being cleared off the server's
-    queue (client.protect_queued_actions)."""
-    protect = getattr(client, "protect_queued_actions", None)
-    if protect is not None:
-        protect(seconds)
-
-
 def safe_food(item: Item) -> bool:
     """Food she may eat: identified, and not cursed, damned or unpaid."""
     return (not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED) and
@@ -303,22 +295,26 @@ class SafetyPolicy:
         return next((item for item in safe
                      if item.item_type == c.TYPE_FOOD), None)
 
-    async def _heal(self, client: AtrinikClient) -> bool:
+    def _usable_heal(self, client: AtrinikClient) -> Item | None:
+        """A healing item, or a healing spell she can afford, if any."""
         heal = self._find(client.state.inventory, self.healing_patterns)
+        if heal is not None and heal.item_type == c.TYPE_SPELL:
+            cost = int(heal.extra.get("cost", 0) or 0)
+            if cost > int(client.state.stats.get("sp", 0) or 0):
+                return None
+        return heal
+
+    async def _heal(self, client: AtrinikClient) -> bool:
+        heal = self._usable_heal(client)
         if heal is None:
             return False
         if heal.item_type == c.TYPE_SPELL:
-            cost = int(heal.extra.get("cost", 0) or 0)
-            if cost > int(client.state.stats.get("sp", 0) or 0):
-                return False
             # The official client's `/cast <spell>` sends FIRE direction 0
             # with the spell object's tag. Applying a spell merely readies or
             # unreadies it and was the reason Sera never recovered health.
             await client.fire(0, heal.tag)
-            _protect(client, self.heal_cooldown)
         else:
             await client.apply(heal.tag)
-            _protect(client, self.heal_cooldown)
         return True
 
     async def enforce(self, client: AtrinikClient) -> bool:
@@ -331,25 +327,13 @@ class SafetyPolicy:
         if maxhp <= 0:
             return True
         ratio = hp / maxhp
-        # Starving, food comes first: hunger is what drains her health, and
-        # eating is one APPLY. Otherwise the critical-health branch below
-        # returns before the food logic is reached and she starves carrying
-        # food.
-        food_level = int(stats.get("food", 1000) or 0)
-        if food_level <= 0:
-            food = self._food(client.state.inventory)
-            if food is not None:
-                now = time.monotonic()
-                if not (self._food_attempt_level == food_level and
-                        now - self._last_food < self.food_retry_seconds):
-                    await client.apply(food.tag)
-                    _protect(client, self.food_retry_seconds)
-                    self._last_food = now
-                    self._food_attempt_level = food_level
-                    return False
-                # Applied and awaiting the food stat (protected from clears):
-                # critical health is still handled below, never reported safe.
-        if ratio <= self.flee_below:
+        # Critical health with no heal she can use: clearing is pointless (it
+        # only wipes the move that might save her) and food may still help, so
+        # fall through to eating. Live: a starving Sera at critical health,
+        # with no castable heal, had every step towards food cleared.
+        critical_without_heal = (
+            ratio <= self.flee_below and self._usable_heal(client) is None)
+        if ratio <= self.flee_below and not critical_without_heal:
             now = time.monotonic()
             if now - self._last_heal >= self.heal_cooldown:
                 await client.clear_actions()
@@ -362,7 +346,12 @@ class SafetyPolicy:
                 log.warning("safety heal: health %.0f%%", ratio * 100)
                 self._last_warning = now
             return False
-        if ratio <= self.heal_below:
+        if critical_without_heal:
+            now = time.monotonic()
+            if now - self._last_warning >= 2.0:
+                log.warning("critical health %.0f%% and no usable heal", ratio * 100)
+                self._last_warning = now
+        if ratio <= self.heal_below and not critical_without_heal:
             now = time.monotonic()
             if now - self._last_heal < self.heal_cooldown:
                 return False
@@ -395,11 +384,10 @@ class SafetyPolicy:
             food = self._food(client.state.inventory)
             if food:
                 await client.apply(food.tag)
-                _protect(client, self.food_retry_seconds)
                 self._last_food = now
                 self._food_attempt_level = food_level
                 return False
-        return True
+        return not critical_without_heal
 
 
 class BotTask:
