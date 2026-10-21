@@ -13848,6 +13848,75 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         unknown = analyzer_spot("Nowhere", [self.TREES, "/no/such/map"], ["rat L1"])
         self.assertEqual(analyzer_spot_legs(unknown, graph), ())
 
+    def test_depleted_farming_picks_a_spot_whose_town_trips_route_strictly(self):
+        from .navigation import (_town_reach_cache, analyzer_farm_selection,
+                                 town_safely_reachable)
+
+        # Live case: depleted at level 27, the safety ranking led to the
+        # Morliana circuit, from which no strictly safe route reaches the
+        # bank, the shop or the temple, so no selling or cure trip could
+        # start. The Strakewood Island circuit reaches all of them.
+        graph = built_graph()
+        morliana = analyzer_spot("Morliana circuit", [
+            "/shattered_islands/world_11_4", "/shattered_islands/world_11_5",
+            "/shattered_islands/world_11_6"], ["rat L1"])
+        strakewood = analyzer_spot("Strakewood Island circuit", [
+            "/shattered_islands/world_0_51", "/shattered_islands/world_1_51"], ["rat L1"])
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees], "safety": [morliana, strakewood]})
+        client.state.stats["level"] = 27
+        _town_reach_cache.clear()
+        # Each call plans at most its budget of strict routes.
+        self.assertIsNone(town_safely_reachable(
+            client, graph, "/shattered_islands/world_0_51", [0]))
+        self.assertFalse(town_safely_reachable(
+            client, graph, "/shattered_islands/world_11_4", [99]))
+        self.assertTrue(town_safely_reachable(
+            client, graph, "/shattered_islands/world_0_51", [99]))
+        _town_reach_cache.clear()
+        client.state.depletion_points_known = True
+        client.state.depletion_points = 67
+        client.state.place_item(Item(
+            502, item_type=c.TYPE_FORCE, quality=0, name="depletion"), client.state.player_tag)
+
+        def settle():
+            # One strict route per call; an undecided spot counts until it
+            # fails, so the answer settles over a few calls.
+            names = [analyzer_farm_selection(client, graph)[1]["name"]
+                     for _ in range(60)]
+            return names[-1]
+
+        # The first call's one route (Morliana to the bank) already fails, so
+        # the next spot, still undecided, is returned; checking it confirms it.
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Strakewood Island circuit")
+        self.assertEqual(settle(), "Strakewood Island circuit")
+        # No safety spot qualifies: the chosen objective's spot applies...
+        client.farm_analyzer.rankings["safety"] = [morliana]
+        self.assertEqual(settle(), "Trees")
+        # ...and with safety chosen too, the best usable safety spot.
+        client.state.farm_objective = "safety"
+        self.assertEqual(settle(), "Morliana circuit")
+        # Not depleted, the analyzer's ranking applies unfiltered.
+        client.farm_analyzer.rankings["safety"] = [morliana, strakewood]
+        client.state.remove_item(502)
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Morliana circuit")
+
+    def test_a_strict_trip_without_a_safe_route_retries_shortly(self):
+        # Refused for want of a strictly safe route from where she stands is
+        # not a failure: farming moves her, so the trip retries in minutes,
+        # never after the cure's 30 minutes or funding's 6 hours.
+        refusal = ("no route to /shattered_islands/world_3_58 avoiding every "
+                   "known hazard: no component route")
+        self.assertEqual(FarmCircuitTask.failure_backoff(refusal, 1800.0),
+                         FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS)
+        self.assertEqual(FarmCircuitTask.failure_backoff(
+            "/shattered_islands/world_0_69 is itself a known hazard", 21600.0),
+            FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS)
+        self.assertEqual(FarmCircuitTask.failure_backoff(
+            "temple service took payment but depletion remained", 1800.0), 1800.0)
+
     def test_selection_follows_the_objective_and_skips_live_failures(self):
         from .navigation import analyzer_farm_selection
 
