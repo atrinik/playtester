@@ -4959,6 +4959,31 @@ class FarmCircuitTask(BotTask):
     def _hungry(self, client: AtrinikClient) -> bool:
         return hungry(client)
 
+    # Food stat below which a food trip starts even in the middle of a fight
+    # or corpse: at the observed ~15 food a minute that leaves about six
+    # minutes. Live: on a busy circuit she fought continuously, the food trip
+    # waited for a lull that never came, and she starved four times.
+    FOOD_URGENT = 90
+
+    def _food_urgent(self, client: AtrinikClient) -> bool:
+        """Hungry and nearly starving: no fight may hold the food trip back."""
+        return (self._hungry(client) and
+                int(client.state.stats.get("food", 1000) or 0) < self.FOOD_URGENT)
+
+    def _food_trip(self, client: AtrinikClient) -> tuple[NavigateThenTask | None, str]:
+        """The food trip to start now: the shop, or a temple priest.
+
+        Hungry and unable to afford a merchant order above the protected
+        cash, she goes straight to a temple: walking to the shop only to be
+        refused there cost every hungry cycle a wasted trip.
+        """
+        affordable = (BuyShopUpgradeTask.wallet_value(client) >=
+                      self.FOOD_RESERVE_CASH + self._food_order_cost())
+        if self.clock() >= self._resupply_retry_at and (
+                affordable or not self._hungry(client)):
+            return self._new_food_resupply(client), "shop"
+        return self._new_temple_food(client), "temple"
+
     def _food_order_cost(self) -> int:
         """What a usual restock order costs at the cheapest authored merchant
         food (its value per item, times the usual quantity)."""
@@ -6536,14 +6561,12 @@ class FarmCircuitTask(BotTask):
         # Survival supplies first, then clear unknown/cursed-item risk and
         # carrying pressure; discretionary shopping is always last.
         if (isinstance(farm, FarmTask) and self._needs_food_resupply(client) and
-                not self._busy_finishing_fight_or_loot(client, farm)):
-            if self.clock() >= self._resupply_retry_at:
-                resupply, kind = self._new_food_resupply(client), "shop"
-            else:
-                resupply, kind = self._new_temple_food(client), "temple"
-                if resupply is None:
-                    self._temple_food_retry_at = (
-                        self.clock() + self.TEMPLE_FOOD_RETRY_SECONDS)
+                (self._food_urgent(client) or
+                 not self._busy_finishing_fight_or_loot(client, farm))):
+            resupply, kind = self._food_trip(client)
+            if resupply is None and kind == "temple":
+                self._temple_food_retry_at = (
+                    self.clock() + self.TEMPLE_FOOD_RETRY_SECONDS)
             if resupply is not None:
                 await client.clear_actions()
                 await client.set_combat(False)

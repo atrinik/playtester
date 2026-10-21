@@ -4317,6 +4317,39 @@ class QuestTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_hungry_and_broke_goes_straight_to_a_temple(self):
+        task = FarmCircuitTask(WorldGraph(), [("/a", "treant")], clock=lambda: 10.0)
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["food"] = 150
+        # Live: 851 coins with nothing banked, under the protected 1,000.
+        client.state.bank_balance = 851
+        # The shop would refuse her, so the trip is the temple from the start.
+        self.assertEqual(task._food_trip(client)[1], "temple")
+        client.state.bank_balance = 5_000
+        self.assertEqual(task._food_trip(client)[1], "shop")
+        # Not hungry, a proactive restock is the shop's alone.
+        client.state.stats["food"] = 300
+        client.state.bank_balance = 851
+        self.assertEqual(task._food_trip(client)[1], "shop")
+
+    def test_nearly_starving_food_trip_does_not_wait_for_a_lull(self):
+        task = FarmCircuitTask(WorldGraph(), [("/a", "treant")], clock=lambda: 10.0)
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        # Hungry, but with minutes to spare: a fight still finishes first.
+        client.state.stats["food"] = 150
+        self.assertFalse(task._food_urgent(client))
+        # Live: continuous fights on a busy circuit; food reached 0 and she
+        # starved. Below FOOD_URGENT the trip starts mid-fight.
+        client.state.stats["food"] = task.FOOD_URGENT - 1
+        self.assertTrue(task._food_urgent(client))
+        # Safe food carried is eaten on the spot instead.
+        for tag in range(93, 96):
+            client.state.place_item(Item(tag, item_type=c.TYPE_FOOD, quality=100,
+                                         name="wholemeal bread"), 7)
+        self.assertFalse(task._food_urgent(client))
+
     def test_farm_circuit_requests_food_detour_at_safe_low_reserve(self):
         graph = WorldGraph()
         task = FarmCircuitTask(graph, [("/a", "treant")], clock=lambda: 10.0)
