@@ -3709,12 +3709,13 @@ def effective_farm_objective(state) -> str:
 # Services a depleted character must reach for her cure and its funding, all
 # planned with strict_safety: the bank, the apartment chest, the Brynknot shop
 # floor, Kulgar's identify-all and Saruthar's temple.
-TOWN_SERVICES: tuple[tuple[str, tuple[int, int]], ...] = (
-    ("/shattered_islands/world_0_67", (19, 15)),
-    ("/shattered_islands/strakewood_island/apartments/apartment_cheap", (1, 3)),
-    ("/shattered_islands/world_0_69", (15, 7)),
-    ("/shattered_islands/world_8_79", (4, 9)),
-    ("/shattered_islands/world_3_58", (13, 13)),
+# Each entry carries the approach tolerance its task's navigation uses.
+TOWN_SERVICES: tuple[tuple[str, tuple[int, int], int], ...] = (
+    ("/shattered_islands/world_0_67", (19, 15), 0),
+    ("/shattered_islands/strakewood_island/apartments/apartment_cheap", (1, 3), 0),
+    ("/shattered_islands/world_0_69", (15, 7), 0),
+    ("/shattered_islands/world_8_79", (4, 9), 1),
+    ("/shattered_islands/world_3_58", (13, 13), 1),
 )
 # Strict town routes already planned: per (graph, map, level, learned hazards,
 # access items), the result of each (start, service) pair.
@@ -3771,7 +3772,7 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
         _town_reach_cache.clear()
     results = _town_reach_cache.setdefault(key, {})
     for start in _farm_starts(graph, path) or [None]:
-        for destination, xy in TOWN_SERVICES:
+        for destination, xy, tolerance in TOWN_SERVICES:
             pair = (start, destination)
             if pair not in results:
                 if budget[0] <= 0:
@@ -3783,6 +3784,9 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
                     proxy.state.map.world_x, proxy.state.map.world_y = start
                     navigation = NavigateTask(graph, destination, destination_xy=xy)
                     navigation.strict_safety = True
+                    if tolerance:
+                        navigation.tolerance = tolerance
+                        navigation._approach = navigation._approach_candidates()
                     try:
                         navigation._plan(proxy)
                         results[pair] = True
@@ -5318,6 +5322,18 @@ class FarmCircuitTask(BotTask):
     RESTORATION_RETRY_SECONDS = 1800.0
     PAID_RESTORATION_RETRY_SECONDS = 6 * 3600.0
 
+    # A strict trip with no safe route from where she stands has not failed:
+    # it retries shortly, once farming has moved her somewhere it routes from
+    # (or a map that killed her stops counting), never after a long backoff.
+    STRICT_ROUTE_RETRY_SECONDS = 120.0
+
+    @classmethod
+    def failure_backoff(cls, error: str, default: float) -> float:
+        if ("avoiding every known hazard" in error or
+                "is itself a known hazard" in error):
+            return cls.STRICT_ROUTE_RETRY_SECONDS
+        return default
+
     @classmethod
     def restoration_backoff(cls, error: str) -> float:
         if error.startswith("temple service took payment"):
@@ -5432,10 +5448,12 @@ class FarmCircuitTask(BotTask):
         task = self._cure_funding
         self._cure_funding = None
         if task is None or task.status == TaskStatus.FAILED or not task.task.retrieved:
-            if task is not None and task.status == TaskStatus.FAILED:
+            failed = task is not None and task.status == TaskStatus.FAILED
+            if failed:
                 log.warning("cure funding trip failed: %s", task.error)
-            self._cure_funding_retry_at = (
-                self.clock() + self.CURE_FUNDING_RETRY_SECONDS)
+            self._cure_funding_retry_at = self.clock() + (
+                self.failure_backoff(task.error, self.CURE_FUNDING_RETRY_SECONDS)
+                if failed else self.CURE_FUNDING_RETRY_SECONDS)
             return
         log.info("cure funding: took %d item(s) from the apartment",
                  len(task.task.retrieved))
@@ -6144,7 +6162,8 @@ class FarmCircuitTask(BotTask):
                 if self._bank_sync.status == TaskStatus.FAILED:
                     log.warning("bank balance sync failed: %s",
                                 self._bank_sync.error)
-                    self._bank_sync_retry_at = self.clock() + 1800.0
+                    self._bank_sync_retry_at = self.clock() + self.failure_backoff(
+                        self._bank_sync.error, 1800.0)
                 else:
                     log.info("bank balance synchronized: %d copper",
                              client.state.bank_balance)
@@ -6201,7 +6220,9 @@ class FarmCircuitTask(BotTask):
                 if self._restoration.status == TaskStatus.FAILED:
                     log.warning("depletion removal failed: %s",
                                 self._restoration.error)
-                    backoff = self.restoration_backoff(self._restoration.error)
+                    backoff = self.failure_backoff(
+                        self._restoration.error,
+                        self.restoration_backoff(self._restoration.error))
                     self._restoration_retry_at = self.clock() + backoff
                     if backoff == self.PAID_RESTORATION_RETRY_SECONDS:
                         # Survives restarts, which rebuild this task.
@@ -6361,7 +6382,8 @@ class FarmCircuitTask(BotTask):
             await self._banking.tick(client)
             if self._banking.status == TaskStatus.FAILED:
                 log.warning("bank deposit failed: %s", self._banking.error)
-                self._banking_retry_at = self.clock() + 1800.0
+                self._banking_retry_at = self.clock() + self.failure_backoff(
+                    self._banking.error, 1800.0)
                 self._banking = None
             elif self._banking.status == TaskStatus.COMPLETE:
                 log.info("all carried cash banked; returning to farm")
@@ -6379,7 +6401,8 @@ class FarmCircuitTask(BotTask):
             if self._selling.status == TaskStatus.FAILED:
                 log.warning("identified junk sale failed: %s",
                             self._selling.error)
-                self._selling_retry_at = self.clock() + 1800.0
+                self._selling_retry_at = self.clock() + self.failure_backoff(
+                    self._selling.error, 1800.0)
                 self._selling = None
             elif self._selling.status == TaskStatus.COMPLETE:
                 log.info("identified junk sale complete; returning to farm")
@@ -6400,7 +6423,8 @@ class FarmCircuitTask(BotTask):
             if self._identification.status == TaskStatus.FAILED:
                 log.warning("mass identification failed: %s",
                             self._identification.error)
-                self._identification_retry_at = self.clock() + 1800.0
+                self._identification_retry_at = self.clock() + self.failure_backoff(
+                    self._identification.error, 1800.0)
                 self._identification = None
             elif self._identification.status == TaskStatus.COMPLETE:
                 # Evaluate the newly revealed batch before returning to a
@@ -6425,7 +6449,8 @@ class FarmCircuitTask(BotTask):
             if self._storage.status == TaskStatus.FAILED:
                 log.warning("unidentified storage failed: %s",
                             self._storage.error)
-                self._storage_retry_at = self.clock() + 1800.0
+                self._storage_retry_at = self.clock() + self.failure_backoff(
+                    self._storage.error, 1800.0)
                 self._storage = None
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")

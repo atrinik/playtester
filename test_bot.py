@@ -13903,6 +13903,20 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
                          "Morliana circuit")
 
+    def test_a_strict_trip_without_a_safe_route_retries_shortly(self):
+        # Refused for want of a strictly safe route from where she stands is
+        # not a failure: farming moves her, so the trip retries in minutes,
+        # never after the cure's 30 minutes or funding's 6 hours.
+        refusal = ("no route to /shattered_islands/world_3_58 avoiding every "
+                   "known hazard: no component route")
+        self.assertEqual(FarmCircuitTask.failure_backoff(refusal, 1800.0),
+                         FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS)
+        self.assertEqual(FarmCircuitTask.failure_backoff(
+            "/shattered_islands/world_0_69 is itself a known hazard", 21600.0),
+            FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS)
+        self.assertEqual(FarmCircuitTask.failure_backoff(
+            "temple service took payment but depletion remained", 1800.0), 1800.0)
+
     def test_selection_follows_the_objective_and_skips_live_failures(self):
         from .navigation import analyzer_farm_selection
 
