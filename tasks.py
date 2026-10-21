@@ -321,6 +321,23 @@ class SafetyPolicy:
         if maxhp <= 0:
             return True
         ratio = hp / maxhp
+        # Starving, food comes first: hunger is what drains her health, and
+        # eating is one APPLY. Otherwise the critical-health branch below
+        # returns before the food logic is reached and she starves carrying
+        # food.
+        food_level = int(stats.get("food", 1000) or 0)
+        if food_level <= 0:
+            food = self._food(client.state.inventory)
+            if food is not None:
+                now = time.monotonic()
+                if (self._food_attempt_level == food_level and
+                        now - self._last_food < self.food_retry_seconds):
+                    # Applied; awaiting the food stat. Nothing may clear it.
+                    return True
+                await client.apply(food.tag)
+                self._last_food = now
+                self._food_attempt_level = food_level
+                return False
         if ratio <= self.flee_below:
             now = time.monotonic()
             if now - self._last_heal >= self.heal_cooldown:

@@ -4844,6 +4844,31 @@ class QuestTests(unittest.TestCase):
         client.state.stats["food"] = 100
         self.assertTrue(circuit._needs_food_resupply(client))
 
+    def test_safety_eats_before_healing_when_starving(self):
+        class FakeClient:
+            def __init__(self):
+                # Critical health and food 0, a safe meal carried, no heal.
+                self.state = type("State", (), {
+                    "stats": {"hp": 10, "maxhp": 100, "food": 0},
+                    "inventory": [Item(50, item_type=c.TYPE_FOOD, quality=100,
+                                       name="wholemeal bread")],
+                })()
+                self.applied, self.clears = [], 0
+
+            async def apply(self, tag):
+                self.applied.append(tag)
+
+            async def clear_actions(self):
+                self.clears += 1
+
+        client = FakeClient()
+        policy = SafetyPolicy()
+        self.assertFalse(asyncio.run(policy.enforce(client)))
+        self.assertEqual((client.applied, client.clears), ([50], 0))
+        # While the stat update is pending, nothing clears it.
+        self.assertTrue(asyncio.run(policy.enforce(client)))
+        self.assertEqual((client.applied, client.clears), ([50], 0))
+
     def test_safety_never_eats_identified_cursed_food(self):
         class FakeClient:
             def __init__(self):
