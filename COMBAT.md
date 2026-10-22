@@ -134,14 +134,29 @@ nearly unchanged. Live, Wizardry XP did not move for hours.
 - **Out of mana, she waits.** When the next cast would dip into the
   healing reserve, she keeps her distance with combat off until mana
   regenerates, rather than let a melee finish hand Slash its share.
-- **Pulls wait for a full bar.** Unengaged and not under attack, she rests
-  until her mana is full before the next pull (`training-rest`).
+- **Never melee a training target.** Whenever the spell cannot be cast
+  (hurt below the heal threshold, line blocked), the farm loop keeps her
+  distance with combat off; safety and retreat handle her health. Pulls use
+  the spell, never a launcher, and travel defence casts too. The only melee
+  left is the cornered-retreat breakout, a survival exception.
+- **Pulls wait for a full bar.** Unengaged, with no creature coming at her
+  and not under attack, she rests until her mana is full before the next
+  pull (`training-rest`), unless she has no food (mana regenerates only
+  with food). The circuit counts the rest as busy, so a leg switch does not
+  send her on with a partial bar. Resting out of combat also ramps her
+  regeneration up: with Meditation, the server multiplies it by
+  1 + seconds since combat / 10, up to tenfold (`player_do_some_living`).
+  Only hits and offensive casts restart that clock.
+- **A bar that cannot cast trains the weapon.** Spell-only training needs
+  max mana to cover one cast beyond the healing reserve.
 - **The analyzer ranks spell kills.** The profile sent for Wizardry training
   is the caster model: the median raw damage of her recent spell hits, taken
-  from her own hit text ("You hit X for N (P) with ..." gives raw damage
-  N - P); the cast delay (`action_time`, at least 0.8 s); the spell's mana
-  cost; `regen_sp` (the client shows it per second); and max mana less the
-  three-heal reserve. Magic bullet deals weapon magic, which the locked
+  from her own hit text within 3 s of her own cast ("You hit X for N (P)
+  with ..." gives raw damage N - P); a fixed 1 s cast delay (mana, not the
+  cast rate, bounds the kill rate, and the client's `action_time` reflects
+  whatever she did last); the spell's mana cost; `regen_sp` (the client
+  shows it per second); max mana less the three-heal reserve; and
+  `--meditation` when she has that skill. Magic bullet deals weapon magic, which the locked
   analyzer cannot model, so it is passed as magic: understated only against
   the few monsters that resist magic. No monster archetype resists weapon
   magic. Until a cast has been observed, the weapon stands in.

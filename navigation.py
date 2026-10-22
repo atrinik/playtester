@@ -3109,7 +3109,8 @@ class NavigateThenTask(BotTask):
         # to finish the enemy after healing.
         if (ratio > self.safety.flee_below and nearest is not None and
                 not hold_fire and isinstance(self.task, FarmTask) and
-                self.task.should_training_finish(client, nearest[3])):
+                (self.task.spell_only_training(client) or
+                 self.task.should_training_finish(client, nearest[3]))):
             _, x, y, obj = nearest
             self.task.remember_engagement(client, x, y, obj.target_id)
             selected = await select_target(client, x, y, obj.target_id)
@@ -6229,6 +6230,8 @@ class FarmCircuitTask(BotTask):
         return bool(
             selected_is_visible or selected_is_alive or
             recent_hostile_contact(client) or
+            # Resting for mana before the next spell-only pull.
+            farm._training_resting or
             farm._engaged_target or corpse_with_contents or
             corpse_operation or farm._suspected_corpse_tiles or
             farm._suspected_corpse_probe)

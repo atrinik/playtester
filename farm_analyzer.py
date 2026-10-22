@@ -64,6 +64,12 @@ SPELL_ATTACKS = frozenset({
 # resist magic.
 SPELL_ATTACK_ALIASES = {"weapon magic": "magic"}
 SPELL_SAMPLES = 30
+# Hit text this soon after her own offensive cast is that spell's damage.
+SPELL_HIT_WINDOW_SECONDS = 3.0
+# Seconds per cast in the caster model. The client's action_time is the delay
+# of whatever she did last (a sword swing included), and mana, not the cast
+# rate, bounds a spell-only kill rate, so a fixed second is used.
+SPELL_CAST_DELAY = 1.0
 
 
 def owned_skill_level(state, name: str) -> int:
@@ -131,6 +137,9 @@ class CombatProfile:
     mana_regen: float = 0.0
     max_mana: int = 0
     spell_attack: str = ""
+    # She has Meditation: resting out of combat ramps regeneration up to
+    # tenfold (types/player.c, player_do_some_living).
+    meditation: bool = False
 
     def arguments(self) -> list[str]:
         if self.spell_damage > 0:
@@ -143,6 +152,8 @@ class CombatProfile:
                 "--max-mana", str(self.max_mana),
                 "--attack-type", self.spell_attack,
             ]
+            if self.meditation:
+                args.append("--meditation")
         else:
             args = [
                 str(self.skill_level),
@@ -168,9 +179,11 @@ class CombatProfile:
         if other is None:
             return True
         if (self.skill, self.skill_level, self.attack, self.character_level,
-                self.max_aggro_pack, self.spell_attack, self.mana_cost) != (
+                self.max_aggro_pack, self.spell_attack, self.mana_cost,
+                self.meditation) != (
                 other.skill, other.skill_level, other.attack, other.character_level,
-                other.max_aggro_pack, other.spell_attack, other.mana_cost):
+                other.max_aggro_pack, other.spell_attack, other.mana_cost,
+                other.meditation):
             return True
         if (self.spell_damage > 0) != (other.spell_damage > 0):
             return True
@@ -179,7 +192,6 @@ class CombatProfile:
             return abs(new - old) > fraction * max(abs(old), 1.0)
 
         if (relative(self.spell_damage, other.spell_damage, 0.15) or
-                relative(self.cast_delay, other.cast_delay, 0.10) or
                 relative(self.mana_regen, other.mana_regen, 0.10) or
                 relative(self.max_mana, other.max_mana, 0.10) or
                 relative(self.damage, other.damage, 0.10) or
@@ -206,6 +218,7 @@ class CombatProfile:
             "spell_damage": self.spell_damage, "cast_delay": self.cast_delay,
             "mana_cost": self.mana_cost, "mana_regen": self.mana_regen,
             "max_mana": self.max_mana, "spell_attack": self.spell_attack,
+            "meditation": self.meditation,
         }
 
 
@@ -262,9 +275,8 @@ def combat_profile(client, spell_damage: float = 0.0,
             cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
             regen = float(stats.get("regen_sp", 0) or 0)
             maxsp = int(stats.get("maxsp", 0) or 0)
-            action_time = float(stats.get("action_time", 0) or 0)
         except (TypeError, ValueError):
-            cost, regen, maxsp, action_time = 0, 0.0, 0, 0.0
+            cost, regen, maxsp = 0, 0.0, 0
         heal_costs = [
             int(item.extra.get("cost", 0) or 0) for item in state.inventory
             if item.item_type == c.TYPE_SPELL and "heal" in item.name.casefold() and
@@ -274,9 +286,13 @@ def combat_profile(client, spell_damage: float = 0.0,
                 0 < cost <= offence and regen > 0):
             caster = dict(
                 spell_damage=round(spell_damage, 1),
-                cast_delay=round(max(0.8, action_time), 3), mana_cost=cost,
+                cast_delay=SPELL_CAST_DELAY, mana_cost=cost,
                 mana_regen=round(regen, 3), max_mana=offence,
-                spell_attack=spell_attack)
+                spell_attack=spell_attack,
+                meditation=any(
+                    item.item_type == c.TYPE_SKILL and
+                    item.name.casefold() == "meditation"
+                    for item in state.inventory))
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
@@ -318,10 +334,12 @@ class FarmAnalyzer:
         self._last_attempt_at = 0.0
         self._task: asyncio.Task | None = None
         self._process: asyncio.subprocess.Process | None = None
-        # Raw damage of her recent damage-spell hits and their attack type.
+        # Raw damage of her recent damage-spell hits, their attack type, the
+        # spell they came from and the next message position to read.
         self.spell_samples: list[int] = []
         self.spell_attack = ""
-        self._spell_seen_at = 0.0
+        self.spell_name = ""
+        self._message_position = 0
 
     @classmethod
     def from_bundle(cls, installed: dict, **kwargs) -> "FarmAnalyzer":
@@ -364,12 +382,23 @@ class FarmAnalyzer:
                 now - self.reported_at >= self.REFRESH_SECONDS)
 
     def observe_spells(self, client) -> None:
-        """Record the raw damage of new damage-spell hits from her hit text."""
-        for entry in getattr(client.state, "messages", ()):
-            if len(entry) <= 3 or entry[0] <= self._spell_seen_at:
+        """Record the raw damage of her damage spell from her own hit text.
+
+        Only hit text within a few seconds of her own offensive cast counts,
+        so elemental melee (rings of fire and the like) is never sampled.
+        """
+        state = client.state
+        entries = state.messages_since(self._message_position)
+        self._message_position = state.message_count
+        cast_at, spell = getattr(client, "last_offensive_cast", (0.0, ""))
+        if spell and spell != self.spell_name:
+            self.spell_name = spell
+            self.spell_samples = []
+            self.spell_attack = ""
+        for timestamp, _, _, text in entries:
+            if not 0.0 <= timestamp - cast_at <= SPELL_HIT_WINDOW_SECONDS:
                 continue
-            self._spell_seen_at = entry[0]
-            match = HIT_TEXT.match(entry[3])
+            match = HIT_TEXT.match(text)
             if match is None:
                 continue
             attack = match.group(3).casefold()

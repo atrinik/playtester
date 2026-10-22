@@ -6099,6 +6099,42 @@ class QuestTests(unittest.TestCase):
             client, [(4, 12, 8, target)])))
         self.assertEqual(fired, [])
 
+    def test_wizardry_training_never_pulls_with_a_launcher(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        target = MapObject(
+            3, 1, 0, 0, name="quickwood", target_id=100, target_hp=100)
+        client.state.map.tile(12, 8).objects[3] = target
+        client.state.stats["sp"] = 0
+        bow = Item(41, flags=c.ITEM_APPLIED, item_type=c.TYPE_BOW,
+                   quality=81, name="spruce short bow")
+        arrow = Item(42, flags=c.ITEM_APPLIED, item_type=c.TYPE_ARROW,
+                     quality=80, name="pine arrow", quantity=25)
+        spell = Item(
+            43, item_type=c.TYPE_SPELL, name="magic bullet",
+            extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 4})
+        skill = Item(44, item_type=c.TYPE_SKILL, name="wizardry spells")
+        client.state.inventory.extend((bow, arrow, spell, skill))
+        fired = []
+
+        async def fire(direction, tag=0):
+            fired.append((direction, tag))
+
+        client.fire = fire
+        # With launchers allowed and no mana, an ordinary farm pulls with
+        # the bow ...
+        task = FarmTask(combat_spell="magic bullet", allow_launchers=True)
+        asyncio.run(task.ranged_pull(client, [(4, 12, 8, target)]))
+        self.assertEqual(fired, [(3, bow.tag)])
+        # ... but Wizardry training would hand the bow a share of the kill.
+        fired.clear()
+        task = FarmTask(combat_skill="wizardry spells",
+                        combat_spell="magic bullet", allow_launchers=True)
+        self.assertTrue(task.spell_only_training(client))
+        self.assertFalse(asyncio.run(task.ranged_pull(
+            client, [(4, 12, 8, target)])))
+        self.assertEqual(fired, [])
+
     def test_neutral_ranged_pull_refuses_creature_behind_target(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
@@ -7072,6 +7108,54 @@ class QuestTests(unittest.TestCase):
             combat_spell=spell)
         return client, task
 
+    def test_wizardry_training_never_melees_when_it_cannot_cast(self):
+        # Hurt below the heal threshold with no heal known, the finisher
+        # declines; the tick keeps her distance with combat off instead of
+        # meleeing the training target.
+        client = self._wizard_training_client(80, x=9, y=8)
+        client.state.stats.update({"hp": 60, "maxhp": 100})
+        task = FarmTask(
+            zone="/test", target="kobold",
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds")
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.fired, [])
+        self.assertNotIn(True, client.combat)
+        # Healthy again, the spell is cast.
+        client.state.stats["hp"] = 100
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.fired, [(3, 42)])
+        self.assertNotIn(True, client.combat)
+
+    def test_wizardry_training_needs_a_bar_that_affords_a_cast(self):
+        client = self._wizard_training_client(80)
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        task = FarmTask(combat_skill="wizardry spells",
+                        combat_spell="cause light wounds")
+        # Four for the cast plus twelve held for heals: 15 cannot cast.
+        client.state.stats["maxsp"] = 15
+        self.assertFalse(task.spell_only_training(client))
+        client.state.stats["maxsp"] = 16
+        self.assertTrue(task.spell_only_training(client))
+
+    def test_navigation_defence_casts_while_training_wizardry(self):
+        client = self._wizard_training_client(100, x=9, y=8)
+        target = client.state.map.tile(9, 8).objects[3]
+        client.state.target_id = target.target_id
+        client.state.stats.update(hp=100, maxhp=100, target_hp=100)
+        child = FarmTask(
+            zone="/test", target="kobold",
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds")
+        task = NavigateThenTask(object(), "/test", child, combat_approach=True)
+        # On the destination map at full target health: the spell, not melee.
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.fired, [(3, 42)])
+        self.assertNotIn(True, client.combat)
+
     def test_wizardry_training_rests_to_full_mana_before_a_pull(self):
         client = self._wizard_training_client(100, x=14, y=8)
         client.state.stats.update({"sp": 30, "maxsp": 62})
@@ -7105,6 +7189,31 @@ class QuestTests(unittest.TestCase):
         client.state.map.tile(14, 8).objects[3] = MapObject(
             3, 1, 0, 0, name="kobold", target_id=100, target_hp=100)
         client.state.stats["sp"] = 62
+        asyncio.run(task.tick(client))
+        self.assertFalse(task._training_resting)
+        self.assertEqual(
+            [entry for entry in client.decisions if entry[0] == "training-rest"],
+            [("training-rest", "sp=30/62")])
+        self.assertTrue(client.moves or client.direct_moves or client.fired)
+
+    def test_wizardry_training_rest_yields_to_hunger_and_an_approach(self):
+        client = self._wizard_training_client(100, x=14, y=8)
+        client.state.stats.update({"sp": 30, "maxsp": 62, "food": 0})
+        task = FarmTask(
+            zone="/test", target="kobold",
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds")
+        # Mana regenerates only with food: no waiting at food 0.
+        asyncio.run(task.tick(client))
+        self.assertFalse(task._training_resting)
+        # Nor while a creature is coming at her.
+        client.state.stats["food"] = 500
+        task = FarmTask(
+            zone="/test", target="kobold",
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds")
+        task._engaged_target = None
+        client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 2 damage.")]
         asyncio.run(task.tick(client))
         self.assertFalse(task._training_resting)
 
@@ -12383,6 +12492,17 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(FarmCircuitTask._busy_finishing_fight_or_loot(
             client, farm))
 
+    def test_farm_circuit_waits_out_a_training_mana_rest(self):
+        # Leaving mid-rest would send her on with a partial mana bar.
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        farm = FarmTask(zone="/test")
+        self.assertFalse(FarmCircuitTask._busy_finishing_fight_or_loot(
+            client, farm))
+        farm._training_resting = True
+        self.assertTrue(FarmCircuitTask._busy_finishing_fight_or_loot(
+            client, farm))
+
     def test_friendly_npc_selection_does_not_starve_maintenance(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
@@ -14788,20 +14908,32 @@ class FarmAnalyzerTests(unittest.TestCase):
                               extra={"cost": 4}), 7)
         analyzer = self.analyzer()
         now = time.time()
+        # Her own cast (FarmTask.commit_offensive_spell records it).
+        client.last_offensive_cast = (now - 20, "magic bullet")
         state.messages = [
             # Magic bullet deals weapon magic, modelled as magic.
-            (now - 5, 0, "", "You hit kobold for 12 (-3) with weapon magic."),
-            (now - 4, 0, "", "You hit kobold for 41 (0) with slash."),
-            (now - 3, 0, "", "You hit kobold for 14 (0) with weapon magic."),
-            (now - 2, 0, "", "kobold hit you for 4 (0) slash damage."),
+            (now - 19, 0, "", "You hit kobold for 12 (-3) with weapon magic."),
+            (now - 18.5, 0, "", "You hit kobold for 41 (0) with slash."),
+            (now - 18, 0, "", "You hit kobold for 14 (0) with weapon magic."),
+            (now - 17.5, 0, "", "kobold hit you for 4 (0) slash damage."),
+            # Long after the cast: elemental melee (a ring of fire), ignored.
+            (now - 2, 0, "", "You hit kobold for 9 (0) with fire."),
         ]
         analyzer.observe_spells(client)
         # Raw damage is done minus the protection change; melee is ignored.
         self.assertEqual(analyzer.spell_samples, [15, 14])
         self.assertEqual(analyzer.spell_attack, "magic")
-        # Each line is counted once.
+        # Each line is counted once, even when stamps tie.
+        state.add_message(0, "", "You hit kobold for 5 (0) with weapon magic.")
+        client.last_offensive_cast = (state.messages[-1][0], "magic bullet")
+        state.add_message(0, "", "You hit kobold for 6 (0) with weapon magic.")
         analyzer.observe_spells(client)
-        self.assertEqual(analyzer.spell_samples, [15, 14])
+        analyzer.observe_spells(client)
+        self.assertEqual(analyzer.spell_samples, [15, 14, 5, 6])
+        # Another spell starts over.
+        client.last_offensive_cast = (time.time(), "cause light wounds")
+        analyzer.observe_spells(client)
+        self.assertEqual(analyzer.spell_samples, [])
 
         profile = combat_profile(client, 14.5, "magic")
         args = profile.arguments()
@@ -14813,6 +14945,14 @@ class FarmAnalyzerTests(unittest.TestCase):
                             ("--max-mana", "50"), ("--attack-type", "magic"),
                             ("--max-aggro-pack", "1"), ("--max-health", "188")):
             self.assertEqual(args[args.index(flag) + 1], value, flag)
+        # Without Meditation, no out-of-combat regeneration ramp.
+        self.assertNotIn("--meditation", args)
+        state.place_item(Item(tag=15, name="meditation", item_type=c.TYPE_SKILL,
+                              extra={"level": 0}), 7)
+        meditating = combat_profile(client, 14.5, "magic")
+        self.assertIn("--meditation", meditating.arguments())
+        self.assertTrue(meditating.materially_differs(profile))
+        state.remove_item(15)
         # Turning the spell model on, or a big damage change, re-ranks.
         self.assertTrue(profile.materially_differs(combat_profile(client)))
         self.assertTrue(profile.materially_differs(

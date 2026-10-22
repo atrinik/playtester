@@ -1269,6 +1269,9 @@ class FarmTask(BotTask):
         self._spell_budget_observed_sp = int(
             client.state.stats.get("sp", 0) or 0)
         self._last_offensive_commit_at = time.monotonic()
+        # Wall-clock like message stamps: the analyzer attributes hit text
+        # shortly after this to the spell (FarmAnalyzer.observe_spells).
+        client.last_offensive_cast = (time.time(), spell.name.casefold())
 
     def training_skill_item(self, client: AtrinikClient) -> Item | None:
         if not self.combat_skill:
@@ -1303,8 +1306,16 @@ class FarmTask(BotTask):
         Slash, not Wizardry. The whole fight is cast; out of mana she keeps
         her distance until it regenerates.
         """
-        return ("wizardry" in self.combat_skill and
-                self.training_active(client))
+        if not ("wizardry" in self.combat_skill and
+                self.training_active(client)):
+            return False
+        # A bar too small for one cast beyond the healing reserve can never
+        # cast: then the weapon trains (the profile ranks it that way too).
+        spell = self.combat_spell_item(client)
+        maxsp = int(client.state.stats.get("maxsp", 0) or 0)
+        cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
+        return spell is not None and (
+            maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
 
     def training_active(self, client: AtrinikClient) -> bool:
         skill = self.training_skill_item(client)
@@ -2872,7 +2883,9 @@ class FarmTask(BotTask):
         # ranged pressure is disabled, approach with the shielded melee
         # loadout instead of briefly readying an untrained launcher and
         # suppressing shield protections.
-        allow_launcher = self.allow_launchers
+        # A launcher pull would hand the bow a share of a training kill.
+        allow_launcher = (self.allow_launchers and
+                          not self.spell_only_training(client))
         launcher = next((item for item in client.state.inventory
                          if allow_launcher and
                          item.item_type == c.TYPE_BOW and
@@ -3986,12 +3999,18 @@ class FarmTask(BotTask):
             return
         if (engaged is None and self.spell_only_training(client) and
                 (nearest_threat is None or nearest_threat[0] > 2) and
+                not any(active_threat(entry) for entry in threats) and
                 not recent_hostile_contact(client)):
             # Spell-only training pulls on a full mana bar, so most of a
-            # fight is cast without waiting for mana mid-fight.
+            # fight is cast without waiting for mana mid-fight. Resting out
+            # of combat also ramps regeneration up (Meditation). Mana
+            # regenerates only while she has food in her stomach.
             sp = int(client.state.stats.get("sp", 0) or 0)
             maxsp = int(client.state.stats.get("maxsp", 0) or 0)
-            if 0 < maxsp and sp < maxsp:
+            food = int(client.state.stats.get("food", 0) or 0)
+            if 0 < maxsp and sp < maxsp and food > 0:
+                if await self.maintain_inventory(client):
+                    return
                 if not self._training_resting:
                     self._training_resting = True
                     recorder = getattr(client, "record_action", None)
@@ -4081,6 +4100,17 @@ class FarmTask(BotTask):
             self._lure_progress_at = 0.0
             self._last_lure_step_at = 0.0
             if await self.training_finisher(client, x, y, obj):
+                return
+            if self.spell_only_training(client):
+                # Never melee a training target: whenever the spell cannot
+                # be cast (hurt, line blocked), keep the distance with
+                # combat off; safety and retreat handle her health.
+                await client.clear_actions()
+                await client.set_combat(False)
+                await self.melee_kite(
+                    client, x, y, obj, map_node=self.map_node,
+                    preserve_spell_line=self.combat_spell_item(client))
+                self._last_action = time.monotonic()
                 return
             semantic = map_object_semantic(client, obj)
             # Peaceful creatures must be provoked deliberately: the requested
