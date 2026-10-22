@@ -41,6 +41,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
+                    RANGED_RESIDENT_MARKERS, RANGED_RESIDENT_RADIUS,
                     RetrieveItemsTask, SellJunkTask, TaskStatus,
                     TempleFoodTask, TempleServiceTask,
                     corpse_tile_standable, movement_ack_timeout,
@@ -123,6 +124,19 @@ class NamedSpawn:
         if self.start_minute <= self.end_minute:
             return self.start_minute <= value <= self.end_minute
         return value >= self.start_minute or value <= self.end_minute
+
+    @property
+    def ranged(self) -> bool:
+        """Whether this spawn's names mark a ranged attacker."""
+        return any(marker in name.casefold()
+                   for name in (self.named, *self.candidates)
+                   for marker in RANGED_RESIDENT_MARKERS)
+
+    @property
+    def pull_clearance_radius(self) -> int:
+        """Tiles a pull square keeps from this resident."""
+        radius = max(1, self.aggro_radius)
+        return max(radius, RANGED_RESIDENT_RADIUS) if self.ranged else radius
 
 
 @dataclass(slots=True, frozen=True)
@@ -4799,6 +4813,13 @@ class FarmCircuitTask(BotTask):
             neutral_spawn(spawn) for spawn in priorities)
         aggressive_spawns = [
             spawn for spawn in priorities if not neutral_spawn(spawn)]
+        # Pull squares keep clear of every aggressive resident of the map, not
+        # only the spawns this leg targets: Sera died seven times in forty
+        # minutes to orc packs whose other members were never part of the
+        # clearance check.
+        residents = [
+            spawn for spawn in self.graph.named_spawns.get(zone, [])
+            if not spawn.peaceful and not neutral_spawn(spawn)]
         # Aggressive residents are pulled one at a time from boundary squares
         # outside every other resident's authored detection radius; passive
         # spawns keep the adjacent patrol.
@@ -4808,6 +4829,8 @@ class FarmCircuitTask(BotTask):
         patrol = []
         pull_avoidance: dict[
             tuple[int, int], set[tuple[int, int]]] = {}
+        # Spawn square -> its clear pull square, the farm's kite anchor.
+        pull_squares: dict[tuple[int, int], tuple[int, int]] = {}
 
         def walkable(point: tuple[int, int]) -> bool:
             x, y = point
@@ -4857,8 +4880,8 @@ class FarmCircuitTask(BotTask):
                 clearance = min((
                     max(abs(point[0] - other.x),
                         abs(point[1] - other.y)) -
-                    max(1, other.aggro_radius)
-                    for other in aggressive_spawns if other is not spawn
+                    other.pull_clearance_radius
+                    for other in residents if other is not spawn
                 ), default=99)
                 if clearance <= 0:
                     continue
@@ -4870,6 +4893,7 @@ class FarmCircuitTask(BotTask):
                 continue
             _, _, goal = max(candidates)
             patrol.append(goal)
+            pull_squares[(spawn.x, spawn.y)] = goal
             blocked = set()
             for resident in aggressive_spawns:
                 resident_radius = max(1, resident.aggro_radius)
@@ -4893,6 +4917,17 @@ class FarmCircuitTask(BotTask):
                         aggressive_detection_ranges[semantic] = max(
                             aggressive_detection_ranges.get(semantic, 0),
                             spawn.aggro_radius)
+            # The lone-pull check measures every other resident by its own
+            # authored radius where one is known; the rest default to 4.
+            for spawn in residents:
+                if spawn in priorities or spawn.aggro_radius <= 0:
+                    continue
+                for identity in (spawn.named, *spawn.candidates):
+                    semantic = self.graph._semantic_name(identity)
+                    if semantic:
+                        aggressive_detection_ranges[semantic] = max(
+                            aggressive_detection_ranges.get(semantic, 0),
+                            spawn.aggro_radius)
         farm = FarmTask(
             zone=zone, target=target, combat_skill=self.combat_skill,
             combat_spell=self.combat_spell, patrol=patrol,
@@ -4902,6 +4937,7 @@ class FarmCircuitTask(BotTask):
             neutral_targets=neutral_targets,
             aggressive_detection_ranges=aggressive_detection_ranges,
             pull_avoidance=pull_avoidance,
+            pull_squares=pull_squares,
             allow_launchers=(
                 not self._auto_combat_build and not bool(self.combat_spell)))
         farm._lore_book_attempts = self._lore_book_attempts

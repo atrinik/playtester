@@ -422,6 +422,13 @@ class LootPolicy:
 # Gear-score value of one point of each caster bonus while training Wizardry.
 CASTER_STAT_WEIGHTS = {"int": 60, "pow": 60, "mana": 4}
 
+# Monsters whose names mark them as ranged attackers. They hit from beyond
+# their authored detection radius, so pull squares and lone pulls keep at
+# least RANGED_RESIDENT_RADIUS tiles from them. Sera kept dying to orc packs
+# of two or three that included archers.
+RANGED_RESIDENT_MARKERS = ("archer", "bowman", "slinger", "mage")
+RANGED_RESIDENT_RADIUS = 6
+
 
 @dataclass(slots=True)
 class InventoryPolicy:
@@ -803,6 +810,16 @@ class FarmTask(BotTask):
 
     MELEE_SWING_HOLD_SECONDS = 0.30
     MELEE_GAP_TIMEOUT = 2.5
+    # After a pull she holds at its anchor this long for the target to come,
+    # rather than walking to it and into whatever stands beside it.
+    PULL_WAIT_SECONDS = 8.0
+    # A pulled target that did not come and is no longer alone is left for
+    # this long.
+    PULL_SET_ASIDE_SECONDS = 120.0
+    # A spawn's clear pull square anchors a target this close to the spawn,
+    # provided the square is this close to her.
+    PULL_SQUARE_SPAWN_RANGE = 6
+    PULL_SQUARE_REACH = 7
     FINISHER_FEEDBACK_GRACE_SECONDS = 2.0
     WIZARD_FINISHER_CAST_LIMIT = 6
     LURE_STALL_SECONDS = 12.0
@@ -819,6 +836,8 @@ class FarmTask(BotTask):
                  aggressive_detection_ranges: dict[str, int] | None = None,
                  pull_avoidance: dict[
                      tuple[int, int], set[tuple[int, int]]] | None = None,
+                 pull_squares: dict[
+                     tuple[int, int], tuple[int, int]] | None = None,
                  allow_launchers: bool | None = None):
         super().__init__(f"farm:{target or item or zone or 'current-zone'}")
         self.zone = zone
@@ -847,6 +866,11 @@ class FarmTask(BotTask):
         self.pull_avoidance = {
             (int(goal[0]), int(goal[1])): set(blocked)
             for goal, blocked in (pull_avoidance or {}).items()
+        }
+        # Spawn square -> the clear pull square its residents are fought from.
+        self.pull_squares = {
+            (int(spawn[0]), int(spawn[1])): (int(goal[0]), int(goal[1]))
+            for spawn, goal in (pull_squares or {}).items()
         }
         self._priority_target_ids: dict[int, int] = {}
         # Peaceful creatures seen occupying a named spawn; attacked with force.
@@ -894,6 +918,14 @@ class FarmTask(BotTask):
         self._last_offensive_commit_at = 0.0
         self._last_pull_at = 0.0
         self._pull_launcher_tag = 0
+        # The pulled target and the world square she fights it from (target
+        # id, path, x, y), and when the post-pull wait began (0 once it came
+        # or the wait ended).
+        self._pull_anchor: tuple[int, str, int, int] | None = None
+        self._pull_wait_since = 0.0
+        # Pulled targets that neither came nor stayed alone -> expiry. This
+        # hides them from target choice only; they remain threats.
+        self._pull_set_aside: dict[int, float] = {}
         self._retreat_attempt: tuple[str, int, int, int, int, float] | None = None
         self._retreat_blocked: set[tuple[str, int, int]] = set()
         self._last_retreat_step_at = 0.0
@@ -1699,6 +1731,10 @@ class FarmTask(BotTask):
             # deadlocking against an immobile or obstructed target. A
             # A move can briefly show three empty tiles, so distance four is
             # held rather than immediately approaching back into danger.
+            if not maintain_gap_step and self.pull_waiting(obj.target_id):
+                # A pulled target gets the longer post-pull wait at its
+                # anchor, which approaches only a target still alone.
+                return False
             if (not maintain_gap_step and
                     now - self._kite_gap_since <= self.MELEE_GAP_TIMEOUT):
                 return True
@@ -1725,6 +1761,9 @@ class FarmTask(BotTask):
         other_targets = [
             (tx, ty) for tx, ty, other in m.targets(friendly=False)
             if other.target_id != obj.target_id]
+        # Kite a pulled target back toward its clear anchor; local separation
+        # alone drifted her toward the next pack.
+        anchor = self.target_anchor(client, obj.target_id)
         candidates = []
         for direction, (dx, dy) in c.DIRECTION_DELTAS.items():
             if not direction:
@@ -1758,11 +1797,16 @@ class FarmTask(BotTask):
                 preserve_spell_line is not None and
                 self.spell_fire_direction(
                     preserve_spell_line, x, y, nx, ny) is not None)
-            candidates.append((aligned, separation, mobility, random.random(),
+            anchor_distance = 0 if anchor is None else max(
+                abs(anchor[0] - world_x), abs(anchor[1] - world_y))
+            # The anchor only breaks ties between steps that keep clear of
+            # the default four-tile detection radius of every other hostile.
+            candidates.append((aligned, min(separation, 4), -anchor_distance,
+                               separation, mobility, random.random(),
                                direction, world_x, world_y))
         if not candidates:
             return False
-        _, _, _, _, direction, world_x, world_y = max(candidates)
+        *_, direction, world_x, world_y = max(candidates)
         await client.clear_actions()
         await client.move(direction, run=False)
         self._kite_step_attempt = (
@@ -2563,6 +2607,216 @@ class FarmTask(BotTask):
                      not re.search(r"heal|cure|protection", item.name, re.I)),
                     None)
 
+    def detection_radius(self, client: AtrinikClient, obj) -> int:
+        """Tiles within which a monster acquires her: authored, else 4."""
+        semantic = map_object_semantic(client, obj).casefold()
+        return max((
+            radius for identity, radius in
+            self.aggressive_detection_ranges.items()
+            if identity and identity in semantic
+        ), default=4)
+
+    def neighbour_radius(self, client: AtrinikClient, obj) -> int:
+        """How far a monster joins a fight: detection, 6+ for ranged ones."""
+        radius = self.detection_radius(client, obj)
+        semantic = map_object_semantic(client, obj).casefold()
+        if any(marker in semantic for marker in RANGED_RESIDENT_MARKERS):
+            radius = max(radius, RANGED_RESIDENT_RADIUS)
+        return radius
+
+    def _lone_target(self, client: AtrinikClient, candidate: tuple,
+                     fight_square: tuple[int, int]) -> bool:
+        """Whether a candidate (distance, view x, view y, object) comes alone.
+
+        No other visible hostile may have the candidate, or the view square
+        she fights it from, inside its own detection radius. A fixed two-tile
+        check let orc packs of two or three join pulls and kill Sera seven
+        times in forty minutes. Authored-peaceful creatures never join.
+        """
+        _, x, y, obj = candidate[:4]
+        fight_x, fight_y = fight_square
+        for other_x, other_y, other in client.state.map.targets(
+                friendly=False):
+            if (other.target_id == obj.target_id or
+                    self.authored_peaceful(client, other)):
+                continue
+            radius = self.neighbour_radius(client, other)
+            if (max(abs(other_x - x), abs(other_y - y)) <= radius or
+                    max(abs(other_x - fight_x),
+                        abs(other_y - fight_y)) <= radius):
+                return False
+        return True
+
+    def pull_anchor(self, client: AtrinikClient, x: int,
+                    y: int) -> tuple[int, int]:
+        """The world square she fights the target at view x, y from.
+
+        That is the clear pull square of the target's spawn when she can
+        reach it, otherwise the square she stands on.
+        """
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        here = (m.world_x, m.world_y)
+        # Pull squares are coordinates of the farm map alone.
+        if self.map_node is None or self.map_node.path != m.path:
+            return here
+        world_x, world_y = m.world_x + x - cx, m.world_y + y - cy
+        spawn_distance, goal = min((
+            (max(abs(spawn_x - world_x), abs(spawn_y - world_y)), goal)
+            for (spawn_x, spawn_y), goal in self.pull_squares.items()),
+            default=(99, here))
+        if (spawn_distance <= self.PULL_SQUARE_SPAWN_RANGE and
+                max(abs(goal[0] - here[0]), abs(goal[1] - here[1])) <=
+                self.PULL_SQUARE_REACH):
+            return goal
+        return here
+
+    @staticmethod
+    def anchor_view(client: AtrinikClient,
+                    anchor: tuple[int, int]) -> tuple[int, int]:
+        m = client.state.map
+        return (m.width // 2 + anchor[0] - m.world_x,
+                m.height // 2 + anchor[1] - m.world_y)
+
+    def lone_pull_candidate(self, client: AtrinikClient,
+                            candidate: tuple) -> bool:
+        """Whether a candidate is alone at its position and its anchor."""
+        _, x, y, _ = candidate[:4]
+        return self._lone_target(client, candidate, self.anchor_view(
+            client, self.pull_anchor(client, x, y)))
+
+    def begin_pull_wait(self, client: AtrinikClient, target_id: int,
+                        anchor: tuple[int, int]) -> None:
+        self._pull_anchor = (
+            target_id, client.state.map.path, anchor[0], anchor[1])
+        self._pull_wait_since = time.monotonic()
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("pull-wait",
+                     f"target={target_id} anchor={anchor[0]},{anchor[1]}")
+
+    def pulled_aside(self, client: AtrinikClient, obj,
+                     distance: int) -> bool:
+        """Whether a pull set-aside still hides this monster from targeting.
+
+        It ends only when it expires or the monster arrives within two
+        tiles, where a melee attacker must be: a pulled orc that arrives late
+        is fought, not ignored while she commits to its packmate. Standing
+        within its detection radius does not end it, or she would walk up to
+        a monster that is not alone and pull its packmate too. Combat text
+        does not end it either: it names attackers only by species, so a
+        packmate's arrow or a stale line from an earlier kill would release
+        it and walk her into the pack.
+        """
+        expiry = self._pull_set_aside.get(obj.target_id, 0.0)
+        if expiry <= time.monotonic() or distance <= 2:
+            self._pull_set_aside.pop(obj.target_id, None)
+            return False
+        return True
+
+    def pull_waiting(self, target_id: int) -> bool:
+        return bool(self._pull_wait_since and
+                    self._pull_anchor is not None and
+                    self._pull_anchor[0] == target_id)
+
+    def target_anchor(self, client: AtrinikClient,
+                      target_id: int) -> tuple[int, int] | None:
+        """The world anchor of a pulled target on this map, if any."""
+        anchor = self._pull_anchor
+        if (anchor is None or anchor[0] != target_id or
+                anchor[1] != client.state.map.path):
+            return None
+        return anchor[2], anchor[3]
+
+    async def step_toward_anchor(self, client: AtrinikClient, x: int, y: int,
+                                 obj) -> bool:
+        """Take one step back toward the pull anchor, never toward the target."""
+        anchor = self.target_anchor(client, obj.target_id)
+        m = client.state.map
+        if anchor is None:
+            return False
+        now = time.monotonic()
+        if self._kite_step_pending(client, obj.target_id, now):
+            return True
+        remaining = max(abs(anchor[0] - m.world_x),
+                        abs(anchor[1] - m.world_y))
+        if not remaining:
+            return False
+        cx, cy = m.width // 2, m.height // 2
+        target_distance = max(abs(x - cx), abs(y - cy))
+        steps = []
+        for direction, (dx, dy) in c.DIRECTION_DELTAS.items():
+            if not direction:
+                continue
+            nx, ny = cx + dx, cy + dy
+            world_x, world_y = m.world_x + dx, m.world_y + dy
+            anchor_distance = max(abs(anchor[0] - world_x),
+                                  abs(anchor[1] - world_y))
+            if (anchor_distance >= remaining or
+                    max(abs(x - nx), abs(y - ny)) < target_distance or
+                    (m.path, world_x, world_y) in self._kite_blocked or
+                    not self.within_farm_map(client, nx, ny) or
+                    not self.retreat_tile_walkable(m.path, world_x, world_y)):
+                continue
+            tile = m.tiles.get((nx, ny))
+            if tile is not None and tile.targets:
+                continue
+            steps.append((anchor_distance, random.random(),
+                          direction, world_x, world_y))
+        if not steps:
+            return False
+        _, _, direction, world_x, world_y = min(steps)
+        await client.clear_actions()
+        await client.move(direction, run=False)
+        self._kite_step_attempt = (
+            m.path, m.world_x, m.world_y, world_x, world_y, now,
+            obj.target_id)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("pull-anchor-step",
+                     f"target={obj.target_id} step={world_x},{world_y}")
+        return True
+
+    async def post_pull_wait(self, client: AtrinikClient, x: int, y: int,
+                             obj) -> bool:
+        """Hold at the anchor for a pulled target, then approach only if alone.
+
+        Walking to a pulled target that did not come led Sera into its pack.
+        Returns True while holding or once the target is set aside.
+        """
+        if not self.pull_waiting(obj.target_id):
+            return False
+        now = time.monotonic()
+        m = client.state.map
+        distance = max(abs(x - m.width // 2), abs(y - m.height // 2))
+        # Only arrival (handled by the caller) or the timeout ends the wait.
+        # Combat text cannot say which same-species monster hit her, so a
+        # ranged target shooting her waits it out; safety and the pack-split
+        # retreat still react to the damage.
+        if now - self._pull_wait_since < self.PULL_WAIT_SECONDS:
+            await self.step_toward_anchor(client, x, y, obj)
+            return True
+        self._pull_wait_since = 0.0
+        recorder = getattr(client, "record_action", None)
+        if self._lone_target(client, (distance, x, y, obj), (x, y)):
+            if recorder is not None:
+                recorder("pull-wait-approach", f"target={obj.target_id}")
+            return False
+        await client.clear_actions()
+        await client.set_combat(False)
+        clear_target = getattr(client, "clear_target", None)
+        if clear_target is not None:
+            await clear_target()
+        self._pull_set_aside[obj.target_id] = (
+            now + self.PULL_SET_ASIDE_SECONDS)
+        self.release_engagement(obj.target_id)
+        log.info("pulled target %s did not come and is not alone; "
+                 "setting it aside for %.0fs", obj.target_id,
+                 self.PULL_SET_ASIDE_SECONDS)
+        if recorder is not None:
+            recorder("pull-wait-set-aside", f"target={obj.target_id}")
+        return True
+
     async def ranged_pull(self, client: AtrinikClient,
                           targets: list[tuple]) -> bool:
         """Aggro one aligned distant target before walking into its pack."""
@@ -2581,11 +2835,7 @@ class FarmTask(BotTask):
                 continue
             direction = self.spell_fire_direction(
                 direction_spell, x, y, cx, cy)
-            neighbours = sum(
-                other.target_id != obj.target_id and
-                max(abs(other_x - x), abs(other_y - y)) <= 2
-                for other_x, other_y, other in all_hostiles)
-            if neighbours == 0:
+            if self.lone_pull_candidate(client, (distance, x, y, obj)):
                 entry = (distance, x, y, obj, direction)
                 isolated.append(entry)
                 if (direction is not None and
@@ -2729,6 +2979,8 @@ class FarmTask(BotTask):
             self.remember_engagement(client, x, y, obj.target_id)
             await client.fire(direction, spell.tag)
             self.commit_offensive_spell(client, spell)
+            self.begin_pull_wait(
+                client, obj.target_id, self.pull_anchor(client, x, y))
             self._last_pull_at = self._last_action = now
             return True
         if launcher is not None and ammo is not None:
@@ -2741,6 +2993,8 @@ class FarmTask(BotTask):
                     return False
                 self.remember_engagement(client, x, y, obj.target_id)
                 await client.fire(direction, launcher.tag)
+                self.begin_pull_wait(
+                    client, obj.target_id, self.pull_anchor(client, x, y))
                 self._last_pull_at = now
             self._pull_launcher_tag = launcher.tag
             self._last_action = now
@@ -2871,6 +3125,9 @@ class FarmTask(BotTask):
         mobility_blocked.update(
             (m.world_x + x - cx, m.world_y + y - cy)
             for x, y in threats)
+        # Between otherwise equal steps, prefer the engaged pull's anchor.
+        anchor = (self.target_anchor(client, engaged_id)
+                  if engaged_id else None)
         for direction, (dx, dy) in c.DIRECTION_DELTAS.items():
             if not direction:
                 continue
@@ -2890,9 +3147,11 @@ class FarmTask(BotTask):
             escape_depth, escape_area = retreat_mobility(
                 self.map_node, (world_x, world_y),
                 blocked=mobility_blocked)
+            anchor_distance = 0 if anchor is None else max(
+                abs(anchor[0] - world_x), abs(anchor[1] - world_y))
             choices.append((int(escape_depth >= 2), separation,
-                            escape_depth, escape_area, random.random(),
-                            direction, world_x, world_y))
+                            escape_depth, escape_area, -anchor_distance,
+                            random.random(), direction, world_x, world_y))
         if not choices:
             # If every legal exit is occupied, continued flee commands can
             # never succeed. Fight the adjacent blocker to open one escape
@@ -2919,7 +3178,7 @@ class FarmTask(BotTask):
                 self._last_action = now
                 return True
             return False
-        (viable, separation, escape_depth, escape_area, _, direction,
+        (viable, separation, escape_depth, escape_area, _, _, direction,
          world_x, world_y) = max(choices)
         recorder = getattr(client, "record_action", None)
         # A retreat that sheds nobody is worse than standing: the pursuers
@@ -3436,12 +3695,7 @@ class FarmTask(BotTask):
         proven_attackers = recent_hostile_attackers(client)
 
         def detection_radius(obj: MapObject) -> int:
-            semantic = map_object_semantic(client, obj).casefold()
-            return max((
-                radius for identity, radius in
-                self.aggressive_detection_ranges.items()
-                if identity and identity in semantic
-            ), default=4)
+            return self.detection_radius(client, obj)
 
         def active_threat(entry) -> bool:
             obj = entry[3]
@@ -3498,9 +3752,22 @@ class FarmTask(BotTask):
 
         if not hostile_contact and not initial_threats:
             self.remember_safe_position(client)
+        # A hit never commits her to a set-aside pull or to a packmate within
+        # its reach: combat text cannot say which one attacked, and fighting
+        # the packmate drags the set-aside monster in too. Within two tiles
+        # a set-aside pull is released anyway.
+        set_aside_threats = [
+            entry for entry in initial_threats
+            if self.pulled_aside(client, entry[3], entry[0])]
+        contact_threats = [
+            entry for entry in initial_threats
+            if entry not in set_aside_threats and not any(
+                max(abs(entry[1] - aside[1]), abs(entry[2] - aside[2])) <=
+                self.neighbour_radius(client, aside[3])
+                for aside in set_aside_threats)]
         if (hostile_contact and self._engaged_target is None and
-                initial_threats):
-            _, x, y, obj = min(initial_threats, key=lambda entry: entry[0])
+                contact_threats):
+            _, x, y, obj = min(contact_threats, key=lambda entry: entry[0])
             # An aggressive monster can land its first hit before the normal
             # target scan. Commit it before emergency healing preempts combat.
             self.remember_engagement(client, x, y, obj.target_id)
@@ -3511,6 +3778,20 @@ class FarmTask(BotTask):
         if await self.emergency_recall(
                 client, ratio=ratio, nearby_count=nearby_count,
                 hostile_contact=hostile_contact):
+            self._last_action = time.monotonic()
+            return
+        if (hostile_contact and self._engaged_target is None and
+                not contact_threats and set_aside_threats):
+            # Hit with only set-aside pulls and their packmates in view: step
+            # away from the visible threats. The unseen-contact fallback could
+            # step toward a set-aside monster it does not account for.
+            # On a neutral farm it may see no threat at all; then fall back
+            # to the unseen-contact retreat rather than stand under fire.
+            last_heal = self.safety._last_heal
+            await self.safety.enforce(client)
+            if (self.safety._last_heal == last_heal and
+                    not await self.low_health_retreat(client)):
+                await self.invisible_contact_retreat(client)
             self._last_action = time.monotonic()
             return
         if (hostile_contact and self._engaged_target is None and
@@ -3569,6 +3850,7 @@ class FarmTask(BotTask):
         cx, cy = client.state.map.width // 2, client.state.map.height // 2
         targets = []
         threats = []
+        pulled_aside_ids: set[int] = set()
         for x, y, obj in client.state.map.targets(friendly=False):
             if not self.within_farm_map(client, x, y):
                 continue
@@ -3605,6 +3887,9 @@ class FarmTask(BotTask):
                     previous, priority_rank)
             distance = max(abs(x - cx), abs(y - cy))
             threats.append((distance, x, y, obj))
+            if self.pulled_aside(client, obj, distance):
+                pulled_aside_ids.add(obj.target_id)
+                continue
             # Some authored monsters disguise themselves until disturbed.
             # Their live face/name therefore cannot match the farm pattern,
             # but a hostile occupying the authored named-spawn point is the
@@ -3624,6 +3909,10 @@ class FarmTask(BotTask):
                 client, {entry[3].target_id for entry in threats}):
             return
         nearest_threat = min(threats, key=lambda value: value[0], default=None)
+        if (self._engaged_target is not None and
+                self._engaged_target[0] in pulled_aside_ids):
+            # Never fight a still-set-aside pull, however it became engaged.
+            self.release_engagement(self._engaged_target[0])
         engaged_id = self._engaged_target[0] if self._engaged_target else 0
         engaged = next((entry for entry in threats
                         if entry[3].target_id == engaged_id), None)
@@ -3679,23 +3968,25 @@ class FarmTask(BotTask):
             # Finish the creature deliberately pulled/engaged instead of
             # switching to whichever add happens to step one tile closer.
             targets = [engaged]
-        elif nearest_threat is not None and nearest_threat[0] <= 3:
+        elif any(entry[0] <= 3 and entry[3].target_id not in pulled_aside_ids
+                 for entry in threats):
+            # A set-aside monster standing near her does not make its
+            # packmates targets; it is fought once it arrives or attacks.
             if self.neutral_targets:
                 active = [entry for entry in threats if active_threat(entry)]
                 if active:
                     targets = active
             else:
                 targets = threats
+            targets = [entry for entry in targets
+                       if entry[3].target_id not in pulled_aside_ids]
         if engaged is None and self.single_target_wizardry(client):
-            # Pull only a creature with nobody else within two tiles of it;
-            # one already beside her is fought regardless.
-            others = list(client.state.map.targets(friendly=False))
+            # Pull only a lone creature (see _lone_target); one already
+            # beside her or coming at her is fought regardless.
             targets = [
                 entry for entry in targets
-                if entry[0] <= 1 or not any(
-                    other.target_id != entry[3].target_id and
-                    max(abs(ox - entry[1]), abs(oy - entry[2])) <= 2
-                    for ox, oy, other in others)]
+                if entry[0] <= 1 or active_threat(entry) or
+                self.lone_pull_candidate(client, entry)]
         if (engaged is None and nearest_threat is not None and
                 nearest_threat[0] > 2):
             pull_candidate = min(
@@ -3730,6 +4021,9 @@ class FarmTask(BotTask):
                         value[3].target_id, len(self.priority_spawns)),
                     value[0]))
             self.remember_engagement(client, x, y, obj.target_id)
+            if distance <= 2 and self.pull_waiting(obj.target_id):
+                # The pulled target came to her: fight it normally.
+                self._pull_wait_since = 0.0
             if (getattr(client.state, "target_id", 0) != obj.target_id and
                     not await select_target(client, x, y, obj.target_id)):
                 # Set aside as unselectable: let go of it, and of the combat
@@ -3797,7 +4091,7 @@ class FarmTask(BotTask):
                 # Target + combat mode drives automatic melee. Movement is
                 # reserved for deliberate dodging and positional bonuses.
                 await self.melee_position(client, x, y, obj)
-            else:
+            elif not await self.post_pull_wait(client, x, y, obj):
                 # One approach/alignment step per safety tick avoids a queued
                 # path traversing several unseen aggro radii.
                 await self.approach_target(client, x, y, obj)

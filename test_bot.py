@@ -6125,6 +6125,344 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(fired, [])
         self.assertEqual(client.direct_moves, [])
 
+    def _lone_pull_client(self, neighbour_square=None,
+                          neighbour_name="orc archer"):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        target = MapObject(
+            3, 1, 0, 0, name="orc", target_id=100, target_hp=100)
+        client.state.map.tile(12, 8).objects[3] = target
+        if neighbour_square is not None:
+            client.state.map.tile(*neighbour_square).objects[3] = MapObject(
+                3, 2, 0, 0, name=neighbour_name, target_id=200,
+                target_hp=100)
+        client.state.stats["sp"] = 20
+        spell = Item(
+            43, item_type=c.TYPE_SPELL, name="magic bullet",
+            extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 4})
+        client.state.inventory.append(spell)
+        client.fired = []
+
+        async def fire(direction, tag=0):
+            client.fired.append((direction, tag))
+
+        client.fire = fire
+        return client, target
+
+    def test_ranged_pull_takes_only_a_lone_target(self):
+        # Three tiles beside the target, the old two-tile check pulled it
+        # into the archer's default four-tile detection radius.
+        for square in ((15, 8), (8, 4)):
+            with self.subTest(neighbour=square):
+                client, target = self._lone_pull_client(square)
+                task = FarmTask(combat_spell="magic bullet")
+                self.assertFalse(asyncio.run(task.ranged_pull(
+                    client, [(4, 12, 8, target)])))
+                self.assertEqual(client.fired, [])
+        client, target = self._lone_pull_client((8, 16))
+        task = FarmTask(combat_spell="magic bullet")
+        self.assertTrue(asyncio.run(task.ranged_pull(
+            client, [(4, 12, 8, target)])))
+        self.assertEqual(client.fired, [(3, 43)])
+        self.assertTrue(task.pull_waiting(100))
+        self.assertEqual(task.target_anchor(client, 100), (10, 10))
+
+    def test_lone_pull_measures_each_neighbour_by_its_own_radius(self):
+        client, target = self._lone_pull_client((15, 8), "kobold")
+        task = FarmTask(combat_spell="magic bullet",
+                        aggressive_detection_ranges={"kobold": 2})
+        self.assertTrue(asyncio.run(task.ranged_pull(
+            client, [(4, 12, 8, target)])))
+        self.assertEqual(client.fired, [(3, 43)])
+
+    def _pulled_farm(self, neighbour_square=None, anchor=(10, 10)):
+        client, target = self._lone_pull_client(neighbour_square)
+        client.state.map.tiles.clear()
+        client.state.map.tile(14, 8).objects[3] = target
+        if neighbour_square is not None:
+            client.state.map.tile(*neighbour_square).objects[3] = MapObject(
+                3, 2, 0, 0, name="orc archer", target_id=200,
+                target_hp=100)
+        client.state.target_id = 100
+        task = FarmTask(zone="/test", target="orc")
+        task.remember_engagement(client, 14, 8, 100)
+        task.begin_pull_wait(client, 100, anchor)
+        return client, task
+
+    def test_post_pull_wait_steps_back_toward_the_anchor(self):
+        client, task = self._pulled_farm(anchor=(9, 10))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.direct_moves, [(7, False)])
+        self.assertEqual(client.moves, [])
+
+    def test_post_pull_wait_sets_aside_a_target_no_longer_alone(self):
+        client, task = self._pulled_farm(neighbour_square=(16, 8))
+        asyncio.run(task.tick(client))
+        # Holding on her anchor: no step toward the target or its pack.
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.moves, [])
+        self.assertTrue(task.pull_waiting(100))
+        task._pull_wait_since -= task.PULL_WAIT_SECONDS + 0.1
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.moves, [])
+        self.assertIsNone(task._engaged_target)
+        self.assertFalse(task.target_temporarily_unreachable(100))
+        self.assertAlmostEqual(
+            task._pull_set_aside[100] - time.monotonic(),
+            task.PULL_SET_ASIDE_SECONDS, delta=5)
+        self.assertEqual(client.cleared_targets, 1)
+
+    def test_pull_set_aside_target_stays_a_threat_within_its_radius(self):
+        client, task = self._pulled_farm(neighbour_square=(16, 8))
+        task._pull_wait_since -= task.PULL_WAIT_SECONDS + 0.1
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        # It and its packmate wander to three and four tiles from her,
+        # inside their detection radius, without attacking.
+        target = client.state.map.tile(14, 8).objects.pop(3)
+        archer = client.state.map.tile(16, 8).objects.pop(3)
+        client.state.map.tile(11, 8).objects[3] = target
+        client.state.map.tile(12, 9).objects[3] = archer
+        client.targets.clear()
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        # Still set aside and never approached, yet it counts as a threat:
+        # with its packmate it makes a pack she steps away from.
+        self.assertIn(100, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.targets, [])
+        self.assertIn(client.direct_moves[-1][0], (6, 7, 8))
+
+    def _set_aside_pull(self, target_square, archer_square):
+        client, task = self._pulled_farm(neighbour_square=(16, 8))
+        task._pull_wait_since -= task.PULL_WAIT_SECONDS + 0.1
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        target = client.state.map.tile(14, 8).objects.pop(3)
+        archer = client.state.map.tile(16, 8).objects.pop(3)
+        client.state.map.tile(*target_square).objects[3] = target
+        client.state.map.tile(*archer_square).objects[3] = archer
+        client.targets.clear()
+        task._last_action = 0.0
+        return client, task
+
+    def test_combat_text_never_releases_a_set_aside_pull(self):
+        # Three tiles away, with its packmate behind it. Combat text names
+        # species only: the archer's arrow, or the target's own name, cannot
+        # prove which orc hit her.
+        client, task = self._set_aside_pull((11, 8), (14, 8))
+        now = time.time()
+        client.state.messages = [
+            (now, 0, 0, "orc archer hit you for 3 (-3) impact damage."),
+            (now, 0, 0, "orc hit you for 3 (-3) impact damage.")]
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        # Nor does the hit commit her to the archer within the set-aside
+        # orc's reach: she steps away from both instead.
+        self.assertIsNone(task._engaged_target)
+        self.assertIn(client.direct_moves[-1][0], (6, 7, 8))
+
+    def test_hit_with_only_set_aside_pulls_in_view_retreats_from_them(self):
+        client, task = self._set_aside_pull((11, 8), (16, 8))
+        client.state.map.tile(16, 8).objects.pop(3)
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertIn(client.direct_moves[-1][0], (6, 7, 8))
+
+    def test_engagement_on_a_set_aside_pull_is_released(self):
+        client, task = self._set_aside_pull((12, 8), (16, 8))
+        task.remember_engagement(client, 12, 8, 100)
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.targets, [])
+
+    def test_hit_commits_to_a_threat_beyond_the_set_aside_reach(self):
+        # The archer stands five tiles from the set-aside orc, outside its
+        # four-tile reach, so the hit commits to the archer.
+        client, task = self._set_aside_pull((11, 8), (16, 8))
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        self.assertEqual(task._engaged_target[0], 200)
+
+    def test_set_aside_hit_heals_before_retreating(self):
+        client, task = self._set_aside_pull((11, 8), (16, 8))
+        client.state.map.tile(16, 8).objects.pop(3)
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+
+        async def heal(safety, client):
+            safety._last_heal = time.monotonic()
+            return False
+
+        with patch.object(type(task.safety), "enforce", heal):
+            asyncio.run(task.tick(client))
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.direct_moves, [])
+
+    def test_neutral_set_aside_hit_falls_back_to_unseen_contact_retreat(self):
+        # On a neutral farm only a named attacker counts as a threat; an
+        # unseen goblin's hit leaves low_health_retreat nothing to flee.
+        client, task = self._set_aside_pull((11, 8), (16, 8))
+        client.state.map.tile(16, 8).objects.pop(3)
+        task.neutral_targets = True
+        task._last_threat_origin = None
+        client.state.messages = [
+            (time.time(), 0, 0, "goblin hit you for 3 (-3) impact damage.")]
+        unseen = []
+
+        async def invisible_contact_retreat(client):
+            unseen.append(True)
+            return True
+
+        task.invisible_contact_retreat = invisible_contact_retreat
+        asyncio.run(task.tick(client))
+        self.assertEqual(unseen, [True])
+        self.assertIsNone(task._engaged_target)
+
+    def test_set_aside_pull_arriving_within_two_tiles_is_fought(self):
+        client, task = self._set_aside_pull((10, 8), (16, 8))
+        asyncio.run(task.tick(client))
+        self.assertNotIn(100, task._pull_set_aside)
+        self.assertEqual(task._engaged_target[0], 100)
+        self.assertEqual(client.combat[-1], True)
+
+    def test_pull_set_aside_target_nearby_does_not_make_its_packmate_a_target(self):
+        client, task = self._pulled_farm(neighbour_square=(16, 8))
+        task._pull_wait_since -= task.PULL_WAIT_SECONDS + 0.1
+        asyncio.run(task.tick(client))
+        target = client.state.map.tile(14, 8).objects.pop(3)
+        archer = client.state.map.tile(16, 8).objects.pop(3)
+        client.state.map.tile(11, 8).objects[3] = target
+        client.state.map.tile(13, 8).objects[3] = archer
+        client.targets.clear()
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.targets, [])
+
+    def test_post_pull_wait_approaches_a_lone_target_after_the_wait(self):
+        client, task = self._pulled_farm()
+        task._pull_wait_since -= task.PULL_WAIT_SECONDS + 0.1
+        asyncio.run(task.tick(client))
+        self.assertFalse(task.pull_waiting(100))
+        self.assertNotIn(100, task._pull_set_aside)
+        self.assertEqual(task._engaged_target[0], 100)
+        self.assertTrue(client.direct_moves or client.moves)
+
+    def test_post_pull_wait_ignores_combat_text(self):
+        # Only arrival or the timeout ends the wait: the text cannot say
+        # which orc hit her.
+        client, task = self._pulled_farm(anchor=(9, 10))
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+        asyncio.run(task.tick(client))
+        self.assertTrue(task.pull_waiting(100))
+        self.assertEqual(client.direct_moves, [(7, False)])
+
+    def test_post_pull_wait_ends_when_the_target_arrives(self):
+        client, task = self._pulled_farm()
+        target = client.state.map.tile(14, 8).objects.pop(3)
+        client.state.map.tile(10, 8).objects[3] = target
+        asyncio.run(task.tick(client))
+        self.assertFalse(task.pull_waiting(100))
+        self.assertEqual(task._engaged_target[0], 100)
+
+    def test_ranged_pull_keeps_six_tiles_from_an_archer(self):
+        # Five tiles from her square, outside the default detection radius.
+        client, target = self._lone_pull_client((3, 8))
+        task = FarmTask(combat_spell="magic bullet")
+        self.assertFalse(asyncio.run(task.ranged_pull(
+            client, [(4, 12, 8, target)])))
+        self.assertEqual(client.fired, [])
+
+    def test_pull_anchor_is_the_spawn_pull_square_on_the_farm_map(self):
+        client, _ = self._lone_pull_client()
+        task = FarmTask(zone="/test", pull_squares={(15, 10): (12, 12)})
+        # Without the farm map's node the squares have no frame.
+        self.assertEqual(task.pull_anchor(client, 12, 8), (10, 10))
+        task.map_node = MapNode(path="/test", width=25, height=25)
+        self.assertEqual(task.pull_anchor(client, 12, 8), (12, 12))
+        task.map_node = MapNode(path="/elsewhere", width=25, height=25)
+        self.assertEqual(task.pull_anchor(client, 12, 8), (10, 10))
+
+    def _anchored_kite(self, other_square=None):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        target = MapObject(
+            3, 1, 0, 0, name="orc", target_id=100, target_hp=55)
+        client.state.map.tile(10, 8).objects[3] = target
+        if other_square is not None:
+            client.state.map.tile(*other_square).objects[3] = MapObject(
+                3, 2, 0, 0, name="orc", target_id=200, target_hp=100)
+        client.state.stats.update(target_hp=55, action_time=1.20)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task = FarmTask(zone="/test", target="orc")
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        task.remember_engagement(client, 10, 8, target.target_id)
+        # Anchored north-west of her.
+        task._pull_anchor = (100, "/test", 8, 8)
+        return client, task, target
+
+    def test_melee_kite_steps_toward_the_anchor_among_safe_steps(self):
+        client, task, target = self._anchored_kite()
+        self.assertTrue(asyncio.run(
+            task.melee_kite(client, 10, 8, target)))
+        self.assertEqual(client.direct_moves[-1], (8, False))
+
+    def test_melee_kite_prefers_a_safe_step_over_the_anchor(self):
+        # North-west toward the anchor would land three tiles from another
+        # orc, inside its detection radius; west keeps four.
+        client, task, target = self._anchored_kite(other_square=(4, 4))
+        self.assertTrue(asyncio.run(
+            task.melee_kite(client, 10, 8, target)))
+        self.assertEqual(client.direct_moves[-1], (7, False))
+
+    def test_low_health_retreat_breaks_ties_toward_the_anchor(self):
+        for anchor, direction in (((8, 8), 8), ((8, 12), 6)):
+            with self.subTest(anchor=anchor):
+                client = self._combat_client()
+                client.state.map.tiles.clear()
+                client.state.map.world_x = 10
+                client.state.map.world_y = 10
+                client.state.map.tile(10, 8).objects[3] = MapObject(
+                    3, 1, 0, 0, name="orc", target_id=100, target_hp=55)
+                task = FarmTask(zone="/test", target="orc")
+                task.remember_engagement(client, 10, 8, 100)
+                task._pull_anchor = (100, "/test", *anchor)
+                self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+                self.assertEqual(client.direct_moves[-1], (direction, False))
+
+    def test_low_health_retreat_ignores_the_anchor_of_another_target(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.map.tile(10, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="orc", target_id=100, target_hp=55)
+        task = FarmTask(zone="/test", target="orc")
+        task.remember_engagement(client, 10, 8, 100)
+        # South-west, but for an earlier pull that is no longer engaged.
+        task._pull_anchor = (999, "/test", 8, 12)
+        with patch("random.random", return_value=0.5):
+            self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        # Equal steps fall to the highest direction, not the anchor's 6.
+        self.assertEqual(client.direct_moves[-1], (8, False))
+
     def test_pursuit_holds_through_transient_missing_target_frame(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
@@ -6720,12 +7058,13 @@ class QuestTests(unittest.TestCase):
         return client
 
     def _crowded_wizardry_farm(self, spell="cause light wounds"):
-        client = self._wizard_training_client(100, x=11, y=8)
+        client = self._wizard_training_client(100, x=13, y=8)
         client.state.stats["sp"] = 0
-        # A pair of kobolds three tiles east, and a lone one four tiles north.
-        client.state.map.tile(12, 8).objects[3] = MapObject(
+        # A pair of kobolds five tiles east, and a lone one seven tiles
+        # north, outside the pair's default four-tile detection radius.
+        client.state.map.tile(14, 8).objects[3] = MapObject(
             3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
-        client.state.map.tile(8, 4).objects[3] = MapObject(
+        client.state.map.tile(8, 1).objects[3] = MapObject(
             3, 1, 0, 0, name="kobold", target_id=102, target_hp=100)
         task = FarmTask(
             zone="/test", target="kobold", neutral_targets=True,
@@ -6738,6 +7077,19 @@ class QuestTests(unittest.TestCase):
         self.assertTrue(task.single_target_wizardry(client))
         asyncio.run(task.tick(client))
         self.assertEqual(task._engaged_target[0], 102)
+
+    def test_wizardry_training_fights_an_active_threat_that_is_not_alone(self):
+        client = self._wizard_training_client(100, x=11, y=8)
+        client.state.stats["sp"] = 0
+        # Coming at her from three tiles, with a packmate three tiles behind:
+        # inside its detection radius, beyond the two-tile cluster retreat.
+        client.state.map.tile(14, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
+        task = FarmTask(zone="/test", target="kobold",
+                        combat_skill="wizardry spells")
+        self.assertTrue(task.single_target_wizardry(client))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._engaged_target[0], 100)
 
     def test_knowing_firestorm_alone_keeps_single_target_wizardry(self):
         client, task = self._crowded_wizardry_farm()
@@ -9124,6 +9476,40 @@ class QuestTests(unittest.TestCase):
         self.assertNotIn((12, 11), fahrgorm.patrol)
         self.assertTrue(any(max(abs(x - 12), abs(y - 11)) == 1
                             for x, y in fahrgorm.patrol))
+
+    def _pull_square(self, *residents):
+        graph = WorldGraph()
+        node = MapNode("/camp", width=30, height=30)
+        node.terrain = {(x, y): 1 for x in range(30) for y in range(30)}
+        graph.nodes["/camp"] = node
+        graph.named_spawns["/camp"] = [
+            NamedSpawn("/camp", 10, 10, "goblin", ("goblin",),
+                       aggro_radius=2),
+            *residents]
+        circuit = FarmCircuitTask(
+            graph, [("/camp", "goblin")],
+            spot=analyzer_spot("Camp", ["/camp"], ["goblin L5"],
+                               aggressive=1))
+        farm = circuit._new_child().task
+        goal = farm.pull_squares[(10, 10)]
+        self.assertIn(goal, farm.patrol)
+        return goal
+
+    def test_pull_square_keeps_clear_of_residents_outside_the_leg(self):
+        kobold = NamedSpawn("/camp", 14, 10, "kobold", ("kobold",),
+                            aggro_radius=3)
+        goal = self._pull_square(kobold)
+        self.assertGreater(max(abs(goal[0] - 14), abs(goal[1] - 10)), 3)
+
+    def test_pull_square_keeps_six_tiles_from_ranged_residents(self):
+        archer = NamedSpawn("/camp", 10, 5, "orc archer", ("orc archer",),
+                            aggro_radius=1)
+        kobold = NamedSpawn("/camp", 10, 16, "kobold", ("kobold",),
+                            aggro_radius=1)
+        self.assertEqual(archer.pull_clearance_radius, 6)
+        self.assertEqual(kobold.pull_clearance_radius, 1)
+        goal = self._pull_square(archer, kobold)
+        self.assertGreater(max(abs(goal[0] - 10), abs(goal[1] - 5)), 6)
 
     def test_failed_circuit_route_retreats_instead_of_ending_task(self):
         client = self._combat_client()
