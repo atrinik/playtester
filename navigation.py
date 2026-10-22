@@ -4654,9 +4654,11 @@ class FarmCircuitTask(BotTask):
     def _review_combat_build(self, client: AtrinikClient,
                              farm: FarmTask) -> bool:
         """Reconfigure secondary training only between fights and loot."""
+        desired = self._automatic_combat_plan(client)
+        # The farming analyzer ranks spots for the skill being trained.
+        client.state.combat_training_skill = desired[0]
         if not self._auto_combat_build:
             return False
-        desired = self._automatic_combat_plan(client)
         current = (self.combat_skill, self.combat_spell,
                    self.combat_skill_until_level)
         if desired == current or self._busy_finishing_fight_or_loot(
