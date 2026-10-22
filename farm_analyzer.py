@@ -5,8 +5,9 @@ world-tile circuit from the pinned content and Classic experience tables. It
 takes tens of seconds, so it runs as a separate low-priority process while the
 bot keeps playing. It is fed the character's live combat profile (the
 killing skill's level and the player doll's DAM, WC, weapon speed, AC and
-protections) and re-runs when that profile changes materially or the result
-ages out. One ``--ranking all`` run yields every objective, so switching the
+protections; while training Wizardry, the spell's observed damage per cast,
+cast delay and mana instead of the weapon) and re-runs when that profile
+changes materially or the result ages out. One ``--ranking all`` run yields every objective, so switching the
 preferred objective never needs a new run.
 """
 
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
+import re
+import statistics
 import shutil
 import sys
 import time
@@ -42,14 +45,31 @@ WEAPON_SCHOOLS = {
     "pierce weapons": "pierce",
     "cleave weapons": "cleave",
 }
-# The automatic secondary-combat plan: Wizardry through the finisher (melee
-# brings a target down, a spell lands the kill). One pure function of the
-# character's state, shared by the farm circuit and the analyzer profile, so
-# spots are ranked for the trained skill from the very first analysis.
+# The automatic secondary-combat plan: Wizardry, trained by spell-only kills
+# (the server splits kill XP by each skill's share of the damage). One pure
+# function of the character's state, shared by the farm circuit and the
+# analyzer profile, so spots are ranked for the trained skill.
 AUTO_WIZARD_START_LEVEL = 18
 AUTO_WIZARD_FIRST_TARGET = 10
 AUTO_WIZARD_AOE_REVIEW_LEVEL = 25
 AUTO_WIZARD_AOE_TARGET = 15
+# Her own hit text: "You hit <name> for <done> (<done - raw>) with <attack>."
+HIT_TEXT = re.compile(r"^You hit .+ for (\d+) \((-?\d+)\) with ([a-z ]+)\.$", re.I)
+# Attack types a damage spell's hit text can name, as the analyzer knows them.
+SPELL_ATTACKS = frozenset({
+    "fire", "cold", "electricity", "poison", "acid", "drain", "magic"})
+# Hit-text attack names the locked analyzer lacks, mapped to the nearest it
+# knows. Magic bullet deals weapon magic, which no monster archetype
+# protects against; as "magic" it is understated only against the few that
+# resist magic.
+SPELL_ATTACK_ALIASES = {"weapon magic": "magic"}
+SPELL_SAMPLES = 30
+# Hit text this soon after her own offensive cast is that spell's damage.
+SPELL_HIT_WINDOW_SECONDS = 3.0
+# Seconds per cast in the caster model. The client's action_time is the delay
+# of whatever she did last (a sword swing included), and mana, not the cast
+# rate, bounds a spell-only kill rate, so a fixed second is used.
+SPELL_CAST_DELAY = 1.0
 
 
 def owned_skill_level(state, name: str) -> int:
@@ -108,14 +128,41 @@ class CombatProfile:
     # Largest likely simultaneous aggro a spot may have; 0 allows any. While
     # a secondary skill trains one target at a time, spots must not pack.
     max_aggro_pack: int = 0
+    # Spell-only training: raw damage per cast (0 simulates the weapon),
+    # seconds per cast, mana per cast, mana regenerated per second, the mana
+    # usable for offence (max mana less the healing reserve), attack type.
+    spell_damage: float = 0.0
+    cast_delay: float = 0.0
+    mana_cost: int = 0
+    mana_regen: float = 0.0
+    max_mana: int = 0
+    spell_attack: str = ""
+    # She has Meditation: resting out of combat ramps regeneration up to
+    # tenfold (types/player.c, player_do_some_living).
+    meditation: bool = False
 
     def arguments(self) -> list[str]:
-        args = [
-            str(self.skill_level),
-            "--melee-damage", str(self.damage),
-            "--weapon-class", str(self.weapon_class),
-            "--weapon-speed", f"{self.weapon_speed:g}",
-            "--melee-attack", f"{self.attack}=100",
+        if self.spell_damage > 0:
+            args = [
+                str(self.skill_level),
+                "--damage-per-attack", f"{self.spell_damage:g}",
+                "--attack-delay", f"{self.cast_delay:g}",
+                "--mana-cost", str(self.mana_cost),
+                "--mana-regen", f"{self.mana_regen:g}",
+                "--max-mana", str(self.max_mana),
+                "--attack-type", self.spell_attack,
+            ]
+            if self.meditation:
+                args.append("--meditation")
+        else:
+            args = [
+                str(self.skill_level),
+                "--melee-damage", str(self.damage),
+                "--weapon-class", str(self.weapon_class),
+                "--weapon-speed", f"{self.weapon_speed:g}",
+                "--melee-attack", f"{self.attack}=100",
+            ]
+        args += [
             "--character-level", str(self.character_level),
             "--max-health", str(self.max_health),
             "--character-speed", f"{self.speed:g}",
@@ -132,15 +179,22 @@ class CombatProfile:
         if other is None:
             return True
         if (self.skill, self.skill_level, self.attack, self.character_level,
-                self.max_aggro_pack) != (
+                self.max_aggro_pack, self.spell_attack, self.mana_cost,
+                self.meditation) != (
                 other.skill, other.skill_level, other.attack, other.character_level,
-                other.max_aggro_pack):
+                other.max_aggro_pack, other.spell_attack, other.mana_cost,
+                other.meditation):
+            return True
+        if (self.spell_damage > 0) != (other.spell_damage > 0):
             return True
 
         def relative(new: float, old: float, fraction: float) -> bool:
             return abs(new - old) > fraction * max(abs(old), 1.0)
 
-        if (relative(self.damage, other.damage, 0.10) or
+        if (relative(self.spell_damage, other.spell_damage, 0.15) or
+                relative(self.mana_regen, other.mana_regen, 0.10) or
+                relative(self.max_mana, other.max_mana, 0.10) or
+                relative(self.damage, other.damage, 0.10) or
                 relative(self.weapon_speed, other.weapon_speed, 0.05) or
                 relative(self.speed, other.speed, 0.05) or
                 relative(self.max_health, other.max_health, 0.10) or
@@ -161,11 +215,20 @@ class CombatProfile:
             "speed": self.speed, "armour_class": self.armour_class,
             "protections": dict(self.protections),
             "max_aggro_pack": self.max_aggro_pack,
+            "spell_damage": self.spell_damage, "cast_delay": self.cast_delay,
+            "mana_cost": self.mana_cost, "mana_regen": self.mana_regen,
+            "max_mana": self.max_mana, "spell_attack": self.spell_attack,
+            "meditation": self.meditation,
         }
 
 
-def combat_profile(client) -> CombatProfile | None:
-    """Read the killing skill and player doll, or None if unsupported."""
+def combat_profile(client, spell_damage: float = 0.0,
+                   spell_attack: str = "") -> CombatProfile | None:
+    """Read the killing skill and player doll, or None if unsupported.
+
+    ``spell_damage``/``spell_attack`` are the observed raw damage per hit of
+    her damage spell and its attack type (see FarmAnalyzer.observe_spells).
+    """
     state = client.state
     weapon = state.items.get(state.equipment.get(c.EQUIP_WEAPON, 0))
     if weapon is None or not getattr(weapon, "required_skill_tag", 0):
@@ -195,20 +258,47 @@ def combat_profile(client) -> CombatProfile | None:
         for index, name in enumerate(c.ATTACK_NAMES)
         for value in (state.protections.get(index, 0),)
         if value))
-    # Training a secondary skill (the Wizardry finisher), melee still brings
-    # each target down and the skill lands the kill, so its XP is ranked at
-    # that skill's level, on spots that send one monster at a time.
+    # Training Wizardry, every hit is the spell (kill XP is split by damage
+    # share), so it is ranked at that skill's level on spots that send one
+    # monster at a time, killing with the spell's damage and mana. Until a
+    # cast has been observed, the weapon stands in.
     max_aggro_pack = 0
-    training = automatic_training_plan(state)[0]
+    caster: dict[str, Any] = {}
+    training, spell_name, _ = automatic_training_plan(state)
     trained_level = owned_skill_level(state, training) if training else 0
     if trained_level >= 1:
         school, skill_level, max_aggro_pack = training, trained_level, 1
+        spell = next((item for item in state.inventory
+                      if item.item_type == c.TYPE_SPELL and
+                      item.name.casefold() == spell_name), None)
+        try:
+            cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
+            regen = float(stats.get("regen_sp", 0) or 0)
+            maxsp = int(stats.get("maxsp", 0) or 0)
+        except (TypeError, ValueError):
+            cost, regen, maxsp = 0, 0.0, 0
+        heal_costs = [
+            int(item.extra.get("cost", 0) or 0) for item in state.inventory
+            if item.item_type == c.TYPE_SPELL and "heal" in item.name.casefold() and
+            int(item.extra.get("cost", 0) or 0) > 0]
+        offence = maxsp - min(heal_costs, default=0) * 3
+        if (spell_damage > 0 and spell_attack in SPELL_ATTACKS and
+                0 < cost <= offence and regen > 0):
+            caster = dict(
+                spell_damage=round(spell_damage, 1),
+                cast_delay=SPELL_CAST_DELAY, mana_cost=cost,
+                mana_regen=round(regen, 3), max_mana=offence,
+                spell_attack=spell_attack,
+                meditation=any(
+                    item.item_type == c.TYPE_SKILL and
+                    item.name.casefold() == "meditation"
+                    for item in state.inventory))
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
         character_level=character_level, max_health=max_health,
         speed=round(speed, 3), armour_class=armour_class, protections=protections,
-        max_aggro_pack=max_aggro_pack)
+        max_aggro_pack=max_aggro_pack, **caster)
 
 
 class FarmAnalyzer:
@@ -244,6 +334,12 @@ class FarmAnalyzer:
         self._last_attempt_at = 0.0
         self._task: asyncio.Task | None = None
         self._process: asyncio.subprocess.Process | None = None
+        # Raw damage of her recent damage-spell hits, their attack type, the
+        # spell they came from and the next message position to read.
+        self.spell_samples: list[int] = []
+        self.spell_attack = ""
+        self.spell_name = ""
+        self._message_position = 0
 
     @classmethod
     def from_bundle(cls, installed: dict, **kwargs) -> "FarmAnalyzer":
@@ -285,9 +381,48 @@ class FarmAnalyzer:
         return (profile.materially_differs(self.profile) or
                 now - self.reported_at >= self.REFRESH_SECONDS)
 
+    def observe_spells(self, client) -> None:
+        """Record the raw damage of her damage spell from her own hit text.
+
+        Only hit text within a few seconds of her own offensive cast counts,
+        so elemental melee (rings of fire and the like) is never sampled.
+        """
+        state = client.state
+        entries = state.messages_since(self._message_position)
+        self._message_position = state.message_count
+        casts = list(getattr(client, "offensive_casts", ()))
+        for timestamp, _, _, text in entries:
+            spell = next((
+                name for cast_at, name in reversed(casts)
+                if 0.0 <= timestamp - cast_at <= SPELL_HIT_WINDOW_SECONDS), "")
+            if not spell:
+                continue
+            if spell != self.spell_name:
+                self.spell_name = spell
+                self.spell_samples = []
+                self.spell_attack = ""
+            match = HIT_TEXT.match(text)
+            if match is None:
+                continue
+            attack = match.group(3).casefold()
+            attack = SPELL_ATTACK_ALIASES.get(attack, attack)
+            if attack not in SPELL_ATTACKS:
+                continue
+            raw = int(match.group(1)) - int(match.group(2))
+            if raw > 0:
+                self.spell_samples = (self.spell_samples + [raw])[-SPELL_SAMPLES:]
+                self.spell_attack = attack
+
     def poll(self, client) -> bool:
         """Start a background analysis if the live profile calls for one."""
-        profile = combat_profile(client)
+        self.observe_spells(client)
+        # Only samples of the spell the training plan casts describe it.
+        planned = automatic_training_plan(client.state)[1]
+        observed = self.spell_samples and self.spell_name == planned
+        profile = combat_profile(
+            client,
+            statistics.median(self.spell_samples) if observed else 0.0,
+            self.spell_attack)
         if profile is None:
             if self.report is None and not self.running:
                 self.status = "unsupported"

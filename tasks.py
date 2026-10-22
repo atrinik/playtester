@@ -960,6 +960,10 @@ class FarmTask(BotTask):
         # finisher windows without knowing their absolute maximum HP.
         self._target_damage: dict[int, tuple[int, float, float, int]] = {}
         self._melee_target_id = 0
+        # Spell-only training is waiting for a full mana bar before a pull,
+        # and when the rest was last confirmed (see training_rest_active).
+        self._training_resting = False
+        self._training_rest_at = 0.0
         self._melee_cycle_anchor = 0.0
         self._melee_anchor_message_at = 0.0
         self._finish_race_targets: set[int] = set()
@@ -1267,6 +1271,12 @@ class FarmTask(BotTask):
         self._spell_budget_observed_sp = int(
             client.state.stats.get("sp", 0) or 0)
         self._last_offensive_commit_at = time.monotonic()
+        # Wall-clock like message stamps: the analyzer attributes hit text
+        # shortly after one of these to the spell (FarmAnalyzer.observe_spells).
+        casts = getattr(client, "offensive_casts", None)
+        if casts is None:
+            casts = client.offensive_casts = deque(maxlen=20)
+        casts.append((time.time(), spell.name.casefold()))
 
     def training_skill_item(self, client: AtrinikClient) -> Item | None:
         if not self.combat_skill:
@@ -1292,6 +1302,30 @@ class FarmTask(BotTask):
             "wizardry" in self.combat_skill and
             self.training_active(client) and
             not casts_firestorm)
+
+    def spell_only_training(self, client: AtrinikClient) -> bool:
+        """Whether every hit on a training target must be the trained spell.
+
+        The server splits kill XP by each skill's share of the damage dealt
+        (award_kill_exp), so a sword hit on a Wizardry training target feeds
+        Slash, not Wizardry. The whole fight is cast; out of mana she keeps
+        her distance until it regenerates.
+        """
+        if not ("wizardry" in self.combat_skill and
+                self.training_active(client)):
+            return False
+        # A bar too small for one cast beyond the healing reserve can never
+        # cast: then the weapon trains (the profile ranks it that way too).
+        spell = self.combat_spell_item(client)
+        maxsp = int(client.state.stats.get("maxsp", 0) or 0)
+        cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
+        return spell is not None and (
+            maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
+
+    def training_rest_active(self) -> bool:
+        """Whether a mana rest was confirmed on the farm just now."""
+        return (self._training_resting and
+                time.monotonic() - self._training_rest_at <= 1.0)
 
     def training_active(self, client: AtrinikClient) -> bool:
         skill = self.training_skill_item(client)
@@ -1438,8 +1472,14 @@ class FarmTask(BotTask):
         # is in flight retain ownership of the finisher down to the genuine
         # flee threshold.  Dropping it at 79% previously re-enabled Slash
         # after Sera had already spent the mana and stood still for the cast.
+        # Spell-only training has no melee to fall back to: by the time it
+        # runs, safety has had its chance to heal (a neutral farm's isolated
+        # kite heals only at its flee threshold, as before), so it casts
+        # down to the flee threshold.
+        spells_only = self.spell_only_training(client)
         if (hp / maxhp <= self.safety.flee_below or
-                (hp / maxhp < 0.80 and not pending_for_target)):
+                (hp / maxhp < 0.80 and not pending_for_target and
+                 not spells_only)):
             return False
         target_hp = self.observed_target_hp(client, obj)
         window = self.finisher_window(obj.target_id)
@@ -1455,9 +1495,9 @@ class FarmTask(BotTask):
         melee_hit_handoff = self.observed_training_melee_hit(
             client, obj)
         if (not self.training_active(client) or
-                target_hp <= 0 or
+                (target_hp <= 0 and not spells_only) or
                 (target_hp > window and not timed_neutral_handoff and
-                 not melee_hit_handoff)):
+                 not melee_hit_handoff and not spells_only)):
             return False
         skill = self.training_skill_item(client)
         if skill is None:
@@ -1468,7 +1508,9 @@ class FarmTask(BotTask):
             if spell is None:
                 return False
             if not self.offensive_spell_affordable(client, spell):
-                if self.neutral_targets:
+                # Spell-only training waits out its mana too: a melee
+                # finish would hand Slash its damage share of the kill.
+                if spells_only or self.neutral_targets:
                     # Once a deliberately pulled passive has entered the
                     # Wizardry handoff, falling back to automatic melee at the
                     # healing reserve steals the kill and defeats catch-up
@@ -1477,11 +1519,13 @@ class FarmTask(BotTask):
                     # cast (or the ordinary health gate forces a retreat).
                     await client.clear_actions()
                     await client.set_combat(False)
-                    await self.melee_kite(
+                    moved = await self.melee_kite(
                         client, x, y, obj, map_node=self.map_node,
                         preserve_spell_line=spell)
                     self._last_action = time.monotonic()
-                    return True
+                    # Spell-only training reports a kite that could not
+                    # step, so travel defence can fight a cornering attacker.
+                    return moved or not spells_only
                 return False
             now = time.monotonic()
             cooldown = max(
@@ -1518,7 +1562,8 @@ class FarmTask(BotTask):
             if (self._finishing_target_id == obj.target_id and
                     now - self._last_finisher_at < cooldown):
                 return True
-            if self._finisher_casts >= self.WIZARD_FINISHER_CAST_LIMIT:
+            if (not spells_only and
+                    self._finisher_casts >= self.WIZARD_FINISHER_CAST_LIMIT):
                 return False
             m = client.state.map
             cx, cy = m.width // 2, m.height // 2
@@ -1680,6 +1725,10 @@ class FarmTask(BotTask):
         """Move as soon as a pursuer closes to one empty intervening tile."""
         m = client.state.map
         current_node = map_node
+        if current_node is not None and current_node.path != m.path:
+            # Another map's terrain (the farm's, seen from a transit map)
+            # says nothing about these coordinates.
+            current_node = None
         if current_node is None and self.map_node is not None:
             if self.map_node.path == m.path:
                 current_node = self.map_node
@@ -2852,7 +2901,9 @@ class FarmTask(BotTask):
         # ranged pressure is disabled, approach with the shielded melee
         # loadout instead of briefly readying an untrained launcher and
         # suppressing shield protections.
-        allow_launcher = self.allow_launchers
+        # A launcher pull would hand the bow a share of a training kill.
+        allow_launcher = (self.allow_launchers and
+                          not self.spell_only_training(client))
         launcher = next((item for item in client.state.inventory
                          if allow_launcher and
                          item.item_type == c.TYPE_BOW and
@@ -3474,7 +3525,8 @@ class FarmTask(BotTask):
         target_hp = int(client.state.stats.get("target_hp", 0) or 0)
         action_time = float(client.state.stats.get("action_time", 0) or 0)
         now = time.monotonic()
-        if (engaged_id <= 0 or
+        if (self.spell_only_training(client) or
+                engaged_id <= 0 or
                 getattr(client.state, "target_id", 0) != engaged_id or
                 not 0 < target_hp <= 15 or health_ratio < 0.80 or
                 action_time > 0.80 or
@@ -3964,6 +4016,35 @@ class FarmTask(BotTask):
             await client.set_combat(False)
             self.complete()
             return
+        if (engaged is None and self.spell_only_training(client) and
+                (nearest_threat is None or nearest_threat[0] > 2) and
+                not any(active_threat(entry) for entry in threats
+                        if entry[3].target_id not in pulled_aside_ids) and
+                not recent_hostile_contact(client)):
+            # Spell-only training pulls on a full mana bar, so most of a
+            # fight is cast without waiting for mana mid-fight. Resting out
+            # of combat also ramps regeneration up (Meditation). Mana
+            # regenerates only while she has food in her stomach.
+            sp = int(client.state.stats.get("sp", 0) or 0)
+            maxsp = int(client.state.stats.get("maxsp", 0) or 0)
+            food = int(client.state.stats.get("food", 0) or 0)
+            if 0 < maxsp and sp < maxsp and food > 0:
+                # A rest is new unless confirmed just now: one left behind by
+                # a detour starts over (clears, combat off, logged).
+                if not self.training_rest_active():
+                    # Restart before upkeep can take the tick.
+                    self._training_resting = True
+                    recorder = getattr(client, "record_action", None)
+                    if recorder is not None:
+                        recorder("training-rest", f"sp={sp}/{maxsp}")
+                    await client.clear_actions()
+                    await client.set_combat(False)
+                self._training_rest_at = time.monotonic()
+                if await self.maintain_inventory(client):
+                    return
+                self._last_action = time.monotonic()
+                return
+        self._training_resting = False
         if engaged is not None:
             # Finish the creature deliberately pulled/engaged instead of
             # switching to whichever add happens to step one tile closer.
@@ -4043,6 +4124,17 @@ class FarmTask(BotTask):
             self._lure_progress_at = 0.0
             self._last_lure_step_at = 0.0
             if await self.training_finisher(client, x, y, obj):
+                return
+            if self.spell_only_training(client):
+                # Never melee a training target: whenever the spell cannot
+                # be cast (hurt, line blocked), keep the distance with
+                # combat off; safety and retreat handle her health.
+                await client.clear_actions()
+                await client.set_combat(False)
+                await self.melee_kite(
+                    client, x, y, obj, map_node=self.map_node,
+                    preserve_spell_line=self.combat_spell_item(client))
+                self._last_action = time.monotonic()
                 return
             semantic = map_object_semantic(client, obj)
             # Peaceful creatures must be provoked deliberately: the requested

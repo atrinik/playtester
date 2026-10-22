@@ -3107,8 +3107,14 @@ class NavigateThenTask(BotTask):
         # before a routine heal. FarmTask applies its stricter 80% health gate;
         # below that, survival immediately wins and normal melee remains free
         # to finish the enemy after healing.
+        # On the farm's own map, spell-only training fights after safety
+        # instead (see below). Transit keeps the last-resort fight.
+        spells_only = (isinstance(self.task, FarmTask) and
+                       m.path == self.navigation.destination and
+                       self.task.spell_only_training(client))
         if (ratio > self.safety.flee_below and nearest is not None and
-                not hold_fire and isinstance(self.task, FarmTask) and
+                not hold_fire and not spells_only and
+                isinstance(self.task, FarmTask) and
                 self.task.should_training_finish(client, nearest[3])):
             _, x, y, obj = nearest
             self.task.remember_engagement(client, x, y, obj.target_id)
@@ -3341,6 +3347,36 @@ class NavigateThenTask(BotTask):
         self._hold_fire_signature = ()
         self._halo_yield.clear()
         self._halo_closed_since = 0.0
+        if (spells_only and nearest is not None and nearest[0] <= 4 and
+                time.monotonic() - self._last_defense_action < 0.30):
+            self._defending = True
+            return True
+        if spells_only and nearest is not None and nearest[0] <= 4:
+            # Spell-only training never melees what it fights here: safety
+            # has had its chance to heal, so cast; when the spell cannot be
+            # cast, keep the distance with combat off. Only an adjacent
+            # attacker she cannot step away from is fought below (survival).
+            self._defending = True
+            _, x, y, obj = nearest
+            self.task.remember_engagement(client, x, y, obj.target_id)
+            if not await select_target(client, x, y, obj.target_id):
+                self.task.release_engagement(obj.target_id)
+                await client.set_combat(False)
+                return False
+            if await self.task.training_finisher(client, x, y, obj):
+                self._last_defense_action = time.monotonic()
+                return True
+            await client.clear_actions()
+            await client.set_combat(False)
+            if not (await self.task.melee_kite(
+                    client, x, y, obj, map_node=node,
+                    preserve_spell_line=self.task.combat_spell_item(client)) or
+                    nearest[0] > 1 or not recent_hostile_contact(client, 3.0)):
+                # Survival: an adjacent attacker she can neither cast at nor
+                # step away from is fought, here and now.
+                await client.set_combat(True, force=True)
+            self._last_defense_action = time.monotonic()
+            return True
         # Only close a short gap. Chasing a merely visible target across the
         # viewport was what repeatedly pulled the character into larger packs.
         if nearest is not None and nearest[0] <= 4:
@@ -6933,7 +6969,8 @@ class FarmCircuitTask(BotTask):
         if (isinstance(farm, FarmTask) and
                 (named_spawn_empty or patrol_swept_empty) and
                 live_targets == 0 and elapsed >= 15.0 and
-                not self._busy_finishing_fight_or_loot(client, farm)):
+                not self._busy_finishing_fight_or_loot(client, farm) and
+                not farm.training_rest_active()):
             if not self._empty_spawn_since:
                 self._empty_spawn_since = now
                 return
@@ -6963,6 +7000,10 @@ class FarmCircuitTask(BotTask):
         # late-spawning attacker into the next map's pack.
         if (isinstance(farm, FarmTask) and
                 self._busy_finishing_fight_or_loot(client, farm)):
+            return
+        # Nor mid-rest for mana, or she sets off with a partial bar. Services
+        # may still detour during a rest.
+        if isinstance(farm, FarmTask) and farm.training_rest_active():
             return
         next_leg = self._next_ready_leg(self.leg_index + 1, level)
         if next_leg == self.leg_index:
