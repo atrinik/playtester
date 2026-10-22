@@ -35,9 +35,12 @@ hostile has either of these inside its own detection radius:
 
 A monster's detection radius comes from `aggressive_detection_ranges`, which
 the circuit fills from the authored `aggro_radius` of every aggressive
-resident on the map; unknown monsters default to 4. Authored-peaceful
-creatures are ignored, since they never join a fight. `ranged_pull` and the
-single-target Wizardry filter both use this one predicate.
+resident on the map; unknown monsters default to 4. A neighbour whose name
+marks it as a ranged attacker (see below) counts with a radius of at least 6.
+Authored-peaceful creatures are ignored, since they never join a fight.
+`ranged_pull` and the single-target Wizardry filter both use this one
+predicate. The Wizardry filter still keeps a monster that is beside her or
+already coming at her (an active threat), so she never ignores an attacker.
 
 ### Clear pull square as the kite anchor
 
@@ -48,11 +51,15 @@ of the map. Residents whose names contain "archer", "bowman", "slinger" or
 they shoot from outside their detection range. The chosen squares are passed
 to `FarmTask` as `pull_squares`.
 
-When she pulls, the farm records an anchor: the pull square of the nearest
-target spawn if she can reach it, otherwise the square she stands on. After
-the pull, `melee_kite` prefers steps toward the anchor. `low_health_retreat`
-is unchanged except that it prefers the step toward the anchor when two
-steps are otherwise equal.
+When she pulls, the farm records an anchor. It is the pull square of the
+target spawn nearest the target, provided that spawn is within 6 tiles of
+the target and its pull square within 7 tiles of her. Both distances are
+Chebyshev, with no path check, and apply only on the farm map itself.
+Otherwise the anchor is the square she stands on. After the pull,
+`melee_kite` prefers steps toward the anchor among steps that keep at least
+4 tiles from every other hostile; separation still wins over the anchor.
+`low_health_retreat` is unchanged except that, for the engaged target's
+anchor, it prefers the step toward it when two steps are otherwise equal.
 
 ### Wait, then approach only if alone
 
@@ -61,10 +68,17 @@ After a pull she holds at or near the anchor for up to `PULL_WAIT_SECONDS`
 step that brings her closer to the target.
 
 - If the target comes within 2 tiles, she fights it normally.
+- If it attacks her from range (combat text names it) while it is lone, the
+  wait ends at once and she fights it.
 - If it has not come when the wait ends, she approaches it only if it is
   still lone, measured at its current position.
-- Otherwise she sets it aside for `PULL_SET_ASIDE_SECONDS` (120 s), using
-  the farm's existing unreachable-target list, and picks another target.
+- Otherwise she sets it aside for `PULL_SET_ASIDE_SECONDS` (120 s) and picks
+  another target. A set-aside only hides the monster from target choice and
+  pull candidates. It still counts as a threat throughout. The set-aside
+  ends when it expires, when the monster attacks her, or when it arrives
+  within 2 tiles of her. Standing within its detection radius of her does
+  not end it, and while it stands near her its packmates do not become
+  targets.
 
 The old 2.5 s fallback that walked toward the target no longer applies to a
 pulled target.
@@ -107,9 +121,10 @@ Open questions:
 - No change to melee kiting against a target that was not pulled, to the
   pack-split retreat, or to emergency recall.
 - No path-level avoidance of archer ranges. The extended radius applies to
-  pull-square clearance only; patrol avoidance still uses authored radii.
+  pull-square clearance and the lone-pull check only; patrol avoidance and
+  threat detection still use authored radii.
 - No AoE behaviour yet. Firestorm already lifts the single-target Wizardry
   filter once she casts it, but pulls still require a lone target.
-- No new set-aside mechanism. The farm's unreachable-target list hides a
-  set-aside monster from target choice and threat counts alike, so if it
-  later attacks her, only the existing unseen-contact retreat responds.
+- No hiding of set-aside monsters from threat handling. A pull set-aside
+  hides a monster from target choice only; it stays a threat and is released
+  when it attacks her or arrives within 2 tiles of her.

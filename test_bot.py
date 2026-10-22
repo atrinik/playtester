@@ -6210,20 +6210,152 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.direct_moves, [])
         self.assertEqual(client.moves, [])
         self.assertIsNone(task._engaged_target)
-        self.assertTrue(task.target_temporarily_unreachable(100))
+        self.assertFalse(task.target_temporarily_unreachable(100))
         self.assertAlmostEqual(
-            task._unreachable_targets[100] - time.monotonic(),
+            task._pull_set_aside[100] - time.monotonic(),
             task.PULL_SET_ASIDE_SECONDS, delta=5)
         self.assertEqual(client.cleared_targets, 1)
+
+    def test_pull_set_aside_target_stays_a_threat_and_is_fought_when_it_attacks(self):
+        client, task = self._pulled_farm(neighbour_square=(16, 8))
+        task._pull_wait_since -= task.PULL_WAIT_SECONDS + 0.1
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        # It and its packmate wander to three and four tiles from her,
+        # inside their detection radius, without attacking.
+        target = client.state.map.tile(14, 8).objects.pop(3)
+        archer = client.state.map.tile(16, 8).objects.pop(3)
+        client.state.map.tile(11, 8).objects[3] = target
+        client.state.map.tile(12, 9).objects[3] = archer
+        client.targets.clear()
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        # Still set aside and never approached, yet it counts as a threat:
+        # with its packmate it makes a pack she steps away from.
+        self.assertIn(100, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.targets, [])
+        self.assertIn(client.direct_moves[-1][0], (6, 7, 8))
+        client.state.map.tile(12, 9).objects.pop(3)
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertNotIn(100, task._pull_set_aside)
+        self.assertEqual(task._engaged_target[0], 100)
+        self.assertEqual(client.combat[-1], True)
+
+    def test_pull_set_aside_target_nearby_does_not_make_its_packmate_a_target(self):
+        client, task = self._pulled_farm(neighbour_square=(16, 8))
+        task._pull_wait_since -= task.PULL_WAIT_SECONDS + 0.1
+        asyncio.run(task.tick(client))
+        target = client.state.map.tile(14, 8).objects.pop(3)
+        archer = client.state.map.tile(16, 8).objects.pop(3)
+        client.state.map.tile(11, 8).objects[3] = target
+        client.state.map.tile(13, 8).objects[3] = archer
+        client.targets.clear()
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.targets, [])
 
     def test_post_pull_wait_approaches_a_lone_target_after_the_wait(self):
         client, task = self._pulled_farm()
         task._pull_wait_since -= task.PULL_WAIT_SECONDS + 0.1
         asyncio.run(task.tick(client))
         self.assertFalse(task.pull_waiting(100))
-        self.assertFalse(task.target_temporarily_unreachable(100))
+        self.assertNotIn(100, task._pull_set_aside)
         self.assertEqual(task._engaged_target[0], 100)
         self.assertTrue(client.direct_moves or client.moves)
+
+    def test_post_pull_wait_fights_a_lone_target_that_attacks_from_range(self):
+        client, task = self._pulled_farm(anchor=(9, 10))
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+        asyncio.run(task.tick(client))
+        self.assertFalse(task.pull_waiting(100))
+        self.assertEqual(task._engaged_target[0], 100)
+        # It approaches instead of stepping back west to the anchor.
+        self.assertNotIn((7, False), client.direct_moves)
+        self.assertTrue(client.direct_moves or client.moves)
+
+    def test_post_pull_wait_ends_when_the_target_arrives(self):
+        client, task = self._pulled_farm()
+        target = client.state.map.tile(14, 8).objects.pop(3)
+        client.state.map.tile(10, 8).objects[3] = target
+        asyncio.run(task.tick(client))
+        self.assertFalse(task.pull_waiting(100))
+        self.assertEqual(task._engaged_target[0], 100)
+
+    def test_ranged_pull_keeps_six_tiles_from_an_archer(self):
+        # Five tiles from her square, outside the default detection radius.
+        client, target = self._lone_pull_client((3, 8))
+        task = FarmTask(combat_spell="magic bullet")
+        self.assertFalse(asyncio.run(task.ranged_pull(
+            client, [(4, 12, 8, target)])))
+        self.assertEqual(client.fired, [])
+
+    def test_pull_anchor_is_the_spawn_pull_square_on_the_farm_map(self):
+        client, _ = self._lone_pull_client()
+        task = FarmTask(zone="/test", pull_squares={(15, 10): (12, 12)})
+        # Without the farm map's node the squares have no frame.
+        self.assertEqual(task.pull_anchor(client, 12, 8), (10, 10))
+        task.map_node = MapNode(path="/test", width=25, height=25)
+        self.assertEqual(task.pull_anchor(client, 12, 8), (12, 12))
+        task.map_node = MapNode(path="/elsewhere", width=25, height=25)
+        self.assertEqual(task.pull_anchor(client, 12, 8), (10, 10))
+
+    def _anchored_kite(self, other_square=None):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        target = MapObject(
+            3, 1, 0, 0, name="orc", target_id=100, target_hp=55)
+        client.state.map.tile(10, 8).objects[3] = target
+        if other_square is not None:
+            client.state.map.tile(*other_square).objects[3] = MapObject(
+                3, 2, 0, 0, name="orc", target_id=200, target_hp=100)
+        client.state.stats.update(target_hp=55, action_time=1.20)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task = FarmTask(zone="/test", target="orc")
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        task.remember_engagement(client, 10, 8, target.target_id)
+        # Anchored north-west of her.
+        task._pull_anchor = (100, "/test", 8, 8)
+        return client, task, target
+
+    def test_melee_kite_steps_toward_the_anchor_among_safe_steps(self):
+        client, task, target = self._anchored_kite()
+        self.assertTrue(asyncio.run(
+            task.melee_kite(client, 10, 8, target)))
+        self.assertEqual(client.direct_moves[-1], (8, False))
+
+    def test_melee_kite_prefers_a_safe_step_over_the_anchor(self):
+        # North-west toward the anchor would land three tiles from another
+        # orc, inside its detection radius; west keeps four.
+        client, task, target = self._anchored_kite(other_square=(4, 4))
+        self.assertTrue(asyncio.run(
+            task.melee_kite(client, 10, 8, target)))
+        self.assertEqual(client.direct_moves[-1], (7, False))
+
+    def test_low_health_retreat_breaks_ties_toward_the_anchor(self):
+        for anchor, direction in (((8, 8), 8), ((8, 12), 6)):
+            with self.subTest(anchor=anchor):
+                client = self._combat_client()
+                client.state.map.tiles.clear()
+                client.state.map.world_x = 10
+                client.state.map.world_y = 10
+                client.state.map.tile(10, 8).objects[3] = MapObject(
+                    3, 1, 0, 0, name="orc", target_id=100, target_hp=55)
+                task = FarmTask(zone="/test", target="orc")
+                task.remember_engagement(client, 10, 8, 100)
+                task._pull_anchor = (100, "/test", *anchor)
+                self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+                self.assertEqual(client.direct_moves[-1], (direction, False))
 
     def test_pursuit_holds_through_transient_missing_target_frame(self):
         client = self._combat_client()

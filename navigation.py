@@ -41,6 +41,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
+                    RANGED_RESIDENT_MARKERS, RANGED_RESIDENT_RADIUS,
                     RetrieveItemsTask, SellJunkTask, TaskStatus,
                     TempleFoodTask, TempleServiceTask,
                     corpse_tile_standable, movement_ack_timeout,
@@ -101,14 +102,6 @@ class Waypoint:
     y: int
     name: str = ""
     archetype: str = ""
-
-
-# Residents whose names mark them as ranged attackers. They hit from beyond
-# their authored detection radius, so a pull square keeps at least
-# RANGED_RESIDENT_RADIUS tiles from them. Sera kept dying to orc packs of two
-# or three that included archers.
-RANGED_RESIDENT_MARKERS = ("archer", "bowman", "slinger", "mage")
-RANGED_RESIDENT_RADIUS = 6
 
 
 @dataclass(slots=True, frozen=True)
