@@ -2690,25 +2690,21 @@ class FarmTask(BotTask):
             recorder("pull-wait",
                      f"target={target_id} anchor={anchor[0]},{anchor[1]}")
 
-    def target_attacking(self, client: AtrinikClient, obj) -> bool:
-        """Whether combat text names this monster attacking her."""
-        semantic = map_object_semantic(client, obj).casefold()
-        return any(_same_semantic_identity(name, semantic)
-                   for name in recent_hostile_attackers(client))
-
     def pulled_aside(self, client: AtrinikClient, obj,
                      distance: int) -> bool:
         """Whether a pull set-aside still hides this monster from targeting.
 
-        It ends as soon as the monster attacks her or arrives within two
-        tiles: a pulled orc that arrives late must be fought, not ignored
-        while she commits to its packmate. Merely standing within its
-        detection radius does not end it; she would walk up to a monster
-        that is not alone and pull its packmate too.
+        It ends only when it expires or the monster arrives within two
+        tiles, where a melee attacker must be: a pulled orc that arrives late
+        is fought, not ignored while she commits to its packmate. Standing
+        within its detection radius does not end it, or she would walk up to
+        a monster that is not alone and pull its packmate too. Combat text
+        does not end it either: it names attackers only by species, so a
+        packmate's arrow or a stale line from an earlier kill would release
+        it and walk her into the pack.
         """
         expiry = self._pull_set_aside.get(obj.target_id, 0.0)
-        if (expiry <= time.monotonic() or distance <= 2 or
-                self.target_attacking(client, obj)):
+        if expiry <= time.monotonic() or distance <= 2:
             self._pull_set_aside.pop(obj.target_id, None)
             return False
         return True
@@ -2788,17 +2784,16 @@ class FarmTask(BotTask):
         now = time.monotonic()
         m = client.state.map
         distance = max(abs(x - m.width // 2), abs(y - m.height // 2))
-        lone = self._lone_target(client, (distance, x, y, obj), (x, y))
-        # An archer shooting her from range never comes: fight it at once
-        # while it is alone, rather than holding for the whole wait.
-        attacking = lone and self.target_attacking(client, obj)
-        if (now - self._pull_wait_since < self.PULL_WAIT_SECONDS and
-                not attacking):
+        # Only arrival (handled by the caller) or the timeout ends the wait.
+        # Combat text cannot say which same-species monster hit her, so a
+        # ranged target shooting her waits it out; safety and the pack-split
+        # retreat still react to the damage.
+        if now - self._pull_wait_since < self.PULL_WAIT_SECONDS:
             await self.step_toward_anchor(client, x, y, obj)
             return True
         self._pull_wait_since = 0.0
         recorder = getattr(client, "record_action", None)
-        if lone:
+        if self._lone_target(client, (distance, x, y, obj), (x, y)):
             if recorder is not None:
                 recorder("pull-wait-approach", f"target={obj.target_id}")
             return False
@@ -3752,9 +3747,14 @@ class FarmTask(BotTask):
 
         if not hostile_contact and not initial_threats:
             self.remember_safe_position(client)
+        # A set-aside pull is never committed to by a hit: combat text cannot
+        # say it was the attacker, and within two tiles it is released anyway.
+        contact_threats = [
+            entry for entry in initial_threats
+            if not self.pulled_aside(client, entry[3], entry[0])]
         if (hostile_contact and self._engaged_target is None and
-                initial_threats):
-            _, x, y, obj = min(initial_threats, key=lambda entry: entry[0])
+                contact_threats):
+            _, x, y, obj = min(contact_threats, key=lambda entry: entry[0])
             # An aggressive monster can land its first hit before the normal
             # target scan. Commit it before emergency healing preempts combat.
             self.remember_engagement(client, x, y, obj.target_id)
@@ -3768,8 +3768,10 @@ class FarmTask(BotTask):
             self._last_action = time.monotonic()
             return
         if (hostile_contact and self._engaged_target is None and
-                not initial_threats):
+                not contact_threats):
             # An off-screen first contact can occur just after a map seam.
+            # A hit with only set-aside pulls in view is unattributed too:
+            # escape it rather than patrol on under fire.
             # A position recorded moments before the hit is not necessarily
             # safe: once we start escaping, never navigate back toward it.
             last_heal = self.safety._last_heal
@@ -3882,6 +3884,10 @@ class FarmTask(BotTask):
                 client, {entry[3].target_id for entry in threats}):
             return
         nearest_threat = min(threats, key=lambda value: value[0], default=None)
+        if (self._engaged_target is not None and
+                self._engaged_target[0] in pulled_aside_ids):
+            # Never fight a still-set-aside pull, however it became engaged.
+            self.release_engagement(self._engaged_target[0])
         engaged_id = self._engaged_target[0] if self._engaged_target else 0
         engaged = next((entry for entry in threats
                         if entry[3].target_id == engaged_id), None)

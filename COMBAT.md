@@ -68,20 +68,33 @@ After a pull she holds at or near the anchor for up to `PULL_WAIT_SECONDS`
 step that brings her closer to the target.
 
 - If the target comes within 2 tiles, she fights it normally.
-- If it attacks her from range (combat text names it) while it is lone, the
-  wait ends at once and she fights it.
-- If it has not come when the wait ends, she approaches it only if it is
-  still lone, measured at its current position.
+- If it has not come after 8 s, she approaches it only if it is still lone,
+  measured at its current position.
 - Otherwise she sets it aside for `PULL_SET_ASIDE_SECONDS` (120 s) and picks
   another target. A set-aside only hides the monster from target choice and
   pull candidates. It still counts as a threat throughout. The set-aside
-  ends when it expires, when the monster attacks her, or when it arrives
-  within 2 tiles of her. Standing within its detection radius of her does
-  not end it, and while it stands near her its packmates do not become
-  targets.
+  ends only when it expires or the monster arrives within 2 tiles of her,
+  where a melee attacker must be. Standing within its detection radius of
+  her does not end it, and while it stands near her its packmates do not
+  become targets.
 
 The old 2.5 s fallback that walked toward the target no longer applies to a
 pulled target.
+
+The pull mode does not use combat-text attribution. Combat text names an
+attacker only by species, so a packmate's arrow ("orc archer hit you") or a
+stale line from an orc killed earlier would look like the pulled orc
+attacking. So:
+
+- the wait ends only on arrival or the 8 s timeout;
+- the set-aside ends only on expiry or arrival;
+- a hit while she has no engagement commits her to the nearest threat that
+  is not set aside, never to a set-aside monster; a hit with only set-aside
+  monsters in view is handled as unseen contact, and she retreats.
+
+A ranged pulled target that shoots her therefore waits out the 8 s. The
+safety policy (healing and the flee threshold) and the pack-split retreat
+still react to the damage.
 
 ### Analyzer ranking (already shipped)
 
@@ -127,4 +140,4 @@ Open questions:
   filter once she casts it, but pulls still require a lone target.
 - No hiding of set-aside monsters from threat handling. A pull set-aside
   hides a monster from target choice only; it stays a threat and is released
-  when it attacks her or arrives within 2 tiles of her.
+  only when it expires or the monster arrives within 2 tiles of her.
