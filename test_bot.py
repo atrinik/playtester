@@ -10198,7 +10198,7 @@ class QuestTests(unittest.TestCase):
         client = FakeClient()
         task = BankBalanceTask("Tolmir", refresh=True)
         asyncio.run(task.tick(client))
-        task._sent_at -= task.REFRESH_TIMEOUT_SECONDS + 1
+        task._sent_monotonic -= task.REFRESH_TIMEOUT_SECONDS + 1
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.FAILED)
 

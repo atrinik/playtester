@@ -4834,7 +4834,10 @@ class BankBalanceTask(BotTask):
         # an old open dialogue can never confirm the stale cached value.
         self.refresh = refresh
         self._sent = False
+        # Wall-clock send time, compared with the client's observation stamp;
+        # the timeout runs on the monotonic clock, immune to clock changes.
         self._sent_at = 0.0
+        self._sent_monotonic = 0.0
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
@@ -4844,6 +4847,7 @@ class BankBalanceTask(BotTask):
             return
         if not self._sent:
             self._sent_at = time.time()
+            self._sent_monotonic = time.monotonic()
             await client.talk("balance", self.banker)
             self._sent = True
             return
@@ -4851,7 +4855,7 @@ class BankBalanceTask(BotTask):
             observed = float(getattr(client.state, "bank_balance_observed_at", 0.0) or 0.0)
             if observed >= self._sent_at:
                 self.complete()
-            elif time.time() - self._sent_at > self.REFRESH_TIMEOUT_SECONDS:
+            elif time.monotonic() - self._sent_monotonic > self.REFRESH_TIMEOUT_SECONDS:
                 self.fail("banker did not report a fresh balance")
             return
         feedback = "\n".join(
