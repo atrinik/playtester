@@ -8590,6 +8590,43 @@ class QuestTests(unittest.TestCase):
         self._corner(task, client)
         asyncio.run(task._defend_while_navigating(client))
         self.assertNotIn((7, False), client.direct_moves)
+        # Far across the viewport it does not stop the back-out.
+        client.state.map.tiles.clear()
+        client.state.map.tile(16, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="hill giant", target_id=700, target_hp=100)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves[-1], (7, False))
+
+    def test_unseen_attacker_retreat_never_masks_a_close_visible_creature(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider hit you for 3 damage.")]
+        # The committed target drifted seven tiles off (beyond pack range);
+        # another is beside her.
+        client.state.map.tile(15, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="bat", target_id=600, target_hp=100)
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 2, 0, 0, name="spider", target_id=601, target_hp=100)
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task._last_pull_target = 600
+        task._trail = [("/test", 9, 10), ("/test", 10, 10)]
+        self._corner(task, client)
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertFalse(any(action == "navigation-unseen-attacker-retreat"
+                             for action, _ in client.decisions))
 
     def test_unseen_attacker_retreat_needs_a_walkable_trail_step(self):
         client = self._combat_client()

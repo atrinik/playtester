@@ -2854,7 +2854,6 @@ class NavigateThenTask(BotTask):
             if value and delta == (dx, dy)), 0)
         if (path != m.path or not direction or
                 (path, x, y) in self._retreat_blocked or
-                (x, y) in self.navigation._threat_blocked or
                 (x, y) in node.occupied or
                 not node.walkable(
                     x, y, allow_locked=self.navigation._allow_locked(client))):
@@ -3315,8 +3314,8 @@ class NavigateThenTask(BotTask):
                     await self._combat_step_toward(client, x, y)
                 self._last_defense_action = time.monotonic()
             return True
-        if ((nearest is None or nearest[0] > 4) and not hold_fire and
-                not dangerous and
+        if (not nearby and not hold_fire and
+                not any(threat[0] <= 5 for threat in dangerous) and
                 client.state.map.path != self.navigation.destination):
             # Hit and cornered with nothing close enough to fight: the
             # attacker is unseen. Between retreat steps the defence holds;
