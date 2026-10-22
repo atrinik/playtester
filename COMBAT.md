@@ -89,12 +89,17 @@ attacking. So:
 - the wait ends only on arrival or the 8 s timeout;
 - the set-aside ends only on expiry or arrival;
 - a hit while she has no engagement commits her to the nearest threat that
-  is not set aside, never to a set-aside monster; a hit with only set-aside
-  monsters in view is handled as unseen contact, and she retreats.
+  is neither set aside nor inside a set-aside monster's reach (its detection
+  radius, at least 6 for a ranged monster, measured from that monster);
+- if no such threat remains but a set-aside monster is visible, she does not
+  commit and retreats with `low_health_retreat`, which steps away from the
+  visible threats; with no threats in view at all, the existing unseen-contact
+  retreat applies.
 
-A ranged pulled target that shoots her therefore waits out the 8 s. The
-safety policy (healing and the flee threshold) and the pack-split retreat
-still react to the damage.
+A ranged pulled target that shoots her therefore waits out the 8 s, and a
+set-aside ranged monster is not fought until it closes to 2 tiles or its
+120 s set-aside expires. The safety policy (healing and the flee threshold)
+and the retreats still react to its damage.
 
 ### Analyzer ranking (already shipped)
 

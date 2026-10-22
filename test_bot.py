@@ -6261,9 +6261,28 @@ class QuestTests(unittest.TestCase):
             (now, 0, 0, "orc hit you for 3 (-3) impact damage.")]
         asyncio.run(task.tick(client))
         self.assertIn(100, task._pull_set_aside)
-        # The hit commits to the nearest threat not set aside, the archer,
-        # rather than to the nearer set-aside orc.
-        self.assertEqual(task._engaged_target[0], 200)
+        # Nor does the hit commit her to the archer within the set-aside
+        # orc's reach: she steps away from both instead.
+        self.assertIsNone(task._engaged_target)
+        self.assertIn(client.direct_moves[-1][0], (6, 7, 8))
+
+    def test_hit_with_only_set_aside_pulls_in_view_retreats_from_them(self):
+        client, task = self._set_aside_pull((11, 8), (16, 8))
+        client.state.map.tile(16, 8).objects.pop(3)
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertIn(client.direct_moves[-1][0], (6, 7, 8))
+
+    def test_engagement_on_a_set_aside_pull_is_released(self):
+        client, task = self._set_aside_pull((12, 8), (16, 8))
+        task.remember_engagement(client, 12, 8, 100)
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.targets, [])
 
     def test_set_aside_pull_arriving_within_two_tiles_is_fought(self):
         client, task = self._set_aside_pull((10, 8), (16, 8))

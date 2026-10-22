@@ -2616,6 +2616,14 @@ class FarmTask(BotTask):
             if identity and identity in semantic
         ), default=4)
 
+    def neighbour_radius(self, client: AtrinikClient, obj) -> int:
+        """How far a monster joins a fight: detection, 6+ for ranged ones."""
+        radius = self.detection_radius(client, obj)
+        semantic = map_object_semantic(client, obj).casefold()
+        if any(marker in semantic for marker in RANGED_RESIDENT_MARKERS):
+            radius = max(radius, RANGED_RESIDENT_RADIUS)
+        return radius
+
     def _lone_target(self, client: AtrinikClient, candidate: tuple,
                      fight_square: tuple[int, int]) -> bool:
         """Whether a candidate (distance, view x, view y, object) comes alone.
@@ -2632,10 +2640,7 @@ class FarmTask(BotTask):
             if (other.target_id == obj.target_id or
                     self.authored_peaceful(client, other)):
                 continue
-            radius = self.detection_radius(client, other)
-            semantic = map_object_semantic(client, other).casefold()
-            if any(marker in semantic for marker in RANGED_RESIDENT_MARKERS):
-                radius = max(radius, RANGED_RESIDENT_RADIUS)
+            radius = self.neighbour_radius(client, other)
             if (max(abs(other_x - x), abs(other_y - y)) <= radius or
                     max(abs(other_x - fight_x),
                         abs(other_y - fight_y)) <= radius):
@@ -3747,11 +3752,19 @@ class FarmTask(BotTask):
 
         if not hostile_contact and not initial_threats:
             self.remember_safe_position(client)
-        # A set-aside pull is never committed to by a hit: combat text cannot
-        # say it was the attacker, and within two tiles it is released anyway.
+        # A hit never commits her to a set-aside pull or to a packmate within
+        # its reach: combat text cannot say which one attacked, and fighting
+        # the packmate drags the set-aside monster in too. Within two tiles
+        # a set-aside pull is released anyway.
+        set_aside_threats = [
+            entry for entry in initial_threats
+            if self.pulled_aside(client, entry[3], entry[0])]
         contact_threats = [
             entry for entry in initial_threats
-            if not self.pulled_aside(client, entry[3], entry[0])]
+            if entry not in set_aside_threats and not any(
+                max(abs(entry[1] - aside[1]), abs(entry[2] - aside[2])) <=
+                self.neighbour_radius(client, aside[3])
+                for aside in set_aside_threats)]
         if (hostile_contact and self._engaged_target is None and
                 contact_threats):
             _, x, y, obj = min(contact_threats, key=lambda entry: entry[0])
@@ -3768,10 +3781,19 @@ class FarmTask(BotTask):
             self._last_action = time.monotonic()
             return
         if (hostile_contact and self._engaged_target is None and
-                not contact_threats):
+                not contact_threats and set_aside_threats):
+            # Hit with only set-aside pulls and their packmates in view: step
+            # away from the visible threats. The unseen-contact fallback could
+            # step toward a set-aside monster it does not account for.
+            last_heal = self.safety._last_heal
+            await self.safety.enforce(client)
+            if self.safety._last_heal == last_heal:
+                await self.low_health_retreat(client)
+            self._last_action = time.monotonic()
+            return
+        if (hostile_contact and self._engaged_target is None and
+                not initial_threats):
             # An off-screen first contact can occur just after a map seam.
-            # A hit with only set-aside pulls in view is unattributed too:
-            # escape it rather than patrol on under fire.
             # A position recorded moments before the hit is not necessarily
             # safe: once we start escaping, never navigate back toward it.
             last_heal = self.safety._last_heal
