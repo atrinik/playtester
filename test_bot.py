@@ -4317,6 +4317,56 @@ class QuestTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_hungry_she_asks_a_temple_first_and_honours_each_retry(self):
+        now = [10.0]
+        graph = WorldGraph()
+        task = FarmCircuitTask(graph, [("/a", "treant")], clock=lambda: now[0])
+        task._new_temple_food = lambda client: "temple trip"
+        task._new_food_resupply = lambda client: "shop trip"
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["food"] = 150
+        # Live: 851 coins, under the protected 1,000; the shop refused her.
+        client.state.bank_balance = 851
+        graph.temple_priests = ["priest"]
+        # Hungry, temple food is free whatever the wallet.
+        self.assertEqual(task._food_trip(client), ("temple trip", "temple"))
+        # A failed temple request waits out its retry: the shop meanwhile.
+        task._temple_food_retry_at = now[0] + task.TEMPLE_FOOD_RETRY_SECONDS
+        self.assertEqual(task._food_trip(client), ("shop trip", "shop"))
+        # Both backing off: no trip at all this tick, never a retry loop.
+        task._resupply_retry_at = now[0] + 1800.0
+        self.assertEqual(task._food_trip(client), (None, ""))
+        # Not hungry, the carried reserve is restocked at the shop.
+        task._temple_food_retry_at = task._resupply_retry_at = 0.0
+        client.state.stats["food"] = 300
+        self.assertEqual(task._food_trip(client), ("shop trip", "shop"))
+        # No temple anywhere: hungry, the shop feeds her.
+        graph.temple_priests = []
+        client.state.stats["food"] = 150
+        self.assertEqual(task._food_trip(client), ("shop trip", "shop"))
+
+    def test_nearly_starving_food_trip_does_not_wait_for_a_lull(self):
+        task = FarmCircuitTask(WorldGraph(), [("/a", "treant")], clock=lambda: 10.0)
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        # Hungry, but with minutes to spare: a fight still finishes first.
+        client.state.stats["food"] = 150
+        self.assertFalse(task._food_urgent(client))
+        # Live: continuous fights on a busy circuit; food reached 0 and she
+        # starved. Below FOOD_URGENT the trip starts mid-fight.
+        client.state.stats["food"] = task.FOOD_URGENT - 1
+        self.assertTrue(task._food_urgent(client))
+        # Nearly starving, pending food identification no longer holds the
+        # trip back either: that also waits for a lull.
+        task._food_identification_pending = lambda client: True
+        self.assertTrue(task._needs_food_resupply(client))
+        # Safe food carried is eaten on the spot instead.
+        for tag in range(93, 96):
+            client.state.place_item(Item(tag, item_type=c.TYPE_FOOD, quality=100,
+                                         name="wholemeal bread"), 7)
+        self.assertFalse(task._food_urgent(client))
+
     def test_farm_circuit_requests_food_detour_at_safe_low_reserve(self):
         graph = WorldGraph()
         task = FarmCircuitTask(graph, [("/a", "treant")], clock=lambda: 10.0)
