@@ -4252,10 +4252,6 @@ class FarmCircuitTask(BotTask):
     # a spellbook drops.  The later level-15 review unlocks the first authored
     # cone/AoE spells without diverting every early kill away from the main
     # weapon school.
-    AUTO_WIZARD_START_LEVEL = farm_analyzer_plan.AUTO_WIZARD_START_LEVEL
-    AUTO_WIZARD_FIRST_TARGET = farm_analyzer_plan.AUTO_WIZARD_FIRST_TARGET
-    AUTO_WIZARD_AOE_REVIEW_LEVEL = farm_analyzer_plan.AUTO_WIZARD_AOE_REVIEW_LEVEL
-    AUTO_WIZARD_AOE_TARGET = farm_analyzer_plan.AUTO_WIZARD_AOE_TARGET
 
     # Live failures exclude an analyzer pick for this long; see the README.
     FARM_DEATH_QUARANTINE_SECONDS = 6 * 60 * 60
@@ -4618,13 +4614,8 @@ class FarmCircuitTask(BotTask):
 
     @staticmethod
     def _skill_level(client: AtrinikClient, name: str) -> int:
-        folded = name.casefold()
-        return max((
-            int(item.extra.get("level", 0) or 0)
-            for item in client.state.inventory
-            if item.item_type == c.TYPE_SKILL and
-            item.name.casefold() == folded
-        ), default=0)
+        # One reading for the circuit and the farming analyzer.
+        return farm_analyzer_plan.owned_skill_level(client.state, name)
 
     def _automatic_combat_plan(
             self, client: AtrinikClient) -> tuple[str, str, int]:

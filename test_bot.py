@@ -13949,8 +13949,16 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertEqual((main.skill, main.max_aggro_pack), ("slash weapons", 0))
         self.assertNotIn("--max-aggro-pack", main.arguments())
         self.assertTrue(main.materially_differs(profile))
-        # Without a training spell, nothing trains.
+        # Between levels 18 and 24 the first target (10) is already met.
         state.items[12].extra["level"] = 10
+        state.stats["level"] = 22
+        self.assertEqual(combat_profile(client).skill, "slash weapons")
+        state.stats["level"] = 28
+        # An unreadable skill level counts as none, never an error.
+        state.items[12].extra["level"] = "?"
+        self.assertEqual(combat_profile(client).skill_level, 22)
+        state.items[12].extra["level"] = 10
+        # Without a training spell, nothing trains.
         state.remove_item(13)
         self.assertEqual(combat_profile(client).skill, "slash weapons")
 

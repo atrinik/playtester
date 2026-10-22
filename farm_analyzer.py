@@ -52,19 +52,23 @@ AUTO_WIZARD_AOE_REVIEW_LEVEL = 25
 AUTO_WIZARD_AOE_TARGET = 15
 
 
-def _skill_level(state, name: str) -> int:
+def owned_skill_level(state, name: str) -> int:
+    """The level of the named skill she has, or 0 (also when unreadable)."""
     folded = name.casefold()
-    return max((
-        int(item.extra.get("level", 0) or 0)
-        for item in state.inventory
-        if item.item_type == c.TYPE_SKILL and item.name.casefold() == folded
-    ), default=0)
+    levels = []
+    for item in state.inventory:
+        if item.item_type == c.TYPE_SKILL and item.name.casefold() == folded:
+            try:
+                levels.append(int(item.extra.get("level", 0) or 0))
+            except (TypeError, ValueError):
+                levels.append(0)
+    return max(levels, default=0)
 
 
 def automatic_training_plan(state) -> tuple[str, str, int]:
     """The (skill, spell, target level) to train next, or ("", "", 0)."""
     level = int(state.stats.get("level", 0) or 0)
-    wizardry = _skill_level(state, "wizardry spells")
+    wizardry = owned_skill_level(state, "wizardry spells")
     known = {item.name.casefold() for item in state.inventory
              if item.item_type == c.TYPE_SPELL}
     spell = next((name for name in ("magic bullet", "cause light wounds")
@@ -196,7 +200,7 @@ def combat_profile(client) -> CombatProfile | None:
     # that skill's level, on spots that send one monster at a time.
     max_aggro_pack = 0
     training = automatic_training_plan(state)[0]
-    trained_level = _skill_level(state, training) if training else 0
+    trained_level = owned_skill_level(state, training) if training else 0
     if trained_level >= 1:
         school, skill_level, max_aggro_pack = training, trained_level, 1
     return CombatProfile(
