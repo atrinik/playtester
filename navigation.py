@@ -3644,7 +3644,9 @@ class BuySpellTask(BotTask):
                     balance = max(0, self._bank_before - bank_spend)
                     setter = getattr(client, "set_bank_balance", None)
                     if setter is not None:
-                        setter(balance)
+                        # Local accounting keeps the last observation time.
+                        setter(balance, observed_at=float(getattr(
+                            client.state, "bank_balance_observed_at", 0.0) or 0.0))
                     else:
                         client.state.bank_balance = balance
                 self._accounted = True
@@ -5594,10 +5596,10 @@ class FarmCircuitTask(BotTask):
                 self._depletion_service_cost(client) and
                 time.time() - observed > self.BANK_RESYNC_SECONDS)
 
-    def _new_bank_sync(self) -> NavigateThenTask:
+    def _new_bank_sync(self, *, refresh: bool = False) -> NavigateThenTask:
         task = NavigateThenTask(
             self.graph, "/shattered_islands/world_0_67",
-            BankBalanceTask("Tolmir"), destination_xy=(19, 15),
+            BankBalanceTask("Tolmir", refresh=refresh), destination_xy=(19, 15),
             combat_approach=True)
         task.navigation.strict_safety = True
         return task
@@ -6540,14 +6542,10 @@ class FarmCircuitTask(BotTask):
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
-            if client.state.bank_balance_known:
-                # A stale cached balance: drop it so the banker is asked.
-                forget = getattr(client, "forget_bank_balance", None)
-                if forget is not None:
-                    forget()
-                else:
-                    client.state.bank_balance_known = False
-            self._bank_sync = self._new_bank_sync()
+            # With a stale balance known, keep it (cure funding still needs
+            # the known shortfall if the trip fails) and ask for a fresh one.
+            self._bank_sync = self._new_bank_sync(
+                refresh=client.state.bank_balance_known)
             await self._bank_sync.tick(client)
             return
         # Treat disease before routine logistics: corpse-trap diseases can

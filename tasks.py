@@ -4090,9 +4090,12 @@ class BuyShopUpgradeTask(BotTask):
 
     @staticmethod
     def _set_bank_balance(client: AtrinikClient, balance: int) -> None:
+        """Record a locally accounted balance. It is no new observation of
+        the bank, so the last observation time is kept."""
         setter = getattr(client, "set_bank_balance", None)
         if setter is not None:
-            setter(balance)
+            setter(balance, observed_at=float(
+                getattr(client.state, "bank_balance_observed_at", 0.0) or 0.0))
         else:
             client.state.bank_balance = balance
 
@@ -4820,20 +4823,36 @@ class BankTask(BotTask):
 class BankBalanceTask(BotTask):
     """Ask a nearby banker for the authoritative persistent balance."""
 
-    def __init__(self, banker: str):
+    # Seconds a refresh waits for the banker's answer before failing.
+    REFRESH_TIMEOUT_SECONDS = 10.0
+
+    def __init__(self, banker: str, *, refresh: bool = False):
         super().__init__(f"bank-balance:{banker}")
         self.banker = banker
+        # Ask even with a balance known, and accept only an answer observed
+        # after the request (the client stamps every balance it reads), so
+        # an old open dialogue can never confirm the stale cached value.
+        self.refresh = refresh
         self._sent = False
+        self._sent_at = 0.0
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
-        if client.state.bank_balance_known:
+        if not self.refresh and client.state.bank_balance_known:
             self.complete()
             return
         if not self._sent:
+            self._sent_at = time.time()
             await client.talk("balance", self.banker)
             self._sent = True
+            return
+        if self.refresh:
+            observed = float(getattr(client.state, "bank_balance_observed_at", 0.0) or 0.0)
+            if observed >= self._sent_at:
+                self.complete()
+            elif time.time() - self._sent_at > self.REFRESH_TIMEOUT_SECONDS:
+                self.fail("banker did not report a fresh balance")
             return
         feedback = "\n".join(
             entry[3] for entry in client.state.messages[-10:]

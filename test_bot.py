@@ -4430,7 +4430,7 @@ class QuestTests(unittest.TestCase):
         client.state.bank_balance = 2_000
         client.state.bank_balance_known = True
         client.persisted = []
-        client.set_bank_balance = lambda balance: (
+        client.set_bank_balance = lambda balance, observed_at=None: (
             client.persisted.append(balance),
             setattr(client.state, "bank_balance", balance))
         BuyShopUpgradeTask.account_purchase(client, 50)
@@ -10168,6 +10168,55 @@ class QuestTests(unittest.TestCase):
         client.state.remove_item(22)
         self.assertFalse(circuit._needs_bank_sync(client))
 
+    def test_a_balance_refresh_accepts_only_an_answer_after_its_request(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance, self.state.bank_balance_known = 35, True
+                self.state.bank_balance_observed_at = time.time() - 6 * 3600
+                self.talked = []
+
+            async def talk(self, message, npc=None):
+                self.talked.append(message)
+
+        client = FakeClient()
+        # A stale "balance is 35 copper" dialogue still open from before.
+        client.state.messages.append((time.time(), 0, 0, "Your balance is 35 copper coins."))
+        task = BankBalanceTask("Tolmir", refresh=True)
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.talked, ["balance"])
+        asyncio.run(task.tick(client))
+        # The old answer and the cached balance do not complete it...
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertEqual(client.state.bank_balance, 35)
+        # ...only a balance observed after the request does.
+        client.state.bank_balance = 1_000_035
+        client.state.bank_balance_observed_at = time.time() + 1
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        # No answer at all fails into the circuit's retry.
+        client = FakeClient()
+        task = BankBalanceTask("Tolmir", refresh=True)
+        asyncio.run(task.tick(client))
+        task._sent_at -= task.REFRESH_TIMEOUT_SECONDS + 1
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+
+    def test_local_purchase_accounting_is_no_fresh_bank_observation(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance, self.state.bank_balance_known = 5_000, True
+                self.state.bank_balance_observed_at = 1_000.0
+                self.calls = []
+
+            def set_bank_balance(self, balance, observed_at=None):
+                self.calls.append((balance, observed_at))
+
+        client = FakeClient()
+        BuyShopUpgradeTask.account_purchase(client, 2_000)
+        self.assertEqual(client.calls, [(3_000, 1_000.0)])
+
     def test_farm_circuit_routes_depletion_to_real_aris_temple(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
@@ -10449,7 +10498,7 @@ class QuestTests(unittest.TestCase):
                 self.connected = False
                 self.talks = []
 
-            def set_bank_balance(self, balance):
+            def set_bank_balance(self, balance, observed_at=None):
                 self.persisted.append(balance)
                 self.state.bank_balance = balance
 
@@ -13158,7 +13207,7 @@ class NavigationTests(unittest.TestCase):
             async def talk(self, message, npc):
                 self.talks.append((message, npc))
 
-            def set_bank_balance(self, balance):
+            def set_bank_balance(self, balance, observed_at=None):
                 self.state.bank_balance = balance
 
         client = FakeClient()
