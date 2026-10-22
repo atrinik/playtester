@@ -2597,6 +2597,8 @@ class NavigateThenTask(BotTask):
     # Off the destination map, fight back only once something has been
     # hitting her and the route has made no progress for this long.
     TRANSIT_CORNERED_SECONDS = 4.0
+    # A held-fire halo that alone leaves no route yields after this long.
+    HALO_YIELD_SECONDS = 5.0
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -2631,6 +2633,8 @@ class NavigateThenTask(BotTask):
         self._last_moved_at = 0.0
         # Threats (id and world tile) the last held-fire halo was built around.
         self._hold_fire_signature: tuple[tuple[int, int, int], ...] = ()
+        # Held-fire creatures whose halo has yielded to a closed route.
+        self._halo_yield: set[int] = set()
         self._last_danger_target = 0
         self._last_pack_signature: tuple[int, ...] = ()
         self._pack_exit_stall: tuple[
@@ -3257,7 +3261,27 @@ class NavigateThenTask(BotTask):
             return True
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.
-            self._halo_threats(client, nearby, radius=1)
+            # The halo is a preference: once it alone has left no route for
+            # a while, those creatures' halos yield and she walks past. Live:
+            # a brown bat hovering over water beside a one-tile shore path
+            # below Fort Sether held Sera for half an hour; it never hit her,
+            # so the cornered rule never let her fight it either.
+            no_route_since = self.navigation._no_route_since
+            if (no_route_since and time.monotonic() - no_route_since >=
+                    self.HALO_YIELD_SECONDS):
+                yielded = {threat[3].target_id for threat in nearby
+                           } - self._halo_yield
+                if yielded:
+                    self._halo_yield |= yielded
+                    self.navigation._no_route_since = 0.0
+                    recorder = getattr(client, "record_action", None)
+                    if recorder is not None:
+                        recorder("navigation-halo-yield",
+                                 f"targets={','.join(map(str, sorted(yielded)))}")
+            self._halo_threats(
+                client, [threat for threat in nearby
+                         if threat[3].target_id not in self._halo_yield],
+                radius=1)
             if getattr(client.state, "combat", False) and not combat_released:
                 await client.set_combat(False)
             m = client.state.map
@@ -3275,6 +3299,7 @@ class NavigateThenTask(BotTask):
             self._defending = False
             return False
         self._hold_fire_signature = ()
+        self._halo_yield.clear()
         # Only close a short gap. Chasing a merely visible target across the
         # viewport was what repeatedly pulled the character into larger packs.
         if nearest is not None and nearest[0] <= 4:

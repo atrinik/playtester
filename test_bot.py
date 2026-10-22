@@ -8663,6 +8663,61 @@ class QuestTests(unittest.TestCase):
         task._last_position = (m.path, m.world_x, m.world_y)
         task._last_moved_at = time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1
 
+    def test_held_fire_halo_yields_once_it_alone_closes_the_route(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 22
+        client.state.map.world_y = 13
+        # Live: a brown bat over water beside a one-tile shore path; it never
+        # hits her, so she holds fire and its halo closes the path.
+        bat = MapObject(3, 1, 0, 0, name="brown bat", target_id=900, target_hp=100)
+        client.state.map.tile(4, 7).objects[3] = bat
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        m = client.state.map
+        task._last_position = (m.path, m.world_x, m.world_y)
+        task._last_moved_at = time.monotonic()
+
+        # With a route, or no route only briefly, the halo stands.
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn((18, 13), task.navigation._threat_blocked)
+        task.navigation._no_route_since = time.monotonic() - 1
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn((18, 13), task.navigation._threat_blocked)
+        self.assertEqual(client.decisions.count(("navigation-halo-yield", "targets=900")), 0)
+
+        # No route for longer: its halo yields, and stays yielded as it moves.
+        task.navigation._no_route_since = time.monotonic() - task.HALO_YIELD_SECONDS - 1
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task.navigation._threat_blocked, set())
+        self.assertIn(("navigation-halo-yield", "targets=900"), client.decisions)
+        self.assertEqual(task.navigation._no_route_since, 0.0)
+        client.state.map.tiles.clear()
+        client.state.map.tile(5, 7).objects[3] = bat
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task.navigation._threat_blocked, set())
+        self.assertEqual(client.decisions.count(("navigation-halo-yield", "targets=900")), 1)
+
+        # A newcomer still gets its halo.
+        client.state.map.tile(10, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="brown bat", target_id=901, target_hp=100)
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn((23, 13), task.navigation._threat_blocked)
+        self.assertNotIn((18, 13), task.navigation._threat_blocked)
+
+        # Once nothing is nearby, the yield is forgotten.
+        client.state.map.tiles.clear()
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertEqual(task._halo_yield, set())
+
     def test_transit_holds_fire_while_the_route_still_progresses(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
