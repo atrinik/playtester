@@ -8433,6 +8433,229 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(task._last_moved_at, moved_at)
         self.assertTrue(client.targets)
 
+    def test_unseen_attacker_backs_her_out_into_view_and_then_a_fight(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 19
+        client.state.map.world_y = 19
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        # Live: a spider on an unlit square sends no object, only its hits.
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider misses you!")]
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        for x in (21, 20, 19):
+            client.state.map.world_x = x
+            task._record_trail(client)
+
+        # Still walking: hold fire and keep to the route.
+        m = client.state.map
+        task._last_position = (m.path, m.world_x, m.world_y)
+        task._last_moved_at = time.monotonic()
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+
+        # Cornered: she steps back east along her trail and defends.
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [(3, False)])
+        self.assertTrue(task._defending)
+        self.assertIn(("navigation-unseen-attacker-retreat", "direction=3 to=20,19"),
+                      client.decisions)
+        # The very next tick (the runner's 0.25 s) holds the defence: no
+        # recovery stop or clear cancels the step in flight.
+        clears = client.clears
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(task._defending)
+        self.assertEqual(client.direct_moves, [(3, False)])
+        self.assertEqual(client.clears, clears)
+        # Past the throttle but still waiting for that step, she sends no other.
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+
+        # Arrived, still hit and unseen: the trail collapses and the next step
+        # goes farther back, and her own steps do not restart the cornered
+        # clock.
+        moved_at = task._last_moved_at
+        client.state.map.world_x = 20
+        task._record_trail(client)
+        self.assertEqual(task._trail[-2:], [("/test", 21, 19), ("/test", 20, 19)])
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves[-1], (3, False))
+        self.assertEqual(task._last_moved_at, moved_at)
+
+        # It follows her into the light: still cornered, she fights it.
+        client.state.map.world_x = 21
+        client.state.map.tile(7, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="spider", target_id=500, target_hp=100)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.targets[-1][2], 500)
+
+    def test_unseen_attacker_ends_the_defence_once_the_hits_stop(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.stats.update(sp=47, maxsp=47)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task._trail = [("/test", 12, 10), ("/test", 11, 10), ("/test", 10, 10)]
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider hit you for 8 damage.")]
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(task._defending)
+        # Arrived and still hit: she keeps backing out.
+        client.state.map.world_x = 11
+        task._record_trail(client)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(task._defending)
+        self.assertNotIn((0, False), client.direct_moves)
+        # Out of its reach the hits stop: at full health she resumes the route,
+        # and the step in flight is forgotten rather than learned as blocked.
+        client.state.messages = []
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertFalse(task._defending)
+        self.assertEqual(client.direct_moves[-1], (0, False))
+        self.assertIsNone(task._retreat_attempt)
+        self.assertEqual(task._retreat_blocked, set())
+
+    def test_unseen_attacker_retreat_with_a_far_creature_or_a_refused_step(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider misses you!")]
+        # A bat six tiles off is visible; the spider hitting her is not.
+        client.state.map.tile(14, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="bat", target_id=600, target_hp=100)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task._trail = [("/test", 9, 10), ("/test", 10, 10)]
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [(7, False)])
+        # The step never lands: past the acknowledgement timeout the square
+        # is learned as blocked and she leaves the route alone.
+        path, x, y, _ = task._retreat_attempt
+        task._retreat_attempt = (path, x, y, time.monotonic() - 60)
+        task._last_defense_action = 0.0
+        task._defending = False
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn(("/test", 9, 10), task._retreat_blocked)
+        self.assertEqual(len(client.direct_moves), 1)
+
+    def test_unseen_attacker_retreat_yields_to_a_visible_dangerous_monster(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider misses you!")]
+        client.state.map.tile(5, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="hill giant", target_id=700, target_hp=100)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        graph.monster_level = lambda *args, **kwargs: 40
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        # Her trail leads back toward the giant: she does not take it.
+        task._trail = [("/test", 9, 10), ("/test", 10, 10)]
+        self._corner(task, client)
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertNotIn((7, False), client.direct_moves)
+        # Far across the viewport it does not stop the back-out.
+        client.state.map.tiles.clear()
+        client.state.map.tile(16, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="hill giant", target_id=700, target_hp=100)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves[-1], (7, False))
+
+    def test_unseen_attacker_retreat_never_masks_a_close_visible_creature(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider hit you for 3 damage.")]
+        # The committed target drifted seven tiles off (beyond pack range);
+        # another is beside her.
+        client.state.map.tile(15, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="bat", target_id=600, target_hp=100)
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 2, 0, 0, name="spider", target_id=601, target_hp=100)
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task._last_pull_target = 600
+        task._trail = [("/test", 9, 10), ("/test", 10, 10)]
+        self._corner(task, client)
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertFalse(any(action == "navigation-unseen-attacker-retreat"
+                             for action, _ in client.decisions))
+
+    def test_unseen_attacker_retreat_needs_a_walkable_trail_step(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", "spider misses you!")]
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        node.terrain[(11, 10)] = 0
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        self._corner(task, client)
+        # No trail yet (just logged in), then a trail step that is no longer
+        # walkable, then one across a map seam: she leaves the route alone.
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        task._trail = [("/test", 11, 10), ("/test", 10, 10)]
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        node.occupied = {(9, 10)}
+        task._trail = [("/test", 9, 10), ("/test", 10, 10)]
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        task._trail = [("/other", 9, 10), ("/test", 10, 10)]
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+
     @staticmethod
     def _corner(task, client):
         """She has stood on this square past the cornered threshold."""
