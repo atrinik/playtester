@@ -4317,6 +4317,53 @@ class QuestTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_farm_circuit_empty_sweep_waits_out_a_mana_rest(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing")
+                self.state.map.path = "/a"
+                self.state.place_item(
+                    Item(990, name="staple food", quantity=10), self.state.player_tag)
+                self.clears = 0
+                self.combat = []
+
+            async def clear_actions(self):
+                self.clears += 1
+
+            async def set_combat(self, enabled, force=False):
+                self.combat.append(enabled)
+
+        async def scenario():
+            now = [1.0]
+            graph = WorldGraph()
+            graph.nodes["/a"] = MapNode("/a", width=20, height=20)
+            graph.nodes["/b"] = MapNode("/b", width=20, height=20)
+            graph.named_spawns["/a"] = [NamedSpawn(
+                "/a", 5, 5, "ordinary rat", ())]
+            task = FarmCircuitTask(
+                graph, [("/a", "rat"), ("/b", "other")],
+                dwell_seconds=90, clock=lambda: now[0])
+            client = FakeClient()
+            await task.start(client)
+            task.child.navigation.complete()
+            task.child.status = TaskStatus.RUNNING
+            farm = task.child.task
+
+            async def resting_tick(_client):
+                farm._training_resting = True
+                farm._training_rest_at = time.monotonic()
+
+            task.child.tick = resting_tick
+            await task.tick(client)
+            farm._patrol_index = len(farm.patrol)
+            for stamp in (17.0, 20.1, 30.0):
+                now[0] = stamp
+                await task.tick(client)
+            # The sweep is empty, but she is resting for mana: no switch.
+            self.assertEqual(task.leg_index, 0)
+
+        asyncio.run(scenario())
+
     def test_hungry_she_asks_a_temple_first_and_honours_each_retry(self):
         now = [10.0]
         graph = WorldGraph()
@@ -7177,6 +7224,57 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(task.spell_only_training(client))
         client.state.stats["maxsp"] = 16
         self.assertTrue(task.spell_only_training(client))
+
+    def test_navigation_spell_only_falls_back_to_melee_only_when_cornered(self):
+        client = self._wizard_training_client(100, x=9, y=8)
+        target = client.state.map.tile(9, 8).objects[3]
+        client.state.target_id = target.target_id
+        client.state.stats.update(hp=100, maxhp=100, target_hp=100, sp=0)
+        child = FarmTask(
+            zone="/test", target="kobold",
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds")
+        kites = []
+
+        async def no_kite(*args, **kwargs):
+            kites.append(kwargs.get("preserve_spell_line"))
+            return False
+
+        child.melee_kite = no_kite
+        task = NavigateThenTask(object(), "/test", child, combat_approach=True)
+        # No mana and no step away, but nothing has hit her: hold, no melee.
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.fired, [])
+        self.assertNotIn(True, client.combat)
+        self.assertIsNotNone(kites[-1])
+        # The adjacent creature is hitting her: survival, she fights back.
+        client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+        task._last_defense_action = 0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn(True, client.combat)
+
+    def test_navigation_spell_only_applies_on_the_farm_map_only(self):
+        client = self._wizard_training_client(100, x=9, y=8)
+        target = client.state.map.tile(9, 8).objects[3]
+        client.state.target_id = target.target_id
+        client.state.stats.update(hp=100, maxhp=100, target_hp=100)
+        client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+        child = FarmTask(
+            zone="/farm", target="kobold",
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(graph, "/farm", child, combat_approach=True)
+        m = client.state.map
+        task._last_position = (m.path, m.world_x, m.world_y)
+        task._last_moved_at = time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1
+        # Cornered on a transit map: the last-resort fight, not the spell.
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.fired, [])
+        self.assertIn(True, client.combat)
 
     def test_wizardry_training_rests_to_full_mana_before_a_pull(self):
         client = self._wizard_training_client(100, x=14, y=8)

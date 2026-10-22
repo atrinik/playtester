@@ -138,10 +138,12 @@ nearly unchanged. Live, Wizardry XP did not move for hours.
 - **Never melee a training target.** Whenever the spell cannot be cast
   (hurt below the heal threshold, line blocked), the farm loop keeps her
   distance with combat off; safety and retreat handle her health. Pulls use
-  the spell, never a launcher. Travel defence casts at a threat within reach
-  after safety, or keeps its distance. Melee remains only as survival: the
-  cornered-retreat breakout and the pursued stand (an attacker still
-  adjacent after three retreat steps).
+  the spell, never a launcher. On the farm's map, travel defence casts at a
+  threat within reach after safety, or keeps its distance. Melee remains only
+  as survival: the cornered-retreat breakout, the pursued stand (an attacker
+  still adjacent after three retreat steps), travel defence against an
+  adjacent attacker she cannot cast at or step away from, and transit maps'
+  last-resort fight when cornered.
 - **Pulls wait for a full bar.** Unengaged, with no creature coming at her
   and not under attack, she rests until her mana is full before the next
   pull (`training-rest`), unless she has no food (mana regenerates only

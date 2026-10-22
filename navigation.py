@@ -3107,8 +3107,10 @@ class NavigateThenTask(BotTask):
         # before a routine heal. FarmTask applies its stricter 80% health gate;
         # below that, survival immediately wins and normal melee remains free
         # to finish the enemy after healing.
-        # Spell-only training fights after safety instead (see below).
+        # On the farm's own map, spell-only training fights after safety
+        # instead (see below). Transit keeps the last-resort fight.
         spells_only = (isinstance(self.task, FarmTask) and
+                       m.path == self.navigation.destination and
                        self.task.spell_only_training(client))
         if (ratio > self.safety.flee_below and nearest is not None and
                 not hold_fire and not spells_only and
@@ -3345,26 +3347,33 @@ class NavigateThenTask(BotTask):
         self._hold_fire_signature = ()
         self._halo_yield.clear()
         self._halo_closed_since = 0.0
+        if (spells_only and nearest is not None and nearest[0] <= 4 and
+                time.monotonic() - self._last_defense_action < 0.30):
+            self._defending = True
+            return True
         if spells_only and nearest is not None and nearest[0] <= 4:
             # Spell-only training never melees what it fights here: safety
             # has had its chance to heal, so cast; when the spell cannot be
-            # cast, keep the distance with combat off.
+            # cast, keep the distance with combat off. Only an adjacent
+            # attacker she cannot step away from is fought below (survival).
             self._defending = True
-            if time.monotonic() - self._last_defense_action >= 0.30:
-                _, x, y, obj = nearest
-                self.task.remember_engagement(client, x, y, obj.target_id)
-                if not await select_target(client, x, y, obj.target_id):
-                    self.task.release_engagement(obj.target_id)
-                    await client.set_combat(False)
-                    return False
-                if not await self.task.training_finisher(client, x, y, obj):
-                    await client.clear_actions()
-                    await client.set_combat(False)
-                    await self.task.melee_kite(
-                        client, x, y, obj,
-                        preserve_spell_line=self.task.combat_spell_item(client))
+            _, x, y, obj = nearest
+            self.task.remember_engagement(client, x, y, obj.target_id)
+            if not await select_target(client, x, y, obj.target_id):
+                self.task.release_engagement(obj.target_id)
+                await client.set_combat(False)
+                return False
+            if await self.task.training_finisher(client, x, y, obj):
                 self._last_defense_action = time.monotonic()
-            return True
+                return True
+            await client.clear_actions()
+            await client.set_combat(False)
+            if (await self.task.melee_kite(
+                    client, x, y, obj, map_node=node,
+                    preserve_spell_line=self.task.combat_spell_item(client)) or
+                    nearest[0] > 1 or not recent_hostile_contact(client, 3.0)):
+                self._last_defense_action = time.monotonic()
+                return True
         # Only close a short gap. Chasing a merely visible target across the
         # viewport was what repeatedly pulled the character into larger packs.
         if nearest is not None and nearest[0] <= 4:

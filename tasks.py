@@ -1519,11 +1519,13 @@ class FarmTask(BotTask):
                     # cast (or the ordinary health gate forces a retreat).
                     await client.clear_actions()
                     await client.set_combat(False)
-                    await self.melee_kite(
+                    moved = await self.melee_kite(
                         client, x, y, obj, map_node=self.map_node,
                         preserve_spell_line=spell)
                     self._last_action = time.monotonic()
-                    return True
+                    # Spell-only training reports a kite that could not
+                    # step, so travel defence can fight a cornering attacker.
+                    return moved or not spells_only
                 return False
             now = time.monotonic()
             cooldown = max(
@@ -1723,6 +1725,10 @@ class FarmTask(BotTask):
         """Move as soon as a pursuer closes to one empty intervening tile."""
         m = client.state.map
         current_node = map_node
+        if current_node is not None and current_node.path != m.path:
+            # Another map's terrain (the farm's, seen from a transit map)
+            # says nothing about these coordinates.
+            current_node = None
         if current_node is None and self.map_node is not None:
             if self.map_node.path == m.path:
                 current_node = self.map_node
@@ -4025,17 +4031,17 @@ class FarmTask(BotTask):
             if 0 < maxsp and sp < maxsp and food > 0:
                 # A rest is new unless confirmed just now: one left behind by
                 # a detour starts over (clears, combat off, logged).
-                fresh = self.training_rest_active()
-                self._training_rest_at = time.monotonic()
-                if await self.maintain_inventory(client):
-                    return
-                if not fresh:
+                if not self.training_rest_active():
+                    # Restart before upkeep can take the tick.
                     self._training_resting = True
                     recorder = getattr(client, "record_action", None)
                     if recorder is not None:
                         recorder("training-rest", f"sp={sp}/{maxsp}")
                     await client.clear_actions()
                     await client.set_combat(False)
+                self._training_rest_at = time.monotonic()
+                if await self.maintain_inventory(client):
+                    return
                 self._last_action = time.monotonic()
                 return
         self._training_resting = False
