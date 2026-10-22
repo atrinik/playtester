@@ -2854,6 +2854,8 @@ class NavigateThenTask(BotTask):
             if value and delta == (dx, dy)), 0)
         if (path != m.path or not direction or
                 (path, x, y) in self._retreat_blocked or
+                (x, y) in self.navigation._threat_blocked or
+                (x, y) in node.occupied or
                 not node.walkable(
                     x, y, allow_locked=self.navigation._allow_locked(client))):
             return False
@@ -3313,11 +3315,17 @@ class NavigateThenTask(BotTask):
                     await self._combat_step_toward(client, x, y)
                 self._last_defense_action = time.monotonic()
             return True
-        if (nearest is None and not hold_fire and
-                client.state.map.path != self.navigation.destination and
-                time.monotonic() - self._last_defense_action >= 0.30 and
-                await self._unseen_attacker_retreat(client)):
-            return True
+        if ((nearest is None or nearest[0] > 4) and not hold_fire and
+                not dangerous and
+                client.state.map.path != self.navigation.destination):
+            # Hit and cornered with nothing close enough to fight: the
+            # attacker is unseen. Between retreat steps the defence holds;
+            # the recovery branch below would cancel the step in flight.
+            if (self._defending and
+                    time.monotonic() - self._last_defense_action < 0.30):
+                return True
+            if await self._unseen_attacker_retreat(client):
+                return True
         if self._defending:
             maxsp = int(client.state.stats.get("maxsp", 0) or 0)
             sp = int(client.state.stats.get("sp", 0) or 0)
@@ -3343,6 +3351,9 @@ class NavigateThenTask(BotTask):
             await client.move(0, run=False)
             await client.set_combat(False)
             await client.clear_actions()
+            # The clear may cancel a retreat step in flight; it must not be
+            # learned later as a blocked square.
+            self._retreat_attempt = None
             self.navigation._issued_goal = None
             self.navigation._issued_click = None
             self.navigation._last_progress = time.monotonic()
