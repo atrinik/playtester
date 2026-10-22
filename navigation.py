@@ -3644,7 +3644,9 @@ class BuySpellTask(BotTask):
                     balance = max(0, self._bank_before - bank_spend)
                     setter = getattr(client, "set_bank_balance", None)
                     if setter is not None:
-                        setter(balance)
+                        # Local accounting keeps the last observation time.
+                        setter(balance, observed_at=float(getattr(
+                            client.state, "bank_balance_observed_at", 0.0) or 0.0))
                     else:
                         client.state.bank_balance = balance
                 self._accounted = True
@@ -5573,13 +5575,48 @@ class FarmCircuitTask(BotTask):
             (self._disease_suspected and not self._disease_cures(client)) or
             int(client.state.stats.get("level", 0) or 0) >= 8
         )
-        return (needs_budget and not client.state.bank_balance_known and
+        return (needs_budget and (not client.state.bank_balance_known or
+                                  self._stale_balance_short(client)) and
                 self.clock() >= self._bank_sync_retry_at)
 
-    def _new_bank_sync(self) -> NavigateThenTask:
+    # A cached balance older than this is checked again before she is held
+    # back from a cure it cannot pay: the bank may hold money she has not
+    # seen. Live, an owner's deposit went unseen for hours behind a cached
+    # balance of 35 copper, and she kept dying depleted instead of curing.
+    BANK_RESYNC_SECONDS = 1800.0
+
+    def _stale_balance_short(self, client: AtrinikClient) -> bool:
+        """Depleted, a cached balance too small for the cure, and old."""
+        observed = float(getattr(client.state, "bank_balance_observed_at", 0.0) or 0.0)
+        # The temple's own retry gates first: a balance it cannot use yet
+        # is not worth a bank trip.
+        return (client.state.bank_balance_known and
+                self._has_depletion(client) and
+                client.state.depletion_points_known and
+                client.state.depletion_points >= self.DEPLETION_SERVICE_THRESHOLD and
+                BuyShopUpgradeTask.wallet_value(client) <
+                self._depletion_service_cost(client) and
+                time.time() - observed > self.BANK_RESYNC_SECONDS and
+                self.clock() >= self._restoration_retry_at and
+                time.time() >= float(getattr(
+                    client.state, "paid_restoration_retry_until", 0.0) or 0.0))
+
+    def _bank_sync_backoff(self, task: NavigateThenTask) -> float:
+        """Seconds before another bank sync after ``task`` failed.
+
+        A refresh of a known balance is optional (the known shortfall already
+        drives cure funding), so with no safe route it waits a whole re-sync
+        interval rather than interrupting farming every two minutes.
+        """
+        backoff = self.failure_backoff(task.error, 1800.0)
+        if getattr(task.task, "refresh", False):
+            backoff = max(backoff, self.BANK_RESYNC_SECONDS)
+        return backoff
+
+    def _new_bank_sync(self, *, refresh: bool = False) -> NavigateThenTask:
         task = NavigateThenTask(
             self.graph, "/shattered_islands/world_0_67",
-            BankBalanceTask("Tolmir"), destination_xy=(19, 15),
+            BankBalanceTask("Tolmir", refresh=refresh), destination_xy=(19, 15),
             combat_approach=True)
         task.navigation.strict_safety = True
         return task
@@ -6191,8 +6228,8 @@ class FarmCircuitTask(BotTask):
                 if self._bank_sync.status == TaskStatus.FAILED:
                     log.warning("bank balance sync failed: %s",
                                 self._bank_sync.error)
-                    self._bank_sync_retry_at = self.clock() + self.failure_backoff(
-                        self._bank_sync.error, 1800.0)
+                    self._bank_sync_retry_at = (
+                        self.clock() + self._bank_sync_backoff(self._bank_sync))
                 else:
                     log.info("bank balance synchronized: %d copper",
                              client.state.bank_balance)
@@ -6522,7 +6559,10 @@ class FarmCircuitTask(BotTask):
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
-            self._bank_sync = self._new_bank_sync()
+            # With a stale balance known, keep it (cure funding still needs
+            # the known shortfall if the trip fails) and ask for a fresh one.
+            self._bank_sync = self._new_bank_sync(
+                refresh=client.state.bank_balance_known)
             await self._bank_sync.tick(client)
             return
         # Treat disease before routine logistics: corpse-trap diseases can

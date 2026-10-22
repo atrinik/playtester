@@ -4430,7 +4430,7 @@ class QuestTests(unittest.TestCase):
         client.state.bank_balance = 2_000
         client.state.bank_balance_known = True
         client.persisted = []
-        client.set_bank_balance = lambda balance: (
+        client.set_bank_balance = lambda balance, observed_at=None: (
             client.persisted.append(balance),
             setattr(client.state, "bank_balance", balance))
         BuyShopUpgradeTask.account_purchase(client, 50)
@@ -10143,6 +10143,150 @@ class QuestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "itself a known hazard"):
             nav._plan(client)
 
+    def test_a_stale_balance_too_small_for_the_cure_is_checked_again(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 28
+        client.state.bank_balance = 35
+        client.state.bank_balance_known = True
+        client.state.depletion_points = 25
+        client.state.depletion_points_known = True
+        client.state.place_item(Item(
+            22, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        # Live: an owner deposited gold the cached 35 copper did not show.
+        client.state.bank_balance_observed_at = time.time() - 6 * 3600
+        self.assertTrue(circuit._needs_bank_sync(client))
+        # Freshly confirmed, it is believed: no trip every tick while short.
+        client.state.bank_balance_observed_at = time.time()
+        self.assertFalse(circuit._needs_bank_sync(client))
+        # Able to pay, or not depleted, an old balance is good enough.
+        client.state.bank_balance_observed_at = time.time() - 6 * 3600
+        client.state.bank_balance = 5_000
+        self.assertFalse(circuit._needs_bank_sync(client))
+        client.state.bank_balance = 35
+        client.state.remove_item(22)
+        self.assertFalse(circuit._needs_bank_sync(client))
+
+    def test_a_balance_refresh_accepts_only_an_answer_after_its_request(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance, self.state.bank_balance_known = 35, True
+                self.state.bank_balance_observed_at = time.time() - 6 * 3600
+                self.talked = []
+
+            async def talk(self, message, npc=None):
+                self.talked.append(message)
+
+        client = FakeClient()
+        # A stale "balance is 35 copper" dialogue still open from before.
+        client.state.messages.append((time.time(), 0, 0, "Your balance is 35 copper coins."))
+        task = BankBalanceTask("Tolmir", refresh=True)
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.talked, ["balance"])
+        asyncio.run(task.tick(client))
+        # The old answer and the cached balance do not complete it...
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertEqual(client.state.bank_balance, 35)
+        # ...only a balance observed after the request does.
+        client.state.bank_balance = 1_000_035
+        client.state.bank_balance_observed_at = time.time() + 1
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        # No answer at all fails into the circuit's retry.
+        client = FakeClient()
+        task = BankBalanceTask("Tolmir", refresh=True)
+        asyncio.run(task.tick(client))
+        task._sent_monotonic -= task.REFRESH_TIMEOUT_SECONDS + 1
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+
+    def test_player_chat_never_sets_the_bank_balance(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.bank_balance, client.state.bank_balance_known = 35, True
+            for chat in sorted(c.PLAYER_CHAT_TYPES):
+                packet = bytes((chat,)) + b"\0" + b"Your balance is 50 copper coins.\0"
+                await client._handle_drawinfo(Cursor(packet), packet)
+            self.assertEqual(client.state.bank_balance, 35)
+            self.assertEqual(client.state.bank_balance_observed_at, 0.0)
+            # A game message is the bank's.
+            packet = bytes((c.CHAT_TYPE_GAME,)) + b"\0" + b"Your balance is 50 copper coins.\0"
+            await client._handle_drawinfo(Cursor(packet), packet)
+            self.assertEqual(client.state.bank_balance, 50)
+
+        asyncio.run(scenario())
+
+    def test_bank_tasks_ignore_balances_typed_in_player_chat(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing")
+                self.talked = []
+
+            async def talk(self, message, npc=None):
+                self.talked.append(message)
+
+        client = FakeClient()
+        task = BankBalanceTask("Tolmir")
+        asyncio.run(task.tick(client))
+        client.state.messages.append(
+            (time.time(), c.CHAT_TYPE_LOCAL, "", "Your balance is 9999 gold coins."))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertFalse(client.state.bank_balance_known)
+
+    def test_a_future_balance_stamp_is_clamped_to_now(self):
+        client = AtrinikClient(ClientConfig())
+        client.set_bank_balance(10, observed_at=time.time() + 3600)
+        self.assertLessEqual(client.state.bank_balance_observed_at, time.time())
+
+    def test_balance_refresh_waits_for_the_temple_and_backs_off_without_a_route(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 28
+        client.state.bank_balance, client.state.bank_balance_known = 35, True
+        client.state.bank_balance_observed_at = time.time() - 6 * 3600
+        client.state.depletion_points, client.state.depletion_points_known = 25, True
+        client.state.place_item(Item(
+            22, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        self.assertTrue(circuit._needs_bank_sync(client))
+        # The temple still waits out a paid-but-failed cure: no bank trip yet.
+        client.state.paid_restoration_retry_until = time.time() + 3600
+        self.assertFalse(circuit._needs_bank_sync(client))
+        client.state.paid_restoration_retry_until = 0.0
+        circuit._restoration_retry_at = circuit.clock() + 60
+        self.assertFalse(circuit._needs_bank_sync(client))
+        circuit._restoration_retry_at = 0.0
+        # A known balance is refreshed; an unknown one is plainly read.
+        self.assertTrue(circuit._new_bank_sync(refresh=True).task.refresh)
+        self.assertFalse(circuit._new_bank_sync().task.refresh)
+        # Without a safe route, a refresh waits a re-sync interval, not 2 min.
+        refusal = "no route to /shattered_islands/world_0_67 avoiding every known hazard"
+        refresh = circuit._new_bank_sync(refresh=True)
+        refresh.error = refusal
+        self.assertEqual(circuit._bank_sync_backoff(refresh), circuit.BANK_RESYNC_SECONDS)
+        first = circuit._new_bank_sync()
+        first.error = refusal
+        self.assertEqual(circuit._bank_sync_backoff(first),
+                         circuit.STRICT_ROUTE_RETRY_SECONDS)
+
+    def test_local_purchase_accounting_is_no_fresh_bank_observation(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance, self.state.bank_balance_known = 5_000, True
+                self.state.bank_balance_observed_at = 1_000.0
+                self.calls = []
+
+            def set_bank_balance(self, balance, observed_at=None):
+                self.calls.append((balance, observed_at))
+
+        client = FakeClient()
+        BuyShopUpgradeTask.account_purchase(client, 2_000)
+        self.assertEqual(client.calls, [(3_000, 1_000.0)])
+
     def test_farm_circuit_routes_depletion_to_real_aris_temple(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
@@ -10424,7 +10568,7 @@ class QuestTests(unittest.TestCase):
                 self.connected = False
                 self.talks = []
 
-            def set_bank_balance(self, balance):
+            def set_bank_balance(self, balance, observed_at=None):
                 self.persisted.append(balance)
                 self.state.bank_balance = balance
 
@@ -13133,7 +13277,7 @@ class NavigationTests(unittest.TestCase):
             async def talk(self, message, npc):
                 self.talks.append((message, npc))
 
-            def set_bank_balance(self, balance):
+            def set_bank_balance(self, balance, observed_at=None):
                 self.state.bank_balance = balance
 
         client = FakeClient()

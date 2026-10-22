@@ -429,8 +429,8 @@ class AtrinikClient:
             except (TypeError, ValueError):
                 self.state.last_bank_deposit_at = 0.0
             try:
-                observed_at = max(
-                    0.0, float(record.get("bank_balance_observed_at", 0.0)))
+                observed_at = min(time.time(), max(
+                    0.0, float(record.get("bank_balance_observed_at", 0.0))))
                 fresh = (observed_at > 0 and
                          time.time() - observed_at <=
                          self.BANK_BALANCE_CACHE_SECONDS)
@@ -760,8 +760,11 @@ class AtrinikClient:
         """Persist a recently server-confirmed balance across short restarts."""
         self.state.bank_balance = max(0, int(balance))
         self.state.bank_balance_known = True
-        self.state.bank_balance_observed_at = max(
-            0.0, float(time.time() if observed_at is None else observed_at))
+        # Never in the future: a stamp from a clock that was ahead would
+        # otherwise look fresh until the clock caught up.
+        now = time.time()
+        self.state.bank_balance_observed_at = min(now, max(
+            0.0, float(now if observed_at is None else observed_at)))
         character = self.state.player_name or self.config.character
         if not character:
             return
@@ -1361,7 +1364,10 @@ class AtrinikClient:
         cutoff = self.state.messages[-1][0] - post_mortem.REVIEW_HISTORY_SECONDS
         while self.review_messages and self.review_messages[0][0] < cutoff:
             self.review_messages.popleft()
-        if update_bank_balance(self.state, text):
+        # A player can type "your balance is ..." in chat; only game and NPC
+        # messages are the bank's (the banker itself answers in a dialogue).
+        if (msg_type not in c.PLAYER_CHAT_TYPES and
+                update_bank_balance(self.state, text)):
             self.set_bank_balance(self.state.bank_balance)
         lowered = text.casefold()
         normalized = lowered.strip()
