@@ -42,6 +42,46 @@ WEAPON_SCHOOLS = {
     "pierce weapons": "pierce",
     "cleave weapons": "cleave",
 }
+# The automatic secondary-combat plan: Wizardry through the finisher (melee
+# brings a target down, a spell lands the kill). One pure function of the
+# character's state, shared by the farm circuit and the analyzer profile, so
+# spots are ranked for the trained skill from the very first analysis.
+AUTO_WIZARD_START_LEVEL = 18
+AUTO_WIZARD_FIRST_TARGET = 10
+AUTO_WIZARD_AOE_REVIEW_LEVEL = 25
+AUTO_WIZARD_AOE_TARGET = 15
+
+
+def owned_skill_level(state, name: str) -> int:
+    """The level of the named skill she has, or 0 (also when unreadable)."""
+    folded = name.casefold()
+    levels = []
+    for item in state.inventory:
+        if item.item_type == c.TYPE_SKILL and item.name.casefold() == folded:
+            try:
+                levels.append(int(item.extra.get("level", 0) or 0))
+            except (TypeError, ValueError):
+                levels.append(0)
+    return max(levels, default=0)
+
+
+def automatic_training_plan(state) -> tuple[str, str, int]:
+    """The (skill, spell, target level) to train next, or ("", "", 0)."""
+    level = int(state.stats.get("level", 0) or 0)
+    wizardry = owned_skill_level(state, "wizardry spells")
+    known = {item.name.casefold() for item in state.inventory
+             if item.item_type == c.TYPE_SPELL}
+    spell = next((name for name in ("magic bullet", "cause light wounds")
+                  if name in known), "")
+    if not spell or level < AUTO_WIZARD_START_LEVEL:
+        return "", "", 0
+    if wizardry < AUTO_WIZARD_FIRST_TARGET:
+        return "wizardry spells", spell, AUTO_WIZARD_FIRST_TARGET
+    if level >= AUTO_WIZARD_AOE_REVIEW_LEVEL and wizardry < AUTO_WIZARD_AOE_TARGET:
+        return "wizardry spells", spell, AUTO_WIZARD_AOE_TARGET
+    return "", "", 0
+
+
 # Fields copied from each ranked result into the dashboard snapshot.
 SUMMARY_FIELDS = (
     "path", "name", "region", "location", "map_paths", "monsters", "xp_hour",
@@ -65,6 +105,9 @@ class CombatProfile:
     speed: float
     armour_class: int
     protections: tuple[tuple[str, int], ...]
+    # Largest likely simultaneous aggro a spot may have; 0 allows any. While
+    # a secondary skill trains one target at a time, spots must not pack.
+    max_aggro_pack: int = 0
 
     def arguments(self) -> list[str]:
         args = [
@@ -80,14 +123,18 @@ class CombatProfile:
         ]
         for name, value in self.protections:
             args += ["--player-protection", f"{name}={value}"]
+        if self.max_aggro_pack:
+            args += ["--max-aggro-pack", str(self.max_aggro_pack)]
         return args
 
     def materially_differs(self, other: "CombatProfile | None") -> bool:
         """Whether a new analysis could rank spots differently."""
         if other is None:
             return True
-        if (self.skill, self.skill_level, self.attack, self.character_level) != (
-                other.skill, other.skill_level, other.attack, other.character_level):
+        if (self.skill, self.skill_level, self.attack, self.character_level,
+                self.max_aggro_pack) != (
+                other.skill, other.skill_level, other.attack, other.character_level,
+                other.max_aggro_pack):
             return True
 
         def relative(new: float, old: float, fraction: float) -> bool:
@@ -113,6 +160,7 @@ class CombatProfile:
             "character_level": self.character_level, "max_health": self.max_health,
             "speed": self.speed, "armour_class": self.armour_class,
             "protections": dict(self.protections),
+            "max_aggro_pack": self.max_aggro_pack,
         }
 
 
@@ -147,11 +195,20 @@ def combat_profile(client) -> CombatProfile | None:
         for index, name in enumerate(c.ATTACK_NAMES)
         for value in (state.protections.get(index, 0),)
         if value))
+    # Training a secondary skill (the Wizardry finisher), melee still brings
+    # each target down and the skill lands the kill, so its XP is ranked at
+    # that skill's level, on spots that send one monster at a time.
+    max_aggro_pack = 0
+    training = automatic_training_plan(state)[0]
+    trained_level = owned_skill_level(state, training) if training else 0
+    if trained_level >= 1:
+        school, skill_level, max_aggro_pack = training, trained_level, 1
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
         character_level=character_level, max_health=max_health,
-        speed=round(speed, 3), armour_class=armour_class, protections=protections)
+        speed=round(speed, 3), armour_class=armour_class, protections=protections,
+        max_aggro_pack=max_aggro_pack)
 
 
 class FarmAnalyzer:

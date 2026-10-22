@@ -13915,6 +13915,66 @@ class FarmAnalyzerTests(unittest.TestCase):
         unarmed.state.equipment = {}
         self.assertIsNone(combat_profile(unarmed))
 
+    def test_training_wizardry_ranks_one_at_a_time_spots_for_it(self):
+        from .farm_analyzer import automatic_training_plan, combat_profile
+
+        # Live: character 28, slash 28, Wizardry 10. Ranked for slash, the orc
+        # camps came first and their packs killed her. While the automatic
+        # plan trains Wizardry (the finisher lands each kill), spots are
+        # ranked at Wizardry's level, one monster at a time, from the very
+        # first analysis: the plan is a function of her state alone.
+        client = self.client()
+        state = client.state
+        state.player_tag = 7
+        state.stats["level"] = 28
+        state.place_item(state.items[10], 7)
+        state.place_item(Item(tag=12, name="wizardry spells",
+                              item_type=c.TYPE_SKILL, extra={"level": 10}), 7)
+        state.place_item(Item(tag=13, name="magic bullet",
+                              item_type=c.TYPE_SPELL), 7)
+        self.assertEqual(automatic_training_plan(state),
+                         ("wizardry spells", "magic bullet", 15))
+        profile = combat_profile(client)
+        self.assertEqual((profile.skill, profile.skill_level, profile.max_aggro_pack),
+                         ("wizardry spells", 10, 1))
+        args = profile.arguments()
+        self.assertEqual(args[0], "10")
+        self.assertEqual(args[args.index("--max-aggro-pack") + 1], "1")
+        # Melee still brings each target down: its stats stay in the model.
+        self.assertEqual(args[args.index("--melee-damage") + 1], "44")
+        # At the target, training ends: main weapon spots, no pack limit,
+        # and the change calls for a new ranking.
+        state.items[12].extra["level"] = 15
+        main = combat_profile(client)
+        self.assertEqual((main.skill, main.max_aggro_pack), ("slash weapons", 0))
+        self.assertNotIn("--max-aggro-pack", main.arguments())
+        self.assertTrue(main.materially_differs(profile))
+        # Between levels 18 and 24 the first target (10) is already met.
+        state.items[12].extra["level"] = 10
+        state.stats["level"] = 22
+        self.assertEqual(combat_profile(client).skill, "slash weapons")
+        state.stats["level"] = 28
+        # An unreadable skill level counts as none, never an error.
+        state.items[12].extra["level"] = "?"
+        self.assertEqual(combat_profile(client).skill_level, 22)
+        state.items[12].extra["level"] = 10
+        # Without a training spell, nothing trains.
+        state.remove_item(13)
+        self.assertEqual(combat_profile(client).skill, "slash weapons")
+
+    def test_the_circuit_follows_the_shared_training_plan(self):
+        from .farm_analyzer import automatic_training_plan
+
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 28
+        client.state.place_item(Item(12, name="wizardry spells",
+                                     item_type=c.TYPE_SKILL, extra={"level": 10}), 7)
+        client.state.place_item(Item(13, name="magic bullet", item_type=c.TYPE_SPELL), 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], analyzer_driven=True)
+        self.assertEqual(circuit._automatic_combat_plan(client),
+                         automatic_training_plan(client.state))
+
     def test_only_material_profile_changes_call_for_a_new_ranking(self):
         from .farm_analyzer import combat_profile
 
