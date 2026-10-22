@@ -3368,12 +3368,15 @@ class NavigateThenTask(BotTask):
                 return True
             await client.clear_actions()
             await client.set_combat(False)
-            if (await self.task.melee_kite(
+            if not (await self.task.melee_kite(
                     client, x, y, obj, map_node=node,
                     preserve_spell_line=self.task.combat_spell_item(client)) or
                     nearest[0] > 1 or not recent_hostile_contact(client, 3.0)):
-                self._last_defense_action = time.monotonic()
-                return True
+                # Survival: an adjacent attacker she can neither cast at nor
+                # step away from is fought, here and now.
+                await client.set_combat(True, force=True)
+            self._last_defense_action = time.monotonic()
+            return True
         # Only close a short gap. Chasing a merely visible target across the
         # viewport was what repeatedly pulled the character into larger packs.
         if nearest is not None and nearest[0] <= 4:

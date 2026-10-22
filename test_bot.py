@@ -7235,10 +7235,15 @@ class QuestTests(unittest.TestCase):
             combat_skill="wizardry spells",
             combat_spell="cause light wounds")
         kites = []
+        real_kite = child.melee_kite
 
         async def no_kite(*args, **kwargs):
+            # Only the spell-preserving kite is cornered; any other kite runs
+            # for real, so the survival path is exercised end to end.
             kites.append(kwargs.get("preserve_spell_line"))
-            return False
+            if kwargs.get("preserve_spell_line") is not None:
+                return False
+            return await real_kite(*args, **kwargs)
 
         child.melee_kite = no_kite
         task = NavigateThenTask(object(), "/test", child, combat_approach=True)
@@ -7300,6 +7305,19 @@ class QuestTests(unittest.TestCase):
         task._last_action = 0
         asyncio.run(task.tick(client))
         self.assertEqual(client.decisions.count(("training-rest", "sp=30/62")), 2)
+        # Even when inventory upkeep takes that first tick back.
+        task._training_rest_at -= 5
+        task._last_action = 0
+        client.combat.clear()
+
+        async def upkeep(_client):
+            return True
+
+        task.maintain_inventory = upkeep
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.decisions.count(("training-rest", "sp=30/62")), 3)
+        self.assertEqual(client.combat, [False])
+        del task.maintain_inventory
         # One coming at her is fought regardless.
         client.state.map.tiles.clear()
         client.state.map.tile(9, 8).objects[3] = MapObject(
@@ -7320,7 +7338,7 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(task._training_resting)
         self.assertEqual(
             [entry for entry in client.decisions if entry[0] == "training-rest"],
-            [("training-rest", "sp=30/62")] * 2)
+            [("training-rest", "sp=30/62")] * 3)
         self.assertTrue(client.moves or client.direct_moves or client.fired)
 
     def test_wizardry_training_rest_yields_to_hunger_and_an_approach(self):
