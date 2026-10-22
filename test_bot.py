@@ -13915,16 +13915,25 @@ class FarmAnalyzerTests(unittest.TestCase):
         unarmed.state.equipment = {}
         self.assertIsNone(combat_profile(unarmed))
 
-    def test_training_a_secondary_skill_ranks_one_at_a_time_spots_for_it(self):
-        from .farm_analyzer import combat_profile
+    def test_training_wizardry_ranks_one_at_a_time_spots_for_it(self):
+        from .farm_analyzer import automatic_training_plan, combat_profile
 
-        # Live: slash 28, Wizardry 10. Ranked for slash, the orc camps came
-        # first and their packs killed her; the Wizardry finisher lands each
-        # kill, so spots are ranked at Wizardry's level, one monster at a time.
+        # Live: character 28, slash 28, Wizardry 10. Ranked for slash, the orc
+        # camps came first and their packs killed her. While the automatic
+        # plan trains Wizardry (the finisher lands each kill), spots are
+        # ranked at Wizardry's level, one monster at a time, from the very
+        # first analysis: the plan is a function of her state alone.
         client = self.client()
-        client.state.items[12] = Item(tag=12, name="wizardry spells",
-                                      item_type=c.TYPE_SKILL, extra={"level": 10})
-        client.state.combat_training_skill = "wizardry spells"
+        state = client.state
+        state.player_tag = 7
+        state.stats["level"] = 28
+        state.place_item(state.items[10], 7)
+        state.place_item(Item(tag=12, name="wizardry spells",
+                              item_type=c.TYPE_SKILL, extra={"level": 10}), 7)
+        state.place_item(Item(tag=13, name="magic bullet",
+                              item_type=c.TYPE_SPELL), 7)
+        self.assertEqual(automatic_training_plan(state),
+                         ("wizardry spells", "magic bullet", 15))
         profile = combat_profile(client)
         self.assertEqual((profile.skill, profile.skill_level, profile.max_aggro_pack),
                          ("wizardry spells", 10, 1))
@@ -13933,25 +13942,30 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertEqual(args[args.index("--max-aggro-pack") + 1], "1")
         # Melee still brings each target down: its stats stay in the model.
         self.assertEqual(args[args.index("--melee-damage") + 1], "44")
-        # Switching between training and main weapon XP calls for a new run.
-        main = combat_profile(self.client())
-        self.assertEqual(main.max_aggro_pack, 0)
+        # At the target, training ends: main weapon spots, no pack limit,
+        # and the change calls for a new ranking.
+        state.items[12].extra["level"] = 15
+        main = combat_profile(client)
+        self.assertEqual((main.skill, main.max_aggro_pack), ("slash weapons", 0))
         self.assertNotIn("--max-aggro-pack", main.arguments())
         self.assertTrue(main.materially_differs(profile))
-        # A trained skill she does not have is ignored.
-        client.state.combat_training_skill = "evocation"
+        # Without a training spell, nothing trains.
+        state.items[12].extra["level"] = 10
+        state.remove_item(13)
         self.assertEqual(combat_profile(client).skill, "slash weapons")
 
-    def test_the_circuit_publishes_the_skill_it_trains(self):
-        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")],
-                                  combat_skill="wizardry spells",
-                                  combat_spell="magic bullet", level_until=15)
+    def test_the_circuit_follows_the_shared_training_plan(self):
+        from .farm_analyzer import automatic_training_plan
+
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
-        circuit._auto_combat_build = False
-        farm = FarmTask()
-        circuit._review_combat_build(client, farm)
-        self.assertEqual(client.state.combat_training_skill, "wizardry spells")
+        client.state.stats["level"] = 28
+        client.state.place_item(Item(12, name="wizardry spells",
+                                     item_type=c.TYPE_SKILL, extra={"level": 10}), 7)
+        client.state.place_item(Item(13, name="magic bullet", item_type=c.TYPE_SPELL), 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], analyzer_driven=True)
+        self.assertEqual(circuit._automatic_combat_plan(client),
+                         automatic_training_plan(client.state))
 
     def test_only_material_profile_changes_call_for_a_new_ranking(self):
         from .farm_analyzer import combat_profile

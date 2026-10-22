@@ -32,6 +32,7 @@ from .targeting import select_target, target_set_aside
 
 from .client import AtrinikClient, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
+from . import farm_analyzer as farm_analyzer_plan
 from . import self_improvement
 from .model import STARTER_APARTMENT
 from .pathfinding import graph_search, grid_reachable, grid_search
@@ -4251,10 +4252,10 @@ class FarmCircuitTask(BotTask):
     # a spellbook drops.  The later level-15 review unlocks the first authored
     # cone/AoE spells without diverting every early kill away from the main
     # weapon school.
-    AUTO_WIZARD_START_LEVEL = 18
-    AUTO_WIZARD_FIRST_TARGET = 10
-    AUTO_WIZARD_AOE_REVIEW_LEVEL = 25
-    AUTO_WIZARD_AOE_TARGET = 15
+    AUTO_WIZARD_START_LEVEL = farm_analyzer_plan.AUTO_WIZARD_START_LEVEL
+    AUTO_WIZARD_FIRST_TARGET = farm_analyzer_plan.AUTO_WIZARD_FIRST_TARGET
+    AUTO_WIZARD_AOE_REVIEW_LEVEL = farm_analyzer_plan.AUTO_WIZARD_AOE_REVIEW_LEVEL
+    AUTO_WIZARD_AOE_TARGET = farm_analyzer_plan.AUTO_WIZARD_AOE_TARGET
 
     # Live failures exclude an analyzer pick for this long; see the README.
     FARM_DEATH_QUARANTINE_SECONDS = 6 * 60 * 60
@@ -4631,34 +4632,15 @@ class FarmCircuitTask(BotTask):
         if not self._auto_combat_build:
             return (self.combat_skill, self.combat_spell,
                     self.combat_skill_until_level)
-        level = int(client.state.stats.get("level", 0) or 0)
-        wizardry = self._skill_level(client, "wizardry spells")
-        known = {
-            item.name.casefold()
-            for item in client.state.inventory
-            if item.item_type == c.TYPE_SPELL
-        }
-        spell = next((name for name in ("magic bullet", "cause light wounds")
-                      if name in known), "")
-        if not spell or level < self.AUTO_WIZARD_START_LEVEL:
-            return "", "", 0
-        if wizardry < self.AUTO_WIZARD_FIRST_TARGET:
-            return ("wizardry spells", spell,
-                    self.AUTO_WIZARD_FIRST_TARGET)
-        if (level >= self.AUTO_WIZARD_AOE_REVIEW_LEVEL and
-                wizardry < self.AUTO_WIZARD_AOE_TARGET):
-            return ("wizardry spells", spell,
-                    self.AUTO_WIZARD_AOE_TARGET)
-        return "", "", 0
+        # Shared with the farming analyzer's profile (farm_analyzer.py).
+        return farm_analyzer_plan.automatic_training_plan(client.state)
 
     def _review_combat_build(self, client: AtrinikClient,
                              farm: FarmTask) -> bool:
         """Reconfigure secondary training only between fights and loot."""
-        desired = self._automatic_combat_plan(client)
-        # The farming analyzer ranks spots for the skill being trained.
-        client.state.combat_training_skill = desired[0]
         if not self._auto_combat_build:
             return False
+        desired = self._automatic_combat_plan(client)
         current = (self.combat_skill, self.combat_spell,
                    self.combat_skill_until_level)
         if desired == current or self._busy_finishing_fight_or_loot(

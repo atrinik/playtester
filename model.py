@@ -260,9 +260,6 @@ class GameState:
     farm_zone_quarantine: dict[str, float] = field(default_factory=dict)
     # Which farming-analyzer ranking autoplay follows (see farm_analyzer.OBJECTIVES).
     farm_objective: str = "xp"
-    # The secondary skill the farm circuit trains, such as "wizardry spells"
-    # (empty for main weapon XP). The farming analyzer ranks spots for it.
-    combat_training_skill: str = ""
     # Per-spot lessons from deaths and emergency recalls (self_improvement.py).
     farm_adaptations: dict[str, dict] = field(default_factory=dict)
     farm_zone_last_checked: dict[str, float] = field(default_factory=dict)

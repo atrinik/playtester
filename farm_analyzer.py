@@ -42,6 +42,42 @@ WEAPON_SCHOOLS = {
     "pierce weapons": "pierce",
     "cleave weapons": "cleave",
 }
+# The automatic secondary-combat plan: Wizardry through the finisher (melee
+# brings a target down, a spell lands the kill). One pure function of the
+# character's state, shared by the farm circuit and the analyzer profile, so
+# spots are ranked for the trained skill from the very first analysis.
+AUTO_WIZARD_START_LEVEL = 18
+AUTO_WIZARD_FIRST_TARGET = 10
+AUTO_WIZARD_AOE_REVIEW_LEVEL = 25
+AUTO_WIZARD_AOE_TARGET = 15
+
+
+def _skill_level(state, name: str) -> int:
+    folded = name.casefold()
+    return max((
+        int(item.extra.get("level", 0) or 0)
+        for item in state.inventory
+        if item.item_type == c.TYPE_SKILL and item.name.casefold() == folded
+    ), default=0)
+
+
+def automatic_training_plan(state) -> tuple[str, str, int]:
+    """The (skill, spell, target level) to train next, or ("", "", 0)."""
+    level = int(state.stats.get("level", 0) or 0)
+    wizardry = _skill_level(state, "wizardry spells")
+    known = {item.name.casefold() for item in state.inventory
+             if item.item_type == c.TYPE_SPELL}
+    spell = next((name for name in ("magic bullet", "cause light wounds")
+                  if name in known), "")
+    if not spell or level < AUTO_WIZARD_START_LEVEL:
+        return "", "", 0
+    if wizardry < AUTO_WIZARD_FIRST_TARGET:
+        return "wizardry spells", spell, AUTO_WIZARD_FIRST_TARGET
+    if level >= AUTO_WIZARD_AOE_REVIEW_LEVEL and wizardry < AUTO_WIZARD_AOE_TARGET:
+        return "wizardry spells", spell, AUTO_WIZARD_AOE_TARGET
+    return "", "", 0
+
+
 # Fields copied from each ranked result into the dashboard snapshot.
 SUMMARY_FIELDS = (
     "path", "name", "region", "location", "map_paths", "monsters", "xp_hour",
@@ -159,17 +195,10 @@ def combat_profile(client) -> CombatProfile | None:
     # each target down and the skill lands the kill, so its XP is ranked at
     # that skill's level, on spots that send one monster at a time.
     max_aggro_pack = 0
-    training = str(getattr(state, "combat_training_skill", "") or "").casefold()
-    trained = next((item for item in state.items.values()
-                    if item.item_type == c.TYPE_SKILL and
-                    item.name.casefold() == training), None) if training else None
-    if trained is not None:
-        try:
-            trained_level = int(trained.extra.get("level", 0) or 0)
-        except (TypeError, ValueError):
-            trained_level = 0
-        if trained_level >= 1:
-            school, skill_level, max_aggro_pack = training, trained_level, 1
+    training = automatic_training_plan(state)[0]
+    trained_level = _skill_level(state, training) if training else 0
+    if trained_level >= 1:
+        school, skill_level, max_aggro_pack = training, trained_level, 1
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
