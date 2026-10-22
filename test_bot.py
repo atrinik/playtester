@@ -10143,6 +10143,31 @@ class QuestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "itself a known hazard"):
             nav._plan(client)
 
+    def test_a_stale_balance_too_small_for_the_cure_is_checked_again(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 28
+        client.state.bank_balance = 35
+        client.state.bank_balance_known = True
+        client.state.depletion_points = 25
+        client.state.depletion_points_known = True
+        client.state.place_item(Item(
+            22, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        # Live: an owner deposited gold the cached 35 copper did not show.
+        client.state.bank_balance_observed_at = time.time() - 6 * 3600
+        self.assertTrue(circuit._needs_bank_sync(client))
+        # Freshly confirmed, it is believed: no trip every tick while short.
+        client.state.bank_balance_observed_at = time.time()
+        self.assertFalse(circuit._needs_bank_sync(client))
+        # Able to pay, or not depleted, an old balance is good enough.
+        client.state.bank_balance_observed_at = time.time() - 6 * 3600
+        client.state.bank_balance = 5_000
+        self.assertFalse(circuit._needs_bank_sync(client))
+        client.state.bank_balance = 35
+        client.state.remove_item(22)
+        self.assertFalse(circuit._needs_bank_sync(client))
+
     def test_farm_circuit_routes_depletion_to_real_aris_temple(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)

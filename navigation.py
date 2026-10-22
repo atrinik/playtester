@@ -5573,8 +5573,26 @@ class FarmCircuitTask(BotTask):
             (self._disease_suspected and not self._disease_cures(client)) or
             int(client.state.stats.get("level", 0) or 0) >= 8
         )
-        return (needs_budget and not client.state.bank_balance_known and
+        return (needs_budget and (not client.state.bank_balance_known or
+                                  self._stale_balance_short(client)) and
                 self.clock() >= self._bank_sync_retry_at)
+
+    # A cached balance older than this is checked again before she is held
+    # back from a cure it cannot pay: the bank may hold money she has not
+    # seen. Live, an owner's deposit went unseen for hours behind a cached
+    # balance of 35 copper, and she kept dying depleted instead of curing.
+    BANK_RESYNC_SECONDS = 1800.0
+
+    def _stale_balance_short(self, client: AtrinikClient) -> bool:
+        """Depleted, a cached balance too small for the cure, and old."""
+        observed = float(getattr(client.state, "bank_balance_observed_at", 0.0) or 0.0)
+        return (client.state.bank_balance_known and
+                self._has_depletion(client) and
+                client.state.depletion_points_known and
+                client.state.depletion_points >= self.DEPLETION_SERVICE_THRESHOLD and
+                BuyShopUpgradeTask.wallet_value(client) <
+                self._depletion_service_cost(client) and
+                time.time() - observed > self.BANK_RESYNC_SECONDS)
 
     def _new_bank_sync(self) -> NavigateThenTask:
         task = NavigateThenTask(
@@ -6522,6 +6540,13 @@ class FarmCircuitTask(BotTask):
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
+            if client.state.bank_balance_known:
+                # A stale cached balance: drop it so the banker is asked.
+                forget = getattr(client, "forget_bank_balance", None)
+                if forget is not None:
+                    forget()
+                else:
+                    client.state.bank_balance_known = False
             self._bank_sync = self._new_bank_sync()
             await self._bank_sync.tick(client)
             return
