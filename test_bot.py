@@ -7239,7 +7239,8 @@ class QuestTests(unittest.TestCase):
 
         async def no_kite(*args, **kwargs):
             # Only the spell-preserving kite is cornered; any other kite runs
-            # for real, so the survival path is exercised end to end.
+            # for real, so a fall-through to the generic melee branch would
+            # hold combat off and fail the survival check below.
             kites.append(kwargs.get("preserve_spell_line"))
             if kwargs.get("preserve_spell_line") is not None:
                 return False
@@ -7252,11 +7253,19 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.fired, [])
         self.assertNotIn(True, client.combat)
         self.assertIsNotNone(kites[-1])
-        # The adjacent creature is hitting her: survival, she fights back.
+        # Hit, but the creature is two tiles off: still no melee.
         client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+        client.state.map.tiles.clear()
+        client.state.map.tile(10, 8).objects[3] = target
         task._last_defense_action = 0
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertIn(True, client.combat)
+        self.assertNotIn(True, client.combat)
+        # Adjacent and hitting her: survival, she ends the tick fighting.
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = target
+        task._last_defense_action = 0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIs(client.combat[-1], True)
 
     def test_navigation_spell_only_applies_on_the_farm_map_only(self):
         client = self._wizard_training_client(100, x=9, y=8)

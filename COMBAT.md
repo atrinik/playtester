@@ -145,7 +145,9 @@ nearly unchanged. Live, Wizardry XP did not move for hours.
   adjacent attacker she cannot cast at or step away from, and transit maps'
   last-resort fight when cornered. Accepted limit: that travel-defence
   check reads any recent hit, so an unseen or distant attacker can make her
-  fight an adjacent training creature that is not the one hitting her.
+  fight an adjacent training creature that is not the one hitting her, and
+  a kite refused only because the creature's health is not reported yet
+  counts as cornered.
 - **Pulls wait for a full bar.** Unengaged, with no creature coming at her
   and not under attack, she rests until her mana is full before the next
   pull (`training-rest`), unless she has no food (mana regenerates only
