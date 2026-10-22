@@ -2823,6 +2823,54 @@ class NavigateThenTask(BotTask):
         self._last_defense_action = time.monotonic()
         return True
 
+    async def _unseen_attacker_retreat(self, client: AtrinikClient) -> bool:
+        """Back away along the trail from an attacker she cannot see.
+
+        An unlit square sends no object, so there is nothing to select or
+        route around. Live: a spider in a dark two-wide corridor below Fort
+        Sether held Sera on one square for an hour while her stalled steps
+        learned and reset the same two blocks. Backing out draws an aggressive
+        attacker into view, where the cornered rule fights it; defending keeps
+        these steps from restarting the cornered clock.
+        """
+        m = client.state.map
+        now = time.monotonic()
+        if self._retreat_attempt is not None:
+            path, x, y, sent_at = self._retreat_attempt
+            if (m.path, m.world_x, m.world_y) == (path, x, y):
+                self._retreat_attempt = None
+            elif now - sent_at < movement_ack_timeout(client):
+                return True
+            else:
+                self._retreat_blocked.add((path, x, y))
+                self._retreat_attempt = None
+        node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
+        if node is None or len(self._trail) < 2:
+            return False
+        path, x, y = self._trail[-2]
+        dx, dy = x - m.world_x, y - m.world_y
+        direction = next((
+            value for value, delta in c.DIRECTION_DELTAS.items()
+            if value and delta == (dx, dy)), 0)
+        if (path != m.path or not direction or
+                (path, x, y) in self._retreat_blocked or
+                not node.walkable(
+                    x, y, allow_locked=self.navigation._allow_locked(client))):
+            return False
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("navigation-unseen-attacker-retreat",
+                     f"direction={direction} to={x},{y}")
+        self._defending = True
+        await client.clear_actions()
+        await client.move(direction)
+        self._retreat_attempt = (path, x, y, now)
+        self.navigation._issued_goal = None
+        self.navigation._issued_click = None
+        self.navigation._last_progress = now
+        self._last_defense_action = now
+        return True
+
     async def _combat_step_toward(
             self, client: AtrinikClient, view_x: int, view_y: int) -> bool:
         """Take one authored step toward a target and learn live blockers."""
@@ -3264,6 +3312,11 @@ class NavigateThenTask(BotTask):
                 if nearest[0] > 1:
                     await self._combat_step_toward(client, x, y)
                 self._last_defense_action = time.monotonic()
+            return True
+        if (nearest is None and not hold_fire and
+                client.state.map.path != self.navigation.destination and
+                time.monotonic() - self._last_defense_action >= 0.30 and
+                await self._unseen_attacker_retreat(client)):
             return True
         if self._defending:
             maxsp = int(client.state.stats.get("maxsp", 0) or 0)
