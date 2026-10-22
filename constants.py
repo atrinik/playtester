@@ -112,6 +112,9 @@ CHAT_TYPE_CHAT = 3
 CHAT_TYPE_LOCAL = 4
 CHAT_TYPE_PRIVATE = 5
 CHAT_TYPE_PARTY = 7
+# Channels other players write to: never authoritative game state.
+PLAYER_CHAT_TYPES = frozenset({
+    CHAT_TYPE_CHAT, CHAT_TYPE_LOCAL, CHAT_TYPE_PRIVATE, CHAT_TYPE_PARTY})
 
 CMD_PARTY_LIST = 1
 CMD_PARTY_WHO = 2

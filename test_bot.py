@@ -10202,6 +10202,54 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.FAILED)
 
+    def test_player_chat_never_sets_the_bank_balance(self):
+        async def scenario():
+            client = AtrinikClient(ClientConfig())
+            client.state.bank_balance, client.state.bank_balance_known = 35, True
+            for chat in sorted(c.PLAYER_CHAT_TYPES):
+                packet = bytes((chat,)) + b"\0" + b"Your balance is 50 copper coins.\0"
+                await client._handle_drawinfo(Cursor(packet), packet)
+            self.assertEqual(client.state.bank_balance, 35)
+            # A game message is the bank's.
+            packet = bytes((0,)) + b"\0" + b"Your balance is 50 copper coins.\0"
+            await client._handle_drawinfo(Cursor(packet), packet)
+            self.assertEqual(client.state.bank_balance, 50)
+
+        asyncio.run(scenario())
+
+    def test_a_future_balance_stamp_is_clamped_to_now(self):
+        client = AtrinikClient(ClientConfig())
+        client.set_bank_balance(10, observed_at=time.time() + 3600)
+        self.assertLessEqual(client.state.bank_balance_observed_at, time.time())
+
+    def test_balance_refresh_waits_for_the_temple_and_backs_off_without_a_route(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 28
+        client.state.bank_balance, client.state.bank_balance_known = 35, True
+        client.state.bank_balance_observed_at = time.time() - 6 * 3600
+        client.state.depletion_points, client.state.depletion_points_known = 25, True
+        client.state.place_item(Item(
+            22, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        self.assertTrue(circuit._needs_bank_sync(client))
+        # The temple still waits out a paid-but-failed cure: no bank trip yet.
+        client.state.paid_restoration_retry_until = time.time() + 3600
+        self.assertFalse(circuit._needs_bank_sync(client))
+        client.state.paid_restoration_retry_until = 0.0
+        # A known balance is refreshed; an unknown one is plainly read.
+        self.assertTrue(circuit._new_bank_sync(refresh=True).task.refresh)
+        self.assertFalse(circuit._new_bank_sync().task.refresh)
+        # Without a safe route, a refresh waits a re-sync interval, not 2 min.
+        refusal = "no route to /shattered_islands/world_0_67 avoiding every known hazard"
+        refresh = circuit._new_bank_sync(refresh=True)
+        refresh.error = refusal
+        self.assertEqual(circuit._bank_sync_backoff(refresh), circuit.BANK_RESYNC_SECONDS)
+        first = circuit._new_bank_sync()
+        first.error = refusal
+        self.assertEqual(circuit._bank_sync_backoff(first),
+                         circuit.STRICT_ROUTE_RETRY_SECONDS)
+
     def test_local_purchase_accounting_is_no_fresh_bank_observation(self):
         class FakeClient:
             def __init__(self):

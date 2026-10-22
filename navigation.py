@@ -5588,13 +5588,30 @@ class FarmCircuitTask(BotTask):
     def _stale_balance_short(self, client: AtrinikClient) -> bool:
         """Depleted, a cached balance too small for the cure, and old."""
         observed = float(getattr(client.state, "bank_balance_observed_at", 0.0) or 0.0)
+        # The temple's own retry gates first: a balance it cannot use yet
+        # is not worth a bank trip.
         return (client.state.bank_balance_known and
                 self._has_depletion(client) and
                 client.state.depletion_points_known and
                 client.state.depletion_points >= self.DEPLETION_SERVICE_THRESHOLD and
                 BuyShopUpgradeTask.wallet_value(client) <
                 self._depletion_service_cost(client) and
-                time.time() - observed > self.BANK_RESYNC_SECONDS)
+                time.time() - observed > self.BANK_RESYNC_SECONDS and
+                self.clock() >= self._restoration_retry_at and
+                time.time() >= float(getattr(
+                    client.state, "paid_restoration_retry_until", 0.0) or 0.0))
+
+    def _bank_sync_backoff(self, task: NavigateThenTask) -> float:
+        """Seconds before another bank sync after ``task`` failed.
+
+        A refresh of a known balance is optional (the known shortfall already
+        drives cure funding), so with no safe route it waits a whole re-sync
+        interval rather than interrupting farming every two minutes.
+        """
+        backoff = self.failure_backoff(task.error, 1800.0)
+        if getattr(task.task, "refresh", False):
+            backoff = max(backoff, self.BANK_RESYNC_SECONDS)
+        return backoff
 
     def _new_bank_sync(self, *, refresh: bool = False) -> NavigateThenTask:
         task = NavigateThenTask(
@@ -6211,8 +6228,8 @@ class FarmCircuitTask(BotTask):
                 if self._bank_sync.status == TaskStatus.FAILED:
                     log.warning("bank balance sync failed: %s",
                                 self._bank_sync.error)
-                    self._bank_sync_retry_at = self.clock() + self.failure_backoff(
-                        self._bank_sync.error, 1800.0)
+                    self._bank_sync_retry_at = (
+                        self.clock() + self._bank_sync_backoff(self._bank_sync))
                 else:
                     log.info("bank balance synchronized: %d copper",
                              client.state.bank_balance)
