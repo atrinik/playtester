@@ -3107,10 +3107,14 @@ class NavigateThenTask(BotTask):
         # before a routine heal. FarmTask applies its stricter 80% health gate;
         # below that, survival immediately wins and normal melee remains free
         # to finish the enemy after healing.
-        if (ratio > self.safety.flee_below and nearest is not None and
-                not hold_fire and isinstance(self.task, FarmTask) and
-                (self.task.spell_only_training(client) or
-                 self.task.should_training_finish(client, nearest[3]))):
+        # Spell-only training casts down to the flee threshold once safety
+        # has had its chance; here safety runs after, so it heals first.
+        if (nearest is not None and not hold_fire and
+                isinstance(self.task, FarmTask) and
+                ratio > (self.safety.heal_below
+                         if self.task.spell_only_training(client)
+                         else self.safety.flee_below) and
+                self.task.should_training_finish(client, nearest[3])):
             _, x, y, obj = nearest
             self.task.remember_engagement(client, x, y, obj.target_id)
             selected = await select_target(client, x, y, obj.target_id)
@@ -6230,8 +6234,6 @@ class FarmCircuitTask(BotTask):
         return bool(
             selected_is_visible or selected_is_alive or
             recent_hostile_contact(client) or
-            # Resting for mana before the next spell-only pull.
-            farm._training_resting or
             farm._engaged_target or corpse_with_contents or
             corpse_operation or farm._suspected_corpse_tiles or
             farm._suspected_corpse_probe)
@@ -6966,6 +6968,10 @@ class FarmCircuitTask(BotTask):
         # late-spawning attacker into the next map's pack.
         if (isinstance(farm, FarmTask) and
                 self._busy_finishing_fight_or_loot(client, farm)):
+            return
+        # Nor mid-rest for mana, or she sets off with a partial bar. Services
+        # may still detour during a rest.
+        if isinstance(farm, FarmTask) and farm.training_rest_active():
             return
         next_leg = self._next_ready_leg(self.leg_index + 1, level)
         if next_leg == self.leg_index:

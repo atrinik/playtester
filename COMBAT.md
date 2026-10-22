@@ -129,21 +129,23 @@ nearly unchanged. Live, Wizardry XP did not move for hours.
 
 - **Every hit is the spell.** While Wizardry trains, `training_finisher`
   casts from the first hit. It has no hand-off window and no per-target cast
-  limit, and auto-melee stays off. It starts a cast at any health that safety
-  would not heal at (`heal_below`), down to the flee threshold.
+  limit, and auto-melee stays off. Safety heals first; after that it casts
+  down to the flee threshold.
 - **Out of mana, she waits.** When the next cast would dip into the
   healing reserve, she keeps her distance with combat off until mana
   regenerates, rather than let a melee finish hand Slash its share.
 - **Never melee a training target.** Whenever the spell cannot be cast
   (hurt below the heal threshold, line blocked), the farm loop keeps her
   distance with combat off; safety and retreat handle her health. Pulls use
-  the spell, never a launcher, and travel defence casts too. The only melee
-  left is the cornered-retreat breakout, a survival exception.
+  the spell, never a launcher. Melee remains only as survival: the
+  cornered-retreat breakout, the pursued stand (an attacker still adjacent
+  after three retreat steps), and travel defence, which fights back only
+  when cornered.
 - **Pulls wait for a full bar.** Unengaged, with no creature coming at her
   and not under attack, she rests until her mana is full before the next
   pull (`training-rest`), unless she has no food (mana regenerates only
-  with food). The circuit counts the rest as busy, so a leg switch does not
-  send her on with a partial bar. Resting out of combat also ramps her
+  with food). The circuit's dwell does not switch legs during a fresh rest,
+  so she does not set off with a partial bar; service detours still may. Resting out of combat also ramps her
   regeneration up: with Meditation, the server multiplies it by
   1 + seconds since combat / 10, up to tenfold (`player_do_some_living`).
   Only hits and offensive casts restart that clock.
@@ -151,7 +153,8 @@ nearly unchanged. Live, Wizardry XP did not move for hours.
   max mana to cover one cast beyond the healing reserve.
 - **The analyzer ranks spell kills.** The profile sent for Wizardry training
   is the caster model: the median raw damage of her recent spell hits, taken
-  from her own hit text within 3 s of her own cast ("You hit X for N (P)
+  from her own hit text within 3 s of one of her recent casts of the
+  planned spell ("You hit X for N (P)
   with ..." gives raw damage N - P); a fixed 1 s cast delay (mana, not the
   cast rate, bounds the kill rate, and the client's `action_time` reflects
   whatever she did last); the spell's mana cost; `regen_sp` (the client

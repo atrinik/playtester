@@ -390,14 +390,17 @@ class FarmAnalyzer:
         state = client.state
         entries = state.messages_since(self._message_position)
         self._message_position = state.message_count
-        cast_at, spell = getattr(client, "last_offensive_cast", (0.0, ""))
-        if spell and spell != self.spell_name:
-            self.spell_name = spell
-            self.spell_samples = []
-            self.spell_attack = ""
+        casts = list(getattr(client, "offensive_casts", ()))
         for timestamp, _, _, text in entries:
-            if not 0.0 <= timestamp - cast_at <= SPELL_HIT_WINDOW_SECONDS:
+            spell = next((
+                name for cast_at, name in reversed(casts)
+                if 0.0 <= timestamp - cast_at <= SPELL_HIT_WINDOW_SECONDS), "")
+            if not spell:
                 continue
+            if spell != self.spell_name:
+                self.spell_name = spell
+                self.spell_samples = []
+                self.spell_attack = ""
             match = HIT_TEXT.match(text)
             if match is None:
                 continue
@@ -413,9 +416,12 @@ class FarmAnalyzer:
     def poll(self, client) -> bool:
         """Start a background analysis if the live profile calls for one."""
         self.observe_spells(client)
+        # Only samples of the spell the training plan casts describe it.
+        planned = automatic_training_plan(client.state)[1]
+        observed = self.spell_samples and self.spell_name == planned
         profile = combat_profile(
             client,
-            statistics.median(self.spell_samples) if self.spell_samples else 0.0,
+            statistics.median(self.spell_samples) if observed else 0.0,
             self.spell_attack)
         if profile is None:
             if self.report is None and not self.running:

@@ -960,8 +960,10 @@ class FarmTask(BotTask):
         # finisher windows without knowing their absolute maximum HP.
         self._target_damage: dict[int, tuple[int, float, float, int]] = {}
         self._melee_target_id = 0
-        # Spell-only training is waiting for a full mana bar before a pull.
+        # Spell-only training is waiting for a full mana bar before a pull,
+        # and when the rest was last confirmed (see training_rest_active).
         self._training_resting = False
+        self._training_rest_at = 0.0
         self._melee_cycle_anchor = 0.0
         self._melee_anchor_message_at = 0.0
         self._finish_race_targets: set[int] = set()
@@ -1270,8 +1272,11 @@ class FarmTask(BotTask):
             client.state.stats.get("sp", 0) or 0)
         self._last_offensive_commit_at = time.monotonic()
         # Wall-clock like message stamps: the analyzer attributes hit text
-        # shortly after this to the spell (FarmAnalyzer.observe_spells).
-        client.last_offensive_cast = (time.time(), spell.name.casefold())
+        # shortly after one of these to the spell (FarmAnalyzer.observe_spells).
+        casts = getattr(client, "offensive_casts", None)
+        if casts is None:
+            casts = client.offensive_casts = deque(maxlen=20)
+        casts.append((time.time(), spell.name.casefold()))
 
     def training_skill_item(self, client: AtrinikClient) -> Item | None:
         if not self.combat_skill:
@@ -1316,6 +1321,11 @@ class FarmTask(BotTask):
         cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
         return spell is not None and (
             maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
+
+    def training_rest_active(self) -> bool:
+        """Whether a mana rest was confirmed on the farm just now."""
+        return (self._training_resting and
+                time.monotonic() - self._training_rest_at <= 1.0)
 
     def training_active(self, client: AtrinikClient) -> bool:
         skill = self.training_skill_item(client)
@@ -1462,12 +1472,13 @@ class FarmTask(BotTask):
         # is in flight retain ownership of the finisher down to the genuine
         # flee threshold.  Dropping it at 79% previously re-enabled Slash
         # after Sera had already spent the mana and stood still for the cast.
-        # Spell-only training has no melee to fall back to, so it starts a
-        # cast at any health safety would not heal at first.
+        # Spell-only training has no melee to fall back to: by the time it
+        # runs, safety has had its chance to heal, so it casts down to the
+        # flee threshold.
         spells_only = self.spell_only_training(client)
-        start_floor = self.safety.heal_below if spells_only else 0.80
         if (hp / maxhp <= self.safety.flee_below or
-                (hp / maxhp < start_floor and not pending_for_target)):
+                (hp / maxhp < 0.80 and not pending_for_target and
+                 not spells_only)):
             return False
         target_hp = self.observed_target_hp(client, obj)
         window = self.finisher_window(obj.target_id)
@@ -3507,7 +3518,8 @@ class FarmTask(BotTask):
         target_hp = int(client.state.stats.get("target_hp", 0) or 0)
         action_time = float(client.state.stats.get("action_time", 0) or 0)
         now = time.monotonic()
-        if (engaged_id <= 0 or
+        if (self.spell_only_training(client) or
+                engaged_id <= 0 or
                 getattr(client.state, "target_id", 0) != engaged_id or
                 not 0 < target_hp <= 15 or health_ratio < 0.80 or
                 action_time > 0.80 or
@@ -3999,7 +4011,8 @@ class FarmTask(BotTask):
             return
         if (engaged is None and self.spell_only_training(client) and
                 (nearest_threat is None or nearest_threat[0] > 2) and
-                not any(active_threat(entry) for entry in threats) and
+                not any(active_threat(entry) for entry in threats
+                        if entry[3].target_id not in pulled_aside_ids) and
                 not recent_hostile_contact(client)):
             # Spell-only training pulls on a full mana bar, so most of a
             # fight is cast without waiting for mana mid-fight. Resting out
@@ -4011,6 +4024,7 @@ class FarmTask(BotTask):
             if 0 < maxsp and sp < maxsp and food > 0:
                 if await self.maintain_inventory(client):
                     return
+                self._training_rest_at = time.monotonic()
                 if not self._training_resting:
                     self._training_resting = True
                     recorder = getattr(client, "record_action", None)

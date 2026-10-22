@@ -7109,23 +7109,22 @@ class QuestTests(unittest.TestCase):
         return client, task
 
     def test_wizardry_training_never_melees_when_it_cannot_cast(self):
-        # Hurt below the heal threshold with no heal known, the finisher
-        # declines; the tick keeps her distance with combat off instead of
-        # meleeing the training target.
-        client = self._wizard_training_client(80, x=9, y=8)
-        client.state.stats.update({"hp": 60, "maxhp": 100})
+        # On a neutral farm a bystander in the spell's line makes the
+        # finisher decline; the tick keeps her distance with combat off
+        # instead of meleeing the training target.
+        client = self._wizard_training_client(80, x=12, y=8)
+        client.state.map.tile(10, 8).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold", target_id=101, target_hp=100)
+        target = client.state.map.tile(12, 8).objects[3]
         task = FarmTask(
             zone="/test", target="kobold",
             combat_skill="wizardry spells",
-            combat_spell="cause light wounds")
+            combat_spell="cause light wounds", neutral_targets=True)
+        task.remember_engagement(client, 12, 8, target.target_id)
+        self.assertFalse(asyncio.run(
+            task.training_finisher(client, 12, 8, target)))
         asyncio.run(task.tick(client))
         self.assertEqual(client.fired, [])
-        self.assertNotIn(True, client.combat)
-        # Healthy again, the spell is cast.
-        client.state.stats["hp"] = 100
-        task._last_action = 0
-        asyncio.run(task.tick(client))
-        self.assertEqual(client.fired, [(3, 42)])
         self.assertNotIn(True, client.combat)
 
     def test_wizardry_training_needs_a_bar_that_affords_a_cast(self):
@@ -7140,21 +7139,6 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(task.spell_only_training(client))
         client.state.stats["maxsp"] = 16
         self.assertTrue(task.spell_only_training(client))
-
-    def test_navigation_defence_casts_while_training_wizardry(self):
-        client = self._wizard_training_client(100, x=9, y=8)
-        target = client.state.map.tile(9, 8).objects[3]
-        client.state.target_id = target.target_id
-        client.state.stats.update(hp=100, maxhp=100, target_hp=100)
-        child = FarmTask(
-            zone="/test", target="kobold",
-            combat_skill="wizardry spells",
-            combat_spell="cause light wounds")
-        task = NavigateThenTask(object(), "/test", child, combat_approach=True)
-        # On the destination map at full target health: the spell, not melee.
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertEqual(client.fired, [(3, 42)])
-        self.assertNotIn(True, client.combat)
 
     def test_wizardry_training_rests_to_full_mana_before_a_pull(self):
         client = self._wizard_training_client(100, x=14, y=8)
@@ -7206,14 +7190,17 @@ class QuestTests(unittest.TestCase):
         # Mana regenerates only with food: no waiting at food 0.
         asyncio.run(task.tick(client))
         self.assertFalse(task._training_resting)
-        # Nor while a creature is coming at her.
+        # Nor while a creature within its detection radius is coming at her
+        # (no hit yet).
         client.state.stats["food"] = 500
+        client.state.messages = []
+        client.state.map.tiles.clear()
+        client.state.map.tile(11, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=100, target_hp=100)
         task = FarmTask(
             zone="/test", target="kobold",
             combat_skill="wizardry spells",
             combat_spell="cause light wounds")
-        task._engaged_target = None
-        client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 2 damage.")]
         asyncio.run(task.tick(client))
         self.assertFalse(task._training_resting)
 
@@ -7553,9 +7540,9 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.fired, [(3, 42)])
         self.assertEqual(client.combat, [False])
 
-    def test_wizardry_training_casts_until_safety_would_heal(self):
+    def test_wizardry_training_casts_down_to_the_flee_threshold(self):
         client = self._wizard_training_client(15, x=9, y=8)
-        client.state.stats["hp"] = 79
+        client.state.stats["hp"] = 60
         client.state.stats["maxhp"] = 100
         target = client.state.map.tile(9, 8).objects[3]
         task = FarmTask(
@@ -7563,15 +7550,16 @@ class QuestTests(unittest.TestCase):
             combat_skill="wizardry spells",
             combat_spell="cause light wounds")
         task.remember_engagement(client, 9, 8, target.target_id)
-        # Hurt but above the heal threshold: still the spell, never melee.
+        # Hurt below the heal threshold (safety had its chance first): still
+        # the spell, never melee.
         self.assertTrue(asyncio.run(
             task.training_finisher(client, 9, 8, target)))
         self.assertEqual(len(client.fired), 1)
         self.assertNotIn(True, client.combat)
-        # At the heal threshold a new cast waits for safety to heal.
+        # At the flee threshold the fight is retreat's.
         task._last_finisher_at = 0
         task._finisher_pending_feedback = None
-        client.state.stats["hp"] = 69
+        client.state.stats["hp"] = 55
         self.assertFalse(asyncio.run(
             task.training_finisher(client, 9, 8, target)))
         self.assertEqual(len(client.fired), 1)
@@ -12492,16 +12480,20 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(FarmCircuitTask._busy_finishing_fight_or_loot(
             client, farm))
 
-    def test_farm_circuit_waits_out_a_training_mana_rest(self):
-        # Leaving mid-rest would send her on with a partial mana bar.
+    def test_a_training_mana_rest_counts_only_while_fresh(self):
+        # The circuit's dwell must not send her on mid-rest, but a rest is
+        # no fight: services may detour, and a stale flag (after a recall
+        # off the farm) means nothing.
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         farm = FarmTask(zone="/test")
+        farm._training_resting = True
+        farm._training_rest_at = time.monotonic()
+        self.assertTrue(farm.training_rest_active())
         self.assertFalse(FarmCircuitTask._busy_finishing_fight_or_loot(
             client, farm))
-        farm._training_resting = True
-        self.assertTrue(FarmCircuitTask._busy_finishing_fight_or_loot(
-            client, farm))
+        farm._training_rest_at = time.monotonic() - 5
+        self.assertFalse(farm.training_rest_active())
 
     def test_friendly_npc_selection_does_not_starve_maintenance(self):
         client = type("Client", (), {})()
@@ -14909,7 +14901,7 @@ class FarmAnalyzerTests(unittest.TestCase):
         analyzer = self.analyzer()
         now = time.time()
         # Her own cast (FarmTask.commit_offensive_spell records it).
-        client.last_offensive_cast = (now - 20, "magic bullet")
+        client.offensive_casts = collections.deque([(now - 20, "magic bullet")], maxlen=20)
         state.messages = [
             # Magic bullet deals weapon magic, modelled as magic.
             (now - 19, 0, "", "You hit kobold for 12 (-3) with weapon magic."),
@@ -14925,15 +14917,23 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertEqual(analyzer.spell_attack, "magic")
         # Each line is counted once, even when stamps tie.
         state.add_message(0, "", "You hit kobold for 5 (0) with weapon magic.")
-        client.last_offensive_cast = (state.messages[-1][0], "magic bullet")
+        client.offensive_casts.append((state.messages[-1][0], "magic bullet"))
         state.add_message(0, "", "You hit kobold for 6 (0) with weapon magic.")
         analyzer.observe_spells(client)
         analyzer.observe_spells(client)
         self.assertEqual(analyzer.spell_samples, [15, 14, 5, 6])
-        # Another spell starts over.
-        client.last_offensive_cast = (time.time(), "cause light wounds")
+        # A hit after an earlier cast in the same fight still counts.
+        stamp = time.time()
+        client.offensive_casts.extend(
+            [(stamp - 2, "magic bullet"), (stamp - 0.5, "magic bullet")])
+        state.messages.append((stamp - 1, 0, "", "You hit kobold for 7 (0) with weapon magic."))
         analyzer.observe_spells(client)
-        self.assertEqual(analyzer.spell_samples, [])
+        self.assertEqual(analyzer.spell_samples, [15, 14, 5, 6, 7])
+        # Another spell starts over.
+        client.offensive_casts.append((time.time(), "cause light wounds"))
+        state.add_message(0, "", "You hit kobold for 8 (0) with weapon magic.")
+        analyzer.observe_spells(client)
+        self.assertEqual(analyzer.spell_samples, [8])
 
         profile = combat_profile(client, 14.5, "magic")
         args = profile.arguments()
