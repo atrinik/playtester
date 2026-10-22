@@ -2635,6 +2635,8 @@ class NavigateThenTask(BotTask):
         self._hold_fire_signature: tuple[tuple[int, int, int], ...] = ()
         # Held-fire creatures whose halo has yielded to a closed route.
         self._halo_yield: set[int] = set()
+        # Since when held-fire halos alone have closed the local route.
+        self._halo_closed_since = 0.0
         self._last_danger_target = 0
         self._last_pack_signature: tuple[int, ...] = ()
         self._pack_exit_stall: tuple[
@@ -2915,6 +2917,26 @@ class NavigateThenTask(BotTask):
         await client.move(direction)
         self._combat_attempt = (m.path, *path[1], now)
         return True
+
+    def _halo_alone_closes_route(self, client: AtrinikClient,
+                                 hard: set[tuple[int, int]]) -> bool:
+        """Whether held-fire halos, beyond ``hard`` blocks, close the route."""
+        navigation = self.navigation
+        m = client.state.map
+        if not navigation.route or navigation.route[0].source != m.path:
+            return False
+        edge = navigation.route[0]
+        start = (m.world_x, m.world_y)
+        allow_locked = navigation._allow_locked(client)
+        base = (navigation._runtime_blocked | navigation._temporary_blocked |
+                hard)
+        if navigation.graph.local_path(
+                m.path, start, (edge.x, edge.y), allow_locked=allow_locked,
+                excluded=base | navigation._threat_blocked):
+            return False
+        return bool(navigation.graph.local_path(
+            m.path, start, (edge.x, edge.y), allow_locked=allow_locked,
+            excluded=base))
 
     def _halo_threats(self, client: AtrinikClient, threats, *, radius: int) -> None:
         """Mark the walkable squares around threats as temporarily blocked."""
@@ -3261,34 +3283,41 @@ class NavigateThenTask(BotTask):
             return True
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.
-            # The halo is a preference: once it alone has left no route for
-            # a while, those creatures' halos yield and she walks past. Live:
+            # The halo is a preference: once it alone has closed the route
+            # for a while, those creatures' halos yield and she walks past. Live:
             # a brown bat hovering over water beside a one-tile shore path
             # below Fort Sether held Sera for half an hour; it never hit her,
             # so the cornered rule never let her fight it either.
-            no_route_since = self.navigation._no_route_since
-            if (no_route_since and time.monotonic() - no_route_since >=
-                    self.HALO_YIELD_SECONDS):
-                yielded = {threat[3].target_id for threat in nearby
-                           } - self._halo_yield
-                if yielded:
-                    self._halo_yield |= yielded
-                    self.navigation._no_route_since = 0.0
-                    recorder = getattr(client, "record_action", None)
-                    if recorder is not None:
-                        recorder("navigation-halo-yield",
-                                 f"targets={','.join(map(str, sorted(yielded)))}")
-            self._halo_threats(
-                client, [threat for threat in nearby
-                         if threat[3].target_id not in self._halo_yield],
-                radius=1)
+            # A group never yields.
+            hard = set(self.navigation._threat_blocked)
+            soft = [threat for threat in nearby
+                    if threat[3].target_id not in self._halo_yield]
+            self._halo_threats(client, soft, radius=1)
+            now = time.monotonic()
+            if not (soft and len(pull_pack) < 2 and
+                    self._halo_alone_closes_route(client, hard)):
+                self._halo_closed_since = 0.0
+            elif not self._halo_closed_since:
+                self._halo_closed_since = now
+            elif now - self._halo_closed_since >= self.HALO_YIELD_SECONDS:
+                yielded = {threat[3].target_id for threat in soft}
+                self._halo_yield |= yielded
+                self._halo_closed_since = 0.0
+                self.navigation._threat_blocked.clear()
+                self.navigation._threat_blocked.update(hard)
+                soft = []
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("navigation-halo-yield",
+                             f"targets={','.join(map(str, sorted(yielded)))}")
             if getattr(client.state, "combat", False) and not combat_released:
                 await client.set_combat(False)
             m = client.state.map
             cx, cy = m.width // 2, m.height // 2
+            # A yielded creature moving does not invalidate the plan.
             signature = tuple(sorted(
                 (threat[3].target_id, m.world_x + threat[1] - cx,
-                 m.world_y + threat[2] - cy) for threat in nearby))
+                 m.world_y + threat[2] - cy) for threat in soft))
             if signature != self._hold_fire_signature:
                 # A click path already in flight was planned without these
                 # threats; cancel it so the next plan steers around them.
@@ -3300,6 +3329,7 @@ class NavigateThenTask(BotTask):
             return False
         self._hold_fire_signature = ()
         self._halo_yield.clear()
+        self._halo_closed_since = 0.0
         # Only close a short gap. Chasing a merely visible target across the
         # viewport was what repeatedly pulled the character into larger packs.
         if nearest is not None and nearest[0] <= 4:
