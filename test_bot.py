@@ -8724,6 +8724,46 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(task._halo_yield, set())
         self.assertEqual(task._halo_closed_since, 0.0)
 
+    def test_held_fire_halo_yield_survives_learned_blocks_and_keeps_danger(self):
+        client, task = self._shore_corridor()
+        # A dangerous giant three tiles off, beside a dry nook (24, 11).
+        node = task.navigation.graph.nodes["/test"]
+        node.terrain[(24, 11)] = 1
+        task.navigation.graph.monster_level = (
+            lambda name, *args, **kwargs: 40 if "giant" in name else 1)
+        client.state.map.tile(10, 5).objects[3] = MapObject(
+            3, 2, 0, 0, name="hill giant", target_id=950, target_hp=100)
+        client.state.map.tile(4, 7).objects[3] = MapObject(
+            3, 1, 0, 0, name="brown bat", target_id=900, target_hp=100)
+        # Her step under the bat stalled earlier: a learned block on the row.
+        task.navigation._runtime_blocked = {(17, 13)}
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertGreater(task._halo_closed_since, 0.0)
+        task._halo_closed_since = time.monotonic() - task.HALO_YIELD_SECONDS - 1
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn(("navigation-halo-yield", "targets=900"), client.decisions)
+        # The danger halo stays; with the learned block lifted (as the
+        # navigator's own reset does next) the row is open.
+        self.assertIn((24, 11), task.navigation._threat_blocked)
+        self.assertNotIn((18, 13), task.navigation._threat_blocked)
+        self.assertTrue(task.navigation.graph.local_path(
+            "/test", (22, 13), (0, 13), excluded=task.navigation._threat_blocked))
+
+    def test_held_fire_halo_wait_restarts_for_a_newcomer(self):
+        client, task = self._shore_corridor()
+        client.state.map.tile(4, 7).objects[3] = MapObject(
+            3, 1, 0, 0, name="brown bat", target_id=900, target_hp=100)
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        task._halo_closed_since = time.monotonic() - task.HALO_YIELD_SECONDS - 1
+        # The first bat leaves and another closes the row: it waits anew.
+        client.state.map.tiles.clear()
+        client.state.map.tile(5, 7).objects[3] = MapObject(
+            3, 2, 0, 0, name="brown bat", target_id=901, target_hp=100)
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task._halo_yield, set())
+        self.assertGreater(task._halo_closed_since, time.monotonic() - 1)
+        self.assertIn((19, 13), task.navigation._threat_blocked)
+
     def test_held_fire_halo_does_not_yield_for_a_group_or_another_blocker(self):
         client, task = self._shore_corridor()
         # Two creatures, one within two tiles: hold fire, but never yield.
@@ -8733,6 +8773,7 @@ class QuestTests(unittest.TestCase):
             3, 2, 0, 0, name="kobold", target_id=902, target_hp=100)
         self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
         task._halo_closed_since = time.monotonic() - 60
+        task._halo_closed_for = frozenset({901, 902})
         self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
         self.assertIn((20, 13), task.navigation._threat_blocked)
         self.assertEqual(task._halo_yield, set())
@@ -8745,6 +8786,7 @@ class QuestTests(unittest.TestCase):
             3, 3, 0, 0, name="brown bat", target_id=903, target_hp=100)
         task.navigation._temporary_blocked = {(10, 13)}
         task._halo_closed_since = time.monotonic() - 60
+        task._halo_closed_for = frozenset({903})
         self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
         self.assertIn((18, 13), task.navigation._threat_blocked)
         self.assertEqual(task._halo_yield, set())
@@ -8753,6 +8795,7 @@ class QuestTests(unittest.TestCase):
         task.navigation._temporary_blocked = set()
         task.navigation.route = [MapEdge("/elsewhere", "/farm", 0, 13)]
         task._halo_closed_since = time.monotonic() - 60
+        task._halo_closed_for = frozenset({903})
         self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(task._halo_yield, set())
 

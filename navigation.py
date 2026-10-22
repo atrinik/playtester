@@ -2637,6 +2637,7 @@ class NavigateThenTask(BotTask):
         self._halo_yield: set[int] = set()
         # Since when held-fire halos alone have closed the local route.
         self._halo_closed_since = 0.0
+        self._halo_closed_for: frozenset[int] = frozenset()
         self._last_danger_target = 0
         self._last_pack_signature: tuple[int, ...] = ()
         self._pack_exit_stall: tuple[
@@ -2920,7 +2921,14 @@ class NavigateThenTask(BotTask):
 
     def _halo_alone_closes_route(self, client: AtrinikClient,
                                  hard: set[tuple[int, int]]) -> bool:
-        """Whether held-fire halos, beyond ``hard`` blocks, close the route."""
+        """Whether held-fire halos, beyond ``hard`` blocks, close the route.
+
+        Learned stall blocks are lifted here: the navigator's own reset
+        clears them only once a path exists without the halos, so counting
+        them would leave each waiting on the other. On a seam edge this
+        checks only the exact crossing, so a halo may yield slightly early
+        where another seam square was still open.
+        """
         navigation = self.navigation
         m = client.state.map
         if not navigation.route or navigation.route[0].source != m.path:
@@ -2928,8 +2936,7 @@ class NavigateThenTask(BotTask):
         edge = navigation.route[0]
         start = (m.world_x, m.world_y)
         allow_locked = navigation._allow_locked(client)
-        base = (navigation._runtime_blocked | navigation._temporary_blocked |
-                hard)
+        base = navigation._temporary_blocked | hard
         if navigation.graph.local_path(
                 m.path, start, (edge.x, edge.y), allow_locked=allow_locked,
                 excluded=base | navigation._threat_blocked):
@@ -3294,11 +3301,15 @@ class NavigateThenTask(BotTask):
                     if threat[3].target_id not in self._halo_yield]
             self._halo_threats(client, soft, radius=1)
             now = time.monotonic()
+            soft_ids = frozenset(threat[3].target_id for threat in soft)
             if not (soft and len(pull_pack) < 2 and
                     self._halo_alone_closes_route(client, hard)):
                 self._halo_closed_since = 0.0
-            elif not self._halo_closed_since:
+            elif (not self._halo_closed_since or
+                    soft_ids != self._halo_closed_for):
+                # The wait belongs to these creatures; a newcomer restarts it.
                 self._halo_closed_since = now
+                self._halo_closed_for = soft_ids
             elif now - self._halo_closed_since >= self.HALO_YIELD_SECONDS:
                 yielded = {threat[3].target_id for threat in soft}
                 self._halo_yield |= yielded
