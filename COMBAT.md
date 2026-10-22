@@ -8,7 +8,8 @@ changed, and what comes next. It covers the farm loop in `tasks.py`
 ## The problem
 
 Sera (character level 28, slash weapons 28, Wizardry 10) trains Wizardry with
-magic bullet as a finisher. In a live session she died 7 times in 40 minutes,
+magic bullet (see "Spell-only Wizardry training" below). In a live session she
+died 7 times in 40 minutes,
 each time to an orc pack of 2-3 attackers, archers included, while at full
 stats. One orc at a time is easy for her; two or three are not.
 
@@ -115,6 +116,41 @@ Pull request https://github.com/atrinik/playtester/pull/77 ranks
 Wizardry-to-15 spots by running the farm analyzer at the trained skill's
 level with `--max-aggro-pack 1`, so the circuit only picks spots where a lone
 pull is possible.
+
+## Spell-only Wizardry training
+
+The server splits kill XP between every skill that damaged the monster, in
+proportion to each skill's share of the damage (`award_kill_exp` in
+`server/src/server/attack.c`). Each skill's share is of its own capped kill
+XP: at Wizardry 10 that cap is 10,000 per kill, reached by almost any monster
+of level 10 or higher. The old finisher, where the sword brought a target
+down and a spell landed the last hit, therefore fed Slash and left Wizardry
+nearly unchanged. Live, Wizardry XP did not move for hours.
+
+- **Every hit is the spell.** While Wizardry trains, `training_finisher`
+  casts from the first hit. It has no hand-off window and no per-target cast
+  limit, and auto-melee stays off. It starts a cast at any health that safety
+  would not heal at (`heal_below`), down to the flee threshold.
+- **Out of mana, she waits.** When the next cast would dip into the
+  healing reserve, she keeps her distance with combat off until mana
+  regenerates, rather than let a melee finish hand Slash its share.
+- **Pulls wait for a full bar.** Unengaged and not under attack, she rests
+  until her mana is full before the next pull (`training-rest`).
+- **The analyzer ranks spell kills.** The profile sent for Wizardry training
+  is the caster model: the median raw damage of her recent spell hits, taken
+  from her own hit text ("You hit X for N (P) with ..." gives raw damage
+  N - P); the cast delay (`action_time`, at least 0.8 s); the spell's mana
+  cost; `regen_sp` (the client shows it per second); and max mana less the
+  three-heal reserve. Magic bullet deals weapon magic, which the locked
+  analyzer cannot model, so it is passed as magic: understated only against
+  the few monsters that resist magic. No monster archetype resists weapon
+  magic. Until a cast has been observed, the weapon stands in.
+
+For example, with her live mana (8 SP per cast, 0.3 SP/s, 50 SP usable) and an
+assumed 14 damage per cast, the analyzer ranks level 10-11 spots first, at
+about 145,000 XP/hour. Mana is the bottleneck: most of each clear is spent resting.
+Raising mana regeneration (Pow/Int gear, Meditation) or capacity is what
+speeds training up.
 
 ## Next phase: storm farming (owner decisions, 2026-10-22)
 

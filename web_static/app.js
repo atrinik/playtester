@@ -148,7 +148,7 @@ function renderFarming() {
     ? `Farming for ${(fa.objectives || {})[fa.objective] || fa.objective} while depleted (${fa.objective_override.points} points); back to ${(fa.objectives || {})[chosen] || chosen} once cured. `
     : "";
   $("#fa-profile").textContent = override + (p
-    ? `Simulating ${p.skill} ${p.skill_level}${p.max_aggro_pack ? ` (melee assist, ≤${p.max_aggro_pack} aggro)` : ''} · DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing · HP ${p.max_health} · AC ${p.armour_class}`
+    ? `Simulating ${p.skill} ${p.skill_level}${p.max_aggro_pack ? ` (≤${p.max_aggro_pack} aggro)` : ''} · ${p.spell_damage > 0 ? `spells only: ${p.spell_damage} ${p.spell_attack}/cast · ${p.cast_delay}s/cast · ${p.mana_cost} of ${p.max_mana} SP · ${p.mana_regen} SP/s` : `DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing`} · HP ${p.max_health} · AC ${p.armour_class}`
     : "");
   $("#fa-ranking").innerHTML = (fa.ranking || []).map((r, i) => `
     <div class="spot${i === 0 ? " top" : ""}">
