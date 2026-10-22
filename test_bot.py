@@ -8663,6 +8663,142 @@ class QuestTests(unittest.TestCase):
         task._last_position = (m.path, m.world_x, m.world_y)
         task._last_moved_at = time.monotonic() - task.TRANSIT_CORNERED_SECONDS - 1
 
+    def _shore_corridor(self):
+        """Live shape: one dry row (y=13) with water above and rock below."""
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 22
+        client.state.map.world_y = 13
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): int(y == 13) for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node, "/farm": MapNode(path="/farm", width=24, height=24)}
+        task = NavigateThenTask(
+            graph, "/farm", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task.navigation.route = [MapEdge("/test", "/farm", 0, 13)]
+        m = client.state.map
+        task._last_position = (m.path, m.world_x, m.world_y)
+        task._last_moved_at = time.monotonic()
+        return client, task
+
+    def test_held_fire_halo_yields_once_it_alone_closes_the_route(self):
+        client, task = self._shore_corridor()
+        # Live: a brown bat over the water beside the dry row never hits her,
+        # so she holds fire and its halo closes the only path.
+        bat = MapObject(3, 1, 0, 0, name="brown bat", target_id=900, target_hp=100)
+        client.state.map.tile(4, 7).objects[3] = bat
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn((18, 13), task.navigation._threat_blocked)
+        self.assertGreater(task._halo_closed_since, 0.0)
+        # Briefly closed: the halo stands.
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn((18, 13), task.navigation._threat_blocked)
+        self.assertNotIn(("navigation-halo-yield", "targets=900"), client.decisions)
+
+        # Closed by the halo alone for longer: it yields, the route opens,
+        # and the shared navigation timers are left alone.
+        task._halo_closed_since = time.monotonic() - task.HALO_YIELD_SECONDS - 1
+        task.navigation._no_route_since = 123.0
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertNotIn((18, 13), task.navigation._threat_blocked)
+        self.assertIn(("navigation-halo-yield", "targets=900"), client.decisions)
+        self.assertEqual(task.navigation._no_route_since, 123.0)
+        self.assertTrue(task.navigation.graph.local_path(
+            "/test", (22, 13), (0, 13), excluded=task.navigation._threat_blocked))
+        # It stays yielded as it hovers, and its moves cancel nothing.
+        clears = client.clears
+        client.state.map.tiles.clear()
+        client.state.map.tile(5, 7).objects[3] = bat
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertNotIn((19, 13), task.navigation._threat_blocked)
+        self.assertEqual(client.clears, clears)
+        self.assertEqual(client.decisions.count(("navigation-halo-yield", "targets=900")), 1)
+
+        # Once nothing is nearby, the yield is forgotten.
+        client.state.map.tiles.clear()
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertEqual(task._halo_yield, set())
+        self.assertEqual(task._halo_closed_since, 0.0)
+
+    def test_held_fire_halo_yield_survives_learned_blocks_and_keeps_danger(self):
+        client, task = self._shore_corridor()
+        # A dangerous giant three tiles off, beside a dry nook (24, 11).
+        node = task.navigation.graph.nodes["/test"]
+        node.terrain[(24, 11)] = 1
+        task.navigation.graph.monster_level = (
+            lambda name, *args, **kwargs: 40 if "giant" in name else 1)
+        client.state.map.tile(10, 5).objects[3] = MapObject(
+            3, 2, 0, 0, name="hill giant", target_id=950, target_hp=100)
+        client.state.map.tile(4, 7).objects[3] = MapObject(
+            3, 1, 0, 0, name="brown bat", target_id=900, target_hp=100)
+        # Her step under the bat stalled earlier: a learned block on the row.
+        task.navigation._runtime_blocked = {(17, 13)}
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertGreater(task._halo_closed_since, 0.0)
+        task._halo_closed_since = time.monotonic() - task.HALO_YIELD_SECONDS - 1
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn(("navigation-halo-yield", "targets=900"), client.decisions)
+        # The danger halo stays; with the learned block lifted (as the
+        # navigator's own reset does next) the row is open.
+        self.assertIn((24, 11), task.navigation._threat_blocked)
+        self.assertNotIn((18, 13), task.navigation._threat_blocked)
+        self.assertTrue(task.navigation.graph.local_path(
+            "/test", (22, 13), (0, 13), excluded=task.navigation._threat_blocked))
+
+    def test_held_fire_halo_wait_restarts_for_a_newcomer(self):
+        client, task = self._shore_corridor()
+        client.state.map.tile(4, 7).objects[3] = MapObject(
+            3, 1, 0, 0, name="brown bat", target_id=900, target_hp=100)
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        task._halo_closed_since = time.monotonic() - task.HALO_YIELD_SECONDS - 1
+        # The first bat leaves and another closes the row: it waits anew.
+        client.state.map.tiles.clear()
+        client.state.map.tile(5, 7).objects[3] = MapObject(
+            3, 2, 0, 0, name="brown bat", target_id=901, target_hp=100)
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task._halo_yield, set())
+        self.assertGreater(task._halo_closed_since, time.monotonic() - 1)
+        self.assertIn((19, 13), task.navigation._threat_blocked)
+
+    def test_held_fire_halo_does_not_yield_for_a_group_or_another_blocker(self):
+        client, task = self._shore_corridor()
+        # Two creatures, one within two tiles: hold fire, but never yield.
+        client.state.map.tile(6, 7).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=901, target_hp=100)
+        client.state.map.tile(5, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold", target_id=902, target_hp=100)
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        task._halo_closed_since = time.monotonic() - 60
+        task._halo_closed_for = frozenset({901, 902})
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn((20, 13), task.navigation._threat_blocked)
+        self.assertEqual(task._halo_yield, set())
+        self.assertEqual(task._halo_closed_since, 0.0)
+
+        # One creature, but the row is also closed by a live occupant
+        # farther on: yielding would open nothing, so it does not.
+        client.state.map.tiles.clear()
+        client.state.map.tile(4, 7).objects[3] = MapObject(
+            3, 3, 0, 0, name="brown bat", target_id=903, target_hp=100)
+        task.navigation._temporary_blocked = {(10, 13)}
+        task._halo_closed_since = time.monotonic() - 60
+        task._halo_closed_for = frozenset({903})
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertIn((18, 13), task.navigation._threat_blocked)
+        self.assertEqual(task._halo_yield, set())
+
+        # Nor without a route edge on this map (another map's stale state).
+        task.navigation._temporary_blocked = set()
+        task.navigation.route = [MapEdge("/elsewhere", "/farm", 0, 13)]
+        task._halo_closed_since = time.monotonic() - 60
+        task._halo_closed_for = frozenset({903})
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task._halo_yield, set())
+
     def test_transit_holds_fire_while_the_route_still_progresses(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
