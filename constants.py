@@ -108,6 +108,7 @@ C_ACCESS_RESULT = int(ServerToClientCommand.ACCESS_RESULT)
 C_ACCESS_POLICY = int(ServerToClientCommand.ACCESS_POLICY)
 
 # DRAWINFO chat channels shared with common/toolkit/socket.h.
+CHAT_TYPE_GAME = 2
 CHAT_TYPE_CHAT = 3
 CHAT_TYPE_LOCAL = 4
 CHAT_TYPE_PRIVATE = 5

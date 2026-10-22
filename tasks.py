@@ -4807,8 +4807,10 @@ class BankTask(BotTask):
             await client.talk(f"deposit {self.deposit}", self.banker)
             self._sent = True
             return
+        # Player chat is no bank feedback, however it is worded.
         feedback = [entry[3].casefold()
-                    for entry in client.state.messages[-10:]]
+                    for entry in client.state.messages[-10:]
+                    if entry[1] not in c.PLAYER_CHAT_TYPES]
         if client.state.interface is not None:
             feedback.append(client.state.interface.text.casefold())
         combined = "\n".join(feedback)
@@ -4860,7 +4862,7 @@ class BankBalanceTask(BotTask):
             return
         feedback = "\n".join(
             entry[3] for entry in client.state.messages[-10:]
-            if len(entry) > 3)
+            if len(entry) > 3 and entry[1] not in c.PLAYER_CHAT_TYPES)
         if client.state.interface is not None:
             feedback += "\n" + client.state.interface.text
         if update_bank_balance(client.state, feedback):

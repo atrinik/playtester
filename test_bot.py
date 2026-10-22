@@ -10210,12 +10210,31 @@ class QuestTests(unittest.TestCase):
                 packet = bytes((chat,)) + b"\0" + b"Your balance is 50 copper coins.\0"
                 await client._handle_drawinfo(Cursor(packet), packet)
             self.assertEqual(client.state.bank_balance, 35)
+            self.assertEqual(client.state.bank_balance_observed_at, 0.0)
             # A game message is the bank's.
-            packet = bytes((0,)) + b"\0" + b"Your balance is 50 copper coins.\0"
+            packet = bytes((c.CHAT_TYPE_GAME,)) + b"\0" + b"Your balance is 50 copper coins.\0"
             await client._handle_drawinfo(Cursor(packet), packet)
             self.assertEqual(client.state.bank_balance, 50)
 
         asyncio.run(scenario())
+
+    def test_bank_tasks_ignore_balances_typed_in_player_chat(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing")
+                self.talked = []
+
+            async def talk(self, message, npc=None):
+                self.talked.append(message)
+
+        client = FakeClient()
+        task = BankBalanceTask("Tolmir")
+        asyncio.run(task.tick(client))
+        client.state.messages.append(
+            (time.time(), c.CHAT_TYPE_LOCAL, "", "Your balance is 9999 gold coins."))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertFalse(client.state.bank_balance_known)
 
     def test_a_future_balance_stamp_is_clamped_to_now(self):
         client = AtrinikClient(ClientConfig())
@@ -10237,6 +10256,9 @@ class QuestTests(unittest.TestCase):
         client.state.paid_restoration_retry_until = time.time() + 3600
         self.assertFalse(circuit._needs_bank_sync(client))
         client.state.paid_restoration_retry_until = 0.0
+        circuit._restoration_retry_at = circuit.clock() + 60
+        self.assertFalse(circuit._needs_bank_sync(client))
+        circuit._restoration_retry_at = 0.0
         # A known balance is refreshed; an unknown one is plainly read.
         self.assertTrue(circuit._new_bank_sync(refresh=True).task.refresh)
         self.assertFalse(circuit._new_bank_sync().task.refresh)
