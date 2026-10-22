@@ -1473,8 +1473,9 @@ class FarmTask(BotTask):
         # flee threshold.  Dropping it at 79% previously re-enabled Slash
         # after Sera had already spent the mana and stood still for the cast.
         # Spell-only training has no melee to fall back to: by the time it
-        # runs, safety has had its chance to heal, so it casts down to the
-        # flee threshold.
+        # runs, safety has had its chance to heal (a neutral farm's isolated
+        # kite heals only at its flee threshold, as before), so it casts
+        # down to the flee threshold.
         spells_only = self.spell_only_training(client)
         if (hp / maxhp <= self.safety.flee_below or
                 (hp / maxhp < 0.80 and not pending_for_target and
@@ -4022,10 +4023,13 @@ class FarmTask(BotTask):
             maxsp = int(client.state.stats.get("maxsp", 0) or 0)
             food = int(client.state.stats.get("food", 0) or 0)
             if 0 < maxsp and sp < maxsp and food > 0:
+                # A rest is new unless confirmed just now: one left behind by
+                # a detour starts over (clears, combat off, logged).
+                fresh = self.training_rest_active()
+                self._training_rest_at = time.monotonic()
                 if await self.maintain_inventory(client):
                     return
-                self._training_rest_at = time.monotonic()
-                if not self._training_resting:
+                if not fresh:
                     self._training_resting = True
                     recorder = getattr(client, "record_action", None)
                     if recorder is not None:

@@ -7123,8 +7123,46 @@ class QuestTests(unittest.TestCase):
         task.remember_engagement(client, 12, 8, target.target_id)
         self.assertFalse(asyncio.run(
             task.training_finisher(client, 12, 8, target)))
+        # Past the finisher's cooldown, the tick reaches the never-melee hold.
+        task._last_finisher_at = 0
         asyncio.run(task.tick(client))
         self.assertEqual(client.fired, [])
+        self.assertEqual(client.combat, [False])
+
+    def test_wizardry_training_invisible_finisher_hold_never_melees(self):
+        client = self._wizard_training_client(10, x=9, y=8)
+        client.state.target_id = 100
+        client.state.stats.update({"hp": 100, "maxhp": 100, "target_hp": 10,
+                                   "action_time": 0.5})
+        task = FarmTask(combat_skill="wizardry spells",
+                        combat_spell="cause light wounds")
+        self.assertFalse(asyncio.run(
+            task.invisible_finisher_hold(client, 100, 1.0)))
+        self.assertEqual(client.combat, [])
+
+    def test_navigation_defence_casts_while_training_wizardry(self):
+        # On the farm map before arrival, a training kobold at full health
+        # within reach gets the spell, never melee.
+        client = self._wizard_training_client(100, x=9, y=8)
+        target = client.state.map.tile(9, 8).objects[3]
+        client.state.target_id = target.target_id
+        client.state.stats.update(hp=100, maxhp=100, target_hp=100)
+        child = FarmTask(
+            zone="/test", target="kobold",
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds")
+        task = NavigateThenTask(object(), "/test", child, combat_approach=True)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.fired, [(3, 42)])
+        self.assertNotIn(True, client.combat)
+        # Hurt with no heal known (safety cannot act): still the spell.
+        client.fired.clear()
+        client.state.stats.update(hp=60, target_hp=10)
+        child._last_finisher_at = 0
+        child._finisher_pending_feedback = None
+        task._last_defense_action = 0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.fired, [(3, 42)])
         self.assertNotIn(True, client.combat)
 
     def test_wizardry_training_needs_a_bar_that_affords_a_cast(self):
@@ -7157,6 +7195,13 @@ class QuestTests(unittest.TestCase):
         self.assertIn(("training-rest", "sp=30/62"), client.decisions)
         asyncio.run(task.tick(client))
         self.assertEqual(client.decisions.count(("training-rest", "sp=30/62")), 1)
+        # Each rest tick confirms it, so the circuit's dwell waits.
+        self.assertTrue(task.training_rest_active())
+        # A rest left stale by a detour starts over when she is back.
+        task._training_rest_at -= 5
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.decisions.count(("training-rest", "sp=30/62")), 2)
         # One coming at her is fought regardless.
         client.state.map.tiles.clear()
         client.state.map.tile(9, 8).objects[3] = MapObject(
@@ -7177,7 +7222,7 @@ class QuestTests(unittest.TestCase):
         self.assertFalse(task._training_resting)
         self.assertEqual(
             [entry for entry in client.decisions if entry[0] == "training-rest"],
-            [("training-rest", "sp=30/62")])
+            [("training-rest", "sp=30/62")] * 2)
         self.assertTrue(client.moves or client.direct_moves or client.fired)
 
     def test_wizardry_training_rest_yields_to_hunger_and_an_approach(self):

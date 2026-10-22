@@ -129,23 +129,25 @@ nearly unchanged. Live, Wizardry XP did not move for hours.
 
 - **Every hit is the spell.** While Wizardry trains, `training_finisher`
   casts from the first hit. It has no hand-off window and no per-target cast
-  limit, and auto-melee stays off. Safety heals first; after that it casts
-  down to the flee threshold.
+  limit, and auto-melee stays off. Safety heals first (on a neutral farm,
+  the isolated kite heals only at its flee threshold, as before); after that
+  it casts down to the flee threshold.
 - **Out of mana, she waits.** When the next cast would dip into the
   healing reserve, she keeps her distance with combat off until mana
   regenerates, rather than let a melee finish hand Slash its share.
 - **Never melee a training target.** Whenever the spell cannot be cast
   (hurt below the heal threshold, line blocked), the farm loop keeps her
   distance with combat off; safety and retreat handle her health. Pulls use
-  the spell, never a launcher. Melee remains only as survival: the
-  cornered-retreat breakout, the pursued stand (an attacker still adjacent
-  after three retreat steps), and travel defence, which fights back only
-  when cornered.
+  the spell, never a launcher. Travel defence casts at a threat within reach
+  after safety, or keeps its distance. Melee remains only as survival: the
+  cornered-retreat breakout and the pursued stand (an attacker still
+  adjacent after three retreat steps).
 - **Pulls wait for a full bar.** Unengaged, with no creature coming at her
   and not under attack, she rests until her mana is full before the next
   pull (`training-rest`), unless she has no food (mana regenerates only
-  with food). The circuit's dwell does not switch legs during a fresh rest,
-  so she does not set off with a partial bar; service detours still may. Resting out of combat also ramps her
+  with food). The circuit's dwell and empty-sweep switches wait out a fresh
+  rest, so she does not set off with a partial bar; service detours still
+  may. Resting out of combat also ramps her
   regeneration up: with Meditation, the server multiplies it by
   1 + seconds since combat / 10, up to tenfold (`player_do_some_living`).
   Only hits and offensive casts restart that clock.
