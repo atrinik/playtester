@@ -92,14 +92,22 @@ attacking. So:
   is neither set aside nor inside a set-aside monster's reach (its detection
   radius, at least 6 for a ranged monster, measured from that monster);
 - if no such threat remains but a set-aside monster is visible, she does not
-  commit and retreats with `low_health_retreat`, which steps away from the
-  visible threats; with no threats in view at all, the existing unseen-contact
-  retreat applies.
+  commit. Healing comes first; otherwise she retreats with
+  `low_health_retreat`, which steps away from the visible threats. On a
+  neutral farm that retreat counts only monsters matching a named attacker,
+  so when it finds none she falls back to the unseen-contact retreat. Its
+  pursued-stand rule can still make her fight a packmate that stays
+  adjacent through several retreat steps. With no threats in view at all,
+  the existing unseen-contact retreat applies.
 
 A ranged pulled target that shoots her therefore waits out the 8 s, and a
 set-aside ranged monster is not fought until it closes to 2 tiles or its
 120 s set-aside expires. The safety policy (healing and the flee threshold)
 and the retreats still react to its damage.
+
+Accepted limit: while she is unengaged, a monster standing within a
+set-aside monster's reach is not fought back, unless it comes adjacent and
+the pursued-stand rule fires, until the set-aside expires.
 
 ### Analyzer ranking (already shipped)
 

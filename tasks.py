@@ -3785,10 +3785,13 @@ class FarmTask(BotTask):
             # Hit with only set-aside pulls and their packmates in view: step
             # away from the visible threats. The unseen-contact fallback could
             # step toward a set-aside monster it does not account for.
+            # On a neutral farm it may see no threat at all; then fall back
+            # to the unseen-contact retreat rather than stand under fire.
             last_heal = self.safety._last_heal
             await self.safety.enforce(client)
-            if self.safety._last_heal == last_heal:
-                await self.low_health_retreat(client)
+            if (self.safety._last_heal == last_heal and
+                    not await self.low_health_retreat(client)):
+                await self.invisible_contact_retreat(client)
             self._last_action = time.monotonic()
             return
         if (hostile_contact and self._engaged_target is None and

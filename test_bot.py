@@ -6284,6 +6284,51 @@ class QuestTests(unittest.TestCase):
         self.assertIsNone(task._engaged_target)
         self.assertEqual(client.targets, [])
 
+    def test_hit_commits_to_a_threat_beyond_the_set_aside_reach(self):
+        # The archer stands five tiles from the set-aside orc, outside its
+        # four-tile reach, so the hit commits to the archer.
+        client, task = self._set_aside_pull((11, 8), (16, 8))
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+        asyncio.run(task.tick(client))
+        self.assertIn(100, task._pull_set_aside)
+        self.assertEqual(task._engaged_target[0], 200)
+
+    def test_set_aside_hit_heals_before_retreating(self):
+        client, task = self._set_aside_pull((11, 8), (16, 8))
+        client.state.map.tile(16, 8).objects.pop(3)
+        client.state.messages = [
+            (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
+
+        async def heal(safety, client):
+            safety._last_heal = time.monotonic()
+            return False
+
+        with patch.object(type(task.safety), "enforce", heal):
+            asyncio.run(task.tick(client))
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.direct_moves, [])
+
+    def test_neutral_set_aside_hit_falls_back_to_unseen_contact_retreat(self):
+        # On a neutral farm only a named attacker counts as a threat; an
+        # unseen goblin's hit leaves low_health_retreat nothing to flee.
+        client, task = self._set_aside_pull((11, 8), (16, 8))
+        client.state.map.tile(16, 8).objects.pop(3)
+        task.neutral_targets = True
+        task._last_threat_origin = None
+        client.state.messages = [
+            (time.time(), 0, 0, "goblin hit you for 3 (-3) impact damage.")]
+        unseen = []
+
+        async def invisible_contact_retreat(client):
+            unseen.append(True)
+            return True
+
+        task.invisible_contact_retreat = invisible_contact_retreat
+        asyncio.run(task.tick(client))
+        self.assertEqual(unseen, [True])
+        self.assertIsNone(task._engaged_target)
+
     def test_set_aside_pull_arriving_within_two_tiles_is_fought(self):
         client, task = self._set_aside_pull((10, 8), (16, 8))
         asyncio.run(task.tick(client))
