@@ -1643,12 +1643,14 @@ class AtrinikClient:
         # A line opening with another name ("Mira, ...") is someone else's,
         # as her own replies are: never hers to answer (no bot loops).
         # "Hi, Sera" or "Ok, where are you" open with a word, not a name;
-        # "Ok, Kitty, ..." is still Kitty's.
+        # "Ok, Kitty, ...", "Hey Kitty, ...", "@Kitty, ..." and "Kitty: ..."
+        # are still Kitty's. A name only at the end ("Where is Sera, Kitty?")
+        # is not read; the reply caps bound what that lets through.
         names_her = bool(player_name and re.search(
             rf"\b{re.escape(player_name)}\b", folded))
         addressee = re.match(
-            rf"(?:(?:{CHAT_INTERJECTION_PATTERN})\s*,\s*)*([a-z][\w'-]*)\s*,",
-            folded)
+            rf"@?(?:(?:{CHAT_INTERJECTION_PATTERN})\b[\s,]*)*@?"
+            rf"([a-z][\w'-]*)\s*[,:]", folded)
         if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and
                 addressee.group(1) != player_name and
                 addressee.group(1) not in CHAT_INTERJECTIONS):

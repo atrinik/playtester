@@ -2403,6 +2403,8 @@ class ProtocolTests(unittest.TestCase):
         deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Cy[/a]: Hi, Sera!")
         self.assertEqual(len(commands), count + 1)
         self.assertTrue(commands[-1].startswith("/say Cy, "))
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Gus[/a]: hey sera: where are you")
+        self.assertTrue(commands[-1].startswith("/say Gus, I'm in "))
         # Her rules read the party line without its "[Party] Name says:".
         deliver(c.CHAT_TYPE_PARTY, "[a=#charname]Dee[/a]: [P] Dee says: Sera")
         self.assertEqual(commands[-1], "/gsay Dee, I'm here! Just out training.")
@@ -2451,9 +2453,12 @@ class ProtocolTests(unittest.TestCase):
         deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Ash[/a]: Kitty, how are you?")
         self.assertEqual(len(commands), 2)
         # So is one that opens with a word first, or merely mentions her.
-        for text in ("Ok, Kitty, how are you?", "Hey, Kitty, where are you?"):
+        for text in ("Ok, Kitty, how are you?", "Hey, Kitty, where are you?",
+                     "Hey Kitty, where are you?"):
             deliver(c.CHAT_TYPE_LOCAL, f"[a=#charname]Ash[/a]: {text}")
-        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Eve[/a]: Mira, where is Sera?")
+        for text in ("Mira, where is Sera?", "Hey Mira, where is Sera?",
+                     "@Mira, where is Sera?", "Mira: where is Sera?"):
+            deliver(c.CHAT_TYPE_LOCAL, f"[a=#charname]Eve[/a]: {text}")
         self.assertEqual(len(commands), 2)
         # But "Ok, ..." with no name continues Ash's talk with her.
         deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Ash[/a]: Ok, where are you")
