@@ -608,7 +608,10 @@ class DashboardState:
             if isinstance(rate, (int, float)) and not isinstance(rate, bool):
                 predicted = (objective, float(rate))
         return client.metrics.render(
-            carried=BuyShopUpgradeTask.carried_wallet_value(client),
+            # An empty inventory before it loads is not an empty purse.
+            carried=(BuyShopUpgradeTask.carried_wallet_value(client)
+                     if state.phase == "playing" and
+                     state.inventory_replay_complete else None),
             banked=state.bank_balance if state.bank_balance_known else None,
             predicted_xp=predicted)
 
@@ -869,6 +872,8 @@ class WebControlServer:
             previous = self.engine.task
             if previous:
                 previous.fail("stopped by operator")
+                self.client.record_action(
+                    "task-end", f"{previous.name} stopped by operator")
                 self.engine.last_task = {
                     "name": previous.name, "status": "failed",
                     "error": previous.error, "started_at": previous.started_at,

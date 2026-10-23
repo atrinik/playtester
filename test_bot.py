@@ -16699,7 +16699,10 @@ class MetricsTests(unittest.TestCase):
         self.message("You got 120 exp in skill Wizardry.")
         self.message("You hit kobold for 14 (0) with slash.")
         self.message("kobold hit you for 9 (-1) fire damage.")
-        self.message("The spell heals you for 22 health.")
+        self.message("The spell heals you for 22 hp!")
+        # An immune attack type still reports its line, for no damage.
+        self.message("You hit kobold for 0 (0) with fire.")
+        self.message("kobold hit you for 0 (0) cold damage.")
         self.message("You paid 5 silver coins for a short sword.")
         self.message("You receive 1 gold coin for a ring.")
         # Player chat quoting the same lines is someone typing.
@@ -16711,6 +16714,8 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(m.damage_dealt.value((*base, "slash")), 14)
         self.assertEqual(m.hits_dealt.value((*base, "slash")), 1)
         self.assertEqual(m.damage_taken.value((*base, "fire")), 9)
+        self.assertEqual(m.hits_dealt.value((*base, "fire")), 0)
+        self.assertEqual(m.hits_taken.value((*base, "cold")), 0)
         self.assertEqual(m.heals.value((*base, "spell")), 1)
         self.assertEqual(m.healed.value(base), 22)
         self.assertEqual((m.purchases.value(base), m.money_spent.value((*base, "purchase"))),
@@ -16747,6 +16752,10 @@ class MetricsTests(unittest.TestCase):
         m.item_moved(Item(tag=11, location=1), 0)
         self.assertEqual({key[2]: value for key, value in m.item_moves.samples.items()},
                          {"store": 1, "retrieve": 1, "loot": 1, "pickup": 1, "drop": 1})
+        # Corpse looting mostly goes through /take.
+        m.command("/take all")
+        m.command("/say hi")
+        self.assertEqual(m.item_moves.value((*base, "loot")), 2)
         client._log_chat(c.CHAT_TYPE_LOCAL, "in", "Zoey", "hi")
         client._log_chat(c.CHAT_TYPE_PRIVATE, "out", "Zoey", "hello")
         self.assertEqual(m.chat_lines.value((*base, "in", "say")), 1)
@@ -16757,6 +16766,16 @@ class MetricsTests(unittest.TestCase):
                           m.disconnects.value(base)), (2, 1, 1))
         client._record_post_mortem()
         self.assertEqual(m.deaths.value((*base, "unclassified")), 1)
+
+    def test_time_before_the_first_connection_is_offline(self):
+        client = AtrinikClient(ClientConfig(host="game.example", port=13327,
+                                            character="Sera"))
+        m = client.metrics
+        m._state_since -= 40
+        asyncio.run(client.emit("connected", None))
+        seconds = {key[2]: value for key, value in m.state_seconds.samples.items()}
+        self.assertGreaterEqual(seconds["disconnected"], 40)
+        self.assertNotIn("idle", seconds)
 
     def test_tasks_states_and_gauges(self):
         from .tasks import BotTask

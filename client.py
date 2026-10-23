@@ -2499,6 +2499,8 @@ class AtrinikClient:
 
     async def execute_client_command(self, command: str) -> None:
         """Execute commands that the graphical client normally intercepts."""
+        if self.metrics is not None:
+            self.metrics.command(command)
         match = re.fullmatch(r'/talk\s+1\s+(.+)', command, re.S)
         if match:
             await self.talk(match.group(1))

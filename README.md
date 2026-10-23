@@ -169,7 +169,8 @@ bot does over hours for analysis. The endpoint has the same access rules as
 header, and needs no other credential. It is read-only and holds no secrets.
 It never includes the account, password, invite code or certificate. Scrape it
 from the same machine or through the same authenticated tunnel as the
-dashboard.
+dashboard. Deploying Prometheus or Grafana (scrape configuration and
+dashboards) is out of scope here.
 
 Every series is named `atrinik_playtester_*` and carries `character` (in lower
 case) and `server` labels. Counters are kept in memory and start again from zero when
@@ -198,12 +199,12 @@ Counters:
 | --- | --- | --- |
 | `kills_total` | `monster` | "You killed …" lines |
 | `experience_gained_total` | `skill` | experience from "You got N exp in skill …" |
-| `damage_dealt_total`, `hits_dealt_total` | `attack` | "You hit … for N with …" |
-| `damage_taken_total`, `hits_taken_total` | `type` | "… hit you for N … damage" |
+| `damage_dealt_total`, `hits_dealt_total` | `attack` | "You hit … for N with …"; the server sends one line per attack type of a swing, so hits count damaging lines, not swings |
+| `damage_taken_total`, `hits_taken_total` | `type` | "… hit you for N … damage", one damaging line per attack type |
 | `spells_cast_total` | `spell` | spell casts ordered (including any the server refuses) |
 | `mana_spent_total` | | each ordered cast's listed spell cost |
-| `heals_total` | `source` | healing spells received (`spell`) and healing potions applied (`potion`) |
-| `healed_hp_total` | | health restored by healing spells |
+| `heals_total` | `source` | her own healing spells on herself (`spell`) and healing potions applied (`potion`) |
+| `healed_hp_total` | | health restored by her healing spells on herself |
 | `potions_used_total` | `potion` | potions applied |
 | `deaths_total` | `cause` | deaths, by the post-mortem cause |
 | `rests_total` | | rests started to regain spell points |
@@ -211,11 +212,11 @@ Counters:
 | `purchases_total`, `sales_total` | | shop purchases and sales |
 | `money_spent_copper_total` | `reason` | money paid in shops (`purchase`) |
 | `money_gained_copper_total` | `source` | money received for sales (`sale`) |
-| `item_moves_total` | `direction` | item moves ordered: `store`, `retrieve`, `loot`, `pickup`, `drop` |
+| `item_moves_total` | `direction` | item moves ordered: `store`, `retrieve`, `loot` (corpse moves and `/take` commands), `pickup`, `drop` |
 | `chat_lines_total` | `direction`, `channel` | player chat heard and answered |
 | `connections_total`, `reconnects_total`, `disconnects_total` | | game server connections; a failed attempt also counts as a disconnect |
 | `tasks_started_total` | `task` | top-level tasks started |
-| `tasks_finished_total` | `task`, `status` | top-level tasks that completed or failed |
+| `tasks_finished_total` | `task`, `status` | top-level tasks that completed, failed or were stopped from the dashboard (stopping counts as failed); a task replaced by another is not counted |
 | `state_seconds_total` | `state` | seconds `fighting`, `resting`, `travelling`, `shopping` (shops, temple, NPC dialogue), `busy`, `idle` or `disconnected` (not playing) |
 
 The time in each state follows the latest recorded action that marks one. For

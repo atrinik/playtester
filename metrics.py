@@ -209,7 +209,8 @@ class BotMetrics:
         self.tasks = LabelLimit(64, fold=False)
         self.phases = LabelLimit(64)
         self._connected_before = False
-        self._state = "idle"
+        # Nothing is played before the first connection.
+        self._state = "disconnected"
         self._state_since = time.monotonic()
 
         def counter(name: str, help_text: str, *labels: str) -> Family:
@@ -249,15 +250,22 @@ class BotMetrics:
         self.damage_dealt = counter(
             "damage_dealt_total", "Damage dealt, by attack type or hitting skill and spell.",
             "attack")
-        self.hits_dealt = counter("hits_dealt_total", "Hits landed, by attack.", "attack")
+        self.hits_dealt = counter(
+            "hits_dealt_total",
+            "Damaging hit lines, by attack: one per attack type of each swing.", "attack")
         self.damage_taken = counter("damage_taken_total", "Damage taken, by damage type.",
                                     "type")
-        self.hits_taken = counter("hits_taken_total", "Hits taken, by damage type.", "type")
+        self.hits_taken = counter(
+            "hits_taken_total",
+            "Damaging hit lines taken, by damage type: one per attack type.", "type")
         self.spells_cast = counter("spells_cast_total", "Spell casts ordered, by spell.", "spell")
         self.mana_spent = counter(
             "mana_spent_total", "Spell points for ordered casts, from each spell's listed cost.")
-        self.heals = counter("heals_total", "Heals received, by source.", "source")
-        self.healed = counter("healed_hp_total", "Health restored by healing spells.")
+        self.heals = counter("heals_total",
+                             "Her own heals: healing spells on herself, healing potions.",
+                             "source")
+        self.healed = counter("healed_hp_total",
+                              "Health restored by her healing spells on herself.")
         self.potions_used = counter("potions_used_total", "Potions applied, by potion.",
                                     "potion")
         self.deaths = counter("deaths_total", "Deaths, by post-mortem cause.", "cause")
@@ -272,7 +280,8 @@ class BotMetrics:
                                     "source")
         self.item_moves = counter(
             "item_moves_total",
-            "Item moves ordered: store, retrieve, loot, pickup or drop.", "direction")
+            "Item moves ordered: store, retrieve, loot (with /take), pickup or drop.",
+            "direction")
         self.chat_lines = counter("chat_lines_total", "Player chat lines, by direction "
                                   "and channel.", "direction", "channel")
         self.connections = counter("connections_total", "Connections to the game server.")
@@ -384,13 +393,17 @@ class BotMetrics:
         line = str(text).strip()
         base = self.base()
         if match := DEALT.match(line):
-            attack = self.attacks(match.group("attack"))
-            self.damage_dealt.inc((*base, attack), int(match.group("amount")))
-            self.hits_dealt.inc((*base, attack))
+            attack, amount = self.attacks(match.group("attack")), int(match.group("amount"))
+            self.damage_dealt.inc((*base, attack), amount)
+            if amount:
+                # An immune attack type still reports a line "for 0".
+                self.hits_dealt.inc((*base, attack))
         elif match := HIT_PATTERN.match(line):
             kind = self.damage_types(match.group("type") or "physical")
-            self.damage_taken.inc((*base, kind), int(match.group("amount")))
-            self.hits_taken.inc((*base, kind))
+            amount = int(match.group("amount"))
+            self.damage_taken.inc((*base, kind), amount)
+            if amount:
+                self.hits_taken.inc((*base, kind))
         elif match := KILL.match(line):
             self.kills.inc((*base, self.monsters(match.group("name"))))
         elif match := XP.match(line):
@@ -451,6 +464,12 @@ class BotMetrics:
             else:
                 direction = "retrieve"
         self.item_moves.inc((*self.base(), direction))
+
+    @_never_raises
+    def command(self, command: str) -> None:
+        """A client command: corpse looting goes through /take."""
+        if str(command).strip().casefold().startswith("/take"):
+            self.item_moves.inc((*self.base(), "loot"))
 
     @_never_raises
     def chat(self, msg_type: int, direction: str) -> None:
