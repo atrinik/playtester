@@ -16,6 +16,8 @@ log = logging.getLogger(__name__)
 CHAT_RETENTION_SECONDS = 365 * 24 * 3600
 CHAT_PRUNE_EVERY = 500
 CHAT_TEXT_LIMIT = 1000
+# And at most this many lines per server and account, newest kept.
+CHAT_ROW_LIMIT = 300_000
 
 
 class BotMemory:
@@ -137,6 +139,14 @@ class BotMemory:
                     """DELETE FROM chat_log
                        WHERE server = ? AND account = ? AND at < ?""",
                     (self.server, self.account, now - CHAT_RETENTION_SECONDS))
+                db.execute(
+                    """DELETE FROM chat_log
+                       WHERE server = ? AND account = ? AND at < (
+                           SELECT at FROM chat_log
+                           WHERE server = ? AND account = ?
+                           ORDER BY at DESC LIMIT 1 OFFSET ?)""",
+                    (self.server, self.account, self.server, self.account,
+                     CHAT_ROW_LIMIT - 1))
 
     def chat_history(self, character: str, *, limit: int = 200,
                      sender: str = "") -> list[dict[str, Any]]:
@@ -145,8 +155,8 @@ class BotMemory:
                    WHERE server = ? AND account = ? AND character = ?"""
         params: list[Any] = [self.server, self.account, character.casefold()]
         if sender:
-            query += " AND lower(sender) = ?"
-            params.append(sender.casefold())
+            query += " AND lower(sender) = lower(?)"
+            params.append(sender)
         query += " ORDER BY at DESC LIMIT ?"
         params.append(max(1, min(int(limit), 5000)))
         with self._connect() as db:

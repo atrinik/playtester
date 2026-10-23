@@ -32,6 +32,12 @@ from .transport import QuicStream
 POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
 
+# A player gets at most one such fallback reply per this many seconds.
+CHAT_FALLBACK_SECONDS = 600.0
+# And at most this many replies of any kind per window: no conversation
+# with another auto-responder can run on.
+CHAT_REPLIES_PER_SENDER = 3
+CHAT_REPLY_WINDOW_SECONDS = 300.0
 # Friendly replies to a message meant for her that no rule answers, in turn.
 CHAT_FALLBACKS = (
     "Ha, I'm not sure! I'm busy training right now.",
@@ -180,6 +186,8 @@ class AtrinikClient:
             tuple[str, tuple[re.Pattern, ...], tuple[str, ...]]] = []
         self._chat_rule_uses: dict[str, int] = {}
         self._chat_fallback_uses = 0
+        self._chat_fallback_at: dict[str, float] = {}
+        self._chat_replies: dict[str, deque[float]] = {}
         self.chat_context_provider: Callable[[], dict[str, str]] | None = None
         self._reload_chat_rules()
         requested_memory = (Path(config.runtime_state_path)
@@ -1473,7 +1481,13 @@ class AtrinikClient:
             return "", ""
         if match is None:
             return "", ""
-        return match.group(1).strip(), match.group(2).strip()
+        sender, body = match.group(1).strip(), match.group(2).strip()
+        if msg_type == c.CHAT_TYPE_PARTY:
+            # Party chat reads "[Party] Name says: text" after the prefix.
+            body = re.sub(
+                rf"^\[[^\]]*\]\s+{re.escape(sender)}\s+says:\s*", "",
+                body, flags=re.I)
+        return sender, body
 
     def _current_place_description(self) -> str:
         m = self.state.map
@@ -1620,11 +1634,16 @@ class AtrinikClient:
         recent_correspondent = (
             chat_now - self._chat_correspondents.get(
                 sender.casefold(), 0.0) <= 90.0)
-        # A tell, party chat and /say near her are meant for her; public
-        # /chat only when it names her or continues a conversation.
+        # A line opening with another name ("Mira, ...") is someone else's,
+        # as her own replies are: never hers to answer (no bot loops).
+        addressee = re.match(r"([a-z][\w'-]*)\s*,", folded)
+        if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and
+                addressee.group(1) != player_name):
+            return
+        # A tell is meant for her; /say, party and /chat only when they name
+        # her or continue a conversation she answered.
         direct = bool(
-            msg_type in (c.CHAT_TYPE_PRIVATE, c.CHAT_TYPE_PARTY,
-                         c.CHAT_TYPE_LOCAL) or
+            msg_type == c.CHAT_TYPE_PRIVATE or
             recent_correspondent or
             (player_name and re.search(
                 rf"\b{re.escape(player_name)}\b", folded)))
@@ -1677,9 +1696,10 @@ class AtrinikClient:
                 folded))
 
         response = ""
-        if location_question:
+        fallback = False
+        if location_question and direct:
             response = f"I'm in {self._current_place_description()} right now."
-        elif status_question:
+        elif status_question and direct:
             response = (
                 f"I'm training and exploring around "
                 f"{self._current_place_description()} right now.")
@@ -1731,6 +1751,29 @@ class AtrinikClient:
         elif direct and (small_talk := self._small_talk_response(folded)):
             response = small_talk
         elif direct:
+            # At most one fallback per player every few minutes.
+            if (chat_now - self._chat_fallback_at.get(sender.casefold(), -1e9)
+                    < CHAT_FALLBACK_SECONDS):
+                return
+            fallback = True
+        else:
+            return
+
+        prompt_key = f"{msg_type}:{sender.casefold()}:{folded}"
+        now = chat_now
+        replies = self._chat_replies.setdefault(
+            sender.casefold(), deque(maxlen=CHAT_REPLIES_PER_SENDER))
+        if (prompt_key == self._last_chat_prompt or
+                now - self._last_chat_reply_at < 12.0 or
+                (len(replies) == CHAT_REPLIES_PER_SENDER and
+                 now - replies[0] < CHAT_REPLY_WINDOW_SECONDS)):
+            return
+        self._last_chat_prompt = prompt_key
+        self._last_chat_reply_at = now
+        replies.append(now)
+        if len(self._chat_replies) > 64:
+            del self._chat_replies[next(iter(self._chat_replies))]
+        if fallback:
             # The review queue for new rules from questions real players
             # actually ask; the chat log keeps the full conversation.
             self.record_action(
@@ -1739,17 +1782,10 @@ class AtrinikClient:
             response = CHAT_FALLBACKS[
                 self._chat_fallback_uses % len(CHAT_FALLBACKS)]
             self._chat_fallback_uses += 1
+            self._chat_fallback_at[sender.casefold()] = now
         else:
-            return
-
-        prompt_key = f"{msg_type}:{sender.casefold()}:{folded}"
-        now = chat_now
-        if (prompt_key == self._last_chat_prompt or
-                now - self._last_chat_reply_at < 12.0):
-            return
-        self._last_chat_prompt = prompt_key
-        self._last_chat_reply_at = now
-        self._chat_correspondents[sender.casefold()] = now
+            # Only an answered question keeps the conversation open.
+            self._chat_correspondents[sender.casefold()] = now
         if len(self._chat_correspondents) > 32:
             oldest = min(
                 self._chat_correspondents,
