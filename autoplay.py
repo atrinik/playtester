@@ -6,7 +6,8 @@ import logging
 import time
 
 from .client import AtrinikClient
-from .catalog_quest_tasks import CatalogQuestTask, POLICIES
+from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
+                                  POLICIES)
 from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
                          analyzer_farm_selection, hungry, temple_food_trip)
 from .quest_tasks import EscapingDesertedIslandTask
@@ -30,6 +31,10 @@ class AutoplayTask(BotTask):
     MANA_CRYSTAL_LEVEL = 18
     MANA_CRYSTAL_QUEST = "Gandyld's Mana Crystal"
     MANA_CRYSTAL_RECOVERY_RETRY = 24 * 60 * 60
+    # The alchemists' pool lies past Old Outpost maps whose residents reach
+    # level 24 (troll elite soldiers): wait until she outlevels them well.
+    MANA_CRYSTAL_UPGRADE_LEVEL = 30
+    MANA_CRYSTAL_UPGRADE_RETRY = 24 * 60 * 60
 
     def __init__(self, graph: WorldGraph, *, target_level: int = 115):
         super().__init__(f"autoplay:level-{max(1, int(target_level))}")
@@ -39,6 +44,7 @@ class AutoplayTask(BotTask):
         self.phase = "bootstrap"
         self._intro_complete = False
         self._mana_recovery_attempted = False
+        self._mana_upgrade_retry_at = 0.0
         self._retry_at = 0.0
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
@@ -124,6 +130,39 @@ class AutoplayTask(BotTask):
             quest.status != "completed" and
             not self._has_mana_crystal(client) and
             not self._mana_recovery_attempted and not recent_failure)
+
+    def _needs_mana_crystal_upgrade(self, client: AtrinikClient) -> bool:
+        """Take the crystal to the alchemists' pool and report to Gandyld.
+
+        The pool also makes a new crystal when hers is lost, so this runs
+        whether or not she carries one.
+        """
+        quest = client.state.quests.get(self.MANA_CRYSTAL_QUEST)
+        recent_failure = any(
+            entry.get("action") == "autoplay-retry" and
+            "mana-crystal-upgrade" in str(entry.get("detail", "")) and
+            time.time() - float(entry.get("time", 0) or 0) <
+            self.MANA_CRYSTAL_UPGRADE_RETRY
+            for entry in reversed(getattr(client, "decision_history", ()))
+            if isinstance(entry, dict))
+        return bool(
+            client.state.quests_loaded and quest is not None and
+            quest.status != "completed" and
+            any(part.name == ManaCrystalUpgradeTask.PART and
+                part.status not in ("done", "completed", "failed")
+                for part in quest.parts) and
+            int(client.state.stats.get("level", 0) or 0) >=
+            self.MANA_CRYSTAL_UPGRADE_LEVEL and
+            time.monotonic() >= self._mana_upgrade_retry_at and
+            not recent_failure)
+
+    async def _start_mana_crystal_upgrade(
+            self, client: AtrinikClient) -> None:
+        await client.clear_actions()
+        await client.set_combat(False)
+        await client.clear_target()
+        await self._set_child(client, "mana-crystal-upgrade",
+                              ManaCrystalUpgradeTask(self.graph))
 
     async def _start_mana_crystal_detour(
             self, client: AtrinikClient) -> None:
@@ -211,6 +250,9 @@ class AutoplayTask(BotTask):
                 if self._needs_mana_crystal_recovery(client):
                     await self._start_mana_crystal_recovery(client)
                     return
+                if self._needs_mana_crystal_upgrade(client):
+                    await self._start_mana_crystal_upgrade(client)
+                    return
             try:
                 await self.child.tick(client)
             except ConnectionError as exc:
@@ -236,6 +278,11 @@ class AutoplayTask(BotTask):
                     self._temple_food_retry_at = (
                         time.monotonic() +
                         FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+                elif self.phase == "mana-crystal-upgrade":
+                    # A long, hostile trip: do not repeat it every few
+                    # minutes when it cannot succeed.
+                    self._mana_upgrade_retry_at = (
+                        time.monotonic() + self.MANA_CRYSTAL_UPGRADE_RETRY)
                 await self._recover_child_failure(client)
                 return
             completed_phase = self.phase
@@ -276,6 +323,9 @@ class AutoplayTask(BotTask):
             return
         if self._needs_mana_crystal_recovery(client):
             await self._start_mana_crystal_recovery(client)
+            return
+        if self._needs_mana_crystal_upgrade(client):
+            await self._start_mana_crystal_upgrade(client)
             return
 
         # The farming analyzer is the only source of farm spots. Until its
