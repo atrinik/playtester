@@ -2396,6 +2396,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(commands[-1], "/chat Mira, I'm here! Just out training.")
         deliver(c.CHAT_TYPE_CHAT, "[a=#charname]Ash[/a]: SERA WHAT'S YOUR LOCATION")
         self.assertTrue(commands[-1].startswith("/chat Ash, I'm in "))
+        # A line opening "Hi," or "Ok," is not addressed to someone else.
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Bo[/a]: Ok, Sera where are you")
+        self.assertTrue(commands[-1].startswith("/say Bo, I'm in "))
+        count = len(commands)
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Cy[/a]: Hi, Sera!")
+        self.assertEqual(len(commands), count + 1)
+        self.assertTrue(commands[-1].startswith("/say Cy, "))
+        # Her rules read the party line without its "[Party] Name says:".
+        deliver(c.CHAT_TYPE_PARTY, "[a=#charname]Dee[/a]: [P] Dee says: Sera")
+        self.assertEqual(commands[-1], "/gsay Dee, I'm here! Just out training.")
 
     def test_chat_meant_for_others_never_starts_a_reply(self):
         from .client import CHAT_FALLBACKS
@@ -2427,7 +2437,7 @@ class ProtocolTests(unittest.TestCase):
         # ten minutes gets no second fallback.
         deliver(c.CHAT_TYPE_CHAT, "[a=#charname]Kitty[/a]: Sera, ribbit?")
         self.assertEqual(commands, [f"/chat Kitty, {CHAT_FALLBACKS[0]}"])
-        for text in ("lol ok", "who wants to raid", "Sera, croak?"):
+        for text in ("lol ok", "how are you?", "who wants to raid", "Sera, croak?"):
             deliver(c.CHAT_TYPE_CHAT, f"[a=#charname]Kitty[/a]: {text}")
         self.assertEqual(len(commands), 1)
         # Another bot's reply to someone else ("Kitty, ...") is not hers,
@@ -2435,14 +2445,19 @@ class ProtocolTests(unittest.TestCase):
         deliver(c.CHAT_TYPE_LOCAL,
                 "[a=#charname]Mira[/a]: Kitty, Ha, I'm not sure! I'm busy training.")
         self.assertEqual(len(commands), 1)
+        # Mid-conversation, a line Ash addresses to someone else is theirs.
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Ash[/a]: how are you Sera?")
+        self.assertEqual(len(commands), 2)
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Ash[/a]: Kitty, how are you?")
+        self.assertEqual(len(commands), 2)
         # Even when a rule matches each time (her apology rule answers
-        # "Sorry, ..."), no player gets more than three replies in five
+        # "Sorry, ..."), no player gets more than five replies in five
         # minutes: two auto-responders cannot talk forever.
-        for _ in range(6):
+        for _ in range(8):
             deliver(c.CHAT_TYPE_LOCAL,
                     "[a=#charname]Mira[/a]: Sera, Sorry, I didn't quite get that.")
             client._last_chat_prompt = ""
-        self.assertEqual(len(commands), 4)
+        self.assertEqual(len(commands), 7)
         self.assertTrue(commands[-1].startswith("/say Mira, "))
 
     def test_chat_log_keeps_conversations_for_review(self):

@@ -62,6 +62,10 @@ class BotMemory:
             db.execute(
                 """CREATE INDEX IF NOT EXISTS chat_log_by_character
                    ON chat_log (server, account, character, at)""")
+            # Pruning works per account, newest first.
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS chat_log_by_account
+                   ON chat_log (server, account, at)""")
         self._chat_appends = 0
 
     @contextmanager

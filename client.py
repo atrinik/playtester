@@ -32,11 +32,16 @@ from .transport import QuicStream
 POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
 
+# Words that open a line with a comma without addressing anyone ("Hi, ...").
+CHAT_INTERJECTIONS = frozenset((
+    "ah", "btw", "hey", "hi", "hello", "hmm", "lol", "no", "nope", "oh", "ok",
+    "okay", "so", "sorry", "thanks", "ty", "um", "wait", "well", "yeah", "yep",
+    "yes", "yo"))
 # A player gets at most one such fallback reply per this many seconds.
 CHAT_FALLBACK_SECONDS = 600.0
 # And at most this many replies of any kind per window: no conversation
 # with another auto-responder can run on.
-CHAT_REPLIES_PER_SENDER = 3
+CHAT_REPLIES_PER_SENDER = 5
 CHAT_REPLY_WINDOW_SECONDS = 300.0
 # Friendly replies to a message meant for her that no rule answers, in turn.
 CHAT_FALLBACKS = (
@@ -1636,17 +1641,17 @@ class AtrinikClient:
                 sender.casefold(), 0.0) <= 90.0)
         # A line opening with another name ("Mira, ...") is someone else's,
         # as her own replies are: never hers to answer (no bot loops).
+        # "Hi, Sera" or "Ok, where are you" open with a word, not a name.
+        names_her = bool(player_name and re.search(
+            rf"\b{re.escape(player_name)}\b", folded))
         addressee = re.match(r"([a-z][\w'-]*)\s*,", folded)
-        if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and
-                addressee.group(1) != player_name):
+        if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and not names_her
+                and addressee.group(1) not in CHAT_INTERJECTIONS):
             return
         # A tell is meant for her; /say, party and /chat only when they name
         # her or continue a conversation she answered.
         direct = bool(
-            msg_type == c.CHAT_TYPE_PRIVATE or
-            recent_correspondent or
-            (player_name and re.search(
-                rf"\b{re.escape(player_name)}\b", folded)))
+            msg_type == c.CHAT_TYPE_PRIVATE or recent_correspondent or names_her)
         location_question = bool(re.search(
             r"\b(?:where\s+(?:are|r)\s+(?:you|u)|"
             r"where(?:'s|\s+is)\s+(?:sera|she)|"
@@ -1761,8 +1766,7 @@ class AtrinikClient:
 
         prompt_key = f"{msg_type}:{sender.casefold()}:{folded}"
         now = chat_now
-        replies = self._chat_replies.setdefault(
-            sender.casefold(), deque(maxlen=CHAT_REPLIES_PER_SENDER))
+        replies = self._chat_replies.get(sender.casefold(), ())
         if (prompt_key == self._last_chat_prompt or
                 now - self._last_chat_reply_at < 12.0 or
                 (len(replies) == CHAT_REPLIES_PER_SENDER and
@@ -1770,7 +1774,15 @@ class AtrinikClient:
             return
         self._last_chat_prompt = prompt_key
         self._last_chat_reply_at = now
+        # Reinserted on each reply, so the dict runs least recently used
+        # first; senders quiet for a whole window are forgotten.
+        replies = self._chat_replies.pop(
+            sender.casefold(), None) or deque(maxlen=CHAT_REPLIES_PER_SENDER)
         replies.append(now)
+        for key in [key for key, value in self._chat_replies.items()
+                    if now - value[-1] >= CHAT_REPLY_WINDOW_SECONDS]:
+            del self._chat_replies[key]
+        self._chat_replies[sender.casefold()] = replies
         if len(self._chat_replies) > 64:
             del self._chat_replies[next(iter(self._chat_replies))]
         if fallback:
@@ -1782,6 +1794,9 @@ class AtrinikClient:
             response = CHAT_FALLBACKS[
                 self._chat_fallback_uses % len(CHAT_FALLBACKS)]
             self._chat_fallback_uses += 1
+            for key in [key for key, at in self._chat_fallback_at.items()
+                        if now - at >= CHAT_FALLBACK_SECONDS]:
+                del self._chat_fallback_at[key]
             self._chat_fallback_at[sender.casefold()] = now
         else:
             # Only an answered question keeps the conversation open.
