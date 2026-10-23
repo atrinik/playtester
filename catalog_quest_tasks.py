@@ -536,6 +536,16 @@ def apply_ground_trip(graph: WorldGraph, action: Action) -> NavigateThenTask:
     return task
 
 
+class ArrivedTask(BotTask):
+    """Done on arrival: lets NavigateThenTask serve as a defended leg."""
+
+    def __init__(self):
+        super().__init__("arrived")
+
+    async def tick(self, client: AtrinikClient) -> None:
+        self.complete()
+
+
 class ManaCrystalUpgradeTask(BotTask):
     """Enhance Gandyld's mana crystal in the alchemists' pool, then report.
 
@@ -545,12 +555,19 @@ class ManaCrystalUpgradeTask(BotTask):
     accepts the first. The pool makes the enhanced crystal whether or not
     she carries the old one (pool_concoction.py), so it also replaces a
     lost crystal; Gandyld's dialogue offers no other replacement.
+
+    The trip leaves the farm circuit, whose death and recall handling never
+    sees it, so it fails itself on a death or emergency recall and after
+    MAX_SECONDS; autoplay then waits a day before trying again.
     """
 
     QUEST = "Gandyld's Mana Crystal"
     PART = "A Better Crystal"
     UPGRADED_CAPACITY = 100
     REPORT_WAIT_SECONDS = 6.0
+    MAX_SECONDS = 30 * 60
+    EXAMINE_ATTEMPTS = 3
+    GANDYLD_MAP = "/shattered_islands/world_6_58"
 
     def __init__(self, graph: WorldGraph,
                  catalog: dict[str, QuestDefinition] | None = None):
@@ -559,8 +576,12 @@ class ManaCrystalUpgradeTask(BotTask):
         self.catalog = catalog or load_catalog()
         self.child: BotTask | None = None
         self.dipped = False
+        self.returned = False
         self._reported_at = 0.0
         self._last_request = 0.0
+        self._started_at = 0.0
+        self._started_epoch = 0.0
+        self._examine_attempts = 0
 
     def _part_active(self, client: AtrinikClient) -> bool:
         quest = client.state.quests.get(self.QUEST)
@@ -570,12 +591,42 @@ class ManaCrystalUpgradeTask(BotTask):
                    part.status not in ("done", "completed", "failed")
                    for part in quest.parts)
 
+    def _trip_failure(self, client: AtrinikClient) -> str:
+        for record in reversed(getattr(client, "decision_history", ())):
+            if not isinstance(record, dict):
+                continue
+            if float(record.get("time", 0.0) or 0.0) < self._started_epoch:
+                break
+            if record.get("action") in ("death", "emergency-recall"):
+                return f"{record['action']} during the trip"
+        if time.monotonic() - self._started_at > self.MAX_SECONDS:
+            return f"trip took over {self.MAX_SECONDS // 60} minutes"
+        return ""
+
+    def _return_leg(self) -> NavigateThenTask:
+        """Back to Gandyld's map, fighting out of the Old Outpost."""
+        place = NPC["Gandyld"]
+        task = NavigateThenTask(
+            self.graph, place.map_path, ArrivedTask(),
+            destination_xy=(place.x, place.y), combat_approach=True,
+            safety=SafetyPolicy(heal_below=0.85, flee_below=0.70))
+        task.navigation.tolerance = 2
+        task.navigation.allow_ranged_hazard_fallback = True
+        return task
+
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
+        now = time.monotonic()
+        if not self._started_at:
+            self._started_at = now
+            self._started_epoch = time.time()
+        failure = self._trip_failure(client)
+        if failure:
+            self.fail(failure)
+            return
         if client.state.phase != "playing":
             return
-        now = time.monotonic()
         if not client.state.quests_loaded:
             if now - self._last_request > 1.0:
                 await client.request_quests()
@@ -593,6 +644,8 @@ class ManaCrystalUpgradeTask(BotTask):
                 return
             if isinstance(self.child, DialogAtTask):
                 self._reported_at = now
+            elif isinstance(getattr(self.child, "task", None), ArrivedTask):
+                self.returned = True
             else:
                 self.dipped = True
             self.child = None
@@ -610,15 +663,27 @@ class ManaCrystalUpgradeTask(BotTask):
                 await client.request_quests()
                 self._last_request = now
             return
-        crystal = ManaCrystal.carried(client)
-        if (not self.dipped and crystal is not None and
-                await ManaCrystal.learn(client, crystal)):
-            return
-        known = ManaCrystal.known(crystal) if crystal is not None else None
-        if not self.dipped and (
-                known is None or known[0] < self.UPGRADED_CAPACITY):
-            policy = POLICIES[self.QUEST].parts[self.PART]
-            self.child = apply_ground_trip(self.graph, policy.action)
+        if not self.dipped:
+            crystal = ManaCrystal.carried(client)
+            if crystal is not None and ManaCrystal.known(crystal) is None:
+                # Never send a crystal of unknown capacity to the pool: an
+                # enhanced one would only waste the trip. Examine again.
+                if await ManaCrystal.learn(client, crystal):
+                    return
+                if ManaCrystal.known(crystal) is None:
+                    self._examine_attempts += 1
+                    if self._examine_attempts >= self.EXAMINE_ATTEMPTS:
+                        self.fail("could not read the crystal's capacity")
+                        return
+                    crystal.extra.pop("crystal_examine_retry_at", None)
+                    return
+            known = ManaCrystal.known(crystal) if crystal is not None else None
+            if known is None or known[0] < self.UPGRADED_CAPACITY:
+                policy = POLICIES[self.QUEST].parts[self.PART]
+                self.child = apply_ground_trip(self.graph, policy.action)
+                return
+        if not self.returned and client.state.map.path != self.GANDYLD_MAP:
+            self.child = self._return_leg()
             return
         definition = self.catalog[self.QUEST]
         uid = next(part.uid for part in flatten_parts(definition.parts)

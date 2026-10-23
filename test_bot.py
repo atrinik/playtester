@@ -21,7 +21,7 @@ from .navigation import (BuySpellTask, FarmCircuitTask, FoodProfile,
                          NavigateTask, NavigateThenTask, ServerGameClock,
                          ShopUpgradeSweepTask, WorldGraph, _coordinate_name,
                          content_attr, CONTENT_ROOT)
-from .catalog_quest_tasks import (ApplyAtTask, ApplyGroundTask,
+from .catalog_quest_tasks import (ApplyAtTask, ApplyGroundTask, ArrivedTask,
                                   CatalogQuestTask, DialogAtTask,
                                   AcquireContainerItemTask,
                                   ManaCrystalUpgradeTask,
@@ -3473,7 +3473,8 @@ class QuestTests(unittest.TestCase):
         detail = stock.extra["examined_gear_detail"]
         self.assertEqual(detail["dam"], 8)
         self.assertEqual(detail["attacks"], 15)
-        self.assertEqual(detail["protections"], 12)
+        # Weighted like the "+12" an item name would show.
+        self.assertEqual(detail["protections"], 12 * 8)
         self.assertGreater(task._upgrade_score(client, stock), 0)
 
     def test_shop_upgrade_does_not_score_base_physical_attack_as_bonus(self):
@@ -3539,9 +3540,11 @@ class QuestTests(unittest.TestCase):
                          {"regen": 1, "pow": 1})
         # Pow counts through the caster value only, never also at 40.
         self.assertEqual(stock.extra["examined_gear_detail"]["stats"], 0)
-        # It replaces the worthless worn Pow+1 ring: one regeneration point.
+        # Its baseline is the weaker worn ring, the worthless Pow+1 one
+        # (the force ring scores 136 more); inventory upkeep takes that one
+        # off explicitly. The gain is one regeneration point.
         self.assertEqual(caster._upgrade_score(client, stock),
-                         210 + 358 - 240)
+                         210 + 333 - 240)
 
     def test_shop_upgrade_counts_unreadied_owned_bow_as_baseline(self):
         owned = Item(
@@ -7753,6 +7756,27 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(client.applied, [])
 
+    def test_mana_crystal_draw_guards_and_unacknowledged_casts(self):
+        client, crystal = self._crystal_farm_client(62, 62, x=9, stored=50)
+        # A full bar draws nothing: the server would move no mana.
+        self.assertFalse(asyncio.run(ManaCrystal.draw(client)))
+        self.assertEqual(client.applied, [])
+        self.assertEqual(ManaCrystal.known_charge(client), 50)
+        self.assertTrue(ManaCrystal.has_charge(client))
+        # A cast sent but not yet acknowledged: its cost counts as spent, so
+        # landing after the apply it does not read as an empty crystal.
+        client.state.stats["sp"] = 10
+        self.assertTrue(asyncio.run(ManaCrystal.draw(client, sp=2)))
+        self.assertEqual(crystal.extra["crystal_apply"][:2], ("draw", 2))
+        self._server_sets_sp(client, 52)
+        ManaCrystal.settle(client, crystal)
+        self.assertEqual(ManaCrystal.known_charge(client), 0)
+        self.assertFalse(ManaCrystal.has_charge(client))
+        # Unexamined: no known charge.
+        del crystal.extra["crystal_capacity"]
+        self.assertIsNone(ManaCrystal.known_charge(client))
+        self.assertFalse(ManaCrystal.has_charge(client))
+
     def test_mana_crystal_learns_capacity_and_corrects_from_no_change(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
@@ -7877,18 +7901,18 @@ class QuestTests(unittest.TestCase):
         # Int 12 to 11 changes nothing either; to 10 it costs max mana.
         self.assertEqual(caster.gear_score(ring("ring (Int-1)")), plain)
         self.assertLess(caster.gear_score(ring("ring (Int-2)")), plain)
-        # One regeneration point is +45% regeneration (60 / (60 + 74)), far
-        # above any stat, and the name's "+0" is not a generic bonus.
-        self.assertEqual(caster.gear_score(regen_ring), plain + 358)
+        # One regeneration point is +42% regeneration (60 / (60 + 74 + 10)),
+        # far above any stat, and the name's "+0" is not a generic bonus.
+        self.assertEqual(caster.gear_score(regen_ring), plain + 333)
         self.assertEqual(caster.gear_score(ring("ring (mana reg.+0.8)")),
-                         plain + 716)
+                         plain + 667)
         self.assertGreater(caster.gear_score(mana_ring),
                            caster.gear_score(plus_ring))
         # Pow 15 to 16 is +15% spell damage plus a little mana.
         caster.caster_profile = CasterProfile(
             power=15, intelligence=12, maxsp=74, base_maxsp=74.0)
         pow_value = caster.gear_score(pow_ring) - plain - 8
-        self.assertEqual(pow_value, 146)
+        self.assertEqual(pow_value, 144)
         self.assertGreater(caster.gear_score(regen_ring),
                            caster.gear_score(pow_ring))
         # A worn item is valued from her stats without it.
@@ -7919,19 +7943,80 @@ class QuestTests(unittest.TestCase):
             power=13, intelligence=15, maxsp=74, base_maxsp=74.0)
         self.assertGreater(policy.caster_value({"int": 1}), 0)
 
-    def test_caster_profile_reads_worn_regeneration_and_mana(self):
+    def test_caster_profile_reads_regeneration_and_base_mana(self):
         client = self._wizard_training_client(100)
-        client.state.stats.update({"pow": 16, "int": 12, "maxsp": 86})
+        client.state.inventory[0].extra["level"] = 13
+        client.state.stats.update({"pow": 13, "int": 12, "maxsp": 74})
         client.state.inventory.extend((
             Item(60, item_type=c.TYPE_RING, flags=c.ITEM_APPLIED,
                  name="ring (mana reg.+0.8) (mana+6)"),
             # Carried, not worn: no regeneration.
             Item(61, item_type=c.TYPE_RING, name="ring (mana reg.+0.4)"),
         ))
+        # Without the regen_sp stat, worn names are the fallback.
         profile = CasterProfile.from_client(client)
         self.assertEqual(profile.regen_points, 3)
-        # 86 = base * (1 + 0.1 / 2.5) + 6
-        self.assertAlmostEqual(profile.base_maxsp, 80 / 1.04)
+        # Base mana is the archetype's 4 times Wizardry 13 + 3, whatever
+        # titled items add on top.
+        self.assertEqual(profile.base_maxsp, 64.0)
+        # Her live 1.3 regen_sp at 74 max mana is gen_sp 2: a titled
+        # talisman adds a point no name shows.
+        client.state.stats["regen_sp"] = 1.3
+        self.assertEqual(CasterProfile.from_client(client).regen_points, 2)
+
+    @staticmethod
+    def _ring_client(right_name, left_name, candidate_name):
+        client = QuestTests._wizard_training_client(100)
+        client.state.inventory[0].extra["level"] = 13
+        client.state.stats.update(
+            {"pow": 13, "int": 12, "maxsp": 74, "regen_sp": 1.3})
+        client.applied = []
+
+        async def apply(tag, apply_action=0):
+            client.applied.append(tag)
+
+        client.apply = apply
+        rings = (
+            Item(61, item_type=c.TYPE_RING, quality=80, condition=80,
+                 flags=c.ITEM_APPLIED | c.ITEM_LOCKED, name=right_name),
+            Item(62, item_type=c.TYPE_RING, quality=80, condition=80,
+                 flags=c.ITEM_APPLIED | c.ITEM_LOCKED, name=left_name),
+            Item(63, item_type=c.TYPE_RING, quality=80, condition=80,
+                 flags=c.ITEM_LOCKED, name=candidate_name),
+        )
+        client.state.inventory.extend(rings)
+        client.state.items.update({ring.tag: ring for ring in rings})
+        client.state.equipment.update(
+            {c.EQUIP_RING_RIGHT: 61, c.EQUIP_RING_LEFT: 62})
+        return client
+
+    def test_caster_ring_upgrade_takes_off_the_weakest_ring_first(self):
+        client = self._ring_client(
+            "brass ring (Protections: force +17%)", "copper ring (Pow+1)",
+            "gold ring (mana reg.+0.4)")
+        task = FarmTask(zone="/test", combat_skill="wizardry spells")
+        self.assertTrue(asyncio.run(task.maintain_inventory(client)))
+        # The server would keep the first worn ring in inventory order;
+        # the Pow ring comes off explicitly before the regeneration ring.
+        self.assertEqual(client.applied, [62, 63])
+
+    def test_caster_bonus_displaces_a_protection_ring_only_when_clear(self):
+        client = self._ring_client(
+            "brass ring (Protections: force +17%)",
+            "iron ring (Protections: slow +14%)",
+            "gold ring (mana reg.+0.4)")
+        task = FarmTask(zone="/test", combat_skill="wizardry spells")
+        asyncio.run(task.maintain_inventory(client))
+        # One regeneration point (235) beats the slow ring (112) but not
+        # by the protection's worth again.
+        self.assertEqual(client.applied, [])
+        client = self._ring_client(
+            "brass ring (Protections: force +17%)",
+            "iron ring (Protections: slow +14%)",
+            "gold ring (mana reg.+0.8)")
+        task = FarmTask(zone="/test", combat_skill="wizardry spells")
+        asyncio.run(task.maintain_inventory(client))
+        self.assertEqual(client.applied, [62, 63])
 
     def test_wizardry_training_scores_gear_as_a_caster(self):
         client = self._wizard_training_client(100)
@@ -11036,6 +11121,18 @@ class QuestTests(unittest.TestCase):
         client.request_quests = noop
         asyncio.run(task.tick(client))
         self.assertTrue(task.dipped)
+        # Back to Gandyld's map first, fighting out of the Old Outpost.
+        asyncio.run(task.tick(client))
+        self.assertIsInstance(task.child, NavigateThenTask)
+        self.assertIsInstance(task.child.task, ArrivedTask)
+        self.assertTrue(task.child.navigation.allow_ranged_hazard_fallback)
+        self.assertEqual(task.child.navigation.destination,
+                         "/shattered_islands/world_6_58")
+        task.child.task.status = TaskStatus.COMPLETE
+        task.child.status = TaskStatus.COMPLETE
+        task.child.tick = noop
+        asyncio.run(task.tick(client))
+        self.assertTrue(task.returned)
         asyncio.run(task.tick(client))
         self.assertIsInstance(task.child, DialogAtTask)
         self.assertEqual([choice.pattern for choice in task.child.dialog.choices],
@@ -11048,12 +11145,71 @@ class QuestTests(unittest.TestCase):
 
     def test_mana_crystal_upgrade_reports_an_already_enhanced_crystal(self):
         client = self._gandyld_client()
+        client.state.map.path = "/shattered_islands/world_6_58"
         client.state.inventory.append(Item(
             70, item_type=c.TYPE_POWER_CRYSTAL, name="Gandyld's Mana Crystal",
             extra={"crystal_capacity": 100, "crystal_stored": 40}))
         task = ManaCrystalUpgradeTask(built_graph())
         asyncio.run(task.tick(client))
         self.assertIsInstance(task.child, DialogAtTask)
+
+    def test_mana_crystal_upgrade_never_pools_an_unknown_crystal(self):
+        client = self._gandyld_client()
+        crystal = Item(70, item_type=c.TYPE_POWER_CRYSTAL,
+                       name="Gandyld's Mana Crystal",
+                       extra={"crystal_examine_retry_at": 1e12})
+        client.state.inventory.append(crystal)
+        task = ManaCrystalUpgradeTask(built_graph())
+        examined = []
+
+        async def unanswered(client, item):
+            examined.append(item.extra.pop("crystal_examine_retry_at", None))
+            item.extra["crystal_examine_retry_at"] = 1e12
+            return False
+
+        with patch.object(ManaCrystal, "learn", unanswered):
+            for _ in range(3):
+                asyncio.run(task.tick(client))
+                self.assertIsNone(task.child)
+        # Each failed examine is retried at once, then the trip gives up.
+        self.assertEqual(len(examined), 3)
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("capacity", task.error)
+
+    def test_mana_crystal_upgrade_aborts_on_death_recall_or_overrun(self):
+        for action in ("death", "emergency-recall"):
+            client = self._gandyld_client()
+            client.decision_history = [
+                {"time": time.time() - 60, "action": "death"}]
+            task = ManaCrystalUpgradeTask(built_graph())
+            asyncio.run(task.tick(client))
+            # An older death does not count.
+            self.assertEqual(task.status, TaskStatus.RUNNING)
+            client.decision_history.append(
+                {"time": time.time() + 1, "action": action})
+            asyncio.run(task.tick(client))
+            self.assertEqual(task.status, TaskStatus.FAILED)
+            self.assertIn(action, task.error)
+        client = self._gandyld_client()
+        task = ManaCrystalUpgradeTask(built_graph())
+        asyncio.run(task.tick(client))
+        task._started_at -= task.MAX_SECONDS + 1
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("30 minutes", task.error)
+
+    def test_gandyld_report_routes_back_out_of_the_old_outpost(self):
+        graph = built_graph()
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 31
+        client.state.map = MapState(
+            path="/shattered_islands/strakewood_island/old_outpost/"
+                 "old_outpost_a_0201", world_x=7, world_y=8)
+        leg = ManaCrystalUpgradeTask(graph)._return_leg()
+        route = leg.navigation._plan(client)
+        self.assertEqual(route[-1].destination,
+                         "/shattered_islands/world_6_58")
 
     def test_alchemists_pool_is_reachable_through_the_old_outpost(self):
         graph = built_graph()

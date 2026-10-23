@@ -191,10 +191,15 @@ Otherwise scoring is unchanged and every "+N" counts the same.
 A caster bonus is worth only what it adds at her current stats, using the
 server's formulas:
 
-- **Mana regeneration.** The server regenerates mana at `gen_sp × 60 + maxsp`.
-  `gen_sp` starts at 1 and each worn non-weapon adds its regeneration, which
-  item names show as `(mana reg.+0.4)` per point. One point at her 74 max
-  mana is +45% regeneration.
+- **Mana regeneration.** The server regenerates mana in proportion to
+  `gen_sp × 60 + maxsp + 10`. `gen_sp` starts at 1 and each worn non-weapon
+  adds its regeneration. Item names show it as `(mana reg.+0.4)` per point,
+  but only on untitled rings, amulets and trinkets: a titled item such as
+  the Blue Crystal Talisman of Incuna hides its point. So `gen_sp` is read
+  back from her `regen_sp` stat, which the server sends as
+  `(gen_sp × 60 + maxsp + 10) / 15` tenths before Meditation (at the default
+  8 ticks a second); names are only the fallback. A point's worth depends on
+  what she already wears: with `gen_sp` 2 and 74 max mana it is +29%.
 - **Pow.** Spell damage is multiplied by `1 + spell_dam_bonus[Pow]`, which is
   flat for 11-15: Pow 13 to 14 adds nothing, and 15 to 16 adds 15%. Pow also
   adds `sp_bonus[Pow] / 2.5` of base max mana.
@@ -203,21 +208,37 @@ server's formulas:
   same stat value would give, so Int never outweighs Pow.
 - **Max mana** (`(mana+N)`). Worth its share of her max mana, plus the
   regeneration it adds through `maxsp`.
+- **Base max mana**, which Int and Pow scale, is the player archetype's 4
+  times Wizardry level + 3 (64 at Wizardry 13), not derived from her total,
+  which hidden item mana inflates.
 
 A percent of regeneration counts as much as a percent of spell damage (8
 points), because mana bounds her kill rate. A percent of max mana counts 2.
-So one regeneration point (about 358) outscores any single stat. A worn item
-is valued against her stats without it, so a worn Pow+1 ring that lifts her
-from 12 to 13 is worth nothing next to a candidate that would. Weapons add
-no max mana or regeneration on the server, so on a weapon those count for
-nothing. Shop stock whose ground name lacks the bonuses is valued from its
-examine text, and is never also counted at the generic 40 per stat.
+So one regeneration point (about 235 at `gen_sp` 2) outscores any single
+stat. A worn item is valued against her stats without it, so a worn Pow+1
+ring that lifts her from 12 to 13 is worth nothing next to a candidate that
+would. Weapons add no max mana or regeneration on the server, so on a
+weapon those count for nothing. Shop stock whose ground name lacks the
+bonuses is valued from its examine text, and is never also counted at the
+generic 40 per stat.
+
+Protections count 8 per percent everywhere: through the name's generic
+"+N", and in the shop examine score when the ground name lacks them. A
+caster upgrade takes off a protection item only when it wins clearly, by
+the protection's worth once more: one regeneration point does not displace
+her "slow +14%" ring, two do. Melee scoring has no such margin.
+
+With both ring slots full, the server keeps whichever worn ring comes first
+in inventory order and takes off the other, which may be the better one.
+So a ring upgrade first takes off the weakest worn ring explicitly, then
+puts the new one on.
 
 ### Greyton's ring stock
 
 From level 30, the upgrade sweep also visits Greyton's general store
-(`world_9_67`). Its stock includes a difficulty-50 random-ring square, and
-random rings can roll Pow, Int or mana regeneration. The road from Aris
+(`world_9_67`). Its stock includes a difficulty-50 `random_talisman` square
+(14,8), which rolls a ring 60% of the time and an amulet 40%. Random rings
+can roll Pow, Int or mana regeneration. The road from Aris
 passes level 28-29 orc spawns, hence the level gate. Greyton comes last in
 the sweep, so a saved cursor from an earlier sweep keeps its meaning. The
 sweep policy version moved to 8, so characters at level 18 and above sweep
@@ -244,7 +265,12 @@ drawing).
 - **Drawing.** In a spell-only fight, when the next cast would dip into the
   healing reserve, she applies the crystal if it holds mana
   (`mana-crystal-draw`). She never applies an empty crystal, a full one at
-  full mana, or one while a cast is still affordable.
+  full mana, or one while a cast is still affordable. The mana a draw
+  starts from is net of casts sent but not yet acknowledged, so a cast's
+  cost landing after the apply is not read as an empty crystal.
+- **Charge for other code.** `ManaCrystal.known_charge(client)` and
+  `has_charge(client)` tell whether the crystal holds mana. Code that counts
+  on a mana restorer should use them rather than the crystal's presence.
 
 Getting the crystal and upgrading it:
 
@@ -253,11 +279,18 @@ Getting the crystal and upgrading it:
   she checks the apartment chest, at most once a day.
 - **The free upgrade (`ManaCrystalUpgradeTask`).** It runs from level 30
   while "A Better Crystal" is active. Her crystal's capacity is checked
-  first. If it is below 100, or she has no crystal, she fights through the
-  Old Outpost and applies the alchemists' pool on `old_outpost_a_0201`
-  (7,8). The route's strongest residents are level 24 troll elite soldiers.
-  Then she reports to Gandyld, which completes the part and starts "A
-  Stronger Crystal". A failed trip waits a day before it is tried again.
+  first, by examining it again if an earlier examine went unanswered; a
+  crystal of unknown capacity never goes to the pool. If the capacity is
+  below 100, or she has no crystal, she fights through the Old Outpost and
+  applies the alchemists' pool on `old_outpost_a_0201` (7,8). The route's
+  strongest residents are level 24 troll elite soldiers. She then fights
+  her way back to Gandyld's map on a defended leg (the plain dialogue route
+  finds no way out of the Outpost) and reports, which completes the part
+  and starts "A Stronger Crystal".
+- **Trip guards.** The trip runs outside the farm circuit, whose death and
+  recall handling never sees it. It fails on a death or emergency recall
+  recorded after it started, and after 30 minutes. A failed trip waits a
+  day before it is tried again.
 - **Replacement.** Gandyld's dialogue offers no replacement crystal, but the
   pool's script creates the enhanced crystal whether or not she carries the
   old one. So the pool trip also replaces a lost crystal.
