@@ -12,7 +12,8 @@ from .navigation import NavigateTask, NavigateThenTask, WorldGraph
 from .quest_tasks import DialogTask, EscapingDesertedIslandTask
 from .quests import (QuestDefinition, QuestObjective, dialogue_choices,
                      flatten_parts, load_catalog)
-from .tasks import BotTask, FarmTask, LootPolicy, TaskStatus
+from .tasks import (BotTask, FarmTask, LootPolicy, ManaCrystal, SafetyPolicy,
+                    TaskStatus)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,13 +172,20 @@ POLICIES: dict[str, QuestPolicy] = {
                 "kill", _p("/shattered_islands/strakewood_island/old_outpost/old_outpost_0202", 12, 20),
                 target="Torathog", patrol=((12, 20),)), "Galann Strongfist", "kill_torathog"),
         }),
+    # Each part dips the crystal in a concoction pool (the pool's apply
+    # script, pool_concoction.py). The second pool is in King Rhun's vault,
+    # behind a door whose key King Rhun himself carries.
     "Gandyld's Mana Crystal": QuestPolicy(
         "Gandyld's Mana Crystal", _dialog("Gandyld"), {
             "A Better Crystal": _part(Action(
-                "visit", _p("/shattered_islands/strakewood_island/old_outpost/old_outpost_a_0201", 7, 8)),
+                "apply_ground", _p("/shattered_islands/strakewood_island/old_outpost/old_outpost_a_0201", 7, 8),
+                item="strange concoction",
+                target="You dip the mana crystal into the pool"),
                 "Gandyld", "enhance_crystal_alchemists"),
             "A Stronger Crystal": _part(Action(
-                "visit", _p("/shattered_islands/strakewood_island/old_outpost/old_outpost_a_0204", 7, 17)),
+                "apply_ground", _p("/shattered_islands/strakewood_island/old_outpost/old_outpost_a_0204", 7, 17),
+                item="strange concoction",
+                target="You dip the mana crystal into the pool"),
                 "Gandyld", "enhance_crystal_rhun"),
         }),
     "Lairwenn's Notes": QuestPolicy(
@@ -473,6 +481,217 @@ class ApplyAtTask(BotTask):
             return
         await client.apply(item.tag)
         self.applied = True
+
+
+class ApplyGroundTask(BotTask):
+    """Apply an object underfoot and wait for the message it causes."""
+
+    TIMEOUT_SECONDS = 4.0
+
+    def __init__(self, object_pattern: str, success_pattern: str):
+        super().__init__(f"apply-ground:{object_pattern}")
+        self.pattern = re.compile(object_pattern, re.I)
+        self.success = re.compile(success_pattern, re.I)
+        self._waiting_since = 0.0
+        self._sent_at = 0.0
+        self._position = 0
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        now = time.monotonic()
+        if self._sent_at:
+            if any(self.success.search(entry[3])
+                   for entry in client.state.messages_since(self._position)
+                   if len(entry) > 3):
+                self.complete()
+            elif now - self._sent_at > self.TIMEOUT_SECONDS:
+                self.fail(f"applying {self.pattern.pattern} had no effect")
+            return
+        target = next((item for item in client.state.ground
+                       if self.pattern.search(item.name)), None)
+        if target is None:
+            if not self._waiting_since:
+                self._waiting_since = now
+            elif now - self._waiting_since > self.TIMEOUT_SECONDS:
+                self.fail(f"no {self.pattern.pattern} underfoot")
+            return
+        self._position = client.state.message_count
+        self._sent_at = now
+        await client.apply(target.tag)
+
+
+def apply_ground_trip(graph: WorldGraph, action: Action) -> NavigateThenTask:
+    """Walk to an object, fighting through hostile maps, and apply it."""
+    assert action.place is not None
+    task = NavigateThenTask(
+        graph, action.place.map_path,
+        ApplyGroundTask(action.item, action.target),
+        destination_xy=(action.place.x, action.place.y),
+        combat_approach=True,
+        safety=SafetyPolicy(heal_below=0.85, flee_below=0.70))
+    # The Old Outpost pools lie past several hostile maps; without this
+    # the navigator finds no route at all.
+    task.navigation.allow_ranged_hazard_fallback = True
+    return task
+
+
+class ArrivedTask(BotTask):
+    """Done on arrival: lets NavigateThenTask serve as a defended leg."""
+
+    def __init__(self):
+        super().__init__("arrived")
+
+    async def tick(self, client: AtrinikClient) -> None:
+        self.complete()
+
+
+class ManaCrystalUpgradeTask(BotTask):
+    """Enhance Gandyld's mana crystal in the alchemists' pool, then report.
+
+    Only the first upgrade (50 to 100 SP, "A Better Crystal"): the second
+    pool is in King Rhun's vault, behind a door whose key King Rhun (level
+    30, among his level 25-30 guards) carries, so this stops once Gandyld
+    accepts the first. The pool makes the enhanced crystal whether or not
+    she carries the old one (pool_concoction.py), so it also replaces a
+    lost crystal; Gandyld's dialogue offers no other replacement.
+
+    The trip leaves the farm circuit, whose death and recall handling never
+    sees it, so it fails itself on a death or emergency recall and after
+    MAX_SECONDS; autoplay then waits a day before trying again.
+    """
+
+    QUEST = "Gandyld's Mana Crystal"
+    PART = "A Better Crystal"
+    UPGRADED_CAPACITY = 100
+    REPORT_WAIT_SECONDS = 6.0
+    MAX_SECONDS = 30 * 60
+    EXAMINE_ATTEMPTS = 3
+    GANDYLD_MAP = "/shattered_islands/world_6_58"
+
+    def __init__(self, graph: WorldGraph,
+                 catalog: dict[str, QuestDefinition] | None = None):
+        super().__init__("mana-crystal-upgrade")
+        self.graph = graph
+        self.catalog = catalog or load_catalog()
+        self.child: BotTask | None = None
+        self.dipped = False
+        self.returned = False
+        self._reported_at = 0.0
+        self._last_request = 0.0
+        self._started_at = 0.0
+        self._started_epoch = 0.0
+        self._examine_attempts = 0
+
+    def _part_active(self, client: AtrinikClient) -> bool:
+        quest = client.state.quests.get(self.QUEST)
+        if quest is None or quest.status == "completed":
+            return False
+        return any(part.name == self.PART and
+                   part.status not in ("done", "completed", "failed")
+                   for part in quest.parts)
+
+    def _trip_failure(self, client: AtrinikClient) -> str:
+        for record in reversed(getattr(client, "decision_history", ())):
+            if not isinstance(record, dict):
+                continue
+            if float(record.get("time", 0.0) or 0.0) < self._started_epoch:
+                break
+            if record.get("action") in ("death", "emergency-recall"):
+                return f"{record['action']} during the trip"
+        if time.monotonic() - self._started_at > self.MAX_SECONDS:
+            return f"trip took over {self.MAX_SECONDS // 60} minutes"
+        return ""
+
+    def _return_leg(self) -> NavigateThenTask:
+        """Back to Gandyld's map, fighting out of the Old Outpost."""
+        place = NPC["Gandyld"]
+        task = NavigateThenTask(
+            self.graph, place.map_path, ArrivedTask(),
+            destination_xy=(place.x, place.y), combat_approach=True,
+            safety=SafetyPolicy(heal_below=0.85, flee_below=0.70))
+        task.navigation.tolerance = 2
+        task.navigation.allow_ranged_hazard_fallback = True
+        return task
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        now = time.monotonic()
+        if not self._started_at:
+            self._started_at = now
+            self._started_epoch = time.time()
+        failure = self._trip_failure(client)
+        if failure:
+            self.fail(failure)
+            return
+        if client.state.phase != "playing":
+            return
+        if not client.state.quests_loaded:
+            if now - self._last_request > 1.0:
+                await client.request_quests()
+                self._last_request = now
+            return
+        if not self._part_active(client):
+            self.complete()
+            return
+        if self.child is not None:
+            await self.child.tick(client)
+            if self.child.status == TaskStatus.FAILED:
+                self.fail(f"{self.child.name}: {self.child.error}")
+                return
+            if self.child.status != TaskStatus.COMPLETE:
+                return
+            if isinstance(self.child, DialogAtTask):
+                self._reported_at = now
+            elif isinstance(getattr(self.child, "task", None), ArrivedTask):
+                self.returned = True
+            else:
+                self.dipped = True
+            self.child = None
+            await client.clear_actions()
+            await client.set_combat(False)
+            await client.request_quests()
+            self._last_request = now
+            return
+        if self._reported_at:
+            # The quest journal follows the dialogue; it still shows the
+            # part active only if Gandyld did not take the crystal.
+            if now - self._reported_at > self.REPORT_WAIT_SECONDS:
+                self.fail("Gandyld did not accept the enhanced crystal")
+            elif now - self._last_request > 2.0:
+                await client.request_quests()
+                self._last_request = now
+            return
+        if not self.dipped:
+            crystal = ManaCrystal.carried(client)
+            if crystal is not None and ManaCrystal.known(crystal) is None:
+                # Never send a crystal of unknown capacity to the pool: an
+                # enhanced one would only waste the trip. Examine again.
+                if await ManaCrystal.learn(client, crystal):
+                    return
+                if ManaCrystal.known(crystal) is None:
+                    self._examine_attempts += 1
+                    if self._examine_attempts >= self.EXAMINE_ATTEMPTS:
+                        self.fail("could not read the crystal's capacity")
+                        return
+                    crystal.extra.pop("crystal_examine_retry_at", None)
+                    return
+            known = ManaCrystal.known(crystal) if crystal is not None else None
+            if known is None or known[0] < self.UPGRADED_CAPACITY:
+                policy = POLICIES[self.QUEST].parts[self.PART]
+                self.child = apply_ground_trip(self.graph, policy.action)
+                return
+        if not self.returned and client.state.map.path != self.GANDYLD_MAP:
+            self.child = self._return_leg()
+            return
+        definition = self.catalog[self.QUEST]
+        uid = next(part.uid for part in flatten_parts(definition.parts)
+                   if part.name == self.PART)
+        self.child = DialogAtTask(
+            self.graph, NPC["Gandyld"], "Gandyld",
+            dialogue_choices(definition, "Gandyld", action="complete",
+                             uid=uid))
 
 
 class IncunaApartmentTutorialTask(BotTask):
@@ -860,6 +1079,8 @@ class CatalogQuestTask(BotTask):
                                 (action.place.x, action.place.y))
         if action.kind == "apply":
             return ApplyAtTask(self.graph, action.place, action.item)
+        if action.kind == "apply_ground":
+            return apply_ground_trip(self.graph, action)
         if action.kind == "apartment_tutorial":
             return IncunaApartmentTutorialTask(self.graph, action)
         if action.kind == "container":
