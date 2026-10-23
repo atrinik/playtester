@@ -160,6 +160,70 @@ name the build: its release tag (with `+N` when the commit is N commits past
 it) and short commit, linked to GitHub. CMake records them from Git on every
 build; a tree without Git metadata reports an unknown build.
 
+## Prometheus metrics
+
+The dashboard serves `GET /metrics` in the Prometheus text format 0.0.4
+(`text/plain; version=0.0.4; charset=utf-8`), so a scraper can record what the
+bot does over hours for analysis. The endpoint has the same access rules as
+`/api/state`: it listens only on loopback, rejects a non-loopback `Host`
+header, and needs no other credential. It is read-only and holds no secrets.
+It never includes the account, password, invite code or certificate. Scrape it
+from the same machine or through the same authenticated tunnel as the
+dashboard.
+
+Every series is named `atrinik_playtester_*` and carries `character` (in lower
+case) and `server` labels. Counters are kept in memory and start again from zero when
+the process restarts, which `rate()` and `increase()` handle. Every other
+label comes from a bounded set: server-named monsters (at most 300), skills,
+attacks, damage types, spells, potions, action kinds (at most 200) and task
+types each have a fixed cap. Values past a cap are counted as `other`. Chat and
+other player-typed lines are never parsed into labels; a PvP kill's victim is
+the one character name that can appear, within the monster cap.
+
+Gauges, read from live state on each scrape:
+
+- `connected` (1 while playing), `hp`, `maxhp`, `sp`, `maxsp`, `food`, `level`, `experience`,
+  `regen_hp`, `regen_sp`, `depletion_points`;
+- `skill_level{skill}`, `skill_experience{skill}`;
+- `money_carried_copper`, `money_banked_copper` (only once a balance is
+  known);
+- `farm_predicted_xp_per_hour{objective}`: the farming analyzer's estimate for
+  its first-ranked spot;
+- `task_info{task}` and `phase_info{phase}`: 1 for the running top-level task
+  type and autoplay phase.
+
+Counters:
+
+| Metric | Labels | Counts |
+| --- | --- | --- |
+| `kills_total` | `monster` | "You killed …" lines |
+| `experience_gained_total` | `skill` | experience from "You got N exp in skill …" |
+| `damage_dealt_total`, `hits_dealt_total` | `attack` | "You hit … for N with …" |
+| `damage_taken_total`, `hits_taken_total` | `type` | "… hit you for N … damage" |
+| `spells_cast_total` | `spell` | spell casts ordered (including any the server refuses) |
+| `mana_spent_total` | | each ordered cast's listed spell cost |
+| `heals_total` | `source` | healing spells received (`spell`) and healing potions applied (`potion`) |
+| `healed_hp_total` | | health restored by healing spells |
+| `potions_used_total` | `potion` | potions applied |
+| `deaths_total` | `cause` | deaths, by the post-mortem cause |
+| `rests_total` | | rests started to regain spell points |
+| `actions_total` | `kind` | every recorded action and decision, such as `retreat`, `melee-kite` or `farm-pack-split` |
+| `purchases_total`, `sales_total` | | shop purchases and sales |
+| `money_spent_copper_total` | `reason` | money paid in shops (`purchase`) |
+| `money_gained_copper_total` | `source` | money received for sales (`sale`) |
+| `item_moves_total` | `direction` | item moves ordered: `store`, `retrieve`, `loot`, `pickup`, `drop` |
+| `chat_lines_total` | `direction`, `channel` | player chat heard and answered |
+| `connections_total`, `reconnects_total`, `disconnects_total` | | game server connections; a failed attempt also counts as a disconnect |
+| `tasks_started_total` | `task` | top-level tasks started |
+| `tasks_finished_total` | `task`, `status` | top-level tasks that completed or failed |
+| `state_seconds_total` | `state` | seconds `fighting`, `resting`, `travelling`, `shopping` (shops, temple, NPC dialogue), `busy`, `idle` or `disconnected` (not playing) |
+
+The time in each state follows the latest recorded action that marks one. For
+example, a target or a kite step means fighting, and a step or route decision
+means travelling. Actions that mark none, such as applying an item, keep the
+current state. A task that has not yet done anything that marks a state is
+`busy`; with no task running, she is `idle`.
+
 ## Farming analyzer
 
 Autoplay and the dashboard rank farm spots with the locked `atrinik/tools`
