@@ -16657,5 +16657,239 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.engine.task)
 
 
+class MetricsTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.client = AtrinikClient(ClientConfig(
+            host="game.example", port=13327, character="Sera",
+            runtime_state_path=str(Path(self.directory.name) / "memory.sqlite3")))
+        self.client.state.phase = "playing"
+        self.metrics = self.client.metrics
+        self.base = ("sera", "game.example:13327")
+
+    def message(self, text, msg_type=c.CHAT_TYPE_GAME):
+        asyncio.run(self.client.emit("message", (msg_type, "", text)))
+
+    def test_registry_renders_exposition_format_with_escaped_labels(self):
+        from .metrics import Registry
+
+        registry = Registry()
+        hits = registry.counter("demo_hits_total", "Hits\\ seen\nper line.", ("who",))
+        hits.inc(('a"b\\c\nd',), 2)
+        level = registry.gauge("demo_level", "A level.")
+        level.set((), 1.5)
+        self.assertEqual(registry.render(), (
+            '# HELP demo_hits_total Hits\\\\ seen\\nper line.\n'
+            '# TYPE demo_hits_total counter\n'
+            'demo_hits_total{who="a\\"b\\\\c\\nd"} 2\n'
+            '# HELP demo_level A level.\n'
+            '# TYPE demo_level gauge\n'
+            'demo_level 1.5\n'))
+        with self.assertRaises(ValueError):
+            hits.inc(("x",), -1)
+        with self.assertRaises(ValueError):
+            registry.counter("bad-name", "x")
+        with self.assertRaises(ValueError):
+            registry.counter("demo_hits_total", "again")
+
+    def test_label_values_are_bounded_and_never_free_text(self):
+        from .metrics import OTHER, LabelLimit
+
+        limit = LabelLimit(2)
+        self.assertEqual(limit("[b]Kobold[/b]  Scout"), "kobold scout")
+        self.assertEqual(limit("orc"), "orc")
+        self.assertEqual(limit("troll"), OTHER)
+        self.assertEqual(limit("KOBOLD SCOUT"), "kobold scout")
+        self.assertEqual(len(LabelLimit(5)("x" * 500)), 64)
+        for index in range(400):
+            self.message(f"You killed monster {index}.")
+        monsters = {key[2] for key in self.metrics.kills.samples}
+        self.assertEqual(len(monsters), 301)
+        self.assertIn(OTHER, monsters)
+        self.assertEqual(self.metrics.kills.value((*self.base, OTHER)), 100)
+
+    def test_server_messages_increment_their_series(self):
+        m, base = self.metrics, self.base
+        self.message("You killed kobold.")
+        self.message("You killed orc with fireball.")
+        self.message("You got 120 exp in skill Wizardry.")
+        self.message("You hit kobold for 14 (0) with slash.")
+        self.message("kobold hit you for 9 (-1) fire damage.")
+        self.message("The spell heals you for 22 hp!")
+        # An immune attack type still reports its line, for no damage.
+        self.message("You hit kobold for 0 (0) with fire.")
+        self.message("kobold hit you for 0 (0) cold damage.")
+        self.message("You paid 5 silver coins for a short sword.")
+        self.message("You receive 1 gold coin for a ring.")
+        # Player chat quoting the same lines is someone typing.
+        self.message("You killed kobold.", c.CHAT_TYPE_CHAT)
+        self.message("[a=#charname]Zoey[/a] hit you for 999 fire damage.")
+        self.assertEqual(m.kills.value((*base, "kobold")), 1)
+        self.assertEqual(m.kills.value((*base, "orc")), 1)
+        self.assertEqual(m.xp_gained.value((*base, "wizardry")), 120)
+        self.assertEqual(m.damage_dealt.value((*base, "slash")), 14)
+        self.assertEqual(m.hits_dealt.value((*base, "slash")), 1)
+        self.assertEqual(m.damage_taken.value((*base, "fire")), 9)
+        self.assertEqual(m.hits_dealt.value((*base, "fire")), 0)
+        self.assertEqual(m.hits_taken.value((*base, "cold")), 0)
+        self.assertEqual(m.heals.value((*base, "spell")), 1)
+        self.assertEqual(m.healed.value(base), 22)
+        self.assertEqual((m.purchases.value(base), m.money_spent.value((*base, "purchase"))),
+                         (1, 500))
+        self.assertEqual((m.sales.value(base), m.money_gained.value((*base, "sale"))),
+                         (1, 10_000))
+
+    def test_actions_spells_items_chat_and_connections_are_counted(self):
+        m, base, client = self.metrics, self.base, self.client
+        client.record_action("melee-kite", "target=1")
+        client.record_action("farm-pack-split", "two")
+        client.record_action("training-rest", "sp=1/20")
+        self.assertEqual(m.actions_total.value((*base, "melee-kite")), 1)
+        self.assertEqual(m.actions_total.value((*base, "farm-pack-split")), 1)
+        self.assertEqual(m.rests.value(base), 1)
+        spell = Item(tag=7, name="minor healing", item_type=c.TYPE_SPELL,
+                     extra={"cost": 6})
+        potion = Item(tag=8, name="potion of healing", item_type=c.TYPE_POTION)
+        m.fire(spell)
+        m.fire(Item(tag=9, name="arrow", item_type=0))
+        m.apply(potion)
+        self.assertEqual(m.spells_cast.value((*base, "minor healing")), 1)
+        self.assertEqual(m.mana_spent.value(base), 6)
+        self.assertEqual(m.potions_used.value((*base, "potion of healing")), 1)
+        self.assertEqual(m.heals.value((*base, "potion")), 1)
+        state = client.state
+        state.player_tag = 1
+        state.items[2] = Item(tag=2, name="chest")
+        state.items[3] = Item(tag=3, name="kobold's corpse")
+        m.item_moved(Item(tag=4, location=1), 2)
+        m.item_moved(Item(tag=5, location=2), 1)
+        m.item_moved(Item(tag=6, location=3), 1)
+        m.item_moved(Item(tag=10, location=0), 1)
+        m.item_moved(Item(tag=11, location=1), 0)
+        self.assertEqual({key[2]: value for key, value in m.item_moves.samples.items()},
+                         {"store": 1, "retrieve": 1, "loot": 1, "pickup": 1, "drop": 1})
+        # Corpse looting mostly goes through /take.
+        m.command("/take all")
+        m.command("/say hi")
+        self.assertEqual(m.item_moves.value((*base, "loot")), 2)
+        client._log_chat(c.CHAT_TYPE_LOCAL, "in", "Zoey", "hi")
+        client._log_chat(c.CHAT_TYPE_PRIVATE, "out", "Zoey", "hello")
+        self.assertEqual(m.chat_lines.value((*base, "in", "say")), 1)
+        self.assertEqual(m.chat_lines.value((*base, "out", "tell")), 1)
+        for kind in ("connected", "disconnected", "connected"):
+            asyncio.run(client.emit(kind, None))
+        self.assertEqual((m.connections.value(base), m.reconnects.value(base),
+                          m.disconnects.value(base)), (2, 1, 1))
+        client._record_post_mortem()
+        self.assertEqual(m.deaths.value((*base, "unclassified")), 1)
+
+    def test_time_before_the_first_connection_is_offline(self):
+        client = AtrinikClient(ClientConfig(host="game.example", port=13327,
+                                            character="Sera"))
+        m = client.metrics
+        m._state_since -= 40
+        asyncio.run(client.emit("connected", None))
+        seconds = {key[2]: value for key, value in m.state_seconds.samples.items()}
+        self.assertGreaterEqual(seconds["disconnected"], 40)
+        self.assertNotIn("idle", seconds)
+
+    def test_tasks_states_and_gauges(self):
+        from .tasks import BotTask
+
+        m, base, client = self.metrics, self.base, self.client
+        engine = TaskEngine(client)
+        m.attach(engine)
+        task = BotTask("farm kobolds")
+        task.phase = "adaptive-farming"
+        engine.set_task(task)
+        self.assertEqual(m.tasks_started.value((*base, "BotTask")), 1)
+        # A running task with nothing classified yet is busy, not idle.
+        client.record_action("command", "/x")
+        self.assertEqual(m._state, "busy")
+        client.record_action("target", "actor_count=3 view=1,2 depth=0")
+        # The reconnect gap is offline time, though the phase still reads
+        # "playing" when the client reports the disconnect.
+        asyncio.run(client.emit("disconnected", "lost"))
+        m._state_since -= 5
+        asyncio.run(client.emit("connected", None))
+        client.record_action("target", "actor_count=3 view=1,2 depth=0")
+        m._state_since -= 30
+        client.record_action("training-rest", "sp=1/20")
+        m._state_since -= 20
+        client.record_action("step", "direction=1")
+        m._state_since -= 10
+        client.record_action("shop-upgrade-scan", "")
+        task.complete()
+        client.record_action("task-end", "farm kobolds complete")
+        self.assertEqual(m.tasks_finished.value((*base, "BotTask", "complete")), 1)
+        seconds = {key[2]: value for key, value in m.state_seconds.samples.items()}
+        self.assertGreaterEqual(seconds["fighting"], 30)
+        self.assertGreaterEqual(seconds["resting"], 20)
+        self.assertGreaterEqual(seconds["travelling"], 10)
+        self.assertGreaterEqual(seconds["disconnected"], 5)
+        self.assertLess(seconds["fighting"], 31)
+        self.assertLess(seconds.get("idle", 0), 1)
+        engine.task = None
+        client.state.stats.update(hp=40, maxhp=50, sp=3, maxsp=20, food=900,
+                                  level=7, exp=4321, regen_hp=1.5, regen_sp=0.5)
+        client.state.player_tag = 1
+        client.state.items[20] = Item(tag=20, name="Wizardry", item_type=c.TYPE_SKILL,
+                                      extra={"level": 5, "experience": 900})
+        client.state.inventories[1] = [20]
+        client.state.depletion_points, client.state.depletion_points_known = 2, True
+        text = m.render(carried=1234, banked=None, predicted_xp=("xp", 5000.0))
+        labels = '{character="sera",server="game.example:13327"'
+        for line in (
+                f'atrinik_playtester_hp{labels}}} 40',
+                f'atrinik_playtester_regen_hp{labels}}} 1.5',
+                f'atrinik_playtester_experience{labels}}} 4321',
+                f'atrinik_playtester_skill_level{labels},skill="wizardry"}} 5',
+                f'atrinik_playtester_skill_experience{labels},skill="wizardry"}} 900',
+                f'atrinik_playtester_money_carried_copper{labels}}} 1234',
+                f'atrinik_playtester_depletion_points{labels}}} 2',
+                f'atrinik_playtester_farm_predicted_xp_per_hour{labels},objective="xp"}} 5000',
+                f'atrinik_playtester_connected{labels}}} 1'):
+            self.assertIn(line + "\n", text)
+        self.assertNotIn("atrinik_playtester_money_banked_copper{", text)
+        # No task runs: no task or phase is current.
+        self.assertNotIn("atrinik_playtester_task_info{", text)
+        engine.task = task
+        text = m.render()
+        self.assertIn('task="BotTask"} 1\n', text)
+        self.assertIn('phase="adaptive-farming"} 1\n', text)
+
+
+class MetricsRouteTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = WebTests.asyncSetUp
+    asyncTearDown = WebTests.asyncTearDown
+
+    async def raw_get(self, path, host="localhost"):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        writer.write(f"GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+        await writer.drain()
+        raw = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        head, body = raw.split(b"\r\n\r\n", 1)
+        return head.decode("latin-1"), body.decode()
+
+    async def test_metrics_route_serves_prometheus_text_on_loopback_only(self):
+        self.client.state.player_name = "Sera"
+        self.client.config.password = "do-not-leak"
+        self.client.config.access_code = "0123456789ABCDEF"
+        self.client.metrics.message(c.CHAT_TYPE_GAME, "You killed kobold.")
+        head, body = await self.raw_get("/metrics")
+        self.assertTrue(head.startswith("HTTP/1.1 200"), head)
+        self.assertIn("Content-Type: text/plain; version=0.0.4; charset=utf-8", head)
+        self.assertIn("# TYPE atrinik_playtester_kills_total counter", body)
+        self.assertIn('monster="kobold"} 1\n', body)
+        self.assertIn("atrinik_playtester_connected{", body)
+        self.assertNotIn("do-not-leak", body)
+        self.assertNotIn("0123456789ABCDEF", body)
+        head, _ = await self.raw_get("/metrics", host="metrics.example")
+        self.assertTrue(head.startswith("HTTP/1.1 400"), head)
+
+
 if __name__ == "__main__":
     unittest.main()
