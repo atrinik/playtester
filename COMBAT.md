@@ -139,9 +139,10 @@ nearly unchanged. Live, Wizardry XP did not move for hours.
   (hurt below the heal threshold, line blocked), the farm loop keeps her
   distance with combat off; safety and retreat handle her health. Pulls use
   the spell, never a launcher. On the farm's map, travel defence casts at a
-  threat within reach after safety, or keeps its distance. Melee remains only
-  as survival: the cornered-retreat breakout, the pursued stand (an attacker
-  still adjacent after three retreat steps), travel defence against an
+  threat within reach after safety, or keeps its distance. A retreat step no
+  longer swings at the engaged target. Melee remains only as survival: the
+  cornered-retreat breakout, the pursued stand when she cannot cast (see
+  "Caster kiting" below), travel defence against an
   adjacent attacker she cannot cast at or step away from, and transit maps'
   last-resort fight when cornered. Accepted limit: that travel-defence
   check reads any recent hit, so an unseen or distant attacker can make her
@@ -178,6 +179,132 @@ about 145,000 XP/hour. Mana is the bottleneck: most of each clear is spent resti
 Raising mana regeneration (Pow/Int gear, Meditation) or capacity is what
 speeds training up.
 
+## Caster kiting (implemented)
+
+Live, the circuit made about 724,000 XP/hour against the analyzer's 2.0
+million. Most decisions were retreats, pack splits and two-to-three-tile
+melee-kite gaps. Pursued stands swung the sword at full health, so slash hits
+landed inside Wizardry kills. And 9 of 10 recent deaths were packs on the
+charred treant maps (`world_15_74` to `world_17_74`) and the Strakewood
+underground city orcs.
+
+### Aimed bullets, not eight lines
+
+A bolt or bullet is aimed at the selected target when it is launched:
+`fire_bolt` and `fire_arch_from_position` (`server/src/server/spell_util.c`)
+pass the player's target to `projectile3d_launch`, which turns the heading
+straight at it. It then flies in a straight line (only magic missile homes),
+about 12 tiles for magic bullet, and stops at walls. Whatever damage a
+creature does not absorb flies on into the next creature in its path
+(`common_object_projectile_hit`): after a kill, but also after a block or a
+hit reduced by protection. So the eight FIRE lines matter only for the
+direction byte sent, the nearest one; what she needs is a clear path.
+
+- `aimed_projectile_spell` names the aimed spells (magic bullet, magic
+  missile, cause light wounds, the bolts, lightning, meteor, asteroid).
+  Cones (firestorm, icestorm, holy word) and swarms keep exact lines.
+- `ray_cells` ports the server's planar projectile advance
+  (`types/common/projectile3d.c`), cell for cell: the heading's larger axis
+  moves one tile per step, and a crossing through a corner touches all three
+  cells around it (`boundary_event`).
+- `bullet_ray_clear` checks every cell the flight crosses before the target
+  cell: an authored wall or door, or another creature, blocks it. On a
+  neutral farm the cells beyond the target count too, since leftover damage
+  would wake a bystander.
+- `aimed_fire_direction` gives the direction to send, or None when there is
+  no clear shot. The finisher, spell pulls, pursuit casts and `caster_kite`
+  use it; pack casts check the same ray through `pack_line`.
+- **Casts that do nothing.** Terrain data can miss a wall, and some creatures
+  shrug the bullet off. When a finisher cast's feedback times out with no
+  target-HP drop and no "You hit" line, it counts against that line (target,
+  her square). After `FUTILE_CAST_LIMIT` (2) such casts the line is futile:
+  `aimed_fire_direction` refuses it, so she steps to another square.
+
+### Range 4 to 8
+
+While Wizardry trains, `caster_kite` holds the target 4 to 8 tiles away
+(`CASTER_MIN_RANGE`, `CASTER_MAX_RANGE`): out of melee, in view, and inside
+the bullet's flight.
+
+- She casts whenever the spell is ready and the shot is clear, from wherever
+  she stands, the pull square included.
+- Between casts (action timer, waiting for HP feedback, out of mana) she
+  steps back from a target closer than 4 tiles, preferring squares with a
+  clear shot.
+- At range with no clear shot she steps to a square that has one, preferring
+  one no closer to the target, never inside 4 or beyond 8. This replaces the
+  old walk toward the target (`move_to_view`).
+- After `CASTER_STALL_SECONDS` (10 s) without a shot she sets the target
+  aside with the pull set-aside: hidden from target choice, still a threat,
+  and released as soon as it comes within 2 tiles.
+- Steps respect the authored walkability, steps already found blocked, and
+  occupied tiles. Separation from other hostiles wins, then a clear shot,
+  then range, then the pull anchor.
+
+`melee_kite` still serves weapon fights and the old hybrid handoff.
+
+### Pursuit
+
+An attacker still adjacent after one retreat step (`PURSUIT_CAST_STEPS`)
+gets the spell: she casts at the most wounded adjacent attacker she has a
+clear shot at, with combat off (`pursued-cast`), then keeps retreating until
+the next cast is ready. She casts only above the flee threshold the farm uses
+for the threats within 4 tiles (55%, or 80% for two, 94% for three or more)
+and only when she can afford the cast. Otherwise the melee pursued stand
+(three steps, the breakout latch) applies as before. Pursuit and pack casts
+start the finisher's cooldown, so it does not cast again straight away.
+
+### Packs
+
+With two or more active threats within 4 tiles, and health above the pack
+flee threshold (80% for two, 94% for three or more), `pack_cast` casts
+instead of retreating:
+
+- first choice, a shot whose ray passes through two or more pack members,
+  aimed at the most wounded front one, so what it does not absorb carries on
+  into the next;
+- otherwise the most wounded pack member with a clear shot, but only while
+  none is within 2 tiles.
+
+Between casts, or when neither applies, the existing pack-split retreat
+steps away and keeps her distance.
+
+### Safety
+
+- **Recall-wand charges.** The client sees a wand's charges only in its
+  examine text ("It has N charges left.", `types/player.c`). On a quiet farm
+  tick she examines each identified recall wand of unknown charge. After she
+  fires one, its count is forgotten and read again, since a fire can fizzle
+  without spending a charge. "The wand says poof." (`types/wand.c`) after a
+  fire marks it empty, and the same emergency tries the next recall source
+  at once. An empty wand is no longer an emergency candidate, and recall
+  shopping treats it as no device. When the last recall source is known
+  empty, the recall shop check is reset so a replacement is bought without
+  waiting out its daily interval. Recharging needs the recharge spell,
+  which she does not have.
+- **Hazardous for her kit.** Each farm failure review now stores the
+  analyzer's combat profile she failed with. A spot with three pack or
+  out-damaged failures in 24 hours (`KIT_HAZARD_FAILURES`), each with the
+  same survivability as hers now, is hazardous for her kit. Survivability
+  (`CombatProfile.same_survivability`) is maximum health within 10%, armour
+  class within 2, total protections within 5 and character level within 2;
+  skill level and mana move constantly while she trains and are ignored.
+  The circuit leaves such a spot at once (`farm-kit-hazard`), and
+  `analyzer_farm_choice` skips it until her survivability changes. If every
+  usable spot is hazardous, she farms the least dangerous one rather than
+  idle. No map names are listed; maps qualify by their record. Live, the
+  treant maps had eight such deaths in 90 minutes, `world_16_74` alone five;
+  the underground city had two, so it qualifies on a third.
+- **Healing outpaced.** From the first heal in the last 8 s on, when the
+  hits taken are at least what the later heals restored (her health at the
+  latest heal is no higher than at the first), healing has stopped keeping
+  up (`healing_outpaced`). The hits that pushed her under the heal threshold
+  came before the first heal and do not count. She then stops chaining
+  heals: from the heal threshold down she retreats with combat off
+  (`healing-outpaced`, 4 s at a time), and an emergency recall fires at the
+  heal threshold instead of the flee threshold. At the flee threshold
+  healing resumes alongside the retreat.
+
 ## Next phase: storm farming (owner decisions, 2026-10-22)
 
 At Wizardry 15 the single-target restriction should give way to area spells.
@@ -206,8 +333,9 @@ Open questions:
 
 ## Non-goals
 
-- No change to melee kiting against a target that was not pulled, to the
-  pack-split retreat, or to emergency recall.
+- No change to melee kiting against a target that was not pulled. While
+  Wizardry trains, the pack-split retreat and emergency recall changed as
+  described under "Caster kiting".
 - No path-level avoidance of archer ranges. The extended radius applies to
   pull-square clearance and the lone-pull check only; patrol avoidance and
   threat detection still use authored radii.

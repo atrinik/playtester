@@ -14,6 +14,7 @@ preferred objective never needs a new run.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass
 import json
 import logging
@@ -205,6 +206,34 @@ class CombatProfile:
         new = dict(self.protections)
         return any(abs(new.get(name, 0) - old.get(name, 0)) >= 5
                    for name in set(old) | set(new))
+
+    def same_survivability(self, other: "CombatProfile") -> bool:
+        """Whether two profiles would fare alike against the same monsters.
+
+        Only what keeps her alive counts: maximum health within 10%, armour
+        class within 2, total protections within 5 and character level
+        within 2. Skill level and mana move constantly while she trains and
+        say little about surviving a pack.
+        """
+        return (abs(self.max_health - other.max_health) <=
+                0.10 * max(other.max_health, 1) and
+                abs(self.armour_class - other.armour_class) <= 2 and
+                abs(sum(dict(self.protections).values()) -
+                    sum(dict(other.protections).values())) <= 5 and
+                abs(self.character_level - other.character_level) <= 2)
+
+    @classmethod
+    def from_description(cls, data: dict) -> "CombatProfile | None":
+        """Rebuild a profile from ``describe()``, or None if incomplete."""
+        names = {entry.name for entry in dataclasses.fields(cls)}
+        try:
+            values = {key: value for key, value in data.items() if key in names}
+            values["protections"] = tuple(sorted(
+                (str(name), int(amount))
+                for name, amount in dict(data.get("protections") or {}).items()))
+            return cls(**values)
+        except (TypeError, ValueError, AttributeError):
+            return None
 
     def describe(self) -> dict[str, Any]:
         return {

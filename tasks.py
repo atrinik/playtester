@@ -20,6 +20,7 @@ except ModuleNotFoundError:
     from world_content_audit import load_archetypes
 
 from . import constants as c
+from . import self_improvement
 from .targeting import select_target, target_set_aside
 from .client import (COIN_VALUES, AtrinikClient, format_money,
                      map_object_visual_name, update_bank_balance)
@@ -222,6 +223,157 @@ def recent_player_kill(client: AtrinikClient, seconds: float = 2.5) -> bool:
         if raw.casefold().startswith("you killed "):
             return True
     return False
+
+
+# Directional spells the server aims at the selected target when they are
+# launched: fire_bolt and fire_arch_from_position (server/spell_util.c) pass
+# it to projectile3d_launch, which turns the heading straight at it. They
+# therefore fly at it from any angle, not only along the eight FIRE lines.
+# Cones (firestorm, icestorm, holy word) and swarms keep the FIRE direction.
+AIMED_PROJECTILE_SPELL = re.compile(
+    r"\b(?:magic bullet|magic missile|cause light wounds|frostbolt|firebolt|"
+    r"lightning|negative energy bolt|meteor|asteroid)\b", re.I)
+UNAIMED_SPELL = re.compile(r"swarm|storm|nova", re.I)
+# Bounded digits, as in self_improvement: an oversized amount never matches.
+HEALED_MESSAGE = re.compile(r"^The spell heals you for (\d{1,9}) hp", re.I)
+WAND_CHARGES_MESSAGE = re.compile(r"^It has (\d{1,9}) charges? left", re.I)
+WAND_EMPTY_MESSAGE = re.compile(r"^The (.+) says poof\.", re.I)
+
+
+def aimed_projectile_spell(spell: Item | None) -> bool:
+    """Whether a spell flies straight at the selected target when cast."""
+    return bool(
+        spell is not None and
+        int(spell.extra.get("flags", 0) or 0) & c.SPELL_DESC_DIRECTION and
+        AIMED_PROJECTILE_SPELL.search(spell.name) and
+        not UNAIMED_SPELL.search(spell.name))
+
+
+RAY_FRACTION = 65536  # projectile3d's fixed-point unit (one tile)
+
+
+@lru_cache(maxsize=4096)
+def ray_cells(dx: int, dy: int, reach: int) -> tuple[tuple[int, int], ...]:
+    """Cells a straight projectile aimed at (dx, dy) crosses, out to reach.
+
+    Offsets from the caster, in flight order, the caster's own cell left
+    out. A port of the server's planar projectile advance
+    (types/common/projectile3d.c): the heading is scaled so its larger axis
+    moves one tile per step, and each boundary crossing touches every cell
+    incident to it, so a ray through a corner touches all three cells
+    there, any of which can stop it (boundary_event).
+    """
+    q = RAY_FRACTION
+    vx, vy = dx * q, dy * q
+    largest = max(abs(vx), abs(vy))
+    if not largest:
+        return ()
+    hx = (abs(vx) * q + largest // 2) // largest * (1 if vx >= 0 else -1)
+    hy = (abs(vy) * q + largest // 2) // largest * (1 if vy >= 0 else -1)
+    sx, sy = (1 if hx > 0 else -1), (1 if hy > 0 else -1)
+    fx = fy = q // 2
+    x = y = 0
+    cells: list[tuple[int, int]] = []
+    for _ in range(reach):
+        budget = q
+        for _ in range(7):
+            if budget <= 0:
+                break
+            options = []
+            if hx:
+                options.append(((q - fx) if hx > 0 else fx, abs(hx), 1))
+            if hy:
+                options.append(((q - fy) if hy > 0 else fy, abs(hy), 2))
+            num, den, axes = options[0]
+            for option_num, option_den, option_axes in options[1:]:
+                if option_num * den < num * option_den:
+                    num, den, axes = option_num, option_den, option_axes
+                elif option_num * den == num * option_den:
+                    axes |= option_axes
+            if num * q > budget * den:
+                fx += hx * budget // q
+                fy += hy * budget // q
+                break
+            fx += hx * num // den
+            fy += hy * num // den
+            budget -= (num * q + den - 1) // den
+            for subset in (1, 2, 3):
+                if subset & axes == subset:
+                    cell = (x + (sx if subset & 1 else 0),
+                            y + (sy if subset & 2 else 0))
+                    if cell not in cells:
+                        cells.append(cell)
+            if axes & 1:
+                fx = 0 if hx > 0 else q
+                x += sx
+            if axes & 2:
+                fy = 0 if hy > 0 else q
+                y += sy
+    return tuple(cells)
+
+
+def healing_outpaced(client: AtrinikClient, seconds: float = 8.0) -> bool:
+    """Whether she lost health across at least two recent heals.
+
+    Live, one charred treant (27-33 impact a hit) out-damaged chained
+    minor healing (9-21 a cast) until she died. Only what happened from
+    the first heal in the window on counts: the hits that pushed her under
+    the heal threshold came before it. Healing has stopped keeping up when
+    the hits taken since that heal are at least what the later heals
+    restored, so her health at the latest heal is no higher than at the
+    first.
+    """
+    now = time.time()
+    messages = [entry for entry in getattr(client.state, "messages", ())
+                if float(entry[0]) >= now - seconds and
+                self_improvement.from_server(entry)]
+    heals = [(float(entry[0]), int(match.group(1))) for entry in messages
+             if (match := HEALED_MESSAGE.match(str(entry[-1]).strip()))]
+    if len(heals) < 2:
+        return False
+    first = heals[0][0]
+    damage = sum(self_improvement.hits_between(
+        [entry for entry in messages if float(entry[0]) > first],
+        first, now + 1.0).values())
+    return damage >= sum(amount for _, amount in heals[1:])
+
+
+def wand_charges(client: AtrinikClient) -> dict[int, int]:
+    """Known charges per wand tag, learned from examine text and use."""
+    charges = getattr(client, "wand_charges", None)
+    if charges is None:
+        charges = client.wand_charges = {}
+    return charges
+
+
+def observe_wand_feedback(client: AtrinikClient, tag: int,
+                          since: float) -> bool:
+    """Learn a wand's charges from server text after it was examined or used.
+
+    Only an identified wand's examine text says "It has N charges left."
+    (types/player.c), and firing an empty one says "The <name> says poof."
+    (types/wand.c). The caller names the one wand it just examined or
+    fired, so the text is attributed to that wand alone. Returns whether
+    it said poof.
+    """
+    empty = False
+    for entry in getattr(client.state, "messages", ()):
+        if float(entry[0]) < since or not self_improvement.from_server(entry):
+            continue
+        text = str(entry[-1]).strip()
+        match = WAND_CHARGES_MESSAGE.match(text)
+        if match:
+            wand_charges(client)[tag] = int(match.group(1))
+        elif WAND_EMPTY_MESSAGE.match(text):
+            wand_charges(client)[tag] = 0
+            empty = True
+    return empty
+
+
+def wand_known_empty(client: AtrinikClient, item: Item) -> bool:
+    """Whether a wand is known to have no charges left."""
+    return (item.item_type == c.TYPE_WAND and
+            wand_charges(client).get(item.tag) == 0)
 
 
 def effective_action_time(client: AtrinikClient,
@@ -822,6 +974,19 @@ class FarmTask(BotTask):
     PULL_SQUARE_REACH = 7
     FINISHER_FEEDBACK_GRACE_SECONDS = 2.0
     WIZARD_FINISHER_CAST_LIMIT = 6
+    # Spell-only training holds its target this far away between casts:
+    # out of melee reach, inside the view and magic bullet's 12-tile flight.
+    CASTER_MIN_RANGE = 4
+    CASTER_MAX_RANGE = 8
+    BULLET_RANGE = 12
+    # Retreat steps with an attacker still adjacent before she casts at it.
+    PURSUIT_CAST_STEPS = 1
+    # Seconds a "healing outpaced" disengage lasts once detected.
+    OUTPACED_DISENGAGE_SECONDS = 4.0
+    # Casts from one square that did nothing before that line is futile,
+    # and seconds without any shot before a target is set aside.
+    FUTILE_CAST_LIMIT = 2
+    CASTER_STALL_SECONDS = 10.0
     LURE_STALL_SECONDS = 12.0
     UNREACHABLE_TARGET_COOLDOWN_SECONDS = 5 * 60
 
@@ -942,6 +1107,21 @@ class FarmTask(BotTask):
         self._emergency_recall_apply_at = 0.0
         self._emergency_recall_cast_at = 0.0
         self._emergency_recall_origin = ""
+        # A recall wand fired (tag, wall-clock time), to catch "says poof";
+        # a recall wand examined for its charges, and those examined once.
+        self._recall_wand_fired: tuple[int, float] | None = None
+        self._wand_examine: tuple[int, float] | None = None
+        self._wand_examined: set[int] = set()
+        # Until when healing that cannot keep up makes her disengage.
+        self._outpaced_until = 0.0
+        # The finisher's last cast (line key, wall-clock time), casts that
+        # did nothing per line, lines given up on, and since when the
+        # current target has had no shot (see _observe_cast_effect and
+        # caster_stalled). A line key is (target, map, world x, world y).
+        self._finisher_fired_line: tuple[tuple, float] | None = None
+        self._futile_counts: dict[tuple, int] = {}
+        self._futile_lines: set[tuple] = set()
+        self._caster_stall: tuple[int, float] | None = None
         self._safe_position_history: list[tuple[str, int, int, float]] = []
         self._invisible_escape_direction = 0
         self._invisible_finish_target = 0
@@ -1212,6 +1392,109 @@ class FarmTask(BotTask):
             if steps_x == steps_y:
                 return False
         return True
+
+    def _current_map_node(self, client: AtrinikClient):
+        """The farm map's authored terrain, if she stands on that map."""
+        node = self.map_node
+        if node is None or node.path != client.state.map.path:
+            return None
+        return node
+
+    def _ray_blocked_by_terrain(self, client: AtrinikClient,
+                                origin: tuple[int, int],
+                                cell: tuple[int, int]) -> bool:
+        """Whether a wall or door stands at view cell (origin + offset)."""
+        node = self._current_map_node(client)
+        if node is None:
+            return False
+        m = client.state.map
+        world = (m.world_x + origin[0] + cell[0] - m.width // 2,
+                 m.world_y + origin[1] + cell[1] - m.height // 2)
+        return world in node.blocked or world in node.doors
+
+    def _ray_split(self, client: AtrinikClient, x: int, y: int,
+                   origin: tuple[int, int]
+                   ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """The ray's cells before the target cell, and those after it."""
+        dx, dy = x - origin[0], y - origin[1]
+        cells = list(ray_cells(dx, dy, self.BULLET_RANGE))
+        if (dx, dy) in cells:
+            index = cells.index((dx, dy))
+            return cells[:index], cells[index + 1:]
+        span = max(abs(dx), abs(dy))
+        return ([cell for cell in cells
+                 if max(abs(cell[0]), abs(cell[1])) <= span],
+                [cell for cell in cells
+                 if max(abs(cell[0]), abs(cell[1])) > span])
+
+    def bullet_ray_clear(self, client: AtrinikClient, x: int, y: int,
+                         target_id: int, *,
+                         origin: tuple[int, int] | None = None) -> bool:
+        """Whether an aimed spell from origin reaches view x, y unobstructed.
+
+        Every cell the server's flight crosses before the target cell
+        counts (ray_cells). An authored wall or door there stops it, and
+        another creature there would take the hit (and the aggro) instead.
+        On a neutral farm the path beyond the target counts too: damage the
+        target does not absorb flies on (common_object_projectile_hit) and
+        would wake a bystander behind it.
+        """
+        m = client.state.map
+        origin = origin or (m.width // 2, m.height // 2)
+        if (x, y) == origin:
+            return False
+        before, after = self._ray_split(client, x, y, origin)
+        others = {(other_x - origin[0], other_y - origin[1])
+                  for other_x, other_y, other in m.targets(friendly=False)
+                  if other.target_id != target_id}
+        for cell in before:
+            if (cell in others or
+                    self._ray_blocked_by_terrain(client, origin, cell)):
+                return False
+        if self.neutral_targets:
+            for cell in after:
+                if self._ray_blocked_by_terrain(client, origin, cell):
+                    break
+                if cell in others:
+                    return False
+        return True
+
+    def _line_key(self, client: AtrinikClient, target_id: int,
+                  origin: tuple[int, int]) -> tuple[int, str, int, int]:
+        m = client.state.map
+        return (target_id, m.path,
+                m.world_x + origin[0] - m.width // 2,
+                m.world_y + origin[1] - m.height // 2)
+
+    def aimed_fire_direction(self, client: AtrinikClient, spell: Item,
+                             x: int, y: int, target_id: int, *,
+                             origin: tuple[int, int] | None = None
+                             ) -> int | None:
+        """A FIRE direction that reaches the target at view x, y, or None.
+
+        An aimed projectile (magic bullet) flies straight at the selected
+        target from any angle, so it needs only a clear path; the direction
+        sent is the one nearest it. Other directional spells still need one
+        of the eight exact lines, clear of other creatures on a neutral farm.
+        Targeted spells return 0. A square from which casts at this target
+        did nothing (see FUTILE_CAST_LIMIT) has no shot either.
+        """
+        m = client.state.map
+        origin = origin or (m.width // 2, m.height // 2)
+        if self._line_key(client, target_id, origin) in self._futile_lines:
+            return None
+        if aimed_projectile_spell(spell):
+            if not self.bullet_ray_clear(client, x, y, target_id,
+                                         origin=origin):
+                return None
+            return self._attack_direction(origin[0], origin[1], x, y) or None
+        direction = self.spell_fire_direction(spell, x, y, *origin)
+        if (direction and self.neutral_targets and
+                not self.projectile_line_clear(
+                    client, x, y, target_id,
+                    origin_x=origin[0], origin_y=origin[1])):
+            return None
+        return direction
 
     def combat_spell_item(self, client: AtrinikClient) -> Item | None:
         if not self.combat_spell:
@@ -1519,9 +1802,8 @@ class FarmTask(BotTask):
                     # cast (or the ordinary health gate forces a retreat).
                     await client.clear_actions()
                     await client.set_combat(False)
-                    moved = await self.melee_kite(
-                        client, x, y, obj, map_node=self.map_node,
-                        preserve_spell_line=spell)
+                    moved = await self.spell_kite(
+                        client, x, y, obj, spell, spells_only)
                     self._last_action = time.monotonic()
                     # Spell-only training reports a kite that could not
                     # step, so travel defence can fight a cornering attacker.
@@ -1543,6 +1825,7 @@ class FarmTask(BotTask):
                     # further cast is now an informed decision rather than a
                     # duplicate based on the pre-cast HP packet.
                     self._finisher_pending_feedback = None
+                    self._observe_cast_effect(client, effective=True)
                 elif now - fired_at < max(
                         self.FINISHER_FEEDBACK_GRACE_SECONDS,
                         cooldown + 0.50):
@@ -1550,17 +1833,20 @@ class FarmTask(BotTask):
                     # committed monster one or more tiles away while waiting
                     # for authoritative HP feedback, preserving an available
                     # firing line where terrain permits.
-                    await self.melee_kite(
-                        client, x, y, obj, map_node=self.map_node,
-                        preserve_spell_line=spell)
+                    await self.spell_kite(
+                        client, x, y, obj, spell, spells_only)
                     return True
                 else:
                     # Missed spells and rounded HP percentages must not hold
                     # the fight forever.  Retry after one bounded server
                     # feedback interval.
                     self._finisher_pending_feedback = None
+                    self._observe_cast_effect(client, effective=False)
             if (self._finishing_target_id == obj.target_id and
                     now - self._last_finisher_at < cooldown):
+                if spells_only:
+                    # Between casts she keeps her range (caster_kite).
+                    await self.caster_kite(client, x, y, obj, spell)
                 return True
             if (not spells_only and
                     self._finisher_casts >= self.WIZARD_FINISHER_CAST_LIMIT):
@@ -1576,11 +1862,29 @@ class FarmTask(BotTask):
                 # melee hits while Sera waits for target-HP feedback.
                 await client.clear_actions()
                 await client.set_combat(False)
-                if await self.melee_kite(
-                        client, x, y, obj, map_node=self.map_node,
-                        preserve_spell_line=spell):
+                if await self.spell_kite(
+                        client, x, y, obj, spell, spells_only):
                     self._last_action = time.monotonic()
                     return True
+            direction = self.aimed_fire_direction(
+                client, spell, x, y, obj.target_id)
+            if direction is None:
+                # No clear shot from here (a wall, another creature in the
+                # path, a square whose casts did nothing, or off the eight
+                # lines for a spell that is not aimed): sidestep to a square
+                # that has one, never inside the caster range. Walking at it
+                # led her into melee. Too long without a shot sets it aside.
+                if await self.caster_stalled(client, obj, distance):
+                    return True
+                if await self.caster_kite(client, x, y, obj, spell):
+                    await client.set_combat(False)
+                    self._last_action = time.monotonic()
+                    return True
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("spell-line-blocked",
+                             f"target={obj.target_id} hp={target_hp}%")
+                return False
             self._last_finisher_at = now
             log.info(
                 "wizard finisher: target=%s hp=%s%% window=%s%% timed=%s "
@@ -1588,28 +1892,18 @@ class FarmTask(BotTask):
                 obj.target_id, target_hp, window,
                 int(timed_neutral_handoff), int(melee_hit_handoff), spell.name,
                 client.state.stats.get("sp", 0))
-            direction = self.spell_fire_direction(
-                spell, x, y, m.width // 2, m.height // 2)
-            if (self.neutral_targets and direction not in (None, 0) and
-                    not self.projectile_line_clear(
-                        client, x, y, obj.target_id)):
-                recorder = getattr(client, "record_action", None)
-                if recorder is not None:
-                    recorder("spell-line-blocked",
-                             f"target={obj.target_id} hp={target_hp}%")
-                return False
-            # Disable automatic melee so it cannot steal the finishing blow
-            # while a directional spell is lining up.
+            # Disable automatic melee so it cannot steal the finishing blow.
             await client.clear_actions()
             await client.set_combat(False)
-            if direction is None:
-                await client.move_to_view(x, y)
-            else:
-                await client.fire(direction, spell.tag)
-                self.commit_offensive_spell(client, spell)
-                self._finisher_casts += 1
-                self._finisher_pending_feedback = (
-                    obj.target_id, target_hp, time.monotonic())
+            await client.fire(direction, spell.tag)
+            self.commit_offensive_spell(client, spell)
+            self._last_spell_at = now
+            self._finisher_casts += 1
+            self._finisher_pending_feedback = (
+                obj.target_id, target_hp, time.monotonic())
+            self._finisher_fired_line = (
+                self._line_key(client, obj.target_id, (cx, cy)), time.time())
+            self._caster_stall = None
             self._last_action = time.monotonic()
             return True
 
@@ -1867,6 +2161,251 @@ class FarmTask(BotTask):
                 "melee-kite-gap" if maintain_gap_step else "melee-kite",
                 f"target={obj.target_id} action-time={action_time:.2f} "
                 f"step={world_x},{world_y}")
+        return True
+
+    def _observe_cast_effect(self, client: AtrinikClient, *,
+                             effective: bool) -> None:
+        """Learn whether the finisher's last cast did anything.
+
+        A cast with no target-HP drop and no "You hit" line before its
+        feedback timed out did nothing: a wall the terrain data misses, or
+        a creature the bullet cannot hurt. FUTILE_CAST_LIMIT such casts
+        from one square at one target mark that line futile, so
+        aimed_fire_direction refuses it and she sidesteps instead of
+        spending her mana into it.
+        """
+        fired = self._finisher_fired_line
+        self._finisher_fired_line = None
+        if fired is None:
+            return
+        line, fired_at = fired
+        effective = effective or any(
+            len(entry) > 3 and float(entry[0]) >= fired_at and
+            str(entry[3]).startswith("You hit ")
+            for entry in getattr(client.state, "messages", ()))
+        if effective:
+            self._futile_counts.pop(line, None)
+            return
+        count = self._futile_counts.get(line, 0) + 1
+        self._futile_counts[line] = count
+        if count >= self.FUTILE_CAST_LIMIT:
+            self._futile_lines.add(line)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("spell-line-futile",
+                         f"target={line[0]} from={line[2]},{line[3]} "
+                         f"casts={count}")
+
+    async def caster_stalled(self, client: AtrinikClient, obj,
+                             distance: int) -> bool:
+        """Set a target aside after CASTER_STALL_SECONDS without a shot.
+
+        This uses the pull set-aside: the target is hidden from target
+        choice but stays a threat, and it is released as soon as it comes
+        within two tiles, where it can reach her (pulled_aside).
+        """
+        now = time.monotonic()
+        if self._caster_stall is None or self._caster_stall[0] != obj.target_id:
+            self._caster_stall = (obj.target_id, now)
+            return False
+        if (now - self._caster_stall[1] < self.CASTER_STALL_SECONDS or
+                distance <= 2):
+            return False
+        self._caster_stall = None
+        await client.clear_actions()
+        await client.set_combat(False)
+        clear_target = getattr(client, "clear_target", None)
+        if clear_target is not None:
+            await clear_target()
+        self._pull_set_aside[obj.target_id] = now + self.PULL_SET_ASIDE_SECONDS
+        self.release_engagement(obj.target_id)
+        self._last_action = now
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("caster-stall-set-aside",
+                     f"target={obj.target_id} distance={distance}")
+        return True
+
+    async def spell_kite(self, client: AtrinikClient, x: int, y: int,
+                         obj, spell: Item, spells_only: bool) -> bool:
+        """Keep a spell target at range: caster range while training."""
+        if spells_only:
+            return await self.caster_kite(client, x, y, obj, spell)
+        return await self.melee_kite(
+            client, x, y, obj, map_node=self.map_node,
+            preserve_spell_line=spell)
+
+    async def caster_kite(self, client: AtrinikClient, x: int, y: int,
+                          obj, spell: Item) -> bool:
+        """Hold a spell target CASTER_MIN_RANGE to CASTER_MAX_RANGE tiles away.
+
+        Closer than the minimum, she steps back, preferring squares with a
+        clear shot. At range with no clear shot (a wall or another creature
+        in the path), she steps to a square that has one, preferring one no
+        closer to the target, never inside the minimum or beyond the
+        maximum. Separation from other hostiles wins over both, then the
+        pull anchor. True while a step is sent or still in flight; False
+        when she should hold where she is.
+        """
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        distance = max(abs(x - cx), abs(y - cy))
+        now = time.monotonic()
+        if self._kite_step_pending(client, obj.target_id, now):
+            return True
+        backing_off = distance < self.CASTER_MIN_RANGE
+        if not backing_off and self.aimed_fire_direction(
+                client, spell, x, y, obj.target_id) is not None:
+            return False
+        node = self._current_map_node(client)
+        self._kite_blocked = {
+            key: blocked_at for key, blocked_at in self._kite_blocked.items()
+            if now - blocked_at <= 20.0
+        }
+        others = [(tx, ty) for tx, ty, other in m.targets(friendly=False)
+                  if other.target_id != obj.target_id]
+        anchor = self.target_anchor(client, obj.target_id)
+        candidates = []
+        for direction, (dx, dy) in c.DIRECTION_DELTAS.items():
+            nx, ny = cx + dx, cy + dy
+            step_distance = max(abs(x - nx), abs(y - ny))
+            if (step_distance <= distance if backing_off else
+                    not self.CASTER_MIN_RANGE <= step_distance <=
+                    self.CASTER_MAX_RANGE):
+                continue
+            world_x, world_y = m.world_x + dx, m.world_y + dy
+            if (not self.within_farm_map(client, nx, ny) or
+                    (m.path, world_x, world_y) in self._kite_blocked or
+                    (node is not None and not node.walkable(world_x, world_y))):
+                continue
+            tile = m.tiles.get((nx, ny))
+            if tile is not None and tile.targets:
+                continue
+            clear = self.aimed_fire_direction(
+                client, spell, x, y, obj.target_id,
+                origin=(nx, ny)) is not None
+            if not backing_off and not clear:
+                continue
+            separation = min((max(abs(tx - nx), abs(ty - ny))
+                              for tx, ty in others), default=99)
+            anchor_distance = 0 if anchor is None else max(
+                abs(anchor[0] - world_x), abs(anchor[1] - world_y))
+            mobility = retreat_mobility(node, (world_x, world_y), depth=2)[1]
+            candidates.append((
+                min(separation, 4), clear,
+                min(step_distance, self.CASTER_MIN_RANGE),
+                step_distance >= distance, -anchor_distance,
+                mobility, random.random(), direction, world_x, world_y,
+                step_distance))
+        if not candidates:
+            return False
+        (_, clear, _, _, _, _, _, direction, world_x, world_y,
+         step_distance) = max(candidates)
+        await client.clear_actions()
+        await client.move(direction, run=False)
+        self._kite_step_attempt = (
+            m.path, m.world_x, m.world_y, world_x, world_y, now,
+            obj.target_id)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("caster-kite",
+                     f"target={obj.target_id} distance={distance}->"
+                     f"{step_distance} clear={int(clear)} "
+                     f"step={world_x},{world_y}")
+        return True
+
+    def _note_side_cast(self, target_id: int) -> None:
+        """Start the finisher's cooldown after a pursuit or pack cast.
+
+        Otherwise the finisher, seeing no cast of its own, would fire again
+        the next tick, before the action timer allowed it.
+        """
+        now = time.monotonic()
+        self._last_spell_at = self._last_action = now
+        self._finishing_target_id = target_id
+        self._finisher_casts = 0
+        self._finisher_pending_feedback = None
+        self._last_finisher_at = now
+
+    def spell_ready(self, client: AtrinikClient, spell: Item | None) -> bool:
+        """Whether an offensive cast is affordable and its timer has run."""
+        return bool(
+            spell is not None and
+            self.offensive_spell_affordable(client, spell) and
+            time.monotonic() - self._last_spell_at >= max(
+                0.8, float(client.state.stats.get("action_time", 0) or 0)))
+
+    def pack_line(self, client: AtrinikClient, x: int, y: int, obj,
+                  pack_ids: set[int]) -> int:
+        """Pack members an aimed bullet at view x, y would pass through.
+
+        Zero when the path to it is not clear. Counting starts with the
+        target, the first creature hit, and runs on along the same heading
+        to the bullet's range or a wall.
+        """
+        m = client.state.map
+        origin = (m.width // 2, m.height // 2)
+        if (self._line_key(client, obj.target_id, origin) in
+                self._futile_lines or
+                not self.bullet_ray_clear(client, x, y, obj.target_id)):
+            return 0
+        positions = {
+            (other_x - origin[0], other_y - origin[1]): other.target_id
+            for other_x, other_y, other in m.targets(friendly=False)}
+        hit = {obj.target_id}
+        for cell in self._ray_split(client, x, y, origin)[1]:
+            if self._ray_blocked_by_terrain(client, origin, cell):
+                break
+            if positions.get(cell, 0) in pack_ids:
+                hit.add(positions[cell])
+        return len(hit)
+
+    async def pack_cast(self, client: AtrinikClient, pack: list) -> bool:
+        """Cast at a pack of two or more instead of running from it.
+
+        Damage the target does not absorb (a kill, a block, protection)
+        flies on to the next creature in its path
+        (common_object_projectile_hit), so she prefers a shot through two
+        or more, aimed at the most wounded front creature.
+        Without such a line she shoots the most wounded only while none is
+        within two tiles. Otherwise, or between casts, the caller retreats,
+        which keeps her distance. The caller has already checked her health
+        against the pack flee threshold.
+        """
+        if not self.spell_only_training(client):
+            return False
+        spell = self.combat_spell_item(client)
+        if not aimed_projectile_spell(spell) or not self.spell_ready(
+                client, spell):
+            return False
+        pack_ids = {entry[3].target_id for entry in pack}
+        shots = []
+        for distance, x, y, obj in pack:
+            through = self.pack_line(client, x, y, obj, pack_ids)
+            if through:
+                shots.append((through >= 2, -int(obj.target_hp or 100),
+                              through, -distance, x, y, obj))
+        if not shots:
+            return False
+        double, _, through, _, x, y, obj = max(shots)
+        if not double and min(entry[0] for entry in pack) <= 2:
+            return False
+        if not await select_target(client, x, y, obj.target_id):
+            return False
+        m = client.state.map
+        direction = self._attack_direction(
+            m.width // 2, m.height // 2, x, y)
+        self.remember_engagement(client, x, y, obj.target_id)
+        await client.clear_actions()
+        await client.set_combat(False)
+        await client.fire(direction, spell.tag)
+        self.commit_offensive_spell(client, spell)
+        self._note_side_cast(obj.target_id)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("pack-cast",
+                     f"target={obj.target_id} through={through} "
+                     f"pack={len(pack)}")
         return True
 
     def stationary_caster(self, client: AtrinikClient, x: int, y: int,
@@ -2879,6 +3418,13 @@ class FarmTask(BotTask):
         all_hostiles = list(m.targets(friendly=False))
         direction_spell = Item(
             0, extra={"flags": c.SPELL_DESC_DIRECTION})
+        spell = self.pull_spell_item(client)
+        spell_ready = bool(
+            spell is not None and
+            self.offensive_spell_affordable(client, spell))
+        # An aimed spell pulls from where she stands, at any angle with a
+        # clear path; launchers and other spells need an exact line.
+        aimed_pull = spell_ready and aimed_projectile_spell(spell)
         for distance, x, y, obj in targets:
             if not 2 < distance <= 7:
                 continue
@@ -2887,15 +3433,16 @@ class FarmTask(BotTask):
             if self.lone_pull_candidate(client, (distance, x, y, obj)):
                 entry = (distance, x, y, obj, direction)
                 isolated.append(entry)
-                if (direction is not None and
+                if aimed_pull:
+                    aimed = self.aimed_fire_direction(
+                        client, spell, x, y, obj.target_id)
+                    if aimed is not None:
+                        aligned.append((distance, x, y, obj, aimed))
+                elif (direction is not None and
                         (not self.neutral_targets or
                          self.projectile_line_clear(
                              client, x, y, obj.target_id))):
                     aligned.append(entry)
-        spell = self.pull_spell_item(client)
-        spell_ready = bool(
-            spell is not None and
-            self.offensive_spell_affordable(client, spell))
         # Launcher eligibility is a durable build choice, not merely a
         # consequence of whether this leg currently trains with a spell.  If
         # ranged pressure is disabled, approach with the shielded melee
@@ -3254,7 +3801,45 @@ class FarmTask(BotTask):
             if (not self.neutral_targets or entry[2].target_id == engaged_id) and
             not target_set_aside(client.state, entry[2].target_id) and
             not self.ignore_unrequested_peaceful(client, entry[2])]
-        if (stand_candidates and
+        # While Wizardry trains, a pursuer gets the spell, not the sword: a
+        # melee stand hands Slash its share of the kill (live, pursued
+        # stands at full health put slash hits in Wizardry kills). She casts
+        # above the flee threshold the tick uses for this many threats
+        # (dynamic_flee), when she can afford it and has a clear shot; the
+        # melee stand remains otherwise. Between casts she keeps running.
+        spell = (self.combat_spell_item(client)
+                 if self.spell_only_training(client) else None)
+        near = sum(max(abs(tx - cx), abs(ty - cy)) <= 4 for tx, ty in threats)
+        cast_floor = max(self.safety.flee_below,
+                         0.94 if near >= 3 else 0.80 if near >= 2 else 0.0)
+        castable = [
+            (entry, direction) for entry in stand_candidates
+            if (direction := self.aimed_fire_direction(
+                client, spell, entry[0], entry[1], entry[2].target_id))
+            is not None
+        ] if (spell is not None and ratio > cast_floor and
+              self.offensive_spell_affordable(client, spell)) else []
+        caster_stand = bool(castable)
+        if (caster_stand and
+                self._pursued_retreats >= self.PURSUIT_CAST_STEPS and
+                self.spell_ready(client, spell)):
+            (x, y, obj), direction = min(castable, key=lambda item: (
+                int(getattr(item[0][2], "target_hp", 0) or 100),
+                item[0][2].target_id != engaged_id))
+            if await select_target(client, x, y, obj.target_id):
+                self._pursued_retreats = 0
+                self.remember_engagement(client, x, y, obj.target_id)
+                await client.clear_actions()
+                await client.set_combat(False)
+                await client.fire(direction, spell.tag)
+                self.commit_offensive_spell(client, spell)
+                self._note_side_cast(obj.target_id)
+                if recorder is not None:
+                    recorder("pursued-cast",
+                             f"target={obj.target_id} adjacent={len(adjacent)} "
+                             f"hp={ratio:.0%}")
+                return True
+        if (stand_candidates and not caster_stand and
                 self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
                 ratio > self.STAND_HEALTH_FLOOR):
             x, y, obj = min(stand_candidates, key=lambda entry: (
@@ -3301,17 +3886,20 @@ class FarmTask(BotTask):
         sp = int(client.state.stats.get("sp", 0) or 0)
         emergency_disengage = (
             hp / maxhp <= self.safety.flee_below or
-            (next_heal > 0 and sp < next_heal)
+            (next_heal > 0 and sp < next_heal) or
+            self._outpaced_until > now
         )
         if emergency_disengage and recorder is not None:
             recorder(
                 "emergency-disengage",
                 f"hp={hp}/{maxhp} sp={sp} next-heal={next_heal} "
                 f"target={engaged_id}")
+        # Spell-only training never swings at its target while retreating.
         defensive = next((
             (x, y, obj) for x, y, obj in m.targets(friendly=False)
             if not emergency_disengage and len(threats) == 1 and
-            obj.target_id == engaged_id), None)
+            obj.target_id == engaged_id and
+            not self.spell_only_training(client)), None)
         if defensive is None:
             await client.set_combat(False)
         else:
@@ -3332,12 +3920,16 @@ class FarmTask(BotTask):
 
     @staticmethod
     def emergency_recall_candidates(client: AtrinikClient) -> list[Item]:
-        """Return paid, identified recall sources in survival-first order."""
+        """Return paid, identified recall sources in survival-first order.
+
+        A wand known to be empty (see observe_wand_feedback) is left out.
+        """
         policy = InventoryPolicy()
         candidates = [
             item for item in client.state.inventory
             if re.search(r"\bword of recall\b", item.name, re.I) and
             not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)
+            and not wand_known_empty(client, item)
             and (
                 item.item_type == c.TYPE_SPELL and
                 int(item.extra.get("cost", 0) or 0) <=
@@ -3351,9 +3943,42 @@ class FarmTask(BotTask):
         priority = {c.TYPE_ROD: 0, c.TYPE_WAND: 1, c.TYPE_SPELL: 2}
         return sorted(candidates, key=lambda item: priority[item.item_type])
 
+    def _recall_fired(self, client: AtrinikClient, source: Item) -> None:
+        """Watch a fired wand for "says poof", then examine it again.
+
+        A fire can fizzle (a no-magic square) without spending a charge, so
+        the count is not decremented blind: it is forgotten, and the next
+        quiet farm tick reads it again from the examine text.
+        """
+        if source.item_type != c.TYPE_WAND:
+            return
+        self._recall_wand_fired = (source.tag, time.time())
+        wand_charges(client).pop(source.tag, None)
+        self._wand_examined.discard(source.tag)
+
+    @staticmethod
+    def note_recall_wand_empty(client: AtrinikClient) -> None:
+        """Let recall shopping run now if no recall source is left.
+
+        Its daily interval would otherwise delay a replacement for up to a
+        day after the last wand ran dry.
+        """
+        if any(re.search(r"\bword of recall\b", item.name, re.I) and
+               (item.item_type == c.TYPE_SPELL or
+                item.item_type in (c.TYPE_ROD, c.TYPE_WAND) and
+                not wand_known_empty(client, item))
+               for item in client.state.inventory):
+            return
+        setter = getattr(client, "set_last_recall_shop_check", None)
+        if setter is not None:
+            setter(0.0)
+        elif hasattr(client.state, "last_recall_shop_check_at"):
+            client.state.last_recall_shop_check_at = 0.0
+
     async def emergency_recall(self, client: AtrinikClient, *, ratio: float,
                                nearby_count: int,
-                               hostile_contact: bool) -> bool:
+                               hostile_contact: bool,
+                               healing_outpaced: bool = False) -> bool:
         """Start Word of Recall during a likely-fatal retreat.
 
         The server's recall force keeps building while the player moves and
@@ -3362,6 +3987,20 @@ class FarmTask(BotTask):
         device consumes the current action tick.
         """
         now = time.monotonic()
+        if self._recall_wand_fired is not None:
+            tag, fired_at = self._recall_wand_fired
+            if observe_wand_feedback(client, tag, fired_at):
+                # The wand was empty ("The wand says poof."): no recall is
+                # coming, so the next candidate may be tried at once.
+                self._recall_wand_fired = None
+                self._emergency_recall_cast_at = 0.0
+                self._emergency_recall_source = 0
+                self.note_recall_wand_empty(client)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("recall-wand-empty", f"tag={tag}")
+            elif time.time() - fired_at > 5.0:
+                self._recall_wand_fired = None
         if self._emergency_recall_cast_at:
             if client.state.map.path != self._emergency_recall_origin:
                 self._emergency_recall_cast_at = 0.0
@@ -3377,6 +4016,7 @@ class FarmTask(BotTask):
             source = client.state.items.get(self._emergency_recall_source)
             if source is not None and source.flags & c.ITEM_APPLIED:
                 await client.fire(0)
+                self._recall_fired(client, source)
                 self._emergency_recall_cast_at = now
                 self._emergency_recall_apply_at = 0.0
                 self._emergency_recall_origin = client.state.map.path
@@ -3400,10 +4040,13 @@ class FarmTask(BotTask):
         next_heal = min(healing_costs, default=0)
         sp = int(client.state.stats.get("sp", 0) or 0)
         healing_exhausted = bool(next_heal and sp < next_heal)
+        # Healing that no longer keeps up recalls at the heal threshold
+        # rather than after chaining heals down to the flee threshold.
         critical = (
             ratio <= 0.35 or
             nearby_count >= 2 and ratio <= self.safety.flee_below or
-            healing_exhausted and ratio <= self.safety.flee_below
+            healing_exhausted and ratio <= self.safety.flee_below or
+            healing_outpaced and ratio <= self.safety.heal_below
         )
         if not critical:
             return False
@@ -3420,6 +4063,7 @@ class FarmTask(BotTask):
                 self._emergency_recall_apply_at = now
                 return True
             await client.fire(0)
+            self._recall_fired(client, source)
         else:
             await client.fire(0, source.tag)
         self._emergency_recall_cast_at = now
@@ -3428,6 +4072,43 @@ class FarmTask(BotTask):
         if recorder is not None:
             recorder("emergency-recall", f"via {source.name}")
         return True
+
+    async def check_recall_wand(self, client: AtrinikClient) -> None:
+        """Examine a recall wand of unknown charge while nothing threatens.
+
+        The client sees a wand's charges only in its examine text, so an
+        empty wand looked like a working escape until "The wand says poof."
+        in the fight that needed it. Each wand is examined once per farm
+        task while its charge is unknown, and again after each fire.
+        """
+        if self._wand_examine is not None:
+            tag, sent_at = self._wand_examine
+            observe_wand_feedback(client, tag, sent_at)
+            charges = wand_charges(client).get(tag)
+            if charges is None and time.time() - sent_at <= 5.0:
+                return
+            self._wand_examine = None
+            if charges == 0:
+                self.note_recall_wand_empty(client)
+            if charges is not None:
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("recall-wand-charges", f"tag={tag} charges={charges}")
+            return
+        examine = getattr(client, "examine", None)
+        policy = InventoryPolicy()
+        wand = next((
+            item for item in client.state.inventory
+            if item.item_type == c.TYPE_WAND and
+            re.search(r"\bword of recall\b", item.name, re.I) and
+            policy.identified(item) and
+            item.tag not in wand_charges(client) and
+            item.tag not in self._wand_examined), None)
+        if wand is None or examine is None:
+            return
+        self._wand_examined.add(wand.tag)
+        self._wand_examine = (wand.tag, time.time())
+        await examine(wand.tag)
 
     def remember_safe_position(self, client: AtrinikClient) -> None:
         """Retain a short breadcrumb trail from before hostile contact."""
@@ -3804,6 +4485,7 @@ class FarmTask(BotTask):
 
         if not hostile_contact and not initial_threats:
             self.remember_safe_position(client)
+            await self.check_recall_wand(client)
         # A hit never commits her to a set-aside pull or to a packmate within
         # its reach: combat text cannot say which one attacked, and fighting
         # the packmate drags the set-aside monster in too. Within two tiles
@@ -3827,9 +4509,10 @@ class FarmTask(BotTask):
         nearby_count = sum(
             entry[0] <= 4 and active_threat(entry)
             for entry in initial_threats)
+        outpaced = hostile_contact and healing_outpaced(client)
         if await self.emergency_recall(
                 client, ratio=ratio, nearby_count=nearby_count,
-                hostile_contact=hostile_contact):
+                hostile_contact=hostile_contact, healing_outpaced=outpaced):
             self._last_action = time.monotonic()
             return
         if (hostile_contact and self._engaged_target is None and
@@ -3884,6 +4567,20 @@ class FarmTask(BotTask):
             ratio > dynamic_flee)
         finish_before_healing = self.should_finish_before_healing(
             client, initial_threats, nearby_count, ratio)
+        if (outpaced and
+                self.safety.flee_below < ratio <= self.safety.heal_below):
+            # Heals no longer keep up with the damage (healing_outpaced):
+            # chaining more of them only spends the health she needs to
+            # get away. Disengage now; at the flee threshold healing
+            # resumes alongside the retreat.
+            now = time.monotonic()
+            if self._outpaced_until <= now:
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("healing-outpaced", f"hp={ratio:.0%}")
+            self._outpaced_until = now + self.OUTPACED_DISENGAGE_SECONDS
+            if await self.low_health_retreat(client):
+                return
         if ratio <= dynamic_flee and not finish_before_healing:
             last_heal = self.safety._last_heal
             await self.safety.enforce(client)
@@ -3972,6 +4669,9 @@ class FarmTask(BotTask):
             entry for entry in threats
             if entry[0] <= 4 and active_threat(entry)]
         if len(nearby_pack) >= 2:
+            # Health is above the pack flee threshold here (dynamic_flee).
+            if await self.pack_cast(client, nearby_pack):
+                return
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
                 recorder("farm-pack-split", "targets=" + ",".join(
@@ -4131,9 +4831,9 @@ class FarmTask(BotTask):
                 # combat off; safety and retreat handle her health.
                 await client.clear_actions()
                 await client.set_combat(False)
-                await self.melee_kite(
-                    client, x, y, obj, map_node=self.map_node,
-                    preserve_spell_line=self.combat_spell_item(client))
+                spell = self.combat_spell_item(client)
+                if spell is not None:
+                    await self.caster_kite(client, x, y, obj, spell)
                 self._last_action = time.monotonic()
                 return
             semantic = map_object_semantic(client, obj)
