@@ -2404,9 +2404,13 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(commands), count + 1)
         self.assertTrue(commands[-1].startswith("/say Cy, "))
         for name, text in (("Gus", "Hi there, Sera, where are you?"),
-                           ("Hal", "Howdy, Sera, where are you?")):
+                           ("Hal", "Howdy, Sera, where are you?"),
+                           ("Ivy", "Hiya, Sera, where are you?"),
+                           ("Jo", "Heyy, Sera, where are you?"),
+                           ("Kai", "Cool, where are you Sera?"),
+                           ("Lu", "Question: where are you, Sera?")):
             deliver(c.CHAT_TYPE_LOCAL, f"[a=#charname]{name}[/a]: {text}")
-            self.assertTrue(commands[-1].startswith(f"/say {name}, I'm in "))
+            self.assertTrue(commands[-1].startswith(f"/say {name}, I'm in "), commands[-1])
         # Her rules read the party line without its "[Party] Name says:".
         deliver(c.CHAT_TYPE_PARTY, "[a=#charname]Dee[/a]: [P] Dee says: Sera")
         self.assertEqual(commands[-1], "/gsay Dee, I'm here! Just out training.")

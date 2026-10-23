@@ -32,12 +32,14 @@ from .transport import QuicStream
 POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
 
-# Words that open a line with a comma without addressing anyone ("Hi, ...").
+# Words that open a line with a comma without addressing anyone ("Hi, ..."),
+# also matched with stretched letters folded ("Heyy," and "Hmmm," too).
 CHAT_INTERJECTIONS = frozenset((
-    "ah", "btw", "hey", "heya", "hi", "hiya", "hello", "hmm", "howdy", "lol",
-    "no", "nope", "oh", "ok",
-    "okay", "so", "sorry", "thanks", "ty", "um", "wait", "well", "yeah", "yep",
-    "yes", "yo"))
+    "ah", "alright", "aye", "btw", "cool", "great", "greetings", "haha", "hehe",
+    "hey", "heya", "hi", "hiya", "hello", "hm", "howdy", "lmao", "lol",
+    "nice", "no", "nope", "np", "oh", "ok", "okay", "ops", "oops", "so",
+    "sorry", "sure", "thanks", "ty", "um", "wait", "welcome", "well", "wow",
+    "yay", "yeah", "yep", "yes", "yo"))
 CHAT_INTERJECTION_PATTERN = "|".join(sorted(CHAT_INTERJECTIONS))
 # A player gets at most one such fallback reply per this many seconds.
 CHAT_FALLBACK_SECONDS = 600.0
@@ -1652,9 +1654,10 @@ class AtrinikClient:
         addressee = re.match(
             rf"(?:(?:{CHAT_INTERJECTION_PATTERN})\s*,\s*)*([a-z][\w'-]*)\s*,",
             folded)
+        opener = addressee.group(1) if addressee else ""
         if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and
-                addressee.group(1) != player_name and
-                addressee.group(1) not in CHAT_INTERJECTIONS):
+                opener != player_name and opener not in CHAT_INTERJECTIONS and
+                re.sub(r"(.)\1+", r"\1", opener) not in CHAT_INTERJECTIONS):
             return
         # A tell is meant for her; /say, party and /chat only when they name
         # her or continue a conversation she answered.
