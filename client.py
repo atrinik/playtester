@@ -67,6 +67,23 @@ COIN_VALUES = {
     "jade": 1_000_000, "mithril": 10_000_000,
     "amber": 100_000_000,
 }
+# How a copper amount is written for people, largest coin first.
+COIN_LABELS = (
+    (100_000_000, " amber"), (10_000_000, " mithril"), (1_000_000, " jade"),
+    (10_000, "g"), (100, "s"), (1, "c"),
+)
+
+
+def format_money(copper: float) -> str:
+    """A copper amount in the game's coins, e.g. ``76g 81s 92c``."""
+    value = round(copper)
+    sign, value = ("-" if value < 0 else ""), abs(value)
+    parts = []
+    for worth, label in COIN_LABELS:
+        count, value = divmod(value, worth)
+        if count:
+            parts.append(f"{count}{label}")
+    return sign + (" ".join(parts) or "0c")
 
 
 def parse_money_value(text: str) -> int | None:

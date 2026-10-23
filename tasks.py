@@ -21,7 +21,7 @@ except ModuleNotFoundError:
 
 from . import constants as c
 from .targeting import select_target, target_set_aside
-from .client import (COIN_VALUES, AtrinikClient, map_object_visual_name,
+from .client import (COIN_VALUES, AtrinikClient, format_money, map_object_visual_name,
                      update_bank_balance)
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
@@ -4390,8 +4390,9 @@ class BuyGroundItemsTask(BotTask):
             wallet = BuyShopUpgradeTask.wallet_value(client)
             if cost > max(0, wallet - self.cash_reserve):
                 self.fail(
-                    f"shop item costs {cost}, wallet {wallet}, "
-                    f"reserve {self.cash_reserve}")
+                    f"shop item costs {format_money(cost)}, wallet "
+                    f"{format_money(wallet)}, reserve "
+                    f"{format_money(self.cash_reserve)}")
                 return
             stock = client.state.items.get(self._candidate)
             if stock is None or stock.location != 0:
@@ -4808,7 +4809,7 @@ class BuyShopUpgradeTask(BotTask):
                 recorder(
                     "shop-upgrade-reject",
                     f"{rejected.name if rejected is not None else self._candidate} "
-                    f"cost={cost} budget={budget}")
+                    f"cost={format_money(cost)} budget={format_money(budget)}")
             self._rejected.add(self._candidate)
             self._candidate = 0
             self._examined_at = 0.0
@@ -4827,7 +4828,8 @@ class BuyShopUpgradeTask(BotTask):
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder("shop-upgrade-buy",
-                     f"{candidate.name} cost={cost} budget={budget}")
+                     f"{candidate.name} cost={format_money(cost)} "
+                     f"budget={format_money(budget)}")
         self._move_at = now
 
 
@@ -4987,8 +4989,9 @@ class BuyDialogueStockTask(BotTask):
             total_cost = cost * self.quantity
             if total_cost > max(0, wallet - self.cash_reserve):
                 self.fail(
-                    f"merchant stock costs {total_cost}, wallet {wallet}, "
-                    f"reserve {self.cash_reserve}")
+                    f"merchant stock costs {format_money(total_cost)}, wallet "
+                    f"{format_money(wallet)}, reserve "
+                    f"{format_money(self.cash_reserve)}")
                 return
             self._cost = total_cost
             quote_recorder = getattr(client, "record_vendor_quote", None)
@@ -5027,7 +5030,7 @@ class BuyDialogueStockTask(BotTask):
                 if recorder is not None:
                     recorder(
                         "dialogue-stock-buy",
-                        f"{arrived.name} cost={self._cost}")
+                        f"{arrived.name} cost={format_money(self._cost)}")
                 if self.purchase_count < self.max_purchases:
                     # Dynamic merchants may expose several independently
                     # rolled utility items. Re-open the stock after each
@@ -5288,12 +5291,14 @@ class TempleServiceTask(BotTask):
         if client.state.interface is not None:
             feedback += "\n" + client.state.interface.text.casefold()
         if "do not have enough money" in feedback:
-            self.fail(f"cannot afford temple service costing {self.cost}")
+            self.fail("cannot afford temple service costing "
+                      f"{format_money(self.cost)}")
             return
         if not self._sent_at:
             wallet = BuyShopUpgradeTask.wallet_value(client)
             if wallet < self.cost:
-                self.fail(f"temple service costs {self.cost}, wallet {wallet}")
+                self.fail(f"temple service costs {format_money(self.cost)}, "
+                          f"wallet {format_money(wallet)}")
                 return
             # A dialogue left over from an earlier visit must not pass for
             # this purchase's answer.
@@ -5305,7 +5310,8 @@ class TempleServiceTask(BotTask):
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
                 recorder("temple-service",
-                         f"{self.service} from {self.priest} cost={self.cost}")
+                         f"{self.service} from {self.priest} "
+                         f"cost={format_money(self.cost)}")
             return
         if time.monotonic() - self._sent_at > 8.0:
             # Only the priest's "You pay ..." confirms the fee was taken; an
@@ -5402,7 +5408,8 @@ class MassIdentifyTask(BotTask):
             feedback += "\n" + client.state.interface.text.casefold()
         if "don't have enough money" in feedback or \
                 "do not have enough money" in feedback:
-            self.fail(f"cannot afford mass identification costing {self.cost}")
+            self.fail("cannot afford mass identification costing "
+                      f"{format_money(self.cost)}")
             return
         if self._sent_at and not self._acknowledged_at and \
                 "thank you for your business" in feedback:
@@ -5418,8 +5425,8 @@ class MassIdentifyTask(BotTask):
             required = self.cost + self.cash_reserve
             if wallet < required:
                 self.fail(
-                    f"mass identification needs {required} copper including "
-                    f"reserve, wallet {wallet}")
+                    f"mass identification needs {format_money(required)} "
+                    f"including reserve, wallet {format_money(wallet)}")
                 return
             client.state.interface = None
             await BuyShopUpgradeTask.send_purchase(
@@ -5430,7 +5437,7 @@ class MassIdentifyTask(BotTask):
             if recorder is not None:
                 recorder(
                     "mass-identify",
-                    f"smith={self.smith} cost={self.cost} "
+                    f"smith={self.smith} cost={format_money(self.cost)} "
                     f"items={len(self._unknown_tags)}")
             return
         timeout = 60.0 if self._acknowledged_at else 10.0

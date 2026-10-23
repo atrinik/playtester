@@ -3828,7 +3828,7 @@ class QuestTests(unittest.TestCase):
             (0, 0, 0, "It would cost you 6 silver coins."))
         asyncio.run(task.tick(client))
         self.assertIn((
-            "shop-upgrade-reject", "fine boots cost=600 budget=500"),
+            "shop-upgrade-reject", "fine boots cost=6s budget=5s"),
             client.decisions)
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)
@@ -4127,7 +4127,7 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.moved, [(7, 2, 1)])
         self.assertEqual(client.state.items[2].quality, 80)
         self.assertIn(("shop-upgrade-buy",
-                       "steel longsword cost=200 budget=500"),
+                       "steel longsword cost=2s budget=5s"),
                       client.decisions)
 
         client = FakeClient()
@@ -4360,7 +4360,7 @@ class QuestTests(unittest.TestCase):
             0, 0, 0, "It would cost you 22 silver coins and 20 copper coins."))
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.FAILED)
-        self.assertIn("costs 2220", task.error)
+        self.assertIn("costs 22s 20c", task.error)
         self.assertFalse(client.moves)
 
         client = FakeClient()
@@ -4905,6 +4905,18 @@ class QuestTests(unittest.TestCase):
         task._opened_at -= 1.0
         asyncio.run(task.tick(client))
         self.assertEqual(client.moves, [(7, 91, 1)])
+
+    def test_money_is_written_in_the_games_coins(self):
+        from .client import format_money
+
+        self.assertEqual(format_money(768_192), "76g 81s 92c")
+        self.assertEqual(format_money(985), "9s 85c")
+        self.assertEqual(format_money(10_000), "1g")
+        self.assertEqual(format_money(0), "0c")
+        self.assertEqual(format_money(-250), "-2s 50c")
+        self.assertEqual(format_money(12.6), "13c")
+        self.assertEqual(format_money(123_045_678),
+                         "1 amber 2 mithril 3 jade 4g 56s 78c")
 
     def test_bank_balance_query_tracks_persistent_and_zero_balances(self):
         class FakeClient:
