@@ -37,6 +37,7 @@ CHAT_INTERJECTIONS = frozenset((
     "ah", "btw", "hey", "hi", "hello", "hmm", "lol", "no", "nope", "oh", "ok",
     "okay", "so", "sorry", "thanks", "ty", "um", "wait", "well", "yeah", "yep",
     "yes", "yo"))
+CHAT_INTERJECTION_PATTERN = "|".join(sorted(CHAT_INTERJECTIONS))
 # A player gets at most one such fallback reply per this many seconds.
 CHAT_FALLBACK_SECONDS = 600.0
 # And at most this many replies of any kind per window: no conversation
@@ -1641,12 +1642,16 @@ class AtrinikClient:
                 sender.casefold(), 0.0) <= 90.0)
         # A line opening with another name ("Mira, ...") is someone else's,
         # as her own replies are: never hers to answer (no bot loops).
-        # "Hi, Sera" or "Ok, where are you" open with a word, not a name.
+        # "Hi, Sera" or "Ok, where are you" open with a word, not a name;
+        # "Ok, Kitty, ..." is still Kitty's.
         names_her = bool(player_name and re.search(
             rf"\b{re.escape(player_name)}\b", folded))
-        addressee = re.match(r"([a-z][\w'-]*)\s*,", folded)
-        if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and not names_her
-                and addressee.group(1) not in CHAT_INTERJECTIONS):
+        addressee = re.match(
+            rf"(?:(?:{CHAT_INTERJECTION_PATTERN})\s*,\s*)*([a-z][\w'-]*)\s*,",
+            folded)
+        if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and
+                addressee.group(1) != player_name and
+                addressee.group(1) not in CHAT_INTERJECTIONS):
             return
         # A tell is meant for her; /say, party and /chat only when they name
         # her or continue a conversation she answered.

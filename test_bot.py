@@ -2450,6 +2450,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(commands), 2)
         deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Ash[/a]: Kitty, how are you?")
         self.assertEqual(len(commands), 2)
+        # So is one that opens with a word first, or merely mentions her.
+        for text in ("Ok, Kitty, how are you?", "Hey, Kitty, where are you?"):
+            deliver(c.CHAT_TYPE_LOCAL, f"[a=#charname]Ash[/a]: {text}")
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Eve[/a]: Mira, where is Sera?")
+        self.assertEqual(len(commands), 2)
+        # But "Ok, ..." with no name continues Ash's talk with her.
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Ash[/a]: Ok, where are you")
+        self.assertEqual(len(commands), 3)
+        self.assertTrue(commands[-1].startswith("/say Ash, I'm in "))
         # Even when a rule matches each time (her apology rule answers
         # "Sorry, ..."), no player gets more than five replies in five
         # minutes: two auto-responders cannot talk forever.
@@ -2457,8 +2466,14 @@ class ProtocolTests(unittest.TestCase):
             deliver(c.CHAT_TYPE_LOCAL,
                     "[a=#charname]Mira[/a]: Sera, Sorry, I didn't quite get that.")
             client._last_chat_prompt = ""
-        self.assertEqual(len(commands), 7)
+        self.assertEqual(len(commands), 8)
         self.assertTrue(commands[-1].startswith("/say Mira, "))
+        # Players are forgotten once their windows pass.
+        later = time.monotonic() + 3600.0
+        with patch("time.monotonic", return_value=later):
+            deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Fay[/a]: Sera, ribbit?")
+        self.assertEqual(list(client._chat_replies), ["fay"])
+        self.assertEqual(list(client._chat_fallback_at), ["fay"])
 
     def test_chat_log_keeps_conversations_for_review(self):
         with tempfile.TemporaryDirectory() as directory:
