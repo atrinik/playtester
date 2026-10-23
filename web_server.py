@@ -780,6 +780,18 @@ class WebControlServer:
                             if key in include}
             await self._reply(writer, 200, _json_bytes(snapshot))
             return
+        if method == "GET" and path == "/api/chat":
+            # The durable chat log: ?sender=NAME&limit=N (newest N, oldest
+            # first, up to 5000).
+            params = parse_qs(query)
+            character = (self.client.state.player_name or
+                         self.client.config.character)
+            history = self.client._memory_store().chat_history(
+                character,
+                limit=int((params.get("limit") or ["200"])[0]),
+                sender=(params.get("sender") or [""])[0]) if character else []
+            await self._reply(writer, 200, _json_bytes({"chat": history}))
+            return
         if method == "GET" and path.startswith("/api/face/"):
             image = self.face_images.png(path[len("/api/face/"):])
             if image is None:

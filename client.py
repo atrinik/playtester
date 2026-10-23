@@ -31,6 +31,14 @@ from .transport import QuicStream
 # The longest a death waits for a locked memory database (seconds).
 POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
+
+# Friendly replies to a message meant for her that no rule answers, in turn.
+CHAT_FALLBACKS = (
+    "Ha, I'm not sure! I'm busy training right now.",
+    "Sorry, I didn't quite get that. I'm out training!",
+    "Hmm, good question! I'll have to think about that one.",
+    "I hear you! Can't stop right now, I'm in the middle of training.",
+)
 EventHandler = Callable[[Event], Awaitable[None] | None]
 
 COIN_VALUES = {
@@ -171,6 +179,7 @@ class AtrinikClient:
         self._chat_rules: list[
             tuple[str, tuple[re.Pattern, ...], tuple[str, ...]]] = []
         self._chat_rule_uses: dict[str, int] = {}
+        self._chat_fallback_uses = 0
         self.chat_context_provider: Callable[[], dict[str, str]] | None = None
         self._reload_chat_rules()
         requested_memory = (Path(config.runtime_state_path)
@@ -1451,7 +1460,9 @@ class AtrinikClient:
     @staticmethod
     def _incoming_player_chat(msg_type: int, text: str) -> tuple[str, str]:
         """Extract the sender and body from server-authored chat markup."""
-        if msg_type == c.CHAT_TYPE_CHAT:
+        if msg_type in (c.CHAT_TYPE_CHAT, c.CHAT_TYPE_LOCAL,
+                        c.CHAT_TYPE_PARTY):
+            # /chat, /say and party chat share the server's named prefix.
             match = re.fullmatch(
                 r"\[a=#charname\]([^[]+)\[/a\]:\s*(.*)", text, re.S)
         elif msg_type == c.CHAT_TYPE_PRIVATE:
@@ -1582,6 +1593,18 @@ class AtrinikClient:
         display = skill_name.removesuffix(" weapons").title()
         return f"{display}, currently level {level}" if level else display
 
+    def _log_chat(self, msg_type: int, direction: str, sender: str,
+                  text: str) -> None:
+        """Keep a chat line in the durable chat log; never fail the bot."""
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        try:
+            self._memory_store().append_chat(
+                character, msg_type, direction, sender, text)
+        except Exception:
+            log.exception("could not keep a chat line")
+
     async def _respond_to_player_chat(self, msg_type: int, text: str) -> None:
         """Answer small, verifiable social questions without chat spam."""
         sender, body = self._incoming_player_chat(msg_type, text)
@@ -1591,21 +1614,31 @@ class AtrinikClient:
                        self.config.character).casefold()
         if sender.casefold() == player_name:
             return
+        self._log_chat(msg_type, "in", sender, body)
         folded = re.sub(r"\s+", " ", body.casefold()).strip()
         chat_now = time.monotonic()
         recent_correspondent = (
             chat_now - self._chat_correspondents.get(
                 sender.casefold(), 0.0) <= 90.0)
+        # A tell, party chat and /say near her are meant for her; public
+        # /chat only when it names her or continues a conversation.
         direct = bool(
-            msg_type == c.CHAT_TYPE_PRIVATE or
+            msg_type in (c.CHAT_TYPE_PRIVATE, c.CHAT_TYPE_PARTY,
+                         c.CHAT_TYPE_LOCAL) or
             recent_correspondent or
             (player_name and re.search(
                 rf"\b{re.escape(player_name)}\b", folded)))
         location_question = bool(re.search(
             r"\b(?:where\s+(?:are|r)\s+(?:you|u)|"
             r"where(?:'s|\s+is)\s+(?:sera|she)|"
+            r"what(?:'s|\s+is)\s+your\s+(?:location|position)|"
             r"what\s+(?:map|zone|area)\s+are\s+you\s+(?:in|at))\b",
             folded))
+        presence_question = bool(
+            re.search(r"\b(?:are\s+)?(?:you|u)\s+there\b", folded) or
+            (player_name and re.fullmatch(
+                rf"(?:yo\s+|hey\s+)?{re.escape(player_name)}[?!. ]*",
+                folded)))
         status_question = bool(re.search(
             r"\bwhat(?:'re|\s+are)\s+you\s+(?:doing|farming|fighting)|"
             r"\bwhat\s+are\s+you\s+up\s+to\b", folded))
@@ -1693,16 +1726,19 @@ class AtrinikClient:
                 "chat-farming-tip", f"sender={sender} text={body}")
         elif greeting:
             response = "Hey!"
+        elif presence_question and direct:
+            response = "I'm here! Just out training."
         elif direct and (small_talk := self._small_talk_response(folded)):
             response = small_talk
         elif direct:
-            # Decisions are persisted in the server/account/character-scoped
-            # SQLite ledger. This is the review queue for extending Sera's
-            # conversational rules from questions real players actually ask.
+            # The review queue for new rules from questions real players
+            # actually ask; the chat log keeps the full conversation.
             self.record_action(
                 "chat-unhandled",
                 f"channel={msg_type} sender={sender} text={body}")
-            return
+            response = CHAT_FALLBACKS[
+                self._chat_fallback_uses % len(CHAT_FALLBACKS)]
+            self._chat_fallback_uses += 1
         else:
             return
 
@@ -1720,11 +1756,23 @@ class AtrinikClient:
                 key=self._chat_correspondents.__getitem__)
             del self._chat_correspondents[oldest]
         clean_sender = sender.replace('"', "")
+        # Answer on the channel she was spoken to on.
         if msg_type == c.CHAT_TYPE_PRIVATE:
             command = f'/tell "{clean_sender}" {response}'
+        elif msg_type == c.CHAT_TYPE_LOCAL:
+            command = f"/say {clean_sender}, {response}"
+        elif msg_type == c.CHAT_TYPE_PARTY:
+            command = f"/gsay {clean_sender}, {response}"
         else:
             command = f"/chat {clean_sender}, {response}"
-        await self.command(command)
+        try:
+            await self.command(command)
+        except ConnectionError:
+            # The connection dropped as she answered; chat is never worth
+            # failing the message handler for.
+            log.info("chat reply to %s not sent: disconnected", clean_sender)
+            return
+        self._log_chat(msg_type, "out", clean_sender, response)
         self.record_action(
             "chat-response",
             f"channel={msg_type} sender={sender} response={response}")

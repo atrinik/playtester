@@ -2338,9 +2338,17 @@ class ProtocolTests(unittest.TestCase):
             "right now.",
         ])
 
-    def test_unknown_direct_chat_is_recorded_for_rule_review(self):
+    def test_unknown_direct_chat_is_recorded_and_answered_kindly(self):
+        from .client import CHAT_FALLBACKS
+
         client = AtrinikClient(ClientConfig(character="Sera"))
         decisions = []
+        commands = []
+
+        async def command(value):
+            commands.append(value)
+
+        client.command = command
         client.record_action = lambda action, detail="": (
             decisions.append((action, detail)))
         text = ("[a=#charname]Kitty[/a]: Sera, what is the airspeed "
@@ -2350,9 +2358,92 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
 
+        # Still queued for rule review, but no longer met with silence.
         self.assertEqual(decisions[0][0], "chat-unhandled")
         self.assertIn("sender=Kitty", decisions[0][1])
         self.assertIn("airspeed velocity", decisions[0][1])
+        self.assertEqual(commands, [f"/chat Kitty, {CHAT_FALLBACKS[0]}"])
+
+    def test_say_and_party_chat_are_heard_and_answered_in_kind(self):
+        from .client import CHAT_FALLBACKS
+
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.stats.update(hp=202, maxhp=202)
+        commands = []
+
+        async def command(value):
+            commands.append(value)
+
+        client.command = command
+
+        def deliver(msg_type, text):
+            payload = bytes((msg_type,)) + b"white\0" + text.encode() + b"\0"
+            asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            client._last_chat_reply_at = 0.0
+
+        # Live: Zugzug spoke to her with /say, which she never read.
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Zugzug[/a]: Where did you go wtf")
+        self.assertEqual(commands[-1], f"/say Zugzug, {CHAT_FALLBACKS[0]}")
+        deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Zugzug[/a]: how are you?")
+        self.assertEqual(commands[-1],
+                         "/say Zugzug, Doing well, thanks! Just out training.")
+        deliver(c.CHAT_TYPE_PARTY, "[a=#charname]Zugzug[/a]: are you there?")
+        self.assertEqual(commands[-1], "/gsay Zugzug, I'm here! Just out training.")
+        # Live phrasings that went unanswered on /chat.
+        deliver(c.CHAT_TYPE_CHAT, "[a=#charname]Zugzug[/a]: Sera")
+        self.assertEqual(commands[-1], "/chat Zugzug, I'm here! Just out training.")
+        deliver(c.CHAT_TYPE_CHAT, "[a=#charname]Zugzug[/a]: SERA WHAT'S YOUR LOCATION")
+        self.assertTrue(commands[-1].startswith("/chat Zugzug, I'm in "))
+        # Public chat that is not for her stays unanswered.
+        count = len(commands)
+        deliver(c.CHAT_TYPE_CHAT, "[a=#charname]Mallory[/a]: anyone selling arrows?")
+        self.assertEqual(len(commands), count)
+
+    def test_chat_log_keeps_conversations_for_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = AtrinikClient(ClientConfig(
+                character="Sera",
+                runtime_state_path=str(Path(directory) / "memory.sqlite3")))
+
+            async def command(value):
+                pass
+
+            client.command = command
+            for msg_type, text in (
+                    (c.CHAT_TYPE_LOCAL, "[a=#charname]Zugzug[/a]: TAKE ME TO THE PLACE"),
+                    (c.CHAT_TYPE_CHAT, "[a=#charname]Mallory[/a]: anyone selling arrows?")):
+                payload = bytes((msg_type,)) + b"white\0" + text.encode() + b"\0"
+                asyncio.run(client._handle_drawinfo(Cursor(payload), payload))
+            history = client._memory_store().chat_history("Sera")
+            # Every player line she saw is kept, and her own reply.
+            self.assertEqual(
+                [(entry["direction"], entry["sender"]) for entry in history],
+                [("in", "Zugzug"), ("out", "Zugzug"), ("in", "Mallory")])
+            self.assertEqual(history[0]["text"], "TAKE ME TO THE PLACE")
+            self.assertEqual(history[0]["channel"], c.CHAT_TYPE_LOCAL)
+            self.assertEqual(
+                [entry["sender"] for entry in
+                 client._memory_store().chat_history("Sera", sender="zugzug")],
+                ["Zugzug", "Zugzug"])
+
+    def test_chat_log_prunes_lines_older_than_a_year(self):
+        from .memory import BotMemory, CHAT_RETENTION_SECONDS
+
+        with tempfile.TemporaryDirectory() as directory:
+            memory = BotMemory(Path(directory) / "memory.sqlite3",
+                               server="game", account="acct")
+            now = time.time()
+            memory.append_chat("Sera", c.CHAT_TYPE_CHAT, "in", "Old", "hi",
+                               at=now - CHAT_RETENTION_SECONDS - 10)
+            # The first append of each batch prunes what is older than a year.
+            memory._chat_appends = 0
+            memory.append_chat("Sera", c.CHAT_TYPE_CHAT, "in", "New", "hello", at=now)
+            self.assertEqual([entry["sender"] for entry in memory.chat_history("Sera")],
+                             ["New"])
+            # Another account's lines are its own.
+            other = BotMemory(Path(directory) / "memory.sqlite3",
+                              server="game", account="other")
+            self.assertEqual(other.chat_history("Sera"), [])
 
     def test_live_unhandled_wellbeing_prompt_becomes_a_response(self):
         client = AtrinikClient(ClientConfig(character="Sera"))
@@ -2484,8 +2575,12 @@ class ProtocolTests(unittest.TestCase):
                     Cursor(payload), payload))
 
             deliver()
-            self.assertEqual(decisions[-1][0], "chat-unhandled")
-            self.assertEqual(commands, [])
+            self.assertIn("chat-unhandled", [action for action, _ in decisions])
+            # Unmatched, she answers with a fallback.
+            self.assertEqual(len(commands), 1)
+            commands.clear()
+            client._last_chat_reply_at = 0.0
+            client._last_chat_prompt = ""
 
             rules_path.write_text(json.dumps({"rules": [{
                 "id": "frog",
@@ -16062,6 +16157,27 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         status, _ = await self.request("POST", "/api/task", {
             "type": "farm_circuit", "analyzer_spot": "gone", "legs": []})
         self.assertEqual(status, 400)
+
+    async def test_dashboard_serves_the_chat_log(self):
+        from .memory import BotMemory
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.client.state.player_name = "Sera"
+            self.client.memory = BotMemory(
+                Path(directory) / "memory.sqlite3", server="game", account="acct")
+            self.client.memory.append_chat(
+                "Sera", c.CHAT_TYPE_LOCAL, "in", "Zugzug", "COME BACK", at=10.0)
+            self.client.memory.append_chat(
+                "Sera", c.CHAT_TYPE_CHAT, "in", "Mallory", "arrows?", at=11.0)
+            status, payload = await self.request(
+                "GET", "/api/chat?sender=zugzug&limit=10")
+            self.assertEqual(status, 200, payload)
+            chat = json.loads(payload)["chat"]
+            self.assertEqual([(entry["sender"], entry["text"]) for entry in chat],
+                             [("Zugzug", "COME BACK")])
+            status, payload = await self.request("GET", "/api/chat?limit=1")
+            self.assertEqual([entry["sender"] for entry in json.loads(payload)["chat"]],
+                             ["Mallory"])
 
     async def test_dashboard_serves_farming_analysis_and_persists_the_objective(self):
         self.client.state.farm_adaptations = {
