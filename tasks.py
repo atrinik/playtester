@@ -21,8 +21,8 @@ except ModuleNotFoundError:
 
 from . import constants as c
 from .targeting import select_target, target_set_aside
-from .client import (COIN_VALUES, AtrinikClient, format_money, map_object_visual_name,
-                     update_bank_balance)
+from .client import (COIN_VALUES, AtrinikClient, format_money,
+                     map_object_visual_name, update_bank_balance)
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
 

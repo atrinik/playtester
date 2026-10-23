@@ -4915,6 +4915,11 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(format_money(0), "0c")
         self.assertEqual(format_money(-250), "-2s 50c")
         self.assertEqual(format_money(12.6), "13c")
+        self.assertEqual(format_money(12.5), "13c")
+        # One label per coin the server knows, at the same worth.
+        from .client import COIN_LABELS, COIN_VALUES
+        self.assertEqual(sorted(worth for worth, _ in COIN_LABELS),
+                         sorted(COIN_VALUES.values()))
         self.assertEqual(format_money(123_045_678),
                          "1 amber 2 mithril 3 jade 4g 56s 78c")
 

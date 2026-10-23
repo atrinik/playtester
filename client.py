@@ -8,6 +8,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -76,7 +77,8 @@ COIN_LABELS = (
 
 def format_money(copper: float) -> str:
     """A copper amount in the game's coins, e.g. ``76g 81s 92c``."""
-    value = round(copper)
+    # Halves round up, as the dashboard's Math.round does.
+    value = math.floor(copper + 0.5)
     sign, value = ("-" if value < 0 else ""), abs(value)
     parts = []
     for worth, label in COIN_LABELS:
