@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # Physical attacks are covered by armour; others need specific protection.
 PHYSICAL = frozenset({"impact", "slash", "cleave", "pierce"})
@@ -38,6 +38,13 @@ HEAL_STEP, HEAL_CAP = 0.02, 0.98
 PAUSE_FAILURES, PAUSE_WINDOW_SECONDS = 3, 3600.0
 PAUSE_SECONDS = 3600.0
 KEEP_REVIEWS = 10
+# A spot where this many pack or out-damaged failures happened with one
+# combat kit, within the window, is hazardous for that kit: the analyzer
+# ranks it, but her kit cannot hold it. Tighter margins did not help: live,
+# ten deaths in about 90 minutes on the treant and underground-city maps.
+KIT_HAZARD_FAILURES = 3
+KIT_HAZARD_WINDOW_SECONDS = 24 * 3600.0
+KIT_HAZARD_CAUSES = frozenset({"pack", "out-damaged"})
 
 # Bounded digits: a server line with an oversized amount never reaches
 # int()'s digit limit; it is not a hit we count.
@@ -204,8 +211,13 @@ def remedies(review: FailureReview) -> tuple[str, ...]:
     return ("cautious route",)
 
 
-def learn(record: dict, review: FailureReview, *, now: float | None = None) -> tuple[dict, bool]:
-    """Fold a review into a spot's adaptation record; return (record, pause)."""
+def learn(record: dict, review: FailureReview, *, now: float | None = None,
+          kit: dict | None = None) -> tuple[dict, bool]:
+    """Fold a review into a spot's adaptation record; return (record, pause).
+
+    ``kit`` describes the combat profile she failed with (the analyzer's),
+    kept with the failure for ``kit_hazard``.
+    """
     now = time.time() if now is None else now
     record = dict(record or {})
     level = int(record.get("level", 0) or 0)
@@ -222,9 +234,34 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None) -> t
     entry["remedies"] = list(remedies(review))
     reviews.append(entry)
     pause = level >= MAX_LEVEL and len(failures) >= PAUSE_FAILURES
+    kit_failures = [entry for entry in record.get("kit_failures", ())
+                    if isinstance(entry, dict) and
+                    now - float(entry.get("time", 0.0) or 0.0) <=
+                    KIT_HAZARD_WINDOW_SECONDS]
+    kit_failures.append({"time": review.time, "cause": review.cause,
+                         "kit": dict(kit or {})})
     record.update(level=min(MAX_LEVEL, level + 1), failures=failures[-PAUSE_FAILURES:],
-                  causes=causes, reviews=reviews, updated_at=now)
+                  causes=causes, reviews=reviews, updated_at=now,
+                  kit_failures=kit_failures[-KEEP_REVIEWS:])
     return record, pause
+
+
+def kit_hazard(record: dict | None, same_kit: Callable[[dict], bool], *,
+               now: float | None = None) -> bool:
+    """Whether a spot is hazardous for the kit ``same_kit`` accepts.
+
+    True after KIT_HAZARD_FAILURES pack or out-damaged failures within the
+    window, each with a kit ``same_kit`` judges the same as hers now. A
+    materially different kit (the analyzer's own test) clears it, and so does
+    time.
+    """
+    now = time.time() if now is None else now
+    return sum(
+        1 for entry in (record or {}).get("kit_failures", ())
+        if isinstance(entry, dict) and
+        entry.get("cause") in KIT_HAZARD_CAUSES and
+        now - float(entry.get("time", 0.0) or 0.0) <= KIT_HAZARD_WINDOW_SECONDS and
+        same_kit(entry.get("kit") or {})) >= KIT_HAZARD_FAILURES
 
 
 def improvement_goals(adaptations: dict) -> dict[str, Any]:

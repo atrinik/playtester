@@ -47,7 +47,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     corpse_tile_standable, movement_ack_timeout,
                     recent_hostile_attackers,
                     recent_hostile_contact,
-                    retreat_mobility)
+                    retreat_mobility, wand_known_empty)
 log = logging.getLogger(__name__)
 
 
@@ -3368,9 +3368,9 @@ class NavigateThenTask(BotTask):
                 return True
             await client.clear_actions()
             await client.set_combat(False)
-            if not (await self.task.melee_kite(
-                    client, x, y, obj, map_node=node,
-                    preserve_spell_line=self.task.combat_spell_item(client)) or
+            spell = self.task.combat_spell_item(client)
+            if not ((spell is not None and await self.task.caster_kite(
+                    client, x, y, obj, spell)) or
                     nearest[0] > 1 or not recent_hostile_contact(client, 3.0)):
                 # Survival: an adjacent attacker she can neither cast at nor
                 # step away from is fought, here and now.
@@ -3979,6 +3979,31 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
     return True
 
 
+def current_combat_kit(client: AtrinikClient):
+    """The combat profile the analyzer ranked spots for, if known."""
+    return getattr(getattr(client, "farm_analyzer", None), "profile", None)
+
+
+def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
+                       legs) -> bool:
+    """Whether live failures rate this spot hazardous for her current kit.
+
+    See self_improvement.kit_hazard: repeated pack or out-damaged failures
+    with a kit the analyzer would not rank differently from hers now.
+    """
+    profile = current_combat_kit(client)
+    if profile is None:
+        return False
+    adaptations = getattr(client.state, "farm_adaptations", {}) or {}
+    record = adaptations.get(self_improvement.spot_key(spot, legs))
+
+    def same_kit(kit: dict) -> bool:
+        old = farm_analyzer_plan.CombatProfile.from_description(kit)
+        return old is not None and not profile.materially_differs(old)
+
+    return self_improvement.kit_hazard(record, same_kit)
+
+
 def analyzer_farm_choice(
         client: AtrinikClient, graph: "WorldGraph"
 ) -> tuple[str, tuple[tuple[str, str], ...], dict] | None:
@@ -3986,7 +4011,9 @@ def analyzer_farm_choice(
 
     The farming analyzer is the source of truth. The only exceptions are live
     failures: a spot quarantined after a death, an emergency recall, ten minutes
-    without XP, or an unreachable route is skipped until its quarantine ends.
+    without XP, or an unreachable route is skipped until its quarantine ends,
+    and a spot rated hazardous for her current kit (kit_hazardous_spot) is
+    skipped until her kit materially changes.
 
     While depleted, a safety spot is skipped once any map on it is known not
     to reach every town service on a strictly safe route
@@ -4013,7 +4040,8 @@ def analyzer_farm_choice(
         for spot in analyzer.ranking(objective):
             legs = analyzer_spot_legs(spot, graph)
             if legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
-                            for path, _ in legs):
+                            for path, _ in legs) and not kit_hazardous_spot(
+                                client, spot, legs):
                 usable.append((objective, legs, spot))
     if not depleted_for_temple(client.state):
         return usable[0] if usable else None
@@ -4698,7 +4726,10 @@ class FarmCircuitTask(BotTask):
                          f"{on_map} damage from " + ", ".join(sorted(hits)))
         key = self._spot_key()
         adaptations = getattr(client.state, "farm_adaptations", {}) or {}
-        record, pause = self_improvement.learn(adaptations.get(key, {}), review)
+        kit = current_combat_kit(client)
+        record, pause = self_improvement.learn(
+            adaptations.get(key, {}), review,
+            kit=kit.describe() if kit is not None else None)
         setter = getattr(client, "set_farm_adaptation", None)
         if setter is not None:
             setter(key, record)
@@ -4719,6 +4750,15 @@ class FarmCircuitTask(BotTask):
             self._quarantine_farm_path(
                 client, path, "repeated failures at the maximum adaptation level",
                 seconds=self_improvement.PAUSE_SECONDS)
+            return True
+        if kit_hazardous_spot(client, self.spot, self.legs):
+            # Her kit cannot hold this spot: choose another now. It stays
+            # skipped until her kit materially changes (analyzer_farm_choice).
+            if recorder is not None:
+                recorder("farm-kit-hazard",
+                         f"{(self.spot or {}).get('name', key)}: "
+                         f"{self_improvement.KIT_HAZARD_FAILURES} pack or "
+                         "out-damaged failures with this kit")
             return True
         # Rebuild the farm child so the tighter margins apply immediately, but
         # keep any Word of Recall still in flight: the recall decision is
@@ -4846,7 +4886,8 @@ class FarmCircuitTask(BotTask):
             quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
             now = time.time()
             if any(float(quarantine.get(path, 0.0) or 0.0) > now
-                   for path, _ in self.legs):
+                   for path, _ in self.legs) or kit_hazardous_spot(
+                       client, self.spot, self.legs):
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("farm-spots-exhausted",
@@ -5941,11 +5982,13 @@ class FarmCircuitTask(BotTask):
 
     @staticmethod
     def _owned_recall_device(client: AtrinikClient) -> bool:
+        # A wand known to be empty is no escape: recall shopping replaces it.
         policy = InventoryPolicy()
         return any(
             item.item_type in (c.TYPE_ROD, c.TYPE_WAND) and
             "word of recall" in item.name.casefold() and
             policy.identified(item) and
+            not wand_known_empty(client, item) and
             not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)
             for item in client.state.inventory)
 

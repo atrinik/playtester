@@ -14,6 +14,7 @@ preferred objective never needs a new run.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass
 import json
 import logging
@@ -205,6 +206,19 @@ class CombatProfile:
         new = dict(self.protections)
         return any(abs(new.get(name, 0) - old.get(name, 0)) >= 5
                    for name in set(old) | set(new))
+
+    @classmethod
+    def from_description(cls, data: dict) -> "CombatProfile | None":
+        """Rebuild a profile from ``describe()``, or None if incomplete."""
+        names = {entry.name for entry in dataclasses.fields(cls)}
+        try:
+            values = {key: value for key, value in data.items() if key in names}
+            values["protections"] = tuple(sorted(
+                (str(name), int(amount))
+                for name, amount in dict(data.get("protections") or {}).items()))
+            return cls(**values)
+        except (TypeError, ValueError, AttributeError):
+            return None
 
     def describe(self) -> dict[str, Any]:
         return {
