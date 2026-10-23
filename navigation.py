@@ -3989,7 +3989,8 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
     """Whether live failures rate this spot hazardous for her current kit.
 
     See self_improvement.kit_hazard: repeated pack or out-damaged failures
-    with a kit the analyzer would not rank differently from hers now.
+    with a kit whose survivability matches hers now
+    (CombatProfile.same_survivability).
     """
     profile = current_combat_kit(client)
     if profile is None:
@@ -3999,7 +4000,7 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
 
     def same_kit(kit: dict) -> bool:
         old = farm_analyzer_plan.CombatProfile.from_description(kit)
-        return old is not None and not profile.materially_differs(old)
+        return old is not None and profile.same_survivability(old)
 
     return self_improvement.kit_hazard(record, same_kit)
 
@@ -4013,7 +4014,8 @@ def analyzer_farm_choice(
     failures: a spot quarantined after a death, an emergency recall, ten minutes
     without XP, or an unreachable route is skipped until its quarantine ends,
     and a spot rated hazardous for her current kit (kit_hazardous_spot) is
-    skipped until her kit materially changes.
+    skipped until her survivability changes, unless every usable spot is
+    hazardous; then the least dangerous of them is farmed.
 
     While depleted, a safety spot is skipped once any map on it is known not
     to reach every town service on a strictly safe route
@@ -4035,14 +4037,20 @@ def analyzer_farm_choice(
     quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
     now = time.time()
     usable = []
+    hazardous = []
     for objective in dict.fromkeys(
             (effective_farm_objective(client.state), chosen)):
         for spot in analyzer.ranking(objective):
             legs = analyzer_spot_legs(spot, graph)
             if legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
-                            for path, _ in legs) and not kit_hazardous_spot(
-                                client, spot, legs):
-                usable.append((objective, legs, spot))
+                            for path, _ in legs):
+                (hazardous if kit_hazardous_spot(client, spot, legs)
+                 else usable).append((objective, legs, spot))
+    if not usable and hazardous:
+        # Every usable spot is hazardous for her kit: farm the least
+        # dangerous one rather than idle until the hazard ages out.
+        usable = [min(hazardous, key=lambda entry: float(
+            entry[2].get("danger", 0.0) or 0.0))]
     if not depleted_for_temple(client.state):
         return usable[0] if usable else None
     budget = [1]
@@ -4751,15 +4759,6 @@ class FarmCircuitTask(BotTask):
                 client, path, "repeated failures at the maximum adaptation level",
                 seconds=self_improvement.PAUSE_SECONDS)
             return True
-        if kit_hazardous_spot(client, self.spot, self.legs):
-            # Her kit cannot hold this spot: choose another now. It stays
-            # skipped until her kit materially changes (analyzer_farm_choice).
-            if recorder is not None:
-                recorder("farm-kit-hazard",
-                         f"{(self.spot or {}).get('name', key)}: "
-                         f"{self_improvement.KIT_HAZARD_FAILURES} pack or "
-                         "out-damaged failures with this kit")
-            return True
         # Rebuild the farm child so the tighter margins apply immediately, but
         # keep any Word of Recall still in flight: the recall decision is
         # recorded when it is fired, and a fresh task would fire another.
@@ -4771,6 +4770,16 @@ class FarmCircuitTask(BotTask):
                     setattr(self.child.task, name, getattr(previous, name))
             self._farm_started_at = 0.0
             self._empty_spawn_since = 0.0
+        if kit_hazardous_spot(client, self.spot, self.legs):
+            # Her kit cannot hold this spot: choose again now. It stays
+            # skipped while her survivability is the same
+            # (analyzer_farm_choice).
+            if recorder is not None:
+                recorder("farm-kit-hazard",
+                         f"{(self.spot or {}).get('name', key)}: "
+                         f"{self_improvement.KIT_HAZARD_FAILURES} pack or "
+                         "out-damaged failures with this kit")
+            return True
         return False
 
     def _quarantine_farm_path(self, client: AtrinikClient, path: str,
@@ -4886,8 +4895,7 @@ class FarmCircuitTask(BotTask):
             quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
             now = time.time()
             if any(float(quarantine.get(path, 0.0) or 0.0) > now
-                   for path, _ in self.legs) or kit_hazardous_spot(
-                       client, self.spot, self.legs):
+                   for path, _ in self.legs):
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("farm-spots-exhausted",
