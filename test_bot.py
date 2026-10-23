@@ -2405,10 +2405,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(commands[-1].startswith("/say Cy, "))
         for name, text in (("Gus", "Hi there, Sera, where are you?"),
                            ("Hal", "Howdy, Sera, where are you?"),
-                           ("Ivy", "Hiya, Sera, where are you?"),
+                           ("Ivy", "Hellooo, Sera, where are you?"),
                            ("Jo", "Heyy, Sera, where are you?"),
                            ("Kai", "Cool, where are you Sera?"),
-                           ("Lu", "Question: where are you, Sera?")):
+                           ("Lu", "Hmm, ok, where are you Sera?")):
             deliver(c.CHAT_TYPE_LOCAL, f"[a=#charname]{name}[/a]: {text}")
             self.assertTrue(commands[-1].startswith(f"/say {name}, I'm in "), commands[-1])
         # Her rules read the party line without its "[Party] Name says:".
@@ -2459,7 +2459,8 @@ class ProtocolTests(unittest.TestCase):
         deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Ash[/a]: Kitty, how are you?")
         self.assertEqual(len(commands), 2)
         # So is one that opens with a word first, or merely mentions her.
-        for text in ("Ok, Kitty, how are you?", "Hey, Kitty, where are you?"):
+        for text in ("Ok, Kitty, how are you?", "Hey, Kitty, where are you?",
+                     "Hmm, Kitty, where are you?", "Heyy, Kitty, where are you?"):
             deliver(c.CHAT_TYPE_LOCAL, f"[a=#charname]Ash[/a]: {text}")
         deliver(c.CHAT_TYPE_LOCAL, "[a=#charname]Eve[/a]: Mira, where is Sera?")
         self.assertEqual(len(commands), 2)

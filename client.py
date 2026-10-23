@@ -33,14 +33,20 @@ POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
 
 # Words that open a line with a comma without addressing anyone ("Hi, ..."),
-# also matched with stretched letters folded ("Heyy," and "Hmmm," too).
+# matched with stretched letters folded ("Heyy,", "Hmmm," and "Hellooo,").
 CHAT_INTERJECTIONS = frozenset((
     "ah", "alright", "aye", "btw", "cool", "great", "greetings", "haha", "hehe",
     "hey", "heya", "hi", "hiya", "hello", "hm", "howdy", "lmao", "lol",
-    "nice", "no", "nope", "np", "oh", "ok", "okay", "ops", "oops", "so",
+    "nice", "no", "nope", "np", "oh", "ok", "okay", "oops", "so",
     "sorry", "sure", "thanks", "ty", "um", "wait", "welcome", "well", "wow",
     "yay", "yeah", "yep", "yes", "yo"))
-CHAT_INTERJECTION_PATTERN = "|".join(sorted(CHAT_INTERJECTIONS))
+
+
+def _fold_letters(word: str) -> str:
+    return re.sub(r"(.)\1+", r"\1", word)
+
+
+CHAT_INTERJECTIONS_FOLDED = frozenset(map(_fold_letters, CHAT_INTERJECTIONS))
 # A player gets at most one such fallback reply per this many seconds.
 CHAT_FALLBACK_SECONDS = 600.0
 # And at most this many replies of any kind per window: no conversation
@@ -1651,13 +1657,15 @@ class AtrinikClient:
         # where is Sera?", and the reply caps bound what that lets through.
         names_her = bool(player_name and re.search(
             rf"\b{re.escape(player_name)}\b", folded))
-        addressee = re.match(
-            rf"(?:(?:{CHAT_INTERJECTION_PATTERN})\s*,\s*)*([a-z][\w'-]*)\s*,",
-            folded)
-        opener = addressee.group(1) if addressee else ""
+        # The first leading "word," that is not an opener names the addressee.
+        addressee = ""
+        leading = re.match(r"(?:[a-z][\w'-]*\s*,\s*)*", folded).group()
+        for word in re.findall(r"[a-z][\w'-]*", leading):
+            if _fold_letters(word) not in CHAT_INTERJECTIONS_FOLDED:
+                addressee = word
+                break
         if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and
-                opener != player_name and opener not in CHAT_INTERJECTIONS and
-                re.sub(r"(.)\1+", r"\1", opener) not in CHAT_INTERJECTIONS):
+                addressee != player_name):
             return
         # A tell is meant for her; /say, party and /chat only when they name
         # her or continue a conversation she answered.
