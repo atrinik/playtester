@@ -34,7 +34,8 @@ log = logging.getLogger(__name__)
 
 # Words that open a line with a comma without addressing anyone ("Hi, ...").
 CHAT_INTERJECTIONS = frozenset((
-    "ah", "btw", "hey", "hi", "hello", "hmm", "lol", "no", "nope", "oh", "ok",
+    "ah", "btw", "hey", "heya", "hi", "hiya", "hello", "hmm", "howdy", "lol",
+    "no", "nope", "oh", "ok",
     "okay", "so", "sorry", "thanks", "ty", "um", "wait", "well", "yeah", "yep",
     "yes", "yo"))
 CHAT_INTERJECTION_PATTERN = "|".join(sorted(CHAT_INTERJECTIONS))
@@ -1643,14 +1644,14 @@ class AtrinikClient:
         # A line opening with another name ("Mira, ...") is someone else's,
         # as her own replies are: never hers to answer (no bot loops).
         # "Hi, Sera" or "Ok, where are you" open with a word, not a name;
-        # "Ok, Kitty, ...", "Hey Kitty, ...", "@Kitty, ..." and "Kitty: ..."
-        # are still Kitty's. A name only at the end ("Where is Sera, Kitty?")
-        # is not read; the reply caps bound what that lets through.
+        # "Ok, Kitty, ..." is still Kitty's. Only that plain "Name," form is
+        # read: missing chat to her is worse than answering "Hey Kitty,
+        # where is Sera?", and the reply caps bound what that lets through.
         names_her = bool(player_name and re.search(
             rf"\b{re.escape(player_name)}\b", folded))
         addressee = re.match(
-            rf"@?(?:(?:{CHAT_INTERJECTION_PATTERN})\b[\s,]*)*@?"
-            rf"([a-z][\w'-]*)\s*[,:]", folded)
+            rf"(?:(?:{CHAT_INTERJECTION_PATTERN})\s*,\s*)*([a-z][\w'-]*)\s*,",
+            folded)
         if (msg_type != c.CHAT_TYPE_PRIVATE and addressee and
                 addressee.group(1) != player_name and
                 addressee.group(1) not in CHAT_INTERJECTIONS):
