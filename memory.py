@@ -12,6 +12,13 @@ from typing import Any, Iterator
 
 log = logging.getLogger(__name__)
 
+# Chat lines are kept this long, pruned now and then while appending.
+CHAT_RETENTION_SECONDS = 365 * 24 * 3600
+CHAT_PRUNE_EVERY = 500
+CHAT_TEXT_LIMIT = 1000
+# And at most this many lines per server and account, newest kept.
+CHAT_ROW_LIMIT = 300_000
+
 
 class BotMemory:
     """Small SQLite key/value store for durable autonomous decisions."""
@@ -39,6 +46,27 @@ class BotMemory:
                        key TEXT PRIMARY KEY,
                        value TEXT NOT NULL
                    )""")
+            # Player chat she saw and her replies, one row each, so a talk
+            # can be reviewed weeks later (the decision log keeps hours).
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS chat_log (
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       at REAL NOT NULL,
+                       channel INTEGER NOT NULL,
+                       direction TEXT NOT NULL,
+                       sender TEXT NOT NULL,
+                       text TEXT NOT NULL
+                   )""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS chat_log_by_character
+                   ON chat_log (server, account, character, at)""")
+            # Pruning works per account, newest first.
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS chat_log_by_account
+                   ON chat_log (server, account, at)""")
+        self._chat_appends = 0
 
     @contextmanager
     def _connect(self, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
@@ -95,6 +123,51 @@ class BotMemory:
                 (self.server, self.account, character.casefold(), kind,
                  encoded, time.time()),
             )
+
+    def append_chat(self, character: str, channel: int, direction: str,
+                    sender: str, text: str, *, at: float | None = None) -> None:
+        """Keep one chat line (``direction`` "in" or "out") for a year."""
+        now = time.time() if at is None else at
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO chat_log
+                       (server, account, character, at, channel, direction,
+                        sender, text)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (self.server, self.account, character.casefold(), now,
+                 int(channel), direction, sender[:64],
+                 text[:CHAT_TEXT_LIMIT]))
+            self._chat_appends += 1
+            if self._chat_appends % CHAT_PRUNE_EVERY == 1:
+                db.execute(
+                    """DELETE FROM chat_log
+                       WHERE server = ? AND account = ? AND at < ?""",
+                    (self.server, self.account, now - CHAT_RETENTION_SECONDS))
+                db.execute(
+                    """DELETE FROM chat_log
+                       WHERE server = ? AND account = ? AND at < (
+                           SELECT at FROM chat_log
+                           WHERE server = ? AND account = ?
+                           ORDER BY at DESC LIMIT 1 OFFSET ?)""",
+                    (self.server, self.account, self.server, self.account,
+                     CHAT_ROW_LIMIT - 1))
+
+    def chat_history(self, character: str, *, limit: int = 200,
+                     sender: str = "") -> list[dict[str, Any]]:
+        """Her most recent chat lines, oldest first, optionally one sender's."""
+        query = """SELECT at, channel, direction, sender, text FROM chat_log
+                   WHERE server = ? AND account = ? AND character = ?"""
+        params: list[Any] = [self.server, self.account, character.casefold()]
+        if sender:
+            query += " AND lower(sender) = lower(?)"
+            params.append(sender)
+        query += " ORDER BY at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 5000)))
+        with self._connect() as db:
+            rows = db.execute(query, params).fetchall()
+        return [{"at": at, "channel": channel, "direction": direction,
+                 "sender": who, "text": text}
+                for at, channel, direction, who, text in reversed(rows)]
 
     def import_legacy(self, state_path: Path, activity_path: Path) -> None:
         """Import the old unscoped JSON files once without modifying them."""
