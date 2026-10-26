@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import dataclasses
 import json
 import time
 import tempfile
@@ -7381,13 +7382,14 @@ class QuestTests(unittest.TestCase):
         self.assertNotIn(client.direct_moves[-1][0], (3, 7))
 
     def test_directional_spell_waits_for_exact_alignment(self):
+        # A cone is not aimed at the target: it needs an exact line.
         client = self._combat_client()
         client.state.map.tiles.clear()
         client.state.map.tile(11, 9).objects[3] = MapObject(
             3, 1, 0, 0, name="kobold", target_id=100, target_hp=100)
         client.state.stats["sp"] = 20
         client.state.inventory.append(Item(
-            42, item_type=c.TYPE_SPELL, name="cause light wounds",
+            42, item_type=c.TYPE_SPELL, name="icestorm",
             extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 4}))
         fired = []
 
@@ -7396,7 +7398,7 @@ class QuestTests(unittest.TestCase):
 
         client.fire = fire
         task = FarmTask(zone="/test", target="kobold",
-                        combat_spell="cause light wounds")
+                        combat_spell="icestorm")
         asyncio.run(task.tick(client))
         self.assertEqual(fired, [])
         # Preserve range and sidestep south onto the exact east-west firing
@@ -7409,9 +7411,34 @@ class QuestTests(unittest.TestCase):
         client.state.map.tile(11, 8).objects[3] = MapObject(
             3, 1, 0, 0, name="kobold", target_id=100, target_hp=100)
         task = FarmTask(zone="/test", target="kobold",
-                        combat_spell="cause light wounds")
+                        combat_spell="icestorm")
         asyncio.run(task.tick(client))
         self.assertEqual(fired, [(3, 42)])
+        self.assertEqual(client.moves, [])
+
+    def test_aimed_spell_pulls_off_the_eight_lines(self):
+        # A bolt or bullet flies at the selected target from any angle, so
+        # the pull fires from where she stands instead of aligning first.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(11, 9).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=100, target_hp=100)
+        client.state.stats["sp"] = 20
+        client.state.inventory.append(Item(
+            42, item_type=c.TYPE_SPELL, name="magic bullet",
+            extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 4}))
+        fired = []
+
+        async def fire(direction, tag=0):
+            fired.append((direction, tag))
+
+        client.fire = fire
+        task = FarmTask(zone="/test", target="kobold",
+                        combat_spell="magic bullet")
+        asyncio.run(task.tick(client))
+        self.assertEqual(fired, [(4, 42)])
+        self.assertEqual(client.targets, [(11, 9, 100)])
+        self.assertEqual(client.direct_moves, [])
         self.assertEqual(client.moves, [])
 
     def test_targeted_spell_uses_selected_target_not_rounded_direction(self):
@@ -7535,18 +7562,15 @@ class QuestTests(unittest.TestCase):
             combat_skill="wizardry spells",
             combat_spell="cause light wounds")
         kites = []
-        real_kite = child.melee_kite
 
-        async def no_kite(*args, **kwargs):
-            # Only the spell-preserving kite is cornered; any other kite runs
+        async def no_kite(client, x, y, obj, spell):
+            # The caster kite is cornered; the generic melee kite still runs
             # for real, so a fall-through to the generic melee branch would
             # hold combat off and fail the survival check below.
-            kites.append(kwargs.get("preserve_spell_line"))
-            if kwargs.get("preserve_spell_line") is not None:
-                return False
-            return await real_kite(*args, **kwargs)
+            kites.append(spell)
+            return False
 
-        child.melee_kite = no_kite
+        child.caster_kite = no_kite
         task = NavigateThenTask(object(), "/test", child, combat_approach=True)
         # No mana and no step away, but nothing has hit her: hold, no melee.
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
@@ -8470,9 +8494,16 @@ class QuestTests(unittest.TestCase):
             combat_spell="cause light wounds", neutral_targets=True)
         task.remember_engagement(client, 12, 8, target.target_id)
 
-        self.assertFalse(asyncio.run(
+        # Damage left over from a kill would fly on into the bystander, so
+        # she does not cast; she sidesteps to a square whose line is clear.
+        self.assertTrue(asyncio.run(
             task.training_finisher(client, 12, 8, target)))
         self.assertEqual(client.fired, [])
+        self.assertEqual(len(client.direct_moves), 1)
+        dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        self.assertTrue(task.bullet_ray_clear(
+            client, 12, 8, target.target_id, origin=(8 + dx, 8 + dy)))
+        self.assertGreaterEqual(max(abs(12 - 8 - dx), abs(8 - 8 - dy)), 4)
 
     def test_skill_training_uses_selected_target_protocol_hp(self):
         client = self._wizard_training_client(0)
@@ -8487,16 +8518,618 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.fired, [(3, 42)])
         self.assertEqual(client.combat, [False])
 
-    def test_misaligned_wizard_finisher_repositions_without_casting(self):
+    def test_wizard_finisher_fires_an_aimed_spell_off_the_eight_lines(self):
+        # The server aims a bolt or bullet at the selected target from any
+        # angle (projectile3d_launch), so a target off the eight FIRE lines
+        # is shot at, never walked toward.
         client = self._wizard_training_client(15, 11, 9)
         task = FarmTask(
             zone="/test", target="kobold",
             combat_skill="wizardry spells",
             combat_spell="cause light wounds")
         asyncio.run(task.tick(client))
-        self.assertEqual(client.fired, [])
+        self.assertEqual(client.fired, [(4, 42)])
         self.assertEqual(client.combat, [False])
-        self.assertEqual(client.moves, [(11, 9)])
+        self.assertEqual(client.moves, [])
+
+    @staticmethod
+    def _open_farm(task, client, size=40):
+        """Open authored terrain around her at world (20, 20)."""
+        node = MapNode(path="/test", width=size, height=size)
+        node.terrain = {(x, y): 1 for x in range(size) for y in range(size)}
+        task.map_node = node
+        client.state.map.world_x = client.state.map.world_y = 20
+        return node
+
+    @staticmethod
+    def _record_actions(client):
+        client.recorded = []
+        client.record_action = lambda action, detail="": (
+            client.recorded.append((action, detail)))
+
+    def _caster_task(self, client, **kwargs):
+        task = FarmTask(
+            zone="/test", target="kobold",
+            combat_skill="wizardry spells",
+            combat_spell="cause light wounds", **kwargs)
+        self._open_farm(task, client)
+        return task
+
+    def test_aimed_spell_needs_a_clear_path_not_one_of_eight_lines(self):
+        client = self._wizard_training_client(100, x=13, y=10)
+        task = self._caster_task(client)
+        spell = task.combat_spell_item(client)
+        self.assertEqual(
+            task.aimed_fire_direction(client, spell, 13, 10, 100), 4)
+        # A wall two tiles along the path (world 22,21) stops the bullet.
+        task.map_node.blocked.add((22, 21))
+        self.assertIsNone(
+            task.aimed_fire_direction(client, spell, 13, 10, 100))
+        task.map_node.blocked.clear()
+        # So does another creature in the path, which would take the hit.
+        client.state.map.tile(10, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold", target_id=101, target_hp=100)
+        self.assertIsNone(
+            task.aimed_fire_direction(client, spell, 13, 10, 100))
+        # A cone is not aimed: it still needs one of the eight exact lines.
+        cone = Item(44, item_type=c.TYPE_SPELL, name="firestorm",
+                    extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 13})
+        self.assertIsNone(
+            task.aimed_fire_direction(client, cone, 13, 10, 100))
+        self.assertEqual(
+            task.aimed_fire_direction(client, cone, 13, 8, 100), 3)
+
+    def test_ray_cells_touch_every_cell_of_a_corner_crossing(self):
+        from .tasks import ray_cells
+
+        # Exact diagonal: each corner touches the two side cells too.
+        self.assertEqual(ray_cells(2, 2, 2),
+                         ((1, 0), (0, 1), (1, 1), (2, 1), (1, 2), (2, 2)))
+        # A shallow line crosses (2,0) before stepping up, which the old
+        # sampled ray missed.
+        self.assertIn((2, 0), ray_cells(3, 1, 3))
+        # A wall at the last corner before a diagonal target blocks it.
+        client = self._wizard_training_client(100, x=10, y=10)
+        task = self._caster_task(client)
+        spell = task.combat_spell_item(client)
+        self.assertEqual(
+            task.aimed_fire_direction(client, spell, 10, 10, 100), 4)
+        task.map_node.blocked.add((22, 21))
+        self.assertIsNone(
+            task.aimed_fire_direction(client, spell, 10, 10, 100))
+
+    def test_futile_casts_mark_the_line_and_she_moves(self):
+        # Two casts with no HP drop and no hit text: the line from this
+        # square is futile (a wall the terrain data misses), so she stops
+        # spending mana into it and steps to another square.
+        client = self._wizard_training_client(80, x=13, y=8)
+        client.state.messages = []
+        task = self._caster_task(client)
+        self._record_actions(client)
+        target = client.state.map.tile(13, 8).objects[3]
+        task.remember_engagement(client, 13, 8, target.target_id)
+        for _ in range(task.FUTILE_CAST_LIMIT):
+            task._last_finisher_at = task._last_spell_at = 0
+            self.assertTrue(asyncio.run(
+                task.training_finisher(client, 13, 8, target)))
+            pending = task._finisher_pending_feedback
+            task._finisher_pending_feedback = (
+                pending[0], pending[1], time.monotonic() - 10)
+            task._last_finisher_at = task._last_spell_at = 0
+            asyncio.run(task.training_finisher(client, 13, 8, target))
+        self.assertEqual(len(client.fired), task.FUTILE_CAST_LIMIT)
+        self.assertIn("spell-line-futile",
+                      [action for action, _ in client.recorded])
+        self.assertTrue(client.direct_moves)
+        # A hit line after a cast keeps the line in use.
+        client = self._wizard_training_client(80, x=13, y=8)
+        task = self._caster_task(client)
+        target = client.state.map.tile(13, 8).objects[3]
+        client.state.messages = [
+            (time.time() + 1, 2, "ffffff",
+             "You hit kobold for 25 (0) with magic.")]
+        for _ in range(task.FUTILE_CAST_LIMIT + 1):
+            task._finisher_pending_feedback = None
+            task._last_finisher_at = task._last_spell_at = 0
+            asyncio.run(task.training_finisher(client, 13, 8, target))
+            pending = task._finisher_pending_feedback
+            task._finisher_pending_feedback = (
+                pending[0], pending[1], time.monotonic() - 10)
+            task._last_finisher_at = task._last_spell_at = 0
+            asyncio.run(task.training_finisher(client, 13, 8, target))
+        self.assertEqual(task._futile_lines, set())
+
+    def test_negative_aimed_ray_refuses_a_wall_or_bystander_before_target(self):
+        client = self._wizard_training_client(100, x=2, y=6)
+        task = self._caster_task(client)
+        spell = task.combat_spell_item(client)
+        # Server advance crosses offset (-2,0) on its way to (-6,-2).
+        # Rounding negative fixed-point advances down skipped this cell.
+        self.assertIsNotNone(task.aimed_fire_direction(client, spell, 2, 6, 100))
+        task.map_node.blocked.add((18, 20))
+        self.assertIsNone(task.aimed_fire_direction(client, spell, 2, 6, 100))
+        task.map_node.blocked.clear()
+        client.state.map.tile(6, 8).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold", target_id=101, target_hp=100)
+        self.assertIsNone(task.aimed_fire_direction(client, spell, 2, 6, 100))
+
+    def test_ray_cells_match_independent_server_negative_octant_traces(self):
+        from .tasks import ray_cells
+
+        # Independent review vectors for Classic projectile3d.c aim and
+        # advance (v5.99.0, adcab310): fixed-point headings and signed C
+        # division truncated toward zero. These are outputs, not a second
+        # copy of the flight implementation.
+        traces = {
+            (-6, -2): ((-1, 0), (-2, 0), (-2, -1), (-3, -1), (-4, -1),
+                       (-5, -1), (-5, -2), (-6, -2), (-7, -2), (-8, -2),
+                       (-8, -3)),
+            (-7, -5): ((-1, 0), (-1, -1), (-2, -1), (-2, -2), (-3, -2),
+                       (-4, -2), (-4, -3), (-5, -3), (-5, -4), (-6, -4),
+                       (-6, -5), (-7, -5), (-8, -5), (-8, -6)),
+            (-5, -1): ((-1, 0), (-2, 0), (-3, 0), (-3, -1), (-4, -1),
+                       (-5, -1), (-6, -1), (-7, -1), (-8, -1), (-8, -2)),
+        }
+        for (dx, dy), expected in traces.items():
+            with self.subTest(dx=dx, dy=dy):
+                self.assertEqual(ray_cells(dx, dy, 8), expected)
+
+    def test_ray_cells_preserve_reflection_in_every_visible_octant(self):
+        from .tasks import ray_cells
+
+        # Integer truncation toward zero preserves a flight's reflection
+        # about either axis; flooring a negative advance does not. Cover
+        # both steep and shallow headings throughout the 17x17 viewport.
+        for dx in range(9):
+            for dy in range(9):
+                positive = ray_cells(dx, dy, 12)
+                for sx, sy in ((-1, 1), (1, -1), (-1, -1)):
+                    with self.subTest(dx=sx * dx, dy=sy * dy):
+                        self.assertEqual(
+                            ray_cells(sx * dx, sy * dy, 12),
+                            tuple((sx * x, sy * y) for x, y in positive))
+
+    def test_target_without_a_shot_is_set_aside_after_a_while(self):
+        # Walled in on every side but the target's, with a wall between:
+        # no shot and no step. She holds, then sets it aside.
+        client = self._wizard_training_client(80, x=13, y=8)
+        task = self._caster_task(client)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx or dy:
+                    task.map_node.blocked.add((20 + dx, 20 + dy))
+        self._record_actions(client)
+        target = client.state.map.tile(13, 8).objects[3]
+        task.remember_engagement(client, 13, 8, target.target_id)
+        self.assertFalse(asyncio.run(
+            task.training_finisher(client, 13, 8, target)))
+        task._caster_stall = (target.target_id,
+                              time.monotonic() - task.CASTER_STALL_SECONDS)
+        self.assertTrue(asyncio.run(
+            task.training_finisher(client, 13, 8, target)))
+        self.assertIn(target.target_id, task._pull_set_aside)
+        self.assertIsNone(task._engaged_target)
+        self.assertIn("caster-stall-set-aside",
+                      [action for action, _ in client.recorded])
+        self.assertEqual(client.fired, [])
+
+    def test_caster_kite_backs_away_from_a_close_target(self):
+        client = self._wizard_training_client(100, x=10, y=8)
+        task = self._caster_task(client)
+        self._record_actions(client)
+        target = client.state.map.tile(10, 8).objects[3]
+        self.assertTrue(asyncio.run(task.caster_kite(
+            client, 10, 8, target, task.combat_spell_item(client))))
+        direction, running = client.direct_moves[0]
+        self.assertFalse(running)
+        dx, dy = c.DIRECTION_DELTAS[direction]
+        self.assertEqual(max(abs(10 - 8 - dx), abs(8 - 8 - dy)), 3)
+        self.assertEqual(client.recorded[-1][0], "caster-kite")
+
+    def test_caster_kite_holds_at_range_with_a_clear_shot(self):
+        client = self._wizard_training_client(100, x=13, y=9)
+        task = self._caster_task(client)
+        target = client.state.map.tile(13, 9).objects[3]
+        self.assertFalse(asyncio.run(task.caster_kite(
+            client, 13, 9, target, task.combat_spell_item(client))))
+        self.assertEqual(client.direct_moves, [])
+
+    def test_caster_kite_sidesteps_a_wall_preferring_not_to_close_in(self):
+        # Five tiles east with a wall between: she steps to a square with a
+        # clear shot that is no closer, where walking at it led to melee.
+        client = self._wizard_training_client(100, x=13, y=8)
+        task = self._caster_task(client)
+        task.map_node.blocked.add((21, 20))
+        target = client.state.map.tile(13, 8).objects[3]
+        self.assertTrue(asyncio.run(task.caster_kite(
+            client, 13, 8, target, task.combat_spell_item(client))))
+        dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        self.assertGreaterEqual(max(abs(13 - 8 - dx), abs(8 - 8 - dy)), 5)
+        self.assertTrue(task.bullet_ray_clear(
+            client, 13, 8, target.target_id, origin=(8 + dx, 8 + dy)))
+        self.assertEqual(client.moves, [])
+
+    def test_wizard_finisher_opens_range_between_casts(self):
+        client = self._wizard_training_client(15, x=11, y=8)
+        task = self._caster_task(client)
+        target = client.state.map.tile(11, 8).objects[3]
+        task.remember_engagement(client, 11, 8, target.target_id)
+        self.assertTrue(asyncio.run(
+            task.training_finisher(client, 11, 8, target)))
+        self.assertEqual(client.fired, [(3, 42)])
+        # Waiting for the cast's feedback, she steps back out to four tiles
+        # rather than hold a two- or three-tile melee gap.
+        self.assertTrue(asyncio.run(
+            task.training_finisher(client, 11, 8, target)))
+        self.assertEqual(client.fired, [(3, 42)])
+        dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        self.assertEqual(max(abs(11 - 8 - dx), abs(8 - 8 - dy)), 4)
+        self.assertNotIn(True, client.combat)
+
+    def _spell_pursuit_client(self, hp=150):
+        client = self._combat_client()
+        client.state.stats.update(hp=hp, maxhp=176, sp=20)
+        client.state.inventory.extend((
+            Item(41, item_type=c.TYPE_SKILL, name="wizardry spells"),
+            Item(42, item_type=c.TYPE_SPELL, name="magic bullet",
+                 extra={"flags": c.SPELL_DESC_DIRECTION, "cost": 4}),
+        ))
+        client.fired = []
+
+        async def fire(direction, tag=0):
+            client.fired.append((direction, tag))
+
+        client.fire = fire
+        self._record_actions(client)
+        task = FarmTask(zone="/test", combat_skill="wizardry spells",
+                        combat_spell="magic bullet")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        return client, task
+
+    @staticmethod
+    def _retreat_once(client, task):
+        result = asyncio.run(task.low_health_retreat(client))
+        task._retreat_attempt = None
+        task._last_retreat_step_at = 0.0
+        return result
+
+    def test_spell_training_casts_at_a_pursuer_instead_of_meleeing(self):
+        # The shaman (9,8) stays adjacent however she steps. One retreat
+        # step that sheds nobody, and she casts at it, combat off.
+        client, task = self._spell_pursuit_client()
+        self.assertTrue(self._retreat_once(client, task))
+        self.assertEqual(client.fired, [])
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertTrue(self._retreat_once(client, task))
+        self.assertEqual(client.fired, [(3, 42)])
+        self.assertEqual(client.targets[-1], (9, 8, 200))
+        self.assertNotIn(True, client.combat)
+        self.assertIn("pursued-cast",
+                      [action for action, _ in client.recorded])
+        self.assertEqual(task._cornered_breakout_target, 0)
+        # Between casts she keeps running; never the sword.
+        for _ in range(task.PURSUIT_STAND_STEPS + 1):
+            self._retreat_once(client, task)
+        self.assertEqual(len(client.fired), 1)
+        self.assertNotIn(True, client.combat)
+
+    def test_spell_training_pursuer_melee_when_she_cannot_afford_a_cast(self):
+        client, task = self._spell_pursuit_client()
+        client.state.stats["sp"] = 0
+        for _ in range(task.PURSUIT_STAND_STEPS + 1):
+            self._retreat_once(client, task)
+        self.assertEqual(client.combat[-1], True)
+        self.assertEqual(task._cornered_breakout_target, 200)
+        self.assertEqual(client.fired, [])
+
+    def test_spell_training_pursuit_keeps_escape_direction_during_cooldown(self):
+        client, task = self._spell_pursuit_client()
+        task._last_spell_at = time.monotonic()
+        task._pursued_retreats = task.PURSUIT_CAST_STEPS
+        task._pursuit_ids = {200}
+        task._pursuit_last_at = time.monotonic()
+
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+
+        self.assertEqual(client.fired, [])
+        direction, running = client.direct_moves[-1]
+        dx, dy = c.DIRECTION_DELTAS[direction]
+        # The adjacent shaman is east at (9,8). A shot check must not
+        # replace the chosen escape step with the eastward FIRE direction.
+        self.assertGreater(max(abs(9 - 8 - dx), abs(8 - 8 - dy)), 1)
+        self.assertFalse(running)
+        self.assertEqual(task._retreat_attempt[3:5], (12 + dx, 12 + dy))
+
+    def test_spell_training_pursuit_cast_uses_the_pack_flee_threshold(self):
+        # 71% is above the 55% flee threshold but below the 80% one for two
+        # nearby threats (the chief three tiles off): the melee stand, not
+        # a cast that stands still beside two of them.
+        client, task = self._spell_pursuit_client(hp=125)
+        for _ in range(task.PURSUIT_STAND_STEPS + 1):
+            self._retreat_once(client, task)
+        self.assertEqual(client.fired, [])
+        self.assertEqual(task._cornered_breakout_target, 200)
+        # Alone with the shaman, the same health casts.
+        client, task = self._spell_pursuit_client(hp=125)
+        client.state.map.tile(11, 8).objects.clear()
+        for _ in range(task.PURSUIT_CAST_STEPS + 1):
+            self._retreat_once(client, task)
+        self.assertEqual(client.fired, [(3, 42)])
+
+    def test_spell_training_pursuit_cast_needs_a_clear_shot(self):
+        # A wall at the corner between her and a diagonal pursuer stops the
+        # bullet (the server checks every cell at a corner crossing).
+        client, task = self._spell_pursuit_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold shaman", target_id=200, target_hp=100)
+        task.map_node.blocked.add((13, 12))
+        for _ in range(task.PURSUIT_CAST_STEPS + 1):
+            self._retreat_once(client, task)
+        self.assertEqual(client.fired, [])
+
+    def test_spell_training_pursuer_melee_below_the_flee_threshold(self):
+        client, task = self._spell_pursuit_client(hp=80)
+        for _ in range(task.PURSUIT_STAND_STEPS + 1):
+            self._retreat_once(client, task)
+        self.assertEqual(client.fired, [])
+        self.assertEqual(client.combat[-1], True)
+        self.assertEqual(task._cornered_breakout_target, 200)
+
+    def test_spell_training_retreat_never_swings_at_its_target(self):
+        # Healthy, alone with it and able to cast: an ordinary retreat step
+        # used to swing at the engaged target.
+        client, task = self._spell_pursuit_client(hp=150)
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 7).objects[3] = MapObject(
+            3, 1, 0, 0, name="hill giant", target_id=100)
+        task.remember_engagement(client, 9, 7, 100)
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(client.combat, [False])
+
+    def _pack_client(self, front, *others):
+        client = self._wizard_training_client(40, x=front[0], y=front[1])
+        for index, (x, y, hp) in enumerate(others, start=101):
+            client.state.map.tile(x, y).objects[3] = MapObject(
+                3, 1, 0, 0, name="kobold", target_id=index, target_hp=hp)
+        task = self._caster_task(client)
+        self._record_actions(client)
+        return client, task
+
+    def test_spell_training_casts_through_a_lined_up_pack(self):
+        # Two kobolds on one line east: a bullet that kills the wounded
+        # front one carries on into the second, so she casts, not runs.
+        client, task = self._pack_client((10, 8), (12, 8, 100))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.fired, [(3, 42)])
+        self.assertEqual(client.targets[-1], (10, 8, 100))
+        self.assertEqual(client.direct_moves, [])
+        self.assertIn(("pack-cast", "target=100 through=2 pack=2"),
+                      client.recorded)
+        self.assertNotIn(True, client.combat)
+        # Between casts she keeps her distance with a retreat step.
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.fired), 1)
+        self.assertEqual(len(client.direct_moves), 1)
+
+    def test_spell_training_pack_off_one_line_casts_only_at_range(self):
+        # No line through both. One within two tiles: she retreats.
+        client, task = self._pack_client((10, 8), (8, 11, 100))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.fired, [])
+        self.assertTrue(client.direct_moves)
+        self.assertIn("farm-pack-split",
+                      [action for action, _ in client.recorded])
+        # Both three or more tiles off: she shoots the most wounded.
+        client, task = self._pack_client((11, 8), (8, 11, 100))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.fired, [(3, 42)])
+        self.assertEqual(client.targets[-1], (11, 8, 100))
+
+    def test_farm_learns_recall_wand_charges_and_drops_an_empty_one(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    name="pine wand of word of recall (lvl 17)")
+        client.state.inventory = [wand]
+        client.state.items[wand.tag] = wand
+        client.state.messages = []
+        examined = []
+
+        async def examine(tag):
+            examined.append(tag)
+
+        client.examine = examine
+        self._record_actions(client)
+        task = FarmTask(zone="/test")
+        asyncio.run(task.check_recall_wand(client))
+        self.assertEqual(examined, [77])
+        self.assertEqual(FarmTask.emergency_recall_candidates(client), [wand])
+        client.state.messages.append(
+            (time.time() + 0.1, 2, "ffffff", "It has 0 charges left."))
+        asyncio.run(task.check_recall_wand(client))
+        self.assertIn(("recall-wand-charges", "tag=77 charges=0"),
+                      client.recorded)
+        self.assertEqual(FarmTask.emergency_recall_candidates(client), [])
+        # Recall shopping sees no working device, so it can replace it.
+        self.assertFalse(FarmCircuitTask._owned_recall_device(client))
+        # A known wand is not examined again.
+        asyncio.run(task.check_recall_wand(client))
+        self.assertEqual(examined, [77])
+
+    def test_last_empty_recall_wand_lets_recall_shopping_run_now(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    name="pine wand of word of recall (lvl 17)")
+        client.state.inventory = [wand]
+        client.state.messages = []
+        client.state.last_recall_shop_check_at = time.time() - 60
+
+        async def examine(tag):
+            pass
+
+        client.examine = examine
+        task = FarmTask(zone="/test")
+        asyncio.run(task.check_recall_wand(client))
+        client.state.messages.append(
+            (time.time() + 0.1, 2, "ffffff", "It has 0 charges left."))
+        asyncio.run(task.check_recall_wand(client))
+        self.assertEqual(client.state.last_recall_shop_check_at, 0.0)
+
+    def test_fired_recall_wand_is_examined_again_not_counted_down(self):
+        # A fire can fizzle without spending a charge, so the count is read
+        # again rather than decremented blind.
+        from .tasks import wand_charges
+
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    flags=c.ITEM_APPLIED,
+                    name="pine wand of word of recall (lvl 17)")
+        client.state.inventory = [wand]
+        client.state.items[wand.tag] = wand
+        client.state.messages = []
+        examined = []
+
+        async def examine(tag):
+            examined.append(tag)
+
+        client.examine = examine
+        task = FarmTask(zone="/test")
+        asyncio.run(task.check_recall_wand(client))
+        client.state.messages.append(
+            (time.time() + 0.1, 2, "ffffff", "It has 3 charges left."))
+        asyncio.run(task.check_recall_wand(client))
+        self.assertEqual(wand_charges(client)[77], 3)
+        self.assertTrue(asyncio.run(task.emergency_recall(
+            client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+        self.assertNotIn(77, wand_charges(client))
+        asyncio.run(task.check_recall_wand(client))
+        self.assertEqual(examined, [77, 77])
+
+    def test_recall_wand_that_says_poof_falls_back_to_the_spell(self):
+        client = self._combat_client()
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    flags=c.ITEM_APPLIED,
+                    name="pine wand of word of recall (lvl 17)")
+        spell = Item(71, item_type=c.TYPE_SPELL, name="word of recall",
+                     extra={"cost": 24})
+        client.state.stats["sp"] = 30
+        client.state.inventory = [wand, spell]
+        client.state.items[wand.tag] = wand
+        client.state.messages = []
+        client.fired = []
+
+        async def fire(direction, tag=0):
+            client.fired.append((direction, tag))
+
+        client.fire = fire
+        self._record_actions(client)
+        task = FarmTask(zone="/test")
+        self.assertTrue(asyncio.run(task.emergency_recall(
+            client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+        self.assertEqual(client.fired, [(0, 0)])
+        client.state.messages.append(
+            (time.time() + 0.1, 2, "ffffff", "The wand says poof."))
+        self.assertTrue(asyncio.run(task.emergency_recall(
+            client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+        self.assertEqual(client.fired, [(0, 0), (0, 71)])
+        self.assertIn("recall-wand-empty",
+                      [action for action, _ in client.recorded])
+
+    @staticmethod
+    def _outpaced_messages():
+        now = time.time()
+        return [
+            (now - 5, 2, "ff0000",
+             "charred treant hit you for 27 (-16) impact damage."),
+            (now - 4, 2, "ffffff", "The spell heals you for 21 hp!"),
+            (now - 3, 2, "ff0000",
+             "charred treant hit you for 33 (-16) impact damage."),
+            (now - 2, 2, "ffffff", "The spell heals you for 13 hp!"),
+        ]
+
+    def test_healing_outpaced_by_damage_is_detected(self):
+        from .tasks import healing_outpaced
+
+        client = self._combat_client()
+        client.state.messages = self._outpaced_messages()
+        self.assertTrue(healing_outpaced(client))
+        # A later heal that restores more than the hits since the first.
+        stamp = client.state.messages[3][0]
+        client.state.messages[3] = (
+            stamp, 2, "ffffff", "The spell heals you for 40 hp!")
+        self.assertFalse(healing_outpaced(client))
+        # A single heal is not enough to judge.
+        del client.state.messages[3]
+        self.assertFalse(healing_outpaced(client))
+
+    def test_hits_before_the_first_heal_do_not_count_as_outpacing(self):
+        # A treant hits 25 every 3 s; under the heal threshold she heals 16
+        # every 1.15 s. The hits that put her there came before the heals.
+        from .tasks import healing_outpaced
+
+        client = self._combat_client()
+        now = time.time()
+        client.state.messages = [
+            (now - 7.0, 2, "ff0000",
+             "charred treant hit you for 25 (-10) impact damage."),
+            (now - 4.0, 2, "ff0000",
+             "charred treant hit you for 25 (-10) impact damage."),
+            (now - 2.3, 2, "ffffff", "The spell heals you for 16 hp!"),
+            (now - 1.15, 2, "ffffff", "The spell heals you for 16 hp!"),
+        ]
+        self.assertFalse(healing_outpaced(client))
+
+    def test_outpaced_healing_disengages_instead_of_chaining_heals(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=90)
+        client.state.stats.update(hp=65, maxhp=100, sp=40)
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        client.state.messages = self._outpaced_messages()
+        client.fired = []
+
+        async def fire(direction, tag=0):
+            client.fired.append((direction, tag))
+
+        client.fire = fire
+        self._record_actions(client)
+        task = FarmTask(zone="/test")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        client.state.map.world_x = client.state.map.world_y = 12
+        task.remember_engagement(client, 9, 8, 100)
+        asyncio.run(task.tick(client))
+        self.assertNotIn((0, 43), client.fired)
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertIn("healing-outpaced",
+                      [action for action, _ in client.recorded])
+        self.assertNotIn(True, client.combat)
+
+    def test_outpaced_healing_recalls_at_the_heal_threshold(self):
+        client = self._combat_client()
+        rod = Item(73, item_type=c.TYPE_ROD, quality=70, condition=70,
+                   flags=c.ITEM_APPLIED,
+                   name="rod of word of recall (lvl 12)")
+        client.state.inventory = [rod]
+        client.state.items[rod.tag] = rod
+        task = FarmTask(zone="/test")
+        self.assertFalse(asyncio.run(task.emergency_recall(
+            client, ratio=0.65, nearby_count=1, hostile_contact=True)))
+        self.assertTrue(asyncio.run(task.emergency_recall(
+            client, ratio=0.65, nearby_count=1, hostile_contact=True,
+            healing_outpaced=True)))
 
     def test_unprobed_zero_hp_living_target_remains_attackable(self):
         client = self._combat_client()
@@ -16239,6 +16872,76 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         client.farm_analyzer = None
         self.assertIsNone(analyzer_farm_selection(client, graph))
 
+    @staticmethod
+    def kit(**changes):
+        from .farm_analyzer import CombatProfile
+
+        profile = CombatProfile(
+            skill="wizardry spells", skill_level=13, attack="slash",
+            damage=58, weapon_class=42, weapon_speed=2.25,
+            character_level=31, max_health=282, speed=0.59,
+            armour_class=48, protections=(("impact", 42),))
+        return dataclasses.replace(profile, **changes)
+
+    def test_repeated_pack_deaths_rate_a_spot_hazardous_for_her_kit(self):
+        from . import self_improvement as si
+        from .navigation import analyzer_farm_selection
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        client = self.client({"xp": [trees, pocket]})
+        client.farm_analyzer.profile = self.kit()
+        circuit = self.circuit(client, trees)
+        circuit._failure_epoch = 0.0
+        base = time.time() - 600
+        results = []
+        for death in range(si.KIT_HAZARD_FAILURES):
+            when = base + 100 * death
+            for offset, text in enumerate((
+                    "evil treant hit you for 30 (-30) impact damage.",
+                    "quickwood hit you for 20 (-20) impact damage.")):
+                client.state.messages.append(
+                    (when - 5 + offset, 2, "ff0000", text))
+            client.decision_history.append({
+                "time": when, "action": "death", "detail": "",
+                "task": "", "map": self.TREES})
+            results.append(circuit._observe_farm_death(client))
+        # Margins tighten first; the third pack death with the same kit
+        # makes the spot hazardous for it, and she leaves for another.
+        self.assertEqual(results, [False] * (len(results) - 1) + [True])
+        self.assertIn("farm-kit-hazard",
+                      [entry["action"] for entry in client.decision_history])
+        self.assertEqual(analyzer_farm_selection(
+            client, built_graph())[1]["name"], "Pocket")
+        self.assertTrue(circuit._upgrade_progression(
+            client, circuit.child.task))
+        self.assertEqual(circuit.spot["name"], "Pocket")
+        # Training (skill level, mana) does not change her survivability.
+        client.farm_analyzer.profile = self.kit(skill_level=16)
+        self.assertEqual(analyzer_farm_selection(
+            client, built_graph())[1]["name"], "Pocket")
+        # Much more health does, and the spot is ranked again.
+        client.farm_analyzer.profile = self.kit(max_health=340)
+        self.assertEqual(analyzer_farm_selection(
+            client, built_graph())[1]["name"], "Trees")
+
+    def test_when_every_spot_is_hazardous_she_farms_the_least_dangerous(self):
+        from . import self_improvement as si
+        from .navigation import analyzer_farm_selection
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        trees["danger"], pocket["danger"] = 2.0, 1.5
+        client = self.client({"xp": [trees, pocket]})
+        client.farm_analyzer.profile = self.kit()
+        failures = [{"time": time.time(), "cause": "pack",
+                     "kit": self.kit().describe()}] * si.KIT_HAZARD_FAILURES
+        client.state.farm_adaptations = {
+            spot["path"]: {"level": 3, "kit_failures": failures}
+            for spot in (trees, pocket)}
+        self.assertEqual(analyzer_farm_selection(
+            client, built_graph())[1]["name"], "Pocket")
+
     def circuit(self, client, spot):
         from .navigation import analyzer_spot_legs
 
@@ -16296,6 +16999,48 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
             "task": "", "map": "/elsewhere"})
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
+
+    def test_empty_recall_wand_falls_back_after_circuit_failure_rebuild(self):
+        from .tasks import wand_charges
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        client.state.map.path = self.TREES
+        client.state.stats["sp"] = 30
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    flags=c.ITEM_APPLIED,
+                    name="pine wand of word of recall (lvl 17)")
+        spell = Item(71, item_type=c.TYPE_SPELL, name="word of recall",
+                     extra={"cost": 24})
+        client.state.place_item(wand, client.state.player_tag)
+        client.state.place_item(spell, client.state.player_tag)
+        fired = []
+
+        async def send(packet):
+            pass
+
+        async def fire(direction, tag=0):
+            fired.append((direction, tag))
+
+        client.send = send
+        client.fire = fire
+        circuit = self.circuit(client, trees)
+        previous = circuit.child.task
+        self.assertTrue(asyncio.run(previous.emergency_recall(
+            client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+        self.assertEqual(fired, [(0, 0)])
+        # The actual recall decision triggers the circuit's adaptation and
+        # child rebuild before the server reports that the wand was empty.
+        self.assertFalse(circuit._observe_farm_death(client))
+        rebuilt = circuit.child.task
+        self.assertIsNot(rebuilt, previous)
+        client.state.add_message(2, "ffffff", "The wand says poof.")
+        self.assertTrue(asyncio.run(rebuilt.emergency_recall(
+            client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+        self.assertEqual(fired, [(0, 0), (0, 71)])
+        self.assertEqual(wand_charges(client)[77], 0)
+        self.assertIn("recall-wand-empty",
+                      [entry["action"] for entry in client.decision_history])
 
     def test_route_death_in_combat_teaches_a_route_hazard(self):
         from .navigation import FarmCircuitTask
@@ -16741,6 +17486,29 @@ class SelfImprovementTests(unittest.TestCase):
         record["failures"] = [1000.0 - si.PAUSE_WINDOW_SECONDS - 1] * 2
         _, pause = si.learn(record, review, now=1000.0)
         self.assertFalse(pause)
+
+    def test_kit_hazard_counts_only_pack_or_out_damaged_with_that_kit(self):
+        from . import self_improvement as si
+
+        kit = {"skill": "wizardry spells", "skill_level": 13}
+        beaten = self.review(["ogre hit you for 50 (-50) impact damage."])
+        record = {}
+        for _ in range(si.KIT_HAZARD_FAILURES - 1):
+            record, _ = si.learn(record, beaten, now=1000.0, kit=kit)
+
+        def same(other):
+            return other == kit
+
+        self.assertFalse(si.kit_hazard(record, same, now=1000.0))
+        hungry = self.review(["Sera starved to death."])
+        record, _ = si.learn(record, hungry, now=1000.0, kit=kit)
+        self.assertFalse(si.kit_hazard(record, same, now=1000.0))
+        record, _ = si.learn(record, beaten, now=1000.0, kit=kit)
+        self.assertTrue(si.kit_hazard(record, same, now=1000.0))
+        self.assertFalse(si.kit_hazard(
+            record, lambda other: False, now=1000.0))
+        self.assertFalse(si.kit_hazard(
+            record, same, now=1000.0 + si.KIT_HAZARD_WINDOW_SECONDS + 1))
 
     def test_margins_tighten_per_level_up_to_their_caps(self):
         from . import self_improvement as si
