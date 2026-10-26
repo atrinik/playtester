@@ -8230,6 +8230,56 @@ class QuestTests(unittest.TestCase):
             asyncio.run(task.training_finisher(client, 13, 8, target))
         self.assertEqual(task._futile_lines, set())
 
+    def test_negative_aimed_ray_refuses_a_wall_or_bystander_before_target(self):
+        client = self._wizard_training_client(100, x=2, y=6)
+        task = self._caster_task(client)
+        spell = task.combat_spell_item(client)
+        # Server advance crosses offset (-2,0) on its way to (-6,-2).
+        # Rounding negative fixed-point advances down skipped this cell.
+        self.assertIsNotNone(task.aimed_fire_direction(client, spell, 2, 6, 100))
+        task.map_node.blocked.add((18, 20))
+        self.assertIsNone(task.aimed_fire_direction(client, spell, 2, 6, 100))
+        task.map_node.blocked.clear()
+        client.state.map.tile(6, 8).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold", target_id=101, target_hp=100)
+        self.assertIsNone(task.aimed_fire_direction(client, spell, 2, 6, 100))
+
+    def test_ray_cells_match_independent_server_negative_octant_traces(self):
+        from .tasks import ray_cells
+
+        # Independent review vectors for Classic projectile3d.c aim and
+        # advance (v5.99.0, adcab310): fixed-point headings and signed C
+        # division truncated toward zero. These are outputs, not a second
+        # copy of the flight implementation.
+        traces = {
+            (-6, -2): ((-1, 0), (-2, 0), (-2, -1), (-3, -1), (-4, -1),
+                       (-5, -1), (-5, -2), (-6, -2), (-7, -2), (-8, -2),
+                       (-8, -3)),
+            (-7, -5): ((-1, 0), (-1, -1), (-2, -1), (-2, -2), (-3, -2),
+                       (-4, -2), (-4, -3), (-5, -3), (-5, -4), (-6, -4),
+                       (-6, -5), (-7, -5), (-8, -5), (-8, -6)),
+            (-5, -1): ((-1, 0), (-2, 0), (-3, 0), (-3, -1), (-4, -1),
+                       (-5, -1), (-6, -1), (-7, -1), (-8, -1), (-8, -2)),
+        }
+        for (dx, dy), expected in traces.items():
+            with self.subTest(dx=dx, dy=dy):
+                self.assertEqual(ray_cells(dx, dy, 8), expected)
+
+    def test_ray_cells_preserve_reflection_in_every_visible_octant(self):
+        from .tasks import ray_cells
+
+        # Integer truncation toward zero preserves a flight's reflection
+        # about either axis; flooring a negative advance does not. Cover
+        # both steep and shallow headings throughout the 17x17 viewport.
+        for dx in range(9):
+            for dy in range(9):
+                positive = ray_cells(dx, dy, 12)
+                for sx, sy in ((-1, 1), (1, -1), (-1, -1)):
+                    with self.subTest(dx=sx * dx, dy=sy * dy):
+                        self.assertEqual(
+                            ray_cells(sx * dx, sy * dy, 12),
+                            tuple((sx * x, sy * y) for x, y in positive))
+
     def test_target_without_a_shot_is_set_aside_after_a_while(self):
         # Walled in on every side but the target's, with a wall between:
         # no shot and no step. She holds, then sets it aside.
@@ -16303,6 +16353,48 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
             "task": "", "map": "/elsewhere"})
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
+
+    def test_empty_recall_wand_falls_back_after_circuit_failure_rebuild(self):
+        from .tasks import wand_charges
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        client.state.map.path = self.TREES
+        client.state.stats["sp"] = 30
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    flags=c.ITEM_APPLIED,
+                    name="pine wand of word of recall (lvl 17)")
+        spell = Item(71, item_type=c.TYPE_SPELL, name="word of recall",
+                     extra={"cost": 24})
+        client.state.place_item(wand, client.state.player_tag)
+        client.state.place_item(spell, client.state.player_tag)
+        fired = []
+
+        async def send(packet):
+            pass
+
+        async def fire(direction, tag=0):
+            fired.append((direction, tag))
+
+        client.send = send
+        client.fire = fire
+        circuit = self.circuit(client, trees)
+        previous = circuit.child.task
+        self.assertTrue(asyncio.run(previous.emergency_recall(
+            client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+        self.assertEqual(fired, [(0, 0)])
+        # The actual recall decision triggers the circuit's adaptation and
+        # child rebuild before the server reports that the wand was empty.
+        self.assertFalse(circuit._observe_farm_death(client))
+        rebuilt = circuit.child.task
+        self.assertIsNot(rebuilt, previous)
+        client.state.add_message(2, "ffffff", "The wand says poof.")
+        self.assertTrue(asyncio.run(rebuilt.emergency_recall(
+            client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+        self.assertEqual(fired, [(0, 0), (0, 71)])
+        self.assertEqual(wand_charges(client)[77], 0)
+        self.assertIn("recall-wand-empty",
+                      [entry["action"] for entry in client.decision_history])
 
     def test_route_death_in_combat_teaches_a_route_hazard(self):
         from .navigation import FarmCircuitTask

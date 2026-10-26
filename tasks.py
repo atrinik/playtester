@@ -252,6 +252,12 @@ def aimed_projectile_spell(spell: Item | None) -> bool:
 RAY_FRACTION = 65536  # projectile3d's fixed-point unit (one tile)
 
 
+def _ray_advance(heading: int, numerator: int, denominator: int) -> int:
+    """Scale a signed heading with C's integer truncation toward zero."""
+    magnitude = abs(heading) * numerator // denominator
+    return -magnitude if heading < 0 else magnitude
+
+
 @lru_cache(maxsize=4096)
 def ray_cells(dx: int, dy: int, reach: int) -> tuple[tuple[int, int], ...]:
     """Cells a straight projectile aimed at (dx, dy) crosses, out to reach.
@@ -291,11 +297,11 @@ def ray_cells(dx: int, dy: int, reach: int) -> tuple[tuple[int, int], ...]:
                 elif option_num * den == num * option_den:
                     axes |= option_axes
             if num * q > budget * den:
-                fx += hx * budget // q
-                fy += hy * budget // q
+                fx += _ray_advance(hx, budget, q)
+                fy += _ray_advance(hy, budget, q)
                 break
-            fx += hx * num // den
-            fy += hy * num // den
+            fx += _ray_advance(hx, num, den)
+            fy += _ray_advance(hy, num, den)
             budget -= (num * q + den - 1) // den
             for subset in (1, 2, 3):
                 if subset & axes == subset:

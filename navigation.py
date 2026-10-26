@@ -4648,7 +4648,8 @@ class FarmCircuitTask(BotTask):
         return True
 
     RECALL_STATE = ("_emergency_recall_source", "_emergency_recall_apply_at",
-                    "_emergency_recall_cast_at", "_emergency_recall_origin")
+                    "_emergency_recall_cast_at", "_emergency_recall_origin",
+                    "_recall_wand_fired")
 
     def _spot_key(self) -> str:
         return self_improvement.spot_key(self.spot, self.legs)
