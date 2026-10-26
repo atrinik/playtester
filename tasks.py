@@ -419,8 +419,128 @@ class LootPolicy:
         return self.take_all or any(re.search(pattern, name) for pattern in self.include)
 
 
-# Gear-score value of one point of each caster bonus while training Wizardry.
-CASTER_STAT_WEIGHTS = {"int": 60, "pow": 60, "mana": 4}
+# The server's stat bonus tables, indexed by the stat (0-30). Max mana gains
+# sp_bonus[Int] plus sp_bonus[Pow] / 2.5 of its base (server/living.c), and
+# spell damage is multiplied by 1 + spell_dam_bonus[Pow]
+# (server/spell_util.c). Both are flat for stats 11-15.
+SP_BONUS = (
+    -0.8,
+    -0.6, -0.5, -0.4, -0.35, -0.3,
+    -0.25, -0.2, -0.15, -0.11, -0.07,
+    0.0, 0.0, 0.0, 0.0, 0.0,
+    0.1, 0.2, 0.3, 0.4, 0.5,
+    0.6, 0.7, 0.8, 0.9, 1.0,
+    1.1, 1.4, 1.6, 1.8, 2.0,
+)
+SPELL_DAMAGE_BONUS = (
+    -2.5,
+    -2.0, -1.75, -1.5, -1.25, -1.0,
+    -0.5, -0.5, -0.5, -0.25, -0.25,
+    0.0, 0.0, 0.0, 0.0, 0.0,
+    0.15, 0.25, 0.4, 0.5, 0.65,
+    0.75, 0.85, 0.95, 1.10, 1.30,
+    1.45, 1.55, 1.65, 1.80, 2.0,
+)
+# The server regenerates mana in proportion to gen_sp * 60 + maxsp + 10,
+# where gen_sp starts at 1 and every worn non-weapon adds its stats.sp
+# (types/player.c player_do_some_living, get_regen_value). Only untitled
+# rings, amulets and trinkets show that stats.sp in their names, as
+# "(mana reg.+N)" with N = stats.sp * 0.4 (server/item.c); a titled item
+# such as the Blue Crystal Talisman of Incuna hides it.
+MANA_REGEN_PER_POINT = 60
+MANA_REGEN_FLOOR = 10
+MANA_REGEN_NAME_STEP = 0.4
+# The client's regen_sp stat is gen_client_sp / 10, where gen_client_sp is
+# (gen_sp * 60 + maxsp + 10) / 15 truncated, before Meditation (15 is
+# PLAYER_REGEN_SP_RATE / MAX_TICKS / 10 at the default 8 ticks a second).
+MANA_REGEN_CLIENT_DIVISOR = 15
+# Every player archetype has maxsp 4, multiplied by Wizardry level + 3
+# (server/living.c) before the Int/Pow bonus and item mana are added.
+PLAYER_BASE_MAXSP = 4
+# Gear-score value of one percent of each caster gain while training
+# Wizardry. Mana bounds her kill rate, so a percent of regeneration is worth
+# a percent of spell damage; capacity only lengthens a fight.
+CASTER_GAIN_WEIGHTS = {"damage": 8, "regen": 8, "maxsp": 2}
+
+
+# Gear-score value of one percent of protection. An item name's
+# "(Protections: force +17%)" counts through the generic "+N" (8 per
+# point); the shop examine score uses the same weight.
+PROTECTION_WEIGHT = 8
+
+
+def protection_percent(text: str) -> int:
+    """The summed protection percentages an item text shows."""
+    match = re.search(r"\(Protections:\s*([^)]*)\)", text, re.I)
+    if match is None:
+        return 0
+    return sum(int(value) for value in re.findall(r"([+-]\d+)%",
+                                                  match.group(1)))
+
+
+def stat_bonus(table: tuple[float, ...], stat: int) -> float:
+    return table[max(0, min(len(table) - 1, int(stat)))]
+
+
+def caster_bonuses(text: str) -> dict[str, int]:
+    """Int, Pow, max mana and mana-regeneration points an item text shows."""
+    bonuses: dict[str, int] = {}
+    for match in re.finditer(r"\bmana reg\.\s*([+-]\d+(?:\.\d+)?)", text,
+                             re.I):
+        bonuses["regen"] = bonuses.get("regen", 0) + round(
+            float(match.group(1)) / MANA_REGEN_NAME_STEP)
+    for match in re.finditer(r"\b(Int|Pow|mana)([+-]\d+)\b", text, re.I):
+        key = match.group(1).casefold()
+        bonuses[key] = bonuses.get(key, 0) + int(match.group(2))
+    return {key: value for key, value in bonuses.items() if value}
+
+
+@dataclass(frozen=True, slots=True)
+class CasterProfile:
+    """Her stats as they bear on a Wizardry caster's gear choices.
+
+    The default is a neutral stand-in for when no stats have arrived yet.
+    """
+
+    power: int = 15
+    intelligence: int = 15
+    maxsp: int = 100
+    # The server's gen_sp: 1 plus every worn non-weapon's regeneration.
+    regen_points: int = 1
+    # Max mana before the Int/Pow bonus and item mana are added.
+    base_maxsp: float = 100.0
+
+    @classmethod
+    def from_client(cls, client: AtrinikClient) -> "CasterProfile":
+        stats, default = client.state.stats, cls()
+        power = int(stats.get("pow", 0) or 0) or default.power
+        intelligence = (int(stats.get("int", 0) or 0) or
+                        default.intelligence)
+        maxsp = int(stats.get("maxsp", 0) or 0) or default.maxsp
+        # Titled items hide their regeneration, so read gen_sp back from
+        # the regen_sp stat; item names are only the fallback.
+        shown = round(float(stats.get("regen_sp", 0) or 0) * 10)
+        if shown > 0:
+            regen = round((shown * MANA_REGEN_CLIENT_DIVISOR +
+                           MANA_REGEN_CLIENT_DIVISOR / 2 -
+                           MANA_REGEN_FLOOR - maxsp) / MANA_REGEN_PER_POINT)
+        else:
+            regen = 1
+            equipment_types = InventoryPolicy().equipment_types
+            for item in client.state.inventory:
+                if (item.flags & c.ITEM_APPLIED and
+                        item.item_type in equipment_types and
+                        item.item_type not in (c.TYPE_WEAPON, c.TYPE_BOW)):
+                    regen += caster_bonuses(item.name).get("regen", 0)
+        wizardry = max((int(item.extra.get("level", 0) or 0)
+                        for item in client.state.inventory
+                        if item.item_type == c.TYPE_SKILL and
+                        item.name.casefold() == "wizardry spells"),
+                       default=0)
+        return cls(power=power, intelligence=intelligence, maxsp=maxsp,
+                   regen_points=max(1, regen),
+                   base_maxsp=float(PLAYER_BASE_MAXSP *
+                                    (max(1, wizardry) + 3)))
 
 # Monsters whose names mark them as ranged attackers. They hit from beyond
 # their authored detection radius, so pull squares and lone pulls keep at
@@ -434,8 +554,10 @@ RANGED_RESIDENT_RADIUS = 6
 class InventoryPolicy:
     """Conservative local valuation used before equip/sell/deposit decisions."""
 
-    # Score gear for a Wizardry caster (Int, Pow, mana) rather than generically.
+    # Score gear for a Wizardry caster (Int, Pow, mana, mana regeneration)
+    # rather than generically, against her stats in caster_profile.
     caster_stats: bool = False
+    caster_profile: CasterProfile | None = None
 
     reserve_words: tuple[str, ...] = (
         "quest", "key", "talisman", "artifact", "unique", "exceptional",
@@ -601,19 +723,85 @@ class InventoryPolicy:
         name = item.name
         caster = 0
         if self.caster_stats:
-            # Wizardry scales with Int and Pow and spends mana: weigh those
-            # bonuses well above a generic "+N", which they no longer count as.
-            def weigh(match: re.Match) -> str:
-                nonlocal caster
-                caster += (int(match.group(2)) *
-                           CASTER_STAT_WEIGHTS[match.group(1).casefold()])
-                return ""
-            name = re.sub(r"\b(Int|Pow|mana)([+-]\d+)", weigh, name,
-                          flags=re.I)
+            # Wizardry spends mana and scales with Pow: value these bonuses
+            # by what they actually add, never as a generic "+N".
+            bonuses = (caster_bonuses(name) or
+                       dict(item.extra.get("examined_caster_bonuses") or {}))
+            caster = round(self.caster_value(
+                bonuses, worn=bool(item.flags & c.ITEM_APPLIED),
+                weapon=item.item_type in (c.TYPE_WEAPON, c.TYPE_BOW)))
+            name = re.sub(
+                r"\bmana reg\.\s*[+-]\d+(?:\.\d+)?|\b(?:Int|Pow|mana)[+-]\d+",
+                "", name, flags=re.I)
         named_bonus = sum(
             int(value) for value in re.findall(r"[+]([0-9]+)", name))
         return (quality * 2 + condition + named_bonus * 8 + caster +
                 (120 if item.flags & c.ITEM_MAGICAL else 0))
+
+    def displacement_margin(self, item: Item) -> int:
+        """Extra score a caster upgrade must beat to take off this item.
+
+        A caster bonus may displace a protection item only when it wins
+        clearly: by the protection's own worth once more. Melee scoring
+        needs no margin.
+        """
+        if not self.caster_stats:
+            return 0
+        return max(0, protection_percent(item.name)) * PROTECTION_WEIGHT
+
+    def caster_value(self, bonuses: dict[str, int], *, worn: bool = False,
+                     weapon: bool = False) -> float:
+        """Gear-score worth of caster bonuses, from the server's formulas.
+
+        Each bonus counts only for the spell damage, max mana and mana
+        regeneration it actually adds at her stats: Pow+1 from 13 to 14
+        adds nothing, from 15 to 16 it adds 15% spell damage. A worn item
+        is valued from her stats without it. Int adds only max mana, and
+        never counts for more than the same Pow change would.
+        """
+        profile = self.caster_profile or CasterProfile()
+        power_change = bonuses.get("pow", 0)
+        int_change = bonuses.get("int", 0)
+        # The server adds max mana and regeneration only from non-weapons.
+        mana = 0 if weapon else bonuses.get("mana", 0)
+        regen = 0 if weapon else bonuses.get("regen", 0)
+        power = profile.power - (power_change if worn else 0)
+        intelligence = profile.intelligence - (int_change if worn else 0)
+
+        def maxsp_gain(power: int, intelligence: int, power_change: int,
+                       int_change: int, mana: int) -> float:
+            return mana + profile.base_maxsp * (
+                stat_bonus(SP_BONUS, intelligence + int_change) -
+                stat_bonus(SP_BONUS, intelligence) +
+                (stat_bonus(SP_BONUS, power + power_change) -
+                 stat_bonus(SP_BONUS, power)) / 2.5)
+
+        own = maxsp_gain(power, intelligence, power_change, int_change, mana)
+        maxsp = max(1.0, profile.maxsp - (own if worn else 0))
+        regen_points = max(1, profile.regen_points - (regen if worn else 0))
+        regen_rate = (regen_points * MANA_REGEN_PER_POINT + maxsp +
+                      MANA_REGEN_FLOOR)
+
+        def value(power: int, intelligence: int, power_change: int = 0,
+                  int_change: int = 0, mana: int = 0,
+                  regen: int = 0) -> float:
+            sp = maxsp_gain(power, intelligence, power_change, int_change,
+                            mana)
+            damage = (stat_bonus(SPELL_DAMAGE_BONUS, power + power_change) -
+                      stat_bonus(SPELL_DAMAGE_BONUS, power))
+            return (CASTER_GAIN_WEIGHTS["damage"] * damage * 100 +
+                    CASTER_GAIN_WEIGHTS["maxsp"] * sp / maxsp * 100 +
+                    CASTER_GAIN_WEIGHTS["regen"] *
+                    (regen * MANA_REGEN_PER_POINT + sp) / regen_rate * 100)
+
+        int_value = value(power, intelligence, int_change=int_change)
+        # The same change to Pow at the same stat value bounds Int's worth.
+        as_power = value(intelligence, intelligence, power_change=int_change)
+        int_value = (min(int_value, as_power) if int_change > 0 else
+                     max(int_value, as_power))
+        return (value(power, intelligence, power_change=power_change) +
+                int_value + value(power, intelligence, mana=mana) +
+                value(power, intelligence, regen=regen))
 
     def weight_ratio(self, client: AtrinikClient) -> float:
         limit = float(client.state.stats.get("weight_limit", 0) or 0)
@@ -622,6 +810,206 @@ class InventoryPolicy:
         carried = sum(item.weight * item.quantity
                       for item in client.state.inventory)
         return carried / limit
+
+
+class ManaCrystal:
+    """Bank and draw mana with a carried power crystal, such as Gandyld's.
+
+    The server's rules (types/power_crystal.c): applying it at full mana
+    stores min(space, sp / 2); applying it below full draws
+    min(missing, stored); anything else does nothing. Examining it shows
+    its capacity and a coarse charge. After that, the mana change each apply
+    causes keeps the stored amount up to date. Both live in the crystal's
+    item extras until the inventory is replayed, so every farm shares them.
+    """
+
+    EXAMINE = re.compile(
+        r"It has capacity of (\d+)(?:\.(\d))?(k)?(?: and is ([a-z ]+))?\.",
+        re.I)
+    # The least each examine charge word can mean, as a fraction of the
+    # capacity (types/player.c): "half full" is 30-59%, and so on.
+    CHARGE_FLOOR = {
+        "empty": 0.0, "almost empty": 0.0, "partially filled": 0.1,
+        "half full": 0.3, "well charged": 0.6, "almost full": 0.9,
+        "fully charged": 1.0,
+    }
+    EXAMINE_TIMEOUT = 3.0
+    EXAMINE_RETRY = 60.0
+    # How long an apply's mana change may take to show. No change at all
+    # means nothing moved: the crystal was full (bank) or empty (draw).
+    APPLY_SETTLE = 1.5
+
+    @staticmethod
+    def carried(client: AtrinikClient) -> Item | None:
+        crystals = [item for item in client.state.inventory
+                    if item.item_type == c.TYPE_POWER_CRYSTAL and
+                    not item.flags & c.ITEM_UNPAID]
+        return max(crystals, key=lambda item: int(
+            item.extra.get("crystal_capacity", 0) or 0), default=None)
+
+    @staticmethod
+    def known(item: Item) -> tuple[int, int] | None:
+        """The crystal's (capacity, stored mana), once examined."""
+        capacity = item.extra.get("crystal_capacity")
+        stored = item.extra.get("crystal_stored")
+        if capacity is None or stored is None:
+            return None
+        return int(capacity), int(stored)
+
+    @classmethod
+    def known_charge(cls, client: AtrinikClient) -> int | None:
+        """Mana the carried crystal holds; None without one or unexamined.
+
+        Code deciding whether she can still cast (for example by counting
+        on a mana restorer) should treat only a positive charge as one.
+        """
+        item = cls.carried(client)
+        known = cls.known(item) if item is not None else None
+        return known[1] if known is not None else None
+
+    @classmethod
+    def has_charge(cls, client: AtrinikClient) -> bool:
+        return (cls.known_charge(client) or 0) > 0
+
+    @classmethod
+    def read_examine(cls, item: Item, text: str) -> bool:
+        match = cls.EXAMINE.search(text)
+        if match is None:
+            return False
+        capacity = int(match.group(1))
+        if match.group(3):
+            capacity = capacity * 1000 + int(match.group(2) or 0) * 100
+        charge = (match.group(4) or "empty").strip().casefold()
+        stored = round(capacity * cls.CHARGE_FLOOR.get(charge, 0.0))
+        if charge == "almost empty":
+            stored = min(capacity, 1)
+        item.extra["crystal_capacity"] = capacity
+        item.extra["crystal_stored"] = stored
+        return True
+
+    @classmethod
+    async def learn(cls, client: AtrinikClient, item: Item) -> bool:
+        """Examine the crystal once. True while the answer is awaited."""
+        if cls.known(item) is not None:
+            return False
+        now = time.monotonic()
+        pending = item.extra.get("crystal_examine")
+        if pending is not None:
+            position, sent_at = pending
+            if any(cls.read_examine(item, entry[3])
+                   for entry in client.state.messages_since(position)
+                   if len(entry) > 3):
+                item.extra.pop("crystal_examine", None)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    capacity, stored = cls.known(item) or (0, 0)
+                    recorder("mana-crystal-examine",
+                             f"{item.name}: about {stored}/{capacity} sp")
+                return False
+            if now - sent_at < cls.EXAMINE_TIMEOUT:
+                return True
+            item.extra.pop("crystal_examine", None)
+            item.extra["crystal_examine_retry_at"] = now + cls.EXAMINE_RETRY
+            return False
+        if now < float(item.extra.get("crystal_examine_retry_at", 0.0)):
+            return False
+        item.extra["crystal_examine"] = (client.state.message_count, now)
+        await client.examine(item.tag)
+        return True
+
+    @classmethod
+    def settle(cls, client: AtrinikClient, item: Item) -> bool:
+        """Account a sent apply once its mana change shows. True while the
+        change is awaited."""
+        pending = item.extra.get("crystal_apply")
+        if pending is None:
+            return False
+        kind, before, sent_at = pending
+        observed_at = float(client.state.stat_observed_at.get("sp", 0.0))
+        sp = int(client.state.stats.get("sp", 0) or 0)
+        moved = max(0, before - sp) if kind == "bank" else max(0, sp - before)
+        # An earlier cast acknowledgement or a regeneration tick can arrive
+        # before the apply's result. Only a transfer in the expected direction
+        # settles early; otherwise wait out the apply window before concluding
+        # that the crystal was full or empty. One SP may just be regeneration.
+        if ((observed_at <= sent_at or moved < (1 if kind == "bank" else 2)) and
+                time.monotonic() - sent_at < cls.APPLY_SETTLE):
+            return True
+        item.extra.pop("crystal_apply", None)
+        known = cls.known(item)
+        if known is None:
+            return False
+        capacity, stored = known
+        if kind == "bank":
+            stored = capacity if not moved else min(capacity, stored + moved)
+        else:
+            # A point of regeneration may land at the same time.
+            stored = 0 if moved < 2 else max(0, stored - moved)
+        item.extra["crystal_stored"] = stored
+        return False
+
+    @classmethod
+    async def _apply(cls, client: AtrinikClient, item: Item, kind: str,
+                     detail: str, sp: int | None = None) -> None:
+        if sp is None:
+            sp = int(client.state.stats.get("sp", 0) or 0)
+        item.extra["crystal_apply"] = (kind, sp, time.monotonic())
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder(f"mana-crystal-{kind}", detail)
+        await client.apply(item.tag)
+
+    @classmethod
+    async def bank(cls, client: AtrinikClient) -> bool:
+        """At full mana, store half of it while the crystal has room.
+
+        True when this tick examined, applied or awaited the crystal.
+        """
+        item = cls.carried(client)
+        if item is None:
+            return False
+        if cls.settle(client, item) or await cls.learn(client, item):
+            return True
+        known = cls.known(item)
+        sp = int(client.state.stats.get("sp", 0) or 0)
+        maxsp = int(client.state.stats.get("maxsp", 0) or 0)
+        if known is None or maxsp <= 0 or sp < maxsp or sp < 2:
+            return False
+        capacity, stored = known
+        if stored >= capacity:
+            return False
+        await cls._apply(
+            client, item, "bank",
+            f"sp={sp}/{maxsp}; crystal {stored}/{capacity} "
+            f"+{min(capacity - stored, sp // 2)}")
+        return True
+
+    @classmethod
+    async def draw(cls, client: AtrinikClient,
+                   sp: int | None = None) -> bool:
+        """Below full mana, take back what the crystal holds.
+
+        ``sp`` is her mana net of casts sent but not yet acknowledged, so a
+        cast's cost landing after the apply is not read as a failed draw.
+        True when this tick applied the crystal.
+        """
+        item = cls.carried(client)
+        if item is None or cls.settle(client, item):
+            return False
+        known = cls.known(item)
+        observed = int(client.state.stats.get("sp", 0) or 0)
+        sp = observed if sp is None else min(observed, int(sp))
+        maxsp = int(client.state.stats.get("maxsp", 0) or 0)
+        if known is None or not 0 <= observed < maxsp:
+            return False
+        capacity, stored = known
+        if stored <= 0:
+            return False
+        await cls._apply(
+            client, item, "draw",
+            f"sp={sp}/{maxsp}; crystal {stored}/{capacity} "
+            f"-{min(maxsp - sp, stored)}", sp=sp)
+        return True
 
 
 class InventoryCapabilityTask(BotTask):
@@ -1231,6 +1619,31 @@ class FarmTask(BotTask):
             int(item.extra.get("cost", 0) or 0) > 0
         ]
         return min(costs, default=0) * 3
+
+    async def bank_mana_crystal(self, client: AtrinikClient) -> bool:
+        """Resting on a full bar, store mana in the crystal until it is
+        full; the rest then refills the bar (see ManaCrystal)."""
+        if int(client.state.stats.get("food", 0) or 0) <= 0:
+            # Mana regenerates only with food: keep the bar she has.
+            return False
+        return await ManaCrystal.bank(client)
+
+    async def draw_mana_crystal(self, client: AtrinikClient) -> bool:
+        """In a spell-only fight, draw from the crystal once the next cast
+        would dip into the healing reserve."""
+        if not self.spell_only_training(client):
+            return False
+        spell = self.combat_spell_item(client)
+        if spell is None:
+            return False
+        crystal = ManaCrystal.carried(client)
+        if crystal is not None:
+            # Account the last apply even while casting needs no draw.
+            ManaCrystal.settle(client, crystal)
+        if self.offensive_spell_affordable(client, spell):
+            return False
+        return await ManaCrystal.draw(
+            client, sp=self._sync_offensive_spell_budget(client))
 
     def offensive_spell_affordable(self, client: AtrinikClient,
                                    spell: Item) -> bool:
@@ -2222,6 +2635,9 @@ class FarmTask(BotTask):
             return True
         self.inventory_policy.caster_stats = bool(
             "wizardry" in self.combat_skill and self.training_active(client))
+        self.inventory_policy.caster_profile = (
+            CasterProfile.from_client(client)
+            if self.inventory_policy.caster_stats else None)
         for item in client.state.inventory:
             lore_attempted = getattr(client, "lore_book_attempted", None)
             if (item.item_type == c.TYPE_BOOK and
@@ -2349,9 +2765,18 @@ class FarmTask(BotTask):
                         item.required_skill_tag != candidate.required_skill_tag
                         for item in current)):
                 continue
-            if current and score <= min(
-                    score_item(item) for item in current) + 15:
+            worst = min(current, key=score_item) if current else None
+            if worst is not None and score <= (
+                    score_item(worst) + 15 +
+                    self.inventory_policy.displacement_margin(worst)):
                 continue
+            if worst is not None and len(current) >= len(slots) > 1:
+                # Both ring slots are full. The server would take off the
+                # ring that comes later in inventory order, which may be the
+                # better one: take off the weakest first.
+                if worst.flags & (c.ITEM_CURSED | c.ITEM_DAMNED):
+                    continue
+                await client.apply(worst.tag)
             await client.apply(candidate.tag)
             self._upgrade_attempts.add(candidate.tag)
             self._last_action = time.monotonic()
@@ -4025,6 +4450,9 @@ class FarmTask(BotTask):
             # fight is cast without waiting for mana mid-fight. Resting out
             # of combat also ramps regeneration up (Meditation). Mana
             # regenerates only while she has food in her stomach.
+            if await self.bank_mana_crystal(client):
+                self._last_action = time.monotonic()
+                return
             sp = int(client.state.stats.get("sp", 0) or 0)
             maxsp = int(client.state.stats.get("maxsp", 0) or 0)
             food = int(client.state.stats.get("food", 0) or 0)
@@ -4123,6 +4551,9 @@ class FarmTask(BotTask):
             self._lure_target_world = None
             self._lure_progress_at = 0.0
             self._last_lure_step_at = 0.0
+            if await self.draw_mana_crystal(client):
+                self._last_action = time.monotonic()
+                return
             if await self.training_finisher(client, x, y, obj):
                 return
             if self.spell_only_training(client):
@@ -4416,13 +4847,16 @@ class BuyShopUpgradeTask(BotTask):
     def __init__(self, *, min_improvement: int = 25,
                  cash_reserve: int = 1_000,
                  spend_fraction: float = 0.25,
-                 allow_launchers: bool = True):
+                 allow_launchers: bool = True,
+                 caster_stats: bool = False):
         super().__init__("buy-shop-upgrade")
         self.min_improvement = max(1, int(min_improvement))
         self.cash_reserve = max(0, int(cash_reserve))
         self.spend_fraction = max(0.01, min(1.0, float(spend_fraction)))
         self.allow_launchers = bool(allow_launchers)
-        self.policy = InventoryPolicy()
+        # The owning circuit sets this while she trains Wizardry, as the
+        # farm's maintain_inventory does for carried gear.
+        self.policy = InventoryPolicy(caster_stats=bool(caster_stats))
         self._candidate = 0
         self._feedback_start = 0
         self._examined_at = 0.0
@@ -4601,11 +5035,15 @@ class BuyShopUpgradeTask(BotTask):
                 self.policy.identified(item)
             })
             current = list(current_by_tag.values())
-        scores = [self._gear_score(client, item) for item in current]
-        baseline = ((max(scores) if len(slots) == 1 else min(scores))
-                    if scores else 0)
-        improvement = self._gear_score(client, candidate) - baseline
-        return improvement if improvement >= self.min_improvement else -1
+        scored = [(self._gear_score(client, item), item) for item in current]
+        baseline = ((max if len(slots) == 1 else min)(
+            scored, key=lambda value: value[0]) if scored else None)
+        improvement = self._gear_score(client, candidate) - (
+            baseline[0] if baseline is not None else 0)
+        margin = (self.policy.displacement_margin(baseline[1])
+                  if baseline is not None else 0)
+        return (improvement if improvement >= self.min_improvement + margin
+                else -1)
 
     def _select(self, client: AtrinikClient) -> Item | None:
         candidates = [item for item in client.state.ground
@@ -4661,12 +5099,13 @@ class BuyShopUpgradeTask(BotTask):
         if candidate.item_type == c.TYPE_WEAPON and delay is not None:
             seconds = max(0.125, float(delay.group(1)))
             damage_score = int(damage * 40 / seconds)
-        protection_score = 0
         protections = re.search(
             r"\(Protections:\s*([^)]*)\)", feedback, re.I)
-        if protections is not None:
-            protection_score = sum(int(value) for value in re.findall(
-                r"([+-]\d+)%", protections.group(1)))
+        # Weighted as in an item name, where gear_score already counts them
+        # when the stock's ground name shows them.
+        protection_score = (
+            0 if "(protections:" in candidate.name.casefold() else
+            protection_percent(feedback) * PROTECTION_WEIGHT)
         attack_score = 0
         attacks = re.search(r"\(Attacks:\s*([^)]*)\)", feedback, re.I)
         if attacks is not None:
@@ -4689,9 +5128,20 @@ class BuyShopUpgradeTask(BotTask):
         stat_matches = re.findall(
             r"\b(Str|Dex|Con|Int|Pow|Cha)([+-]\d+)\b",
             feedback, re.I)
-        stat_score = sum(int(value) * 40 for _, value in stat_matches)
         resource_matches = re.findall(
             r"\b(hp|mana)([+-]\d+)\b", feedback, re.I)
+        caster = self.policy.caster_stats and caster_bonuses(feedback)
+        if caster:
+            # gear_score values these from the stock's name, or from this
+            # examination when the ground name lacks them; never twice.
+            candidate.extra["examined_caster_bonuses"] = caster
+            stat_matches = [
+                (name, value) for name, value in stat_matches
+                if name.casefold() not in ("int", "pow")]
+            resource_matches = [
+                (name, value) for name, value in resource_matches
+                if name.casefold() != "mana"]
+        stat_score = sum(int(value) * 40 for _, value in stat_matches)
         resource_score = sum(int(value) for _, value in resource_matches)
         special_score = 50 * sum(
             marker in feedback.casefold() for marker in (
@@ -4700,7 +5150,7 @@ class BuyShopUpgradeTask(BotTask):
                 "(flying)", "(stealth)"))
         if (fields or delay is not None or protections is not None or
                 attacks is not None or stat_matches or resource_matches or
-                special_score):
+                special_score or caster):
             candidate.extra["examined_gear_score"] = (
                 damage_score + fields.get("wc", 0) * 10 +
                 fields.get("ac", 0) * 20 +
@@ -4717,6 +5167,8 @@ class BuyShopUpgradeTask(BotTask):
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
+        if self.policy.caster_stats:
+            self.policy.caster_profile = CasterProfile.from_client(client)
         now = time.monotonic()
         if self._move_at:
             item = client.state.items.get(self._candidate)
