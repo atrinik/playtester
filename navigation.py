@@ -3573,7 +3573,8 @@ class ShopUpgradeSweepTask(BotTask):
     def __init__(self, graph: WorldGraph, maps: Sequence[str], *,
                  allow_launchers: bool = True,
                  allow_hostile_transit: bool = False,
-                 start_index: int = 0):
+                 start_index: int = 0,
+                 caster_stats: bool = False):
         super().__init__("shop-upgrade-sweep")
         self.graph = graph
         self.waypoints = [
@@ -3589,12 +3590,15 @@ class ShopUpgradeSweepTask(BotTask):
         self.purchased = False
         self.allow_launchers = bool(allow_launchers)
         self.allow_hostile_transit = bool(allow_hostile_transit)
+        # Value stock as a Wizardry caster would (see InventoryPolicy).
+        self.caster_stats = bool(caster_stats)
 
     def _new_child(self) -> NavigateThenTask:
         path, point = self.waypoints[self.index]
         child = NavigateThenTask(
             self.graph, path, BuyShopUpgradeTask(
-                allow_launchers=self.allow_launchers),
+                allow_launchers=self.allow_launchers,
+                caster_stats=self.caster_stats),
             destination_xy=point, combat_approach=True,
             # Regional stock is reached through one authored level-14/15
             # crocodile/frog road. At level 18+, permit the live defensive
@@ -4436,7 +4440,7 @@ class FarmCircuitTask(BotTask):
     RECALL_SHOP_INTERVAL = 24 * 60 * 60
     UTILITY_SHOP_INTERVAL = 24 * 60 * 60
     UPGRADE_SWEEP_WALLET_GROWTH = 5_000
-    UPGRADE_SWEEP_POLICY = 7
+    UPGRADE_SWEEP_POLICY = 8
     BANK_DEPOSIT_MINIMUM = 1_000
     BANK_DEPOSIT_WEALTH_OVERRIDE = 10_000
     ROUTINE_TOWN_TRIP_WEIGHT = 0.85
@@ -6167,6 +6171,11 @@ class FarmCircuitTask(BotTask):
                 "/shattered_islands/world_5_46",  # Asteria launchers
                 "/shattered_islands/world_5_58",  # Aris shops
             ))
+        # Greyton's general store stocks random rings (difficulty 50), which
+        # can roll Pow, Int or mana regeneration. The road there from Aris
+        # passes level-28/29 orc spawns, so it waits for level 30.
+        if level >= 30:
+            maps.append("/shattered_islands/world_9_67")  # Greyton store
         cursor = 0
         if (getattr(client.state, "active_upgrade_shop_sweep_policy", 0) ==
                 self.UPGRADE_SWEEP_POLICY):
@@ -6181,7 +6190,17 @@ class FarmCircuitTask(BotTask):
             allow_launchers=(
                 not self._auto_combat_build and not bool(self.combat_spell)),
             allow_hostile_transit=level >= 18,
-            start_index=cursor)
+            start_index=cursor,
+            caster_stats=self._trains_wizardry(client))
+
+    def _trains_wizardry(self, client: AtrinikClient) -> bool:
+        """Whether her current build trains Wizardry, as FarmTask decides
+        it for maintain_inventory."""
+        if "wizardry" not in self.combat_skill:
+            return False
+        level = self._skill_level(client, self.combat_skill)
+        return level > 0 and (not self.combat_skill_until_level or
+                              level < self.combat_skill_until_level)
 
     @staticmethod
     def _has_ship_key(client: AtrinikClient) -> bool:
