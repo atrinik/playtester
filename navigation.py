@@ -30,7 +30,7 @@ except ModuleNotFoundError:
 from . import constants as c
 from .targeting import select_target, target_set_aside
 
-from .client import AtrinikClient, map_object_visual_name
+from .client import AtrinikClient, format_money, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import farm_analyzer as farm_analyzer_plan
 from . import self_improvement
@@ -6426,8 +6426,8 @@ class FarmCircuitTask(BotTask):
                     self._bank_sync_retry_at = (
                         self.clock() + self._bank_sync_backoff(self._bank_sync))
                 else:
-                    log.info("bank balance synchronized: %d copper",
-                             client.state.bank_balance)
+                    log.info("bank balance synchronized: %s",
+                             format_money(client.state.bank_balance))
                     self._bank_sync_retry_at = self.clock() + 3600.0
                 self._bank_sync = None
                 # Chain urgent stat restoration before a dense farm respawn

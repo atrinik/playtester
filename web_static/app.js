@@ -124,7 +124,21 @@ function renderBuild() {
 }
 // Farming analyzer: status, the objective toggle and that objective's ranking.
 const rate = v => { v = +v || 0; return v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${Math.round(v / 1e3)}k` : `${Math.round(v)}`; };
-const coins = v => { v = Math.round(+v || 0); return v >= 10000 ? `${(v / 10000).toFixed(1)}g` : v >= 100 ? `${Math.round(v / 100)}s` : `${v}c`; };
+// Money is held in copper and shown in the game's coins, largest first:
+// coins(768192) is "76g 81s 92c"; coins(v, 2) keeps the two largest coins.
+const COIN_LABELS = [[1e8, " amber"], [1e7, " mithril"], [1e6, " jade"], [1e4, "g"], [100, "s"], [1, "c"]];
+const coins = (v, limit = COIN_LABELS.length) => {
+  v = Math.round(+v || 0);
+  const sign = v < 0 ? "-" : "";
+  v = Math.abs(v);
+  const parts = [];
+  for (const [worth, label] of COIN_LABELS) {
+    const count = Math.floor(v / worth);
+    v -= count * worth;
+    if (count && parts.length < limit) parts.push(`${count}${label}`);
+  }
+  return sign + (parts.join(" ") || "0c");
+};
 const since = t => { const s = Math.max(0, Date.now() / 1000 - t); return s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`; };
 let lastFarmingSig = "";
 function renderFarming() {
@@ -154,7 +168,7 @@ function renderFarming() {
     <div class="spot${i === 0 ? " top" : ""}">
       <div class="spot-head"><b>#${i + 1} ${esc(r.name)}</b><span class="flag">${esc(String(r.region || "").replace(/_/g, " "))}</span></div>
       <small>${esc(r.location || (r.map_paths || []).join(", "))}</small>
-      <div class="spot-metrics"><span title="Estimated XP per hour">XP ${rate(r.xp_hour)}/h</span><span title="Estimated money per hour">${coins(r.money_hour)}/h</span><span title="Estimated loot value per hour">Loot ${rate(r.loot_hour)}/h</span><span title="Estimated incoming damage per clear">Danger ${Math.round(+r.danger || 0)}</span></div>
+      <div class="spot-metrics"><span title="Estimated XP per hour">XP ${rate(r.xp_hour)}/h</span><span title="Estimated money per hour">${coins(r.money_hour, 2)}/h</span><span title="Estimated loot drops per hour">Loot ${rate(r.loot_hour)}/h</span><span title="Estimated incoming damage per clear">Danger ${Math.round(+r.danger || 0)}</span></div>
       <small class="muted">${esc((r.monsters || []).slice(0, 5).join(", "))}${(r.monsters || []).length > 5 ? " …" : ""}</small>
     </div>`).join("") || '<span class="muted">No ranking yet.</span>';
   const learning = fa.self_improvement || {};
@@ -280,8 +294,7 @@ function renderCharacter() {
     `<div class="skill"><span>${esc(k.name)}</span><b>${k.level}</b><div class="bar"><i style="width:${k.progress_percent || 0}%"></i></div></div>`).join("") || '<span class="muted">No skills yet</span>';
   $("#protections").innerHTML = Object.entries(live.protections || {}).filter(([, v]) => v).map(([k, v]) => `<span>${esc(k)} ${v}%</span>`).join("") || '<span class="muted">None</span>';
   const e = live.economy || {};
-  const money = v => { v = +v || 0; return `${Math.floor(v / 10000)}g ${Math.floor((v % 10000) / 100)}s ${v % 100}c`; };
-  $("#wealth").textContent = `Carried ${money(e.carried)} · Bank ${e.bank_known ? money(e.banked) : "unknown"}`;
+  $("#wealth").textContent = `Carried ${coins(e.carried)} · Bank ${e.bank_known ? coins(e.banked) : "unknown"}`;
   const cond = live.conditions || {};
   $("#depletion").textContent = cond.depletion_points_known
     ? `Depletion ${cond.depletion_points} / ${cond.depletion_threshold} before a priest visit`

@@ -23,6 +23,7 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
+from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from .alerts import active as active_alerts
 from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_farm_objective,
                          FarmCircuitTask, NavigateTask, NavigateThenTask,
@@ -594,6 +595,26 @@ class DashboardState:
             "alerts": self.alerts(),
         }
 
+    def prometheus(self) -> str:
+        """The Prometheus exposition: activity counters and live gauges."""
+        client = self.client
+        state = client.state
+        predicted = None
+        analyzer = getattr(client, "farm_analyzer", None)
+        if analyzer is not None:
+            objective = self._farmed_objective()
+            ranked = analyzer.ranking(objective)
+            rate = ranked[0].get("xp_hour") if ranked else None
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+                predicted = (objective, float(rate))
+        return client.metrics.render(
+            # An empty inventory before it loads is not an empty purse.
+            carried=(BuyShopUpgradeTask.carried_wallet_value(client)
+                     if state.phase == "playing" and
+                     state.inventory_replay_complete else None),
+            banked=state.bank_balance if state.bank_balance_known else None,
+            predicted_xp=predicted)
+
     def analyzer_farm_spots(self) -> list[dict[str, Any]]:
         """The preferred objective's ranked spots, as manual farm circuits."""
         analyzer = getattr(self.client, "farm_analyzer", None)
@@ -661,6 +682,7 @@ class WebControlServer:
         self.host, self.port = host, port
         self.catalog = load_catalog()
         self.dashboard = DashboardState(client, engine, graph, self.catalog)
+        client.metrics.attach(engine)
         self.face_images = FaceImages(
             getattr(client, "_runtime_content_root", Path(".")))
         self.server: asyncio.Server | None = None
@@ -780,6 +802,13 @@ class WebControlServer:
                             if key in include}
             await self._reply(writer, 200, _json_bytes(snapshot))
             return
+        if method == "GET" and path == "/metrics":
+            # Read-only and secret-free (no account, password or invite
+            # code), behind the same loopback listener and Host check as
+            # /api/state.
+            await self._reply(writer, 200, self.dashboard.prometheus().encode(),
+                              METRICS_CONTENT_TYPE)
+            return
         if method == "GET" and path == "/api/chat":
             # The durable chat log: ?sender=NAME&limit=N (newest N, oldest
             # first, up to 5000).
@@ -843,6 +872,8 @@ class WebControlServer:
             previous = self.engine.task
             if previous:
                 previous.fail("stopped by operator")
+                self.client.record_action(
+                    "task-end", f"{previous.name} stopped by operator")
                 self.engine.last_task = {
                     "name": previous.name, "status": "failed",
                     "error": previous.error, "started_at": previous.started_at,
