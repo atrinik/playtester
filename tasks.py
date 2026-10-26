@@ -3813,8 +3813,8 @@ class FarmTask(BotTask):
         cast_floor = max(self.safety.flee_below,
                          0.94 if near >= 3 else 0.80 if near >= 2 else 0.0)
         castable = [
-            (entry, direction) for entry in stand_candidates
-            if (direction := self.aimed_fire_direction(
+            (entry, cast_direction) for entry in stand_candidates
+            if (cast_direction := self.aimed_fire_direction(
                 client, spell, entry[0], entry[1], entry[2].target_id))
             is not None
         ] if (spell is not None and ratio > cast_floor and
@@ -3823,7 +3823,7 @@ class FarmTask(BotTask):
         if (caster_stand and
                 self._pursued_retreats >= self.PURSUIT_CAST_STEPS and
                 self.spell_ready(client, spell)):
-            (x, y, obj), direction = min(castable, key=lambda item: (
+            (x, y, obj), cast_direction = min(castable, key=lambda item: (
                 int(getattr(item[0][2], "target_hp", 0) or 100),
                 item[0][2].target_id != engaged_id))
             if await select_target(client, x, y, obj.target_id):
@@ -3831,7 +3831,7 @@ class FarmTask(BotTask):
                 self.remember_engagement(client, x, y, obj.target_id)
                 await client.clear_actions()
                 await client.set_combat(False)
-                await client.fire(direction, spell.tag)
+                await client.fire(cast_direction, spell.tag)
                 self.commit_offensive_spell(client, spell)
                 self._note_side_cast(obj.target_id)
                 if recorder is not None:

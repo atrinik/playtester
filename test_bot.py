@@ -8367,6 +8367,24 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(task._cornered_breakout_target, 200)
         self.assertEqual(client.fired, [])
 
+    def test_spell_training_pursuit_keeps_escape_direction_during_cooldown(self):
+        client, task = self._spell_pursuit_client()
+        task._last_spell_at = time.monotonic()
+        task._pursued_retreats = task.PURSUIT_CAST_STEPS
+        task._pursuit_ids = {200}
+        task._pursuit_last_at = time.monotonic()
+
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+
+        self.assertEqual(client.fired, [])
+        direction, running = client.direct_moves[-1]
+        dx, dy = c.DIRECTION_DELTAS[direction]
+        # The adjacent shaman is east at (9,8). A shot check must not
+        # replace the chosen escape step with the eastward FIRE direction.
+        self.assertGreater(max(abs(9 - 8 - dx), abs(8 - 8 - dy)), 1)
+        self.assertFalse(running)
+        self.assertEqual(task._retreat_attempt[3:5], (12 + dx, 12 + dy))
+
     def test_spell_training_pursuit_cast_uses_the_pack_flee_threshold(self):
         # 71% is above the 55% flee threshold but below the 80% one for two
         # nearby threats (the chief three tiles off): the melee stand, not
