@@ -664,7 +664,16 @@ class ManaCrystalUpgradeTask(BotTask):
                 self._last_request = now
             return
         if not self.dipped:
-            crystal = ManaCrystal.carried(client)
+            # Only Gandyld's named quest crystal can satisfy his turn-in.
+            # A larger ordinary power crystal remains useful for banking,
+            # but its capacity cannot prove that this quest is ready to report.
+            crystal = max((
+                item for item in client.state.inventory
+                if item.item_type == c.TYPE_POWER_CRYSTAL and
+                not item.flags & c.ITEM_UNPAID and
+                "gandyld's mana crystal" in item.name.casefold()
+            ), key=lambda item: int(item.extra.get("crystal_capacity", 0) or 0),
+                default=None)
             if crystal is not None and ManaCrystal.known(crystal) is None:
                 # Never send a crystal of unknown capacity to the pool: an
                 # enhanced one would only waste the trip. Examine again.

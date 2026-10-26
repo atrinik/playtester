@@ -11182,6 +11182,32 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)
 
+    def test_mana_crystal_upgrade_ignores_larger_ordinary_crystals(self):
+        graph = built_graph()
+        for quest_capacity in (None, 50, 100):
+            with self.subTest(quest_capacity=quest_capacity):
+                client = self._gandyld_client()
+                client.state.map.path = ManaCrystalUpgradeTask.GANDYLD_MAP
+                ordinary = Item(
+                    71, item_type=c.TYPE_POWER_CRYSTAL, name="power crystal",
+                    extra={"crystal_capacity": 200, "crystal_stored": 100})
+                client.state.inventory.append(ordinary)
+                if quest_capacity is not None:
+                    client.state.inventory.append(Item(
+                        70, item_type=c.TYPE_POWER_CRYSTAL,
+                        name="Gandyld's Mana Crystal",
+                        extra={"crystal_capacity": quest_capacity,
+                               "crystal_stored": 0}))
+                # Banking still uses the larger ordinary crystal.
+                self.assertIs(ManaCrystal.carried(client), ordinary)
+                task = ManaCrystalUpgradeTask(graph)
+                asyncio.run(task.tick(client))
+                if quest_capacity == 100:
+                    self.assertIsInstance(task.child, DialogAtTask)
+                else:
+                    self.assertIsInstance(task.child, NavigateThenTask)
+                    self.assertIsInstance(task.child.task, ApplyGroundTask)
+
     def test_mana_crystal_upgrade_reports_an_already_enhanced_crystal(self):
         client = self._gandyld_client()
         client.state.map.path = "/shattered_islands/world_6_58"
