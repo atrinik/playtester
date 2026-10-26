@@ -7794,6 +7794,28 @@ class QuestTests(unittest.TestCase):
         self.assertIsNone(ManaCrystal.known_charge(client))
         self.assertFalse(ManaCrystal.has_charge(client))
 
+    def test_crystal_settlement_waits_for_apply_after_intermediate_sp_update(self):
+        client, crystal = self._crystal_farm_client(10, 62, x=9, stored=50)
+        self.assertTrue(asyncio.run(ManaCrystal.draw(client, sp=2)))
+        # The pending cast cost arrives before the crystal's mana transfer.
+        self._server_sets_sp(client, 2)
+        self.assertTrue(ManaCrystal.settle(client, crystal))
+        self.assertEqual(ManaCrystal.known_charge(client), 50)
+        self._server_sets_sp(client, 52)
+        self.assertFalse(ManaCrystal.settle(client, crystal))
+        self.assertEqual(ManaCrystal.known_charge(client), 0)
+
+        crystal.extra["crystal_stored"] = 50
+        client.state.stats["sp"] = 62
+        self.assertTrue(asyncio.run(ManaCrystal.bank(client)))
+        # A full-bar stat update does not prove that the crystal is full.
+        self._server_sets_sp(client, 62)
+        self.assertTrue(ManaCrystal.settle(client, crystal))
+        self.assertEqual(ManaCrystal.known_charge(client), 50)
+        self._server_sets_sp(client, 31)
+        self.assertFalse(ManaCrystal.settle(client, crystal))
+        self.assertEqual(ManaCrystal.known_charge(client), 81)
+
     def test_mana_crystal_learns_capacity_and_corrects_from_no_change(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)

@@ -926,7 +926,13 @@ class ManaCrystal:
             return False
         kind, before, sent_at = pending
         observed_at = float(client.state.stat_observed_at.get("sp", 0.0))
-        if (observed_at <= sent_at and
+        sp = int(client.state.stats.get("sp", 0) or 0)
+        moved = max(0, before - sp) if kind == "bank" else max(0, sp - before)
+        # An earlier cast acknowledgement or a regeneration tick can arrive
+        # before the apply's result. Only a transfer in the expected direction
+        # settles early; otherwise wait out the apply window before concluding
+        # that the crystal was full or empty. One SP may just be regeneration.
+        if ((observed_at <= sent_at or moved < (1 if kind == "bank" else 2)) and
                 time.monotonic() - sent_at < cls.APPLY_SETTLE):
             return True
         item.extra.pop("crystal_apply", None)
@@ -934,13 +940,10 @@ class ManaCrystal:
         if known is None:
             return False
         capacity, stored = known
-        sp = int(client.state.stats.get("sp", 0) or 0)
         if kind == "bank":
-            moved = max(0, before - sp)
             stored = capacity if not moved else min(capacity, stored + moved)
         else:
             # A point of regeneration may land at the same time.
-            moved = max(0, sp - before)
             stored = 0 if moved < 2 else max(0, stored - moved)
         item.extra["crystal_stored"] = stored
         return False
