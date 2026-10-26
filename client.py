@@ -8,6 +8,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -22,6 +23,7 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameSta
                     InterfaceState, Item, MapObject, MapState)
 from .alerts import ProgressWatch
 from .memory import BotMemory
+from .metrics import BotMetrics
 from . import post_mortem
 from .self_improvement import PLAYER_CHANNELS
 from .trends import Trends
@@ -67,6 +69,24 @@ COIN_VALUES = {
     "jade": 1_000_000, "mithril": 10_000_000,
     "amber": 100_000_000,
 }
+# How a copper amount is written for people, largest coin first.
+COIN_LABELS = (
+    (100_000_000, " amber"), (10_000_000, " mithril"), (1_000_000, " jade"),
+    (10_000, "g"), (100, "s"), (1, "c"),
+)
+
+
+def format_money(copper: float) -> str:
+    """A copper amount in the game's coins, e.g. ``76g 81s 92c``."""
+    # Halves round up, as the dashboard's Math.round does.
+    value = math.floor(copper + 0.5)
+    sign, value = ("-" if value < 0 else ""), abs(value)
+    parts = []
+    for worth, label in COIN_LABELS:
+        count, value = divmod(value, worth)
+        if count:
+            parts.append(f"{count}{label}")
+    return sign + (" ".join(parts) or "0c")
 
 
 def parse_money_value(text: str) -> int | None:
@@ -165,6 +185,8 @@ def _after(records: list, mark: Any) -> list:
 
 class AtrinikClient:
     BANK_BALANCE_CACHE_SECONDS = 6 * 60 * 60
+    # Prometheus activity metrics; None on a client built without __init__.
+    metrics: BotMetrics | None = None
 
     """Maintains a live state model and exposes typed game actions."""
 
@@ -247,6 +269,9 @@ class AtrinikClient:
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
         self.trends = Trends()
         self._trends_character = ""
+        # What she does, for the dashboard's Prometheus endpoint.
+        self.metrics = BotMetrics(self)
+        self.add_handler(self.metrics.on_event)
         # When XP, position and the connection last changed, for alerts.
         self.progress_watch = ProgressWatch()
         self.action_context = ""
@@ -836,6 +861,8 @@ class AtrinikClient:
 
     def record_action(self, action: str, detail: str = "") -> None:
         """Keep a bounded, map-aware history of orders sent by automation."""
+        if self.metrics is not None:
+            self.metrics.action(action, detail)
         m = self.state.map
         record = {
             "time": time.time(), "action": action, "detail": detail,
@@ -920,6 +947,8 @@ class AtrinikClient:
             _after(self.decision_history, self._life_marks.get("decisions")),
             since=previous, name=self.state.player_name or self.config.character,
             recorded=time.time()))
+        if self.metrics is not None and self.post_mortems[-1] is not None:
+            self.metrics.death(self.post_mortems[-1].get("cause"))
         self._post_mortem_booked = time.time()
         # The next life starts here: its messages afresh, its vitals from the
         # latest sample (the state it starts in), its records after these.
@@ -1625,6 +1654,8 @@ class AtrinikClient:
     def _log_chat(self, msg_type: int, direction: str, sender: str,
                   text: str) -> None:
         """Keep a chat line in the durable chat log; never fail the bot."""
+        if self.metrics is not None:
+            self.metrics.chat(msg_type, direction)
         character = self.state.player_name or self.config.character
         if not character:
             return
@@ -2407,6 +2438,8 @@ class AtrinikClient:
 
     async def fire(self, direction: int, item_tag: int = 0) -> None:
         item = self.state.items.get(item_tag)
+        if self.metrics is not None:
+            self.metrics.fire(item)
         self.record_action("fire",
                            f"{item.name if item else item_tag or 'readied item'} direction={direction}")
         # The tag is required even when firing the readied item (tag zero).
@@ -2414,6 +2447,8 @@ class AtrinikClient:
 
     async def apply(self, tag: int, apply_action: int = 0) -> None:
         item = self.state.items.get(tag)
+        if self.metrics is not None:
+            self.metrics.apply(item)
         self.record_action("apply", item.name if item else str(tag or "below"))
         packet = Packet(c.S_ITEM_APPLY).u32(max(0, tag))
         if tag <= 0:
@@ -2425,6 +2460,8 @@ class AtrinikClient:
 
     async def move_item(self, destination: int, tag: int, quantity: int = 0) -> None:
         item = self.state.items.get(tag)
+        if self.metrics is not None:
+            self.metrics.item_moved(item, destination)
         self.record_action("move item",
                            f"{item.name if item else tag} x{quantity or 'all'} -> {destination}")
         await self.send(Packet(c.S_ITEM_MOVE).u32(destination).u32(tag).u32(quantity))
@@ -2481,6 +2518,8 @@ class AtrinikClient:
 
     async def execute_client_command(self, command: str) -> None:
         """Execute commands that the graphical client normally intercepts."""
+        if self.metrics is not None:
+            self.metrics.command(command)
         match = re.fullmatch(r'/talk\s+1\s+(.+)', command, re.S)
         if match:
             await self.talk(match.group(1))
