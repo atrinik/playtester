@@ -1501,6 +1501,9 @@ class FarmTask(BotTask):
         self._emergency_recall_apply_at = 0.0
         self._emergency_recall_cast_at = 0.0
         self._emergency_recall_origin = ""
+        # The decision a fired recall is recorded as: "emergency-recall"
+        # marks a failure at the spot, a route-failure recall does not.
+        self._emergency_recall_action = "emergency-recall"
         # A recall wand fired (tag, wall-clock time), to catch "says poof";
         # a recall wand examined for its charges, and those examined once.
         self._recall_wand_fired: tuple[int, float] | None = None
@@ -4409,13 +4412,18 @@ class FarmTask(BotTask):
     async def emergency_recall(self, client: AtrinikClient, *, ratio: float,
                                nearby_count: int,
                                hostile_contact: bool,
-                               healing_outpaced: bool = False) -> bool:
+                               healing_outpaced: bool = False,
+                               force: bool = False,
+                               action: str = "emergency-recall") -> bool:
         """Start Word of Recall during a likely-fatal retreat.
 
         The server's recall force keeps building while the player moves and
         takes damage, so subsequent ticks continue normal retreat instead of
         standing still. This method returns true only while readying/firing a
         device consumes the current action tick.
+
+        ``force`` recalls whatever her health (a route that keeps failing);
+        the cast is then recorded as ``action`` instead of an emergency.
         """
         now = time.monotonic()
         if self._recall_wand_fired is not None:
@@ -4453,13 +4461,13 @@ class FarmTask(BotTask):
                 self._emergency_recall_origin = client.state.map.path
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
-                    recorder("emergency-recall", f"via {source.name}")
+                    recorder(self._emergency_recall_action, f"via {source.name}")
                 return True
             if now - self._emergency_recall_apply_at <= 3.0:
                 return True
             self._emergency_recall_apply_at = 0.0
             self._emergency_recall_source = 0
-        if not hostile_contact:
+        if not hostile_contact and not force:
             return False
         healing_costs = [
             int(item.extra.get("cost", 0) or 0)
@@ -4479,13 +4487,14 @@ class FarmTask(BotTask):
             healing_exhausted and ratio <= self.safety.flee_below or
             healing_outpaced and ratio <= self.safety.heal_below
         )
-        if not critical:
+        if not critical and not force:
             return False
         candidates = self.emergency_recall_candidates(client)
         if not candidates:
             return False
         source = candidates[0]
         self._emergency_recall_source = source.tag
+        self._emergency_recall_action = action
         await client.clear_actions()
         await client.set_combat(False)
         if source.item_type in (c.TYPE_ROD, c.TYPE_WAND):
@@ -4501,7 +4510,7 @@ class FarmTask(BotTask):
         self._emergency_recall_origin = client.state.map.path
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
-            recorder("emergency-recall", f"via {source.name}")
+            recorder(action, f"via {source.name}")
         return True
 
     async def check_recall_wand(self, client: AtrinikClient) -> None:
