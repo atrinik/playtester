@@ -1603,7 +1603,11 @@ class NavigateTask(BotTask):
     # Live, a permanent one closed the Old Outpost's only stairs back to the
     # surface, and every replan to the Underground City failed for half an
     # hour while she fought grey golems.
+    # Each repeat of the same exclusion within the trip doubles it, up to
+    # the cap: a detour that keeps leading back to a held exit settles
+    # instead of ping-ponging every 75 s.
     EDGE_EXCLUSION_SECONDS = 75.0
+    EDGE_EXCLUSION_MAX_SECONDS = 300.0
 
     @property
     def _excluded_edges(self) -> set[tuple]:
@@ -1617,11 +1621,15 @@ class NavigateTask(BotTask):
 
     def _exclude_edge(self, edge: MapEdge) -> None:
         """Exclude one exit (other stairs between the maps stay open) or a
-        whole tile seam, for EDGE_EXCLUSION_SECONDS."""
+        whole tile seam: EDGE_EXCLUSION_SECONDS, doubled on each repeat of
+        the same key, up to EDGE_EXCLUSION_MAX_SECONDS."""
         key = ((edge.source, edge.destination, edge.x, edge.y)
                if edge.kind == "exit" else (edge.source, edge.destination))
-        self._edge_exclusions[key] = (
-            time.monotonic() + self.EDGE_EXCLUSION_SECONDS)
+        strikes = self._edge_exclusion_strikes.get(key, 0)
+        self._edge_exclusion_strikes[key] = strikes + 1
+        seconds = min(self.EDGE_EXCLUSION_MAX_SECONDS,
+                      self.EDGE_EXCLUSION_SECONDS * 2 ** min(strikes, 8))
+        self._edge_exclusions[key] = time.monotonic() + seconds
 
     def __init__(self, graph: WorldGraph, destination: str,
                  destination_xy: tuple[int, int] | None = None,
@@ -1644,6 +1652,8 @@ class NavigateTask(BotTask):
         # Runtime edge exclusions and when each expires (time.monotonic());
         # see _exclude_edge.
         self._edge_exclusions: dict[tuple, float] = {}
+        # How often each key was excluded on this trip (see _exclude_edge).
+        self._edge_exclusion_strikes: dict[tuple, int] = {}
         self._runtime_blocked: set[tuple[int, int]] = set()
         # When the current local route first disappeared (0.0 while one exists).
         # Separate from _last_progress, which approach-candidate rotation resets.
@@ -4613,11 +4623,6 @@ class FarmCircuitTask(BotTask):
         self._cure_apply_at = 0.0
         self._disease_message_index = 0
         self._disease_suspected = False
-        # Kills worth no experience on the spot (see _observe_zero_xp_kills).
-        self._zero_xp_message_index: int | None = None
-        self._zero_xp_kills: list[float] = []
-        self._zero_xp_exp = 0
-        self._zero_xp_child: NavigateThenTask | None = None
         self._restoration: NavigateThenTask | None = None
         self._restoration_retry_at = 0.0
         self._expedition_origin: tuple[str, int, int] | None = None
@@ -4968,79 +4973,6 @@ class FarmCircuitTask(BotTask):
                      f"{spot.get('name', '?')} ({objective}): "
                      + ", ".join(path for path, _ in self.legs))
         return True
-
-    # The server's line for a kill below her skill's green level
-    # (attack.c; exp.c calc_level_difference returns 0).
-    ZERO_XP_MESSAGE = "wasn't worth any experience"
-    # This many such kills on the farmed leg's map, with no experience
-    # gained in between, within the window: the spot is wrong for her.
-    ZERO_XP_KILLS = 3
-    ZERO_XP_WINDOW_SECONDS = 300.0
-
-    def _observe_zero_xp_kills(self, client: AtrinikClient) -> bool:
-        """Count kills worth no experience on the spot; True once it is wrong.
-
-        Only analyzer picks are judged, and only kills on the map of the leg
-        she is farming count: a leg map she passes through on the way to
-        another is transit. Experience gained in between, a new farm child
-        (another leg, another spot, a rebuild after a death) or the window's
-        end starts the count again.
-        """
-        state = client.state
-        if self._zero_xp_message_index is None:
-            self._zero_xp_message_index = state.message_count
-        entries = state.messages_since(self._zero_xp_message_index)
-        self._zero_xp_message_index = state.message_count
-        if (self.child is not self._zero_xp_child or
-                self._current_exp > self._zero_xp_exp):
-            self._zero_xp_kills.clear()
-        self._zero_xp_child = self.child
-        self._zero_xp_exp = self._current_exp
-        if (not self.analyzer_driven or self.child is None or
-                state.map.path != self.child.navigation.destination):
-            return False
-        now = time.time()
-        self._zero_xp_kills[:] = [
-            stamp for stamp in self._zero_xp_kills
-            if now - stamp <= self.ZERO_XP_WINDOW_SECONDS]
-        self._zero_xp_kills.extend(
-            float(entry[0]) for entry in entries
-            if len(entry) > 3 and
-            self.ZERO_XP_MESSAGE in str(entry[3]).casefold())
-        if len(self._zero_xp_kills) < self.ZERO_XP_KILLS:
-            return False
-        count = len(self._zero_xp_kills)
-        self._zero_xp_kills.clear()
-        self._learn_zero_xp_spot(client, state.map.path, count)
-        return True
-
-    def _learn_zero_xp_spot(self, client: AtrinikClient, path: str,
-                            kills: int) -> None:
-        """Record a zero-xp review for the spot and skip it for a while."""
-        key = self._spot_key()
-        review = self_improvement.FailureReview(
-            time=time.time(), kind="zero-xp", map=path,
-            cause=self_improvement.ZERO_XP,
-            detail=f"{kills} kills on {path} worth no experience")
-        adaptations = getattr(client.state, "farm_adaptations", {}) or {}
-        kit = current_combat_kit(client)
-        record, _pause = self_improvement.learn(
-            adaptations.get(key, {}), review,
-            kit=kit.describe() if kit is not None else None)
-        setter = getattr(client, "set_farm_adaptation", None)
-        if setter is not None:
-            setter(key, record)
-        else:
-            adaptations[key] = record
-        self._adaptations = getattr(client.state, "farm_adaptations", {}) or {}
-        recorder = getattr(client, "record_action", None)
-        if recorder is not None:
-            recorder("farm-failure-review",
-                     f"zero-xp at {(self.spot or {}).get('name', key)}: "
-                     f"{review.cause} ({review.detail}); improve: "
-                     + ", ".join(self_improvement.remedies(review)))
-        self._quarantine_farm_path(
-            client, path, f"{kills} kills worth no experience")
 
     async def _recover_failed_navigation(
             self, client: AtrinikClient, farm: FarmTask) -> bool:
@@ -6554,11 +6486,6 @@ class FarmCircuitTask(BotTask):
             self.complete()
             return
         self._observe_disease(client)
-        if self._observe_zero_xp_kills(client):
-            farm = self.child.task if self.child is not None else None
-            if isinstance(farm, FarmTask) and self._upgrade_progression(
-                    client, farm):
-                return
         if await self.server_clock.sync(client):
             return
         assert self.child is not None

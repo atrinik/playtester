@@ -10,9 +10,7 @@ excluding it:
 * ``damage-type``: one non-physical damage type did most of the damage;
 * ``starvation``: she starved to death (no food);
 * ``route``: the failure happened on the way to the spot, not on it;
-* ``out-damaged``: a single creature out-damaged the character;
-* ``zero-xp``: kills on the spot were worth no experience to her, so the
-  spot is below her level (not a combat failure: no margin changes).
+* ``out-damaged``: a single creature out-damaged the character.
 
 Each failure raises that spot's adaptation level, which tightens the recovery
 margins used there. It also records longer-term goals that equipment and spell
@@ -47,8 +45,6 @@ KEEP_REVIEWS = 10
 KIT_HAZARD_FAILURES = 3
 KIT_HAZARD_WINDOW_SECONDS = 24 * 3600.0
 KIT_HAZARD_CAUSES = frozenset({"pack", "out-damaged"})
-# Kills worth no experience: the spot is wrong for her, not too hard.
-ZERO_XP = "zero-xp"
 
 # Bounded digits: a server line with an oversized amount never reaches
 # int()'s digit limit; it is not a hit we count.
@@ -212,8 +208,6 @@ def remedies(review: FailureReview) -> tuple[str, ...]:
         return ("better weapon and armour",)
     if review.cause == "starvation":
         return ("keep food stocked",)
-    if review.cause == ZERO_XP:
-        return ("a spot with monsters at her level",)
     return ("cautious route",)
 
 
@@ -227,14 +221,11 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
     now = time.time() if now is None else now
     record = dict(record or {})
     level = int(record.get("level", 0) or 0)
-    # A zero-xp review is no combat failure: margins, the pause and the kit
-    # hazard are left alone.
-    combat = review.cause != ZERO_XP
     # Only failures that happen with every tactic already at its maximum count
     # toward the last-resort pause; failures on the way up do not.
     failures = [stamp for stamp in record.get("failures", ())
                 if now - float(stamp) <= PAUSE_WINDOW_SECONDS]
-    if combat and level >= MAX_LEVEL:
+    if level >= MAX_LEVEL:
         failures.append(review.time)
     causes = dict(record.get("causes", {}))
     causes[review.cause] = int(causes.get(review.cause, 0)) + 1
@@ -242,16 +233,14 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
     entry = review.summary()
     entry["remedies"] = list(remedies(review))
     reviews.append(entry)
-    pause = combat and level >= MAX_LEVEL and len(failures) >= PAUSE_FAILURES
+    pause = level >= MAX_LEVEL and len(failures) >= PAUSE_FAILURES
     kit_failures = [entry for entry in record.get("kit_failures", ())
                     if isinstance(entry, dict) and
                     now - float(entry.get("time", 0.0) or 0.0) <=
                     KIT_HAZARD_WINDOW_SECONDS]
-    if combat:
-        kit_failures.append({"time": review.time, "cause": review.cause,
-                             "kit": dict(kit or {})})
-    record.update(level=min(MAX_LEVEL, level + combat),
-                  failures=failures[-PAUSE_FAILURES:],
+    kit_failures.append({"time": review.time, "cause": review.cause,
+                         "kit": dict(kit or {})})
+    record.update(level=min(MAX_LEVEL, level + 1), failures=failures[-PAUSE_FAILURES:],
                   causes=causes, reviews=reviews, updated_at=now,
                   kit_failures=kit_failures[-KEEP_REVIEWS:])
     return record, pause

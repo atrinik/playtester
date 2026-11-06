@@ -17450,13 +17450,12 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
 
 
 class RouteFailureTests(unittest.TestCase):
-    """Expiring route exclusions and the on-spot zero-XP guard."""
+    """Expiring, per-exit route exclusions."""
 
     OUTPOST = "/shattered_islands/strakewood_island/old_outpost/old_outpost_0101"
     UNDERGROUND = ("/shattered_islands/strakewood_island/underground_city/"
                    "underground_city_0_3")
     SURFACE = "/shattered_islands/world_5_57"
-    GREY_KILL = "Your enemy wasn't worth any experience to you."
 
     def test_an_excluded_exit_expires_and_other_stairs_stay_open(self):
         # Live: a pack on the Old Outpost stairs got them excluded for the
@@ -17515,75 +17514,47 @@ class RouteFailureTests(unittest.TestCase):
         self.assertEqual(every.route[-1].destination, self.UNDERGROUND)
         self.assertEqual(every._excluded_edges, set())
 
-    def test_zero_xp_kills_on_the_spot_reset_with_the_farm_child(self):
-        from . import self_improvement
-
-        trees_path = AnalyzerFarmSelectionTests.TREES
-        pocket_path = AnalyzerFarmSelectionTests.POCKET
-        # A two-leg circuit: she farms Trees (leg 1); Pocket is leg 2.
-        trees = analyzer_spot("Trees", [trees_path, pocket_path],
-                              ["evil treant L13"])
-        upper = analyzer_spot(
-            "Upper", [AnalyzerFarmSelectionTests.UPPER], ["evil treant L13"])
+    def test_a_repeatedly_excluded_exit_stays_excluded_longer(self):
+        # A held exit with another way round: each time the route comes back
+        # to it and the click finds no path, it is excluded for longer, so a
+        # detour cannot ping-pong back to it every EDGE_EXCLUSION_SECONDS.
+        graph = WorldGraph()
+        for path in ("/a", "/b"):
+            node = MapNode(path, width=10, height=10)
+            node.terrain = {(x, y): 1 for x in range(10) for y in range(10)}
+            graph.nodes[path] = node
+        held = MapEdge("/a", "/b", 8, 5, kind="exit", label="stairs")
+        other = MapEdge("/a", "/b", 1, 5, kind="exit", label="stairs")
+        graph.nodes["/a"].edges = [held, other]
         client = AtrinikClient(ClientConfig())
         client.state.phase = "playing"
-        client.state.stats.update({"level": 22, "exp": 1000, "hp": 100, "maxhp": 100})
-        client.farm_analyzer = StubAnalyzer({"xp": [trees, upper]})
+        client.state.map.path = "/a"
+        client.state.map.world_x, client.state.map.world_y = 6, 5
 
-        def circuit_for(spot, analyzer_driven=True):
-            from .navigation import analyzer_spot_legs
+        async def send(_packet):
+            return None
 
-            circuit = FarmCircuitTask(
-                built_graph(), list(analyzer_spot_legs(spot, built_graph())),
-                analyzer_driven=analyzer_driven, spot=spot)
-            circuit.child = circuit._new_child()
-            circuit.status = TaskStatus.RUNNING
-
-            async def stop_after_observing(_client):
-                return True
-
-            # The tick returns right after its zero-XP observation.
-            circuit.server_clock.sync = stop_after_observing
-            return circuit
-
-        def kill(circuit, count):
-            for _ in range(count):
-                client.state.add_message(0, "ffffff", self.GREY_KILL)
-            asyncio.run(circuit.tick(client))
-
-        circuit = circuit_for(trees)
-        self.assertEqual(circuit.child.navigation.destination, trees_path)
-        # Passing over the other leg's map is transit: those kills never count.
-        client.state.map.path = pocket_path
-        kill(circuit, 0)
-        kill(circuit, circuit.ZERO_XP_KILLS + 1)
-        self.assertEqual(client.state.farm_zone_quarantine, {})
-        client.state.map.path = trees_path
-        kill(circuit, circuit.ZERO_XP_KILLS - 1)
-        # Rebuilt farm child (a death review, another leg or spot): anew.
-        circuit.child = circuit._new_child()
-        kill(circuit, 1)
-        self.assertNotIn(trees_path, client.state.farm_zone_quarantine)
-        # Experience gained in between: anew.
-        client.state.stats["exp"] += 100
-        kill(circuit, circuit.ZERO_XP_KILLS - 1)
-        self.assertNotIn(trees_path, client.state.farm_zone_quarantine)
-        kill(circuit, circuit.ZERO_XP_KILLS - 1)
-        self.assertIn(trees_path, client.state.farm_zone_quarantine)
-        record = client.state.farm_adaptations[trees["path"]]
-        self.assertEqual(record["causes"], {self_improvement.ZERO_XP: 1})
-        # Not a combat failure: margins, the pause and kit hazards stay.
-        self.assertEqual(record["level"], 0)
-        self.assertEqual(record["kit_failures"], [])
-        self.assertEqual(circuit.spot["name"], "Upper")
-        # Only analyzer picks are judged.
-        client.state.farm_zone_quarantine.clear()
-        client.state.farm_adaptations.clear()
-        explicit = circuit_for(trees, analyzer_driven=False)
-        kill(explicit, 0)
-        kill(explicit, explicit.ZERO_XP_KILLS + 1)
-        self.assertEqual(client.state.farm_zone_quarantine, {})
-        self.assertEqual(client.state.farm_adaptations, {})
+        client.send = send
+        navigation = NavigateTask(graph, "/b")
+        # A pack rings the held stairs: no local path reaches them.
+        navigation._threat_blocked = {
+            (x, y) for x in range(7, 10) for y in range(4, 7)} - {(8, 5)}
+        key = ("/a", "/b", 8, 5)
+        lasted = []
+        at = 1000.0
+        for _ in range(4):
+            navigation.status, navigation.route = TaskStatus.RUNNING, []
+            with patch("atrinik_bot.navigation.time.monotonic", return_value=at):
+                asyncio.run(navigation.tick(client))
+            lasted.append(navigation._edge_exclusions[key] - at)
+            # The other stairs are taken meanwhile.
+            self.assertEqual((navigation.route[0].x, navigation.route[0].y),
+                             (1, 5))
+            at = navigation._edge_exclusions[key] + 1.0
+        base = NavigateTask.EDGE_EXCLUSION_SECONDS
+        self.assertEqual(lasted, [base, 2 * base, 4 * base,
+                                  NavigateTask.EDGE_EXCLUSION_MAX_SECONDS])
+        self.assertLessEqual(NavigateTask.EDGE_EXCLUSION_MAX_SECONDS, 300.0)
 
 
 class SelfImprovementTests(unittest.TestCase):
