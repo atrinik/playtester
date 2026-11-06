@@ -46,9 +46,10 @@ server source archive `atrinik-classic-server-5.99.0.tar.gz`
 commit `adcab31088a7ce02555d7a6f4f862034a982abbb`). That source is cached data:
 the analyzer reads it, and at runtime the dashboard also reads its `new_levels`
 experience table from `src/server/exp.c` in the cached bundle as text, to show
-progress to the next level. Nothing from it is compiled, linked, executed, or
-distributed by this repository. The dashboard's in-repository fallback, used
-only when that file cannot be read, stays at levels 0-30 (31 entries).
+progress to the next level. Apart from the dashboard's in-repository fallback,
+the first 31 entries of that table (levels 0-30), used only when the file cannot
+be read, nothing from it is compiled, linked, executed, or distributed by this
+repository.
 
 Release artifacts must record their exact resolved dependency graph and retain
 all required license texts and notices. No linked GPL binary should be
