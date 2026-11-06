@@ -12765,7 +12765,7 @@ class QuestTests(unittest.TestCase):
         # Each ring is offered once and the chest is not asked again while
         # the server may still be answering.
         self.assertEqual(client.moves, [(90, 81), (90, 82)])
-        self.assertIn(task.status, (TaskStatus.READY, TaskStatus.RUNNING))
+        self.assertEqual(task.status, TaskStatus.RUNNING)
         # Still carried past the confirmation window, the rings were refused:
         # sellable stock still comes out, then the visit ends.
         for tag in task._sent:
