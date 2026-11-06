@@ -4519,6 +4519,7 @@ class FarmCircuitTask(BotTask):
                  analyzer_driven: bool = False,
                  spot: dict | None = None,
                  backoffs: dict[str, float] | None = None,
+                 avoid_priests: Callable[[], Iterable[str]] = tuple,
                  clock: Callable[[], float] = time.monotonic):
         if not legs:
             raise ValueError("a farm circuit needs at least one leg")
@@ -4625,6 +4626,8 @@ class FarmCircuitTask(BotTask):
         # whichever circuit saw them; a persisted ledger replay is not new.
         self._failure_epoch = time.time()
         self._tier_progress_exp = 0
+        # Priests to pass over for temple food (autoplay's failed trips).
+        self.avoid_priests = avoid_priests
         # A rebuilt circuit starts with fresh service tasks but keeps the
         # backoffs of the circuit it replaces (see backoffs()).
         for name, until in (backoffs or {}).items():
@@ -4634,8 +4637,10 @@ class FarmCircuitTask(BotTask):
     # Maintenance retry deadlines (on ``clock``) a replacement circuit
     # inherits. Live: autoplay rebuilt the circuit after every temple food
     # trip, and each new one walked straight back to a full apartment chest.
+    # Food deadlines are left out: a fresh circuit feeds her as soon as she
+    # is hungry, rather than farming hungry while an old backoff runs out.
     BACKOFF_ATTRIBUTES = (
-        "_resupply_retry_at", "_temple_food_retry_at", "_storage_retry_at",
+        "_storage_retry_at",
         "_identification_retry_at", "_bed_retry_at", "_selling_retry_at",
         "_cure_funding_retry_at", "_banking_retry_at", "_bank_sync_retry_at",
         "_shopping_retry_at", "_recall_shopping_retry_at",
@@ -5333,7 +5338,8 @@ class FarmCircuitTask(BotTask):
             self._resupply = None
 
     def _new_temple_food(self, client: AtrinikClient) -> NavigateThenTask | None:
-        return temple_food_trip(self.graph, client)
+        return temple_food_trip(self.graph, client,
+                                exclude=tuple(self.avoid_priests()))
 
     def _food_resupply_quantity(
             self, client: AtrinikClient, profile: FoodProfile) -> int:

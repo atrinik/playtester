@@ -97,7 +97,7 @@ class AutoplayTask(BotTask):
             name: until for name, until in self._failed_priests.items()
             if until > now}
         trip = temple_food_trip(self.graph, client,
-                                exclude=tuple(self._failed_priests))
+                                exclude=self._avoided_priests())
         if trip is None:
             self._temple_food_retry_at = (
                 now + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
@@ -119,6 +119,12 @@ class AutoplayTask(BotTask):
                      f"paused {paused}")
         return True
 
+    def _avoided_priests(self) -> tuple[str, ...]:
+        """Priests whose food trip failed recently; farm circuits skip them too."""
+        now = time.monotonic()
+        return tuple(name for name, until in self._failed_priests.items()
+                     if until > now)
+
     async def _temple_food_failed(self, client: AtrinikClient) -> bool:
         """Settle a failed temple food trip; True when another one started.
 
@@ -126,8 +132,10 @@ class AutoplayTask(BotTask):
         nearest other priest reachable from where she now stands is tried at
         once: live, Sera retried an unreachable Talrain every cycle while
         Friar Marcus, who fed her each time, was a few maps away. Otherwise
-        the usual retry wait applies, and farming (which feeds her itself
-        from a priest or a shop) resumes meanwhile.
+        it takes the ordinary child-failure path: after that short backoff a
+        fresh farm circuit is built, which feeds her itself (from a priest
+        not passed over, or a shop), and autoplay's own temple trips wait
+        the usual retry time.
         """
         assert self.child is not None
         failed = f"{self.phase}: {self.child.name}: {self.child.error}"
@@ -399,4 +407,5 @@ class AutoplayTask(BotTask):
             FarmCircuitTask(
                 self.graph, list(legs), level_until=self.target_level,
                 analyzer_driven=True, spot=spot,
-                backoffs=self._circuit_backoffs))
+                backoffs=self._circuit_backoffs,
+                avoid_priests=self._avoided_priests))

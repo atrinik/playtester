@@ -11791,6 +11791,12 @@ class QuestTests(unittest.TestCase):
         # Its trip to a full chest failed: the chest is left alone for hours.
         full = f"{DepositItemsTask.STORAGE_FULL}: 1 item(s) not stored"
         first._storage_retry_at = first.clock() + first.failure_backoff(full, 1800.0)
+        # Food backoffs are not inherited: a fresh circuit feeds her as soon
+        # as she is hungry.
+        first._temple_food_retry_at = first.clock() + 600.0
+        first._resupply_retry_at = first.clock() + 1800.0
+        # Autoplay's temple trip to Talrain just failed.
+        autoplay._failed_priests["Talrain"] = time.monotonic() + 3600.0
         autoplay.phase, autoplay.child = "adaptive-farming", first
 
         async def hold(*_):
@@ -11816,6 +11822,18 @@ class QuestTests(unittest.TestCase):
         self.assertTrue(FarmCircuitTask(
             built_graph(), [("/shattered_islands/world_14_79", "evil treant")]
         )._needs_apartment_storage(client))
+        self.assertEqual((rebuilt._temple_food_retry_at, rebuilt._resupply_retry_at),
+                         (0.0, 0.0))
+        # Its own temple food passes over the priest autoplay just failed.
+        from . import navigation as navigation_module
+        asked = []
+
+        def trip(graph, client, exclude=()):
+            asked.append(tuple(exclude))
+
+        with patch.object(navigation_module, "temple_food_trip", trip):
+            rebuilt._new_temple_food(client)
+        self.assertEqual(asked, [("Talrain",)])
 
     def test_autoplay_recovers_started_mana_crystal_from_apartment(self):
         client = self._combat_client()
@@ -12695,9 +12713,17 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.moves, [(7, 91)])
         self.assertEqual(task.status, TaskStatus.RUNNING)
 
+    # The live rendering of the server's "That won't fit in the %s!"
+    # (types/player.c) for Sera's open apartment chest.
+    WONT_FIT_LIVE = "That won't fit in the spruce chest (open) (active)!"
+
     @staticmethod
-    def _refusing_chest_client(answer):
-        """An open spruce chest that refuses every deposit with ``answer``."""
+    def _refusing_chest_client(answer, *, accept=(), earlier=""):
+        """An open spruce chest that refuses deposits with ``answer``.
+
+        Tags in ``accept`` go in silently; ``earlier`` is a message already
+        on screen before the deposit starts.
+        """
         class FakeClient:
             def __init__(self):
                 self.state = GameState(phase="playing", player_tag=7)
@@ -12711,12 +12737,14 @@ class QuestTests(unittest.TestCase):
                     self.state.place_item(Item(
                         tag, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
                         quality=90, condition=100, name=f"ring {tag}"), 7)
+                if earlier:
+                    self.state.add_message(0, "ffffff", earlier)
                 self.moves = []
 
             async def move_item(self, destination, tag, quantity=0):
                 self.moves.append((destination, tag))
-                if destination == 7:
-                    self.state.place_item(self.state.items[tag], 7)
+                if destination == 7 or tag in accept:
+                    self.state.place_item(self.state.items[tag], destination)
                 elif answer:
                     self.state.add_message(0, "ffffff", answer)
 
@@ -12737,7 +12765,7 @@ class QuestTests(unittest.TestCase):
         # Each ring is offered once and the chest is not asked again while
         # the server may still be answering.
         self.assertEqual(client.moves, [(90, 81), (90, 82)])
-        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertIn(task.status, (TaskStatus.READY, TaskStatus.RUNNING))
         # Still carried past the confirmation window, the rings were refused:
         # sellable stock still comes out, then the visit ends.
         for tag in task._sent:
@@ -12745,21 +12773,23 @@ class QuestTests(unittest.TestCase):
         for _ in range(5):
             asyncio.run(task.tick(client))
         self.assertEqual(client.moves, [(90, 81), (90, 82), (7, 91)])
-        self.assertEqual((task.status, task.refused), (TaskStatus.FAILED, 2))
+        self.assertEqual(task.status, TaskStatus.FAILED)
         return task
 
     def test_deposit_into_a_full_chest_offers_each_item_once_then_fails(self):
         # Live: a full spruce chest answered "That won't fit" four times a
         # second for twenty minutes while the same items were offered again.
-        # The server's words (types/player.c: "That won't fit in the %s!").
         task = self._deposit_until_refused(
-            self._refusing_chest_client("That won't fit in the spruce chest!"))
-        self.assertTrue(task.full)
+            self._refusing_chest_client(self.WONT_FIT_LIVE))
+        self.assertEqual((task.full, task.refused), (True, 2))
         self.assertTrue(task.error.startswith(DepositItemsTask.STORAGE_FULL))
         # The farm circuit then leaves the chest alone for hours, not the
         # usual half hour.
         self.assertEqual(FarmCircuitTask.failure_backoff(task.error, 1800.0),
                          FarmCircuitTask.STORAGE_FULL_RETRY_SECONDS)
+        # It is the server's answer that says full, not the silence.
+        silent = self._deposit_until_refused(self._refusing_chest_client(""))
+        self.assertFalse(silent.error.startswith(DepositItemsTask.STORAGE_FULL))
 
     def test_deposit_refused_for_another_reason_is_an_ordinary_failure(self):
         # A chest no longer active refuses too, but it is not full: the
@@ -12775,6 +12805,21 @@ class QuestTests(unittest.TestCase):
         task = self._deposit_until_refused(
             self._refusing_chest_client("That won't fit in the quiver!"))
         self.assertFalse(task.full)
+
+    def test_deposit_with_room_for_some_items_is_not_full(self):
+        # The server says "won't fit" for any one item heavier than the room
+        # left. Another item went in, so the chest is not full.
+        task = self._deposit_until_refused(
+            self._refusing_chest_client(self.WONT_FIT_LIVE, accept={81}))
+        self.assertEqual((task.full, task.refused), (True, 1))
+        self.assertTrue(task.error.startswith(DepositItemsTask.STORAGE_REFUSED))
+        self.assertEqual(FarmCircuitTask.failure_backoff(task.error, 1800.0), 1800.0)
+
+    def test_deposit_ignores_won_t_fit_from_before_it_started(self):
+        task = self._deposit_until_refused(
+            self._refusing_chest_client("", earlier=self.WONT_FIT_LIVE))
+        self.assertFalse(task.full)
+        self.assertTrue(task.error.startswith(DepositItemsTask.STORAGE_REFUSED))
 
     def test_deposit_completes_once_every_item_is_accepted(self):
         class FakeClient:

@@ -6687,8 +6687,9 @@ class DepositItemsTask(BotTask):
         # Everything still carried was offered and refused. Live: a full
         # spruce chest refused the same items four times a second for
         # twenty minutes, until hunger pulled her away. Only the server's
-        # "won't fit" means full; any other refusal (a chest no longer
-        # active, say) is an ordinary failure.
+        # "won't fit" with nothing accepted this visit means full: one item
+        # too heavy for the room left, or any other refusal (a chest no
+        # longer active, say), is an ordinary failure.
         self.refused = len(items)
         follow = self.then_retrieve
         if follow is not None and follow.status not in (
@@ -6700,7 +6701,10 @@ class DepositItemsTask(BotTask):
         if follow is not None and follow.status == TaskStatus.FAILED:
             self.fail(follow.error)
         elif self.refused:
-            reason = self.STORAGE_FULL if self.full else self.STORAGE_REFUSED
+            carried = {item.tag for item in client.state.inventory}
+            accepted = any(tag not in carried for tag in self._sent)
+            reason = (self.STORAGE_FULL if self.full and not accepted
+                      else self.STORAGE_REFUSED)
             self.fail(f"{reason}: {self.refused} item(s) not stored")
         else:
             self.complete()
