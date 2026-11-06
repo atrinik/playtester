@@ -4518,6 +4518,7 @@ class FarmCircuitTask(BotTask):
                  clear_hostile_route: bool = False,
                  analyzer_driven: bool = False,
                  spot: dict | None = None,
+                 backoffs: dict[str, float] | None = None,
                  clock: Callable[[], float] = time.monotonic):
         if not legs:
             raise ValueError("a farm circuit needs at least one leg")
@@ -4624,6 +4625,29 @@ class FarmCircuitTask(BotTask):
         # whichever circuit saw them; a persisted ledger replay is not new.
         self._failure_epoch = time.time()
         self._tier_progress_exp = 0
+        # A rebuilt circuit starts with fresh service tasks but keeps the
+        # backoffs of the circuit it replaces (see backoffs()).
+        for name, until in (backoffs or {}).items():
+            if name in self.BACKOFF_ATTRIBUTES:
+                setattr(self, name, max(getattr(self, name), float(until)))
+
+    # Maintenance retry deadlines (on ``clock``) a replacement circuit
+    # inherits. Live: autoplay rebuilt the circuit after every temple food
+    # trip, and each new one walked straight back to a full apartment chest.
+    BACKOFF_ATTRIBUTES = (
+        "_resupply_retry_at", "_temple_food_retry_at", "_storage_retry_at",
+        "_identification_retry_at", "_bed_retry_at", "_selling_retry_at",
+        "_cure_funding_retry_at", "_banking_retry_at", "_bank_sync_retry_at",
+        "_shopping_retry_at", "_recall_shopping_retry_at",
+        "_utility_shopping_retry_at", "_ship_key_retry_at", "_spell_retry_at",
+        "_cure_retry_at", "_restoration_retry_at",
+    )
+
+    def backoffs(self) -> dict[str, float]:
+        """The maintenance retry deadlines still pending, for a successor."""
+        now = self.clock()
+        return {name: getattr(self, name) for name in self.BACKOFF_ATTRIBUTES
+                if getattr(self, name) > now}
 
     def _observe_farm_death(self, client: AtrinikClient) -> bool:
         """Quarantine an analyzer pick after a death or an emergency recall."""

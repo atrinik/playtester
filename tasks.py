@@ -6608,11 +6608,13 @@ class MassIdentifyTask(BotTask):
 class DepositItemsTask(BotTask):
     """Deposit matching items in an already visible/open house container."""
 
-    # A move the server neither carried out nor answered within this long
-    # was refused. Each item is offered once: a full container answers
-    # "That won't fit in the chest!" and keeps refusing it.
+    # A move the server has not carried out within this long was refused.
+    # Each item is offered once: a full container answers "That won't fit
+    # in the <container>!" (server types/player.c) and keeps refusing it.
     MOVE_CONFIRM_SECONDS = 5.0
     STORAGE_FULL = "storage container is full"
+    STORAGE_REFUSED = "storage container refused"
+    WONT_FIT = re.compile(r"\bthat won't fit in the (.+?)!", re.I)
 
     def __init__(self, container_name: str, patterns: tuple[str, ...] = (),
                  *, unidentified_only: bool = False,
@@ -6630,10 +6632,14 @@ class DepositItemsTask(BotTask):
         self._sent: dict[int, float] = {}
         # Items the container refused, once nothing else is left to offer.
         self.refused = 0
+        # Whether the server said this container has no room.
+        self.full = False
+        self._feedback_start = 0
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
+            self._feedback_start = client.state.message_count
         container = next((item for item in (*client.state.ground,
                                             *client.state.inventory)
                           if self.container_name in item.name.casefold()), None)
@@ -6644,6 +6650,11 @@ class DepositItemsTask(BotTask):
             await client.apply(container.tag)
             self._opened = True
             return
+        for entry in client.state.messages_since(self._feedback_start):
+            match = self.WONT_FIT.search(entry[3]) if len(entry) > 3 else None
+            if match and self.container_name in match.group(1).casefold():
+                self.full = True
+        self._feedback_start = client.state.message_count
         policy = InventoryPolicy()
         items = [
             item for item in client.state.inventory
@@ -6675,7 +6686,9 @@ class DepositItemsTask(BotTask):
             return
         # Everything still carried was offered and refused. Live: a full
         # spruce chest refused the same items four times a second for
-        # twenty minutes, until hunger pulled her away.
+        # twenty minutes, until hunger pulled her away. Only the server's
+        # "won't fit" means full; any other refusal (a chest no longer
+        # active, say) is an ordinary failure.
         self.refused = len(items)
         follow = self.then_retrieve
         if follow is not None and follow.status not in (
@@ -6687,7 +6700,8 @@ class DepositItemsTask(BotTask):
         if follow is not None and follow.status == TaskStatus.FAILED:
             self.fail(follow.error)
         elif self.refused:
-            self.fail(f"{self.STORAGE_FULL}: {self.refused} item(s) refused")
+            reason = self.STORAGE_FULL if self.full else self.STORAGE_REFUSED
+            self.fail(f"{reason}: {self.refused} item(s) not stored")
         else:
             self.complete()
 

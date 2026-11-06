@@ -53,11 +53,12 @@ class AutoplayTask(BotTask):
         self._temple_food_retry_at = 0.0
         # Priests whose food trip failed, until when they are passed over.
         self._failed_priests: dict[str, float] = {}
-        # The farm circuit a temple food trip interrupted. It resumes
-        # afterwards with its maintenance backoffs intact: a fresh circuit
-        # forgets them and starts the same errand again (live: the trip to a
-        # full apartment chest, every half hour for a day, and no farming).
-        self._paused_circuit: FarmCircuitTask | None = None
+        # Whether this hunger episode already tried a second priest.
+        self._hunger_fallback_used = False
+        # The farm circuit's pending maintenance backoffs. Each rebuilt
+        # circuit inherits them, so it does not restart an errand that just
+        # failed (live: the walk to a full apartment chest, every cycle).
+        self._circuit_backoffs: dict[str, float] = {}
         self.safety = SafetyPolicy()
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
@@ -89,6 +90,9 @@ class AutoplayTask(BotTask):
     async def _start_temple_food(self, client: AtrinikClient) -> bool:
         """Pause the current phase for the free temple food service."""
         now = time.monotonic()
+        if self.phase != "temple-food" or self.child is None:
+            # A new hunger episode, not the fallback after a failed trip.
+            self._hunger_fallback_used = False
         self._failed_priests = {
             name: until for name, until in self._failed_priests.items()
             if until > now}
@@ -100,9 +104,6 @@ class AutoplayTask(BotTask):
             log.warning("starving, but no temple priest is reachable")
             return False
         paused = f"{self.phase}: {self.child.name}" if self.child else "idle"
-        if (self.phase == "adaptive-farming" and
-                isinstance(self.child, FarmCircuitTask)):
-            self._paused_circuit = self.child
         if self.phase == "mana-crystal-recovery":
             # Interrupted before an outcome; it runs again once she has eaten.
             self._mana_recovery_attempted = False
@@ -119,14 +120,14 @@ class AutoplayTask(BotTask):
         return True
 
     async def _temple_food_failed(self, client: AtrinikClient) -> bool:
-        """Settle a failed temple food trip; True when it was handled.
+        """Settle a failed temple food trip; True when another one started.
 
-        That priest is passed over for a while, and the nearest other one
-        reachable from where she now stands is tried at once: live, Sera
-        retried an unreachable Talrain every cycle while Friar Marcus, who
-        fed her each time, was a few maps away. With none, the interrupted
-        farm circuit resumes and feeds her itself (a priest or the shop);
-        without one either, the caller's ordinary retry backoff applies.
+        That priest is passed over for a while. Once per hunger episode the
+        nearest other priest reachable from where she now stands is tried at
+        once: live, Sera retried an unreachable Talrain every cycle while
+        Friar Marcus, who fed her each time, was a few maps away. Otherwise
+        the usual retry wait applies, and farming (which feeds her itself
+        from a priest or a shop) resumes meanwhile.
         """
         assert self.child is not None
         failed = f"{self.phase}: {self.child.name}: {self.child.error}"
@@ -134,35 +135,19 @@ class AutoplayTask(BotTask):
         if priest:
             self._failed_priests[priest] = (
                 time.monotonic() + self.TEMPLE_PRIEST_RETRY)
-        if hungry(client) and await self._start_temple_food(client):
-            outcome = "another priest"
-        else:
-            self._temple_food_retry_at = (
-                time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
-            if self._paused_circuit is None:
-                return False
-            await client.clear_actions()
-            await client.set_combat(False)
-            await client.clear_target()
-            self.child = None
-            self._resume_paused_circuit(client)
-            outcome = "farm circuit resumed"
-        log.warning("autoplay temple food failed: %s; %s", failed, outcome)
-        recorder = getattr(client, "record_action", None)
-        if recorder is not None:
-            recorder("autoplay-retry", f"{failed}; {outcome}")
-        return True
-
-    def _resume_paused_circuit(self, client: AtrinikClient) -> bool:
-        """Hand control back to the farm circuit a food trip interrupted."""
-        circuit, self._paused_circuit = self._paused_circuit, None
-        if circuit is None or circuit.status != TaskStatus.RUNNING:
-            return False
-        self.phase, self.child = "adaptive-farming", circuit
-        recorder = getattr(client, "record_action", None)
-        if recorder is not None:
-            recorder("autoplay-phase", f"adaptive-farming: {circuit.name} (resumed)")
-        return True
+        if not self._hunger_fallback_used and hungry(client):
+            self._hunger_fallback_used = True
+            if await self._start_temple_food(client):
+                log.warning("autoplay temple food failed: %s; "
+                            "trying another priest", failed)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("autoplay-retry",
+                             f"{failed}; trying another priest")
+                return True
+        self._temple_food_retry_at = (
+            time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+        return False
 
     def _needs_mana_crystal_start(self, client: AtrinikClient) -> bool:
         """Collect Gandyld's safe 50-SP opening reward exactly once."""
@@ -265,8 +250,6 @@ class AutoplayTask(BotTask):
 
     async def _set_child(self, client: AtrinikClient, phase: str,
                          child: BotTask) -> None:
-        if phase != "temple-food":
-            self._paused_circuit = None
         self.phase = phase
         self.child = child
         await child.start(client)
@@ -320,6 +303,8 @@ class AutoplayTask(BotTask):
                     return
             try:
                 await self.child.tick(client)
+                if isinstance(self.child, FarmCircuitTask):
+                    self._circuit_backoffs = self.child.backoffs()
             except ConnectionError as exc:
                 # The child's dialogue, transfer, or purchase may be half done;
                 # rebuild it from the server's state after the reconnect.
@@ -334,7 +319,6 @@ class AutoplayTask(BotTask):
                     # The interrupted recovery never ran to an outcome.
                     self._mana_recovery_attempted = False
                 self.child = None
-                self._paused_circuit = None
                 raise
             if self.child.status not in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
@@ -354,8 +338,6 @@ class AutoplayTask(BotTask):
             self.child = None
             self._consecutive_failures = 0
             self._retry_at = 0.0
-            if completed_phase == "temple-food" and self._resume_paused_circuit(client):
-                return
             if completed_phase == "intro-quest":
                 self._intro_complete = True
             elif completed_phase == "mana-crystal-starter":
@@ -416,4 +398,5 @@ class AutoplayTask(BotTask):
             client, "adaptive-farming",
             FarmCircuitTask(
                 self.graph, list(legs), level_until=self.target_level,
-                analyzer_driven=True, spot=spot))
+                analyzer_driven=True, spot=spot,
+                backoffs=self._circuit_backoffs))
