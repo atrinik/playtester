@@ -1381,7 +1381,10 @@ class WorldGraph:
             node = self.nodes.get(map_path)
             if node is not None:
                 for edge in node.edges:
-                    if excluded and (edge.source, edge.destination) in excluded:
+                    if excluded and (
+                            (edge.source, edge.destination) in excluded or
+                            (edge.source, edge.destination, edge.x, edge.y)
+                            in excluded):
                         continue
                     if (avoided_maps and edge.destination in avoided_maps and
                             edge.destination != destination):
@@ -1595,6 +1598,38 @@ class NavigateTask(BotTask):
     KNOWN_LETHAL_TRANSIT = frozenset({
         "/shattered_islands/world_4_69",
     })
+    # A runtime edge exclusion (a pack-held exit, a seam with no crossing, a
+    # click that found no path) is a detour hint, never a wall: it expires.
+    # Live, a permanent one closed the Old Outpost's only stairs back to the
+    # surface, and every replan to the Underground City failed for half an
+    # hour while she fought grey golems.
+    # Each repeat of the same exclusion within the trip doubles it, up to
+    # the cap: a detour that keeps leading back to a held exit settles
+    # instead of ping-ponging every 75 s.
+    EDGE_EXCLUSION_SECONDS = 75.0
+    EDGE_EXCLUSION_MAX_SECONDS = 300.0
+
+    @property
+    def _excluded_edges(self) -> set[tuple]:
+        """The live exclusions: (source, destination, x, y) for an exit,
+        (source, destination) for a tile seam. Expired ones are dropped."""
+        now = time.monotonic()
+        self._edge_exclusions = {
+            key: until for key, until in self._edge_exclusions.items()
+            if until > now}
+        return set(self._edge_exclusions)
+
+    def _exclude_edge(self, edge: MapEdge) -> None:
+        """Exclude one exit (other stairs between the maps stay open) or a
+        whole tile seam: EDGE_EXCLUSION_SECONDS, doubled on each repeat of
+        the same key, up to EDGE_EXCLUSION_MAX_SECONDS."""
+        key = ((edge.source, edge.destination, edge.x, edge.y)
+               if edge.kind == "exit" else (edge.source, edge.destination))
+        strikes = self._edge_exclusion_strikes.get(key, 0)
+        self._edge_exclusion_strikes[key] = strikes + 1
+        seconds = min(self.EDGE_EXCLUSION_MAX_SECONDS,
+                      self.EDGE_EXCLUSION_SECONDS * 2 ** min(strikes, 8))
+        self._edge_exclusions[key] = time.monotonic() + seconds
 
     def __init__(self, graph: WorldGraph, destination: str,
                  destination_xy: tuple[int, int] | None = None,
@@ -1614,7 +1649,11 @@ class NavigateTask(BotTask):
         self._last_progress = 0.0
         self._issued_goal: tuple[str, int, int] | None = None
         self._issued_click: tuple[str, int, int] | None = None
-        self._excluded_edges: set[tuple[str, str]] = set()
+        # Runtime edge exclusions and when each expires (time.monotonic());
+        # see _exclude_edge.
+        self._edge_exclusions: dict[tuple, float] = {}
+        # How often each key was excluded on this trip (see _exclude_edge).
+        self._edge_exclusion_strikes: dict[tuple, int] = {}
         self._runtime_blocked: set[tuple[int, int]] = set()
         # When the current local route first disappeared (0.0 while one exists).
         # Separate from _last_progress, which approach-candidate rotation resets.
@@ -2446,7 +2485,7 @@ class NavigateTask(BotTask):
                     abs(orthogonal - authored_orthogonal),
                     len(path), crossing))
         if not candidates:
-            self._excluded_edges.add((edge.source, edge.destination))
+            self._exclude_edge(edge)
             self.route = []
             self._issued_goal = None
             self._issued_click = None
@@ -2572,7 +2611,7 @@ class NavigateTask(BotTask):
                 self._last_action = time.monotonic()
                 return
         if not await self._click_path(client, edge.x, edge.y):
-            self._excluded_edges.add((edge.source, edge.destination))
+            self._exclude_edge(edge)
             try:
                 self.route = self._plan(client)
             except ValueError as exc:
@@ -2662,7 +2701,7 @@ class NavigateThenTask(BotTask):
             return False
         if now - self._pack_exit_stall[1] < self.PACK_EXIT_BYPASS_SECONDS:
             return False
-        self.navigation._excluded_edges.add((edge.source, edge.destination))
+        self.navigation._exclude_edge(edge)
         self.navigation.route = []
         self.navigation._issued_goal = None
         self.navigation._issued_click = None

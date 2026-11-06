@@ -5871,6 +5871,44 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(client.fired, [(0, 0)])
         self.assertEqual(task._emergency_recall_origin, "/test")
 
+    def test_loadout_upkeep_leaves_a_readied_recall_wand_until_it_fires(self):
+        def readied():
+            client = self._combat_client()
+            wand = Item(
+                77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                name="wand of word of recall (lvl 12)")
+            client.state.inventory = [wand]
+            client.state.items[wand.tag] = wand
+            client.applied, client.fired = [], []
+
+            async def apply(tag):
+                client.applied.append(tag)
+                wand.flags ^= c.ITEM_APPLIED
+
+            async def fire(direction, tag=0):
+                client.fired.append((direction, tag))
+
+            client.apply, client.fire = apply, fire
+            task = FarmTask(zone="/test")
+            self.assertTrue(asyncio.run(task.emergency_recall(
+                client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+            self.assertEqual(client.applied, [77])
+            return client, task, wand
+
+        # Upkeep between the apply and the fire would cancel the recall.
+        client, task, wand = readied()
+        self.assertFalse(asyncio.run(task.restore_combat_loadout(client)))
+        self.assertTrue(wand.flags & c.ITEM_APPLIED)
+        self.assertTrue(asyncio.run(task.emergency_recall(
+            client, ratio=0.30, nearby_count=1, hostile_contact=True)))
+        self.assertEqual(client.fired, [(0, 0)])
+        # A stale apply never keeps the wand readied.
+        client, task, wand = readied()
+        task._emergency_recall_apply_at -= task.RECALL_APPLY_WINDOW_SECONDS + 1
+        self.assertTrue(asyncio.run(task.restore_combat_loadout(client)))
+        self.assertEqual(client.applied, [77, 77])
+        self.assertFalse(wand.flags & c.ITEM_APPLIED)
+
     def test_emergency_recall_prefers_rod_and_rejects_unknown_device(self):
         client = self._combat_client()
         unknown = Item(
@@ -10704,8 +10742,10 @@ class QuestTests(unittest.TestCase):
             self.assertFalse(asyncio.run(
                 task._defend_while_navigating(client)))
 
-        self.assertIn(("/test", "/well"),
-                      task.navigation._excluded_edges)
+        # Excluded at the patched clock (it expires EDGE_EXCLUSION_SECONDS on).
+        self.assertEqual(task.navigation._edge_exclusions, {
+            ("/test", "/well", 13, 22):
+                116.0 + NavigateTask.EDGE_EXCLUSION_SECONDS})
         self.assertEqual(task.navigation.route, [])
 
     def test_pack_split_retreat_forbids_immediate_backtrack(self):
@@ -17774,6 +17814,114 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual((circuit.child.task.safety.flee_below,
                           circuit.child.task.safety.heal_below),
                          FarmCircuitTask.PASSIVE_SAFETY)
+
+
+class RouteFailureTests(unittest.TestCase):
+    """Expiring, per-exit route exclusions."""
+
+    OUTPOST = "/shattered_islands/strakewood_island/old_outpost/old_outpost_0101"
+    UNDERGROUND = ("/shattered_islands/strakewood_island/underground_city/"
+                   "underground_city_0_3")
+    SURFACE = "/shattered_islands/world_5_57"
+
+    def test_an_excluded_exit_expires_and_other_stairs_stay_open(self):
+        # Live: a pack on the Old Outpost stairs got them excluded for the
+        # rest of the trip, and the outpost's only way back to the surface
+        # stayed closed: every replan to the Underground City failed.
+        def navigation_tick(navigation, client, at):
+            navigation.status, navigation.route = TaskStatus.RUNNING, []
+            with patch("atrinik_bot.navigation.time.monotonic", return_value=at):
+                asyncio.run(navigation.tick(client))
+
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update(level=34, hp=300, maxhp=300)
+        client.state.map.path = self.OUTPOST
+        client.state.map.world_x, client.state.map.world_y = 16, 8
+
+        async def send(_packet):
+            return None
+
+        client.send = send
+        graph = built_graph()
+        stairs = [edge for edge in graph.nodes[self.OUTPOST].edges
+                  if edge.destination == self.SURFACE]
+        self.assertGreater(len(stairs), 1)
+        # A concrete bound: an exclusion is a detour hint, never a wall.
+        self.assertLessEqual(NavigateTask.EDGE_EXCLUSION_SECONDS, 300.0)
+
+        def navigation():
+            task = NavigateTask(graph, self.UNDERGROUND)
+            # As live: no pack-free return exists, so the careful route
+            # clear (_retry_unavoidable_return_route) is on.
+            task.allow_ranged_hazard_fallback = True
+            return task
+
+        # One held exit closes only that exit: other stairs are used.
+        one = navigation()
+        with patch("atrinik_bot.navigation.time.monotonic", return_value=1000.0):
+            one._exclude_edge(stairs[0])
+        navigation_tick(one, client, 1000.0)
+        self.assertEqual(one.status, TaskStatus.RUNNING)
+        self.assertEqual(one.route[0].destination, self.SURFACE)
+        self.assertNotEqual((one.route[0].x, one.route[0].y),
+                            (stairs[0].x, stairs[0].y))
+        # Every stairs held: no route until the exclusions expire.
+        every = navigation()
+        with patch("atrinik_bot.navigation.time.monotonic", return_value=1000.0):
+            for edge in stairs:
+                every._exclude_edge(edge)
+        navigation_tick(every, client, 1000.0)
+        self.assertEqual(every.status, TaskStatus.FAILED)
+        self.assertIn("no component route", every.error)
+        navigation_tick(every, client,
+                        1000.0 + NavigateTask.EDGE_EXCLUSION_SECONDS + 1)
+        self.assertEqual(every.status, TaskStatus.RUNNING)
+        self.assertEqual(every.route[0].destination, self.SURFACE)
+        self.assertEqual(every.route[-1].destination, self.UNDERGROUND)
+        self.assertEqual(every._excluded_edges, set())
+
+    def test_a_repeatedly_excluded_exit_stays_excluded_longer(self):
+        # A held exit with another way round: each time the route comes back
+        # to it and the click finds no path, it is excluded for longer, so a
+        # detour cannot ping-pong back to it every EDGE_EXCLUSION_SECONDS.
+        graph = WorldGraph()
+        for path in ("/a", "/b"):
+            node = MapNode(path, width=10, height=10)
+            node.terrain = {(x, y): 1 for x in range(10) for y in range(10)}
+            graph.nodes[path] = node
+        held = MapEdge("/a", "/b", 8, 5, kind="exit", label="stairs")
+        other = MapEdge("/a", "/b", 1, 5, kind="exit", label="stairs")
+        graph.nodes["/a"].edges = [held, other]
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.map.path = "/a"
+        client.state.map.world_x, client.state.map.world_y = 6, 5
+
+        async def send(_packet):
+            return None
+
+        client.send = send
+        navigation = NavigateTask(graph, "/b")
+        # A pack rings the held stairs: no local path reaches them.
+        navigation._threat_blocked = {
+            (x, y) for x in range(7, 10) for y in range(4, 7)} - {(8, 5)}
+        key = ("/a", "/b", 8, 5)
+        lasted = []
+        at = 1000.0
+        for _ in range(4):
+            navigation.status, navigation.route = TaskStatus.RUNNING, []
+            with patch("atrinik_bot.navigation.time.monotonic", return_value=at):
+                asyncio.run(navigation.tick(client))
+            lasted.append(navigation._edge_exclusions[key] - at)
+            # The other stairs are taken meanwhile.
+            self.assertEqual((navigation.route[0].x, navigation.route[0].y),
+                             (1, 5))
+            at = navigation._edge_exclusions[key] + 1.0
+        base = NavigateTask.EDGE_EXCLUSION_SECONDS
+        self.assertEqual(lasted, [base, 2 * base, 4 * base,
+                                  NavigateTask.EDGE_EXCLUSION_MAX_SECONDS])
+        self.assertLessEqual(NavigateTask.EDGE_EXCLUSION_MAX_SECONDS, 300.0)
 
 
 class SelfImprovementTests(unittest.TestCase):

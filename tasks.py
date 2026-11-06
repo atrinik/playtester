@@ -3146,13 +3146,23 @@ class FarmTask(BotTask):
         return False
 
     async def restore_combat_loadout(self, client: AtrinikClient) -> bool:
-        """Unready stale launchers and one-shot maintenance devices."""
+        """Unready stale launchers and one-shot maintenance devices.
+
+        A recall device readied by emergency_recall is left alone for that
+        apply's own window: unreadying it before the fire cancels the recall.
+        A stale apply never keeps it readied.
+        """
+        readying = (
+            self._emergency_recall_source
+            if self._emergency_recall_apply_at and
+            time.monotonic() - self._emergency_recall_apply_at <=
+            self.RECALL_APPLY_WINDOW_SECONDS else 0)
         ranged_item = next((
             item for item in client.state.inventory
             if (item.item_type in (c.TYPE_ROD, c.TYPE_WAND) or
                 not self.allow_launchers and
                 item.item_type in (c.TYPE_BOW, c.TYPE_ARROW)) and
-            item.flags & c.ITEM_APPLIED), None)
+            item.flags & c.ITEM_APPLIED and item.tag != readying), None)
         if ranged_item is None:
             return False
         await client.apply(ranged_item.tag)
@@ -4349,6 +4359,10 @@ class FarmTask(BotTask):
         self._last_action = now
         return True
 
+    # How long a readied recall device waits for its applied state before
+    # the apply is abandoned (emergency_recall, restore_combat_loadout).
+    RECALL_APPLY_WINDOW_SECONDS = 3.0
+
     @staticmethod
     def emergency_recall_candidates(client: AtrinikClient) -> list[Item]:
         """Return paid, identified recall sources in survival-first order.
@@ -4455,7 +4469,8 @@ class FarmTask(BotTask):
                 if recorder is not None:
                     recorder("emergency-recall", f"via {source.name}")
                 return True
-            if now - self._emergency_recall_apply_at <= 3.0:
+            if (now - self._emergency_recall_apply_at <=
+                    self.RECALL_APPLY_WINDOW_SECONDS):
                 return True
             self._emergency_recall_apply_at = 0.0
             self._emergency_recall_source = 0
