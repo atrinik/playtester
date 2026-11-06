@@ -1501,9 +1501,6 @@ class FarmTask(BotTask):
         self._emergency_recall_apply_at = 0.0
         self._emergency_recall_cast_at = 0.0
         self._emergency_recall_origin = ""
-        # The decision a fired recall is recorded as: "emergency-recall"
-        # marks a failure at the spot, a route-failure recall does not.
-        self._emergency_recall_action = "emergency-recall"
         # A recall wand fired (tag, wall-clock time), to catch "says poof";
         # a recall wand examined for its charges, and those examined once.
         self._recall_wand_fired: tuple[int, float] | None = None
@@ -3149,13 +3146,19 @@ class FarmTask(BotTask):
         return False
 
     async def restore_combat_loadout(self, client: AtrinikClient) -> bool:
-        """Unready stale launchers and one-shot maintenance devices."""
+        """Unready stale launchers and one-shot maintenance devices.
+
+        A recall device readied and not yet fired is left alone: unreadying
+        it between the apply and the fire cancels the recall every tick.
+        """
+        readying = (self._emergency_recall_source
+                    if self._emergency_recall_apply_at else 0)
         ranged_item = next((
             item for item in client.state.inventory
             if (item.item_type in (c.TYPE_ROD, c.TYPE_WAND) or
                 not self.allow_launchers and
                 item.item_type in (c.TYPE_BOW, c.TYPE_ARROW)) and
-            item.flags & c.ITEM_APPLIED), None)
+            item.flags & c.ITEM_APPLIED and item.tag != readying), None)
         if ranged_item is None:
             return False
         await client.apply(ranged_item.tag)
@@ -4422,8 +4425,10 @@ class FarmTask(BotTask):
         standing still. This method returns true only while readying/firing a
         device consumes the current action tick.
 
-        ``force`` recalls whatever her health (a route that keeps failing);
-        the cast is then recorded as ``action`` instead of an emergency.
+        ``force`` recalls whatever her health (a route that keeps failing).
+        The cast is recorded as ``action`` of the call that fires it, so a
+        device readied by one caller and fired by another is recorded for
+        the cast, not the earlier apply.
         """
         now = time.monotonic()
         if self._recall_wand_fired is not None:
@@ -4461,7 +4466,7 @@ class FarmTask(BotTask):
                 self._emergency_recall_origin = client.state.map.path
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
-                    recorder(self._emergency_recall_action, f"via {source.name}")
+                    recorder(action, f"via {source.name}")
                 return True
             if now - self._emergency_recall_apply_at <= 3.0:
                 return True
@@ -4494,7 +4499,6 @@ class FarmTask(BotTask):
             return False
         source = candidates[0]
         self._emergency_recall_source = source.tag
-        self._emergency_recall_action = action
         await client.clear_actions()
         await client.set_combat(False)
         if source.item_type in (c.TYPE_ROD, c.TYPE_WAND):

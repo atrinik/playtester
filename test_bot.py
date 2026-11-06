@@ -10618,8 +10618,10 @@ class QuestTests(unittest.TestCase):
             self.assertFalse(asyncio.run(
                 task._defend_while_navigating(client)))
 
-        self.assertIn(("/test", "/well"),
-                      task.navigation._excluded_edges)
+        # Excluded at the patched clock (it expires EDGE_EXCLUSION_SECONDS on).
+        self.assertEqual(task.navigation._edge_exclusions, {
+            ("/test", "/well", 13, 22):
+                116.0 + NavigateTask.EDGE_EXCLUSION_SECONDS})
         self.assertEqual(task.navigation.route, [])
 
     def test_pack_split_retreat_forbids_immediate_backtrack(self):
@@ -11491,102 +11493,6 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(circuit.status, TaskStatus.READY)
         self.assertTrue(client.direct_moves)
         self.assertEqual(client.combat[-1], False)
-
-    def test_failing_circuit_route_recalls_then_gives_up_within_a_limit(self):
-        client = self._combat_client()
-        client.state.map.path = "/danger"
-        client.state.map.tiles.clear()
-        client.state.map.tile(9, 8).objects[3] = MapObject(
-            3, 1, 0, 0, name="lava golem", target_id=100)
-        client.state.messages = [(
-            time.time(), 2, "cc66ff", "lava golem hit you for 9 damage.")]
-        wand = Item(
-            77, item_type=c.TYPE_WAND, quality=80, condition=80,
-            name="wand of word of recall (lvl 12)")
-        client.state.inventory = [wand]
-        client.state.items[wand.tag] = wand
-        client.applied, client.fired, client.decisions = [], [], []
-
-        async def apply(tag):
-            client.applied.append(tag)
-
-        async def fire(direction, tag=0):
-            client.fired.append((direction, tag))
-
-        client.apply, client.fire = apply, fire
-        client.record_action = lambda action, detail="": (
-            client.decisions.append((action, detail)))
-        graph = WorldGraph()
-        for path in ("/danger", "/safe", "/home"):
-            node = MapNode(path=path, width=25, height=25)
-            node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
-            graph.nodes[path] = node
-        circuit = FarmCircuitTask(graph, [("/safe", "tree")])
-        circuit.child = circuit._new_child()
-        farm = circuit.child.task
-
-        def fail_route():
-            circuit.child.navigation.status = TaskStatus.FAILED
-            circuit.child.navigation.error = "no component route"
-            return asyncio.run(
-                circuit._recover_failed_navigation(client, farm))
-
-        def actions():
-            return [action for action, _ in client.decisions]
-
-        for _ in range(circuit.ROUTE_FAILURE_RECALL_ESCAPES - 1):
-            self.assertTrue(fail_route())
-        self.assertIsNone(circuit._route_recall)
-        self.assertFalse(asyncio.run(circuit._tick_route_recall(client, farm)))
-        self.assertTrue(fail_route())
-        self.assertEqual(circuit._route_recall[0], "/danger")
-        self.assertIn("route-recall-requested", actions())
-        # The wand is readied, then fired, whatever her health.
-        self.assertTrue(asyncio.run(circuit._tick_route_recall(client, farm)))
-        self.assertEqual(client.applied, [77])
-        wand.flags |= c.ITEM_APPLIED
-        self.assertTrue(asyncio.run(circuit._tick_route_recall(client, farm)))
-        self.assertEqual(client.fired, [(0, 0)])
-        # Not an emergency recall: the spot is not blamed for it.
-        self.assertIn("route-failure-recall", actions())
-        self.assertNotIn("emergency-recall", actions())
-        # While the recall builds she keeps escaping.
-        self.assertFalse(asyncio.run(circuit._tick_route_recall(client, farm)))
-        # Recalled: the leg is planned afresh, without the old exclusions.
-        circuit.child.navigation._excluded_edges.add(("/danger", "/safe"))
-        old_child = circuit.child
-        client.state.map.path = "/home"
-        self.assertTrue(asyncio.run(circuit._tick_route_recall(client, farm)))
-        self.assertIsNot(circuit.child, old_child)
-        self.assertFalse(circuit.child.navigation._excluded_edges)
-        self.assertIsNone(circuit._route_recall)
-        self.assertIn("route-recall-replan", actions())
-        # Failing on: the streak survives the recall, so the limit holds.
-        farm = circuit.child.task
-        escapes = circuit._route_failure_escapes
-        for _ in range(circuit.ROUTE_FAILURE_GIVE_UP_ESCAPES - escapes - 1):
-            self.assertTrue(fail_route())
-            circuit._route_recall = None
-        self.assertFalse(fail_route())
-        self.assertIn("navigation-route-failure-limit", actions())
-        self.assertEqual(circuit.child.navigation.status, TaskStatus.FAILED)
-
-    def test_route_recall_lapses_without_a_recall_source(self):
-        client = self._combat_client()
-        client.decisions = []
-        client.record_action = lambda action, detail="": (
-            client.decisions.append((action, detail)))
-        graph = WorldGraph()
-        node = MapNode(path="/safe", width=25, height=25)
-        graph.nodes["/safe"] = node
-        circuit = FarmCircuitTask(graph, [("/safe", "tree")])
-        circuit.child = circuit._new_child()
-        circuit._request_route_recall(client, "test")
-        self.assertFalse(asyncio.run(
-            circuit._tick_route_recall(client, circuit.child.task)))
-        self.assertIsNone(circuit._route_recall)
-        self.assertIn("route-recall-unavailable",
-                      [action for action, _ in client.decisions])
 
     def test_level_eighteen_return_retries_only_after_safe_route_fails(self):
         client = self._combat_client()
@@ -17432,96 +17338,6 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         explicit = FarmCircuitTask(built_graph(), [(self.TREES, "evil treant")])
         self.assertFalse(explicit.analyzer_driven)
 
-    OUTPOST = "/shattered_islands/strakewood_island/old_outpost/old_outpost_0101"
-    UNDERGROUND = ("/shattered_islands/strakewood_island/underground_city/"
-                   "underground_city_0_3")
-
-    def test_an_excluded_only_exit_is_released_instead_of_stranding_her(self):
-        # Live: a pack on the Old Outpost stairs got the stairs excluded. The
-        # exclusion names the map pair, so it closed all three stairs, the
-        # outpost's only way back to the surface; every replan to the
-        # Underground City then failed for half an hour.
-        client = self.client({})
-        client.state.stats["level"] = 34
-        client.state.map.path = self.OUTPOST
-        client.state.map.world_x, client.state.map.world_y = 16, 8
-        navigation = NavigateTask(built_graph(), self.UNDERGROUND)
-        # As live: no pack-free return exists, so the careful route clear
-        # (_retry_unavoidable_return_route) is on.
-        navigation.allow_ranged_hazard_fallback = True
-        navigation._excluded_edges.add(
-            (self.OUTPOST, "/shattered_islands/world_5_57"))
-        with self.assertRaisesRegex(ValueError, "no component route"):
-            navigation._plan(client)
-        route = navigation._plan_releasing_exclusions(client)
-        self.assertEqual(route[0].destination, "/shattered_islands/world_5_57")
-        self.assertEqual(route[-1].destination, self.UNDERGROUND)
-        self.assertFalse(navigation._excluded_edges)
-        self.assertIn("navigation-exclusions-released",
-                      [record["action"] for record in client.decision_history])
-        # An exclusion that leaves another way is kept.
-        client.state.map.path = "/shattered_islands/world_5_57"
-        client.state.map.world_x, client.state.map.world_y = 12, 12
-        excluded = ("/shattered_islands/world_5_57", "/shattered_islands/world_5_58")
-        navigation._excluded_edges.add(excluded)
-        route = navigation._plan_releasing_exclusions(client)
-        self.assertEqual(route[-1].destination, self.UNDERGROUND)
-        self.assertIn(excluded, navigation._excluded_edges)
-
-    def zero_xp_kill(self, client, count=1):
-        for _ in range(count):
-            client.state.add_message(
-                0, "ffffff", "Your enemy wasn't worth any experience to you.")
-
-    def test_zero_xp_kills_on_the_spot_record_a_cause_and_skip_it(self):
-        from . import self_improvement
-
-        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
-        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
-        client = self.client({"xp": [trees, pocket]})
-        circuit = self.circuit(client, trees)
-        client.state.map.path = self.TREES
-        self.assertFalse(circuit._observe_zero_xp_kills(client))
-        self.zero_xp_kill(client, circuit.ZERO_XP_KILLS - 1)
-        self.assertFalse(circuit._observe_zero_xp_kills(client))
-        # A kill worth experience in between starts the count again.
-        circuit._current_exp += 100
-        self.zero_xp_kill(client)
-        self.assertFalse(circuit._observe_zero_xp_kills(client))
-        self.zero_xp_kill(client, circuit.ZERO_XP_KILLS - 1)
-        # Player chat cannot forge the server's line.
-        client.state.add_message(
-            4, "ffffff", "Your enemy wasn't worth any experience to you.")
-        self.assertTrue(circuit._observe_zero_xp_kills(client))
-        self.assertIn(self.TREES, client.state.farm_zone_quarantine)
-        record = client.state.farm_adaptations[trees["path"]]
-        self.assertEqual(record["causes"], {self_improvement.ZERO_XP: 1})
-        # Not a combat failure: margins, the pause and kit hazards stay.
-        self.assertEqual(record["level"], 0)
-        self.assertEqual(record["kit_failures"], [])
-        self.assertEqual(record["reviews"][-1]["remedies"],
-                         ["a spot with monsters at her level"])
-        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
-        self.assertEqual(circuit.spot["name"], "Pocket")
-
-    def test_zero_xp_kills_in_transit_ask_for_a_route_recall(self):
-        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
-        client = self.client({"xp": [trees]})
-        circuit = self.circuit(client, trees)
-        client.state.map.path = self.OUTPOST
-        self.assertFalse(circuit._observe_zero_xp_kills(client))
-        # Kills before the circuit watched, or on a maintenance trip, do not count.
-        circuit._selling = object()
-        self.zero_xp_kill(client, circuit.ZERO_XP_KILLS)
-        self.assertFalse(circuit._observe_zero_xp_kills(client))
-        circuit._selling = None
-        self.assertIsNone(circuit._route_recall)
-        self.zero_xp_kill(client, circuit.ZERO_XP_KILLS)
-        self.assertFalse(circuit._observe_zero_xp_kills(client))
-        self.assertEqual(circuit._route_recall[0], self.OUTPOST)
-        self.assertNotIn(self.TREES, client.state.farm_zone_quarantine)
-        self.assertFalse(client.state.farm_adaptations)
-
     def test_failures_from_before_the_circuit_are_not_new(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
         client = self.client({"xp": [trees]})
@@ -17593,6 +17409,302 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual((circuit.child.task.safety.flee_below,
                           circuit.child.task.safety.heal_below),
                          FarmCircuitTask.PASSIVE_SAFETY)
+
+
+class RouteStallTests(unittest.TestCase):
+    """Bounded travel: expiring exclusions and the per-leg stall rule."""
+
+    OUTPOST = "/shattered_islands/strakewood_island/old_outpost/old_outpost_0101"
+    UNDERGROUND = ("/shattered_islands/strakewood_island/underground_city/"
+                   "underground_city_0_3")
+    SURFACE = "/shattered_islands/world_5_57"
+    GREY_KILL = "Your enemy wasn't worth any experience to you."
+
+    class Client:
+        def __init__(self, path):
+            self.state = GameState(phase="playing")
+            self.state.map.path = path
+            self.state.map.world_x, self.state.map.world_y = 2, 5
+            self.state.stats.update(hp=100, maxhp=100, food=999, exp=1000)
+            self.state.place_item(Item(990, name="staple food", quantity=10),
+                                  self.state.player_tag)
+            self.wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                             name="wand of word of recall (lvl 12)")
+            self.state.place_item(self.wand, self.state.player_tag)
+            self.applied, self.fired, self.decisions = [], [], []
+
+        async def clear_actions(self):
+            pass
+
+        async def set_combat(self, enabled, force=False):
+            pass
+
+        async def apply(self, tag):
+            self.applied.append(tag)
+            self.state.items[tag].flags ^= c.ITEM_APPLIED
+
+        async def fire(self, direction, tag=0):
+            self.fired.append((direction, tag))
+
+        def record_action(self, action, detail=""):
+            self.decisions.append((action, detail))
+
+        def actions(self):
+            return [action for action, _ in self.decisions]
+
+    def circuit(self, now, maps):
+        graph = WorldGraph()
+        for path in (*maps, "/farm", "/home"):
+            node = MapNode(path, width=25, height=25)
+            node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+            graph.nodes[path] = node
+        return FarmCircuitTask(graph, [("/farm", "rat")], clock=lambda: now[0])
+
+    @staticmethod
+    def drive(circuit, client, route_for):
+        """One FarmCircuitTask.tick with the leg's route supplied by the test.
+
+        Only route planning and the transit defense are replaced: the stall
+        rule, the recall and the give-up run through the real tick.
+        """
+        child = circuit.child
+        navigation = child.navigation
+        if not getattr(navigation, "stubbed", False):
+            async def plan(_client, navigation=navigation):
+                navigation.status = TaskStatus.RUNNING
+                navigation.route = route_for(client)
+
+            async def no_defense(_client):
+                return False
+
+            navigation.tick, navigation.stubbed = plan, True
+            child._defend_while_navigating = no_defense
+        asyncio.run(circuit.tick(client))
+
+    def test_a_stalled_leg_recalls_waits_for_it_then_gives_up(self):
+        now = [1000.0]
+        client = self.Client("/start")
+        circuit = self.circuit(now, ["/start"])
+        asyncio.run(circuit.start(client))
+        exit_edge = MapEdge("/start", "/farm", 20, 5, kind="exit")
+
+        def route_for(client):
+            return [exit_edge] if client.state.map.path == "/start" else []
+
+        def run(seconds, step=5.0):
+            end = now[0] + seconds
+            while now[0] < end:
+                now[0] += step
+                # Ping-pong in front of a held exit: never nearer than before.
+                client.state.map.world_x = 2 + int(now[0] // step) % 2
+                self.drive(circuit, client, route_for)
+
+        run(circuit.LEG_STALL_SECONDS - 10)
+        self.assertNotIn("route-recall-requested", client.actions())
+        run(40)
+        self.assertIn("route-recall-requested", client.actions())
+        # The wand is readied, then fired: combat-loadout upkeep does not
+        # unready it in between.
+        self.assertEqual(client.applied[0], 77)
+        self.assertEqual(client.fired, [(0, 0)])
+        self.assertEqual(client.actions().index("route-failure-recall"),
+                         client.actions().index("route-recall-requested") + 1)
+        # Not an emergency recall: the spot is not blamed for it.
+        self.assertIn("route-failure-recall", client.actions())
+        self.assertNotIn("emergency-recall", client.actions())
+        # Waiting for the recall is not a stall.
+        pending = circuit.ROUTE_RECALL_TIMEOUT_SECONDS - 20
+        run(pending)
+        # Recalled home: the leg is planned afresh, the recall state kept.
+        old_child = circuit.child
+        client.state.map.path = "/home"
+        run(5)
+        self.assertIn("route-recall-replan", client.actions())
+        self.assertIsNot(circuit.child, old_child)
+        self.assertEqual(circuit.child.task._emergency_recall_origin, "/start")
+        # No progress from there either: given up LEG_GIVE_UP_SECONDS after
+        # the recall, the wait for it not counted.
+        run(circuit.LEG_GIVE_UP_SECONDS - pending)
+        self.assertNotIn("navigation-route-stalled", client.actions())
+        self.assertEqual(circuit.status, TaskStatus.RUNNING)
+        run(pending + 30)
+        self.assertIn("navigation-route-stalled", client.actions())
+        self.assertEqual(circuit.status, TaskStatus.FAILED)
+        self.assertEqual(client.actions().count("route-recall-requested"), 1)
+
+    def test_a_recall_that_never_comes_lapses_and_the_leg_is_given_up(self):
+        now = [1000.0]
+        client = self.Client("/start")
+        circuit = self.circuit(now, ["/start"])
+        asyncio.run(circuit.start(client))
+
+        def run(seconds, step=5.0):
+            end = now[0] + seconds
+            while now[0] < end:
+                now[0] += step
+                # No route at all: navigation keeps failing.
+                self.drive(circuit, client, lambda client: [])
+
+        run(circuit.LEG_STALL_SECONDS + 10)
+        self.assertEqual(client.fired, [(0, 0)])
+        run(circuit.ROUTE_RECALL_TIMEOUT_SECONDS)
+        self.assertIn("route-recall-lapsed", client.actions())
+        self.assertEqual(circuit.status, TaskStatus.RUNNING)
+        # The fizzled cast is long past (the device clock is real time).
+        circuit.child.task._emergency_recall_cast_at -= 31.0
+        run(circuit.LEG_GIVE_UP_SECONDS)
+        self.assertIn("navigation-route-stalled", client.actions())
+        self.assertEqual(circuit.status, TaskStatus.FAILED)
+        self.assertEqual(client.actions().count("route-recall-requested"), 1)
+
+    def test_travel_that_progresses_never_recalls_despite_grey_kills(self):
+        now = [1000.0]
+        maps = ["/m0", "/m1", "/m2", "/m3"]
+        client = self.Client("/m0")
+        circuit = self.circuit(now, maps)
+        asyncio.run(circuit.start(client))
+        chain = [MapEdge(source, destination, 20, 5, kind="exit")
+                 for source, destination in zip(maps, maps[1:] + ["/farm"])]
+
+        def route_for(client):
+            path = client.state.map.path
+            return chain[maps.index(path):] if path in maps else []
+
+        # Slow travel, a tile every 10 s, killing grey blockers on the way:
+        # well past LEG_STALL_SECONDS on every map, yet always progressing.
+        while client.state.map.path in maps:
+            now[0] += 10.0
+            if client.state.map.world_x >= 20:
+                client.state.map.path = chain[maps.index(
+                    client.state.map.path)].destination
+                client.state.map.world_x = 2
+                if client.state.map.path not in maps:
+                    break
+            else:
+                client.state.map.world_x += 1
+            client.state.add_message(0, "ffffff", self.GREY_KILL)
+            self.drive(circuit, client, route_for)
+        self.assertGreater(now[0] - 1000.0, 3 * circuit.LEG_STALL_SECONDS)
+        self.assertNotIn("route-recall-requested", client.actions())
+        self.assertEqual(client.applied, [])
+        self.assertEqual(client.state.farm_zone_quarantine, {})
+
+    def test_an_excluded_exit_expires_and_other_stairs_stay_open(self):
+        # Live: a pack on the Old Outpost stairs got them excluded for the
+        # rest of the trip, and the outpost's only way back to the surface
+        # stayed closed: every replan to the Underground City failed.
+        def navigation_tick(navigation, client, at):
+            navigation.status, navigation.route = TaskStatus.RUNNING, []
+            with patch("atrinik_bot.navigation.time.monotonic", return_value=at):
+                asyncio.run(navigation.tick(client))
+
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update(level=34, hp=300, maxhp=300)
+        client.state.map.path = self.OUTPOST
+        client.state.map.world_x, client.state.map.world_y = 16, 8
+
+        async def send(_packet):
+            return None
+
+        client.send = send
+        graph = built_graph()
+        stairs = [edge for edge in graph.nodes[self.OUTPOST].edges
+                  if edge.destination == self.SURFACE]
+        self.assertGreater(len(stairs), 1)
+
+        def navigation():
+            task = NavigateTask(graph, self.UNDERGROUND)
+            # As live: no pack-free return exists, so the careful route
+            # clear (_retry_unavoidable_return_route) is on.
+            task.allow_ranged_hazard_fallback = True
+            return task
+
+        # One held exit closes only that exit: other stairs are used.
+        one = navigation()
+        with patch("atrinik_bot.navigation.time.monotonic", return_value=1000.0):
+            one._exclude_edge(stairs[0])
+        navigation_tick(one, client, 1000.0)
+        self.assertEqual(one.status, TaskStatus.RUNNING)
+        self.assertEqual(one.route[0].destination, self.SURFACE)
+        self.assertNotEqual((one.route[0].x, one.route[0].y),
+                            (stairs[0].x, stairs[0].y))
+        # Every stairs held: no route until the exclusions expire.
+        every = navigation()
+        with patch("atrinik_bot.navigation.time.monotonic", return_value=1000.0):
+            for edge in stairs:
+                every._exclude_edge(edge)
+        navigation_tick(every, client, 1000.0)
+        self.assertEqual(every.status, TaskStatus.FAILED)
+        self.assertIn("no component route", every.error)
+        navigation_tick(every, client,
+                        1000.0 + NavigateTask.EDGE_EXCLUSION_SECONDS + 1)
+        self.assertEqual(every.status, TaskStatus.RUNNING)
+        self.assertEqual(every.route[0].destination, self.SURFACE)
+        self.assertEqual(every.route[-1].destination, self.UNDERGROUND)
+        self.assertEqual(every._excluded_edges, set())
+
+    def test_zero_xp_kills_on_the_spot_reset_with_the_farm_child(self):
+        from . import self_improvement
+
+        trees_path = AnalyzerFarmSelectionTests.TREES
+        trees = analyzer_spot("Trees", [trees_path], ["evil treant L13"])
+        pocket = analyzer_spot(
+            "Pocket", [AnalyzerFarmSelectionTests.POCKET], ["evil treant L13"])
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 22, "exp": 1000, "hp": 100, "maxhp": 100})
+        client.farm_analyzer = StubAnalyzer({"xp": [trees, pocket]})
+        client.state.map.path = trees_path
+
+        def circuit_for(spot, analyzer_driven=True):
+            from .navigation import analyzer_spot_legs
+
+            circuit = FarmCircuitTask(
+                built_graph(), list(analyzer_spot_legs(spot, built_graph())),
+                analyzer_driven=analyzer_driven, spot=spot)
+            circuit.child = circuit._new_child()
+            circuit.status = TaskStatus.RUNNING
+
+            async def stop_after_observing(_client):
+                return True
+
+            # The tick returns right after its zero-XP observation.
+            circuit.server_clock.sync = stop_after_observing
+            return circuit
+
+        def kill(circuit, count):
+            for _ in range(count):
+                client.state.add_message(0, "ffffff", self.GREY_KILL)
+            asyncio.run(circuit.tick(client))
+
+        circuit = circuit_for(trees)
+        kill(circuit, 0)
+        kill(circuit, circuit.ZERO_XP_KILLS - 1)
+        # Rebuilt farm child (a death review, another leg or spot): anew.
+        circuit.child = circuit._new_child()
+        kill(circuit, 1)
+        self.assertNotIn(trees_path, client.state.farm_zone_quarantine)
+        # Experience gained in between: anew.
+        client.state.stats["exp"] += 100
+        kill(circuit, circuit.ZERO_XP_KILLS - 1)
+        self.assertNotIn(trees_path, client.state.farm_zone_quarantine)
+        kill(circuit, circuit.ZERO_XP_KILLS - 1)
+        self.assertIn(trees_path, client.state.farm_zone_quarantine)
+        record = client.state.farm_adaptations[trees["path"]]
+        self.assertEqual(record["causes"], {self_improvement.ZERO_XP: 1})
+        # Not a combat failure: margins, the pause and kit hazards stay.
+        self.assertEqual(record["level"], 0)
+        self.assertEqual(record["kit_failures"], [])
+        self.assertEqual(circuit.spot["name"], "Pocket")
+        # Only analyzer picks are judged.
+        client.state.farm_zone_quarantine.clear()
+        client.state.farm_adaptations.clear()
+        explicit = circuit_for(trees, analyzer_driven=False)
+        kill(explicit, 0)
+        kill(explicit, explicit.ZERO_XP_KILLS + 1)
+        self.assertEqual(client.state.farm_zone_quarantine, {})
+        self.assertEqual(client.state.farm_adaptations, {})
 
 
 class SelfImprovementTests(unittest.TestCase):

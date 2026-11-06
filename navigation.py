@@ -1381,7 +1381,10 @@ class WorldGraph:
             node = self.nodes.get(map_path)
             if node is not None:
                 for edge in node.edges:
-                    if excluded and (edge.source, edge.destination) in excluded:
+                    if excluded and (
+                            (edge.source, edge.destination) in excluded or
+                            (edge.source, edge.destination, edge.x, edge.y)
+                            in excluded):
                         continue
                     if (avoided_maps and edge.destination in avoided_maps and
                             edge.destination != destination):
@@ -1595,6 +1598,30 @@ class NavigateTask(BotTask):
     KNOWN_LETHAL_TRANSIT = frozenset({
         "/shattered_islands/world_4_69",
     })
+    # A runtime edge exclusion (a pack-held exit, a seam with no crossing, a
+    # click that found no path) is a detour hint, never a wall: it expires.
+    # Live, a permanent one closed the Old Outpost's only stairs back to the
+    # surface, and every replan to the Underground City failed for half an
+    # hour while she fought grey golems.
+    EDGE_EXCLUSION_SECONDS = 75.0
+
+    @property
+    def _excluded_edges(self) -> set[tuple]:
+        """The live exclusions: (source, destination, x, y) for an exit,
+        (source, destination) for a tile seam. Expired ones are dropped."""
+        now = time.monotonic()
+        self._edge_exclusions = {
+            key: until for key, until in self._edge_exclusions.items()
+            if until > now}
+        return set(self._edge_exclusions)
+
+    def _exclude_edge(self, edge: MapEdge) -> None:
+        """Exclude one exit (other stairs between the maps stay open) or a
+        whole tile seam, for EDGE_EXCLUSION_SECONDS."""
+        key = ((edge.source, edge.destination, edge.x, edge.y)
+               if edge.kind == "exit" else (edge.source, edge.destination))
+        self._edge_exclusions[key] = (
+            time.monotonic() + self.EDGE_EXCLUSION_SECONDS)
 
     def __init__(self, graph: WorldGraph, destination: str,
                  destination_xy: tuple[int, int] | None = None,
@@ -1614,7 +1641,9 @@ class NavigateTask(BotTask):
         self._last_progress = 0.0
         self._issued_goal: tuple[str, int, int] | None = None
         self._issued_click: tuple[str, int, int] | None = None
-        self._excluded_edges: set[tuple[str, str]] = set()
+        # Runtime edge exclusions and when each expires (time.monotonic());
+        # see _exclude_edge.
+        self._edge_exclusions: dict[tuple, float] = {}
         self._runtime_blocked: set[tuple[int, int]] = set()
         # When the current local route first disappeared (0.0 while one exists).
         # Separate from _last_progress, which approach-candidate rotation resets.
@@ -2448,7 +2477,7 @@ class NavigateTask(BotTask):
                     abs(orthogonal - authored_orthogonal),
                     len(path), crossing))
         if not candidates:
-            self._excluded_edges.add((edge.source, edge.destination))
+            self._exclude_edge(edge)
             self.route = []
             self._issued_goal = None
             self._issued_click = None
@@ -2472,32 +2501,6 @@ class NavigateTask(BotTask):
                 "navigation-seam-retry",
                 f"{failed} rejected; trying {crossing}")
         return True
-
-    def _plan_releasing_exclusions(
-            self, client: AtrinikClient) -> list[MapEdge]:
-        """Plan, dropping runtime edge exclusions that leave no route at all.
-
-        An exclusion (a pack-held exit, a seam with no crossing, a stalled
-        click) names a map pair, so it closes every parallel exit between the
-        two maps, and it lasts as long as this task. That is a detour hint,
-        never a wall: live, the stairs out of the Old Outpost were excluded
-        while golems stood on them, and the outpost's only way back to the
-        surface stayed closed for the rest of the trip, so every replan failed
-        ("no component route") and she fought grey golems for half an hour.
-        """
-        try:
-            return self._plan(client)
-        except ValueError:
-            if not self._excluded_edges:
-                raise
-            released = sorted(self._excluded_edges)
-            self._excluded_edges.clear()
-            recorder = getattr(client, "record_action", None)
-            if recorder is not None:
-                recorder("navigation-exclusions-released",
-                         ", ".join(f"{source} -> {destination}"
-                                   for source, destination in released))
-            return self._plan(client)
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
@@ -2568,7 +2571,7 @@ class NavigateTask(BotTask):
             self._issued_click = None
         if not self.route or self.route[0].source != client.state.map.path:
             try:
-                self.route = self._plan_releasing_exclusions(client)
+                self.route = self._plan(client)
             except ValueError as exc:
                 self.fail(str(exc))
                 return
@@ -2600,7 +2603,7 @@ class NavigateTask(BotTask):
                 self._last_action = time.monotonic()
                 return
         if not await self._click_path(client, edge.x, edge.y):
-            self._excluded_edges.add((edge.source, edge.destination))
+            self._exclude_edge(edge)
             try:
                 self.route = self._plan(client)
             except ValueError as exc:
@@ -2690,7 +2693,7 @@ class NavigateThenTask(BotTask):
             return False
         if now - self._pack_exit_stall[1] < self.PACK_EXIT_BYPASS_SECONDS:
             return False
-        self.navigation._excluded_edges.add((edge.source, edge.destination))
+        self.navigation._exclude_edge(edge)
         self.navigation.route = []
         self.navigation._issued_goal = None
         self.navigation._issued_click = None
@@ -4610,17 +4613,20 @@ class FarmCircuitTask(BotTask):
         self._cure_apply_at = 0.0
         self._disease_message_index = 0
         self._disease_suspected = False
-        # A streak of failed-route escapes towards one leg, and the recall it
-        # asked for: (map recalled from, reason). See _recover_failed_navigation.
-        self._route_failure_destination = ""
-        self._route_failure_escapes = 0
-        self._route_failure_at = 0.0
-        self._route_recall: tuple[str, str] | None = None
-        # Kills worth no experience, by map role (see _observe_zero_xp_kills).
+        # Route progress of the leg she travels to (see _observe_leg_progress)
+        # and a requested route recall: (map recalled from, reason, when).
+        self._leg_destination = ""
+        self._leg_best: tuple[int, int] | None = None
+        self._leg_window_at = 0.0
+        self._leg_seen_at = 0.0
+        self._leg_recalls = 0
+        self._leg_progressed_since_recall = False
+        self._route_recall: tuple[str, str, float] | None = None
+        # Kills worth no experience on the spot (see _observe_zero_xp_kills).
         self._zero_xp_message_index: int | None = None
-        self._zero_xp_transit: list[float] = []
-        self._zero_xp_spot: list[float] = []
-        self._zero_xp_spot_exp = 0
+        self._zero_xp_kills: list[float] = []
+        self._zero_xp_exp = 0
+        self._zero_xp_child: NavigateThenTask | None = None
         self._restoration: NavigateThenTask | None = None
         self._restoration_retry_at = 0.0
         self._expedition_origin: tuple[str, int, int] | None = None
@@ -4690,7 +4696,7 @@ class FarmCircuitTask(BotTask):
 
     RECALL_STATE = ("_emergency_recall_source", "_emergency_recall_apply_at",
                     "_emergency_recall_cast_at", "_emergency_recall_origin",
-                    "_emergency_recall_action", "_recall_wand_fired")
+                    "_recall_wand_fired")
 
     def _spot_key(self) -> str:
         return self_improvement.spot_key(self.spot, self.legs)
@@ -4972,42 +4978,117 @@ class FarmCircuitTask(BotTask):
                      + ", ".join(path for path, _ in self.legs))
         return True
 
-    # Escapes from a failing route to one leg before each recall to her
-    # savebed (she then plans again from there), and the total before the leg
-    # is given up as unreachable. Live: about ten escapes a minute, 303 in
-    # half an hour.
-    ROUTE_FAILURE_RECALL_ESCAPES = 10
-    ROUTE_FAILURE_GIVE_UP_ESCAPES = 40
-    # A failure this long after the last one starts a new streak.
-    ROUTE_FAILURE_STREAK_SECONDS = 600.0
+    # A farm leg's route makes progress when fewer route edges remain, or
+    # she is nearer the next one than ever on this trip. Without progress for
+    # LEG_STALL_SECONDS of travel she recalls to her savebed and plans the
+    # leg afresh from there. Without progress for LEG_GIVE_UP_SECONDS after a
+    # recall, or a stall again after LEG_MAX_RECALLS recalls, the leg is
+    # given up as unreachable. Time with a recall pending or in flight, and
+    # time off the trip (farming, maintenance), does not count. Live: about
+    # 300 failed replans in half an hour, each a grey fight.
+    LEG_STALL_SECONDS = 180.0
+    LEG_GIVE_UP_SECONDS = 600.0
+    LEG_MAX_RECALLS = 2
+    # A requested recall that has not moved her by then has failed (no
+    # magic here, an empty wand): the stall clock runs again.
+    ROUTE_RECALL_TIMEOUT_SECONDS = 120.0
     # The server's line for a kill below her skill's green level
     # (attack.c; exp.c calc_level_difference returns 0).
     ZERO_XP_MESSAGE = "wasn't worth any experience"
-    # This many such kills within the window: in transit she is fighting
-    # instead of travelling; on the spot's own maps the spot is wrong for her.
+    # This many such kills on the spot's own maps, with no experience gained
+    # in between, within the window: the spot is wrong for her.
     ZERO_XP_KILLS = 3
     ZERO_XP_WINDOW_SECONDS = 300.0
 
-    def _count_route_failure(self, client: AtrinikClient) -> int:
-        """Count one failed-route escape in the streak towards this leg.
-
-        Only another leg or a quiet spell starts a new streak: neither a
-        recall nor walking onto the next map does, so the limit holds.
-        """
+    def _route_remaining(self, client: AtrinikClient) -> tuple[int, int] | None:
+        """Route edges left and her distance to the next one, if planned."""
         assert self.child is not None
-        destination = self.child.navigation.destination
+        route = self.child.navigation.route
+        m = client.state.map
+        if not route or route[0].source != m.path:
+            return None
+        edge = route[0]
+        return len(route), max(abs(m.world_x - edge.x), abs(m.world_y - edge.y))
+
+    @staticmethod
+    def _recall_in_flight(client: AtrinikClient, farm: FarmTask) -> bool:
+        """Whether a recall is being readied, or cast here and not yet due."""
+        return bool(
+            farm._emergency_recall_apply_at or
+            farm._emergency_recall_cast_at and
+            client.state.map.path == farm._emergency_recall_origin and
+            time.monotonic() - farm._emergency_recall_cast_at <= 30.0)
+
+    def _observe_leg_progress(self, client: AtrinikClient,
+                              farm: FarmTask) -> str:
+        """Watch the trip to the current leg: "", "recall" or "give-up"."""
+        assert self.child is not None
         now = self.clock()
-        if (destination != self._route_failure_destination or
-                now - self._route_failure_at > self.ROUTE_FAILURE_STREAK_SECONDS):
-            self._route_failure_destination = destination
-            self._route_failure_escapes = 0
-        self._route_failure_escapes += 1
-        self._route_failure_at = now
-        return self._route_failure_escapes
+        destination = self.child.navigation.destination
+        if (destination != self._leg_destination or
+                now - self._leg_seen_at > self.FARM_OBSERVATION_GAP_SECONDS):
+            # Another leg, or back from farming or maintenance: a new trip.
+            self._leg_destination = destination
+            self._leg_best = None
+            self._leg_window_at = now
+            self._leg_recalls = 0
+            self._leg_progressed_since_recall = False
+        elif self._route_recall is not None or self._recall_in_flight(
+                client, farm):
+            # A recall is on its way: waiting for it is not a stall.
+            paused = now - self._leg_seen_at
+            self._leg_window_at += paused
+        self._leg_seen_at = now
+        remaining = self._route_remaining(client)
+        if remaining is not None and (
+                self._leg_best is None or remaining < self._leg_best):
+            if self._leg_best is not None:
+                self._leg_window_at = now
+                self._leg_progressed_since_recall = True
+            self._leg_best = remaining
+        if self._route_recall is not None:
+            return ""
+        stalled = now - self._leg_window_at
+        if self._leg_recalls and not self._leg_progressed_since_recall:
+            return "give-up" if stalled >= self.LEG_GIVE_UP_SECONDS else ""
+        if stalled < self.LEG_STALL_SECONDS:
+            return ""
+        if self._leg_recalls >= self.LEG_MAX_RECALLS:
+            return "give-up"
+        self._leg_recalls += 1
+        self._leg_window_at = now
+        self._leg_progressed_since_recall = False
+        return "recall"
+
+    async def _travel_stalled(self, client: AtrinikClient,
+                              farm: FarmTask) -> bool:
+        """Act on a stalled leg; True when this tick is used up."""
+        verdict = self._observe_leg_progress(client, farm)
+        if verdict == "recall":
+            self._request_route_recall(
+                client, f"no route progress for {self.LEG_STALL_SECONDS:.0f}s "
+                f"(recall {self._leg_recalls} of {self.LEG_MAX_RECALLS})")
+            return False
+        if verdict != "give-up":
+            return False
+        assert self.child is not None
+        navigation = self.child.navigation
+        error = (f"no route progress to {navigation.destination} after "
+                 f"{self._leg_recalls} route recall(s)")
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("navigation-route-stalled", error)
+        self._leg_destination = ""
+        navigation.status = TaskStatus.FAILED
+        navigation.error = error
+        if self.analyzer_driven and self._exclude_unreachable_leg(client, farm):
+            return True
+        self.fail(error)
+        return True
 
     def _request_route_recall(self, client: AtrinikClient, reason: str) -> None:
         """Recall to her savebed and plan the leg from there."""
-        self._route_recall = (client.state.map.path, reason)
+        self._route_recall = (client.state.map.path, reason, self.clock())
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder("route-recall-requested",
@@ -5021,25 +5102,38 @@ class FarmCircuitTask(BotTask):
 
         The cast is recorded as "route-failure-recall", not an emergency
         recall: the spot did not fail her, so it is neither quarantined nor
-        reviewed. Between casts she keeps escaping as before. Without a
-        recall source the request lapses, and the escape limit still bounds
-        the trip.
+        reviewed. Between casts she keeps travelling or escaping as before.
+        Without a recall source, or still here after
+        ROUTE_RECALL_TIMEOUT_SECONDS, the request lapses and the stall rule
+        bounds the trip again.
         """
         if self._route_recall is None:
             return False
-        origin, _reason = self._route_recall
+        origin, _reason, requested_at = self._route_recall
         recorder = getattr(client, "record_action", None)
         if client.state.map.path != origin:
-            # Recalled, or she walked off the map: a new route from here,
-            # without the old trip's runtime exclusions.
+            # Recalled, or she walked off the map: a new route from here.
+            # Keep a recall still in flight, as _learn_from_failure does.
             self._route_recall = None
-            self._zero_xp_transit.clear()
+            previous = self.child.task if self.child is not None else None
             self.child = self._new_child()
+            for name in self.RECALL_STATE:
+                if hasattr(previous, name):
+                    setattr(self.child.task, name, getattr(previous, name))
+            # Progress is measured afresh from wherever she now is.
+            self._leg_best = None
             if recorder is not None:
                 recorder("route-recall-replan",
                          f"from {client.state.map.path} to "
                          f"{self.child.navigation.destination}")
             return True
+        if self.clock() - requested_at > self.ROUTE_RECALL_TIMEOUT_SECONDS:
+            self._route_recall = None
+            if recorder is not None:
+                recorder("route-recall-lapsed",
+                         f"still on {origin} after "
+                         f"{self.ROUTE_RECALL_TIMEOUT_SECONDS:.0f}s")
+            return False
         if await farm.emergency_recall(
                 client, ratio=1.0, nearby_count=0, hostile_contact=False,
                 force=True, action="route-failure-recall"):
@@ -5054,50 +5148,40 @@ class FarmCircuitTask(BotTask):
         return False
 
     def _observe_zero_xp_kills(self, client: AtrinikClient) -> bool:
-        """Count kills worth no experience; True once the spot is wrong for her.
+        """Count kills worth no experience on the spot; True once it is wrong.
 
-        Kills on the spot's own maps count against the spot unless she gained
-        experience since the last one; kills elsewhere while she travels to it
-        mean she is fighting instead of travelling, and ask for a route
-        recall. Kills during a maintenance trip count for neither.
+        Only analyzer picks are judged, only kills on the spot's own maps
+        count, and experience gained in between, a new farm child (another
+        leg, another spot, a rebuild after a death) or the window's end
+        starts the count again.
         """
         state = client.state
         if self._zero_xp_message_index is None:
             self._zero_xp_message_index = state.message_count
         entries = state.messages_since(self._zero_xp_message_index)
         self._zero_xp_message_index = state.message_count
-        kills = [float(entry[0]) for entry in entries
-                 if len(entry) > 3 and
-                 self.ZERO_XP_MESSAGE in str(entry[3]).casefold()]
+        if (self.child is not self._zero_xp_child or
+                self._current_exp > self._zero_xp_exp):
+            self._zero_xp_kills.clear()
+        self._zero_xp_child = self.child
+        self._zero_xp_exp = self._current_exp
+        if (not self.analyzer_driven or self.child is None or
+                state.map.path not in {leg for leg, _ in self.legs}):
+            return False
         now = time.time()
-        for bucket in (self._zero_xp_transit, self._zero_xp_spot):
-            bucket[:] = [stamp for stamp in bucket
-                         if now - stamp <= self.ZERO_XP_WINDOW_SECONDS]
-        if not kills or self.child is None:
+        self._zero_xp_kills[:] = [
+            stamp for stamp in self._zero_xp_kills
+            if now - stamp <= self.ZERO_XP_WINDOW_SECONDS]
+        self._zero_xp_kills.extend(
+            float(entry[0]) for entry in entries
+            if len(entry) > 3 and
+            self.ZERO_XP_MESSAGE in str(entry[3]).casefold())
+        if len(self._zero_xp_kills) < self.ZERO_XP_KILLS:
             return False
-        path = state.map.path
-        if path in {leg for leg, _ in self.legs}:
-            if self._current_exp > self._zero_xp_spot_exp:
-                self._zero_xp_spot.clear()
-            self._zero_xp_spot_exp = self._current_exp
-            self._zero_xp_spot.extend(kills)
-            if len(self._zero_xp_spot) >= self.ZERO_XP_KILLS:
-                count = len(self._zero_xp_spot)
-                self._zero_xp_spot.clear()
-                self._learn_zero_xp_spot(client, path, count)
-                return True
-            return False
-        if (self._resupply is not None or
-                any(task is not None for task in self._maintenance_services())):
-            return False
-        self._zero_xp_transit.extend(kills)
-        if (len(self._zero_xp_transit) >= self.ZERO_XP_KILLS and
-                self._route_recall is None):
-            count = len(self._zero_xp_transit)
-            self._zero_xp_transit.clear()
-            self._request_route_recall(
-                client, f"{count} kills worth no experience on the way")
-        return False
+        count = len(self._zero_xp_kills)
+        self._zero_xp_kills.clear()
+        self._learn_zero_xp_spot(client, state.map.path, count)
+        return True
 
     def _learn_zero_xp_spot(self, client: AtrinikClient, path: str,
                             kills: int) -> None:
@@ -5143,28 +5227,13 @@ class FarmCircuitTask(BotTask):
         if not threats and not recent_hostile_contact(client, seconds=15.0):
             return False
         error = navigation.error
-        recorder = getattr(client, "record_action", None)
-        escapes = self._count_route_failure(client)
-        if escapes >= self.ROUTE_FAILURE_GIVE_UP_ESCAPES:
-            # Not even a recall got her off this map: stop escaping and let
-            # the caller treat the leg as unreachable.
-            if recorder is not None:
-                recorder("navigation-route-failure-limit",
-                         f"{escapes} escapes on {client.state.map.path}: {error}")
-            self._route_failure_destination = ""
-            self._route_failure_escapes = 0
-            self._route_recall = None
-            return False
-        if (escapes % self.ROUTE_FAILURE_RECALL_ESCAPES == 0 and
-                self._route_recall is None):
-            self._request_route_recall(
-                client, f"{escapes} failed routes: {error}")
         navigation.status = TaskStatus.RUNNING
         navigation.error = ""
         navigation.route = []
         navigation._issued_goal = None
         navigation._issued_click = None
         navigation._last_progress = time.monotonic()
+        recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder("navigation-route-failure-escape", error)
         if await self.child._defend_while_navigating(client):
@@ -7180,6 +7249,9 @@ class FarmCircuitTask(BotTask):
         # until the next circuit map is reached.
         if client.state.map.path != self.child.navigation.destination:
             self._reset_dwell_off_farm(client.state.map.path)
+            if (isinstance(farm, FarmTask) and
+                    await self._travel_stalled(client, farm)):
+                return
             hp = int(client.state.stats.get("hp", 0) or 0)
             maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
             if hp / maxhp <= self.child.safety.flee_below:
