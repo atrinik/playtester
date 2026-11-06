@@ -3148,11 +3148,15 @@ class FarmTask(BotTask):
     async def restore_combat_loadout(self, client: AtrinikClient) -> bool:
         """Unready stale launchers and one-shot maintenance devices.
 
-        A recall device readied and not yet fired is left alone: unreadying
-        it between the apply and the fire cancels the recall every tick.
+        A recall device readied by emergency_recall is left alone for that
+        apply's own window: unreadying it before the fire cancels the recall.
+        A stale apply never keeps it readied.
         """
-        readying = (self._emergency_recall_source
-                    if self._emergency_recall_apply_at else 0)
+        readying = (
+            self._emergency_recall_source
+            if self._emergency_recall_apply_at and
+            time.monotonic() - self._emergency_recall_apply_at <=
+            self.RECALL_APPLY_WINDOW_SECONDS else 0)
         ranged_item = next((
             item for item in client.state.inventory
             if (item.item_type in (c.TYPE_ROD, c.TYPE_WAND) or
@@ -4355,6 +4359,10 @@ class FarmTask(BotTask):
         self._last_action = now
         return True
 
+    # How long a readied recall device waits for its applied state before
+    # the apply is abandoned (emergency_recall, restore_combat_loadout).
+    RECALL_APPLY_WINDOW_SECONDS = 3.0
+
     @staticmethod
     def emergency_recall_candidates(client: AtrinikClient) -> list[Item]:
         """Return paid, identified recall sources in survival-first order.
@@ -4415,20 +4423,13 @@ class FarmTask(BotTask):
     async def emergency_recall(self, client: AtrinikClient, *, ratio: float,
                                nearby_count: int,
                                hostile_contact: bool,
-                               healing_outpaced: bool = False,
-                               force: bool = False,
-                               action: str = "emergency-recall") -> bool:
+                               healing_outpaced: bool = False) -> bool:
         """Start Word of Recall during a likely-fatal retreat.
 
         The server's recall force keeps building while the player moves and
         takes damage, so subsequent ticks continue normal retreat instead of
         standing still. This method returns true only while readying/firing a
         device consumes the current action tick.
-
-        ``force`` recalls whatever her health (a route that keeps failing).
-        The cast is recorded as ``action`` of the call that fires it, so a
-        device readied by one caller and fired by another is recorded for
-        the cast, not the earlier apply.
         """
         now = time.monotonic()
         if self._recall_wand_fired is not None:
@@ -4466,13 +4467,14 @@ class FarmTask(BotTask):
                 self._emergency_recall_origin = client.state.map.path
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
-                    recorder(action, f"via {source.name}")
+                    recorder("emergency-recall", f"via {source.name}")
                 return True
-            if now - self._emergency_recall_apply_at <= 3.0:
+            if (now - self._emergency_recall_apply_at <=
+                    self.RECALL_APPLY_WINDOW_SECONDS):
                 return True
             self._emergency_recall_apply_at = 0.0
             self._emergency_recall_source = 0
-        if not hostile_contact and not force:
+        if not hostile_contact:
             return False
         healing_costs = [
             int(item.extra.get("cost", 0) or 0)
@@ -4492,7 +4494,7 @@ class FarmTask(BotTask):
             healing_exhausted and ratio <= self.safety.flee_below or
             healing_outpaced and ratio <= self.safety.heal_below
         )
-        if not critical and not force:
+        if not critical:
             return False
         candidates = self.emergency_recall_candidates(client)
         if not candidates:
@@ -4514,7 +4516,7 @@ class FarmTask(BotTask):
         self._emergency_recall_origin = client.state.map.path
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
-            recorder(action, f"via {source.name}")
+            recorder("emergency-recall", f"via {source.name}")
         return True
 
     async def check_recall_wand(self, client: AtrinikClient) -> None:

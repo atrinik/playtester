@@ -57,7 +57,7 @@ FIGHTING_ACTIONS = frozenset({
 RESTING_ACTIONS = frozenset({"training-rest", "navigation-recovery-hold"})
 TRAVELLING_ACTIONS = frozenset({
     "step", "retreat", "pathfind", "approach-step", "savebed-move",
-    "emergency-recall", "route-failure-recall",
+    "emergency-recall",
 })
 SHOPPING_ACTIONS = frozenset({
     "talk", "dialogue-stock-buy", "temple-service", "temple-food",
