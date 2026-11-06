@@ -406,7 +406,7 @@ steps away and keeps her distance.
   which she does not have.
 - **Hazardous for her kit.** Each farm failure review now stores the
   analyzer's combat profile she failed with. A spot with three pack or
-  out-damaged failures in 24 hours (`KIT_HAZARD_FAILURES`), each with the
+  out-damaged failures, or approach deaths, in 24 hours (`KIT_HAZARD_FAILURES`), each with the
   same survivability as hers now, is hazardous for her kit. Survivability
   (`CombatProfile.same_survivability`) is maximum health within 10%, armour
   class within 2, total protections within 5 and character level within 2;
@@ -417,6 +417,15 @@ steps away and keeps her distance.
   idle. No map names are listed; maps qualify by their record. Live, the
   treant maps had eight such deaths in 90 minutes, `world_16_74` alone five;
   the underground city had two, so it qualifies on a third.
+  The hazard is judged per area, not per circuit: the analyzer ranks
+  several overlapping circuits for one area (two for the underground city,
+  three for the burnt forest), and live she moved to a sibling circuit after
+  each one was marked, dying about three times an hour. A candidate spot
+  counts the failures of every adaptation record whose spot shares a map
+  with it (each record keeps its spot's maps), plus failures recorded on
+  one of its maps. A death on the way to a spot (`route`) counts for that
+  spot too; an emergency recall on the way does not. Live, 22 such approach
+  failures at the underground city had not counted.
 - **Healing outpaced.** From the first heal in the last 8 s on, when the
   hits taken are at least what the later heals restored (her health at the
   latest heal is no higher than at the first), healing has stopped keeping

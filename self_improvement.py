@@ -38,10 +38,12 @@ HEAL_STEP, HEAL_CAP = 0.02, 0.98
 PAUSE_FAILURES, PAUSE_WINDOW_SECONDS = 3, 3600.0
 PAUSE_SECONDS = 3600.0
 KEEP_REVIEWS = 10
-# A spot where this many pack or out-damaged failures happened with one
-# combat kit, within the window, is hazardous for that kit: the analyzer
-# ranks it, but her kit cannot hold it. Tighter margins did not help: live,
-# ten deaths in about 90 minutes on the treant and underground-city maps.
+# An area where this many pack or out-damaged failures, or deaths on the
+# way to it, happened with one combat kit, within the window, is hazardous
+# for that kit: the analyzer ranks it, but her kit cannot hold it. Tighter
+# margins did not help: live, ten deaths in about 90 minutes on the treant
+# and underground-city maps. The analyzer ranks several overlapping circuits
+# for one area, so failures count for every spot sharing a map (kit_hazard).
 KIT_HAZARD_FAILURES = 3
 KIT_HAZARD_WINDOW_SECONDS = 24 * 3600.0
 KIT_HAZARD_CAUSES = frozenset({"pack", "out-damaged"})
@@ -212,11 +214,12 @@ def remedies(review: FailureReview) -> tuple[str, ...]:
 
 
 def learn(record: dict, review: FailureReview, *, now: float | None = None,
-          kit: dict | None = None) -> tuple[dict, bool]:
+          kit: dict | None = None, maps: Iterable[str] = ()) -> tuple[dict, bool]:
     """Fold a review into a spot's adaptation record; return (record, pause).
 
     ``kit`` describes the combat profile she failed with (the analyzer's),
-    kept with the failure for ``kit_hazard``.
+    kept with the failure for ``kit_hazard``; ``maps`` are the spot's maps,
+    kept so that its failures also count for overlapping spots.
     """
     now = time.time() if now is None else now
     record = dict(record or {})
@@ -239,29 +242,67 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
                     now - float(entry.get("time", 0.0) or 0.0) <=
                     KIT_HAZARD_WINDOW_SECONDS]
     kit_failures.append({"time": review.time, "cause": review.cause,
+                         "kind": review.kind, "map": review.map,
                          "kit": dict(kit or {})})
+    maps = sorted(set(maps))
+    if maps:
+        record["maps"] = maps
     record.update(level=min(MAX_LEVEL, level + 1), failures=failures[-PAUSE_FAILURES:],
                   causes=causes, reviews=reviews, updated_at=now,
                   kit_failures=kit_failures[-KEEP_REVIEWS:])
     return record, pause
 
 
-def kit_hazard(record: dict | None, same_kit: Callable[[dict], bool], *,
-               now: float | None = None) -> bool:
-    """Whether a spot is hazardous for the kit ``same_kit`` accepts.
+def hazard_failure(entry: dict) -> bool:
+    """Whether a kit failure counts toward a kit hazard.
 
-    True after KIT_HAZARD_FAILURES pack or out-damaged failures within the
-    window, each with a kit ``same_kit`` judges the same as hers now. A
-    materially different kit (the analyzer's own test) clears it, and so does
-    time.
+    Pack and out-damaged failures on the spot count, and so does a death on
+    the way to it ("route"); an emergency recall on the way does not.
+    """
+    cause = entry.get("cause")
+    return cause in KIT_HAZARD_CAUSES or (
+        cause == "route" and entry.get("kind") == "death")
+
+
+def record_maps(key: str, record: dict) -> set[str]:
+    """The maps of the spot an adaptation record belongs to.
+
+    Records stored before the maps were kept fall back to the map paths in
+    their key (spot_key joins a circuit's maps).
+    """
+    maps = record.get("maps")
+    if isinstance(maps, (list, tuple)):
+        return {str(path) for path in maps}
+    return {part for part in str(key).split("|") if part.startswith("/")}
+
+
+def kit_hazard(adaptations: dict | None, maps: Iterable[str],
+               same_kit: Callable[[dict], bool], *,
+               now: float | None = None) -> bool:
+    """Whether the area of a spot on ``maps`` is hazardous for a kit.
+
+    True after KIT_HAZARD_FAILURES qualifying failures (hazard_failure)
+    within the window, each with a kit ``same_kit`` judges the same as hers
+    now, summed over every adaptation record whose spot shares a map with
+    ``maps``, plus failures elsewhere that happened on one of ``maps``. The
+    analyzer ranks overlapping circuits for one area; each must not need its
+    own deaths. A materially different kit (the analyzer's own test) clears
+    it, and so does time.
     """
     now = time.time() if now is None else now
-    return sum(
-        1 for entry in (record or {}).get("kit_failures", ())
-        if isinstance(entry, dict) and
-        entry.get("cause") in KIT_HAZARD_CAUSES and
-        now - float(entry.get("time", 0.0) or 0.0) <= KIT_HAZARD_WINDOW_SECONDS and
-        same_kit(entry.get("kit") or {})) >= KIT_HAZARD_FAILURES
+    maps = set(maps)
+    count = 0
+    for key, record in (adaptations or {}).items():
+        if not isinstance(record, dict):
+            continue
+        shared = bool(record_maps(key, record) & maps)
+        count += sum(
+            1 for entry in record.get("kit_failures", ())
+            if isinstance(entry, dict) and hazard_failure(entry) and
+            (shared or entry.get("map") in maps) and
+            now - float(entry.get("time", 0.0) or 0.0) <= KIT_HAZARD_WINDOW_SECONDS and
+            same_kit(entry.get("kit") or {}))
+    return count >= KIT_HAZARD_FAILURES
 
 
 def improvement_goals(adaptations: dict) -> dict[str, Any]:
