@@ -35,6 +35,8 @@ class AutoplayTask(BotTask):
     # level 24 (troll elite soldiers): wait until she outlevels them well.
     MANA_CRYSTAL_UPGRADE_LEVEL = 30
     MANA_CRYSTAL_UPGRADE_RETRY = 24 * 60 * 60
+    # A priest whose food trip failed is passed over this long.
+    TEMPLE_PRIEST_RETRY = 60 * 60
 
     def __init__(self, graph: WorldGraph, *, target_level: int = 115):
         super().__init__(f"autoplay:level-{max(1, int(target_level))}")
@@ -49,6 +51,13 @@ class AutoplayTask(BotTask):
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
         self._temple_food_retry_at = 0.0
+        # Priests whose food trip failed, until when they are passed over.
+        self._failed_priests: dict[str, float] = {}
+        # The farm circuit a temple food trip interrupted. It resumes
+        # afterwards with its maintenance backoffs intact: a fresh circuit
+        # forgets them and starts the same errand again (live: the trip to a
+        # full apartment chest, every half hour for a day, and no farming).
+        self._paused_circuit: FarmCircuitTask | None = None
         self.safety = SafetyPolicy()
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
@@ -79,13 +88,21 @@ class AutoplayTask(BotTask):
 
     async def _start_temple_food(self, client: AtrinikClient) -> bool:
         """Pause the current phase for the free temple food service."""
-        trip = temple_food_trip(self.graph, client)
+        now = time.monotonic()
+        self._failed_priests = {
+            name: until for name, until in self._failed_priests.items()
+            if until > now}
+        trip = temple_food_trip(self.graph, client,
+                                exclude=tuple(self._failed_priests))
         if trip is None:
             self._temple_food_retry_at = (
-                time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+                now + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
             log.warning("starving, but no temple priest is reachable")
             return False
         paused = f"{self.phase}: {self.child.name}" if self.child else "idle"
+        if (self.phase == "adaptive-farming" and
+                isinstance(self.child, FarmCircuitTask)):
+            self._paused_circuit = self.child
         if self.phase == "mana-crystal-recovery":
             # Interrupted before an outcome; it runs again once she has eaten.
             self._mana_recovery_attempted = False
@@ -99,6 +116,52 @@ class AutoplayTask(BotTask):
             recorder("autoplay-hunger",
                      f"food {int(client.state.stats.get('food', 0) or 0)}; "
                      f"paused {paused}")
+        return True
+
+    async def _temple_food_failed(self, client: AtrinikClient) -> bool:
+        """Settle a failed temple food trip; True when it was handled.
+
+        That priest is passed over for a while, and the nearest other one
+        reachable from where she now stands is tried at once: live, Sera
+        retried an unreachable Talrain every cycle while Friar Marcus, who
+        fed her each time, was a few maps away. With none, the interrupted
+        farm circuit resumes and feeds her itself (a priest or the shop);
+        without one either, the caller's ordinary retry backoff applies.
+        """
+        assert self.child is not None
+        failed = f"{self.phase}: {self.child.name}: {self.child.error}"
+        priest = getattr(getattr(self.child, "task", None), "priest", "")
+        if priest:
+            self._failed_priests[priest] = (
+                time.monotonic() + self.TEMPLE_PRIEST_RETRY)
+        if hungry(client) and await self._start_temple_food(client):
+            outcome = "another priest"
+        else:
+            self._temple_food_retry_at = (
+                time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+            if self._paused_circuit is None:
+                return False
+            await client.clear_actions()
+            await client.set_combat(False)
+            await client.clear_target()
+            self.child = None
+            self._resume_paused_circuit(client)
+            outcome = "farm circuit resumed"
+        log.warning("autoplay temple food failed: %s; %s", failed, outcome)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("autoplay-retry", f"{failed}; {outcome}")
+        return True
+
+    def _resume_paused_circuit(self, client: AtrinikClient) -> bool:
+        """Hand control back to the farm circuit a food trip interrupted."""
+        circuit, self._paused_circuit = self._paused_circuit, None
+        if circuit is None or circuit.status != TaskStatus.RUNNING:
+            return False
+        self.phase, self.child = "adaptive-farming", circuit
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("autoplay-phase", f"adaptive-farming: {circuit.name} (resumed)")
         return True
 
     def _needs_mana_crystal_start(self, client: AtrinikClient) -> bool:
@@ -202,6 +265,8 @@ class AutoplayTask(BotTask):
 
     async def _set_child(self, client: AtrinikClient, phase: str,
                          child: BotTask) -> None:
+        if phase != "temple-food":
+            self._paused_circuit = None
         self.phase = phase
         self.child = child
         await child.start(client)
@@ -269,15 +334,15 @@ class AutoplayTask(BotTask):
                     # The interrupted recovery never ran to an outcome.
                     self._mana_recovery_attempted = False
                 self.child = None
+                self._paused_circuit = None
                 raise
             if self.child.status not in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
                 return
             if self.child.status == TaskStatus.FAILED:
                 if self.phase == "temple-food":
-                    self._temple_food_retry_at = (
-                        time.monotonic() +
-                        FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+                    if await self._temple_food_failed(client):
+                        return
                 elif self.phase == "mana-crystal-upgrade":
                     # A long, hostile trip: do not repeat it every few
                     # minutes when it cannot succeed.
@@ -289,6 +354,8 @@ class AutoplayTask(BotTask):
             self.child = None
             self._consecutive_failures = 0
             self._retry_at = 0.0
+            if completed_phase == "temple-food" and self._resume_paused_circuit(client):
+                return
             if completed_phase == "intro-quest":
                 self._intro_complete = True
             elif completed_phase == "mana-crystal-starter":

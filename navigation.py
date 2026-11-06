@@ -1742,23 +1742,26 @@ class NavigateTask(BotTask):
         hazards = getattr(client.state, "route_hazards", None) or {}
         return {path for path, until in hazards.items() if until > now}
 
-    def _plan(self, client: AtrinikClient) -> list[MapEdge]:
+    def _plan(self, client: AtrinikClient, *,
+              origin: tuple[str, tuple[int, int]] | None = None) -> list[MapEdge]:
         # Learned hazards are a cost, never a wall: one search finds the route
         # that enters as few of them as it can. They never make a trip
         # unroutable or change which other hazards are relaxed, and leaving
         # the map she stands on is free while re-entering it is not.
+        # ``origin`` plans from another (map, tile) than where she stands.
         learned = self._learned_route_hazards(client)
         if self.strict_safety:
-            return self._plan_strict(client, learned)
-        route = self._plan_avoiding(client, learned)
+            return self._plan_strict(client, learned, origin)
+        route = self._plan_avoiding(client, learned, origin)
         if any(edge.destination in learned for edge in route):
             # Entering a map that killed her, the destination included, is
             # never "threat-free" when choosing between optional destinations.
             self._threat_fallback = True
         return route
 
-    def _plan_strict(self, client: AtrinikClient,
-                     learned: set[str]) -> list[MapEdge]:
+    def _plan_strict(self, client: AtrinikClient, learned: set[str],
+                     origin: tuple[str, tuple[int, int]] | None = None,
+                     ) -> list[MapEdge]:
         """Route around every known hazard, or raise ValueError.
 
         Ranged maps count at any level here: a depleted character is fragile
@@ -1768,7 +1771,9 @@ class NavigateTask(BotTask):
         graph would otherwise enter it): the trip waits, for example until a
         map that killed her stops counting.
         """
-        source = client.state.map.path
+        source, source_xy = origin or (
+            client.state.map.path,
+            (client.state.map.world_x, client.state.map.world_y))
         avoided = (
             self._known_ranged_hazard_maps(client, any_level=True) |
             self._known_overlevel_hazard_maps(client) |
@@ -1778,12 +1783,7 @@ class NavigateTask(BotTask):
         if self.destination != source and self.destination in avoided:
             raise ValueError(
                 f"{self.destination} is itself a known hazard")
-        args = (
-            source,
-            (client.state.map.world_x, client.state.map.world_y),
-            self.destination,
-            self._goal_points(),
-        )
+        args = (source, source_xy, self.destination, self._goal_points())
         kwargs = {
             "allow_locked": self._allow_locked(client),
             "excluded": self._excluded_edges,
@@ -1804,15 +1804,13 @@ class NavigateTask(BotTask):
         self._route_threat_maps = set()
         return route
 
-    def _plan_avoiding(self, client: AtrinikClient,
-                       penalized: set[str]) -> list[MapEdge]:
-        source = client.state.map.path
-        args = (
-            source,
-            (client.state.map.world_x, client.state.map.world_y),
-            self.destination,
-            self._goal_points(),
-        )
+    def _plan_avoiding(self, client: AtrinikClient, penalized: set[str],
+                       origin: tuple[str, tuple[int, int]] | None = None,
+                       ) -> list[MapEdge]:
+        source, source_xy = origin or (
+            client.state.map.path,
+            (client.state.map.world_x, client.state.map.world_y))
+        args = (source, source_xy, self.destination, self._goal_points())
         ranged_hazards = self._known_ranged_hazard_maps(client)
         overlevel_hazards = self._known_overlevel_hazard_maps(client)
         pack_hazards = self._known_pack_hazard_maps(source)
@@ -4120,15 +4118,42 @@ def hungry(client: AtrinikClient) -> bool:
             int(client.state.stats.get("food", 1000) or 0) < 180)
 
 
-def temple_food_trip(graph: "WorldGraph",
-                     client: AtrinikClient) -> NavigateThenTask | None:
-    """Route to the nearest priest reachable without a threat fallback."""
+def apartment_exit_origin(
+        client: AtrinikClient) -> tuple[str, tuple[int, int]] | None:
+    """Where leaving the apartment she stands in really puts her.
+
+    The graph gives an apartment a static exit to every entrance in its
+    region, so a route planned from inside one can start from a teleporter
+    she will never arrive at. Live: inside her apartment Sera ranked Talrain
+    one hop away, left to her recorded return on world_4_45, and found no
+    route to him from there. None outside an apartment or before leaving it
+    has shown where its exit leads.
+    """
+    path = client.state.map.path
+    if "/apartments/" not in path:
+        return None
+    back = (getattr(client.state, "apartment_returns", {}) or {}).get(path)
+    if not back:
+        return None
+    return back[0], (int(back[1][0]), int(back[1][1]))
+
+
+def temple_food_trip(graph: "WorldGraph", client: AtrinikClient, *,
+                     exclude: Iterable[str] = ()) -> NavigateThenTask | None:
+    """Route to the nearest priest reachable without a threat fallback.
+
+    Priests named in ``exclude`` (whose trip just failed) are passed over.
+    """
     ranked = []
+    origin = apartment_exit_origin(client)
+    excluded = {name.casefold() for name in exclude}
     for priest in graph.temple_priests:
+        if priest.name.casefold() in excluded:
+            continue
         navigation = NavigateTask(
             graph, priest.map_path, (priest.x, priest.y), tolerance=2)
         try:
-            route = navigation._plan(client)
+            route = navigation._plan(client, origin=origin)
         except ValueError:
             continue
         if not navigation._threat_fallback:
@@ -5332,7 +5357,8 @@ class FarmCircuitTask(BotTask):
             navigation = NavigateTask(
                 self.graph, vendor.map_path, (vendor.x, vendor.y), tolerance=2)
             try:
-                route = navigation._plan(client)
+                route = navigation._plan(
+                    client, origin=apartment_exit_origin(client))
             except ValueError:
                 continue
             if not navigation._threat_fallback:
@@ -5587,12 +5613,17 @@ class FarmCircuitTask(BotTask):
     # it retries shortly, once farming has moved her somewhere it routes from
     # (or a map that killed her stops counting), never after a long backoff.
     STRICT_ROUTE_RETRY_SECONDS = 120.0
+    # A full apartment chest stays full until a later visit has taken
+    # sellable stock back out and sold it; do not walk back every half hour.
+    STORAGE_FULL_RETRY_SECONDS = 6 * 3600.0
 
     @classmethod
     def failure_backoff(cls, error: str, default: float) -> float:
         if ("avoiding every known hazard" in error or
                 "is itself a known hazard" in error):
             return cls.STRICT_ROUTE_RETRY_SECONDS
+        if error.startswith(DepositItemsTask.STORAGE_FULL):
+            return cls.STORAGE_FULL_RETRY_SECONDS
         return default
 
     @classmethod

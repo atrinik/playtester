@@ -32,7 +32,7 @@ from .catalog_quest_tasks import (ApplyAtTask, ApplyGroundTask, ArrivedTask,
                                   KeyThenContainerTask, LostMemoriesArrivalTask,
                                   NPC, POLICIES, RECOMMENDED_QUEST_ORDER)
 from .client import AtrinikClient, ClientConfig
-from .tasks import (BankBalanceTask, BankTask, BindSavebedTask,
+from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
                     BuyShopUpgradeTask, CasterProfile,
                     DepositItemsTask, FarmTask, InventoryCapabilityTask,
@@ -95,6 +95,17 @@ class StubAnalyzer:
     def snapshot(self, objective):
         return {"status": self.status, "objective": objective,
                 "ranking": self.ranking(objective)[:5]}
+
+
+class TempleTrip(BotTask):
+    """A temple food trip that stays where a test puts it."""
+
+    def __init__(self, priest):
+        super().__init__(f"navigate-then:temple:food:{priest}")
+        self.task = TempleFoodTask(priest)
+
+    async def tick(self, client):
+        pass
 
 
 class ProtocolTests(unittest.TestCase):
@@ -11615,8 +11626,10 @@ class QuestTests(unittest.TestCase):
         autoplay._mana_recovery_attempted = True
         trips = []
 
-        def trip(graph, client):
+        def trip(graph, client, exclude=()):
             trips.append(client.state.stats["food"])
+            if "Saruthar" in exclude:
+                return None
             return NavigateThenTask(graph, "/temple", TempleFoodTask("Saruthar"))
 
         with patch.object(autoplay_module, "temple_food_trip", trip):
@@ -11634,10 +11647,12 @@ class QuestTests(unittest.TestCase):
                       if record["action"] == "autoplay-hunger"]
             self.assertEqual(hunger, ["food 100; paused mana-crystal-recovery: "
                                       "navigate-then:retrieve:chest"])
-            # A failed trip waits before the next one, then tries again even
-            # with nothing else to schedule.
+            # A failed trip passes that priest over; with no other one it
+            # waits before the next, then tries again even with nothing
+            # else to schedule.
             autoplay.child.fail("no route")
             asyncio.run(autoplay.tick(client))
+            self.assertEqual(trips, [100, 100])
             self.assertIsNone(autoplay.child)
             self.assertEqual(autoplay.phase, "temple-food")
             self.assertFalse(autoplay._needs_temple_food(client))
@@ -11668,11 +11683,126 @@ class QuestTests(unittest.TestCase):
             client.state.inventory_replay_complete = True
         # No reachable priest: keep going, and look again later.
         autoplay.phase, autoplay.child = "mana-crystal-recovery", walk
-        with patch.object(autoplay_module, "temple_food_trip", lambda graph, client: None):
+        with patch.object(autoplay_module, "temple_food_trip", lambda graph, client, **_: None):
             self.assertTrue(autoplay._needs_temple_food(client))
             self.assertFalse(asyncio.run(autoplay._start_temple_food(client)))
             self.assertIs(autoplay.child, walk)
             self.assertFalse(autoplay._needs_temple_food(client))
+
+    def test_temple_food_is_ranked_from_where_the_apartment_exit_leads(self):
+        from .navigation import temple_food_trip
+
+        graph = built_graph()
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 34, "food": 179})
+        client.state.map.path = STARTER_APARTMENT
+        client.state.map.world_x, client.state.map.world_y = 1, 3
+        # Live: leaving her apartment put Sera on world_4_45, where the
+        # temple ranked nearest from inside (Talrain, through a static exit
+        # she never takes) has no route; Friar Marcus fed her every time.
+        client.state.apartment_returns = {
+            STARTER_APARTMENT: ("/shattered_islands/world_4_45", (19, 4))}
+        trip = temple_food_trip(graph, client)
+        self.assertEqual(trip.task.priest, "Friar Marcus")
+        self.assertEqual(trip.navigation.destination,
+                         "/shattered_islands/world_6_44_1")
+        # A priest whose trip just failed is passed over for the next.
+        other = temple_food_trip(graph, client, exclude=("friar marcus",))
+        self.assertNotIn(other.task.priest, ("Friar Marcus", "Talrain"))
+
+    def test_autoplay_falls_back_to_another_priest_and_resumes_the_circuit(self):
+        from . import autoplay as autoplay_module
+
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 34, "hp": 306, "maxhp": 306, "food": 179})
+
+        async def send(packet):
+            pass
+
+        client.send = send
+        graph = WorldGraph()
+        autoplay = AutoplayTask(graph, target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay._intro_complete = True
+        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
+        circuit.status = TaskStatus.RUNNING
+        # Its storage trip outlasts her food, so autoplay feeds her; the
+        # backoffs the circuit holds must survive the detour.
+        circuit._storage = NavigateThenTask(graph, STARTER_APARTMENT,
+                                            DepositItemsTask("chest"))
+        circuit._resupply_retry_at = 1e12
+        autoplay.phase, autoplay.child = "adaptive-farming", circuit
+        asked = []
+
+        def trip(graph, client, exclude=()):
+            asked.append(tuple(exclude))
+            for priest in ("Talrain", "Friar Marcus"):
+                if priest not in exclude:
+                    return TempleTrip(priest)
+            return None
+
+        with patch.object(autoplay_module, "temple_food_trip", trip):
+            asyncio.run(autoplay.tick(client))
+            self.assertEqual(autoplay.phase, "temple-food")
+            self.assertEqual(autoplay.child.task.priest, "Talrain")
+            # No route to Talrain from where she really is: the friar next,
+            # at once, not another farm cycle later.
+            autoplay.child.fail("no component route to /shattered_islands/world_9_69")
+            asyncio.run(autoplay.tick(client))
+            self.assertEqual(autoplay.phase, "temple-food")
+            self.assertEqual(autoplay.child.task.priest, "Friar Marcus")
+            self.assertEqual(asked, [(), ("Talrain",)])
+            # Fed, she goes back to the same circuit, not a fresh one that
+            # has forgotten every backoff.
+            autoplay.child.complete()
+            asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        self.assertIs(autoplay.child, circuit)
+        self.assertEqual(circuit._resupply_retry_at, 1e12)
+        retries = [record["detail"] for record in client.decision_history
+                   if record["action"] == "autoplay-retry"]
+        self.assertEqual(len(retries), 1)
+        self.assertIn("another priest", retries[0])
+
+    def test_autoplay_resumes_the_circuit_when_no_other_priest_is_reachable(self):
+        from . import autoplay as autoplay_module
+
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 34, "hp": 306, "maxhp": 306, "food": 179})
+
+        async def send(packet):
+            pass
+
+        client.send = send
+        graph = WorldGraph()
+        autoplay = AutoplayTask(graph, target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay._intro_complete = True
+        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
+        circuit.status = TaskStatus.RUNNING
+        circuit._storage = NavigateThenTask(graph, STARTER_APARTMENT,
+                                            DepositItemsTask("chest"))
+        autoplay.phase, autoplay.child = "adaptive-farming", circuit
+
+        def trip(graph, client, exclude=()):
+            if "Talrain" in exclude:
+                return None
+            return TempleTrip("Talrain")
+
+        with patch.object(autoplay_module, "temple_food_trip", trip):
+            asyncio.run(autoplay.tick(client))
+            autoplay.child.fail("no component route")
+            asyncio.run(autoplay.tick(client))
+        # The circuit feeds her itself (the friar or the shop) and keeps its
+        # state; autoplay does not try the same temple again for a while.
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        self.assertIs(autoplay.child, circuit)
+        self.assertEqual(autoplay._retry_at, 0.0)
+        self.assertFalse(autoplay._needs_temple_food(client))
+        self.assertIn("Talrain", autoplay._failed_priests)
 
     def test_autoplay_recovers_started_mana_crystal_from_apartment(self):
         client = self._combat_client()
@@ -12551,6 +12681,85 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(client.moves, [(7, 91)])
         self.assertEqual(task.status, TaskStatus.RUNNING)
+
+    def test_deposit_into_a_full_chest_offers_each_item_once_then_fails(self):
+        # Live: a full spruce chest answered "That won't fit" four times a
+        # second for twenty minutes while the same items were offered again.
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.stats["weight_limit"] = 100
+                chest = Item(90, flags=c.ITEM_CONTAINER_OPEN,
+                             name="spruce chest (open) (active)")
+                self.state.place_item(chest, 0)
+                self.state.place_item(Item(91, item_type=c.TYPE_BOOK, quality=80,
+                                           name="book of tales"), chest.tag)
+                for tag in (81, 82):
+                    self.state.place_item(Item(
+                        tag, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
+                        quality=90, condition=100, name=f"ring {tag}"), 7)
+                self.moves = []
+
+            async def move_item(self, destination, tag, quantity=0):
+                self.moves.append((destination, tag))
+                if destination == 7:
+                    self.state.place_item(self.state.items[tag], 7)
+
+            async def apply(self, tag):
+                raise AssertionError("open chest should not be reopened")
+
+        client = FakeClient()
+        task = DepositItemsTask(
+            "chest", unidentified_only=True, valuable_only=True,
+            then_retrieve=RetrieveItemsTask(
+                "chest", predicate=InventoryPolicy().sellable_junk,
+                max_weight_ratio=0.8))
+        task._opened = True
+        for _ in range(20):
+            asyncio.run(task.tick(client))
+        # Each ring is offered once and the chest is not asked again while
+        # the server may still be answering.
+        self.assertEqual(client.moves, [(90, 81), (90, 82)])
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        # Unanswered past the confirmation window, the rings were refused:
+        # sellable stock still comes out, then the visit ends as full.
+        for tag in task._sent:
+            task._sent[tag] -= DepositItemsTask.MOVE_CONFIRM_SECONDS
+        for _ in range(5):
+            asyncio.run(task.tick(client))
+        self.assertEqual(client.moves, [(90, 81), (90, 82), (7, 91)])
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertTrue(task.error.startswith(DepositItemsTask.STORAGE_FULL))
+        self.assertEqual(task.refused, 2)
+        # The farm circuit then leaves the chest alone for hours, not the
+        # usual half hour.
+        self.assertEqual(FarmCircuitTask.failure_backoff(task.error, 1800.0),
+                         FarmCircuitTask.STORAGE_FULL_RETRY_SECONDS)
+        self.assertEqual(FarmCircuitTask.failure_backoff(
+            "storage container is not visible", 1800.0), 1800.0)
+
+    def test_deposit_completes_once_every_item_is_accepted(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.place_item(Item(90, flags=c.ITEM_CONTAINER_OPEN,
+                                           name="chest"), 0)
+                self.state.place_item(Item(
+                    81, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
+                    quality=90, condition=100, name="ring"), 7)
+                self.moves = []
+
+            async def move_item(self, destination, tag, quantity=0):
+                self.moves.append((destination, tag))
+                self.state.place_item(self.state.items[tag], destination)
+
+        client = FakeClient()
+        task = DepositItemsTask("chest", valuable_only=True)
+        task._opened = True
+        asyncio.run(task.tick(client))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.moves, [(90, 81)])
+        self.assertEqual((task.status, task.refused), (TaskStatus.COMPLETE, 0))
 
     def test_retrieve_items_takes_predicate_matches_up_to_a_weight_limit(self):
         class FakeClient:
