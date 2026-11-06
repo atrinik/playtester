@@ -2,6 +2,7 @@ import asyncio
 import collections
 import dataclasses
 import json
+import os
 import time
 import tempfile
 import shutil
@@ -3101,6 +3102,46 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(progress["next_experience"], 500000)
         self.assertEqual(progress["remaining_experience"], 133392)
         self.assertEqual(progress["progress_percent"], 46.6)
+
+    def test_dashboard_experience_uses_bundled_server_table_past_level_30(self):
+        # The compatibility bundle points the dashboard at the classic server
+        # source the analyzer reads, so high levels have a real next level.
+        self.assertTrue(os.environ.get("ATRINIK_SERVER_SOURCE"))
+        thresholds = experience_thresholds()
+        self.assertGreater(len(thresholds), 100)
+        self.assertEqual(thresholds[31:33], (21700000, 23400000))
+        progress = experience_progress(33, 26100000)
+        self.assertEqual(progress["level_experience"], 25200000)
+        self.assertEqual(progress["next_experience"], 27000000)
+        self.assertEqual(progress["remaining_experience"], 900000)
+        self.assertEqual(progress["progress_percent"], 50.0)
+        top = len(thresholds) - 1
+        self.assertEqual(experience_progress(top, thresholds[top])
+                         ["progress_percent"], 100.0)
+
+    def test_dashboard_experience_fallback_reports_unknown_past_its_end(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"ATRINIK_SERVER_SOURCE": directory}):
+            # An unreadable source falls back to the partial table.
+            self.assertEqual(experience_thresholds()[30], 20000000)
+            self.assertEqual(len(experience_thresholds()), 31)
+            self.assertEqual(experience_progress(9, 366608)
+                             ["progress_percent"], 46.6)
+            beyond = experience_progress(33, 26100000)
+            self.assertIsNone(beyond["next_experience"])
+            self.assertIsNone(beyond["progress_percent"])
+            exp_c = Path(directory) / "exp.c"
+            exp_c.write_text("uint64_t new_levels[4] = {0, 0, 10, 30};\n")
+            # Too short to be the server table: still the fallback.
+            os.environ["ATRINIK_SERVER_SOURCE"] = str(exp_c)
+            self.assertEqual(len(experience_thresholds()), 31)
+            exp_c = Path(directory) / "full.c"
+            exp_c.write_text("uint64_t new_levels[MAXLEVEL + 2] = {%s};\n"
+                             % ", ".join(str(level * 10) for level in range(40)))
+            os.environ["ATRINIK_SERVER_SOURCE"] = str(exp_c)
+            self.assertEqual(len(experience_thresholds()), 40)
+            self.assertEqual(experience_progress(39, 390)
+                             ["progress_percent"], 100.0)
 
     def test_inventory_policy_preserves_but_does_not_lock_stackables(self):
         policy = InventoryPolicy()

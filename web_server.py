@@ -38,34 +38,51 @@ from .tasks import (BankTask, BotTask, BuyShopUpgradeTask, DepositItemsTask,
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).with_name("web_static")
 
-@lru_cache(maxsize=1)
+# Levels 0-30 of the classic server's new_levels table. Only used when the
+# bundled server source cannot be read; levels past it report unknown progress.
+FALLBACK_EXPERIENCE_THRESHOLDS = (
+    0, 0, 2000, 4000, 8000, 16000, 32000, 64000, 125000,
+    250000, 500000, 900000, 1400000, 2000000, 2600000,
+    3300000, 4100000, 4900000, 5700000, 6600000, 7500000,
+    8500000, 9500000, 10600000, 11800000, 13000000,
+    14300000, 15600000, 17000000, 18500000, 20000000)
+
+
+@lru_cache(maxsize=4)
+def _server_experience_thresholds(source: str) -> tuple[int, ...] | None:
+    path = Path(source)
+    if path.is_dir():
+        path /= "src/server/exp.c"
+    try:
+        match = re.search(
+            r"new_levels\[[^]]+\]\s*=\s*\{(.*?)\};", path.read_text(), re.S)
+        values = tuple(int(value) for value in re.findall(r"\d+", match.group(1)))
+    except (AttributeError, OSError, UnicodeDecodeError, ValueError):
+        return None
+    return values if len(values) > len(FALLBACK_EXPERIENCE_THRESHOLDS) else None
+
+
+def _experience_table() -> tuple[tuple[int, ...], bool]:
+    """The server level table and whether it is the complete one.
+
+    ATRINIK_SERVER_SOURCE names a classic server source tree or exp.c; the
+    compatibility bundle sets it to the classic_server input the farming
+    analyzer reads, so an explicit setting still wins.
+    """
+    source = os.getenv("ATRINIK_SERVER_SOURCE", "")
+    values = _server_experience_thresholds(source) if source else None
+    if values is None:
+        return FALLBACK_EXPERIENCE_THRESHOLDS, False
+    return values, True
+
+
 def experience_thresholds() -> tuple[int, ...]:
-    """Read an explicitly configured server level table, with a fallback."""
-    server_source = os.getenv("ATRINIK_SERVER_SOURCE", "")
-    if server_source:
-        source = Path(server_source)
-        if source.is_dir():
-            source /= "src/server/exp.c"
-        try:
-            match = re.search(
-                r"new_levels\[[^]]+\]\s*=\s*\{(.*?)\};",
-                source.read_text(), re.S)
-            values = tuple(
-                int(value) for value in re.findall(r"\d+", match.group(1)))
-            if len(values) >= 31:
-                return values
-        except (AttributeError, OSError, ValueError):
-            pass
-    return (
-        0, 0, 2000, 4000, 8000, 16000, 32000, 64000, 125000,
-        250000, 500000, 900000, 1400000, 2000000, 2600000,
-        3300000, 4100000, 4900000, 5700000, 6600000, 7500000,
-        8500000, 9500000, 10600000, 11800000, 13000000,
-        14300000, 15600000, 17000000, 18500000, 20000000)
+    """The bundled server level table, with a partial fallback."""
+    return _experience_table()[0]
 
 
 def experience_progress(level: int, experience: int) -> dict[str, Any]:
-    thresholds = experience_thresholds()
+    thresholds, complete = _experience_table()
     level = max(0, int(level or 0))
     experience = max(0, int(experience or 0))
     current = thresholds[level] if level < len(thresholds) else experience
@@ -75,14 +92,19 @@ def experience_progress(level: int, experience: int) -> dict[str, Any]:
                  if next_experience is not None else 0)
     span = ((next_experience - current)
             if next_experience is not None else 0)
-    percent = (100.0 if span <= 0 else
-               max(0.0, min(100.0,
-                            (experience - current) * 100.0 / span)))
+    if next_experience is None and not complete:
+        # Past the end of the partial fallback: the next level is unknown,
+        # not reached.
+        percent = None
+    else:
+        percent = round(100.0 if span <= 0 else
+                        max(0.0, min(100.0,
+                                     (experience - current) * 100.0 / span)), 1)
     return {
         "experience": experience, "level_experience": current,
         "next_experience": next_experience,
         "remaining_experience": remaining,
-        "progress_percent": round(percent, 1),
+        "progress_percent": percent,
     }
 
 

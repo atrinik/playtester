@@ -729,6 +729,9 @@ def configure_cached_bundle(cache: Path, lock: dict) -> dict:
     if source not in sys.path:
         sys.path.insert(0, source)
     os.environ.setdefault("ATRINIK_RUNTIME_CONTENT", str(installed["runtime"]))
+    # The dashboard reads the server's level table from the same classic
+    # server source the farming analyzer uses.
+    os.environ.setdefault("ATRINIK_SERVER_SOURCE", str(installed["classic_server"]))
     return installed
 
 
