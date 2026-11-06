@@ -672,20 +672,49 @@ class CompatibilityTests(unittest.TestCase):
         )
         old_path = list(sys.path)
         old_pycache_prefix = sys.pycache_prefix
-        old_runtime = os.environ.pop("ATRINIK_RUNTIME_CONTENT", None)
+        names = ("ATRINIK_RUNTIME_CONTENT", "ATRINIK_SERVER_SOURCE")
+        old_environment = {name: os.environ.pop(name, None) for name in names}
         try:
             compatibility.configure_cached_bundle(cache, lock)
             self.assertEqual(sys.path[0], str(installed["source"]))
             self.assertEqual(sys.pycache_prefix, str(cache / "bytecode"))
             self.assertEqual(os.environ["ATRINIK_RUNTIME_CONTENT"],
                              str(installed["runtime"]))
+            self.assertEqual(os.environ["ATRINIK_SERVER_SOURCE"],
+                             str(installed["classic_server"]))
         finally:
             sys.path[:] = old_path
             sys.pycache_prefix = old_pycache_prefix
-            if old_runtime is None:
-                os.environ.pop("ATRINIK_RUNTIME_CONTENT", None)
-            else:
-                os.environ["ATRINIK_RUNTIME_CONTENT"] = old_runtime
+            for name, value in old_environment.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def test_configure_keeps_an_explicit_server_source(self) -> None:
+        source, runtime, lock = self.valid_inputs()
+        cache = self.root / "cache"
+        compatibility.install_bundle(
+            cache, lock, source_archive=source, runtime_archive=runtime,
+                **self.tool_archives
+        )
+        old_path = list(sys.path)
+        old_pycache_prefix = sys.pycache_prefix
+        names = ("ATRINIK_RUNTIME_CONTENT", "ATRINIK_SERVER_SOURCE")
+        old_environment = {name: os.environ.pop(name, None) for name in names}
+        os.environ["ATRINIK_SERVER_SOURCE"] = str(self.root / "server")
+        try:
+            compatibility.configure_cached_bundle(cache, lock)
+            self.assertEqual(os.environ["ATRINIK_SERVER_SOURCE"],
+                             str(self.root / "server"))
+        finally:
+            sys.path[:] = old_path
+            sys.pycache_prefix = old_pycache_prefix
+            for name, value in old_environment.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     def test_extraction_rejects_traversal_links_and_wrong_root(self) -> None:
         cases = {

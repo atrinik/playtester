@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import time
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -38,51 +37,101 @@ from .tasks import (BankTask, BotTask, BuyShopUpgradeTask, DepositItemsTask,
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).with_name("web_static")
 
-@lru_cache(maxsize=1)
+# Levels 0-30 of the classic server's new_levels table. Only used when the
+# bundled server source cannot be read; levels past it report unknown progress.
+FALLBACK_EXPERIENCE_THRESHOLDS = (
+    0, 0, 2000, 4000, 8000, 16000, 32000, 64000, 125000,
+    250000, 500000, 900000, 1400000, 2000000, 2600000,
+    3300000, 4100000, 4900000, 5700000, 6600000, 7500000,
+    8500000, 9500000, 10600000, 11800000, 13000000,
+    14300000, 15600000, 17000000, 18500000, 20000000)
+
+
+# Parsed server tables by source path. Only successful reads are kept, so a
+# source that becomes readable later (a bundle installed after start) is used.
+_SERVER_TABLES: dict[str, tuple[int, ...]] = {}
+# Sources already reported as unusable, so the fallback is logged once each.
+_UNUSABLE_SOURCES: set[str] = set()
+
+
+def _server_experience_thresholds(source: str) -> tuple[int, ...] | None:
+    """The server's new_levels table from ``source``, or None.
+
+    Accepted only if it looks like that table: longer than the fallback, its
+    first entries equal to the fallback, and never decreasing.
+    """
+    cached = _SERVER_TABLES.get(source)
+    if cached is not None:
+        return cached
+    path = Path(source)
+    if path.is_dir():
+        path /= "src/server/exp.c"
+    try:
+        match = re.search(
+            r"new_levels\[[^]]+\]\s*=\s*\{(.*?)\};", path.read_text(), re.S)
+        values = tuple(int(value) for value in re.findall(r"\d+", match.group(1)))
+    except (AttributeError, OSError, UnicodeDecodeError, ValueError):
+        return None
+    fallback = FALLBACK_EXPERIENCE_THRESHOLDS
+    if (len(values) <= len(fallback) or
+            values[:len(fallback)] != fallback or
+            any(later < earlier for earlier, later in zip(values, values[1:]))):
+        return None
+    _SERVER_TABLES[source] = values
+    return values
+
+
+def _experience_table() -> tuple[tuple[int, ...], bool]:
+    """The server level table and whether it is the complete one.
+
+    ATRINIK_SERVER_SOURCE names a classic server source tree or exp.c; the
+    compatibility bundle sets it to the classic_server input the farming
+    analyzer reads, so an explicit setting still wins.
+    """
+    source = os.getenv("ATRINIK_SERVER_SOURCE", "")
+    values = _server_experience_thresholds(source) if source else None
+    if values is None:
+        if source and source not in _UNUSABLE_SOURCES:
+            _UNUSABLE_SOURCES.add(source)
+            log.warning("ATRINIK_SERVER_SOURCE %s has no usable new_levels "
+                        "table; level progress from level %d on is unknown",
+                        source, len(FALLBACK_EXPERIENCE_THRESHOLDS) - 1)
+        return FALLBACK_EXPERIENCE_THRESHOLDS, False
+    return values, True
+
+
 def experience_thresholds() -> tuple[int, ...]:
-    """Read an explicitly configured server level table, with a fallback."""
-    server_source = os.getenv("ATRINIK_SERVER_SOURCE", "")
-    if server_source:
-        source = Path(server_source)
-        if source.is_dir():
-            source /= "src/server/exp.c"
-        try:
-            match = re.search(
-                r"new_levels\[[^]]+\]\s*=\s*\{(.*?)\};",
-                source.read_text(), re.S)
-            values = tuple(
-                int(value) for value in re.findall(r"\d+", match.group(1)))
-            if len(values) >= 31:
-                return values
-        except (AttributeError, OSError, ValueError):
-            pass
-    return (
-        0, 0, 2000, 4000, 8000, 16000, 32000, 64000, 125000,
-        250000, 500000, 900000, 1400000, 2000000, 2600000,
-        3300000, 4100000, 4900000, 5700000, 6600000, 7500000,
-        8500000, 9500000, 10600000, 11800000, 13000000,
-        14300000, 15600000, 17000000, 18500000, 20000000)
+    """The bundled server level table, with a partial fallback."""
+    return _experience_table()[0]
 
 
 def experience_progress(level: int, experience: int) -> dict[str, Any]:
-    thresholds = experience_thresholds()
+    thresholds, complete = _experience_table()
     level = max(0, int(level or 0))
     experience = max(0, int(experience or 0))
     current = thresholds[level] if level < len(thresholds) else experience
+    # The server's table has MAXLEVEL + 2 entries: the last one is a sentinel
+    # past the level cap, never a level she can reach.
+    last_level = len(thresholds) - (2 if complete else 1)
     next_experience = (thresholds[level + 1]
-                       if level + 1 < len(thresholds) else None)
+                       if level < last_level else None)
     remaining = (max(0, next_experience - experience)
                  if next_experience is not None else 0)
     span = ((next_experience - current)
             if next_experience is not None else 0)
-    percent = (100.0 if span <= 0 else
-               max(0.0, min(100.0,
-                            (experience - current) * 100.0 / span)))
+    if next_experience is None and not complete:
+        # Past the end of the partial fallback: the next level is unknown,
+        # not reached.
+        percent = None
+    else:
+        percent = round(100.0 if span <= 0 else
+                        max(0.0, min(100.0,
+                                     (experience - current) * 100.0 / span)), 1)
     return {
         "experience": experience, "level_experience": current,
         "next_experience": next_experience,
         "remaining_experience": remaining,
-        "progress_percent": round(percent, 1),
+        "progress_percent": percent,
     }
 
 

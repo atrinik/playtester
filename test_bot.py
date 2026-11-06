@@ -2,6 +2,7 @@ import asyncio
 import collections
 import dataclasses
 import json
+import os
 import time
 import tempfile
 import shutil
@@ -46,8 +47,9 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, GameState, Item, M
 from .model import QuestPartProgress, QuestProgress
 from .model import InterfaceState
 from .quest_tasks import DialogTask, EscapingDesertedIslandTask
-from .web_server import (DashboardState, WebControlServer,
-                         experience_progress, experience_thresholds)
+from .web_server import (DashboardState, FALLBACK_EXPERIENCE_THRESHOLDS,
+                         WebControlServer, experience_progress,
+                         experience_thresholds)
 from .navigation_spots import NAVIGATION_SPOTS
 from . import constants as c
 from .autoplay import AutoplayTask
@@ -3112,6 +3114,79 @@ class QuestTests(unittest.TestCase):
         self.assertEqual(progress["next_experience"], 500000)
         self.assertEqual(progress["remaining_experience"], 133392)
         self.assertEqual(progress["progress_percent"], 46.6)
+
+    def test_dashboard_experience_uses_bundled_server_table_past_level_30(self):
+        # The compatibility bundle points the dashboard at the classic server
+        # source the analyzer reads, so high levels have a real next level.
+        # Only its shape is checked here: no server values past level 30 are
+        # copied into this repository.
+        self.assertTrue(os.environ.get("ATRINIK_SERVER_SOURCE"))
+        thresholds = experience_thresholds()
+        self.assertGreater(len(thresholds), 100)
+        self.assertEqual(thresholds[:len(FALLBACK_EXPERIENCE_THRESHOLDS)],
+                         FALLBACK_EXPERIENCE_THRESHOLDS)
+        self.assertTrue(all(earlier <= later for earlier, later
+                            in zip(thresholds, thresholds[1:])))
+        low, high = thresholds[33], thresholds[34]
+        progress = experience_progress(33, (low + high) // 2)
+        self.assertEqual(progress["level_experience"], low)
+        self.assertEqual(progress["next_experience"], high)
+        self.assertEqual(progress["remaining_experience"],
+                         high - (low + high) // 2)
+        self.assertAlmostEqual(progress["progress_percent"], 50.0, delta=0.1)
+        # The last entry is a sentinel past the level cap (MAXLEVEL + 2).
+        cap = len(thresholds) - 2
+        self.assertEqual(experience_progress(cap - 1, thresholds[cap - 1])
+                         ["next_experience"], thresholds[cap])
+        capped = experience_progress(cap, thresholds[cap])
+        self.assertIsNone(capped["next_experience"])
+        self.assertEqual(capped["progress_percent"], 100.0)
+
+    def test_dashboard_experience_fallback_reports_unknown_past_its_end(self):
+        fallback = FALLBACK_EXPERIENCE_THRESHOLDS
+        # Synthetic levels past the fallback, not the server's.
+        synthetic = fallback + tuple(
+            fallback[-1] + 1000 * step for step in range(1, 10))
+
+        def table(values):
+            return "uint64_t new_levels[MAXLEVEL + 2] = {%s};\n" % ", ".join(
+                map(str, values))
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"ATRINIK_SERVER_SOURCE": directory}):
+            # An unusable source falls back to the partial table, and says so
+            # once rather than on every call.
+            with self.assertLogs("atrinik_bot.web_server", "WARNING") as logs:
+                self.assertEqual(experience_thresholds(), fallback)
+                self.assertEqual(experience_thresholds(), fallback)
+            self.assertEqual(len(logs.output), 1)
+            self.assertEqual(experience_progress(9, 366608)
+                             ["progress_percent"], 46.6)
+            beyond = experience_progress(33, 26100000)
+            self.assertIsNone(beyond["next_experience"])
+            self.assertIsNone(beyond["progress_percent"])
+            exp_c = Path(directory) / "exp.c"
+            os.environ["ATRINIK_SERVER_SOURCE"] = str(exp_c)
+            for rejected in (
+                    (0, 0, 10, 30),  # too short
+                    tuple(level * 10 for level in range(40)),  # not the server's
+                    synthetic[:-1] + (0,)):  # decreasing
+                with self.subTest(rejected=rejected[:4]):
+                    exp_c.write_text(table(rejected))
+                    with self.assertLogs("atrinik_bot.web_server", "WARNING"):
+                        self.assertEqual(experience_thresholds(), fallback)
+                    exp_c = exp_c.with_name(exp_c.name + "x")
+                    os.environ["ATRINIK_SERVER_SOURCE"] = str(exp_c)
+            # A failed read is not kept: the same path is read again once usable.
+            self.assertEqual(experience_thresholds(), fallback)
+            exp_c.write_text(table(synthetic))
+            self.assertEqual(experience_thresholds(), synthetic)
+            cap = len(synthetic) - 2
+            self.assertEqual(experience_progress(cap - 1, synthetic[cap - 1])
+                             ["next_experience"], synthetic[cap])
+            capped = experience_progress(cap, synthetic[cap])
+            self.assertIsNone(capped["next_experience"])
+            self.assertEqual(capped["progress_percent"], 100.0)
 
     def test_inventory_policy_preserves_but_does_not_lock_stackables(self):
         policy = InventoryPolicy()
