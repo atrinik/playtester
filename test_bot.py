@@ -18045,7 +18045,8 @@ class SelfImprovementTests(unittest.TestCase):
             return other == kit
 
         def hazard(record, judge=same, now=1000.0):
-            return si.kit_hazard({self.SPOT: record}, [self.SPOT], judge, now=now)
+            return si.kit_hazard({self.SPOT: record}, self.SPOT, [self.SPOT], judge,
+                                 now=now)
 
         self.assertFalse(hazard(record))
         hungry = self.review(["Sera starved to death."])
@@ -18080,12 +18081,12 @@ class SelfImprovementTests(unittest.TestCase):
         adaptations = {"uc-variant-a": record}
         same = kit.__eq__
         # A sibling circuit sharing one map is hazardous too.
-        self.assertTrue(si.kit_hazard(adaptations, [self.UC_B, self.UC_C], same,
+        self.assertTrue(si.kit_hazard(adaptations, "candidate", [self.UC_B, self.UC_C], same,
                                       now=1000.0))
         # A spot on disjoint maps is not.
-        self.assertFalse(si.kit_hazard(adaptations, [self.FOREST], same, now=1000.0))
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.FOREST], same, now=1000.0))
         # Other kits' failures still do not count.
-        self.assertFalse(si.kit_hazard(adaptations, [self.UC_B], lambda other: False,
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.UC_B], lambda other: False,
                                        now=1000.0))
 
     def test_kit_hazard_failures_on_disjoint_maps_do_not_combine(self):
@@ -18096,14 +18097,15 @@ class SelfImprovementTests(unittest.TestCase):
         adaptations = {"uc": self.pack_record([self.UC_A], kit, below),
                        "forest": self.pack_record([self.FOREST], kit, below)}
         for maps in ([self.UC_A], [self.FOREST], [self.UC_A, self.UC_C]):
-            self.assertFalse(si.kit_hazard(adaptations, maps, kit.__eq__, now=1000.0))
+            self.assertFalse(si.kit_hazard(adaptations, "candidate", maps, kit.__eq__,
+                                           now=1000.0))
         # Two overlapping records sum: below the threshold each, not together.
         adaptations["uc-b"] = self.pack_record([self.UC_A, self.UC_B], kit, 1)
-        self.assertTrue(si.kit_hazard(adaptations, [self.UC_A], kit.__eq__, now=1000.0))
+        self.assertTrue(si.kit_hazard(adaptations, "candidate", [self.UC_A], kit.__eq__, now=1000.0))
         # Sharing is with the candidate: the first record's failures on
         # UC_A do not reach a spot on UC_B alone.
-        self.assertFalse(si.kit_hazard(adaptations, [self.UC_B], kit.__eq__, now=1000.0))
-        self.assertFalse(si.kit_hazard(adaptations, [self.FOREST], kit.__eq__,
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.UC_B], kit.__eq__, now=1000.0))
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.FOREST], kit.__eq__,
                                        now=1000.0))
 
     def test_kit_hazard_counts_route_deaths_but_not_route_recalls(self):
@@ -18121,47 +18123,65 @@ class SelfImprovementTests(unittest.TestCase):
             record, _ = si.learn(record, recalled, now=1000.0, kit=kit,
                                  maps=[self.SPOT])
         adaptations = {self.SPOT: record}
-        self.assertFalse(si.kit_hazard(adaptations, [self.SPOT], kit.__eq__, now=1000.0))
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.SPOT], kit.__eq__, now=1000.0))
         for _ in range(si.KIT_HAZARD_FAILURES - 1):
             record, _ = si.learn(record, died, now=1000.0, kit=kit, maps=[self.SPOT])
         adaptations = {self.SPOT: record}
-        self.assertFalse(si.kit_hazard(adaptations, [self.SPOT], kit.__eq__, now=1000.0))
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.SPOT], kit.__eq__, now=1000.0))
         record, _ = si.learn(record, died, now=1000.0, kit=kit, maps=[self.SPOT])
         adaptations = {self.SPOT: record}
         # Deaths on the way count toward the spot she was travelling to,
-        self.assertTrue(si.kit_hazard(adaptations, [self.SPOT], kit.__eq__, now=1000.0))
-        # and toward a spot on the map where she died.
-        self.assertTrue(si.kit_hazard(adaptations, [road], kit.__eq__, now=1000.0))
-        self.assertFalse(si.kit_hazard(adaptations, [self.FOREST], kit.__eq__,
+        self.assertTrue(si.kit_hazard(adaptations, "candidate", [self.SPOT], kit.__eq__, now=1000.0))
+        # but not toward a spot on the road map where she died.
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [road], kit.__eq__, now=1000.0))
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.FOREST], kit.__eq__,
                                        now=1000.0))
-        self.assertFalse(si.kit_hazard(adaptations, [self.SPOT], lambda other: False,
+        self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.SPOT], lambda other: False,
                                        now=1000.0))
 
     def test_kit_hazard_reads_records_persisted_before_maps_were_kept(self):
         from . import self_improvement as si
 
         kit = {"skill": "wizardry spells", "skill_level": 13}
-        # The shape stored before: no maps, no kind or map per failure.
-        old = {"level": 3, "kit_failures": [
-            {"time": 1000.0, "cause": "pack", "kit": dict(kit)},
-            {"time": 1000.0, "cause": "out-damaged", "kit": dict(kit)},
-            {"time": 1000.0, "cause": "route", "kit": dict(kit)}]}
-        key = "|".join((self.UC_A, self.UC_B))
-        adaptations = {key: old, "unrelated": {"level": 1}, "broken": "x"}
-        # Its maps come from its key; an old route entry, maybe a recall,
-        # does not count.
-        self.assertFalse(si.kit_hazard(adaptations, [self.UC_B], kit.__eq__, now=1000.0))
+
+        def old():
+            # The shape stored before: no maps, no kind or map per failure.
+            return {"level": 3, "kit_failures": [
+                {"time": 1000.0, "cause": "pack", "kit": dict(kit)},
+                {"time": 1000.0, "cause": "out-damaged", "kit": dict(kit)},
+                {"time": 1000.0, "cause": "pack", "kit": dict(kit)}]}
+
+        # Live analyzer keys: a circuit's base names, a single map's path.
+        circuit = "circuit[a + b]"
+        single = "maps/underground_city/a"
+        adaptations = {circuit: old(), "unrelated": {"level": 1}, "broken": "x"}
+        # An old circuit record still counts for its own spot,
+        self.assertTrue(si.kit_hazard(adaptations, circuit, [self.UC_A, self.UC_B],
+                                      kit.__eq__, now=1000.0))
+        # but its maps are unknown, so not for a sibling.
+        self.assertFalse(si.kit_hazard(adaptations, "circuit[b + c]",
+                                       [self.UC_B, self.UC_C], kit.__eq__, now=1000.0))
+        # An old single-map record names its map: siblings on it count it.
+        adaptations = {single: old()}
+        self.assertTrue(si.kit_hazard(adaptations, "circuit[a + c]",
+                                      [self.UC_A, self.UC_C], kit.__eq__, now=1000.0))
+        # An old route entry, maybe a recall, does not count.
+        record = old()
+        record["kit_failures"][-1]["cause"] = "route"
+        self.assertFalse(si.kit_hazard({circuit: record}, circuit, [self.UC_A],
+                                       kit.__eq__, now=1000.0))
         pack = self.review(["giant frog hit you for 20 (-20) slash damage.",
                             "crocodile hit you for 25 (-25) pierce damage."],
                            failure_map=self.UC_A)
-        record, _ = si.learn(old, pack, now=1000.0, kit=kit, maps=[self.UC_A])
-        self.assertEqual(record["maps"], [self.UC_A])
+        record, _ = si.learn(record, pack, now=1000.0, kit=kit,
+                             maps=[self.UC_A, self.UC_B])
+        self.assertEqual(record["maps"], [self.UC_A, self.UC_B])
         self.assertEqual(len(record["kit_failures"]), 4)
-        adaptations[key] = record
-        self.assertTrue(si.kit_hazard(adaptations, [self.UC_A], kit.__eq__, now=1000.0))
+        self.assertTrue(si.kit_hazard({circuit: record}, "circuit[b + c]",
+                                      [self.UC_B, self.UC_C], kit.__eq__, now=1000.0))
         # Learning without maps keeps those already known.
         record, _ = si.learn(record, pack, now=1000.0, kit=kit)
-        self.assertEqual(record["maps"], [self.UC_A])
+        self.assertEqual(record["maps"], [self.UC_A, self.UC_B])
 
     def test_margins_tighten_per_level_up_to_their_caps(self):
         from . import self_improvement as si

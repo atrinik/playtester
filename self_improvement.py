@@ -267,39 +267,46 @@ def hazard_failure(entry: dict) -> bool:
 def record_maps(key: str, record: dict) -> set[str]:
     """The maps of the spot an adaptation record belongs to.
 
-    Records stored before the maps were kept fall back to the map paths in
-    their key (spot_key joins a circuit's maps).
+    Records stored before the maps were kept have only their key: a
+    single-map spot's analyzer path ("maps/..." under the content root)
+    names its map; a circuit's ("circuit[a + b]") holds base names only and
+    yields none, so such a record still counts for its own spot
+    (kit_hazard matches the key) but not for its siblings.
     """
     maps = record.get("maps")
     if isinstance(maps, (list, tuple)):
         return {str(path) for path in maps}
-    return {part for part in str(key).split("|") if part.startswith("/")}
+    key = str(key)
+    if key.startswith("maps/"):
+        return {"/" + key.removeprefix("maps/")}
+    return set()
 
 
-def kit_hazard(adaptations: dict | None, maps: Iterable[str],
+def kit_hazard(adaptations: dict | None, key: str, maps: Iterable[str],
                same_kit: Callable[[dict], bool], *,
                now: float | None = None) -> bool:
-    """Whether the area of a spot on ``maps`` is hazardous for a kit.
+    """Whether the area of spot ``key`` on ``maps`` is hazardous for a kit.
 
     True after KIT_HAZARD_FAILURES qualifying failures (hazard_failure)
     within the window, each with a kit ``same_kit`` judges the same as hers
-    now, summed over every adaptation record whose spot shares a map with
-    ``maps``, plus failures elsewhere that happened on one of ``maps``. The
-    analyzer ranks overlapping circuits for one area; each must not need its
-    own deaths. A materially different kit (the analyzer's own test) clears
-    it, and so does time.
+    now, summed over the spot's own record and every record whose spot
+    shares a map with ``maps``. The analyzer ranks overlapping circuits for
+    one area; each must not need its own deaths. A death on the way counts
+    for the spot she was travelling to, not for spots on the road map. A
+    materially different kit (the analyzer's own test) clears it, and so
+    does time.
     """
     now = time.time() if now is None else now
     maps = set(maps)
     count = 0
-    for key, record in (adaptations or {}).items():
+    for record_key, record in (adaptations or {}).items():
         if not isinstance(record, dict):
             continue
-        shared = bool(record_maps(key, record) & maps)
+        if record_key != key and not record_maps(record_key, record) & maps:
+            continue
         count += sum(
             1 for entry in record.get("kit_failures", ())
             if isinstance(entry, dict) and hazard_failure(entry) and
-            (shared or entry.get("map") in maps) and
             now - float(entry.get("time", 0.0) or 0.0) <= KIT_HAZARD_WINDOW_SECONDS and
             same_kit(entry.get("kit") or {}))
     return count >= KIT_HAZARD_FAILURES

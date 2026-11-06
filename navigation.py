@@ -4044,7 +4044,8 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
         return old is not None and profile.same_survivability(old)
 
     return self_improvement.kit_hazard(
-        adaptations, (path for path, _ in legs), same_kit)
+        adaptations, self_improvement.spot_key(spot, legs),
+        (path for path, _ in legs), same_kit)
 
 
 def analyzer_farm_choice(

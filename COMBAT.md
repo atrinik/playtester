@@ -422,10 +422,12 @@ steps away and keeps her distance.
   three for the burnt forest), and live she moved to a sibling circuit after
   each one was marked, dying about three times an hour. A candidate spot
   counts the failures of every adaptation record whose spot shares a map
-  with it (each record keeps its spot's maps), plus failures recorded on
-  one of its maps. A death on the way to a spot (`route`) counts for that
-  spot too; an emergency recall on the way does not. Live, 22 such approach
-  failures at the underground city had not counted.
+  with it (each record keeps its spot's maps), plus its own record's. A
+  death on the way to a spot (`route`) counts for that spot too, not for
+  spots on the road map; an emergency recall on the way does not. Live, 22
+  such approach failures at the underground city had not counted. Records
+  saved before maps were kept count for their own spot, and a single-map
+  spot's also for spots sharing that map.
 - **Healing outpaced.** From the first heal in the last 8 s on, when the
   hits taken are at least what the later heals restored (her health at the
   latest heal is no higher than at the first), healing has stopped keeping
