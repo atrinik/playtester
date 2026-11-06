@@ -35,6 +35,8 @@ class AutoplayTask(BotTask):
     # level 24 (troll elite soldiers): wait until she outlevels them well.
     MANA_CRYSTAL_UPGRADE_LEVEL = 30
     MANA_CRYSTAL_UPGRADE_RETRY = 24 * 60 * 60
+    # A priest whose food trip failed is passed over this long.
+    TEMPLE_PRIEST_RETRY = 60 * 60
 
     def __init__(self, graph: WorldGraph, *, target_level: int = 115):
         super().__init__(f"autoplay:level-{max(1, int(target_level))}")
@@ -49,6 +51,14 @@ class AutoplayTask(BotTask):
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
         self._temple_food_retry_at = 0.0
+        # Priests whose food trip failed, until when they are passed over.
+        self._failed_priests: dict[str, float] = {}
+        # Whether this hunger episode already tried a second priest.
+        self._hunger_fallback_used = False
+        # The farm circuit's pending maintenance backoffs. Each rebuilt
+        # circuit inherits them, so it does not restart an errand that just
+        # failed (live: the walk to a full apartment chest, every cycle).
+        self._circuit_backoffs: dict[str, float] = {}
         self.safety = SafetyPolicy()
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
@@ -79,10 +89,18 @@ class AutoplayTask(BotTask):
 
     async def _start_temple_food(self, client: AtrinikClient) -> bool:
         """Pause the current phase for the free temple food service."""
-        trip = temple_food_trip(self.graph, client)
+        now = time.monotonic()
+        if self.phase != "temple-food" or self.child is None:
+            # A new hunger episode, not the fallback after a failed trip.
+            self._hunger_fallback_used = False
+        self._failed_priests = {
+            name: until for name, until in self._failed_priests.items()
+            if until > now}
+        trip = temple_food_trip(self.graph, client,
+                                exclude=self._avoided_priests())
         if trip is None:
             self._temple_food_retry_at = (
-                time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+                now + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
             log.warning("starving, but no temple priest is reachable")
             return False
         paused = f"{self.phase}: {self.child.name}" if self.child else "idle"
@@ -100,6 +118,44 @@ class AutoplayTask(BotTask):
                      f"food {int(client.state.stats.get('food', 0) or 0)}; "
                      f"paused {paused}")
         return True
+
+    def _avoided_priests(self) -> tuple[str, ...]:
+        """Priests whose food trip failed recently; farm circuits skip them too."""
+        now = time.monotonic()
+        return tuple(name for name, until in self._failed_priests.items()
+                     if until > now)
+
+    async def _temple_food_failed(self, client: AtrinikClient) -> bool:
+        """Settle a failed temple food trip; True when another one started.
+
+        That priest is passed over for a while. Once per hunger episode the
+        nearest other priest reachable from where she now stands is tried at
+        once: live, Sera retried an unreachable Talrain every cycle while
+        Friar Marcus, who fed her each time, was a few maps away. Otherwise
+        it takes the ordinary child-failure path: after that short backoff a
+        fresh farm circuit is built, which feeds her itself (from a priest
+        not passed over, or a shop), and autoplay's own temple trips wait
+        the usual retry time.
+        """
+        assert self.child is not None
+        failed = f"{self.phase}: {self.child.name}: {self.child.error}"
+        priest = getattr(getattr(self.child, "task", None), "priest", "")
+        if priest:
+            self._failed_priests[priest] = (
+                time.monotonic() + self.TEMPLE_PRIEST_RETRY)
+        if not self._hunger_fallback_used and hungry(client):
+            self._hunger_fallback_used = True
+            if await self._start_temple_food(client):
+                log.warning("autoplay temple food failed: %s; "
+                            "trying another priest", failed)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("autoplay-retry",
+                             f"{failed}; trying another priest")
+                return True
+        self._temple_food_retry_at = (
+            time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+        return False
 
     def _needs_mana_crystal_start(self, client: AtrinikClient) -> bool:
         """Collect Gandyld's safe 50-SP opening reward exactly once."""
@@ -255,6 +311,8 @@ class AutoplayTask(BotTask):
                     return
             try:
                 await self.child.tick(client)
+                if isinstance(self.child, FarmCircuitTask):
+                    self._circuit_backoffs = self.child.backoffs()
             except ConnectionError as exc:
                 # The child's dialogue, transfer, or purchase may be half done;
                 # rebuild it from the server's state after the reconnect.
@@ -275,9 +333,8 @@ class AutoplayTask(BotTask):
                 return
             if self.child.status == TaskStatus.FAILED:
                 if self.phase == "temple-food":
-                    self._temple_food_retry_at = (
-                        time.monotonic() +
-                        FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+                    if await self._temple_food_failed(client):
+                        return
                 elif self.phase == "mana-crystal-upgrade":
                     # A long, hostile trip: do not repeat it every few
                     # minutes when it cannot succeed.
@@ -349,4 +406,6 @@ class AutoplayTask(BotTask):
             client, "adaptive-farming",
             FarmCircuitTask(
                 self.graph, list(legs), level_until=self.target_level,
-                analyzer_driven=True, spot=spot))
+                analyzer_driven=True, spot=spot,
+                backoffs=self._circuit_backoffs,
+                avoid_priests=self._avoided_priests))

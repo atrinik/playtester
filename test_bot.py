@@ -33,7 +33,7 @@ from .catalog_quest_tasks import (ApplyAtTask, ApplyGroundTask, ArrivedTask,
                                   KeyThenContainerTask, LostMemoriesArrivalTask,
                                   NPC, POLICIES, RECOMMENDED_QUEST_ORDER)
 from .client import AtrinikClient, ClientConfig
-from .tasks import (BankBalanceTask, BankTask, BindSavebedTask,
+from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
                     BuyShopUpgradeTask, CasterProfile,
                     DepositItemsTask, FarmTask, InventoryCapabilityTask,
@@ -97,6 +97,17 @@ class StubAnalyzer:
     def snapshot(self, objective):
         return {"status": self.status, "objective": objective,
                 "ranking": self.ranking(objective)[:5]}
+
+
+class TempleTrip(BotTask):
+    """A temple food trip that stays where a test puts it."""
+
+    def __init__(self, priest):
+        super().__init__(f"navigate-then:temple:food:{priest}")
+        self.task = TempleFoodTask(priest)
+
+    async def tick(self, client):
+        pass
 
 
 class ProtocolTests(unittest.TestCase):
@@ -11690,8 +11701,10 @@ class QuestTests(unittest.TestCase):
         autoplay._mana_recovery_attempted = True
         trips = []
 
-        def trip(graph, client):
+        def trip(graph, client, exclude=()):
             trips.append(client.state.stats["food"])
+            if "Saruthar" in exclude:
+                return None
             return NavigateThenTask(graph, "/temple", TempleFoodTask("Saruthar"))
 
         with patch.object(autoplay_module, "temple_food_trip", trip):
@@ -11709,10 +11722,12 @@ class QuestTests(unittest.TestCase):
                       if record["action"] == "autoplay-hunger"]
             self.assertEqual(hunger, ["food 100; paused mana-crystal-recovery: "
                                       "navigate-then:retrieve:chest"])
-            # A failed trip waits before the next one, then tries again even
-            # with nothing else to schedule.
+            # A failed trip passes that priest over; with no other one it
+            # waits before the next, then tries again even with nothing
+            # else to schedule.
             autoplay.child.fail("no route")
             asyncio.run(autoplay.tick(client))
+            self.assertEqual(trips, [100, 100])
             self.assertIsNone(autoplay.child)
             self.assertEqual(autoplay.phase, "temple-food")
             self.assertFalse(autoplay._needs_temple_food(client))
@@ -11743,11 +11758,157 @@ class QuestTests(unittest.TestCase):
             client.state.inventory_replay_complete = True
         # No reachable priest: keep going, and look again later.
         autoplay.phase, autoplay.child = "mana-crystal-recovery", walk
-        with patch.object(autoplay_module, "temple_food_trip", lambda graph, client: None):
+        with patch.object(autoplay_module, "temple_food_trip", lambda graph, client, **_: None):
             self.assertTrue(autoplay._needs_temple_food(client))
             self.assertFalse(asyncio.run(autoplay._start_temple_food(client)))
             self.assertIs(autoplay.child, walk)
             self.assertFalse(autoplay._needs_temple_food(client))
+
+    def test_temple_food_is_ranked_from_where_the_apartment_exit_leads(self):
+        from .navigation import temple_food_trip
+
+        graph = built_graph()
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 34, "food": 179})
+        client.state.map.path = STARTER_APARTMENT
+        client.state.map.world_x, client.state.map.world_y = 1, 3
+        # Live: leaving her apartment put Sera on world_4_45, where the
+        # temple ranked nearest from inside (Talrain, through a static exit
+        # she never takes) has no route; Friar Marcus fed her every time.
+        client.state.apartment_returns = {
+            STARTER_APARTMENT: ("/shattered_islands/world_4_45", (19, 4))}
+        trip = temple_food_trip(graph, client)
+        self.assertEqual(trip.task.priest, "Friar Marcus")
+        self.assertEqual(trip.navigation.destination,
+                         "/shattered_islands/world_6_44_1")
+        # A priest whose trip just failed is passed over for the next.
+        other = temple_food_trip(graph, client, exclude=("friar marcus",))
+        self.assertNotIn(other.task.priest, ("Friar Marcus", "Talrain"))
+
+    def test_autoplay_tries_one_other_priest_per_hunger_episode(self):
+        from . import autoplay as autoplay_module
+
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 34, "hp": 306, "maxhp": 306, "food": 179})
+
+        async def send(packet):
+            pass
+
+        client.send = send
+        graph = WorldGraph()
+        autoplay = AutoplayTask(graph, target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay._intro_complete = True
+        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
+        circuit.status = TaskStatus.RUNNING
+        # Its storage trip outlasts her food, so autoplay feeds her.
+        circuit._storage = NavigateThenTask(graph, STARTER_APARTMENT,
+                                            DepositItemsTask("chest"))
+        autoplay.phase, autoplay.child = "adaptive-farming", circuit
+        asked = []
+
+        def trip(graph, client, exclude=()):
+            asked.append(tuple(exclude))
+            for priest in ("Talrain", "Friar Marcus", "Saruthar"):
+                if priest not in exclude:
+                    return TempleTrip(priest)
+            return None
+
+        with patch.object(autoplay_module, "temple_food_trip", trip):
+            asyncio.run(autoplay.tick(client))
+            self.assertEqual(autoplay.phase, "temple-food")
+            self.assertEqual(autoplay.child.task.priest, "Talrain")
+            # No route to Talrain from where she really is: the friar next,
+            # at once, not another farm cycle later.
+            autoplay.child.fail("no component route to /shattered_islands/world_9_69")
+            asyncio.run(autoplay.tick(client))
+            self.assertEqual(autoplay.child.task.priest, "Friar Marcus")
+            self.assertEqual(asked, [(), ("Talrain",)])
+            # A second failure does not chain a third priest: the usual
+            # retry wait applies and farming resumes meanwhile.
+            autoplay.child.fail("Friar Marcus did not answer the temple food request")
+            asyncio.run(autoplay.tick(client))
+            self.assertEqual(len(asked), 2)
+            self.assertIsNone(autoplay.child)
+            self.assertFalse(autoplay._needs_temple_food(client))
+            self.assertEqual(set(autoplay._failed_priests), {"Talrain", "Friar Marcus"})
+            # The next hunger episode may fall back once again, past both.
+            autoplay._temple_food_retry_at = 0.0
+            autoplay.phase, autoplay.child = "adaptive-farming", circuit
+            asyncio.run(autoplay.tick(client))
+            self.assertEqual(autoplay.child.task.priest, "Saruthar")
+            self.assertFalse(autoplay._hunger_fallback_used)
+        retries = [record["detail"] for record in client.decision_history
+                   if record["action"] == "autoplay-retry"]
+        self.assertEqual(len(retries), 2)
+        self.assertIn("trying another priest", retries[0])
+
+    def test_a_rebuilt_farm_circuit_keeps_the_storage_backoff(self):
+        from . import autoplay as autoplay_module
+
+        client = self._combat_client()
+        client.state.stats.update({"level": 34, "exp": 30_000_000, "food": 500})
+        ring = Item(81, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
+                    quality=90, condition=100, name="ring of the ghost")
+        client.state.inventory.append(ring)
+        client.state.items[ring.tag] = ring
+        client.farm_analyzer = StubAnalyzer({"xp": [analyzer_spot(
+            "Eld Woods trees", ["/shattered_islands/world_14_79"],
+            ["evil treant L13×2", "quickwood L11"])]})
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay._intro_complete = True
+        first = FarmCircuitTask(built_graph(), [("/shattered_islands/world_14_79", "evil treant")])
+        first.status = TaskStatus.RUNNING
+        self.assertTrue(first._needs_apartment_storage(client))
+        # Its trip to a full chest failed: the chest is left alone for hours.
+        full = f"{DepositItemsTask.STORAGE_FULL}: 1 item(s) not stored"
+        first._storage_retry_at = first.clock() + first.failure_backoff(full, 1800.0)
+        # Food backoffs are not inherited: a fresh circuit feeds her as soon
+        # as she is hungry.
+        first._temple_food_retry_at = first.clock() + 600.0
+        first._resupply_retry_at = first.clock() + 1800.0
+        # Autoplay's temple trip to Talrain just failed.
+        autoplay._failed_priests["Talrain"] = time.monotonic() + 3600.0
+        autoplay.phase, autoplay.child = "adaptive-farming", first
+
+        async def hold(*_):
+            pass
+
+        with patch.object(first, "tick", hold):
+            asyncio.run(autoplay.tick(client))
+        # A temple trip (or a failure) replaces the circuit; the rebuilt one
+        # has fresh service tasks but does not go straight back to storage.
+        autoplay.child = None
+        with patch.object(autoplay, "_needs_mana_crystal_start", return_value=False), \
+                patch.object(autoplay, "_needs_mana_crystal_recovery", return_value=False), \
+                patch.object(autoplay, "_needs_mana_crystal_upgrade", return_value=False), \
+                patch.object(autoplay_module.FarmCircuitTask, "start", hold):
+            asyncio.run(autoplay.tick(client))
+        rebuilt = autoplay.child
+        self.assertIsInstance(rebuilt, FarmCircuitTask)
+        self.assertIsNot(rebuilt, first)
+        self.assertIsNone(rebuilt._storage)
+        self.assertEqual(rebuilt._storage_retry_at, first._storage_retry_at)
+        self.assertFalse(rebuilt._needs_apartment_storage(client))
+        # Without the inherited backoff, it would have gone back at once.
+        self.assertTrue(FarmCircuitTask(
+            built_graph(), [("/shattered_islands/world_14_79", "evil treant")]
+        )._needs_apartment_storage(client))
+        self.assertEqual((rebuilt._temple_food_retry_at, rebuilt._resupply_retry_at),
+                         (0.0, 0.0))
+        # Its own temple food passes over the priest autoplay just failed.
+        from . import navigation as navigation_module
+        asked = []
+
+        def trip(graph, client, exclude=()):
+            asked.append(tuple(exclude))
+
+        with patch.object(navigation_module, "temple_food_trip", trip):
+            rebuilt._new_temple_food(client)
+        self.assertEqual(asked, [("Talrain",)])
 
     def test_autoplay_recovers_started_mana_crystal_from_apartment(self):
         client = self._combat_client()
@@ -12626,6 +12787,137 @@ class QuestTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(client.moves, [(7, 91)])
         self.assertEqual(task.status, TaskStatus.RUNNING)
+
+    # The live rendering of the server's "That won't fit in the %s!"
+    # (types/player.c) for Sera's open apartment chest.
+    WONT_FIT_LIVE = "That won't fit in the spruce chest (open) (active)!"
+
+    @staticmethod
+    def _refusing_chest_client(answer, *, accept=(), earlier=""):
+        """An open spruce chest that refuses deposits with ``answer``.
+
+        Tags in ``accept`` go in silently; ``earlier`` is a message already
+        on screen before the deposit starts.
+        """
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.stats["weight_limit"] = 100
+                chest = Item(90, flags=c.ITEM_CONTAINER_OPEN,
+                             name="spruce chest (open) (active)")
+                self.state.place_item(chest, 0)
+                self.state.place_item(Item(91, item_type=c.TYPE_BOOK, quality=80,
+                                           name="book of tales"), chest.tag)
+                for tag in (81, 82):
+                    self.state.place_item(Item(
+                        tag, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
+                        quality=90, condition=100, name=f"ring {tag}"), 7)
+                if earlier:
+                    self.state.add_message(0, "ffffff", earlier)
+                self.moves = []
+
+            async def move_item(self, destination, tag, quantity=0):
+                self.moves.append((destination, tag))
+                if destination == 7 or tag in accept:
+                    self.state.place_item(self.state.items[tag], destination)
+                elif answer:
+                    self.state.add_message(0, "ffffff", answer)
+
+            async def apply(self, tag):
+                raise AssertionError("open chest should not be reopened")
+
+        return FakeClient()
+
+    def _deposit_until_refused(self, client):
+        task = DepositItemsTask(
+            "chest", unidentified_only=True, valuable_only=True,
+            then_retrieve=RetrieveItemsTask(
+                "chest", predicate=InventoryPolicy().sellable_junk,
+                max_weight_ratio=0.8))
+        task._opened = True
+        for _ in range(20):
+            asyncio.run(task.tick(client))
+        # Each ring is offered once and the chest is not asked again while
+        # the server may still be answering.
+        self.assertEqual(client.moves, [(90, 81), (90, 82)])
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        # Still carried past the confirmation window, the rings were refused:
+        # sellable stock still comes out, then the visit ends.
+        for tag in task._sent:
+            task._sent[tag] -= DepositItemsTask.MOVE_CONFIRM_SECONDS
+        for _ in range(5):
+            asyncio.run(task.tick(client))
+        self.assertEqual(client.moves, [(90, 81), (90, 82), (7, 91)])
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        return task
+
+    def test_deposit_into_a_full_chest_offers_each_item_once_then_fails(self):
+        # Live: a full spruce chest answered "That won't fit" four times a
+        # second for twenty minutes while the same items were offered again.
+        task = self._deposit_until_refused(
+            self._refusing_chest_client(self.WONT_FIT_LIVE))
+        self.assertEqual((task.full, task.refused), (True, 2))
+        self.assertTrue(task.error.startswith(DepositItemsTask.STORAGE_FULL))
+        # The farm circuit then leaves the chest alone for hours, not the
+        # usual half hour.
+        self.assertEqual(FarmCircuitTask.failure_backoff(task.error, 1800.0),
+                         FarmCircuitTask.STORAGE_FULL_RETRY_SECONDS)
+        # It is the server's answer that says full, not the silence.
+        silent = self._deposit_until_refused(self._refusing_chest_client(""))
+        self.assertFalse(silent.error.startswith(DepositItemsTask.STORAGE_FULL))
+
+    def test_deposit_refused_for_another_reason_is_an_ordinary_failure(self):
+        # A chest no longer active refuses too, but it is not full: the
+        # usual backoff applies, not the full-chest one.
+        for answer in ("The chest is not active.", ""):
+            with self.subTest(answer=answer):
+                task = self._deposit_until_refused(self._refusing_chest_client(answer))
+                self.assertFalse(task.full)
+                self.assertTrue(task.error.startswith(DepositItemsTask.STORAGE_REFUSED))
+                self.assertEqual(FarmCircuitTask.failure_backoff(task.error, 1800.0),
+                                 1800.0)
+        # "Won't fit" in another container says nothing about this one.
+        task = self._deposit_until_refused(
+            self._refusing_chest_client("That won't fit in the quiver!"))
+        self.assertFalse(task.full)
+
+    def test_deposit_with_room_for_some_items_is_not_full(self):
+        # The server says "won't fit" for any one item heavier than the room
+        # left. Another item went in, so the chest is not full.
+        task = self._deposit_until_refused(
+            self._refusing_chest_client(self.WONT_FIT_LIVE, accept={81}))
+        self.assertEqual((task.full, task.refused), (True, 1))
+        self.assertTrue(task.error.startswith(DepositItemsTask.STORAGE_REFUSED))
+        self.assertEqual(FarmCircuitTask.failure_backoff(task.error, 1800.0), 1800.0)
+
+    def test_deposit_ignores_won_t_fit_from_before_it_started(self):
+        task = self._deposit_until_refused(
+            self._refusing_chest_client("", earlier=self.WONT_FIT_LIVE))
+        self.assertFalse(task.full)
+        self.assertTrue(task.error.startswith(DepositItemsTask.STORAGE_REFUSED))
+
+    def test_deposit_completes_once_every_item_is_accepted(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.place_item(Item(90, flags=c.ITEM_CONTAINER_OPEN,
+                                           name="chest"), 0)
+                self.state.place_item(Item(
+                    81, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
+                    quality=90, condition=100, name="ring"), 7)
+                self.moves = []
+
+            async def move_item(self, destination, tag, quantity=0):
+                self.moves.append((destination, tag))
+                self.state.place_item(self.state.items[tag], destination)
+
+        client = FakeClient()
+        task = DepositItemsTask("chest", valuable_only=True)
+        task._opened = True
+        asyncio.run(task.tick(client))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.moves, [(90, 81)])
+        self.assertEqual((task.status, task.refused), (TaskStatus.COMPLETE, 0))
 
     def test_retrieve_items_takes_predicate_matches_up_to_a_weight_limit(self):
         class FakeClient:
