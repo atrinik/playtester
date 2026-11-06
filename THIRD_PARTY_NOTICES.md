@@ -43,9 +43,12 @@ the playtester process. The analyzer reads the Classic server's experience and
 skill tables as text from the GPL-2.0-or-later `atrinik/classic` `v5.99.0`
 server source archive `atrinik-classic-server-5.99.0.tar.gz`
 (`sha256:ea3fd518bacbad7b7f2ccc2ac1425cc32470abd1422ec91832dc07e7c63534e5`,
-commit `adcab31088a7ce02555d7a6f4f862034a982abbb`). That source is cached data
-for the analyzer only; nothing from it is compiled, linked, executed, or
-distributed by this repository.
+commit `adcab31088a7ce02555d7a6f4f862034a982abbb`). That source is cached data:
+the analyzer reads it, and at runtime the dashboard also reads its `new_levels`
+experience table from `src/server/exp.c` in the cached bundle as text, to show
+progress to the next level. Nothing from it is compiled, linked, executed, or
+distributed by this repository. The dashboard's in-repository fallback, used
+only when that file cannot be read, stays at levels 0-30 (31 entries).
 
 Release artifacts must record their exact resolved dependency graph and retain
 all required license texts and notices. No linked GPL binary should be
