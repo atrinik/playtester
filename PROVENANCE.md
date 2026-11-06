@@ -66,3 +66,9 @@ GPL-2.0-or-later Classic server's `exp.c` and `skill_util.c` as text; the
 playtester passes only its own measured combat statistics in and reads the
 analyzer's JSON report out. No analyzer or server source is copied into this
 repository, and ranking results are gameplay estimates, not imported code.
+
+The dashboard's level progress reads the same cached server source's
+`new_levels` table from `exp.c` as text at runtime: data, not linked or
+compiled code. Its in-repository fallback for an unreadable source stays at
+levels 0-30 (31 entries), and its tests check the table's shape without
+copying server values past level 30.
