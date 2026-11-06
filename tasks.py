@@ -6623,6 +6623,14 @@ class MassIdentifyTask(BotTask):
 class DepositItemsTask(BotTask):
     """Deposit matching items in an already visible/open house container."""
 
+    # A move the server has not carried out within this long was refused.
+    # Each item is offered once: a full container answers "That won't fit
+    # in the <container>!" (server types/player.c) and keeps refusing it.
+    MOVE_CONFIRM_SECONDS = 5.0
+    STORAGE_FULL = "storage container is full"
+    STORAGE_REFUSED = "storage container refused"
+    WONT_FIT = re.compile(r"\bthat won't fit in the (.+?)!", re.I)
+
     def __init__(self, container_name: str, patterns: tuple[str, ...] = (),
                  *, unidentified_only: bool = False,
                  valuable_only: bool = False,
@@ -6635,10 +6643,18 @@ class DepositItemsTask(BotTask):
         # Run in the same visit once everything is deposited.
         self.then_retrieve = then_retrieve
         self._opened = False
+        # When each item's move was sent (by tag).
+        self._sent: dict[int, float] = {}
+        # Items the container refused, once nothing else is left to offer.
+        self.refused = 0
+        # Whether the server said this container has no room.
+        self.full = False
+        self._feedback_start = 0
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
+            self._feedback_start = client.state.message_count
         container = next((item for item in (*client.state.ground,
                                             *client.state.inventory)
                           if self.container_name in item.name.casefold()), None)
@@ -6649,6 +6665,11 @@ class DepositItemsTask(BotTask):
             await client.apply(container.tag)
             self._opened = True
             return
+        for entry in client.state.messages_since(self._feedback_start):
+            match = self.WONT_FIT.search(entry[3]) if len(entry) > 3 else None
+            if match and self.container_name in match.group(1).casefold():
+                self.full = True
+        self._feedback_start = client.state.message_count
         policy = InventoryPolicy()
         items = [
             item for item in client.state.inventory
@@ -6668,19 +6689,40 @@ class DepositItemsTask(BotTask):
             return
         items = [item for item in items
                  if not item.flags & (c.ITEM_APPLIED | c.ITEM_LOCKED)]
-        if not items:
-            follow = self.then_retrieve
-            if follow is None:
-                self.complete()
-                return
-            await follow.tick(client)
-            if follow.status == TaskStatus.COMPLETE:
-                self.complete()
-            elif follow.status == TaskStatus.FAILED:
-                self.fail(follow.error)
+        now = time.monotonic()
+        fresh = [item for item in items if item.tag not in self._sent]
+        if fresh:
+            for item in fresh[:5]:
+                self._sent[item.tag] = now
+                await client.move_item(container.tag, item.tag, item.quantity)
             return
-        for item in items[:5]:
-            await client.move_item(container.tag, item.tag, item.quantity)
+        if any(now - self._sent[item.tag] < self.MOVE_CONFIRM_SECONDS
+               for item in items):
+            return
+        # Everything still carried was offered and refused. Live: a full
+        # spruce chest refused the same items four times a second for
+        # twenty minutes, until hunger pulled her away. Only the server's
+        # "won't fit" with nothing accepted this visit means full: one item
+        # too heavy for the room left, or any other refusal (a chest no
+        # longer active, say), is an ordinary failure.
+        self.refused = len(items)
+        follow = self.then_retrieve
+        if follow is not None and follow.status not in (
+                TaskStatus.COMPLETE, TaskStatus.FAILED):
+            # Taking sellable stock back out still frees room for next time.
+            await follow.tick(client)
+            if follow.status not in (TaskStatus.COMPLETE, TaskStatus.FAILED):
+                return
+        if follow is not None and follow.status == TaskStatus.FAILED:
+            self.fail(follow.error)
+        elif self.refused:
+            carried = {item.tag for item in client.state.inventory}
+            accepted = any(tag not in carried for tag in self._sent)
+            reason = (self.STORAGE_FULL if self.full and not accepted
+                      else self.STORAGE_REFUSED)
+            self.fail(f"{reason}: {self.refused} item(s) not stored")
+        else:
+            self.complete()
 
 
 class RetrieveItemsTask(BotTask):
