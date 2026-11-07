@@ -4029,21 +4029,23 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
                        legs) -> bool:
     """Whether live failures rate this spot hazardous for her current kit.
 
-    See self_improvement.kit_hazard: repeated pack or out-damaged failures
-    with a kit whose survivability matches hers now
+    See self_improvement.kit_hazard: repeated pack or out-damaged failures,
+    or deaths on the way, at any spot sharing a map with this one, with a
+    kit whose survivability matches hers now
     (CombatProfile.same_survivability).
     """
     profile = current_combat_kit(client)
     if profile is None:
         return False
     adaptations = getattr(client.state, "farm_adaptations", {}) or {}
-    record = adaptations.get(self_improvement.spot_key(spot, legs))
 
     def same_kit(kit: dict) -> bool:
         old = farm_analyzer_plan.CombatProfile.from_description(kit)
         return old is not None and profile.same_survivability(old)
 
-    return self_improvement.kit_hazard(record, same_kit)
+    return self_improvement.kit_hazard(
+        adaptations, self_improvement.spot_key(spot, legs),
+        (path for path, _ in legs), same_kit)
 
 
 def analyzer_farm_choice(
@@ -4835,7 +4837,8 @@ class FarmCircuitTask(BotTask):
         kit = current_combat_kit(client)
         record, pause = self_improvement.learn(
             adaptations.get(key, {}), review,
-            kit=kit.describe() if kit is not None else None)
+            kit=kit.describe() if kit is not None else None,
+            maps=[leg for leg, _ in self.legs])
         setter = getattr(client, "set_farm_adaptation", None)
         if setter is not None:
             setter(key, record)
@@ -4875,8 +4878,9 @@ class FarmCircuitTask(BotTask):
             if recorder is not None:
                 recorder("farm-kit-hazard",
                          f"{(self.spot or {}).get('name', key)}: "
-                         f"{self_improvement.KIT_HAZARD_FAILURES} pack or "
-                         "out-damaged failures with this kit")
+                         f"{self_improvement.KIT_HAZARD_FAILURES} pack, "
+                         "out-damaged or approach-death failures in this "
+                         "area with this kit")
             return True
         return False
 
