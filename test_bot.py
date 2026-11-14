@@ -17564,6 +17564,192 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
         self.assertEqual(analyzer_farm_selection(
             client, built_graph())[1]["name"], "Trees")
 
+    UC = "/shattered_islands/strakewood_island/underground_city/underground_city_"
+    # Where Sera respawned after each live underground city death.
+    RESPAWN = "/shattered_islands/world_7_64_1", (22, 7)
+
+    def test_a_route_death_skips_every_circuit_routed_through_that_map(self):
+        from . import self_improvement as si
+        from .navigation import (_route_death_cache, analyzer_farm_choice,
+                                 kit_hazardous_spot, route_death_maps)
+
+        # Live, 2026-11-14: six deaths in 13 minutes at the underground
+        # city entrance (0_0), on the way to two circuits that do not farm
+        # it, each of which needed three deaths of its own there.
+        entrance = self.UC + "0_0"
+        circuit_a = analyzer_spot("UC circuit A", [
+            self.UC + "2_2", self.UC + "2_3", self.UC + "3_1", self.UC + "3_2"],
+            ["drow L32"])
+        circuit_b = analyzer_spot("UC circuit B", [
+            self.UC + "0_4", self.UC + "1_2", self.UC + "1_3", self.UC + "1_4"],
+            ["drow L32"])
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [circuit_a, circuit_b, trees],
+                              "safety": [circuit_b, trees]})
+        client.state.stats.update(level=36, hp=322, maxhp=322)
+        client.farm_analyzer.profile = self.kit(max_health=322, character_level=36)
+        client.state.map.path, (client.state.map.world_x,
+                                client.state.map.world_y) = self.RESPAWN
+        graph = built_graph()
+        _route_death_cache.clear()
+        self.assertEqual(analyzer_farm_choice(client, graph)[2]["name"],
+                         "UC circuit A")
+        circuit = self.circuit(client, circuit_a)
+        circuit._failure_epoch = 0.0
+        # Killed by the entrance's puddings and jellies on the way to A.
+        now = time.time()
+        client.decision_history.append({"time": now - 3, "action": "step",
+                                        "detail": "", "task": "", "map": entrance})
+        client.state.messages.append(
+            (now - 1, 2, "ff0000", "brown cave pudding hit you for 40 (-40) acid damage."))
+        client.decision_history.append({"time": now, "action": "death", "detail": "",
+                                        "task": "", "map": entrance})
+        circuit._observe_farm_death(client)
+        record = client.state.farm_adaptations[circuit_a["path"]]
+        self.assertEqual(record["kit_failures"][-1]["map"], entrance)
+        self.assertEqual(route_death_maps(client), {entrance})
+        # One death is not yet a kit hazard for A, but its route is lethal.
+        self.assertFalse(kit_hazardous_spot(client, circuit_a, circuit.legs))
+
+        def settle(calls=6):
+            # One exact route search per call; undecided spots wait.
+            return [analyzer_farm_choice(client, graph) for _ in range(calls)]
+
+        picks = settle()
+        names = {choice[2]["name"] for choice in picks if choice is not None}
+        # Neither A nor B (also routed through 0_0) is picked once.
+        self.assertEqual(names, {"Trees"})
+        self.assertEqual(picks[-1][2]["name"], "Trees")
+        # Depleted, the safety ranking and the xp fallback skip B and A too.
+        client.state.depletion_points_known = True
+        client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD
+        client.state.place_item(Item(
+            503, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
+            client.state.player_tag)
+        client.farm_analyzer.rankings["safety"] = [circuit_b]
+        self.assertEqual({choice[2]["name"] for choice in settle()
+                          if choice is not None}, {"Trees"})
+        # A death she survived (a recall) teaches no farm-selection hazard,
+        # and the hazard ages out like the navigation's route hazard.
+        self.assertEqual(si.route_death_maps(
+            client.state.farm_adaptations, lambda kit: True,
+            now=now + si.ROUTE_DEATH_HAZARD_SECONDS + 1), set())
+        recall = dict(record["kit_failures"][-1], kind="emergency-recall")
+        self.assertEqual(si.route_death_maps(
+            {"x": {"kit_failures": [recall]}}, lambda kit: True, now=now), set())
+        # Nor does a map she only died on after being hurt elsewhere.
+        harmless = dict(record["kit_failures"][-1], map_damage=0)
+        self.assertEqual(si.route_death_maps(
+            {"x": {"kit_failures": [harmless]}}, lambda kit: True, now=now), set())
+
+    def test_the_circuit_leaves_a_spot_only_reachable_through_a_death_map(self):
+        from .navigation import _route_death_cache
+
+        entrance = self.UC + "0_0"
+        circuit_a = analyzer_spot("UC circuit A", [self.UC + "2_2"], ["drow L32"])
+        client = self.client({"xp": [circuit_a]})
+        client.state.map.path, (client.state.map.world_x,
+                                client.state.map.world_y) = self.RESPAWN
+        circuit = self.circuit(client, circuit_a)
+        client.state.farm_adaptations = {circuit_a["path"]: {"kit_failures": [{
+            "time": time.time(), "cause": "route", "kind": "death",
+            "map": entrance, "map_damage": 120, "kit": {}}]}}
+        _route_death_cache.clear()
+        # No other spot is ranked: she stops instead of walking back.
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(circuit.status, TaskStatus.COMPLETE)
+        self.assertIn("farm-spots-exhausted",
+                      [entry["action"] for entry in client.decision_history])
+
+    def test_low_health_on_the_way_to_a_farm_fires_word_of_recall(self):
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        circuit = self.circuit(client, trees)
+        farm = circuit.child.task
+        # Fleeing a pack on the road at 16 of 244 hit points, with a wand.
+        client.state.map.path = self.UC + "0_0"
+        client.state.stats.update(hp=16, maxhp=244)
+        client.state.map.tile(client.state.map.width // 2 + 1,
+                              client.state.map.height // 2).objects[3] = MapObject(
+            3, 1, 0, 0, name="brown cave pudding", target_id=100, target_hp=100)
+        client.state.add_message(2, "ff0000",
+                                 "brown cave pudding hit you for 40 (-40) acid damage.")
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    name="pine wand of word of recall (lvl 17)")
+        client.state.place_item(wand, client.state.player_tag)
+        applied, fired = [], []
+
+        async def apply(tag):
+            applied.append(tag)
+
+        async def fire(direction, tag=0):
+            fired.append((direction, tag))
+
+        async def idle(*args, **kwargs):
+            pass
+
+        client.apply, client.fire = apply, fire
+        client.clear_actions = client.set_combat = idle
+        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual((applied, fired), ([77], []))
+        # The readied wand fires on a later transit tick, whatever her health.
+        wand.flags |= c.ITEM_APPLIED
+        client.state.stats["hp"] = 200
+        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(fired, [(0, 0)])
+        self.assertIn("emergency-recall",
+                      [entry["action"] for entry in client.decision_history])
+        # In flight, it is not fired again.
+        client.state.stats["hp"] = 16
+        self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(fired, [(0, 0)])
+        # Healthy, or without hostile contact, the charge is kept.
+        fresh = self.circuit(client, trees)
+        client.state.stats["hp"] = 200
+        self.assertFalse(asyncio.run(
+            fresh._transit_emergency_recall(client, fresh.child.task)))
+        client.state.stats["hp"] = 16
+        client.state.messages.clear()
+        self.assertFalse(asyncio.run(
+            fresh._transit_emergency_recall(client, fresh.child.task)))
+        self.assertEqual(fired, [(0, 0)])
+        # The circuit's own transit tick asks it before healing or fleeing.
+        wand.flags &= ~c.ITEM_APPLIED
+        client.state.add_message(2, "ff0000",
+                                 "ochre cave jelly hit you for 30 (-30) fire damage.")
+        fresh.status = TaskStatus.RUNNING
+        fresh.server_clock.sync = idle
+        for name in dir(fresh):
+            if name.startswith("_needs_"):
+                setattr(fresh, name, lambda *args, **kwargs: False)
+        asyncio.run(fresh.tick(client))
+        self.assertEqual(applied, [77, 77])
+
+    def test_failures_with_a_stronger_kit_still_count_when_she_is_weaker(self):
+        from . import self_improvement as si
+        from .navigation import kit_hazardous_spot
+
+        strong = self.kit(max_health=322)
+        # Depletion lowered her maximum health; equal or weaker still matches.
+        for now in (strong, self.kit(max_health=244), self.kit(armour_class=40),
+                    self.kit(max_health=350), self.kit(character_level=33)):
+            self.assertTrue(now.no_survivability_gain(strong), now)
+        # Only a genuine gain beyond the tolerance clears it.
+        for now in (self.kit(max_health=400), self.kit(armour_class=51),
+                    self.kit(protections=(("impact", 48),)),
+                    self.kit(character_level=34)):
+            self.assertFalse(now.no_survivability_gain(strong), now)
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [trees]})
+        client.state.farm_adaptations = {trees["path"]: {"kit_failures": [
+            {"time": time.time(), "cause": "pack", "kit": strong.describe()}
+        ] * si.KIT_HAZARD_FAILURES}}
+        legs = ((self.TREES, "evil treant"),)
+        for max_health, hazardous in ((322, True), (244, True), (400, False)):
+            client.farm_analyzer.profile = self.kit(max_health=max_health)
+            self.assertEqual(kit_hazardous_spot(client, trees, legs), hazardous,
+                             max_health)
+
     def test_when_every_spot_is_hazardous_she_farms_the_least_dangerous(self):
         from . import self_improvement as si
         from .navigation import analyzer_farm_selection

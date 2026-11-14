@@ -407,12 +407,16 @@ steps away and keeps her distance.
 - **Hazardous for her kit.** Each farm failure review now stores the
   analyzer's combat profile she failed with. A spot with three pack or
   out-damaged failures, or approach deaths, in 24 hours (`KIT_HAZARD_FAILURES`), each with the
-  same survivability as hers now, is hazardous for her kit. Survivability
-  (`CombatProfile.same_survivability`) is maximum health within 10%, armour
-  class within 2, total protections within 5 and character level within 2;
-  skill level and mana move constantly while she trains and are ignored.
-  The circuit leaves such a spot at once (`farm-kit-hazard`), and
-  `analyzer_farm_choice` skips it until her survivability changes. If every
+  survivability as hers now or better, is hazardous for her kit. The test
+  (`CombatProfile.no_survivability_gain`) is one-sided: a failure stops
+  counting only once she has genuinely improved on it, with maximum health
+  more than 10% up, armour class more than 2 up, total protections more
+  than 5 up or character level more than 2 up. Weaker or equal, it still
+  counts: live, depletion dropped Sera's maximum health from 322 to 244,
+  and a symmetric test had stopped counting the deaths she had at full
+  strength. Skill level and mana move constantly while she trains and are
+  ignored. The circuit leaves such a spot at once (`farm-kit-hazard`), and
+  `analyzer_farm_choice` skips it until her survivability improves. If every
   usable spot is hazardous, she farms the least dangerous one rather than
   idle. No map names are listed; maps qualify by their record. Live, the
   treant maps had eight such deaths in 90 minutes, `world_16_74` alone five;
@@ -428,6 +432,26 @@ steps away and keeps her distance.
   such approach failures at the underground city had not counted. Records
   saved before maps were kept count for their own spot, and a single-map
   spot's also for spots sharing that map.
+- **Route deaths mark the map she died on.** A death on the way to a spot
+  also keeps the transit map and the damage taken on it. For six hours
+  (`ROUTE_DEATH_HAZARD_SECONDS`, as long as navigation penalises that map),
+  `analyzer_farm_choice` skips every spot that has a leg on that map or
+  that no exact route (`route_enters_death_map`, the planner's own search)
+  reaches without entering it, whichever spot she was heading to. That
+  includes the depletion fallbacks. Learned route hazards only cost the
+  planner more, so a spot behind the map would otherwise be walked to
+  through it. Each such search covers the whole world, so one runs per
+  call, and a spot stays unusable until its search clears it. A route
+  recall, a death on a map that did not hurt her, or a death with a kit she
+  has since improved on does not count. With no other usable spot, the
+  circuit stops (`farm-spots-exhausted`) instead of walking back. Live, on
+  2026-11-14, Sera died six times in 13 minutes at the underground city
+  entrance on the way to two circuits that do not farm it.
+- **Recall on the way.** Off the farm map, the circuit asks the farm task's
+  emergency recall first, with the same thresholds, device readiness,
+  charge and in-flight handling and the same `emergency-recall` decision,
+  before healing and the low-health retreat. Live, she had fled at 8-16 hit
+  points with a seven-charge recall wand.
 - **Healing outpaced.** From the first heal in the last 8 s on, when the
   hits taken are at least what the later heals restored (her health at the
   latest heal is no higher than at the first), healing has stopped keeping

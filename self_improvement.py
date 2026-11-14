@@ -47,6 +47,11 @@ KEEP_REVIEWS = 10
 KIT_HAZARD_FAILURES = 3
 KIT_HAZARD_WINDOW_SECONDS = 24 * 3600.0
 KIT_HAZARD_CAUSES = frozenset({"pack", "out-damaged"})
+# A map she died on while travelling to a farm spot stays a farm-selection
+# hazard this long (route_death_maps): every spot routed through it is
+# skipped, as long as navigation avoids a map where a route death took
+# damage (FarmCircuitTask.ROUTE_HAZARD_SECONDS).
+ROUTE_DEATH_HAZARD_SECONDS = 6 * 3600.0
 
 # Bounded digits: a server line with an oversized amount never reaches
 # int()'s digit limit; it is not a hit we count.
@@ -214,12 +219,15 @@ def remedies(review: FailureReview) -> tuple[str, ...]:
 
 
 def learn(record: dict, review: FailureReview, *, now: float | None = None,
-          kit: dict | None = None, maps: Iterable[str] = ()) -> tuple[dict, bool]:
+          kit: dict | None = None, maps: Iterable[str] = (),
+          map_damage: int | None = None) -> tuple[dict, bool]:
     """Fold a review into a spot's adaptation record; return (record, pause).
 
     ``kit`` describes the combat profile she failed with (the analyzer's),
     kept with the failure for ``kit_hazard``; ``maps`` are the spot's maps,
     kept so that its failures also count for overlapping spots.
+    ``map_damage`` is the damage she took on the failure map itself, kept
+    so that route_death_maps blames only a map that actually hurt her.
     """
     now = time.time() if now is None else now
     record = dict(record or {})
@@ -241,9 +249,12 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
                     if isinstance(entry, dict) and
                     now - float(entry.get("time", 0.0) or 0.0) <=
                     KIT_HAZARD_WINDOW_SECONDS]
-    kit_failures.append({"time": review.time, "cause": review.cause,
-                         "kind": review.kind, "map": review.map,
-                         "kit": dict(kit or {})})
+    failure = {"time": review.time, "cause": review.cause,
+               "kind": review.kind, "map": review.map,
+               "kit": dict(kit or {})}
+    if map_damage is not None:
+        failure["map_damage"] = int(map_damage)
+    kit_failures.append(failure)
     maps = sorted(set(maps))
     if maps:
         record["maps"] = maps
@@ -262,6 +273,37 @@ def hazard_failure(entry: dict) -> bool:
     cause = entry.get("cause")
     return cause in KIT_HAZARD_CAUSES or (
         cause == "route" and entry.get("kind") == "death")
+
+
+def route_death_maps(adaptations: dict | None,
+                     applies: Callable[[dict], bool], *,
+                     now: float | None = None) -> set[str]:
+    """Maps she recently died on while travelling to a farm spot.
+
+    Each route death (hazard_failure with cause "route") keeps the map she
+    actually died on, the transit map, in its kit failure. That map is a
+    farm-selection hazard for ROUTE_DEATH_HAZARD_SECONDS, for every spot
+    whose route enters it, whichever spot she was heading to. ``applies``
+    judges the kit the death happened with (a genuinely improved kit clears
+    it). Route recalls do not count: she survived them. Nor does a death on
+    a map that did not hurt her (map_damage 0: she died of earlier hits
+    after crossing onto it), as for the navigation's learned route hazards;
+    an entry stored before map_damage was kept counts.
+    """
+    now = time.time() if now is None else now
+    maps: set[str] = set()
+    for record in (adaptations or {}).values():
+        if not isinstance(record, dict):
+            continue
+        for entry in record.get("kit_failures", ()):
+            if (isinstance(entry, dict) and entry.get("cause") == "route" and
+                    hazard_failure(entry) and entry.get("map") and
+                    int(entry.get("map_damage", 1) or 0) > 0 and
+                    now - float(entry.get("time", 0.0) or 0.0) <=
+                    ROUTE_DEATH_HAZARD_SECONDS and
+                    applies(entry.get("kit") or {})):
+                maps.add(str(entry["map"]))
+    return maps
 
 
 def record_maps(key: str, record: dict) -> set[str]:
