@@ -1671,6 +1671,9 @@ class NavigateTask(BotTask):
         # is retried later), never a dangerous one.
         self.strict_safety = False
         self._failed_tile_crossings: set[tuple[str, str, int, int]] = set()
+        # (map, x, y) seam departures that rejected the step onto them; see
+        # _rejected_departures_on.
+        self._rejected_departures: set[tuple[str, int, int]] = set()
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -2076,7 +2079,22 @@ class NavigateTask(BotTask):
                     "navigation-occupant-blocked",
                     ", ".join(f"{x},{y}" for x, y in sorted(newly_blocked)))
         return (self._runtime_blocked | self._threat_blocked |
-                self._temporary_blocked)
+                self._temporary_blocked |
+                self._rejected_departures_on(m.path, (m.world_x, m.world_y)))
+
+    def _rejected_departures_on(self, map_path: str,
+                                start: tuple[int, int]) -> set[tuple[int, int]]:
+        """Seam departure squares that rejected her step, on one map.
+
+        Unlike learned stall blockers these are never reset while the trip
+        lasts: live, an unseen guard held the departure of Greyton's lower
+        west seam, and resetting it as a stale guess sent Sera stepping into
+        it every half second for twenty minutes. The square she stands on is
+        never excluded, so a path can still start there.
+        """
+        return {
+            (x, y) for path, x, y in self._rejected_departures
+            if path == map_path} - {start}
 
     async def _click_path(self, client: AtrinikClient, world_x: int,
                           world_y: int) -> bool:
@@ -2162,7 +2180,10 @@ class NavigateTask(BotTask):
                     self.graph.local_path(
                         m.path, start, (world_x, world_y),
                         allow_locked=self._allow_locked(client),
-                        excluded=self._threat_blocked | self._temporary_blocked)):
+                        excluded=(self._threat_blocked |
+                                  self._temporary_blocked |
+                                  self._rejected_departures_on(
+                                      m.path, start)))):
                 # Live trap on world_2_67: six learned blocks ringed Sera while a
                 # visible guard kept this branch on the occupant path below, so
                 # she cancelled and replanned for minutes without one step.
@@ -2425,6 +2446,14 @@ class NavigateTask(BotTask):
             return ""
 
         direction = side(edge)
+        stalled_departure = (max(0, min(source.width - 1, edge.x)),
+                             max(0, min(source.height - 1, edge.y)))
+        # An unseen occupant (a guard on a fogged square sends no object)
+        # can hold the departure square itself, so the step onto it is the
+        # one rejected while she is still one tile inside the border.
+        onto_departure = (
+            start != stalled_departure and
+            self._issued_click == (edge.source, *stalled_departure))
         at_border = {
             "west": start[0] == 0,
             "east": start[0] == source.width - 1,
@@ -2434,11 +2463,13 @@ class NavigateTask(BotTask):
         stats = getattr(client.state, "stats", None)
         acknowledgement = (
             movement_ack_timeout(client) if stats is not None else 1.5)
-        if (not at_border or
+        if (not (at_border or onto_departure) or
                 time.monotonic() - self._last_progress < acknowledgement):
             return False
         self._failed_tile_crossings.add(
             (edge.source, edge.destination, edge.x, edge.y))
+        if onto_departure:
+            self._rejected_departures.add((edge.source, *stalled_departure))
         authored = next((
             candidate for candidate in source.edges
             if candidate.kind == "tile" and
@@ -2479,7 +2510,8 @@ class NavigateTask(BotTask):
             path = self.graph.local_path(
                 edge.source, start, departure,
                 allow_locked=self._allow_locked(client),
-                excluded=self._runtime_blocked | self._threat_blocked)
+                excluded=(self._runtime_blocked | self._threat_blocked |
+                          self._rejected_departures_on(edge.source, start)))
             if path:
                 candidates.append((
                     abs(orthogonal - authored_orthogonal),

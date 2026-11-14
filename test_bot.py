@@ -15879,6 +15879,101 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(
             client.decisions[0][0], "navigation-seam-retry")
 
+    def test_navigation_retargets_seam_whose_departure_rejects_steps(self):
+        # Live: Sera stood one tile inside Greyton's lower west seam while an
+        # unseen guard held the departure square. Every rejected diagonal
+        # step learned that square, found no route, and cleared it again,
+        # so she stepped into it every half second for twenty minutes.
+        graph = WorldGraph()
+        for path in ("/start", "/goal"):
+            graph.nodes[path] = MapNode(path, width=6, height=6)
+            graph.nodes[path].terrain = {
+                (x, y): 1 for x in range(6) for y in range(6)
+            }
+        # Column x=0 is wall except a departure at (0,2) and another
+        # opening at (0,4).
+        graph.nodes["/start"].blocked = {(0, 0), (0, 1), (0, 3), (0, 5)}
+        edge = MapEdge("/start", "/goal", -1, 2, kind="tile",
+                       label="coordinate -1,0,0")
+        graph.nodes["/start"].edges.append(edge)
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.map = MapState(
+                    path="/start", world_x=1, world_y=1,
+                    width=17, height=17)
+                self.steps = []
+                self.rejected = 0
+                self.decisions = []
+
+            async def clear_actions(self):
+                pass
+
+            async def move(self, direction, run=False):
+                self.steps.append(direction)
+                dx, dy = c.DIRECTION_DELTAS[direction]
+                x, y = self.state.map.world_x + dx, self.state.map.world_y + dy
+                if self.state.map.path != "/start":
+                    return
+                if (x, y) == (0, 2):
+                    # The unseen guard holds the departure square.
+                    self.rejected += 1
+                    return
+                if x < 0:
+                    self.state.map.path, x = "/goal", 5
+                self.state.map.world_x, self.state.map.world_y = x, y
+
+            def record_action(self, action, detail=""):
+                self.decisions.append((action, detail))
+
+        client = FakeClient()
+        task = NavigateTask(graph, "/goal")
+        task.status = TaskStatus.RUNNING
+        task.route = [edge]
+        task._last_position = ("/start", 1, 1)
+        task._last_progress = time.monotonic() - 60.0
+        for _ in range(40):
+            asyncio.run(task.tick(client))
+            if task.status != TaskStatus.RUNNING:
+                break
+            # Let time pass: every unanswered step now reads as a stall.
+            task._last_action = 0.0
+            task._last_progress -= 10.0
+            if task._no_route_since:
+                task._no_route_since -= 10.0
+        self.assertIn(("/start", "/goal", -1, 2),
+                      task._failed_tile_crossings)
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertEqual(client.state.map.path, "/goal")
+        self.assertEqual(client.state.map.world_y, 4)
+        self.assertIn("navigation-seam-retry",
+                      [action for action, _ in client.decisions])
+        self.assertNotIn("navigation-learned-blocks-reset",
+                         [action for action, _ in client.decisions])
+        self.assertEqual(client.rejected, 1)
+        self.assertEqual(task._rejected_departures, {("/start", 0, 2)})
+        self.assertEqual(client.steps[-1], 7)
+
+        # A learned-block reset never reopens the rejected departure: with
+        # it closed there is no local route, so the seam fails over instead
+        # of stepping into the guard again.
+        client.state.map = MapState(
+            path="/start", world_x=1, world_y=1, width=17, height=17)
+        client.steps.clear()
+        task._runtime_blocked = {(1, 2)}
+        task._issued_goal = task._issued_click = None
+        task._no_route_since = time.monotonic() - 60.0
+        task._last_action = 0.0
+        results = []
+        for _ in range(3):
+            task._last_action = 0.0
+            results.append(asyncio.run(task._click_path(client, -1, 2)))
+        self.assertEqual(client.steps, [])
+        self.assertFalse(results[-1])
+        self.assertNotIn("navigation-learned-blocks-reset",
+                         [action for action, _ in client.decisions])
+
     def test_navigation_marks_unavoidable_overlevel_fallback(self):
         class FakeGraph:
             def __init__(self):
