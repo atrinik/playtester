@@ -1678,8 +1678,10 @@ class NavigateTask(BotTask):
         self._departure_rejection_strikes: dict[
             tuple[str, int, int], int] = {}
         # The step onto a seam departure being timed: ((map, start,
-        # departure), first seen, last seen); see _retry_stalled_tile_crossing.
-        self._departure_attempt: tuple[tuple, float, float] | None = None
+        # departure), first seen, the send then seen, when the timer
+        # started or None); see _retry_stalled_tile_crossing.
+        self._departure_attempt: tuple[
+            tuple, float, float, float | None] | None = None
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -2486,28 +2488,31 @@ class NavigateTask(BotTask):
         # An unseen occupant (a guard on a fogged square sends no object)
         # can hold the departure square itself, so the step onto it is the
         # one rejected while she is still one tile inside the border. A
-        # closed door there legitimately absorbs the first step (it opens
-        # instead of moving her), and a corner edge has no departure side.
+        # corner edge has no departure side.
         onto_departure = (
             bool(direction) and not at_border and
             start != stalled_departure and
-            stalled_departure not in source.doors and
             self._issued_click == (edge.source, *stalled_departure))
+        stalled_for = now - self._last_progress
         if onto_departure:
             # Time the step itself, not her last move: she may have idled
-            # beside the departure for long before stepping. A gap longer
-            # than one acknowledgement starts a new attempt.
-            attempt = (edge.source, start, stalled_departure)
-            if (self._departure_attempt is None or
-                    self._departure_attempt[0] != attempt or
-                    now - self._departure_attempt[2] > acknowledgement):
-                self._departure_attempt = (attempt, now, now)
-            else:
-                self._departure_attempt = (
-                    attempt, self._departure_attempt[1], now)
-            stalled_for = now - self._departure_attempt[1]
-        else:
-            stalled_for = now - self._last_progress
+            # beside the departure for long before stepping. The attempt
+            # lasts until she moves or steps from elsewhere, however often
+            # the step is re-sent in between.
+            key = (edge.source, start, stalled_departure)
+            attempt = self._departure_attempt
+            if (attempt is None or attempt[0] != key or
+                    self._last_progress > attempt[1]):
+                # A closed door absorbs the first step (it opens instead of
+                # moving her), so its timer starts at the next send.
+                attempt = (key, now, self._last_action,
+                           None if stalled_departure in source.doors
+                           else now)
+            elif attempt[3] is None and self._last_action != attempt[2]:
+                attempt = (*attempt[:3], now)
+            self._departure_attempt = attempt
+            stalled_for = (-1.0 if attempt[3] is None
+                           else now - attempt[3])
         if (not (at_border or onto_departure) or
                 stalled_for < acknowledgement):
             return False

@@ -15880,13 +15880,13 @@ class NavigationTests(unittest.TestCase):
             client.decisions[0][0], "navigation-seam-retry")
 
     @staticmethod
-    def _departure_seam(start, *, guard=False, door=False, late=False):
+    def _departure_seam(start, *, guard=False, door=False, late=0):
         """A west seam whose departure (0,2) sits beside an opening (0,4).
 
         The rest of column x=0 is wall. ``guard`` makes the departure reject
         every step (an unseen occupant), ``door`` puts a closed door there
-        that absorbs the first step, and ``late`` delivers each accepted
-        step one tick after it was sent.
+        that absorbs the first step, and ``late`` holds each accepted step
+        for that many ticks after the one that sent it.
         """
         graph = WorldGraph()
         for path in ("/start", "/goal"):
@@ -15912,6 +15912,7 @@ class NavigationTests(unittest.TestCase):
                 self.decisions = []
                 self.door_closed = door
                 self.pending = None
+                self.hold = 0
 
             async def clear_actions(self):
                 pass
@@ -15920,24 +15921,28 @@ class NavigationTests(unittest.TestCase):
                 self.steps.append(direction)
                 dx, dy = c.DIRECTION_DELTAS[direction]
                 x, y = self.state.map.world_x + dx, self.state.map.world_y + dy
-                if self.state.map.path != "/start":
-                    return
-                if guard and (x, y) == (0, 2):
-                    self.rejected += 1
+                if self.state.map.path != "/start" or self.pending:
                     return
                 if self.door_closed and (x, y) == (0, 2):
                     self.door_closed = False  # the step opens the door
                     return
-                target = ("/goal", 5, y) if x < 0 else ("/start", x, y)
-                self.pending = target
+                if guard and (x, y) == (0, 2):
+                    self.rejected += 1
+                    return
+                self.pending = ("/goal", 5, y) if x < 0 else ("/start", x, y)
+                self.hold = late
                 if not late:
                     self.deliver()
 
             def deliver(self):
-                if self.pending is not None:
-                    m = self.state.map
-                    m.path, m.world_x, m.world_y = self.pending
-                    self.pending = None
+                if self.pending is None:
+                    return
+                if self.hold:
+                    self.hold -= 1
+                    return
+                m = self.state.map
+                m.path, m.world_x, m.world_y = self.pending
+                self.pending = None
 
             def record_action(self, action, detail=""):
                 self.decisions.append((action, detail))
@@ -15950,13 +15955,13 @@ class NavigationTests(unittest.TestCase):
         return task, client
 
     @staticmethod
-    def _run_seam(task, client, clock, ticks=40):
+    def _run_seam(task, client, clock, ticks=40, dt=0.5):
         for _ in range(ticks):
             asyncio.run(task.tick(client))
             client.deliver()
             if task.status != TaskStatus.RUNNING:
                 break
-            clock[0] += 0.5
+            clock[0] += dt
 
     def test_navigation_retargets_seam_whose_departure_rejects_steps(self):
         # Live: Sera stood one tile inside Greyton's lower west seam while an
@@ -16006,7 +16011,7 @@ class NavigationTests(unittest.TestCase):
         # She idled beside an open departure far longer than one movement
         # acknowledgement; the step she then sends is answered a tick late.
         clock = [1000.0]
-        task, client = self._departure_seam((1, 1), late=True)
+        task, client = self._departure_seam((1, 1), late=2)
         with patch("atrinik_bot.navigation.time.monotonic",
                    side_effect=lambda: clock[0]):
             task._last_progress = clock[0] - 60.0
@@ -16036,6 +16041,49 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(task._rejected_departures, {})
         self.assertNotIn("navigation-seam-retry",
                          [action for action, _ in client.decisions])
+
+    def _assert_departure_retargeted(self, task, client):
+        self.assertIn(("/start", "/goal", -1, 2),
+                      task._failed_tile_crossings)
+        self.assertIn("navigation-seam-retry",
+                      [action for action, _ in client.decisions])
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertEqual((client.state.map.path, client.state.map.world_y),
+                         ("/goal", 4))
+
+    def test_navigation_retargets_guarded_departure_with_tolerance(self):
+        # Quest, priest and vendor trips keep learned blocks and re-send
+        # the step only after the learned-block reset; the attempt must
+        # still mature across those slow re-sends.
+        clock = [1000.0]
+        task, client = self._departure_seam((1, 1), guard=True)
+        task.tolerance = 1
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   side_effect=lambda: clock[0]):
+            task._last_progress = clock[0] - 60.0
+            self._run_seam(task, client, clock, ticks=200, dt=0.25)
+        self._assert_departure_retargeted(task, client)
+
+    def test_navigation_retargets_guarded_departure_on_slow_ticks(self):
+        # Ticks longer than half an acknowledgement must not restart it.
+        clock = [1000.0]
+        task, client = self._departure_seam((1, 1), guard=True)
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   side_effect=lambda: clock[0]):
+            task._last_progress = clock[0] - 60.0
+            self._run_seam(task, client, clock, dt=1.0)
+        self._assert_departure_retargeted(task, client)
+
+    def test_navigation_retargets_guarded_door_departure(self):
+        # A door forgives only the step that opens it, not a guard behind.
+        clock = [1000.0]
+        task, client = self._departure_seam((1, 2), guard=True, door=True)
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   side_effect=lambda: clock[0]):
+            task._last_progress = clock[0] - 60.0
+            self._run_seam(task, client, clock)
+        self.assertFalse(client.door_closed)
+        self._assert_departure_retargeted(task, client)
 
     def test_navigation_rejected_departure_expires(self):
         task, _ = self._departure_seam((1, 1))
