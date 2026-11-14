@@ -1671,9 +1671,15 @@ class NavigateTask(BotTask):
         # is retried later), never a dangerous one.
         self.strict_safety = False
         self._failed_tile_crossings: set[tuple[str, str, int, int]] = set()
-        # (map, x, y) seam departures that rejected the step onto them; see
-        # _rejected_departures_on.
-        self._rejected_departures: set[tuple[str, int, int]] = set()
+        # (map, x, y) seam departures that rejected the step onto them and
+        # when each rejection expires (time.monotonic()), with how often each
+        # was rejected on this trip; see _reject_departure.
+        self._rejected_departures: dict[tuple[str, int, int], float] = {}
+        self._departure_rejection_strikes: dict[
+            tuple[str, int, int], int] = {}
+        # The step onto a seam departure being timed: ((map, start,
+        # departure), first seen, last seen); see _retry_stalled_tile_crossing.
+        self._departure_attempt: tuple[tuple, float, float] | None = None
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -2082,16 +2088,35 @@ class NavigateTask(BotTask):
                 self._temporary_blocked |
                 self._rejected_departures_on(m.path, (m.world_x, m.world_y)))
 
+    def _reject_departure(self, key: tuple[str, int, int]) -> None:
+        """Close one seam departure square that rejected her step.
+
+        Like _exclude_edge it is a detour hint that expires:
+        EDGE_EXCLUSION_SECONDS, doubled on each repeat on this trip, up to
+        EDGE_EXCLUSION_MAX_SECONDS. A guard or a crowd moves on, and the
+        task instance can outlive one trip by hours.
+        """
+        strikes = self._departure_rejection_strikes.get(key, 0)
+        self._departure_rejection_strikes[key] = strikes + 1
+        seconds = min(self.EDGE_EXCLUSION_MAX_SECONDS,
+                      self.EDGE_EXCLUSION_SECONDS * 2 ** min(strikes, 8))
+        self._rejected_departures[key] = time.monotonic() + seconds
+
     def _rejected_departures_on(self, map_path: str,
                                 start: tuple[int, int]) -> set[tuple[int, int]]:
-        """Seam departure squares that rejected her step, on one map.
+        """Live rejected seam departure squares on one map.
 
-        Unlike learned stall blockers these are never reset while the trip
-        lasts: live, an unseen guard held the departure of Greyton's lower
-        west seam, and resetting it as a stale guess sent Sera stepping into
-        it every half second for twenty minutes. The square she stands on is
-        never excluded, so a path can still start there.
+        Unlike learned stall blockers, a learned-block reset does not reopen
+        these before they expire: live, an unseen guard held the departure
+        of Greyton's lower west seam, and resetting it as a stale guess sent
+        Sera stepping into it every half second for twenty minutes. The
+        square she stands on is never excluded, so a path can still start
+        there. Expired rejections are dropped.
         """
+        now = time.monotonic()
+        self._rejected_departures = {
+            key: until for key, until in self._rejected_departures.items()
+            if until > now}
         return {
             (x, y) for path, x, y in self._rejected_departures
             if path == map_path} - {start}
@@ -2446,14 +2471,6 @@ class NavigateTask(BotTask):
             return ""
 
         direction = side(edge)
-        stalled_departure = (max(0, min(source.width - 1, edge.x)),
-                             max(0, min(source.height - 1, edge.y)))
-        # An unseen occupant (a guard on a fogged square sends no object)
-        # can hold the departure square itself, so the step onto it is the
-        # one rejected while she is still one tile inside the border.
-        onto_departure = (
-            start != stalled_departure and
-            self._issued_click == (edge.source, *stalled_departure))
         at_border = {
             "west": start[0] == 0,
             "east": start[0] == source.width - 1,
@@ -2463,13 +2480,42 @@ class NavigateTask(BotTask):
         stats = getattr(client.state, "stats", None)
         acknowledgement = (
             movement_ack_timeout(client) if stats is not None else 1.5)
+        now = time.monotonic()
+        stalled_departure = (max(0, min(source.width - 1, edge.x)),
+                             max(0, min(source.height - 1, edge.y)))
+        # An unseen occupant (a guard on a fogged square sends no object)
+        # can hold the departure square itself, so the step onto it is the
+        # one rejected while she is still one tile inside the border. A
+        # closed door there legitimately absorbs the first step (it opens
+        # instead of moving her), and a corner edge has no departure side.
+        onto_departure = (
+            bool(direction) and not at_border and
+            start != stalled_departure and
+            stalled_departure not in source.doors and
+            self._issued_click == (edge.source, *stalled_departure))
+        if onto_departure:
+            # Time the step itself, not her last move: she may have idled
+            # beside the departure for long before stepping. A gap longer
+            # than one acknowledgement starts a new attempt.
+            attempt = (edge.source, start, stalled_departure)
+            if (self._departure_attempt is None or
+                    self._departure_attempt[0] != attempt or
+                    now - self._departure_attempt[2] > acknowledgement):
+                self._departure_attempt = (attempt, now, now)
+            else:
+                self._departure_attempt = (
+                    attempt, self._departure_attempt[1], now)
+            stalled_for = now - self._departure_attempt[1]
+        else:
+            stalled_for = now - self._last_progress
         if (not (at_border or onto_departure) or
-                time.monotonic() - self._last_progress < acknowledgement):
+                stalled_for < acknowledgement):
             return False
         self._failed_tile_crossings.add(
             (edge.source, edge.destination, edge.x, edge.y))
         if onto_departure:
-            self._rejected_departures.add((edge.source, *stalled_departure))
+            self._departure_attempt = None
+            self._reject_departure((edge.source, *stalled_departure))
         authored = next((
             candidate for candidate in source.edges
             if candidate.kind == "tile" and

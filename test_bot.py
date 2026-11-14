@@ -15879,20 +15879,24 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(
             client.decisions[0][0], "navigation-seam-retry")
 
-    def test_navigation_retargets_seam_whose_departure_rejects_steps(self):
-        # Live: Sera stood one tile inside Greyton's lower west seam while an
-        # unseen guard held the departure square. Every rejected diagonal
-        # step learned that square, found no route, and cleared it again,
-        # so she stepped into it every half second for twenty minutes.
+    @staticmethod
+    def _departure_seam(start, *, guard=False, door=False, late=False):
+        """A west seam whose departure (0,2) sits beside an opening (0,4).
+
+        The rest of column x=0 is wall. ``guard`` makes the departure reject
+        every step (an unseen occupant), ``door`` puts a closed door there
+        that absorbs the first step, and ``late`` delivers each accepted
+        step one tick after it was sent.
+        """
         graph = WorldGraph()
         for path in ("/start", "/goal"):
             graph.nodes[path] = MapNode(path, width=6, height=6)
             graph.nodes[path].terrain = {
                 (x, y): 1 for x in range(6) for y in range(6)
             }
-        # Column x=0 is wall except a departure at (0,2) and another
-        # opening at (0,4).
         graph.nodes["/start"].blocked = {(0, 0), (0, 1), (0, 3), (0, 5)}
+        if door:
+            graph.nodes["/start"].doors.add((0, 2))
         edge = MapEdge("/start", "/goal", -1, 2, kind="tile",
                        label="coordinate -1,0,0")
         graph.nodes["/start"].edges.append(edge)
@@ -15901,11 +15905,13 @@ class NavigationTests(unittest.TestCase):
             def __init__(self):
                 self.state = GameState(phase="playing", player_tag=7)
                 self.state.map = MapState(
-                    path="/start", world_x=1, world_y=1,
+                    path="/start", world_x=start[0], world_y=start[1],
                     width=17, height=17)
                 self.steps = []
                 self.rejected = 0
                 self.decisions = []
+                self.door_closed = door
+                self.pending = None
 
             async def clear_actions(self):
                 pass
@@ -15916,13 +15922,22 @@ class NavigationTests(unittest.TestCase):
                 x, y = self.state.map.world_x + dx, self.state.map.world_y + dy
                 if self.state.map.path != "/start":
                     return
-                if (x, y) == (0, 2):
-                    # The unseen guard holds the departure square.
+                if guard and (x, y) == (0, 2):
                     self.rejected += 1
                     return
-                if x < 0:
-                    self.state.map.path, x = "/goal", 5
-                self.state.map.world_x, self.state.map.world_y = x, y
+                if self.door_closed and (x, y) == (0, 2):
+                    self.door_closed = False  # the step opens the door
+                    return
+                target = ("/goal", 5, y) if x < 0 else ("/start", x, y)
+                self.pending = target
+                if not late:
+                    self.deliver()
+
+            def deliver(self):
+                if self.pending is not None:
+                    m = self.state.map
+                    m.path, m.world_x, m.world_y = self.pending
+                    self.pending = None
 
             def record_action(self, action, detail=""):
                 self.decisions.append((action, detail))
@@ -15931,48 +15946,122 @@ class NavigationTests(unittest.TestCase):
         task = NavigateTask(graph, "/goal")
         task.status = TaskStatus.RUNNING
         task.route = [edge]
-        task._last_position = ("/start", 1, 1)
-        task._last_progress = time.monotonic() - 60.0
-        for _ in range(40):
+        task._last_position = ("/start", *start)
+        return task, client
+
+    @staticmethod
+    def _run_seam(task, client, clock, ticks=40):
+        for _ in range(ticks):
             asyncio.run(task.tick(client))
+            client.deliver()
             if task.status != TaskStatus.RUNNING:
                 break
-            # Let time pass: every unanswered step now reads as a stall.
-            task._last_action = 0.0
-            task._last_progress -= 10.0
-            if task._no_route_since:
-                task._no_route_since -= 10.0
-        self.assertIn(("/start", "/goal", -1, 2),
-                      task._failed_tile_crossings)
-        self.assertEqual(task.status, TaskStatus.COMPLETE)
-        self.assertEqual(client.state.map.path, "/goal")
-        self.assertEqual(client.state.map.world_y, 4)
-        self.assertIn("navigation-seam-retry",
-                      [action for action, _ in client.decisions])
-        self.assertNotIn("navigation-learned-blocks-reset",
-                         [action for action, _ in client.decisions])
-        self.assertEqual(client.rejected, 1)
-        self.assertEqual(task._rejected_departures, {("/start", 0, 2)})
-        self.assertEqual(client.steps[-1], 7)
+            clock[0] += 0.5
 
-        # A learned-block reset never reopens the rejected departure: with
-        # it closed there is no local route, so the seam fails over instead
-        # of stepping into the guard again.
-        client.state.map = MapState(
-            path="/start", world_x=1, world_y=1, width=17, height=17)
-        client.steps.clear()
-        task._runtime_blocked = {(1, 2)}
-        task._issued_goal = task._issued_click = None
-        task._no_route_since = time.monotonic() - 60.0
-        task._last_action = 0.0
-        results = []
-        for _ in range(3):
-            task._last_action = 0.0
-            results.append(asyncio.run(task._click_path(client, -1, 2)))
-        self.assertEqual(client.steps, [])
-        self.assertFalse(results[-1])
-        self.assertNotIn("navigation-learned-blocks-reset",
+    def test_navigation_retargets_seam_whose_departure_rejects_steps(self):
+        # Live: Sera stood one tile inside Greyton's lower west seam while an
+        # unseen guard held the departure square. Every rejected diagonal
+        # step learned that square, found no route, and cleared it again,
+        # so she stepped into it every half second for twenty minutes.
+        clock = [1000.0]
+        task, client = self._departure_seam((1, 1), guard=True)
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   side_effect=lambda: clock[0]):
+            task._last_progress = clock[0] - 60.0
+            self._run_seam(task, client, clock)
+            self.assertIn(("/start", "/goal", -1, 2),
+                          task._failed_tile_crossings)
+            self.assertIn("navigation-seam-retry",
+                          [action for action, _ in client.decisions])
+            self.assertNotIn("navigation-learned-blocks-reset",
+                             [action for action, _ in client.decisions])
+            self.assertEqual(task.status, TaskStatus.COMPLETE)
+            self.assertEqual(client.state.map.path, "/goal")
+            self.assertEqual(client.state.map.world_y, 4)
+            # Only the attempts within one movement acknowledgement.
+            self.assertEqual(client.rejected, 3)
+            self.assertEqual(set(task._rejected_departures),
+                             {("/start", 0, 2)})
+            self.assertEqual(client.steps[-1], 7)
+
+            # A learned-block reset never reopens the rejected departure:
+            # with it closed there is no local route, so the seam fails over
+            # instead of stepping into the guard again.
+            client.state.map = MapState(
+                path="/start", world_x=1, world_y=1, width=17, height=17)
+            client.steps.clear()
+            task._runtime_blocked = {(1, 2)}
+            task._issued_goal = task._issued_click = None
+            task._no_route_since = clock[0] - 60.0
+            results = []
+            for _ in range(3):
+                task._last_action = 0.0
+                results.append(asyncio.run(task._click_path(client, -1, 2)))
+            self.assertEqual(client.steps, [])
+            self.assertFalse(results[-1])
+            self.assertNotIn("navigation-learned-blocks-reset",
+                             [action for action, _ in client.decisions])
+
+    def test_navigation_idle_departure_step_is_not_rejected_when_late(self):
+        # She idled beside an open departure far longer than one movement
+        # acknowledgement; the step she then sends is answered a tick late.
+        clock = [1000.0]
+        task, client = self._departure_seam((1, 1), late=True)
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   side_effect=lambda: clock[0]):
+            task._last_progress = clock[0] - 60.0
+            self._run_seam(task, client, clock)
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertEqual((client.state.map.path, client.state.map.world_y),
+                         ("/goal", 2))
+        self.assertEqual(task._failed_tile_crossings, set())
+        self.assertEqual(task._rejected_departures, {})
+        self.assertNotIn("navigation-seam-retry",
                          [action for action, _ in client.decisions])
+
+    def test_navigation_door_on_seam_departure_is_not_rejected(self):
+        # The server opens a closed door instead of moving her, so the
+        # first step onto a door departure never moves her.
+        clock = [1000.0]
+        task, client = self._departure_seam((1, 2), door=True)
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   side_effect=lambda: clock[0]):
+            task._last_progress = clock[0] - 60.0
+            self._run_seam(task, client, clock)
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertEqual((client.state.map.path, client.state.map.world_y),
+                         ("/goal", 2))
+        self.assertFalse(client.door_closed)
+        self.assertEqual(task._failed_tile_crossings, set())
+        self.assertEqual(task._rejected_departures, {})
+        self.assertNotIn("navigation-seam-retry",
+                         [action for action, _ in client.decisions])
+
+    def test_navigation_rejected_departure_expires(self):
+        task, _ = self._departure_seam((1, 1))
+        key = ("/start", 0, 2)
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.0):
+            task._reject_departure(key)
+            self.assertEqual(task._rejected_departures_on("/start", (1, 1)),
+                             {(0, 2)})
+            # Never excluded under her own feet, and only on its own map.
+            self.assertEqual(task._rejected_departures_on("/start", (0, 2)),
+                             set())
+            self.assertEqual(task._rejected_departures_on("/goal", (1, 1)),
+                             set())
+        later = 1000.0 + task.EDGE_EXCLUSION_SECONDS + 1.0
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=later):
+            self.assertEqual(task._rejected_departures_on("/start", (1, 1)),
+                             set())
+            self.assertEqual(task._rejected_departures, {})
+            # A repeat on the same trip lasts twice as long.
+            task._reject_departure(key)
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=later + task.EDGE_EXCLUSION_SECONDS * 1.5):
+            self.assertEqual(task._rejected_departures_on("/start", (1, 1)),
+                             {(0, 2)})
 
     def test_navigation_marks_unavoidable_overlevel_fallback(self):
         class FakeGraph:
