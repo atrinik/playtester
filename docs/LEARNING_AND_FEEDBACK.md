@@ -698,8 +698,8 @@ rule: by the time a level-94 monster appears it is too late.
   `/who` reports her as the only player online ("There is 1 player
   online."). Only that count line is parsed; the ingestion filter (4.3.1)
   drops `/who`'s per-player lines unread, because each names a player. A
-  door bump changes nothing for others and
-  needs only "no other player in view".
+  door bump changes nothing for others and needs only "no other player in
+  view".
 - Not on a map whose region is an apartment or house other than her own
   (player housing), and not a shop's staff door.
 - She has spent no consumable to get here and will spend none: she never
