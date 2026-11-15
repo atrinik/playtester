@@ -507,7 +507,9 @@ CREATE TABLE feedback_filings (          -- append-only audit
 ```
 
 Locks also write into ROUTING's `route_requirements` (4.5), which stays the
-only table the planner reads for requirement outcomes.
+only table the planner reads for requirement outcomes. Its columns keep
+ROUTING's meaning: `inputs` is ROUTING's fingerprint of the related quest and
+item state, and the key's name goes in `evidence`.
 
 Caps (starting points): observations 50,000 rows a character, oldest
 unreferenced first; interactions 20,000; fight positions 20,000; facts and
@@ -534,8 +536,8 @@ Text passes an ingestion filter before anything else sees it:
 - **Player books are dropped.** A book packet with a signer and date after
   its text (`book.c:136-142`), or whose examine shows "(signed; permanently
   finalized)" (`item.c:840`), was written by a player and is not stored.
-  Unsigned books whose text does not match authored or generated content
-  are stored with `authored = 0` and never used as evidence in feedback.
+  An unsigned book whose text matches no authored or generated text may be
+  player-edited, so it is dropped too.
 - **Renamed items are dropped.** An item whose examine says "You name it
   ..." keeps only its base archetype name in any record.
 - **Her name and other players' names are replaced.** Her own character
@@ -635,14 +637,16 @@ object's effect is resolved from authored content (principle 2):
 
 - **Connections.** Every object on the same map with the same `connected`
   value is a target. The trial is refused, and the lock marked `forbidden`,
-  when any target is a spawn point (81), teleporter, rune (154), exit (66),
-  creator (42), firewall (62), player mover (40) or duplicator (11), or
-  when the map's difficulty or any spawned resident is above her level.
-  In the content, 7 handles drive such targets. The Altar of Loki
-  (`tol_0101` (11,8)) drives 8 spawn points of level 93-95 monsters, and
-  its twin (11,10) drives two firewalls. Zechna's temple lever drives 4
-  firewalls; a Greyton jail switch drives a creator; the other three are on
-  the editor demonstration map `/planes/creation/creation_0801`.
+  unless every target is a gate, door, plain sign or handle, and when the
+  map's difficulty or any spawned resident is above her level. The rule
+  fails closed: an unknown target type refuses too. In the content, 8
+  handles drive refused targets (spawn points, firewalls, creators, exits,
+  a duplicator). The Altar of Loki (`tol_0101` (11,8)) drives 8 spawn
+  points of level 93-95 monsters, and its twin (11,10) drives two
+  firewalls. Zechna's temple lever drives 4 firewalls; a Greyton jail
+  switch drives a creator; the other four are on the editor demonstration
+  map `/planes/creation/creation_0801`: (4,19) a creator, (6,1) an exit,
+  (10,7) a duplicator and (21,7) an exit.
 - **One-shot levers.** A handle with `exp -1` stays down once pulled ("won't
   budge" afterwards, `handle.c:50-58`); in the content there is one. It is
   never tried: the change cannot be undone for other players.
@@ -650,8 +654,8 @@ object's effect is resolved from authored content (principle 2):
   and mouths: 55 `trigger`, 8 `apply` and 2 `say` events, for example
   `start_lost_memories.py`) is never applied by a trial. Quest policy can
   use it on purpose, as it does today.
-- **Allowed** targets are gates, doors, plain signs and other handles
-  (37 handles drive gates), on maps at or below her level.
+- **Allowed** targets are therefore only gates, doors, plain signs and
+  other handles (37 handles drive gates), on maps at or below her level.
 
 The 10 s watch after a pull (4.4.4) stays as a backstop, not as the safety
 rule: by the time a level-94 monster appears it is too late.
@@ -674,10 +678,13 @@ rule: by the time a level-94 monster appears it is too late.
 #### 4.4.3 Preconditions, all required
 
 - **ROUTING's probe limits** (ROUTING 4.6): full HP and SP; every map and
-  cell on the approach below `PROBE_MAX_DANGER_SECONDS` (300 s); the trials
-  share ROUTING's `PROBES_PER_DAY = 3` budget and its once-per-subject-a-day
-  rule; and the day's trials stop at the first failure (a refusal is not a
-  failure; damage, a spawn, a trap or a recall is).
+  cell on the approach below `PROBE_MAX_DANGER_SECONDS` (300 s); at most
+  `PROBES_PER_DAY = 3` trials a day and once per subject a day; and the
+  day's trials stop at the first failure (damage, a spawn, a trap or a
+  recall). ROUTING ships that budget with its probes in P10, so F7 defines
+  the shared daily counter itself and P10 reuses it, whichever lands first.
+  A refusal is neither a failure here nor a ROUTING `rejected` outcome; it
+  is recorded only as this lock's hint and refusal count.
 - No hostile within its detection radius of her or of the object (the
   `_lone_target` radii, COMBAT.md), and no unseen-contact hit in the last
   10 s.
@@ -688,8 +695,8 @@ rule: by the time a level-94 monster appears it is too late.
   other player on the map. She cannot see a whole map, and `/who` does not
   say where players are (`commands/player/who.c:40-81`), so this means
   `/who` reports her as the only player online ("There is 1 player
-  online."). Only that count line is parsed; the other lines name players
-  and are discarded unread. A door bump changes nothing for others and
+  online."). Only that count line is parsed; the ingestion filter (4.3.1)
+  drops `/who`'s per-player lines unread, because each names a player. A door bump changes nothing for others and
   needs only "no other player in view".
 - Not on a map whose region is an apartment or house other than her own
   (player housing), and not a shop's staff door.
@@ -741,13 +748,20 @@ edges, 4.2 there) and P5 (`route_requirements`, 4.4 there):
   reach them. `UnlockState` gains `learned_tiles`, a map from
   `(path, x, y)` to `passed` or `rejected`, read by `lock_allowed` in
   addition to the item-name access set. Its source is `route_requirements`
-  rows whose subject is `lock:{path}:{x},{y}` (the table's `edge` column
-  holds any subject string; ROUTING's own edge keys are unchanged).
+  rows whose subject is `lock:{path}:{x},{y}` in the table's `edge` column.
+  ROUTING's own edge keys are unchanged. This is a new contract: ROUTING
+  4.4's loader ignores subjects that are not edges in the current content,
+  and its 4.3 knows only edge-keyed `Learned` atoms. F8 therefore amends
+  ROUTING.md (4.3 for `learned_tiles` and `lock_allowed`, 4.4 for `lock:`
+  subjects, which the loader keeps while the tile is still a locked tile)
+  in the same pull request.
 - **Confirmed openings.** A trial that opens a door writes a `passed`
   `route_requirements` row for its lock subject, with the server's "You open
-  the ... with the ..." line as `evidence` and the item's name in
-  `inputs`. An opening "for you" (a force, `door.c:259-260`) writes the same
-  with `inputs = force`. A `passed` row never satisfies a `Consumes` atom.
+  the ... with the ..." line, which names the key, as `evidence`, and
+  ROUTING's quest and item state fingerprint as `inputs`. An opening "for
+  you" (a force, `door.c:259-260`) writes the same with "The ... is opened
+  for you." as `evidence`. A `passed` row never satisfies a `Consumes`
+  atom.
 - **Refusals.** A refusal writes `rejected` with the door's own text as the
   message evidence ROUTING 4.3 requires, and lasts as ROUTING says: until a
   related input changes (a matching item arrives, a quest part completes),
@@ -1101,7 +1115,11 @@ from what the maps say.
   (`web_static/app.js:8`). The body preview uses a Markdown renderer that
   emits no raw HTML, links or images. Every response gains a
   Content-Security-Policy (`default-src 'self'; script-src 'self';
-  object-src 'none'; frame-ancestors 'none'`).
+  object-src 'none'; frame-ancestors 'none'`). Its default `style-src`
+  blocks inline `style=` attributes, which existing panels use
+  (`app.js:83`, `:280`, `:294`, `:488`), so F1 converts them to CSSOM
+  assignments as `app.js:101` already does, rather than allowing inline
+  styles.
 - **Endpoints.** `GET /api/feedback`, and `POST /api/feedback/<id>` with an
   action, under the existing loopback and Origin rules
   (`web_server.py:800-822`).
@@ -1363,7 +1381,8 @@ of what unlocks them. Their connections drive gates, so they pass 4.4.1.
 ### 5.6 A book with a useful fact
 
 `underground_city_2_3_-2`, "note: Day 6 - 7" on a corpse (level 10, so
-Literacy 3 reads it at Int 11 or more): "a ---ic bul--- was needed. It must
+Literacy 3 can read it from Int 4, where 3 + 12 − 5 = 10; Int 11 matters
+only for its experience): "a ---ic bul--- was needed. It must
 be cast northwest from a special location. We have marked the spot with a
 fake torch" and "STAY OFF THE BRIDGE, IT IS A TRAP". The map has pedestals
 that react to `race bullet` at (7,2) and (7,4), and one green wall torch
@@ -1398,9 +1417,12 @@ live behaviour.
 **F1. `feat(memory)`: an observation ledger.** The `observations` table,
 the ingestion filter and attribution (4.3.1) for bumps, applies, walk-ons,
 interfaces, inventory book packets and examines, caps, and a read-only
-Knowledge tab with a CSP.
+Knowledge tab with a CSP, with the existing inline styles converted to
+CSSOM (4.10.5).
 *Accept:* a recorded stream yields the expected attributed rows; chat,
-player-link lines, signed books and renamed items are never stored; her
+player-link lines, signed books, unmatched unsigned books, renamed items and
+`/who` player lines are never stored; every existing panel (vitals, skills,
+task trace, messages) renders unchanged under the CSP; her
 name is replaced in dialogue; book packets parse into title and body; an
 unattributed fact line deduplicates; a full table evicts the oldest
 unreferenced rows; no behaviour change.
@@ -1409,6 +1431,7 @@ unreferenced rows; no behaviour change.
 facts.** The `facts` table and the parsers in 4.3.2. Tile facts persist
 PR #97's `spell_blocked_here` signal behind `persist_tile_facts`, default
 off (shadow: the fact is written and shown, #97 alone decides).
+*Depends on* PR #97 (open at `a1f408a`).
 *Accept:* every section 5 text gives its expected facts; the section 2
 message stream produces one `no_magic` fact; with the flag on, a reconnect
 a day later casts nothing on that square; no LLM dependency.
@@ -1447,20 +1470,29 @@ a POST without the approval key is refused.
 `interactions`, `LockTrialTask` with connection resolution (4.4.1), the
 preconditions including ROUTING's probe limits and the `/who` count,
 Find Traps before first trials, the watch and restore. Flag `try_locks`,
-default off; shadow decisions while off. *Depends on* ROUTING P3 (blocks
-and care) and P5 and P6 (the route tables and the danger costs that
-`PROBE_MAX_DANGER_SECONDS` is measured in).
-*Accept:* the 4.13 trial-safety tests; trials share the 3-a-day probe
-budget; the owner turns the flag on after a supervised session.
+default off; shadow decisions while off. It defines the shared
+`PROBES_PER_DAY` counter if ROUTING P10 has not shipped it. *Depends on*
+ROUTING P3 (blocks and care) and P5 and P6 (the route tables and the
+danger costs that `PROBE_MAX_DANGER_SECONDS` is measured in).
+*Accept:* the 4.13 trial-safety tests; an unknown target type is refused;
+trials and ROUTING probes share one 3-a-day budget; a refusal writes no
+`rejected` row; the owner turns the flag on after a supervised session.
 
 **F8. `feat(navigation)`: learned unlocks into routing.** Trial outcomes
 write `route_requirements` rows for `lock:` subjects, `UnlockState` gains
 `learned_tiles`, and quest-gate facts are offered to P4. *Depends on*
 ROUTING P2, P4 and P5, and on F7.
-*Accept:* a door opened with a key not in `access_item_names` becomes
-routable for her; a refusal with message evidence blocks the tile until a
-related input changes or 24 h pass; a candidate fact alone opens nothing;
-no `Consumes` atom is ever satisfied by a learned record.
+It also amends ROUTING.md 4.3 (`UnlockState.learned_tiles`, read by
+`lock_allowed`) and 4.4 (`lock:` subjects in `route_requirements`, kept by
+the loader while the tile is still locked in the current content), so the
+two documents state one contract.
+*Accept:* the ROUTING.md amendment is in the PR; a door opened with a key
+not in `access_item_names` becomes routable for her; a rejected trial
+outcome with message evidence blocks the tile until a related input
+changes or 24 h pass; `inputs` holds ROUTING's state fingerprint and the
+key name is only in `evidence`; a `lock:` row survives a reload; a
+candidate fact alone opens nothing; no `Consumes` atom is ever satisfied by
+a learned record.
 
 **F9. `feat(feedback)`: hint and quest clarity.** The fair-chance rule and
 verdicts (4.9), regional aggregation of default texts, and quest-part
@@ -1506,16 +1538,18 @@ the insult chain (its last step sets `enemy="player"`); a teleporting link
 is never followed.
 
 **F14. `feat(feedback)`: magic-blocking savebeds.** The `qol` producer from
-4.11.1, using F2's persistent facts.
+4.11.1, using F2's persistent facts. *Depends on* F2, F5 and PR #97.
 *Accept:* the Clearhaven bed yields one draft; a non-savebed `no_magic`
 square yields none.
 
 **F15. `feat(feedback)`: path-blocking NPCs.** The producer from 4.11.4.
+*Depends on* F5.
 *Accept:* ten blocks by one named NPC on one square in a day yield one
 draft; monsters and players yield none.
 
 **F16. `feat(feedback)`: balance comparison reports.** The report in
-4.11.3, drafted as comments on matching issues.
+4.11.3, drafted as comments on matching issues. *Depends on* F5, and on F6
+for the comment target.
 *Accept:* a recorded two-hour fixture per mode produces the table; fewer
 than two hours of a mode says "not enough data"; at most one refresh a week.
 
@@ -1575,8 +1609,8 @@ themselves.
   same or next tick; heavy lag could misattribute a line. Content matching
   backs it up only where authored text exists.
 - Whether the client can tell an unsigned, player-edited book from an
-  authored one is unknown; such books are kept out of evidence by the
-  `authored` check, not detected.
+  authored one is unknown; such books are dropped because their text
+  matches nothing authored, not detected as player-written.
 - Whether GitHub search indexes HTML comments, and exactly which fields the
   issue API drops for a token without push access, were not verified; the
   design reads back every created issue instead of relying on either.
