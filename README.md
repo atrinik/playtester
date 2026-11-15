@@ -23,6 +23,11 @@ the all-quest runner remains separate, and Zechna is not yet an automated
 completion gate. The roadmap issues track the work needed to turn these pieces
 into the single start-to-finish campaign described above.
 
+Design notes: [COMBAT.md](COMBAT.md) describes how she fights, and the
+proposal [docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md)
+covers learning from doors, books and fights, and an owner-approved
+playtester feedback queue.
+
 ## Install and acquire compatible inputs
 
 Build and install the wheel from the repository root in any clean Python 3.11+
