@@ -785,11 +785,22 @@ Writes are best effort, with the post-mortem's short lock timeout. Play
 never waits on telemetry, and a failed write keeps the event in memory for
 the next save. On load, the tables are folded into an in-memory
 `RouteCostModel`. Subjects whose edge no longer exists in the current
-content are ignored until they age out. Existing `route_hazards` entries are
-migrated once as synthetic `death` events at `until - 6 h`. #94's route
-deaths in `kit_failures` are mirrored too. One death can appear in both, so
-the migration deduplicates by (map, time), with time matched within 5 s, and
-keeps the `kit_failures` copy, which has the kit and `map_damage`.
+content are ignored until they age out.
+
+**One source per death.** From P5 on, the live `death` recorder is the only
+writer of new route deaths. History from before P5 is migrated once, under
+a `metadata` marker:
+
+- #94's route deaths in `kit_failures` (cause `route`, `map_damage` > 0) with
+  a time before P5's install become `death` events with their own time, kit
+  and map. Later `kit_failures` entries are never mirrored, because the live
+  recorder already has them.
+- A `route_hazards` entry stores the learn time plus 6 h, and
+  `remember_route_hazard` keeps only the latest per map. So timestamps
+  cannot be matched. An entry is dropped when a migrated `kit_failures`
+  route death on the same map falls inside its 6 h window (death time in
+  `(until − 6 h, until]`). Otherwise it becomes one synthetic `death` at
+  `until − 6 h`, standing for at least the latest death there.
 
 **Privacy.** Only her own observations, in her own namespace. Subjects are
 content coordinates. Monster names are not stored; the post-mortem keeps
@@ -911,44 +922,95 @@ ignores the next spot's own danger. So farm trips have no budget. Instead,
 score(spot) = FARM_VALUE_HORIZON_SECONDS × r_spot / r_top − D(spot)
 ```
 
-- `r_spot` is the analyzer's predicted rate for the farmed objective. All
-  spots compared come from that one objective's ranking, so rates are
-  comparable.
-- `r_top` is the highest rate among the usable spots in that ranking. If it
-  is 0 or missing, the value term is 0 and the least dangerous spot wins,
-  in ranking order on ties.
+- `r_spot` is the analyzer's predicted rate for the scored objective,
+  clamped to at least 0. The scored objective is the first of
+  `analyzer_farm_choice`'s two rankings: the effective objective
+  (`effective_farm_objective`, which is `safety` while depleted).
+  Only if no spot in it is usable is the chosen objective's ranking scored,
+  on its own, as the existing fallback does. Rates from the two rankings are
+  never compared.
+- **Usable** means not quarantined, not kit-hazardous, with a known `D`, and
+  under its cap (below). A spot whose `D` is not known yet, because the
+  per-call planning budget has not reached it, is not yet usable, as #94
+  treats an undecided search. If no spot is usable yet, she keeps her
+  current spot or holds, and the next call continues.
+- `r_top` is the highest clamped rate among the usable spots, so it is taken
+  after quarantine, kit hazard and the caps. If `r_top ≤ 0`, the value term
+  is 0 and the least dangerous spot wins, in ranking order on ties.
 - `FARM_VALUE_HORIZON_SECONDS = 3600` is the rate conversion: an hour of
   farming at the top spot's rate is worth 3600 s, the same unit as danger
   (one death = 1800 s).
-- `D(spot)` is the learned transit danger of the cheapest route from her
-  savebed to the spot, in seconds. It counts learned danger only. Content
-  danger belongs to the analyzer (owner decision; tools #34 adds approach
-  danger there), so the bot's content priors are left out here to avoid
-  counting it twice. The spot's own maps are excluded, as the analyzer rated
-  them, and so is her savebed map, since leaving the map she stands on is
-  free.
-- **Absolute cap.** A spot with `D ≥ FARM_MAX_TRANSIT_DANGER_SECONDS` (3600 s,
-  two fresh deaths) is not farmed even when it is the only one. With no
-  spot under the cap she holds position safely, as she does today before the
-  first ranking.
-- **Chokepoints.** Danger on a chokepoint map (by #94's test: removing it
-  cuts off more than half the maps reachable from her savebed) counts in
-  the score but not toward the cap.
+- `D(spot)` is the transit danger in seconds on every map of the cheapest
+  route from her savebed to the spot, and on every map of the spot's own
+  legs. Route events are recorded only while a `NavigateTask` runs (4.4), so
+  they are all transit danger. A transit death on map M counts for every
+  spot whose route or legs include M, which matches #94 blocking M. Deaths
+  while farming are not route events; they feed the spot's adaptation
+  records and the analyzer as today. Her savebed map is excluded, since
+  leaving the map she stands on is free.
+- **Content danger, now and after tools #34.** The analyzer is to own
+  content danger (owner decision), and tools #34 adds approach danger to it.
+  #34 is in review; it now rates approach danger per component, and scores
+  the Underground City circuits at 0.85 at 244 HP. Until the locked analyzer
+  includes it, content transit danger would be in neither the analyzer nor
+  the score. So, until then, `D` also includes navigation's content priors
+  for the route's maps (4.4). Once the analyzer lock moves to a release
+  with #34's approach danger, detected from that field in its output, the
+  priors are dropped from `D` so content danger is not counted twice.
+- **Cap.** A spot that is not behind a chokepoint is not farmed while
+  `D ≥ FARM_MAX_TRANSIT_DANGER_SECONDS` (3000 s), even when it is the only
+  one.
+- **Chokepoints and the farming pause.** A chokepoint is a map whose
+  removal cuts off more than half the maps reachable from her savebed
+  (#94's test). Its danger adds the same amount to every spot behind it, so
+  it cannot reorder those spots, and a per-spot cap would remove almost all
+  farming at once. So chokepoint danger does not count toward the per-spot
+  cap. It has its own, higher cap instead:
+  `FARM_MAX_CHOKEPOINT_DANGER_SECONDS = 4500` (2.5 fresh deaths). At or
+  above it, every spot behind that chokepoint is paused, she holds position
+  safely, and essential trips go on through the override.
+- **Care on dangerous farm routes.** Any farm trip whose route carries
+  `D ≥ 1800` (one fresh death), chokepoint or not, must meet the
+  essential-trip care conditions: full HP and SP, a ready recall when she
+  owns one, and transit hold-fire. It records a `farm-route-care` decision,
+  shown on the dashboard like an override.
 
-The guarantees:
+The rule, and why it is one rule: danger never becomes a wall by itself
+(owner decision). It reorders spots through the score, it makes a dangerous
+route a careful one at one death, and it pauses only at a cap. The cap is
+higher where pausing costs more, at a chokepoint that stops most farming.
+
+The guarantees, stated with the death rate they allow:
 
 - **One fresh death moves her to a comparable alternative.** A death adds
-  1800 s to every route through that map. Spot A then loses to an untouched
-  spot B when (r_A − r_B) / r_top × 3600 < 1800, that is, when B's rate is
-  within half the top rate of A's. "Comparable value" means exactly that.
-- **With no alternative, she still farms the best spot** while its danger
-  stays under the cap.
+  1800 s to every spot whose route or legs cross that map. Spot A then loses
+  to an untouched spot B when (r_A − r_B) / r_top × 3600 < 1800, that is,
+  when B's rate is within half the top rate of A's. "Comparable value"
+  means exactly that.
+- **With no alternative, she still farms the best spot,** with care once
+  `D ≥ 1800`, while `D` stays under the cap.
+- **Ordinary cap: two deaths close together pause the spot.** Two deaths Δ
+  apart give D = 1800 × (1 + 0.5^(Δ / 6 h)). That reaches 3000 when
+  0.5^(Δ / 6 h) ≥ 2/3, so for Δ ≤ 6 × log2(1.5) ≈ 3.5 h. Two deaths further
+  apart do not pause her. Worst case, with every trip ending in a death: she
+  travels only while D < 3000, a death lifts D to at most 4800, and it takes
+  6 × log2(4800 / 3000) ≈ 4.1 h to fall back. So the cap allows at most one
+  transit death per spot about every 4.1 h (about 6 a day) if every careful
+  trip still fails. The existing adaptation pause (an hour after repeated
+  failures at the maximum level) and the kit-hazard skip still apply on
+  top.
+- **Chokepoint cap: three deaths close together pause farming.** Three
+  deaths spaced Δ apart reach 4500 when 1 + x + x² ≥ 2.5, with
+  x = 0.5^(Δ / 6 h), so for Δ ≤ 6 × log2(1 / 0.823) ≈ 1.7 h. Worst case, a
+  death lifts D to at most 6300, and it takes 6 × log2(6300 / 4500) ≈ 2.9 h
+  to fall back, so at most one chokepoint death about every 2.9 h, always
+  on a careful trip. This is looser than the ordinary cap on purpose: a
+  chokepoint pause stops most farming, and the care rule applies first.
 - **Consistency with #94.** A death on her savebed map adds nothing to `D`,
-  so, as in #94, it blocks nothing. A chokepoint death adds the same danger
-  to every spot behind it, so it reorders only against spots that avoid it,
-  and it never trips the cap: cost-only, as in #94. A death elsewhere is
-  cost, not #94's hard skip, but one fresh death already moves her as
-  above.
+  so, as in #94, it blocks nothing. A chokepoint death is cost-only, as in
+  #94, until its own higher cap. A death elsewhere is cost, not #94's hard
+  skip, but one fresh death already moves her as above, and two close
+  together pause the spot.
 
 The incident with numbers: after the first `underground_city_0_0` death, the
 Underground City spot has `D = 1800` and every alternative avoiding that map
@@ -959,8 +1021,12 @@ Underground City spot is the top (`r_top = r_A`) and B is rated 80% of it,
 the gap is 720 s. A stays behind B until 1800 × 0.5^(t / 6 h) < 720, that is
 t > 6 × log2(2.5) ≈ 7.9 h. The analyzer's actual rates for the Underground
 City spot were not in the live state when it was read, so this uses the
-condition, not the actual ratio. Either way she moves on after one death,
-not five, unless the spot is worth more than twice the next one.
+condition, not the actual ratio. If it was worth more than twice the next
+spot, she would go back, but on a careful trip, and the second death within
+3.5 h pauses it. Either way: at most two deaths, not five.
+`underground_city_0_0` is not a chokepoint by #94's test, as far as the
+static graph shows: removing it cuts off the Underground City, not half her
+world.
 
 ### 4.6 Exploration risk
 
@@ -1040,8 +1106,8 @@ category as the quarantines and `kit_hazard` filters that
 - The analyzer's ranking is unchanged. Learned route cost stays on the
   playtester side and is never fed to the analyzer (owner decision). The
   analyzer stays content-only; `atrinik/tools` issue #34 adds content
-  approach danger to it, which is why `D(spot)` counts learned danger only
-  (4.5).
+  approach danger to it. So `D(spot)` keeps navigation's content priors
+  only until a locked analyzer release has that approach danger (4.5).
 - Savebed selection ranks beds by route cost, not tiles. The ship then counts
   for a Brynknot bed serving Asteria spots.
 - `_observe_farm_death` already blames the destination for a transit death
@@ -1054,9 +1120,9 @@ exactly one of them decides farm selection, so no death counts twice:
 - Until P8 is switched on, #94's `route_death_blocked_maps` decides, as
   merged, whatever the learned-cost flag of P7 says. P7 changes navigation
   only: it plans farm trips with learned costs but gives them no budget and
-  does not touch spot selection. P5 records each #94 route death as a
-  `death` route event (deduplicated, 4.4), so the history is there when P8
-  switches.
+  does not touch spot selection. P5's live recorder captures every route
+  death, and its one-time migration brings in #94's earlier ones (4.4), so
+  the history is there when P8 switches.
 - With P8's flag on, the score decides and `route_death_blocked_maps` is
   not called. Its savebed and chokepoint exceptions carry over (4.5). Its
   kit rule is the same predicate (4.4). Its hard skip of other death maps
@@ -1083,8 +1149,9 @@ exactly one of them decides farm selection, so no death counts twice:
   - the cost model: each signal's weight and half-life with an injected
     clock, the #94 kit predicate, cell attribution only near the planned
     path, recovery on traversal, per-signal caps, the traversal upsert,
-    migration of `route_hazards` deduplicated against `kit_failures`,
-    cold-start seeding from `decisions`;
+    the one-time migration (pre-P5 `kit_failures` only, `route_hazards`
+    entries dropped inside a migrated death's window), a new route death
+    recorded once while #94 is live, cold-start seeding from `decisions`;
   - persistence: round trip, the namespace, a locked database not stalling
     play, block and requirement expiry, privacy (a player attacker leaves no
     name in any row);
@@ -1093,11 +1160,17 @@ exactly one of them decides farm selection, so no death counts twice:
     overrides a decline, a failed strict plan or an owner block with care,
     an owner block is a wall for other trips, and `strict_safety` matches
     today's results on the existing strict-trip tests;
-  - farm selection: no division by zero at `r_top = 0`, mixed objectives
-    never compared, a danger-free tie keeps the higher-ranked spot, one
-    fresh death moves her to a spot within half the top rate, a lone spot is
-    farmed under the cap and not over it, savebed-map deaths add nothing,
-    and chokepoint danger does not count toward the cap;
+  - farm selection: no division by zero at `r_top ≤ 0`, negative rates
+    clamped, the two objectives' rankings never mixed, a danger-free tie
+    keeps the higher-ranked spot, spots without a known `D` not yet usable,
+    one fresh death moves her to a spot within half the top rate, a transit
+    death on a spot's own leg map counts for it, a lone spot is farmed under
+    3000 s and not at or over it, two deaths 3 h apart pause it and 4 h apart
+    do not, savebed-map deaths add nothing, chokepoint danger skips the
+    per-spot cap but pauses all spots behind it at 4500 s, a farm route at
+    `D ≥ 1800` waits for the care conditions and records `farm-route-care`,
+    and content priors are in `D` only while the analyzer lacks approach
+    danger;
   - deaths to other players record nothing.
 - **Content regression tests** against the locked bundle, like
   `test_lost_memories_uses_quest_sam_not_departure_sam`:
@@ -1149,8 +1222,13 @@ savebed walks use the ship with the key; existing tests pass.
 **P3. `feat(dashboard)`: owner route and map blocks.** The `route_blocks`
 table, the dashboard form (subject, 1 h to 7 d), the list with expiry and
 early removal, and the planner treating active blocks as transit walls.
-Essential trips cross a block only when it is their only route, with care
-and an `essential-route-override` record. Behaviour changes only when the
+This phase also introduces the essential-trip classification (food, cure,
+depletion service, savebed move and their funding trips) and the
+care-crossing machinery: wait for full HP and SP where it is safe, require
+a ready recall, hold fire in transit, and record an override. Essential
+trips cross a block only when it is their only route, with care and an
+`essential-route-override` record. P6 reuses both for budget and strict
+overrides, and P8 for farm-route care. Behaviour changes only when the
 owner sets a block.
 *Accept:* a block on a synthetic route forces the alternative; with no
 alternative, an optional trip fails with a block reason, and an essential
@@ -1172,18 +1250,20 @@ a plan; with the flag off, routes are unchanged.
 **P5. `feat(memory)`: record route events.** The `route_events`,
 `route_traversals` and `route_requirements` tables, the recorders from 4.4,
 per-signal caps, cold-start seeding from `decisions`, the `route_hazards`
-migration, and #94's route deaths mirrored as events, deduplicated by (map,
-time). The dashboard lists learned subjects. The
+migration, and #94's route deaths from before P5 migrated once; new deaths
+come from the live recorder only. The dashboard lists learned subjects. The
 planner is unchanged.
 *Accept:* every signal has a test from a recorded decision sequence; a
 locked database delays a death by at most the post-mortem timeout; no player
 names in rows, and no rows for deaths to players; caps hold under a
 synthetic flood of `blocked` rows without evicting deaths; a death present
-in both `route_hazards` and `kit_failures` is recorded once.
+in both `route_hazards` and `kit_failures` is migrated once; a new route
+death while #94 is live is recorded once.
 
 **P6. `feat(navigation)`: a cost model, budgets and shadow planning.** Travel
 time and danger priors, aggregation, weighted `route_points`, errand
-budgets, the essential-trip override, and the shadow farm score. With the flag
+budgets, the essential-trip override (P3's classification and care), and
+the shadow farm score. With the flag
 off, the live plan and farm choice are today's. The new ones are computed
 alongside and logged (`route-shadow-diverge`, `route-shadow-decline`) with
 metrics.
@@ -1204,7 +1284,8 @@ essential trip on the same route proceeds with care.
 `analyzer_farm_choice` picks by score (4.5), and savebeds rank by route cost.
 Behind its own flag; with it on, this replaces #94's
 `route_death_blocked_maps`, and with it off #94 decides (4.9).
-*Accept:* the farm-selection unit tests in 4.10; the incident replay leaves
+*Accept:* the farm-selection unit tests in 4.10, including both caps and
+the care rule; the incident replay leaves
 the Underground City spot after one death, live rather than in shadow;
 savebed choice uses the ship; analyzer ranking untouched; no death is
 counted by both rules.
@@ -1239,9 +1320,11 @@ as a playtester-only filter, no route danger from deaths to players, and the
 1. **Errand and quest budgets.** What fixed danger budget should optional
    errands and quest steps get?
 2. **Farm constants.** Are `FARM_VALUE_HORIZON_SECONDS = 3600` (one hour at
-   the top rate) and `FARM_MAX_TRANSIT_DANGER_SECONDS = 3600` (two fresh
-   deaths) right? Together they mean one death moves her only to a spot
-   within half the top rate.
+   the top rate), `FARM_MAX_TRANSIT_DANGER_SECONDS = 3000` (two deaths within
+   about 3.5 h) and `FARM_MAX_CHOKEPOINT_DANGER_SECONDS = 4500` (three deaths
+   within about 1.7 h of each other) right? The worst cases they allow are
+   one transit death per spot about every 4.1 h, and one chokepoint death
+   about every 2.9 h, always on careful trips.
 3. **Decay.** Are a 6 h half-life for deaths and recalls (matching #94),
    6 h for damage, 30 min for blockers and a 0.7 recovery per successful
    traversal right?
@@ -1263,10 +1346,13 @@ as a playtester-only filter, no route danger from deaths to players, and the
 - Why her deaths cluster in `underground_city_0_0`'s north-east was not
   established. They are off the stairs-to-seam route, so flight or pursuit
   is likely, and the post-mortems show disengage and retreat steps.
-- The weights in 4.4, the transit priors and the farm budget constant are
-  starting points. The replay and the shadow soak calibrate them.
+- The weights in 4.4, the transit priors and the farm score constants
+  (horizon and both caps) are starting points. The replay and the shadow
+  soak calibrate them.
 - #94 was at `86b3172` when this was written. 1.9 and 4.9 follow that
   revision; check `origin/fix/sera-route-death-loop` again before P5 and P8.
-- `atrinik/tools` #34's approach-danger change was not read for this
-  revision. `D(spot)` assumes it covers content danger, so the bot adds only
-  learned danger.
+- `atrinik/tools` #34 was not read for this revision; its status comes from
+  the coordinator. `D(spot)` keeps navigation's content priors until a
+  locked analyzer release carries #34's approach danger.
+- Whether `underground_city_0_0` is a chokepoint by #94's test was reasoned
+  from the static graph, not computed with #94's code.
