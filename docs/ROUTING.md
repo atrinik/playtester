@@ -1373,16 +1373,16 @@ open a safer route, is out of scope. It needs goal planning beyond routing.
 ## 6. Open questions for the owner
 
 None remain. Settled on 2026-11-14 and 2026-11-15 and folded in above: the
-exchange rate (30 min per death), no automatic walls, owner blocks with a 1 h to 7 d expiry, bounded
-and safe-only probes, essential trips crossing blocks with care, route cost
-as a playtester-only filter, no route danger from deaths to players, the
-`savebed` voyages excluded from routing, the farm limits and decay as
-proposed, a one-death budget for errands and quest steps, and owner-approved
-flag flips after a 24 h shadow soak and a divergence report, the
-owner-approved starving exception (a starving food trip may cross an owner
+exchange rate (30 min per death), no automatic walls, owner blocks with a 1 h
+to 7 d expiry, bounded and safe-only probes, essential trips crossing blocks
+with care, route cost as a playtester-only filter, no route danger from deaths
+to players, the `savebed` voyages excluded from routing, the farm limits and
+decay as proposed, a one-death budget for errands and quest steps,
+owner-approved flag flips after a 24 h shadow soak and a divergence report,
+the owner-approved starving exception (a starving food trip may cross an owner
 block with only a ready recall plus hold-fire, recorded as
-`essential-care-starving` and alerted on the dashboard), and the probe
-limits (3 a day, 300 s ceiling).
+`essential-care-starving` and alerted on the dashboard), and the probe limits
+(3 a day, 300 s ceiling).
 
 A separate learning-and-feedback design is coming in
 `docs/LEARNING_AND_FEEDBACK.md` (doors and hints, books and facts, terrain
