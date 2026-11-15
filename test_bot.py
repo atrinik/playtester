@@ -19646,5 +19646,487 @@ class MetricsRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(head.startswith("HTTP/1.1 400"), head)
 
 
+class IdleSurvivalTests(unittest.TestCase):
+    """Stop means "no tasks except survival" (COMBAT.md)."""
+
+    BED = "/shattered_islands/world_7_79"
+
+    def client(self, *, food, hp=100, inventory=()):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.map.path = self.BED
+        client.state.map.world_x, client.state.map.world_y = 16, 3
+        client.state.stats.update({"level": 34, "hp": hp, "maxhp": 100,
+                                   "sp": 50, "food": food})
+        for item in inventory:
+            client.state.place_item(item, client.state.player_tag)
+        client.sent = []
+
+        async def send(packet):
+            client.sent.append(packet)
+
+        client.send = send
+        return client
+
+    def engine(self, client, trip):
+        from . import autoplay as autoplay_module
+        from .autoplay import IdleSurvival
+
+        engine = TaskEngine(client)
+        engine.idle_survival = IdleSurvival(WorldGraph())
+        patcher = patch.object(autoplay_module, "temple_food_trip", trip)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return engine
+
+    @staticmethod
+    def decisions(client, action):
+        return [record["detail"] for record in client.decision_history
+                if record["action"] == action]
+
+    def test_idle_with_low_food_eats_from_inventory(self):
+        bread = Item(61, item_type=c.TYPE_FOOD, quality=100,
+                     name="wholemeal bread", quantity=1)
+        client = self.client(food=40, inventory=[bread])
+        applied = []
+
+        async def apply(tag):
+            applied.append(tag)
+
+        client.apply = apply
+        trips = []
+        engine = self.engine(client, lambda graph, client, **_: trips.append(1))
+        asyncio.run(engine._protect_idle())
+        # Her last meal is eaten where she stands; no trip yet.
+        self.assertEqual(applied, [61])
+        self.assertEqual(trips, [])
+        self.assertIsNone(engine.idle_survival.child)
+        self.assertEqual(self.decisions(client, "idle-hunger"),
+                         ["food 40; ate wholemeal bread"])
+
+    def test_idle_with_no_food_starts_the_temple_food_trip(self):
+        client = self.client(food=120)
+        asked = []
+
+        def trip(graph, client, exclude=()):
+            asked.append(tuple(exclude))
+            return TempleTrip("Friar Marcus")
+
+        engine = self.engine(client, trip)
+        self.assertTrue(asyncio.run(engine._protect_idle()))
+        child = engine.idle_survival.child
+        self.assertIsInstance(child.task, TempleFoodTask)
+        self.assertEqual(child.status, TaskStatus.RUNNING)
+        self.assertEqual(asked, [()])
+        self.assertEqual(self.decisions(client, "idle-hunger"),
+                         ["food 120; navigate-then:temple:food:Friar Marcus"])
+        # Still no task: survival never starts farming or questing.
+        self.assertIsNone(engine.task)
+        # Fed, she returns to idle where she ate.
+        child.complete()
+        client.state.stats["food"] = 500
+        self.assertTrue(asyncio.run(engine._protect_idle()))
+        self.assertIsNone(engine.idle_survival.child)
+        self.assertEqual(len(self.decisions(client, "idle-hunger-fed")), 1)
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(asked, [()])
+        # A task set by the operator takes over and drops a trip in flight.
+        client.state.stats["food"] = 120
+        asyncio.run(engine._protect_idle())
+        self.assertIsNotNone(engine.idle_survival.child)
+        engine.set_task(TempleTrip("other"))
+        self.assertFalse(asyncio.run(engine._protect_idle()))
+        self.assertIsNone(engine.idle_survival.child)
+
+    def test_unreachable_food_backs_off_and_alerts_without_looping(self):
+        from .alerts import ProgressWatch, active
+
+        client = self.client(food=60)
+        asked = []
+
+        def trip(graph, client, exclude=()):
+            asked.append(tuple(exclude))
+            return None
+
+        engine = self.engine(client, trip)
+        for _ in range(50):
+            asyncio.run(engine._protect_idle())
+        # One look, then the backoff: no loop.
+        self.assertEqual(asked, [()])
+        failures = self.decisions(client, "idle-hunger-failed")
+        self.assertEqual(failures, ["food 60; no temple priest is reachable; "
+                                    "retry in 10 min"])
+        alerts = active(client.state, client.decision_history,
+                        ProgressWatch(), autoplay_started_at=None)
+        self.assertIn("idle-food", [alert["id"] for alert in alerts])
+        # Each further failure waits longer, up to an hour.
+        survival = engine.idle_survival
+        survival._retry_at = 0.0
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(len(asked), 2)
+        self.assertTrue(self.decisions(client, "idle-hunger-failed")[-1]
+                        .endswith("retry in 20 min"))
+        survival._failures = 10
+        survival._retry_at = 0.0
+        asyncio.run(engine._protect_idle())
+        self.assertTrue(self.decisions(client, "idle-hunger-failed")[-1]
+                        .endswith("retry in 60 min"))
+        # A trip that fails passes its priest over and backs off as well.
+        survival._failures = 0
+        survival._retry_at = 0.0
+        reachable = []
+
+        def friar(graph, client, exclude=()):
+            reachable.append(tuple(exclude))
+            return None if "Friar Marcus" in exclude else TempleTrip("Friar Marcus")
+
+        from . import autoplay as autoplay_module
+
+        with patch.object(autoplay_module, "temple_food_trip", friar):
+            asyncio.run(engine._protect_idle())
+            survival.child.fail("no route to the temple")
+            self.assertFalse(asyncio.run(engine._protect_idle()))
+            self.assertIsNone(survival.child)
+            for _ in range(20):
+                asyncio.run(engine._protect_idle())
+            self.assertEqual(reachable, [()])
+            survival._retry_at = 0.0
+            asyncio.run(engine._protect_idle())
+            self.assertEqual(reachable, [(), ("Friar Marcus",)])
+        # Eating clears the alert.
+        client.record_action("idle-hunger-fed", "food 500")
+        alerts = active(client.state, client.decision_history,
+                        ProgressWatch(), autoplay_started_at=None)
+        self.assertNotIn("idle-food", [alert["id"] for alert in alerts])
+
+    def test_blocked_spellcasting_stops_further_casts_on_that_square(self):
+        heal = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+        heal.extra["cost"] = 3
+        client = self.client(food=500, hp=40, inventory=[heal])
+        fired = []
+
+        async def fire(direction, tag):
+            fired.append(tag)
+
+        client.fire = fire
+        engine = TaskEngine(client)
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(fired, [24])
+        client.state.add_message(0, "white",
+                                 "Something blocks your spellcasting.")
+        for _ in range(20):
+            engine.idle_safety._last_heal = 0.0
+            asyncio.run(engine._protect_idle())
+        self.assertEqual(fired, [24])
+        self.assertEqual(self.decisions(client, "spell-blocked"),
+                         [f"{self.BED} (16,3)"])
+        # Every policy shares it: a trip's safety does not cast there either.
+        policy = SafetyPolicy()
+        self.assertIsNone(policy._usable_heal(client))
+        # A blocked spell is no reason to hold still waiting for mana.
+        client.state.stats["hp"] = 65
+        self.assertTrue(asyncio.run(policy.enforce(client)))
+        # Off the square, healing casts resume.
+        client.state.map.world_x = 17
+        engine.idle_safety._last_heal = 0.0
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(fired, [24, 24])
+
+    def test_stop_still_ends_farming_and_questing(self):
+        from .web_server import WebControlServer
+
+        client = self.client(food=120)
+        trips = []
+
+        def trip(graph, client, exclude=()):
+            trips.append(1)
+            return TempleTrip("Friar Marcus")
+
+        engine = self.engine(client, trip)
+        graph = WorldGraph()
+        server = WebControlServer(client, engine, graph)
+        for task in (FarmCircuitTask(graph, [("/farm", "rat")]),
+                     EscapingDesertedIslandTask(graph),
+                     AutoplayTask(graph, target_level=115)):
+            engine.set_task(task)
+            task.status = TaskStatus.RUNNING
+            self.assertFalse(asyncio.run(engine._protect_idle()))
+            result = asyncio.run(server._set_task({"type": "stop"}))
+            self.assertEqual(result, {"ok": True, "task": None})
+            self.assertEqual(task.status, TaskStatus.FAILED)
+            self.assertIsNone(engine.task)
+            # Only survival runs afterwards: after Stop's hold, the food
+            # trip, never a task.
+            asyncio.run(engine._protect_idle())
+            self.assertIsNone(engine.idle_survival.child)
+            engine.idle_survival._hold_until = 0.0
+            self.assertTrue(asyncio.run(engine._protect_idle()))
+            self.assertIsNone(engine.task)
+            self.assertIsInstance(engine.idle_survival.child.task,
+                                  TempleFoodTask)
+        self.assertEqual(len(trips), 3)
+
+    def test_blocked_square_refuses_scrolls_rods_and_wands_too(self):
+        spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+        spell.extra["cost"] = 3
+        scroll = Item(25, item_type=c.TYPE_SCROLL, quality=100,
+                      name="scroll of minor healing", quantity=3)
+        rod = Item(26, item_type=c.TYPE_ROD, quality=100,
+                   name="rod of healing")
+        client = self.client(food=500, hp=40, inventory=[spell, scroll, rod])
+        policy = SafetyPolicy()
+        self.assertIsNotNone(policy._usable_heal(client))
+        client.state.add_message(0, "white",
+                                 "Something blocks your spellcasting.")
+        self.assertIsNone(policy._usable_heal(client))
+        potion = Item(27, item_type=c.TYPE_POTION, quality=100,
+                      name="potion of minor healing")
+        client.state.place_item(potion, client.state.player_tag)
+        self.assertEqual(policy._usable_heal(client).tag, 27)
+
+    def test_block_after_moving_marks_the_square_of_the_cast(self):
+        spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+        client = self.client(food=500, inventory=[spell])
+        from .tasks import spell_blocked_here
+
+        self.assertFalse(spell_blocked_here(client))
+        asyncio.run(client.fire(0, 24))
+        # She steps on before the answer arrives.
+        client.state.map.world_x = 17
+        client.state.add_message(0, "white", "Something blocks your spell.")
+        self.assertFalse(spell_blocked_here(client))
+        client.state.map.world_x = 16
+        self.assertTrue(spell_blocked_here(client))
+        self.assertEqual(self.decisions(client, "spell-blocked"),
+                         [f"{self.BED} (16,3)"])
+
+    def test_connection_drop_while_a_trip_starts_keeps_the_engine(self):
+        client = self.client(food=60)
+
+        async def closed():
+            raise ConnectionError("closed")
+
+        client.clear_actions = closed
+        engine = self.engine(client,
+                             lambda graph, client, **_: TempleTrip("Friar Marcus"))
+        self.assertTrue(asyncio.run(engine._protect_idle()))
+        self.assertIsNone(engine.idle_survival.child)
+        self.assertEqual(self.decisions(client, "idle-hunger"), [])
+
+    def test_waits_for_inventory_replay_and_map(self):
+        client = self.client(food=60)
+        trips = []
+        engine = self.engine(client, lambda graph, client, **_: trips.append(1))
+        client.state.inventory_replay_complete = False
+        asyncio.run(engine._protect_idle())
+        client.state.inventory_replay_complete = True
+        client.state.map.path = ""
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [])
+        self.assertEqual(self.decisions(client, "idle-hunger-failed"), [])
+
+    def test_idle_food_alert_clears_once_she_no_longer_needs_food(self):
+        from .alerts import ProgressWatch, active
+
+        client = self.client(food=60)
+        engine = self.engine(client, lambda graph, client, **_: None)
+        asyncio.run(engine._protect_idle())
+
+        def ids(**kwargs):
+            return [alert["id"] for alert in active(
+                client.state, client.decision_history, ProgressWatch(),
+                autoplay_started_at=None, **kwargs)]
+
+        self.assertIn("idle-food", ids())
+        # A task the operator started now owns her food.
+        self.assertNotIn("idle-food", ids(task_running=True))
+        # Fed by hand.
+        client.state.stats["food"] = 900
+        self.assertNotIn("idle-food", ids())
+
+    def test_carried_food_that_never_feeds_her_falls_through_to_the_trip(self):
+        dud = Item(61, item_type=c.TYPE_FOOD, quality=100,
+                   name="stale bread", quantity=5)
+        client = self.client(food=60, inventory=[dud])
+        applied = []
+
+        async def apply(tag):
+            applied.append(tag)
+
+        client.apply = apply
+        trips = []
+
+        def trip(graph, client, exclude=()):
+            trips.append(1)
+            return TempleTrip("Friar Marcus")
+
+        engine = self.engine(client, trip)
+        for _ in range(10):
+            # Each retry window passes; her food stat never rises.
+            engine.idle_safety._last_food = 0.0
+            asyncio.run(engine._protect_idle())
+            if engine.idle_survival.child is not None:
+                break
+        self.assertEqual(applied, [61, 61, 61])
+        self.assertTrue(engine.idle_safety.meals_failing())
+        self.assertEqual(trips, [1])
+        self.assertIsInstance(engine.idle_survival.child.task, TempleFoodTask)
+
+    def test_stop_ends_a_running_trip_and_holds_the_next(self):
+        from .web_server import WebControlServer
+
+        client = self.client(food=120)
+        moves = []
+
+        async def move_to_view(x, y):
+            moves.append((x, y))
+
+        client.move_to_view = move_to_view
+        trips = []
+
+        def trip(graph, client, exclude=()):
+            trips.append(1)
+            return TempleTrip("Friar Marcus")
+
+        engine = self.engine(client, trip)
+        graph = WorldGraph()
+        server = WebControlServer(client, engine, graph)
+        survival = engine.idle_survival
+        asyncio.run(engine._protect_idle())
+        self.assertIsNotNone(survival.child)
+        asyncio.run(server._set_task({"type": "stop"}))
+        self.assertIsNone(survival.child)
+        self.assertEqual(len(self.decisions(client, "idle-survival-hold")), 1)
+        for _ in range(5):
+            asyncio.run(engine._protect_idle())
+        self.assertEqual((trips, survival.child), ([1], None))
+        # After the hold she goes again: starving is worse.
+        survival._hold_until = 0.0
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1, 1])
+        # A manual move ends the trip and holds it off the same way.
+        asyncio.run(server._action({"type": "move", "x": 1, "y": 0}))
+        self.assertEqual(moves, [(1, 0)])
+        self.assertIsNone(survival.child)
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1, 1])
+        # Stop during autoplay's own temple-food phase does not send her
+        # off on a fresh trip at once.
+        survival._hold_until = 0.0
+        autoplay = AutoplayTask(graph, target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay.phase, autoplay.child = "temple-food", TempleTrip("Talrain")
+        engine.set_task(autoplay)
+        asyncio.run(engine._protect_idle())
+        asyncio.run(server._set_task({"type": "stop"}))
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1, 1])
+        self.assertIsNone(survival.child)
+
+    def test_low_food_ends_the_operator_hold(self):
+        client = self.client(food=120)
+        trips = []
+
+        def trip(graph, client, exclude=()):
+            trips.append(1)
+            return TempleTrip("Friar Marcus")
+
+        engine = self.engine(client, trip)
+        survival = engine.idle_survival
+        survival.hold(client, "stopped by operator")
+        # Recorded even with no trip running.
+        self.assertEqual(self.decisions(client, "idle-survival-hold"),
+                         ["stopped by operator; no trip running; "
+                          "food trips held for 10 min"])
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [])
+        # Below the eating threshold the hold ends: she starves soon.
+        client.state.stats["food"] = 90
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1])
+        # And a new one is not applied.
+        survival.hold(client, "manual move")
+        self.assertTrue(self.decisions(client, "idle-survival-hold")[-1]
+                        .endswith("not held: food 90"))
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1, 1])
+
+    def test_repeated_actions_do_not_extend_the_hold_past_its_cap(self):
+        client = self.client(food=150)
+        trips = []
+
+        def trip(graph, client, exclude=()):
+            trips.append(1)
+            return TempleTrip("Friar Marcus")
+
+        engine = self.engine(client, trip)
+        survival = engine.idle_survival
+        survival.hold(client, "manual move")
+        # Nine minutes on, another manual action renews it only up to ten
+        # minutes from the first.
+        shift = survival.RETRY_SECONDS - 60.0
+        survival._hold_started -= shift
+        survival._hold_until -= shift
+        survival.hold(client, "manual move")
+        self.assertLessEqual(survival._hold_until - time.monotonic(), 60.0)
+        self.assertGreater(survival._hold_until - time.monotonic(), 0.0)
+        # Once the budget is spent, further actions add nothing.
+        survival._hold_started -= 60.0
+        survival._hold_until -= 60.0
+        survival.hold(client, "manual dialog")
+        self.assertLessEqual(survival._hold_until, time.monotonic())
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1])
+        # Fed, a later episode gets its own budget again.
+        survival.drop()
+        client.state.stats["food"] = 500
+        survival.hold(client, "stopped by operator")
+        self.assertGreater(survival._hold_until - time.monotonic(),
+                           survival.RETRY_SECONDS - 5)
+
+    def test_a_stale_cast_square_is_not_blamed(self):
+        from .tasks import spell_blocked_here
+
+        client = self.client(food=500)
+        spell_blocked_here(client)
+        # A cast long ago on another square; the refusal answers a use here.
+        client.spell_cast = ((self.BED, 3, 3), client.state.message_count,
+                             time.time() - 60.0)
+        client.state.add_message(0, "white",
+                                 "Something blocks your spellcasting.")
+        self.assertTrue(spell_blocked_here(client))
+        self.assertEqual(self.decisions(client, "spell-blocked"),
+                         [f"{self.BED} (16,3)"])
+
+    def test_only_the_idle_policy_gives_up_on_food_and_only_for_a_while(self):
+        dud = Item(61, item_type=c.TYPE_FOOD, quality=100,
+                   name="stale bread", quantity=5)
+        client = self.client(food=60, inventory=[dud])
+        applied = []
+
+        async def apply(tag):
+            applied.append(tag)
+
+        client.apply = apply
+        task_policy = SafetyPolicy()
+        for _ in range(6):
+            task_policy._last_food = 0.0
+            asyncio.run(task_policy.enforce(client))
+        self.assertEqual(len(applied), 6)
+        self.assertFalse(task_policy.meals_failing())
+        idle = SafetyPolicy(fruitless_meal_limit=3)
+        applied.clear()
+        for _ in range(6):
+            idle._last_food = 0.0
+            asyncio.run(idle.enforce(client))
+        self.assertEqual(len(applied), 3)
+        self.assertTrue(idle.meals_failing())
+        # A minute later she tries it again.
+        idle._fruitless_since -= idle.fruitless_retry_seconds
+        self.assertFalse(idle.meals_failing())
+        asyncio.run(idle.enforce(client))
+        self.assertEqual(len(applied), 4)
+
+
 if __name__ == "__main__":
     unittest.main()
