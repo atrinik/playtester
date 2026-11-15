@@ -1372,8 +1372,8 @@ open a safer route, is out of scope. It needs goal planning beyond routing.
 
 ## 6. Open questions for the owner
 
-None remain. Settled on 2026-11-14 and 2026-11-15 and folded in above: the exchange rate (30 min per
-death), no automatic walls, owner blocks with a 1 h to 7 d expiry, bounded
+None remain. Settled on 2026-11-14 and 2026-11-15 and folded in above: the
+exchange rate (30 min per death), no automatic walls, owner blocks with a 1 h to 7 d expiry, bounded
 and safe-only probes, essential trips crossing blocks with care, route cost
 as a playtester-only filter, no route danger from deaths to players, the
 `savebed` voyages excluded from routing, the farm limits and decay as
