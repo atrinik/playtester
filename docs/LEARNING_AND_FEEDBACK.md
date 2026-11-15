@@ -683,8 +683,9 @@ rule: by the time a level-94 monster appears it is too late.
   day's trials stop at the first failure (damage, a spawn, a trap or a
   recall). ROUTING ships that budget with its probes in P10, so F7 defines
   the shared daily counter itself and P10 reuses it, whichever lands first.
-  A refusal is neither a failure here nor a ROUTING `rejected` outcome; it
-  is recorded only as this lock's hint and refusal count.
+  A door's refusal is not a failure here: it does not stop the day's
+  trials. Before F8 it is recorded only as this lock's hint and refusal
+  count; from F8 on it also writes ROUTING's `rejected` row (4.5).
 - No hostile within its detection radius of her or of the object (the
   `_lone_target` radii, COMBAT.md), and no unseen-contact hit in the last
   10 s.
@@ -696,7 +697,8 @@ rule: by the time a level-94 monster appears it is too late.
   say where players are (`commands/player/who.c:40-81`), so this means
   `/who` reports her as the only player online ("There is 1 player
   online."). Only that count line is parsed; the ingestion filter (4.3.1)
-  drops `/who`'s per-player lines unread, because each names a player. A door bump changes nothing for others and
+  drops `/who`'s per-player lines unread, because each names a player. A
+  door bump changes nothing for others and
   needs only "no other player in view".
 - Not on a map whose region is an apartment or house other than her own
   (player housing), and not a shop's staff door.
@@ -1475,8 +1477,8 @@ default off; shadow decisions while off. It defines the shared
 ROUTING P3 (blocks and care) and P5 and P6 (the route tables and the
 danger costs that `PROBE_MAX_DANGER_SECONDS` is measured in).
 *Accept:* the 4.13 trial-safety tests; an unknown target type is refused;
-trials and ROUTING probes share one 3-a-day budget; a refusal writes no
-`rejected` row; the owner turns the flag on after a supervised session.
+trials and ROUTING probes share one 3-a-day budget; a refusal does not
+stop the day's trials and, before F8, writes no `rejected` row; the owner turns the flag on after a supervised session.
 
 **F8. `feat(navigation)`: learned unlocks into routing.** Trial outcomes
 write `route_requirements` rows for `lock:` subjects, `UnlockState` gains
