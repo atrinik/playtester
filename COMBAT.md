@@ -411,7 +411,8 @@ steps away and keeps her distance.
   (`CombatProfile.no_survivability_gain`) is one-sided: a failure stops
   counting only once she has genuinely improved on it, with maximum health
   more than 10% up, armour class more than 2 up, total protections more
-  than 5 up or character level more than 2 up. Weaker or equal, it still
+  than 5 up or character level more than 2 up, and none of them down by
+  more than that. Weaker or equal, it still
   counts: live, depletion dropped Sera's maximum health from 322 to 244,
   and a symmetric test had stopped counting the deaths she had at full
   strength. Skill level and mana move constantly while she trains and are
@@ -435,23 +436,48 @@ steps away and keeps her distance.
 - **Route deaths mark the map she died on.** A death on the way to a spot
   also keeps the transit map and the damage taken on it. For six hours
   (`ROUTE_DEATH_HAZARD_SECONDS`, as long as navigation penalises that map),
-  `analyzer_farm_choice` skips every spot that has a leg on that map or
-  that no exact route (`route_enters_death_map`, the planner's own search)
-  reaches without entering it, whichever spot she was heading to. That
-  includes the depletion fallbacks. Learned route hazards only cost the
-  planner more, so a spot behind the map would otherwise be walked to
-  through it. Each such search covers the whole world, so one runs per
-  call, and a spot stays unusable until its search clears it. A route
-  recall, a death on a map that did not hurt her, or a death with a kit she
-  has since improved on does not count. With no other usable spot, the
-  circuit stops (`farm-spots-exhausted`) instead of walking back. Live, on
-  2026-11-14, Sera died six times in 13 minutes at the underground city
-  entrance on the way to two circuits that do not farm it.
-- **Recall on the way.** Off the farm map, the circuit asks the farm task's
-  emergency recall first, with the same thresholds, device readiness,
-  charge and in-flight handling and the same `emergency-recall` decision,
-  before healing and the low-health retreat. Live, she had fled at 8-16 hit
-  points with a seven-charge recall wand.
+  `route_death_blocked_maps` blocks that map and every map that she can
+  reach from her savebed only through it. `analyzer_farm_choice` then skips
+  any spot with a leg on a blocked map, whichever spot she was heading to,
+  and the hazard and depletion fallbacks skip it too. Reach comes from the
+  planner's own walkable-component expansion (`WorldGraph.reachable_maps`),
+  judged from the savebed, where every death returns her. Without a known
+  savebed, it is judged from where she stands, keyed by her component. The
+  coarse map graph is not enough: it reaches the underground city's
+  circuits around the entrance through seams she cannot walk.
+  - Exceptions: a route recall, a death on a map that did not hurt her, a
+    death with a kit she has since improved on, a death on her savebed
+    map, and a death on a chokepoint block nothing. A chokepoint is a map
+    cutting off more than half of what she reaches from the savebed
+    (`ROUTE_DEATH_CHOKEPOINT_SHARE`). These keep only the planner's
+    penalised cost. Blocking the town map next to her respawn would block
+    all 40 ranked spots.
+  - Each expansion covers the whole world (a few tenths of a second on the
+    event loop). Results are cached, and at most one runs every
+    `ROUTE_DEATH_SEARCH_INTERVAL_SECONDS` across all callers. None runs in
+    combat, while the circuit finishes a fight or loot, or for the
+    dashboard and Prometheus, which read cached results only.
+  - While a route death is still being judged, nothing is usable. The
+    circuit keeps its plan, and stops (`farm-spots-exhausted`) only once its
+    own spot is judged blocked and no other spot is usable.
+  - Walks between a usable circuit's legs are not routed around blocked
+    maps: learned route hazards only cost the planner more there. Every leg
+    is reachable from the savebed without entering one, so a penalised
+    route enters none unless the server's one-way links leave no other way.
+  - Live, on 2026-11-14, Sera died six times in 13 minutes at the
+    underground city entrance on the way to two circuits that do not farm
+    it.
+- **Recall on the way.** Off the farm map (except on her savebed map, where
+  recall leads anyway), the circuit asks the farm task's emergency recall
+  first. It uses the same thresholds, device readiness, charge and
+  in-flight handling and the same `emergency-recall` decision, before
+  healing and the low-health retreat. Threats count as on the farm
+  (`transit_threat_count`): the engaged target, a creature hitting her, or
+  one within its detection radius. A recall in flight is never followed by
+  another for 30 s, even on another map. Clearing it on the map change had
+  fired a second recall, and with it a second failure review, as soon as
+  the first one landed her in town. Live, she had fled at 8-16 hit points
+  with a seven-charge recall wand.
 - **Healing outpaced.** From the first heal in the last 8 s on, when the
   hits taken are at least what the later heals restored (her health at the
   latest heal is no higher than at the first), healing has stopped keeping

@@ -683,8 +683,12 @@ class DashboardState:
         return spots
 
     def _farmed_objective(self) -> str:
-        """The objective she farms now, after depletion and its fallback."""
-        choice = analyzer_farm_choice(self.client, self.graph)
+        """The objective she farms now, after depletion and its fallback.
+
+        Read-only: the dashboard and Prometheus never run a whole-world
+        route search on the event loop (cached results only).
+        """
+        choice = analyzer_farm_choice(self.client, self.graph, search=False)
         return (choice[0] if choice is not None
                 else effective_farm_objective(self.client.state))
 

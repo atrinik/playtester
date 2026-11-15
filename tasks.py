@@ -4420,6 +4420,32 @@ class FarmTask(BotTask):
         elif hasattr(client.state, "last_recall_shop_check_at"):
             client.state.last_recall_shop_check_at = 0.0
 
+    def transit_threat_count(self, client: AtrinikClient, node=None) -> int:
+        """Active threats within 4 tiles of her, as tick counts them.
+
+        For the circuit's recall decision on a transit map (where the farm's
+        own target, zone and neutral handling do not apply): the engaged
+        target, a creature named by recent hits on her, or one that is not
+        authored peaceful (on ``node``) and within its detection radius.
+        """
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        attackers = recent_hostile_attackers(client)
+        engaged = self._engaged_target[0] if self._engaged_target else 0
+        count = 0
+        for x, y, obj in m.targets(friendly=False):
+            distance = max(abs(x - cx), abs(y - cy))
+            if distance > 4:
+                continue
+            semantic = map_object_semantic(client, obj).casefold()
+            if (obj.target_id == engaged or
+                    any(_same_semantic_identity(name, semantic)
+                        for name in attackers) or
+                    (not self.authored_peaceful(client, obj, node) and
+                     distance <= self.detection_radius(client, obj))):
+                count += 1
+        return count
+
     async def emergency_recall(self, client: AtrinikClient, *, ratio: float,
                                nearby_count: int,
                                hostile_contact: bool,
@@ -4447,10 +4473,13 @@ class FarmTask(BotTask):
             elif time.time() - fired_at > 5.0:
                 self._recall_wand_fired = None
         if self._emergency_recall_cast_at:
-            if client.state.map.path != self._emergency_recall_origin:
-                self._emergency_recall_cast_at = 0.0
-                self._emergency_recall_source = 0
-                return False
+            # A recall in flight is never followed by another within 30 s,
+            # even on another map: either it has landed her at the savebed,
+            # still hurt and with the hits that triggered it inside the
+            # contact window, or she crossed a seam while the force builds.
+            # Clearing on the map change fired a second recall (and a second
+            # emergency-recall decision, which escalates the farm review)
+            # the moment it arrived.
             if now - self._emergency_recall_cast_at <= 30.0:
                 return False
             # A no-magic square can fizzle the delayed force. Permit a later

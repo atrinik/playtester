@@ -1340,19 +1340,19 @@ class WorldGraph:
             return None
         return adjusted, arrival
 
-    def route_points(self, source: str, source_xy: tuple[int, int],
-                     destination: str,
-                     destination_points: list[tuple[int, int]], *,
-                     allow_locked: bool = False,
-                     excluded: set[tuple[str, str]] | None = None,
-                     avoided_maps: set[str] | None = None,
-                     penalized_maps: set[str] | None = None,
-                     ) -> list[MapEdge]:
-        """Route end-to-end between exact walkable components across maps.
+    def _component_states(self, source: str, source_xy: tuple[int, int],
+                          destination: str | None, *,
+                          allow_locked=False,
+                          excluded: set[tuple[str, str]] | None = None,
+                          avoided_maps: set[str] | None = None,
+                          penalized_maps: set[str] | None = None):
+        """Every walkable component reachable from ``source_xy``, and how.
 
-        Entering a ``penalized_maps`` map costs more than any route without
-        one, so the route crosses as few of them as it can and, among those,
-        is the shortest.
+        Breadth-first over exact walkable components across maps: the
+        states (map, component key), the arrival square of each, and the
+        transitions between them as a CSR graph with route metadata and
+        penalty flags. ``avoided_maps`` are never entered, except the
+        ``destination``; apartments are entered only as the destination.
         """
         start_component = self._component(
             source, source_xy, allow_locked=allow_locked)
@@ -1367,18 +1367,11 @@ class WorldGraph:
         edge_metadata: list[int] = []
         edge_costs: list[int] = []
         route_edges: list[MapEdge] = []
-        goals: list[int] = []
         cursor = 0
         while cursor < len(states):
             state = states[cursor]
             map_path, _ = state
             position = positions[cursor]
-            if map_path == destination and (
-                    not destination_points or any(
-                        self.local_path(map_path, position, point,
-                                        allow_locked=allow_locked)
-                        for point in destination_points)):
-                goals.append(cursor)
             node = self.nodes.get(map_path)
             if node is not None:
                 for edge in node.edges:
@@ -1424,6 +1417,46 @@ class WorldGraph:
                         route_edges.append(adjusted)
             offsets.append(len(targets))
             cursor += 1
+        return (states, positions, offsets, targets, edge_metadata,
+                edge_costs, route_edges)
+
+    def reachable_maps(self, source: str, source_xy: tuple[int, int], *,
+                       allow_locked=False,
+                       avoided_maps: set[str] | None = None) -> frozenset[str]:
+        """Maps she can walk to from ``source_xy`` without entering
+        ``avoided_maps``: one whole-world expansion, as route_points does."""
+        states = self._component_states(
+            source, source_xy, None, allow_locked=allow_locked,
+            avoided_maps=avoided_maps)[0]
+        return frozenset(map_path for map_path, _ in states)
+
+    def route_points(self, source: str, source_xy: tuple[int, int],
+                     destination: str,
+                     destination_points: list[tuple[int, int]], *,
+                     allow_locked: bool = False,
+                     excluded: set[tuple[str, str]] | None = None,
+                     avoided_maps: set[str] | None = None,
+                     penalized_maps: set[str] | None = None,
+                     ) -> list[MapEdge]:
+        """Route end-to-end between exact walkable components across maps.
+
+        Entering a ``penalized_maps`` map costs more than any route without
+        one, so the route crosses as few of them as it can and, among those,
+        is the shortest.
+        """
+        states, positions, offsets, targets, edge_metadata, edge_costs, \
+            route_edges = self._component_states(
+                source, source_xy, destination, allow_locked=allow_locked,
+                excluded=excluded, avoided_maps=avoided_maps,
+                penalized_maps=penalized_maps)
+        goals = [
+            index for index, ((map_path, _), position)
+            in enumerate(zip(states, positions))
+            if map_path == destination and (
+                not destination_points or any(
+                    self.local_path(map_path, position, point,
+                                    allow_locked=allow_locked)
+                    for point in destination_points))]
         if not goals:
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
@@ -4152,73 +4185,126 @@ def route_death_maps(client: AtrinikClient) -> set[str]:
     return self_improvement.route_death_maps(adaptations, applies)
 
 
-# Exact routes planned around route-death maps: per (graph, leg, hazards,
-# access items), whether every route from where she was enters a hazard.
-_route_death_cache: dict[tuple, bool] = {}
+# A route-death map that cuts off more than this share of the maps she can
+# reach from her respawn is a chokepoint (a town gate, the island's only
+# road): blocking it would halt all farming, so it keeps only the planner's
+# penalised cost. Live, a hazard on world_7_64, next to her respawn, would
+# have blocked all 40 ranked spots.
+ROUTE_DEATH_CHOKEPOINT_SHARE = 0.5
+# At most one whole-world reachability search (most of a second on the
+# event loop) per this many seconds, shared by every caller.
+ROUTE_DEATH_SEARCH_INTERVAL_SECONDS = 2.0
+# Maps reachable from a respawn component: per (graph, map, component,
+# avoided maps, access items).
+_reach_cache: dict[tuple, frozenset[str]] = {}
+_reach_search_after = [0.0]
 
 
-def route_enters_death_map(client: AtrinikClient, graph: "WorldGraph",
-                           legs, hazards: set[str],
-                           budget: list[int] | None = None) -> bool | None:
-    """Whether reaching this spot enters a map she recently died crossing.
+def route_death_origin(client: AtrinikClient, graph: "WorldGraph"
+                       ) -> tuple[str, tuple[int, int], tuple[int, int]] | None:
+    """(map, square, component key) where route-death reach is judged from.
 
-    True when a leg is itself such a map, or when no exact route
-    (WorldGraph.route_points, the planner's own search) from where she
-    stands reaches a leg without entering one; None while still undecided.
-    Live, Sera died six times in 13 minutes at the underground city
-    entrance on the way to two circuits, neither of which farms the
-    entrance: each circuit's own record had to collect its own deaths
-    there. The coarse map graph is not enough: it reaches those circuits
-    around the entrance through seams she cannot walk.
-
-    Each exact search is a whole-world one (most of a second), so at most
-    ``budget[0]`` run per call, as for town_safely_reachable; results are
-    kept per leg and hazard set, whichever map she asks from: a spot
-    behind a lethal entrance stays behind it as she walks.
+    Her savebed, where every death returns her and every farm trip after
+    one starts, so verdicts do not depend on where she happens to stand
+    (inside the hazard, or behind it). An apartment savebed is left by its
+    recorded return. Without a known savebed, where she stands (keyed by
+    her component, so a verdict is never reused from elsewhere). None
+    while no walkable square is known.
     """
+    state = client.state
+    path = getattr(state, "savebed_map", "") or ""
+    xy = getattr(state, "savebed_xy", None)
+    if path and "/apartments/" in path:
+        back = (getattr(state, "apartment_returns", {}) or {}).get(path)
+        path, xy = (back[0], (int(back[1][0]), int(back[1][1]))) if back else ("", None)
+    if not path or xy is None or path not in graph.nodes:
+        origin = apartment_exit_origin(client)
+        path, xy = origin or (state.map.path,
+                              (state.map.world_x, state.map.world_y))
+    if path not in graph.nodes:
+        return None
+    component = graph._component(path, xy)
+    if not component:
+        return None
+    return path, xy, min(component)
+
+
+def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
+                    avoided: frozenset[str], access, search: bool
+                    ) -> frozenset[str] | None:
+    """Cached reachable_maps from ``origin``; None while not yet searched.
+
+    A search runs only with ``search``, out of combat, and at most once per
+    ROUTE_DEATH_SEARCH_INTERVAL_SECONDS across all callers.
+    """
+    path, xy, component = origin
+    key = (id(graph), path, component, avoided, access)
+    if key in _reach_cache:
+        return _reach_cache[key]
+    if (not search or getattr(client.state, "combat", False) or
+            time.monotonic() < _reach_search_after[0]):
+        return None
+    if len(_reach_cache) > 256:
+        _reach_cache.clear()
+    try:
+        reach = graph.reachable_maps(path, xy, allow_locked=access,
+                                     avoided_maps=set(avoided))
+    except ValueError:
+        reach = frozenset()
+    _reach_cache[key] = reach
+    _reach_search_after[0] = (time.monotonic() +
+                              ROUTE_DEATH_SEARCH_INTERVAL_SECONDS)
+    return reach
+
+
+def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
+                             search: bool = True) -> frozenset[str] | None:
+    """Maps farming must not go to while a recent route death counts.
+
+    The maps she can reach from her respawn (route_death_origin), less
+    those she can still reach without entering a route-death map
+    (route_death_maps): the death maps and everything only reachable
+    through them. Live, Sera died six times in 13 minutes at the
+    underground city entrance on the way to two circuits that do not farm
+    it: each circuit's own record had to collect its own deaths there.
+    The coarse map graph is not enough: it reaches those circuits around
+    the entrance through seams she cannot walk.
+
+    A death on her respawn map, or on a chokepoint, blocks nothing: it
+    keeps only the planner's penalised cost. None while still undecided
+    (searches are cached and rate limited, _reachable_from); empty when
+    nothing is blocked.
+    """
+    hazards = route_death_maps(client)
     if not hazards:
-        return False
-    paths = list(dict.fromkeys(path for path, _ in legs))
-    if any(path in hazards for path in paths):
-        return True
-    origin = apartment_exit_origin(client)
-    source, source_xy = origin or (
-        client.state.map.path,
-        (client.state.map.world_x, client.state.map.world_y))
-    frozen = frozenset(hazards)
-    verdict: bool | None = False
-    for path in paths:
-        if path == source:
-            continue
-        navigation = NavigateTask(graph, path)
-        access = navigation._allow_locked(client)
-        key = (id(graph), path, frozen, access)
-        if key not in _route_death_cache:
-            # From a square no route can start on (mid-transition, or a map
-            # the graph lacks), a failed search proves nothing: wait.
-            if ((budget is not None and budget[0] <= 0) or
-                    source not in graph.nodes or
-                    not graph._component(source, source_xy, allow_locked=access)):
-                verdict = None
-                continue
-            if budget is not None:
-                budget[0] -= 1
-            if len(_route_death_cache) > 512:
-                _route_death_cache.clear()
-            try:
-                graph.route_points(
-                    source, source_xy, path, navigation._goal_points(),
-                    allow_locked=access, avoided_maps=set(hazards) - {source})
-                _route_death_cache[key] = False
-            except ValueError:
-                _route_death_cache[key] = True
-        if _route_death_cache[key]:
-            return True
-    return verdict
+        return frozenset()
+    origin = route_death_origin(client, graph)
+    if origin is None:
+        return None
+    hazards.discard(origin[0])
+    hazards.discard(getattr(client.state, "savebed_map", "") or "")
+    access = NavigateTask(graph, origin[0])._allow_locked(client)
+    everywhere = _reachable_from(client, graph, origin, frozenset(), access, search)
+    if everywhere is None:
+        return None
+    blocking = set()
+    for hazard in sorted(hazards & everywhere):
+        without = _reachable_from(client, graph, origin, frozenset({hazard}),
+                                  access, search)
+        if without is None:
+            return None
+        if (len(everywhere - without) <=
+                ROUTE_DEATH_CHOKEPOINT_SHARE * len(everywhere)):
+            blocking.add(hazard)
+    if not blocking:
+        return frozenset()
+    reach = _reachable_from(client, graph, origin, frozenset(blocking),
+                            access, search)
+    return None if reach is None else frozenset(everywhere - reach)
 
 
 def analyzer_farm_choice(
-        client: AtrinikClient, graph: "WorldGraph"
+        client: AtrinikClient, graph: "WorldGraph", *, search: bool = True
 ) -> tuple[str, tuple[tuple[str, str], ...], dict] | None:
     """The objective farmed now, with its highest-ranked usable spot.
 
@@ -4226,13 +4312,16 @@ def analyzer_farm_choice(
     failures: a spot quarantined after a death, an emergency recall, ten minutes
     without XP, or an unreachable route is skipped until its quarantine ends;
     a spot whose route enters a map where she recently died on the way to a
-    farm (route_enters_death_map) is skipped while that death counts, for
+    farm (route_death_blocked_maps) is skipped while that death counts, for
     every circuit behind the map, not only the one she was heading to; and
     a spot rated hazardous for her current kit (kit_hazardous_spot) is
     skipped until her survivability improves, unless every usable spot is
     hazardous; then the least dangerous of them is farmed. Route-death
-    spots are never that fallback, nor any depletion fallback below, and a
-    spot is usable only once its route is checked (one check per call).
+    spots are never that fallback, nor any depletion fallback below. While
+    a route death is still being judged (route_death_blocked_maps returns
+    None), nothing is usable yet and None is returned. Without ``search``
+    (the dashboard and metrics), only cached results are read: no
+    whole-world search runs on their behalf.
 
     While depleted, a safety spot is skipped once any map on it is known not
     to reach every town service on a strictly safe route
@@ -4255,21 +4344,18 @@ def analyzer_farm_choice(
     now = time.time()
     usable = []
     hazardous = []
-    # One exact route-death search per call, spent in ranking order. Unlike
-    # the town check below, a spot still undecided is not usable yet: no
-    # pick, the depletion fallbacks included, may send her back across a
-    # map that just killed her. With no route death recorded, nothing is
-    # searched.
-    route_deaths = route_death_maps(client)
-    route_budget = [1]
+    # No pick, the fallbacks included, may send her back across a map that
+    # just killed her; with no route death recorded, nothing is searched.
+    blocked = route_death_blocked_maps(client, graph, search=search)
+    if blocked is None:
+        return None
     for objective in dict.fromkeys(
             (effective_farm_objective(client.state), chosen)):
         for spot in analyzer.ranking(objective):
             legs = analyzer_spot_legs(spot, graph)
             if (legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
                              for path, _ in legs) and
-                    route_enters_death_map(client, graph, legs, route_deaths,
-                                           route_budget) is False):
+                    not any(path in blocked for path, _ in legs)):
                 (hazardous if kit_hazardous_spot(client, spot, legs)
                  else usable).append((objective, legs, spot))
     if not usable and hazardous:
@@ -4279,7 +4365,7 @@ def analyzer_farm_choice(
             entry[2].get("danger", 0.0) or 0.0))]
     if not depleted_for_temple(client.state):
         return usable[0] if usable else None
-    budget = [1]
+    budget = [1 if search else 0]
     for objective, legs, spot in usable:
         if objective != "safety":
             return objective, legs, spot
@@ -5173,18 +5259,23 @@ class FarmCircuitTask(BotTask):
         self._progression_level = level
         if not self.analyzer_driven:
             return False
-        choice = analyzer_farm_choice(client, self.graph)
+        busy = self._busy_finishing_fight_or_loot(client, farm)
+        # No whole-world search mid-fight or mid-loot.
+        choice = analyzer_farm_choice(client, self.graph, search=not busy)
         if choice is None:
             # Nothing usable is ranked. Never keep farming a spot that live
             # failures just excluded (quarantined, or only reachable through
             # a map she just died crossing): finish, and autoplay holds
-            # position safely until a usable spot is ranked again.
+            # position safely until a usable spot is ranked again. While a
+            # route death is still being judged, or a fight or loot is
+            # being finished, keep the current plan.
+            blocked = route_death_blocked_maps(client, self.graph, search=False)
+            if blocked is None or busy:
+                return False
             quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
             now = time.time()
-            if (any(float(quarantine.get(path, 0.0) or 0.0) > now
-                    for path, _ in self.legs) or
-                    route_enters_death_map(client, self.graph, self.legs,
-                                           route_death_maps(client), [1]) is True):
+            if any(float(quarantine.get(path, 0.0) or 0.0) > now or
+                   path in blocked for path, _ in self.legs):
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("farm-spots-exhausted",
@@ -5283,21 +5374,21 @@ class FarmCircuitTask(BotTask):
         times in 13 minutes crossing one map. The same farm task decides
         here, with its device readiness, charge and in-flight bookkeeping
         (an applied wand is fired on a later tick, a fired recall is not
-        repeated), and it records the same emergency-recall decision. It is
-        asked every transit tick: it acts only on hostile contact at a
-        critical ratio, or to finish a recall it already started. Threats
-        are counted as FarmTask counts them, within 4 tiles of her, leaving
-        out authored peaceful residents.
+        repeated, even across a map change), and it records the same
+        emergency-recall decision. It is asked every transit tick except on
+        her savebed map: it acts only on hostile contact at a critical
+        ratio, or to finish a recall it already started. Threats are
+        counted as FarmTask counts them (FarmTask.transit_threat_count).
         """
+        path = client.state.map.path
+        # Recall leads to the savebed: pointless there, and right after a
+        # recall lands her there it would only spend another charge.
+        if path and path == getattr(client.state, "savebed_map", ""):
+            return False
         hp = int(client.state.stats.get("hp", 0) or 0)
         maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
-        m = client.state.map
-        cx, cy = m.width // 2, m.height // 2
-        node = self.graph.nodes.get(m.path)
-        nearby_count = sum(
-            1 for x, y, obj in m.targets(friendly=False)
-            if max(abs(x - cx), abs(y - cy)) <= 4 and
-            not farm.authored_peaceful(client, obj, node))
+        nearby_count = farm.transit_threat_count(
+            client, self.graph.nodes.get(path))
         hostile_contact = unresolved_hostile_contact(client, seconds=10.0)
         if await farm.emergency_recall(
                 client, ratio=hp / maxhp, nearby_count=nearby_count,

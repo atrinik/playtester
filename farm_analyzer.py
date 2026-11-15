@@ -213,21 +213,27 @@ class CombatProfile:
         Only what keeps her alive counts: maximum health, armour class,
         total protections and character level. Skill level and mana move
         constantly while she trains and say little about surviving a pack.
-        The test is one-sided: being weaker or equal keeps the failure, and
-        only a genuine gain beyond the tolerance clears it (maximum health
-        more than 10% up, armour class more than 2 up, total protections
-        more than 5 up, or character level more than 2 up). Live, depletion
+        The test is one-sided: being weaker or equal keeps the failure. It
+        stops applying only after a genuine gain beyond the tolerance in
+        one of them (maximum health more than 10%, armour class more than
+        2, total protections more than 5, character level more than 2)
+        with no loss beyond the tolerance in any other: armour class 15
+        down for protections 6 up is no improvement. Live, depletion
         dropped Sera's maximum health from 322 to 244; a symmetric "within
-        10%" test then stopped counting the deaths she had at full strength,
-        so the weaker character walked back into the same fights.
+        10%" test then stopped counting the deaths she had at full
+        strength, so the weaker character walked back into the same fights.
         """
-        return not (
-            self.max_health - earlier.max_health >
-            0.10 * max(earlier.max_health, 1) or
-            self.armour_class - earlier.armour_class > 2 or
-            sum(dict(self.protections).values()) -
-            sum(dict(earlier.protections).values()) > 5 or
-            self.character_level - earlier.character_level > 2)
+        changes = (
+            (self.max_health - earlier.max_health,
+             0.10 * max(earlier.max_health, 1)),
+            (self.armour_class - earlier.armour_class, 2),
+            (sum(dict(self.protections).values()) -
+             sum(dict(earlier.protections).values()), 5),
+            (self.character_level - earlier.character_level, 2),
+        )
+        gain = any(change > tolerance for change, tolerance in changes)
+        loss = any(-change > tolerance for change, tolerance in changes)
+        return not gain or loss
 
     @classmethod
     def from_description(cls, data: dict) -> "CombatProfile | None":
