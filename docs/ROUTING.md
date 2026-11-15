@@ -1036,9 +1036,9 @@ The guarantees, stated with the death rate they allow:
   6 × log2(4800 / 3000) ≈ 4.1 h to fall back. If every careful trip still
   fails, that is two deaths in a burst, a third 1.6 h later (when 3600 s
   decays to 3000), then a rate converging to one every 4.1 h: about 8
-  deaths in the first 24 h per spot, and about 6 a day after that. The existing adaptation pause (an hour after repeated
-  failures at the maximum level) and the kit-hazard skip still apply on
-  top.
+  deaths in the first 24 h per spot, and about 6 a day after that. The
+  existing adaptation pause (an hour after repeated failures at the maximum
+  level) and the kit-hazard skip still apply on top.
 - **Chokepoint cap: three deaths close together pause farming.** Three
   deaths spaced Δ apart reach 4500 when 1 + x + x² ≥ 2.5, with
   x = 0.5^(Δ / 6 h), so for Δ ≤ 6 × log2(1 / 0.823) ≈ 1.7 h. Worst case, a
@@ -1281,8 +1281,9 @@ when the owner sets a block.
 alternative, an optional trip fails with a block reason, and an essential
 trip crosses at full HP and SP with a ready recall and an override shown on
 the dashboard, waiting without limit and alerting after 600 s, while a
-starving food trip waits only for a ready recall; a block expires on time and can be removed early; writes are
-refused off loopback or cross-origin.
+starving food trip waits only for a ready recall; a block expires on time
+and can be removed early; writes are refused off loopback or
+cross-origin.
 
 **P4. `feat(navigation)`: quest-gated and dialogue edges, behind a flag.**
 Compile `<action teleport>` voyages and the recognised quest-gated portal
