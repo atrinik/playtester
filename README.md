@@ -303,8 +303,9 @@ When the analyzer gets a spot wrong, the fix belongs in the analyzer.
 ## Route planning
 
 Navigation plans over a world graph compiled from the locked content: tile
-seams, exits, apartments, locked doors and inventory checkers. Maps where a
-route death happened cost more for six hours. The proposed design for
+seams, exits, apartments, locked doors and inventory checkers. A map where
+she recently died on the way somewhere is avoided for a while when another
+route exists. The proposed design for
 alternative routes, unlocks such as keys, quests and NPC voyages, and costs
 learned from her own experience is in [docs/ROUTING.md](docs/ROUTING.md).
 
