@@ -24,7 +24,8 @@ The owner has also decided (2026-11-14):
 - **Exchange rate.** One expected death costs the same as 30 minutes of extra
   travel.
 - **No automatic walls.** Learned danger never becomes a hard wall on its
-  own. It can stop a trip only through that trip's danger budget (4.5).
+  own. It can stop a trip only through that trip's budget or farm cap
+  (4.5).
 - **Owner blocks.** The dashboard gets a control to block a route or a map.
   Every block expires after a duration she chooses, from 1 hour to 7 days.
   The dashboard shows it, and she can remove it early (4.7).
@@ -45,6 +46,20 @@ And, in a second round of answers:
 - **Deaths to other players are excluded** from route danger (4.4).
 - **The three `savebed` voyages are excluded from routing permanently.**
   Quest tasks may still take them on purpose (1.4, 4.2).
+
+And a third round:
+
+- **Farm limits stay as proposed:** horizon 3600 s, per-spot cap 3000 s,
+  chokepoint cap 4500 s, 6 h half-life. They are tuned later from shadow
+  data.
+- **Decay stays as proposed:** deaths, recalls and damage at 6 h, blockers at
+  30 min, and 0.7 recovery per safe pass, which applies to recall, damage
+  and blocked danger only, never to deaths (4.4).
+- **Errands and quest steps get a budget of one expected death (1800 s).**
+  Above it, the trip is declined and retried later (4.5).
+- **Switch-on.** After 24 h of shadow play, a divergence report is posted on
+  the PR: where she would have routed or farmed differently, and why. The
+  owner approves each flag flip. Nothing flips automatically.
 
 This document first records what the navigator does today, then the gaps
 against that model, then the design and a plan of small pull requests.
@@ -700,7 +715,11 @@ There is no partial discount.
 
 **Aggregation.** For a subject, cost = prior + Σ weight(signal) × magnitude ×
 decay(age) × kit factor. A `traversal` success multiplies the subject's
-accumulated danger by a recovery factor (proposal: 0.7). The proposed
+accumulated recall, damage and blocked danger by a recovery factor of 0.7.
+It never reduces deaths: otherwise every safe pass would shorten the death
+cycle, to about one death every 2.3 h per spot and every 0.8 h at a
+chokepoint. Deaths decay only with time, so the death-rate bounds in 4.5
+hold. The proposed
 defaults, all named constants in one module:
 
 | Signal | Weight (s) | Half-life |
@@ -796,11 +815,13 @@ a `metadata` marker:
   and map. Later `kit_failures` entries are never mirrored, because the live
   recorder already has them.
 - A `route_hazards` entry stores the learn time plus 6 h, and
-  `remember_route_hazard` keeps only the latest per map. So timestamps
-  cannot be matched. An entry is dropped when a migrated `kit_failures`
-  route death on the same map falls inside its 6 h window (death time in
-  `(until − 6 h, until]`). Otherwise it becomes one synthetic `death` at
-  `until − 6 h`, standing for at least the latest death there.
+  `remember_route_hazard` keeps only the latest per map. The learn time
+  (`until − 6 h`) comes after the death review, while `kit_failures` stores
+  the earlier `review.time`. So the entry is matched to the latest migrated
+  `kit_failures` route death on the same map with a time in
+  `[until − 6 h − L, until − 6 h]`, where `L = 10 min` bounds the review
+  delay. A matched entry is dropped. Otherwise it becomes one synthetic
+  `death` at `until − 6 h`, standing for at least the latest death there.
 
 **Privacy.** Only her own observations, in her own namespace. Subjects are
 content coordinates. Monster names are not stored; the post-mortem keeps
@@ -898,10 +919,9 @@ it, planning returns `RouteDeclined(cost, budget, worst subjects)` instead of
 a route. This closes G2 for errands, and it is the only way learned danger
 can stop a trip (owner decision). Farm trips use selection instead (below).
 
-- **Quest steps** get an explicit, larger budget per policy, because some
-  quests require the dangerous road.
-- **Optional errands** (upgrade sweeps, utility shopping, junk sale) get a
-  fixed budget per purpose (open question 1).
+- **Optional errands** (upgrade sweeps, utility shopping, junk sale) and
+  **quest steps** get a budget of one expected death, 1800 s (owner
+  decision). Above it, the trip is declined and retried later.
 - **Essential trips** are food when hungry or starving, a cure or the
   depletion service, the savebed move, and a bank trip that pays for one of
   these. They are never declined into stranding. When their budget, their
@@ -953,10 +973,14 @@ score(spot) = FARM_VALUE_HORIZON_SECONDS × r_spot / r_top − D(spot)
   #34 is in review; it now rates approach danger per component, and scores
   the Underground City circuits at 0.85 at 244 HP. Until the locked analyzer
   includes it, content transit danger would be in neither the analyzer nor
-  the score. So, until then, `D` also includes navigation's content priors
-  for the route's maps (4.4). Once the analyzer lock moves to a release
-  with #34's approach danger, detected from that field in its output, the
-  priors are dropped from `D` so content danger is not counted twice.
+  the score. So, until then, the score also subtracts navigation's content
+  priors for the route's maps (4.4). The caps and the care threshold below
+  use learned `D` only, so a content prior can never pause or slow farming
+  without a death: that would be a content wall. Once the analyzer lock
+  moves to a release with #34's approach danger, detected by the
+  `approach_status` field being present in its output (with
+  `approach_safety_score`), the priors leave the score so content danger is
+  not counted twice.
 - **Cap.** A spot that is not behind a chokepoint is not farmed while
   `D ≥ FARM_MAX_TRANSIT_DANGER_SECONDS` (3000 s), even when it is the only
   one.
@@ -973,7 +997,11 @@ score(spot) = FARM_VALUE_HORIZON_SECONDS × r_spot / r_top − D(spot)
   `D ≥ 1800` (one fresh death), chokepoint or not, must meet the
   essential-trip care conditions: full HP and SP, a ready recall when she
   owns one, and transit hold-fire. It records a `farm-route-care` decision,
-  shown on the dashboard like an override.
+  shown on the dashboard like an override. The wait for those conditions is
+  bounded by `CARE_WAIT_SECONDS = 600`. If they are not met by then, for
+  example because the recall is still recharging, that spot drops out of
+  this selection round and the next-best spot is scored. An essential trip
+  that hits the same bound goes anyway, since it must not strand her.
 
 The rule, and why it is one rule: danger never becomes a wall by itself
 (owner decision). It reorders spots through the score, it makes a dangerous
@@ -1023,7 +1051,8 @@ t > 6 × log2(2.5) ≈ 7.9 h. The analyzer's actual rates for the Underground
 City spot were not in the live state when it was read, so this uses the
 condition, not the actual ratio. If it was worth more than twice the next
 spot, she would go back, but on a careful trip, and the second death within
-3.5 h pauses it. Either way: at most two deaths, not five.
+3.5 h pauses it. Either way: at most two deaths in a burst, not five, then
+the rate bound above.
 `underground_city_0_0` is not a chokepoint by #94's test, as far as the
 static graph shows: removing it cuts off the Underground City, not half her
 world.
@@ -1147,10 +1176,11 @@ exactly one of them decides farm selection, so no death counts twice:
   - dialogue edges: compiling an interface fixture, `state=` and `ncheck`
     gating, `savebed` side effects;
   - the cost model: each signal's weight and half-life with an injected
-    clock, the #94 kit predicate, cell attribution only near the planned
+    clock, recovery never reducing deaths, the #94 kit predicate, cell attribution only near the planned
     path, recovery on traversal, per-signal caps, the traversal upsert,
-    the one-time migration (pre-P5 `kit_failures` only, `route_hazards`
-    entries dropped inside a migrated death's window), a new route death
+    the one-time migration (pre-P5 `kit_failures` only, a `route_hazards`
+    entry dropped when a migrated death lies in
+    `[until − 6 h − 10 min, until − 6 h]`), a new route death
     recorded once while #94 is live, cold-start seeding from `decisions`;
   - persistence: round trip, the namespace, a locked database not stalling
     play, block and requirement expiry, privacy (a player attacker leaves no
@@ -1168,9 +1198,9 @@ exactly one of them decides farm selection, so no death counts twice:
     3000 s and not at or over it, two deaths 3 h apart pause it and 4 h apart
     do not, savebed-map deaths add nothing, chokepoint danger skips the
     per-spot cap but pauses all spots behind it at 4500 s, a farm route at
-    `D ≥ 1800` waits for the care conditions and records `farm-route-care`,
-    and content priors are in `D` only while the analyzer lacks approach
-    danger;
+    `D ≥ 1800` waits at most 600 s for the care conditions, then drops out
+    of the round, and content priors affect only the score, never the caps
+    or care, and only while the analyzer output lacks `approach_status`;
   - deaths to other players record nothing.
 - **Content regression tests** against the locked bundle, like
   `test_lost_memories_uses_quest_sam_not_departure_sam`:
@@ -1194,9 +1224,10 @@ exactly one of them decides farm selection, so no death counts twice:
   after the first `underground_city_0_0` death, with the analyzer rates
   recorded for the test.
 - **Performance.** The benchmark gate in 4.5.
-- **Live soak.** At least 24 h of live play in shadow mode, reviewed with
-  the owner. This is the gate for turning the learned-cost flag on (P7), not
-  for merging the shadow code.
+- **Live soak.** 24 h of live play in shadow mode, then a divergence report
+  posted on the PR: where she would have routed or farmed differently, and
+  why. The owner approves each flag flip (P7, P8); nothing flips
+  automatically. This gates the flips, not merging the shadow code.
 
 ## 5. Phased plan
 
@@ -1275,17 +1306,20 @@ in 4.5 passes.
 plans use learned costs, errand budgets apply, and essential overrides take
 effect. Farm trips plan with learned costs but have no budget, and spot
 selection stays #94's, so no death counts twice (4.9).
-*Gate:* a 24 h live shadow soak from P6, reviewed with the owner, and her
-approval. *Accept:* a repeated transit failure switches to the alternative
-in a synthetic graph; a sole lethal route declines an optional trip; an
-essential trip on the same route proceeds with care.
+*Gate:* 24 h of shadow play from P6, the divergence report on the PR, and
+the owner's approval of this flip.
+*Accept:* a repeated transit failure switches to the alternative in a
+synthetic graph; a sole lethal route declines an optional trip; an essential
+trip on the same route proceeds with care.
 
 **P8. `feat(farm)`: route-aware spot and savebed selection.**
 `analyzer_farm_choice` picks by score (4.5), and savebeds rank by route cost.
 Behind its own flag; with it on, this replaces #94's
 `route_death_blocked_maps`, and with it off #94 decides (4.9).
-*Accept:* the farm-selection unit tests in 4.10, including both caps and
-the care rule; the incident replay leaves
+*Gate:* the same soak and divergence report as P7, for farm choices, and
+the owner's approval of this flip.
+*Accept:* the farm-selection unit tests in 4.10, including both caps, the
+care rule and its bounded wait; the incident replay leaves
 the Underground City spot after one death, live rather than in shadow;
 savebed choice uses the ship; analyzer ranking untouched; no death is
 counted by both rules.
@@ -1314,24 +1348,13 @@ open a safer route, is out of scope. It needs goal planning beyond routing.
 Settled on 2026-11-14 and folded in above: the exchange rate (30 min per
 death), no automatic walls, owner blocks with a 1 h to 7 d expiry, bounded
 and safe-only probes, essential trips crossing blocks with care, route cost
-as a playtester-only filter, no route danger from deaths to players, and the
-`savebed` voyages excluded from routing.
+as a playtester-only filter, no route danger from deaths to players, the
+`savebed` voyages excluded from routing, the farm limits and decay as
+proposed, a one-death budget for errands and quest steps, and owner-approved
+flag flips after a 24 h shadow soak and a divergence report.
 
-1. **Errand and quest budgets.** What fixed danger budget should optional
-   errands and quest steps get?
-2. **Farm constants.** Are `FARM_VALUE_HORIZON_SECONDS = 3600` (one hour at
-   the top rate), `FARM_MAX_TRANSIT_DANGER_SECONDS = 3000` (two deaths within
-   about 3.5 h) and `FARM_MAX_CHOKEPOINT_DANGER_SECONDS = 4500` (three deaths
-   within about 1.7 h of each other) right? The worst cases they allow are
-   one transit death per spot about every 4.1 h, and one chokepoint death
-   about every 2.9 h, always on careful trips.
-3. **Decay.** Are a 6 h half-life for deaths and recalls (matching #94),
-   6 h for damage, 30 min for blockers and a 0.7 recovery per successful
-   traversal right?
-4. **Probe limits.** Is 3 probes a day "a few", and is 300 s (a sixth of a
+1. **Probe limits.** Is 3 probes a day "a few", and is 300 s (a sixth of a
    death) the right ceiling for a "low-danger" approach?
-5. **Soak review.** Beyond 24 h of shadow play, what divergence review do you
-   want before the P7 and P8 flags turn on?
 
 ## 7. Known uncertainties
 
