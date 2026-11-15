@@ -347,8 +347,7 @@ Related farm memory: `farm_adaptations`, with per-kit `kit_failures`, feeds
 `farm_zone_quarantine` maps quarantined spot maps to their expiry.
 
 **PR #94** (`fix(navigation): stop route deaths from looping through one
-transit map`, branch `fix/sera-route-death-loop`, at `86b3172` when this was
-written) adds a farm-selection rule.
+transit map`, merged to main as `c97661b`) adds a farm-selection rule.
 
 - Each route death is kept in `farm_adaptations` `kit_failures`, with its
   transit map and the damage taken there (`map_damage`).
@@ -362,14 +361,17 @@ written) adds a farm-selection rule.
 - Two exceptions are cost-only. A death on her savebed map blocks nothing.
   So does a death on a chokepoint: a map whose removal cuts off more than
   half the maps she can reach (`ROUTE_DEATH_CHOKEPOINT_SHARE = 0.5`). Those
-  keep only the planner's penalized cost.
+  keep only the planner's penalized cost. If several hazards together cut
+  off more than that share, the largest cuts are dropped to cost-only first
+  and the rest stay blocked.
+- With no known savebed, standing on a death map blocks just the death maps,
+  so she walks off instead of holding there.
 - The PR also lets recall work while travelling. It does not change
   `_observe_farm_death`.
 
 An earlier revision (`0b4f787`) used a per-spot `route_enters_death_map`
-search instead. Check `origin/fix/sera-route-death-loop` again before
-implementing 4.9, in case it moves further. Section 4.9 says how this design
-wraps and then replaces it.
+search instead. Section 4.9 says how this design wraps and then replaces the
+merged rule.
 
 ### 1.10 Farming and the planner
 
@@ -1404,8 +1406,7 @@ tactics, a feedback queue). It will feed unlock knowledge into P2 and P4.
 - The weights in 4.4, the transit priors and the farm score constants
   (horizon and both caps) are starting points. The replay and the shadow
   soak calibrate them.
-- #94 was at `86b3172` when this was written. 1.9 and 4.9 follow that
-  revision; check `origin/fix/sera-route-death-loop` again before P5 and P8.
+- 1.9 and 4.9 follow #94 as merged (`c97661b`).
 - `atrinik/tools` #34 was not read for this revision; its status comes from
   the coordinator. `D(spot)` keeps navigation's content priors until a
   locked analyzer release carries #34's approach danger.
