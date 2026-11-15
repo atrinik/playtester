@@ -30,6 +30,7 @@ except ModuleNotFoundError:
 from . import constants as c
 from .targeting import select_target, target_set_aside
 
+from .alerts import HUNGRY_FOOD
 from .client import AtrinikClient, format_money, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import farm_analyzer as farm_analyzer_plan
@@ -4441,7 +4442,7 @@ def starving_without_food(client: AtrinikClient) -> bool:
 def hungry(client: AtrinikClient) -> bool:
     """Low on food with nothing left to eat: she must go and get some."""
     return (food_reserve(client) <= 1 and
-            int(client.state.stats.get("food", 1000) or 0) < 180)
+            int(client.state.stats.get("food", 1000) or 0) < HUNGRY_FOOD)
 
 
 def apartment_exit_origin(

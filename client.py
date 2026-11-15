@@ -30,6 +30,10 @@ from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
 
+# Item types that cast a spell when fired or applied; a no-magic square
+# refuses them all (server spell_util.c cast_spell).
+MAGIC_CAST_TYPES = frozenset((c.TYPE_SPELL, c.TYPE_SCROLL, c.TYPE_ROD,
+                              c.TYPE_WAND))
 # The longest a death waits for a locked memory database (seconds).
 POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
@@ -254,6 +258,10 @@ class AtrinikClient:
         self.review_messages: deque[tuple] = deque(maxlen=post_mortem.REVIEW_HISTORY_LIMIT)
         self._memory_character = ""
         self.decision_history: list[dict] = []
+        # The square and message position of the last spell cast.
+        # The square, message position and wall-clock time of the last
+        # spell cast.
+        self.spell_cast: tuple[tuple[str, int, int], int, float] | None = None
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: deque[list[float]] = deque(maxlen=post_mortem.MAX_LIVE_VITALS)
         # Each other character's live reports, while this client plays another.
@@ -2436,8 +2444,18 @@ class AtrinikClient:
                            f"{'on' if enabled else 'off'}{' forced' if force else ''}")
         await self.send(Packet(c.S_COMBAT).u8(int(enabled)).u8(int(force)))
 
+    def _note_spell_cast(self, item: Item | None) -> None:
+        """Remember where a spell, scroll, rod or wand was used, and after
+        which message, so a "Something blocks your spellcasting." answer
+        marks that square, not wherever she has stepped since."""
+        if item is not None and item.item_type in MAGIC_CAST_TYPES:
+            m = self.state.map
+            self.spell_cast = ((m.path, m.world_x, m.world_y),
+                               self.state.message_count, time.time())
+
     async def fire(self, direction: int, item_tag: int = 0) -> None:
         item = self.state.items.get(item_tag)
+        self._note_spell_cast(item)
         if self.metrics is not None:
             self.metrics.fire(item)
         self.record_action("fire",
@@ -2447,6 +2465,7 @@ class AtrinikClient:
 
     async def apply(self, tag: int, apply_action: int = 0) -> None:
         item = self.state.items.get(tag)
+        self._note_spell_cast(item)
         if self.metrics is not None:
             self.metrics.apply(item)
         self.record_action("apply", item.name if item else str(tag or "below"))

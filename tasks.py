@@ -22,8 +22,9 @@ except ModuleNotFoundError:
 from . import constants as c
 from . import self_improvement
 from .targeting import select_target, target_set_aside
-from .client import (COIN_VALUES, AtrinikClient, format_money,
-                     map_object_visual_name, update_bank_balance)
+from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
+                     format_money, map_object_visual_name,
+                     update_bank_balance)
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
 
@@ -404,6 +405,90 @@ def movement_ack_timeout(client: AtrinikClient) -> float:
     return max(1.5, action_time + 0.75, speed_interval + 0.50)
 
 
+# A spell cast on a no-magic square: cast_spell() (server/spell_util.c)
+# refuses every spell there, so another cast on that square only spams it.
+# Live: idle on her no-magic savebed square, a starving Sera sent about
+# 11,641 minor-healing casts, all answered with this.
+# Word of Recall checks the same square once more (cast_wor,
+# server/spell_effect.c) and answers "Something blocks your spell." instead.
+SPELL_BLOCKED_MESSAGE = re.compile(
+    r"^Something blocks (?:your spellcasting|your spell|"
+    r"the magic of your .+)\.", re.I)
+# What the server refuses on such a square: spells, and the scrolls, rods and
+# wands that cast them (a read scroll turns to dust even so, types/scroll.c).
+# Potions and plain items still work.
+MAGIC_BLOCKED_TYPES = MAGIC_CAST_TYPES
+# A blocked square is remembered this long, so walking off and back does
+# not start the spam again; a message older than this is not attributed.
+SPELL_BLOCK_MEMORY_SECONDS = 60 * 60.0
+SPELL_BLOCK_ATTRIBUTION_SECONDS = 10.0
+
+
+def _square(client: AtrinikClient) -> tuple[str, int, int]:
+    m = getattr(client.state, "map", None)
+    return (str(getattr(m, "path", "") or ""),
+            int(getattr(m, "world_x", 0) or 0),
+            int(getattr(m, "world_y", 0) or 0))
+
+
+def spell_blocked_here(client: AtrinikClient) -> bool:
+    """Whether the server has refused her spells on the square she stands on.
+
+    The server checks the caster's own square. A refusal is attributed to
+    the square of the last recent cast before it (``client.spell_cast``, recorded
+    when the cast is sent), so a step taken before the answer arrives does
+    not mark the wrong square; without a recorded cast, to where she stands.
+    The memory lives on the client, so every safety policy shares it.
+    """
+    blocked = getattr(client, "spell_blocked_squares", None)
+    if blocked is None:
+        blocked = {}
+        try:
+            client.spell_blocked_squares = blocked
+        except AttributeError:
+            pass
+    state = client.state
+    square = _square(client)
+    now = time.monotonic()
+    messages = getattr(state, "messages", None)
+    if messages is not None:
+        offset = int(getattr(state, "message_offset", 0) or 0)
+        count = offset + len(messages)
+        mark = getattr(client, "spell_block_mark", None)
+        mark = offset if mark is None else int(mark)
+        cast = getattr(client, "spell_cast", None)
+        fresh = time.time() - SPELL_BLOCK_ATTRIBUTION_SECONDS
+        for position in range(max(mark, offset), count):
+            entry = messages[position - offset]
+            if not (float(entry[0]) >= fresh and
+                    self_improvement.from_server(entry) and
+                    SPELL_BLOCKED_MESSAGE.match(str(entry[-1]).strip())):
+                continue
+            # Only a recent cast explains the answer; otherwise it is
+            # some other use, on the square she stands on.
+            where = (cast[0] if cast is not None and cast[1] <= position and
+                     float(entry[0]) - float(cast[2]) <=
+                     SPELL_BLOCK_ATTRIBUTION_SECONDS else square)
+            if not where[0]:
+                continue
+            if where not in blocked:
+                log.warning("spellcasting blocked at %s (%d,%d); "
+                            "no more casts on this square", *where)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("spell-blocked",
+                             f"{where[0]} ({where[1]},{where[2]})")
+            blocked[where] = now
+        try:
+            client.spell_block_mark = count
+        except AttributeError:
+            pass
+    for key, since in list(blocked.items()):
+        if now - since >= SPELL_BLOCK_MEMORY_SECONDS:
+            del blocked[key]
+    return square in blocked
+
+
 class TaskStatus(str, Enum):
     READY = "ready"
     RUNNING = "running"
@@ -427,10 +512,35 @@ class SafetyPolicy:
     food_patterns: tuple[str, ...] = ("food", "bread", "mushroom", "apple")
     heal_cooldown: float = 1.15
     food_retry_seconds: float = 3.0
+    # The decision recorded each time it eats, if any ("idle-hunger").
+    eat_action: str = ""
+    # Applications in a row without a rise in the food stat after which
+    # carried food counts as no food, for this long. Zero (the default)
+    # keeps applying it; only the engine's idle policy sets it.
+    fruitless_meal_limit: int = 0
+    fruitless_retry_seconds: float = 60.0
     _last_heal: float = field(default=0.0, init=False, repr=False)
     _last_food: float = field(default=0.0, init=False, repr=False)
     _food_attempt_level: int = field(default=-1, init=False, repr=False)
+    # Food applications in a row that did not raise her food stat.
+    _fruitless_meals: int = field(default=0, init=False, repr=False)
+    _fruitless_since: float = field(default=0.0, init=False, repr=False)
     _last_warning: float = field(default=0.0, init=False, repr=False)
+
+    def meals_failing(self) -> bool:
+        """``fruitless_meal_limit`` applications of carried food in a row left
+        her food stat where it was: what she carries does not feed her.
+
+        It lapses after ``fruitless_retry_seconds``, so she tries it again.
+        """
+        if (not self.fruitless_meal_limit or
+                self._fruitless_meals < self.fruitless_meal_limit):
+            return False
+        if (time.monotonic() - self._fruitless_since >=
+                self.fruitless_retry_seconds):
+            self._fruitless_meals = 0
+            return False
+        return True
 
     @staticmethod
     def _find(items: list[Item], patterns: tuple[str, ...]) -> Item | None:
@@ -453,9 +563,22 @@ class SafetyPolicy:
         return next((item for item in safe
                      if item.item_type == c.TYPE_FOOD), None)
 
+    def _known_heal(self, client: AtrinikClient) -> Item | None:
+        """A healing item, or a healing spell she may cast where she stands.
+
+        No spell, scroll, rod or wand on a square where the server blocks
+        spellcasting.
+        """
+        items = client.state.inventory
+        if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items) and \
+                spell_blocked_here(client):
+            items = [item for item in items
+                     if item.item_type not in MAGIC_BLOCKED_TYPES]
+        return self._find(items, self.healing_patterns)
+
     def _usable_heal(self, client: AtrinikClient) -> Item | None:
         """A healing item, or a healing spell she can afford, if any."""
-        heal = self._find(client.state.inventory, self.healing_patterns)
+        heal = self._known_heal(client)
         if heal is not None and heal.item_type == c.TYPE_SPELL:
             cost = int(heal.extra.get("cost", 0) or 0)
             if cost > int(client.state.stats.get("sp", 0) or 0):
@@ -508,9 +631,10 @@ class SafetyPolicy:
         # cleared), and food may still help. She is not safe while critical,
         # or while a known healing spell waits for SP: regeneration, not
         # walking deeper into the next encounter below the recovery margin.
+        # A spell blocked on this square is no reason to wait here.
         waiting = ratio <= self.flee_below or (
             ratio <= self.heal_below and
-            self._find(client.state.inventory, self.healing_patterns) is not None)
+            self._known_heal(client) is not None)
         if ratio <= self.flee_below:
             now = time.monotonic()
             if now - self._last_warning >= 2.0:
@@ -519,6 +643,21 @@ class SafetyPolicy:
         food_level = int(stats.get("food", 1000) or 0)
         if food_level >= self.min_food:
             self._food_attempt_level = -1
+            self._fruitless_meals = 0
+        elif self.fruitless_meal_limit and self._food_attempt_level >= 0:
+            if food_level > self._food_attempt_level:
+                # Only a rise counts as a meal.
+                self._fruitless_meals = 0
+                self._food_attempt_level = -1
+            elif (time.monotonic() - self._last_food >=
+                  self.food_retry_seconds):
+                self._fruitless_meals += 1
+                self._food_attempt_level = -1
+                if self._fruitless_meals >= self.fruitless_meal_limit:
+                    self._fruitless_since = time.monotonic()
+        if food_level < self.min_food and self.meals_failing():
+            # What she carries does not feed her; stop applying it.
+            return not waiting
         if food_level < self.min_food:
             now = time.monotonic()
             if (self._food_attempt_level == food_level and
@@ -532,6 +671,10 @@ class SafetyPolicy:
                 await client.apply(food.tag)
                 self._last_food = now
                 self._food_attempt_level = food_level
+                recorder = getattr(client, "record_action", None)
+                if self.eat_action and recorder is not None:
+                    recorder(self.eat_action,
+                             f"food {food_level}; ate {food.name}")
                 return False
         return not waiting
 
@@ -6934,7 +7077,12 @@ class TaskEngine:
         self.last_task: dict[str, str | float] | None = None
         self.running = True
         self.inventory_policy = InventoryPolicy()
-        self.idle_safety = SafetyPolicy()
+        self.idle_safety = SafetyPolicy(eat_action="idle-hunger",
+                                        fruitless_meal_limit=3)
+        # Feeds a connected character that has no task (autoplay's
+        # IdleSurvival, which needs the world graph). Stop means "no tasks
+        # except survival": in Atrinik a connected character keeps starving.
+        self.idle_survival: Any = None
         self._normalized_stack_locks: set[int] = set()
 
     def set_task(self, task: BotTask | None) -> None:
@@ -6984,10 +7132,27 @@ class TaskEngine:
         return False
 
     async def _protect_idle(self) -> bool:
-        """Keep an idle or just-completed character alive between tasks."""
+        """Keep an idle or just-completed character alive between tasks.
+
+        Without a task (after Stop, or once a task ends) she still heals,
+        eats what she carries and, through ``idle_survival``, walks to free
+        food when she has none. Nothing else runs: no farming, no questing.
+        """
+        survival = self.idle_survival
         if (self.task is not None or
                 self.client.state.phase != "playing"):
+            if survival is not None:
+                # A task owns her now, or the connection is gone: a trip in
+                # flight is rebuilt from scratch if she still needs it.
+                survival.drop()
             return False
+        if survival is not None:
+            self.client.action_context = "idle-survival"
+            try:
+                if await survival.tick(self.client, self.idle_safety):
+                    return True
+            finally:
+                self.client.action_context = ""
         self.client.action_context = "idle-safety"
         try:
             return not await self.idle_safety.enforce(self.client)

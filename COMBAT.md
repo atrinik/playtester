@@ -499,6 +499,62 @@ steps away and keeps her distance.
   heal threshold instead of the flee threshold. At the flee threshold
   healing resumes alongside the retreat.
 
+- **No casts where magic is blocked.** On a no-magic square the server
+  answers every spell with "Something blocks your spellcasting."
+  (`cast_spell`, `server/spell_util.c`, which checks the caster's own
+  square). The client does not see square flags, so that answer is the
+  signal. The client records the square of each spell, scroll, rod or wand
+  use when it is sent, and `spell_blocked_here` attributes the answer to
+  the square of the last use before it, so a step taken before the answer
+  arrives does not mark the wrong square. Word of Recall's own check
+  answers "Something blocks your spell." and counts too. The square is
+  remembered for an hour, shared by every safety policy. There, safety
+  heals only with potions and plain items, never a spell, scroll, rod or
+  wand (`spell-blocked`; a read scroll turns to dust even so), and a
+  blocked healing spell is no reason to hold still and wait for mana. Once
+  she moves off the square, healing casts resume. Live, idle on her
+  no-magic savebed square in Clearhaven, Sera sent about 11,641
+  minor-healing casts while starving, and 135 of her last 150 messages were
+  that answer.
+
+## Stop: no tasks except survival
+
+The dashboard's Stop (`{"type": "stop"}`) ends the running task: no
+farming, questing, navigation or errands. It does not leave her unattended.
+A connected Atrinik character keeps getting hungry, so with no task the
+engine still runs a narrow survival guard (`TaskEngine._protect_idle`):
+
+- the idle safety policy heals her and eats carried food below its food
+  threshold (`idle-hunger`, "ate ..."). Only a rise in her food stat counts
+  as a meal: after three applications without one, it stops applying what
+  she carries for a minute and treats her as having no food. Only this
+  idle policy does that; task safety policies keep applying food;
+- once she is hungry with nothing to eat (`hungry`, the test autoplay
+  uses), `IdleSurvival` walks to the nearest reachable temple priest for the
+  free food service, the trip autoplay uses (`idle-hunger`, then
+  `idle-hunger-fed`), and she stays idle where she ate;
+- when no priest is reachable or the trip fails, it records
+  `idle-hunger-failed`, passes that priest over for an hour, raises the
+  dashboard's critical `idle-food` alert, and retries only after 10, 20,
+  40, then every 60 minutes. Eating, a later trip, a task, or her food
+  stat back at 180 or more clears the alert. It never loops.
+
+Stop also ends a running idle food trip, and so do the manual dashboard
+actions move, dialog, apply and apply on the ground, which would otherwise
+fight it. Each records `idle-survival-hold`, trip or not. No trip starts
+for the next 10 minutes (`IdleSurvival.RETRY_SECONDS`), so Stop during
+autoplay's own temple-food phase does not send her off again at once.
+Repeated actions cannot stretch that: one hunger episode is held at most
+10 minutes from its first hold. The hold ends, or is not applied, once her
+food is below 100: food falls about a point every 4.3 s, and at zero the
+server drains her health one-for-one (`types/player.c`). After the hold, a
+still-hungry character goes again: starving is worse than overriding the
+operator. Starting any task hands her back to it; a trip in flight is
+dropped. Live,
+on 2026-11-14, Stop left Sera idle, without food or money, on her savebed in
+Clearhaven; she starved to death 22 times, about every 50 minutes, and her
+depletion rose from 41 to 67.
+
 ## Next phase: storm farming (owner decisions, 2026-10-22)
 
 At Wizardry 15 the single-target restriction should give way to area spells.
