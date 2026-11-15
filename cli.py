@@ -125,7 +125,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    from .autoplay import AutoplayTask
+    from .autoplay import AutoplayTask, IdleSurvival
     from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                       POLICIES)
     from .client import AtrinikClient, ClientConfig
@@ -197,6 +197,9 @@ async def main_async(args: argparse.Namespace) -> None:
         bundle = getattr(args, "bundle", None)
         if bundle is not None:
             client.farm_analyzer = FarmAnalyzer.from_bundle(bundle)
+        # Stop, or a finished task, leaves her idle but connected: keep
+        # her fed (no tasks except survival).
+        engine.idle_survival = IdleSurvival(graph)
         if args.task == "autoplay":
             engine.set_task(AutoplayTask(
                 graph, target_level=args.until_level))

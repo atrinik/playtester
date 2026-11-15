@@ -922,6 +922,10 @@ class WebControlServer:
     async def _set_task(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
         if kind == "stop":
+            # Stop means "no tasks except survival": farming, questing and
+            # navigation end, but the engine's idle guard still heals her and
+            # feeds her (carried food, else a temple food trip), because a
+            # connected Atrinik character keeps starving.
             previous = self.engine.task
             if previous:
                 previous.fail("stopped by operator")

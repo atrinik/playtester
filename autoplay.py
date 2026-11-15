@@ -9,7 +9,8 @@ from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
 from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
-                         analyzer_farm_selection, hungry, temple_food_trip)
+                         analyzer_farm_selection, food_reserve, hungry,
+                         temple_food_trip)
 from .quest_tasks import EscapingDesertedIslandTask
 from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
 
@@ -409,3 +410,128 @@ class AutoplayTask(BotTask):
                 analyzer_driven=True, spot=spot,
                 backoffs=self._circuit_backoffs,
                 avoid_priests=self._avoided_priests))
+
+
+class IdleSurvival:
+    """Keep a connected character with no task fed, and nothing more.
+
+    Stop means "no tasks except survival": a character left connected in
+    Atrinik keeps getting hungry. Live, Stop left Sera idle on her no-magic
+    savebed square with no food and no money, and she starved to death 22
+    times, about every 50 minutes, while hunger handling ran only inside
+    AutoplayTask. The engine's idle SafetyPolicy eats carried food below its
+    threshold; this guard takes over once she is hungry (the autoplay test,
+    ``hungry``) with nothing left to eat: the free temple food trip autoplay
+    uses, to the nearest reachable priest. Afterwards she stays idle where
+    she ate. A trip that cannot start or fails is recorded, raises the
+    dashboard's idle-food alert, and is retried only after a growing
+    backoff, so it never loops.
+    """
+
+    RETRY_SECONDS = FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS
+    MAX_RETRY_SECONDS = 60 * 60.0
+    PRIEST_RETRY = AutoplayTask.TEMPLE_PRIEST_RETRY
+    # Below this the engine's idle SafetyPolicy eats carried food.
+    safety_min_food = SafetyPolicy().min_food
+
+    def __init__(self, graph: WorldGraph):
+        self.graph = graph
+        self.child: BotTask | None = None
+        self._retry_at = 0.0
+        self._failures = 0
+        # Priests whose food trip failed, until when they are passed over.
+        self._failed_priests: dict[str, float] = {}
+
+    def drop(self) -> None:
+        """Forget a trip in flight; a still-hungry character starts afresh."""
+        self.child = None
+
+    def _avoided_priests(self) -> tuple[str, ...]:
+        now = time.monotonic()
+        self._failed_priests = {name: until for name, until
+                                in self._failed_priests.items() if until > now}
+        return tuple(self._failed_priests)
+
+    @staticmethod
+    def _record(client: AtrinikClient, action: str, detail: str) -> None:
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder(action, detail)
+
+    def _give_up(self, client: AtrinikClient, reason: str) -> None:
+        self._failures += 1
+        delay = min(self.MAX_RETRY_SECONDS,
+                    self.RETRY_SECONDS * 2 ** (self._failures - 1))
+        self._retry_at = time.monotonic() + delay
+        food = int(client.state.stats.get("food", 0) or 0)
+        log.warning("idle and hungry (food %d) but cannot reach food: %s; "
+                    "retry in %.0f min", food, reason, delay / 60)
+        self._record(client, "idle-hunger-failed",
+                     f"food {food}; {reason}; retry in {delay / 60:.0f} min")
+
+    async def tick(self, client: AtrinikClient) -> bool:
+        """Run one survival step; True while a food trip has her busy."""
+        if self.child is not None:
+            return await self._tick_trip(client)
+        state = client.state
+        # Login and reconnect enter "playing" before the inventory replay and
+        # the first map; the food she carries is unknown until both arrive.
+        if (not getattr(state, "inventory_replay_complete", True) or
+                not getattr(getattr(state, "map", None), "path", "") or
+                time.monotonic() < self._retry_at or not hungry(client)):
+            return False
+        if (food_reserve(client) and
+                int(state.stats.get("food", 0) or 0) < self.safety_min_food):
+            # Her last meal first: the idle safety policy eats it now.
+            return False
+        trip = temple_food_trip(self.graph, client,
+                                exclude=self._avoided_priests())
+        if trip is None:
+            self._give_up(client, "no temple priest is reachable")
+            return False
+        await client.clear_actions()
+        await client.set_combat(False)
+        await client.clear_target()
+        self.child = trip
+        await trip.start(client)
+        self._record(client, "idle-hunger",
+                     f"food {int(state.stats.get('food', 0) or 0)}; "
+                     f"{trip.name}")
+        return True
+
+    async def _tick_trip(self, client: AtrinikClient) -> bool:
+        trip = self.child
+        assert trip is not None
+        try:
+            await trip.tick(client)
+        except ConnectionError as exc:
+            # Rebuilt from the server's state once she is playing again.
+            log.warning("idle food trip lost its connection (%s)",
+                        exc or "closed")
+            self.child = None
+            return True
+        except Exception as exc:  # A trip bug must not end the engine.
+            log.exception("idle food trip failed")
+            trip.fail(str(exc))
+        if trip.status == TaskStatus.COMPLETE:
+            self.child = None
+            self._failures = 0
+            self._retry_at = 0.0
+            self._record(client, "idle-hunger-fed",
+                         f"food {int(client.state.stats.get('food', 0) or 0)}"
+                         f"; {trip.name}")
+            return True
+        if trip.status == TaskStatus.FAILED:
+            self.child = None
+            priest = getattr(getattr(trip, "task", None), "priest", "")
+            if priest:
+                self._failed_priests[priest] = (
+                    time.monotonic() + self.PRIEST_RETRY)
+            self._give_up(client, f"{trip.name}: {trip.error}")
+            try:
+                # Stop the rest of an abandoned route.
+                await client.clear_actions()
+            except ConnectionError:
+                pass
+            return False
+        return True
