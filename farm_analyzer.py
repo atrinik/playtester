@@ -207,20 +207,33 @@ class CombatProfile:
         return any(abs(new.get(name, 0) - old.get(name, 0)) >= 5
                    for name in set(old) | set(new))
 
-    def same_survivability(self, other: "CombatProfile") -> bool:
-        """Whether two profiles would fare alike against the same monsters.
+    def no_survivability_gain(self, earlier: "CombatProfile") -> bool:
+        """Whether a failure she had with ``earlier`` still applies to her now.
 
-        Only what keeps her alive counts: maximum health within 10%, armour
-        class within 2, total protections within 5 and character level
-        within 2. Skill level and mana move constantly while she trains and
-        say little about surviving a pack.
+        Only what keeps her alive counts: maximum health, armour class,
+        total protections and character level. Skill level and mana move
+        constantly while she trains and say little about surviving a pack.
+        The test is one-sided: being weaker or equal keeps the failure. It
+        stops applying only after a genuine gain beyond the tolerance in
+        one of them (maximum health more than 10%, armour class more than
+        2, total protections more than 5, character level more than 2)
+        with no loss beyond the tolerance in any other: armour class 15
+        down for protections 6 up is no improvement. Live, depletion
+        dropped Sera's maximum health from 322 to 244; a symmetric "within
+        10%" test then stopped counting the deaths she had at full
+        strength, so the weaker character walked back into the same fights.
         """
-        return (abs(self.max_health - other.max_health) <=
-                0.10 * max(other.max_health, 1) and
-                abs(self.armour_class - other.armour_class) <= 2 and
-                abs(sum(dict(self.protections).values()) -
-                    sum(dict(other.protections).values())) <= 5 and
-                abs(self.character_level - other.character_level) <= 2)
+        changes = (
+            (self.max_health - earlier.max_health,
+             0.10 * max(earlier.max_health, 1)),
+            (self.armour_class - earlier.armour_class, 2),
+            (sum(dict(self.protections).values()) -
+             sum(dict(earlier.protections).values()), 5),
+            (self.character_level - earlier.character_level, 2),
+        )
+        gain = any(change > tolerance for change, tolerance in changes)
+        loss = any(-change > tolerance for change, tolerance in changes)
+        return not gain or loss
 
     @classmethod
     def from_description(cls, data: dict) -> "CombatProfile | None":
