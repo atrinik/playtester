@@ -17743,27 +17743,36 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
             self.assertEqual(analyzer_farm_choice(client, graph)[2]["name"],
                              "UC circuit A", where)
 
-    def test_standing_on_a_death_map_without_a_savebed_decides_nothing(self):
-        from .navigation import _farm_starts, route_death_blocked_maps
+    def test_standing_on_a_death_map_without_a_savebed_still_walks_off(self):
+        from .navigation import (_farm_starts, analyzer_farm_selection,
+                                 route_death_blocked_maps)
 
         client, circuit_a, _ = self.underground_client()
         graph = built_graph()
         entrance = self.UC + "0_0"
         self.route_death(client, circuit_a, entrance)
         # No savebed (or an apartment one without its recorded return):
-        # judged from where she stands, the entrance itself must not count
-        # as her respawn and unblock itself.
+        # judged from where she stands, the entrance must not unblock
+        # itself, nor leave her undecided and held there for good. Only the
+        # death map is blocked, so a spot elsewhere sends her off it.
         for savebed in (("", None), (STARTER_APARTMENT, STARTER_APARTMENT_BED)):
             client.state.savebed_map, client.state.savebed_xy = savebed
             client.state.apartment_returns = {}
             client.state.map.path = entrance
             client.state.map.world_x, client.state.map.world_y = _farm_starts(
                 graph, entrance)[0]
-            self.assertIsNone(route_death_blocked_maps(client, graph), savebed)
-        # From town, it is blocked again.
+            self.assertEqual(route_death_blocked_maps(client, graph),
+                             frozenset({entrance}), savebed)
+            for _ in range(3):
+                self.assertIsNotNone(analyzer_farm_selection(client, graph), savebed)
+        # Only the entrance is known blocked there: a spot on it is skipped.
+        on_it = analyzer_spot("Entrance", [entrance], ["brown cave pudding L32"])
+        client.farm_analyzer.rankings["xp"] = [on_it] + client.farm_analyzer.rankings["xp"]
+        self.assertNotEqual(analyzer_farm_selection(client, graph)[1]["name"], "Entrance")
+        # From town, everything behind it is blocked again.
         client.state.map.path, (client.state.map.world_x,
                                 client.state.map.world_y) = self.RESPAWN
-        self.assertIn(entrance, route_death_blocked_maps(client, graph))
+        self.assertIn(self.UC + "2_2", route_death_blocked_maps(client, graph))
 
     def test_hazards_that_together_cut_off_most_of_the_world_stay_cost_only(self):
         from . import navigation
@@ -17772,7 +17781,8 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         client, circuit_a, _ = self.underground_client()
         graph = built_graph()
         # Ten reachable maps; each death map alone cuts off three of them,
-        # both together six: over half, so the set is a chokepoint.
+        # both together six: over half. The largest cut (ties by name) is
+        # dropped to cost-only until the rest are under the share.
         world = {f"/m{index}" for index in range(10)}
         cut = {"/m0": {"/m0", "/m1", "/m2"}, "/m3": {"/m3", "/m4", "/m5"}}
 
@@ -17783,10 +17793,25 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
             {"time": time.time(), "cause": "route", "kind": "death",
              "map": map_path, "map_damage": 50, "kit": {}} for map_path in cut]}}
         with patch.object(navigation, "_reachable_from", side_effect=reach):
-            self.assertEqual(route_death_blocked_maps(client, graph), frozenset())
+            self.assertEqual(route_death_blocked_maps(client, graph),
+                             frozenset(cut["/m3"]))
+            with patch.object(navigation, "ROUTE_DEATH_CHOKEPOINT_SHARE", 0.2):
+                self.assertEqual(route_death_blocked_maps(client, graph), frozenset())
             with patch.object(navigation, "ROUTE_DEATH_CHOKEPOINT_SHARE", 0.6):
                 self.assertEqual(route_death_blocked_maps(client, graph),
                                  frozenset(cut["/m0"] | cut["/m3"]))
+        # A small dead end beside a large-cut hazard: the large cut is
+        # dropped first and the dead end stays blocked.
+        world = {f"/m{index}" for index in range(20)}
+        cut = {"/big": {"/big"} | {f"/m{index}" for index in range(8)},
+               "/entrance": {"/entrance", "/m18", "/m19"}}
+        world |= set(cut)
+        client.state.farm_adaptations = {"x": {"kit_failures": [
+            {"time": time.time(), "cause": "route", "kind": "death",
+             "map": map_path, "map_damage": 50, "kit": {}} for map_path in cut]}}
+        with patch.object(navigation, "_reachable_from", side_effect=reach):
+            self.assertEqual(route_death_blocked_maps(client, graph),
+                             frozenset(cut["/entrance"]))
 
     def test_the_circuit_leaves_a_spot_only_reachable_through_a_death_map(self):
         from . import navigation

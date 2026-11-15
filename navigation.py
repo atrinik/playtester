@@ -4284,35 +4284,39 @@ def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
         return None
     if not origin[3] and origin[0] in hazards:
         # Judged from where she stands, and that is a death map: what it
-        # reaches says nothing about the way in. Wait for another square.
-        return None
+        # reaches says nothing about the way in. Block only the death maps
+        # themselves, so a spot elsewhere is picked and she walks off;
+        # waiting for a verdict would hold her there for good.
+        return frozenset(hazards)
     hazards.discard(origin[0])
     hazards.discard(getattr(client.state, "savebed_map", "") or "")
     access = NavigateTask(graph, origin[0])._allow_locked(client)
     everywhere = _reachable_from(client, graph, origin, frozenset(), access, search)
     if everywhere is None:
         return None
-    blocking = set()
+    limit = ROUTE_DEATH_CHOKEPOINT_SHARE * len(everywhere)
+    cuts: dict[str, int] = {}
     for hazard in sorted(hazards & everywhere):
         without = _reachable_from(client, graph, origin, frozenset({hazard}),
                                   access, search)
         if without is None:
             return None
-        if (len(everywhere - without) <=
-                ROUTE_DEATH_CHOKEPOINT_SHARE * len(everywhere)):
-            blocking.add(hazard)
-    if not blocking:
-        return frozenset()
-    reach = _reachable_from(client, graph, origin, frozenset(blocking),
-                            access, search)
-    if reach is None:
-        return None
+        if len(everywhere - without) <= limit:
+            cuts[hazard] = len(everywhere - without)
     # Hazards each under the share can together still cut off most of the
-    # world: then the whole set is a chokepoint and stays cost-only.
-    if (len(everywhere - reach) >
-            ROUTE_DEATH_CHOKEPOINT_SHARE * len(everywhere)):
-        return frozenset()
-    return frozenset(everywhere - reach)
+    # world. Then the largest cuts stay cost-only, one at a time, until
+    # the rest together are under it: a small dead end (the underground
+    # city entrance) stays blocked beside a large-cut hazard.
+    blocking = sorted(cuts, key=lambda hazard: (-cuts[hazard], hazard))
+    while blocking:
+        reach = _reachable_from(client, graph, origin, frozenset(blocking),
+                                access, search)
+        if reach is None:
+            return None
+        if len(everywhere - reach) <= limit:
+            return frozenset(everywhere - reach)
+        blocking.pop(0)
+    return frozenset()
 
 
 def analyzer_farm_choice(

@@ -451,13 +451,16 @@ steps away and keeps her distance.
     cutting off more than half of what she reaches from the savebed
     (`ROUTE_DEATH_CHOKEPOINT_SHARE`). These keep only the planner's
     penalised cost. Blocking the town map next to her respawn would block
-    all 40 ranked spots. Several hazards that each stay under the share,
-    but together cut off more than it, also stay cost-only. Repeated deaths
+    all 40 ranked spots. When hazards that each stay under the share
+    together cut off more than it, the largest cuts become cost-only, one at
+    a time, until the rest are under it, so a small dead end stays blocked
+    beside them. Repeated deaths
     on such a map remain possible until the routing design's care and cap
     rules land (docs/ROUTING.md, https://github.com/atrinik/playtester/pull/95).
   - Without a known savebed (or with an apartment savebed whose return is
     not recorded), reach is judged from where she stands. While she stands
-    on a death map, nothing is decided.
+    on a death map, only the death maps themselves are blocked, so a spot
+    elsewhere sends her off it.
   - Each expansion covers the whole world (a few tenths of a second on the
     event loop). Results are cached, and at most one runs every
     `ROUTE_DEATH_SEARCH_INTERVAL_SECONDS` across all callers. None runs in
