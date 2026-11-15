@@ -61,6 +61,15 @@ And a third round:
   the PR: where she would have routed or farmed differently, and why. The
   owner approves each flag flip. Nothing flips automatically.
 
+And a fourth round:
+
+- **Starving food trips (owner-approved exception).** A food trip while
+  starving may cross an owner block with only a ready recall, if she owns
+  one, plus hold-fire. It is recorded as `essential-care-starving` and
+  alerted on the dashboard (4.5).
+- **Probe limits confirmed:** at most 3 probes a day, and a 300 s ceiling
+  (a sixth of a death) for a low-danger approach (4.6).
+
 This document first records what the navigator does today, then the gaps
 against that model, then the design and a plan of small pull requests.
 
@@ -942,7 +951,7 @@ can stop a trip (owner decision). Farm trips use selection instead (below).
     SP, because she may not regenerate. Its care condition is a ready recall
     when she owns one, plus hold-fire, including when it crosses an owner
     block. This is the one exception; it records `essential-care-starving`
-    and the dashboard shows it.
+    and is alerted on the dashboard (owner-approved).
 
 **Farm selection: value minus danger.** A per-spot budget fails at the
 edges: it divides by zero when a rate is 0, goes negative when rankings mix
@@ -1363,16 +1372,21 @@ open a safer route, is out of scope. It needs goal planning beyond routing.
 
 ## 6. Open questions for the owner
 
-Settled on 2026-11-14 and folded in above: the exchange rate (30 min per
+None remain. Settled on 2026-11-14 and 2026-11-15 and folded in above: the exchange rate (30 min per
 death), no automatic walls, owner blocks with a 1 h to 7 d expiry, bounded
 and safe-only probes, essential trips crossing blocks with care, route cost
 as a playtester-only filter, no route danger from deaths to players, the
 `savebed` voyages excluded from routing, the farm limits and decay as
 proposed, a one-death budget for errands and quest steps, and owner-approved
-flag flips after a 24 h shadow soak and a divergence report.
+flag flips after a 24 h shadow soak and a divergence report, the
+owner-approved starving exception (a starving food trip may cross an owner
+block with only a ready recall plus hold-fire, recorded as
+`essential-care-starving` and alerted on the dashboard), and the probe
+limits (3 a day, 300 s ceiling).
 
-1. **Probe limits.** Is 3 probes a day "a few", and is 300 s (a sixth of a
-   death) the right ceiling for a "low-danger" approach?
+A separate learning-and-feedback design is coming in
+`docs/LEARNING_AND_FEEDBACK.md` (doors and hints, books and facts, terrain
+tactics, a feedback queue). It will feed unlock knowledge into P2 and P4.
 
 ## 7. Known uncertainties
 
