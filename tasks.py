@@ -22,8 +22,9 @@ except ModuleNotFoundError:
 from . import constants as c
 from . import self_improvement
 from .targeting import select_target, target_set_aside
-from .client import (COIN_VALUES, AtrinikClient, format_money,
-                     map_object_visual_name, update_bank_balance)
+from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
+                     format_money, map_object_visual_name,
+                     update_bank_balance)
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
 
@@ -408,8 +409,15 @@ def movement_ack_timeout(client: AtrinikClient) -> float:
 # refuses every spell there, so another cast on that square only spams it.
 # Live: idle on her no-magic savebed square, a starving Sera sent about
 # 11,641 minor-healing casts, all answered with this.
+# Word of Recall checks the same square once more (cast_wor,
+# server/spell_effect.c) and answers "Something blocks your spell." instead.
 SPELL_BLOCKED_MESSAGE = re.compile(
-    r"^Something blocks (?:your spellcasting|the magic of your .+)\.", re.I)
+    r"^Something blocks (?:your spellcasting|your spell|"
+    r"the magic of your .+)\.", re.I)
+# What the server refuses on such a square: spells, and the scrolls, rods and
+# wands that cast them (a read scroll turns to dust even so, types/scroll.c).
+# Potions and plain items still work.
+MAGIC_BLOCKED_TYPES = MAGIC_CAST_TYPES
 # A blocked square is remembered this long, so walking off and back does
 # not start the spam again; a message older than this is not attributed.
 SPELL_BLOCK_MEMORY_SECONDS = 60 * 60.0
@@ -426,8 +434,10 @@ def _square(client: AtrinikClient) -> tuple[str, int, int]:
 def spell_blocked_here(client: AtrinikClient) -> bool:
     """Whether the server has refused her spells on the square she stands on.
 
-    New block messages are attributed to her current square: the server
-    checks the caster's own square, and answers within the tick of the cast.
+    The server checks the caster's own square. A refusal is attributed to
+    the square of the last cast before it (``client.spell_cast``, recorded
+    when the cast is sent), so a step taken before the answer arrives does
+    not mark the wrong square; without a recorded cast, to where she stands.
     The memory lives on the client, so every safety policy shares it.
     """
     blocked = getattr(client, "spell_blocked_squares", None)
@@ -440,28 +450,36 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
     state = client.state
     square = _square(client)
     now = time.monotonic()
-    messages_since = getattr(state, "messages_since", None)
-    if messages_since is not None:
-        count = int(getattr(state, "message_count", 0) or 0)
+    messages = getattr(state, "messages", None)
+    if messages is not None:
+        offset = int(getattr(state, "message_offset", 0) or 0)
+        count = offset + len(messages)
         mark = getattr(client, "spell_block_mark", None)
+        mark = offset if mark is None else int(mark)
+        cast = getattr(client, "spell_cast", None)
         fresh = time.time() - SPELL_BLOCK_ATTRIBUTION_SECONDS
-        found = any(
-            float(entry[0]) >= fresh and self_improvement.from_server(entry) and
-            SPELL_BLOCKED_MESSAGE.match(str(entry[-1]).strip())
-            for entry in messages_since(0 if mark is None else int(mark)))
+        for position in range(max(mark, offset), count):
+            entry = messages[position - offset]
+            if not (float(entry[0]) >= fresh and
+                    self_improvement.from_server(entry) and
+                    SPELL_BLOCKED_MESSAGE.match(str(entry[-1]).strip())):
+                continue
+            where = (cast[0] if cast is not None and cast[1] <= position
+                     else square)
+            if not where[0]:
+                continue
+            if where not in blocked:
+                log.warning("spellcasting blocked at %s (%d,%d); "
+                            "no more casts on this square", *where)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("spell-blocked",
+                             f"{where[0]} ({where[1]},{where[2]})")
+            blocked[where] = now
         try:
             client.spell_block_mark = count
         except AttributeError:
             pass
-        if found and square[0]:
-            if square not in blocked:
-                log.warning("spellcasting blocked at %s (%d,%d); "
-                            "no more casts on this square", *square)
-                recorder = getattr(client, "record_action", None)
-                if recorder is not None:
-                    recorder("spell-blocked",
-                             f"{square[0]} ({square[1]},{square[2]})")
-            blocked[square] = now
     for key, since in list(blocked.items()):
         if now - since >= SPELL_BLOCK_MEMORY_SECONDS:
             del blocked[key]
@@ -496,7 +514,16 @@ class SafetyPolicy:
     _last_heal: float = field(default=0.0, init=False, repr=False)
     _last_food: float = field(default=0.0, init=False, repr=False)
     _food_attempt_level: int = field(default=-1, init=False, repr=False)
+    # Food applications in a row that did not raise her food stat.
+    _fruitless_meals: int = field(default=0, init=False, repr=False)
     _last_warning: float = field(default=0.0, init=False, repr=False)
+
+    FRUITLESS_MEALS = 3
+
+    def meals_failing(self) -> bool:
+        """Three applications of carried food in a row left her food stat
+        where it was: what she carries does not feed her."""
+        return self._fruitless_meals >= self.FRUITLESS_MEALS
 
     @staticmethod
     def _find(items: list[Item], patterns: tuple[str, ...]) -> Item | None:
@@ -522,12 +549,14 @@ class SafetyPolicy:
     def _known_heal(self, client: AtrinikClient) -> Item | None:
         """A healing item, or a healing spell she may cast where she stands.
 
-        No spell on a square where the server blocks spellcasting.
+        No spell, scroll, rod or wand on a square where the server blocks
+        spellcasting.
         """
         items = client.state.inventory
-        if any(item.item_type == c.TYPE_SPELL for item in items) and \
+        if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items) and \
                 spell_blocked_here(client):
-            items = [item for item in items if item.item_type != c.TYPE_SPELL]
+            items = [item for item in items
+                     if item.item_type not in MAGIC_BLOCKED_TYPES]
         return self._find(items, self.healing_patterns)
 
     def _usable_heal(self, client: AtrinikClient) -> Item | None:
@@ -597,6 +626,19 @@ class SafetyPolicy:
         food_level = int(stats.get("food", 1000) or 0)
         if food_level >= self.min_food:
             self._food_attempt_level = -1
+            self._fruitless_meals = 0
+        elif self._food_attempt_level >= 0:
+            if food_level > self._food_attempt_level:
+                # Only a rise counts as a meal.
+                self._fruitless_meals = 0
+                self._food_attempt_level = -1
+            elif (time.monotonic() - self._last_food >=
+                  self.food_retry_seconds):
+                self._fruitless_meals += 1
+                self._food_attempt_level = -1
+        if food_level < self.min_food and self.meals_failing():
+            # What she carries does not feed her; stop applying it.
+            return not waiting
         if food_level < self.min_food:
             now = time.monotonic()
             if (self._food_attempt_level == food_level and
@@ -7087,7 +7129,7 @@ class TaskEngine:
         if survival is not None:
             self.client.action_context = "idle-survival"
             try:
-                if await survival.tick(self.client):
+                if await survival.tick(self.client, self.idle_safety):
                     return True
             finally:
                 self.client.action_context = ""

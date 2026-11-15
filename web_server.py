@@ -515,7 +515,8 @@ class DashboardState:
         return active_alerts(
             self.client.state, self.client.decision_history, watch,
             autoplay_started_at=(float(getattr(task, "started_at", 0.0) or 0.0)
-                                 if autoplay else None))
+                                 if autoplay else None),
+            task_running=task is not None)
 
     def snapshot(self) -> dict[str, Any]:
         state, task = self.client.state, self.engine.task
@@ -925,7 +926,9 @@ class WebControlServer:
             # Stop means "no tasks except survival": farming, questing and
             # navigation end, but the engine's idle guard still heals her and
             # feeds her (carried food, else a temple food trip), because a
-            # connected Atrinik character keeps starving.
+            # connected Atrinik character keeps starving. Stop also ends a
+            # running idle food trip and holds the next one off a while.
+            self._hold_idle_survival("stopped by operator")
             previous = self.engine.task
             if previous:
                 previous.fail("stopped by operator")
@@ -1090,8 +1093,17 @@ class WebControlServer:
             raise ValueError("inventory item no longer exists")
         return item
 
+    def _hold_idle_survival(self, reason: str) -> None:
+        """End the idle food trip and hold it off, as the operator took over."""
+        survival = getattr(self.engine, "idle_survival", None)
+        if survival is not None:
+            survival.hold(self.client, reason)
+
     async def _action(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
+        if kind in ("move", "dialog", "apply", "apply_ground"):
+            # A manual order would fight a running idle food trip.
+            self._hold_idle_survival(f"manual {kind}")
         if kind == "farm_objective":
             objective = str(data.get("objective", ""))
             if objective not in OBJECTIVES:

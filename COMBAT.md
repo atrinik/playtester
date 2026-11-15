@@ -503,9 +503,14 @@ steps away and keeps her distance.
   answers every spell with "Something blocks your spellcasting."
   (`cast_spell`, `server/spell_util.c`, which checks the caster's own
   square). The client does not see square flags, so that answer is the
-  signal: `spell_blocked_here` attributes it to the square she stands on
-  and remembers the square for an hour, shared by every safety policy.
-  There, safety heals only with items, not spells (`spell-blocked`), and a
+  signal. The client records the square of each spell, scroll, rod or wand
+  use when it is sent, and `spell_blocked_here` attributes the answer to
+  the square of the last use before it, so a step taken before the answer
+  arrives does not mark the wrong square. Word of Recall's own check
+  answers "Something blocks your spell." and counts too. The square is
+  remembered for an hour, shared by every safety policy. There, safety
+  heals only with potions and plain items, never a spell, scroll, rod or
+  wand (`spell-blocked`; a read scroll turns to dust even so), and a
   blocked healing spell is no reason to hold still and wait for mana. Once
   she moves off the square, healing casts resume. Live, idle on her
   no-magic savebed square in Clearhaven, Sera sent about 11,641
@@ -520,7 +525,9 @@ A connected Atrinik character keeps getting hungry, so with no task the
 engine still runs a narrow survival guard (`TaskEngine._protect_idle`):
 
 - the idle safety policy heals her and eats carried food below its food
-  threshold (`idle-hunger`, "ate ...");
+  threshold (`idle-hunger`, "ate ..."). Only a rise in her food stat counts
+  as a meal: after three applications without one, it stops applying what
+  she carries and treats her as having no food;
 - once she is hungry with nothing to eat (`hungry`, the test autoplay
   uses), `IdleSurvival` walks to the nearest reachable temple priest for the
   free food service, the trip autoplay uses (`idle-hunger`, then
@@ -528,10 +535,17 @@ engine still runs a narrow survival guard (`TaskEngine._protect_idle`):
 - when no priest is reachable or the trip fails, it records
   `idle-hunger-failed`, passes that priest over for an hour, raises the
   dashboard's critical `idle-food` alert, and retries only after 10, 20,
-  40, then every 60 minutes. Eating, or a later trip, clears the alert.
-  It never loops.
+  40, then every 60 minutes. Eating, a later trip, a task, or her food
+  stat back at 180 or more clears the alert. It never loops.
 
-Starting any task hands her back to it; a trip in flight is dropped. Live,
+Stop also ends a running idle food trip (`idle-survival-hold`), and so do
+the manual dashboard actions move, dialog, apply and apply on the ground,
+which would otherwise fight it. Either way no trip starts for the next 10
+minutes (`IdleSurvival.RETRY_SECONDS`), so Stop during autoplay's own
+temple-food phase does not send her off again at once. After that hold, a
+still-hungry character goes again: starving is worse than overriding the
+operator. Starting any task hands her back to it; a trip in flight is
+dropped. Live,
 on 2026-11-14, Stop left Sera idle, without food or money, on her savebed in
 Clearhaven; she starved to death 22 times, about every 50 minutes, and her
 depletion rose from 41 to 67.

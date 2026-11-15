@@ -11,6 +11,7 @@ from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
 from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
                          analyzer_farm_selection, food_reserve, hungry,
                          temple_food_trip)
+from .alerts import HUNGRY_FOOD
 from .quest_tasks import EscapingDesertedIslandTask
 from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
 
@@ -425,7 +426,13 @@ class IdleSurvival:
     uses, to the nearest reachable priest. Afterwards she stays idle where
     she ate. A trip that cannot start or fails is recorded, raises the
     dashboard's idle-food alert, and is retried only after a growing
-    backoff, so it never loops.
+    backoff, so it never loops. Carried "food" that never raises her food
+    stat (``SafetyPolicy.meals_failing``) does not count as food.
+
+    Stop and manual dashboard actions call ``hold``: a running trip ends
+    and none starts for ``RETRY_SECONDS``. After that, a still-hungry
+    character goes again, since starving is worse than overriding the
+    operator.
     """
 
     RETRY_SECONDS = FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS
@@ -445,6 +452,22 @@ class IdleSurvival:
     def drop(self) -> None:
         """Forget a trip in flight; a still-hungry character starts afresh."""
         self.child = None
+
+    def hold(self, client: AtrinikClient, reason: str) -> None:
+        """The operator took over: end a running trip and wait a while.
+
+        No trip starts for ``RETRY_SECONDS``, so Stop (also during
+        autoplay's own temple-food phase) or a manual move is not overridden
+        at once. Afterwards survival resumes.
+        """
+        trip, self.child = self.child, None
+        self._retry_at = max(self._retry_at,
+                             time.monotonic() + self.RETRY_SECONDS)
+        if trip is not None:
+            log.info("idle food trip %s ended: %s", trip.name, reason)
+            self._record(client, "idle-survival-hold",
+                         f"{trip.name} ended: {reason}; food trips resume "
+                         f"in {self.RETRY_SECONDS / 60:.0f} min")
 
     def _avoided_priests(self) -> tuple[str, ...]:
         now = time.monotonic()
@@ -469,19 +492,28 @@ class IdleSurvival:
         self._record(client, "idle-hunger-failed",
                      f"food {food}; {reason}; retry in {delay / 60:.0f} min")
 
-    async def tick(self, client: AtrinikClient) -> bool:
-        """Run one survival step; True while a food trip has her busy."""
+    async def tick(self, client: AtrinikClient,
+                   safety: SafetyPolicy | None = None) -> bool:
+        """Run one survival step; True while a food trip has her busy.
+
+        ``safety`` is the engine's idle policy, which eats carried food.
+        """
         if self.child is not None:
             return await self._tick_trip(client)
         state = client.state
+        food = int(state.stats.get("food", 1000) or 0)
+        # Carried "food" that has not raised her food stat in three
+        # applications is no food.
+        fruitless = safety is not None and safety.meals_failing()
         # Login and reconnect enter "playing" before the inventory replay and
         # the first map; the food she carries is unknown until both arrive.
         if (not getattr(state, "inventory_replay_complete", True) or
                 not getattr(getattr(state, "map", None), "path", "") or
-                time.monotonic() < self._retry_at or not hungry(client)):
+                time.monotonic() < self._retry_at or
+                not (hungry(client) or (fruitless and food < HUNGRY_FOOD))):
             return False
-        if (food_reserve(client) and
-                int(state.stats.get("food", 0) or 0) < self.safety_min_food):
+        if (food_reserve(client) and food < self.safety_min_food and
+                not fruitless):
             # Her last meal first: the idle safety policy eats it now.
             return False
         trip = temple_food_trip(self.graph, client,
@@ -489,11 +521,18 @@ class IdleSurvival:
         if trip is None:
             self._give_up(client, "no temple priest is reachable")
             return False
-        await client.clear_actions()
-        await client.set_combat(False)
-        await client.clear_target()
-        self.child = trip
-        await trip.start(client)
+        try:
+            await client.clear_actions()
+            await client.set_combat(False)
+            await client.clear_target()
+            self.child = trip
+            await trip.start(client)
+        except ConnectionError as exc:
+            # Never end the engine: the reconnect starts afresh.
+            log.warning("idle food trip lost its connection while starting "
+                        "(%s)", exc or "closed")
+            self.child = None
+            return True
         self._record(client, "idle-hunger",
                      f"food {int(state.stats.get('food', 0) or 0)}; "
                      f"{trip.name}")

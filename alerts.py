@@ -15,6 +15,9 @@ DEATH_WINDOW_SECONDS = 3600.0
 REPEATED_DEATHS = 2
 STUCK_SECONDS = 20 * 60.0
 DISCONNECTED_SECONDS = 180.0
+# Below this food level, with at most one meal left, she must go and get
+# food (navigation.hungry).
+HUNGRY_FOOD = 180
 # An idle character's failed food trip stays alerted this long unless she
 # eats since; IdleSurvival retries at most hourly.
 IDLE_FOOD_ALERT_SECONDS = 2 * 3600.0
@@ -69,7 +72,8 @@ def death_count(decisions: Iterable[dict], since: float) -> int:
 def idle_food_failure(decisions: Iterable[dict], now: float) -> dict | None:
     """The idle survival guard's latest outcome, when it is a recent failure.
 
-    Eating or a new trip since the failure clears it.
+    Eating or a new trip since the failure clears it; ``active`` also
+    clears it once her live state no longer needs food.
     """
     latest = None
     for record in decisions:
@@ -86,11 +90,13 @@ def idle_food_failure(decisions: Iterable[dict], now: float) -> dict | None:
 
 
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
-           autoplay_started_at: float | None, now: float | None = None) -> list[dict[str, str]]:
+           autoplay_started_at: float | None, task_running: bool = False,
+           now: float | None = None) -> list[dict[str, str]]:
     """The alerts that apply right now, most severe first.
 
     ``autoplay_started_at`` is when the running autoplay task started, or
-    None when autoplay is not running.
+    None when autoplay is not running; ``task_running`` is whether any task
+    runs.
     """
     now = time.time() if now is None else now
     alerts: list[dict[str, str]] = []
@@ -108,7 +114,12 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
             int(stats.get("food") or 0) <= 0):
         alerts.append({"id": "starving", "level": "critical",
                        "text": "Starving: food is 0"})
-    failure = idle_food_failure(decisions, now)
+    # Only while she is still idle and still needs food: fed by hand, or by
+    # a task the operator started, the failure no longer matters.
+    failure = (idle_food_failure(decisions, now)
+               if not task_running and
+               getattr(state, "phase", "") == "playing" and "food" in stats and
+               int(stats.get("food") or 0) < HUNGRY_FOOD else None)
     if failure is not None:
         alerts.append({"id": "idle-food", "level": "critical",
                        "text": "Idle and cannot reach food: "
