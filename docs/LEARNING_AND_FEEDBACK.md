@@ -32,13 +32,17 @@ all of the following:
 
 Related work, which this design does not duplicate:
 
-- **Routing** ([`docs/ROUTING.md`](ROUTING.md), draft
+- **Routing** ([`docs/ROUTING.md`](ROUTING.md), merged in
   [PR #95](https://github.com/atrinik/playtester/pull/95)). It owns the edge
-  model, `UnlockState` (its 4.3 and phase P2), dialogue and quest-gated
-  edges (its 4.2 and P4), and the route event tables (P5). Unlock knowledge
-  from this design plugs into P2 and P4 as an input (4.5 below); it never
-  decides routes itself. Until PR #95 merges, the relative link above
-  resolves only on its branch.
+  model, `UnlockState` (its 4.3, phase P2), dialogue and quest-gated edges
+  (4.2, P4), owner blocks and care crossings (4.7, P3), the route tables
+  including `route_requirements` (4.4, P5), the cost model (P6) and the
+  probe limits (4.6). Unlock knowledge from this design is an input to P2,
+  P4 and P5 (4.5 below); it never decides routes itself.
+- **Idle survival** ([PR #97](https://github.com/atrinik/playtester/pull/97),
+  `IdleSurvival` and `spell_blocked_here`). It fixes the starvation loop and
+  the futile casting described in section 2. This design builds on it and
+  does not redesign it.
 - **Resident-mode issues**
   [#15](https://github.com/atrinik/playtester/issues/15) (observation and
   knowledge memory),
@@ -51,29 +55,32 @@ Related work, which this design does not duplicate:
   resident character. This design is the narrow, campaign-useful slice of
   it: unlocks, facts that planning and combat consume, and feedback. Its
   tables are built so that #15 can grow from them rather than replace them
-  (4.2).
+  (4.2), and its dialogue sweep (F13) is the first piece of #17.
 - **Combat** ([`COMBAT.md`](../COMBAT.md)). Terrain tactics (4.7) are
   tie-breakers inside the existing pull, kite and retreat logic, not a new
   fight loop.
 
 ## How the evidence was gathered
 
-- Source: this repository at `995685d` (origin/main). Line numbers refer to
-  that revision.
-- Content: the local `atrinik/content` checkout at `b9657299a`
-  (`v1.14.0-4`). The playtester's lock names content v1.14.0, so the
-  examples should match the locked input, but they were not re-checked
-  against the exact locked archive. All maps were scanned offline with a
-  small parser for doors (type 20), keys (21), inventory checkers (64),
-  handles (93), signs and magic mouths (98), books (8) and scrolls (111),
-  including objects nested in monster inventories.
+- Source: this repository at `9c61751` (origin/main, after #94 and #95).
+  Line numbers refer to that revision.
+- Content: the local `atrinik/content` checkout at `b9657299a`. An
+  independent review confirmed that its maps match the locked content input
+  (v1.14.0, `49f5aab`). All maps were scanned offline with a small parser
+  for doors (type 20), keys (21), inventory checkers (64), handles (93),
+  signs and magic mouths (98), books (8), scrolls (111) and the objects
+  each handle's `connected` value drives, including objects nested in
+  monster inventories.
 - Classic server and client: the `classic` worktree at `f2273c85f`
   (`server/src`, `client/src`).
 - Live state: one `GET /api/state` and one `GET /metrics` of the running bot
   (build v1.64.0, `479efb5`, uptime 20.9 h) on 2026-11-15 at about
-  16:23 UTC. Nothing was posted to the bot.
+  16:23 UTC. Nothing was posted to the bot. Her service has been stopped
+  since.
 - GitHub: read-only searches of `atrinik/classic` and `atrinik/content`
   issues and labels, and of the playtester's own issue list.
+- The "+N", book experience and content claims were checked by an
+  independent reviewer.
 
 The probe scripts are not part of this change. Where something is
 unverified, the text says so.
@@ -85,8 +92,10 @@ unverified, the text says so.
 - Every DRAWINFO line goes into `GameState.messages` as
   `(time, type, color, text)`, bounded to the last 500
   (`model.py:308-313`), with a monotonic position counter so watchers can
-  read "messages since" (`model.py:315-330`). `messages_since` drops player
-  chat unless asked, so other players cannot forge server feedback.
+  read "messages since" (`model.py:315-332`). `messages_since` drops player
+  chat types and any line carrying the player-name link
+  `PLAYER_NAME_LINK` (`[a=#charname]`, `model.py:104`, `model.py:331`)
+  unless asked, so other players cannot forge server feedback.
 - `_handle_drawinfo` (`client.py:1415-1511`) parses a fixed set of lines:
   bank balances, party setup, the savebed notice, deaths, depletion stat
   losses and heals. It also feeds the post-mortem review buffer
@@ -95,8 +104,11 @@ unverified, the text says so.
 - Nothing records which object a line came from. DRAWINFO carries no source
   object. Hint text arrives as an ordinary game line: a locked door's `msg`
   in navy (`00ffff`, `door.c:246`, `door.c:297`), a sign's or magic mouth's
-  `msg` in navy (`sign.c:107`, `sign.c:191`), a lever's `msg` or "You turn
-  the big lever." in white (`handle.c:64-71`).
+  `msg` in navy (`sign.c:107`), a lever's `msg` or "You turn the big lever."
+  in white (`handle.c:64-71`). A sign or magic mouth fired by a connection
+  broadcasts its text to everyone near it (`draw_info_map`,
+  `sign.c:189-199`), so she can receive text that another player or a lever
+  caused.
 - Typed notifications (`CLIENT_CMD_NOTIFICATION`, which a sign can send,
   `sign.c:110-145`) are not dispatched at all
   ([#21](https://github.com/atrinik/playtester/issues/21) records this too).
@@ -106,11 +118,12 @@ unverified, the text says so.
 - `_handle_interface` (`client.py:2318-2362`) decodes the interface packet
   into `InterfaceState` (`model.py:190-198`): title, joined text, links,
   input metadata and objects. Each new interface replaces the previous one;
-  no dialogue page is kept.
+  no dialogue page is kept. The server has already substituted
+  `{activator.name}` with her character name in the text she receives.
 - `choose_interface_link` (`client.py:2538-2565`) follows a link.
   `DialogTask` (`quest_tasks.py:13-112`) says `hello` and follows reviewed
   choices; quest executors in `catalog_quest_tasks.py` drive scripted
-  dialogue. Vendors are found from interface XML (`navigation.py:143`).
+  dialogue. Vendors are found from interface XML (`navigation.py:144`).
 - Dialogue text is used only by the task that opened it, and for the bank
   balance (`client.py:2360`). Nothing is parsed for keys, places or
   passwords.
@@ -120,16 +133,20 @@ unverified, the text says so.
 - Book packets (`CLIENT_CMD_BOOK`) are appended raw to `GameState.books`,
   last 20 kept, in memory only (`client.py:2364-2375`, `model.py:287`). Only
   the quest book is parsed (`quests.parse_quest_book`, `quests.py:143-182`).
+  A book a player wrote and signed carries the signer's name and date after
+  its text (`book.c:136-142`; signing sets them in `book_edit.c:476-486`).
 - `FarmTask.maintain_inventory` applies each unread inventory book once for
   Literacy experience (`tasks.py:3196-3217`). Attempts persist as
   `lore_attempt_counts`, keyed by Literacy level, face, type and name
   (`client.py:776-813`). The text she then receives is discarded.
 - Books are then sold as junk once identified
   (`InventoryPolicy.sellable_junk`, `tasks.py:787-800`). Map books on
-  shelves or corpses are never picked up for reading; there is no "read and
-  put back".
+  shelves or corpses are never picked up for reading.
 - Scrolls (type 111) are identified and used only as spell scrolls; none of
   the four authored scrolls is read for text.
+- Players can rename items (`commands/player/rename.c`); examine then says
+  "You name it ..." (`types/player.c`, `examine`). Nothing in the
+  playtester notices this.
 
 ### 1.4 Quest journal
 
@@ -138,8 +155,8 @@ unverified, the text says so.
 (`quests.py:143-182`). The dashboard shows it (`web_server.py:260`). The
 catalog (`quests.load_catalog`, `quests.py:119`) reads `quest.xml` for
 formal quest executors. Part descriptions are not mined for facts, and
-nothing ties a journal part to a door (ROUTING G-list and 1.3 say the same
-for routing).
+nothing ties a journal part to a door (ROUTING 1.3 says the same for
+routing).
 
 ### 1.5 What `memory.py` persists
 
@@ -158,25 +175,28 @@ for routing).
 
 There is no observation table, no fact table, and no table keyed by a map
 object. The decision ledger keeps the last 2,000 decisions
-(`client.py:862-907`); action history keeps 500 in memory.
+(`client.py:862-907`); action history keeps 500 in memory. ROUTING P5 adds
+`route_events`, `route_traversals`, `route_blocks` and `route_requirements`
+(ROUTING 4.4); none exists yet.
 
-### 1.6 Doors, gates and levers
+### 1.6 Doors, gates, levers and signs
 
 - **Graph.** `WorldGraph.build` marks authored locked doors and blocking
-  inventory checkers as locked tiles with a requirement or exclusion
-  (`navigation.py:698-721`); `access_item_names` maps lock ids to key names
-  (`navigation.py:722-731`); one conditional magic mouth carries a gate's
-  key id (`navigation.py:515-531`). `MapNode.lock_allowed` checks one tile
-  (`navigation.py:255-269`). ROUTING 1.2 inventories this in full.
+  inventory checkers as locked *tiles* with a requirement or exclusion
+  (`navigation.py:699-722`); `access_item_names` maps lock ids to key names
+  (`navigation.py:723-732`); one conditional magic mouth carries a gate's
+  key id (`navigation.py:516-532`). `MapNode.lock_allowed` checks one tile
+  (`navigation.py:256-270`). Locked doors are not edges; ROUTING 1.2
+  inventories this in full.
 - **Ordinary doors** are left to the server's click path, which opens them
-  (`navigation.py:556-558` comment). `_escape_closed_door`
-  (`navigation.py:2365-2416`) and `_bump_boundary_door`
-  (`navigation.py:2418`) bump a closed door when the click path stalls.
+  (`navigation.py:557-559` comment). `_escape_closed_door`
+  (`navigation.py:2399-2450`) and `_bump_boundary_door`
+  (`navigation.py:2452`) bump a closed door when the click path stalls.
 - **Locked doors** are avoided by the planner unless her inventory carries a
-  matching key name (`_allow_locked`, `navigation.py:1700-1708`). She never
+  matching key name (`_allow_locked`, `navigation.py:1734-1742`). She never
   bumps one to read its message, and never records the outcome.
 - **Levers and switches** (type 93): no code applies one. The only map-object
-  applies are exits (`navigation.py:2685-2693`) and two scripted quest
+  applies are exits (`navigation.py:2719-2727`) and two scripted quest
   steps (`catalog_quest_tasks.py:139`, `catalog_quest_tasks.py:293`).
 - **Signs and magic mouths**: magic mouths fire when she walks over them,
   and their text lands unattributed in `messages`. Signs are never applied.
@@ -185,15 +205,16 @@ object. The decision ledger keeps the last 2,000 decisions
 
 - `AtrinikClient.examine(tag)` sends ITEM_EXAMINE (`client.py:2458`). The
   answer is a set of ordinary game lines; the Classic client shows them in
-  the message window and nothing else (`client/src/gui/widgets/inventory.c:1112-1123`).
-  The client's inventory row shows only name, `Con: c/q`, required level
-  and weight (`inventory.c:285-331`).
+  the message window and nothing else
+  (`client/src/gui/widgets/inventory.c:1112-1123`). The client's inventory
+  row shows only name, `Con: c/q`, required level and weight
+  (`inventory.c:285-331`).
 - Three examine readers exist, each for one purpose:
   - recall-wand charges, "It has N charges left." (`tasks.py:348-370`,
-    `tasks.py:4523-4557`);
+    `tasks.py:4552-4586`);
   - the mana crystal's capacity and charge (`ManaCrystal.read_examine`,
     `tasks.py:1033-1048`);
-  - shop stock, where `_apply_examine_metadata` (`tasks.py:5787-5875`)
+  - shop stock, where `_apply_examine_metadata` (`tasks.py:5816-5904`)
     reads `(wc+N)(dam+N)(ac+N)(block+N)(absorb+N%)`, weapon delay,
     protections, attacks, stats and caster bonuses into
     `examined_gear_score`.
@@ -205,27 +226,34 @@ object. The decision ledger keeps the last 2,000 decisions
 
 ### 1.8 Fight review and positions
 
-`self_improvement.review_failure` (`self_improvement.py:101-168`) classifies
+`self_improvement.review_failure` (`self_improvement.py:106-173`) classifies
 a death or recall as pack, resources, damage type, out-damaged or route, and
-`FarmCircuitTask._learn_from_failure` (`navigation.py:4869`) raises the
+`FarmCircuitTask._learn_from_failure` (`navigation.py:5074`) raises the
 spot's adaptation level. Pull squares are chosen from authored aggro radii
-(`navigation.py:3716`, COMBAT.md). Position quality is not recorded: nothing
-knows whether she stood in a corridor, a doorway or the open when she won or
-lost a fight. `low_health_retreat` (`tasks.py:4068`) scores steps by
-separation and escape area, not by how many attackers can reach a square.
+in `FarmCircuitTask._new_child` (`navigation.py:5452`, the pull-square
+search through about line 5543; COMBAT.md). Position quality is not
+recorded: nothing knows whether she stood in a corridor, a doorway or the
+open when she won or lost a fight. `low_health_retreat` (`tasks.py:4068`)
+scores steps by separation and escape area, not by how many attackers can
+reach a square.
 
 ### 1.9 Dashboard and metrics
 
 - `GET /api/state`, `GET /metrics`, `GET /api/chat`, `GET /api/face/*` and
-  `POST /api/task`, `POST /api/action` (`web_server.py:838-895`). The
-  listener must be loopback (`web_server.py:726-768`). A POST is refused only
-  when it carries a cross-origin `Origin` header (`web_server.py:815-818`);
+  `POST /api/task`, `POST /api/action` (`web_server.py:842-899`). The
+  listener must be loopback (`web_server.py:730-772`). A POST is refused only
+  when it carries a cross-origin `Origin` header (`web_server.py:819-822`);
   a request with no `Origin` is accepted.
 - The live dashboard is reachable from the home lab at
   `playtester.atrinik.orion.milkyway`, so a reverse proxy forwards to the
   loopback listener with a loopback `Host`. Whether that proxy
-  authenticates was not checked. This matters for the approval endpoint
-  (4.10.5).
+  authenticates, and whether it forwards, strips or rewrites `Origin`, was
+  not checked: the bot is stopped and contact was limited to GET. The
+  check is a single owner-run request (open question 1). The design does
+  not depend on the answer (4.10.5).
+- The page builds HTML with template strings and an `esc` helper
+  (`web_static/app.js:8`). Responses send `X-Content-Type-Options: nosniff`
+  (`web_server.py:795`) but no Content-Security-Policy.
 
 ## 2. What her history shows
 
@@ -233,34 +261,35 @@ The snapshot on 2026-11-15 is a poor day, and it is the most useful evidence
 in this document.
 
 **An idle starvation loop.** The operator stopped `autoplay:level-115` at
-20:54 UTC on 2026-11-14. Since then Sera has had no task. She starved to death
+20:54 UTC on 2026-11-14. Since then Sera had no task. She starved to death
 every 51 to 54 minutes, the first time on `world_12_76` and from then on
 at her Clearhaven savebed (`world_7_79` (16,3)): 22 starvation deaths in
 the process lifetime (`deaths_total{cause="starvation"}`), all of them in
-the decision ledger. Each
-respawn restores 500 food (`types/player.c:1226-1229`) and each death drains
-stats. Her depletion count is now 66, and the stats the dashboard reports
-are Str 3, Dex 3, Con 3, Int 1, Pow 1, with max mana 20. She carries no
-food and no money. Nothing in the playtester eats, buys food or logs out
-while no task runs. This is a playtester defect, outside this design, and
-it is still running; it should be fixed and the character reviewed before
-any feature below is judged on her live behaviour.
+the decision ledger. Each respawn restores 500 food
+(`types/player.c:1226-1229`) and each death drains stats. Her depletion
+count reached 66, and the stats the dashboard reported were Str 3, Dex 3,
+Con 3, Int 1, Pow 1, with max mana 20. She carried no food and no money.
+The service has been stopped since, and
+[PR #97](https://github.com/atrinik/playtester/pull/97) fixes the loop
+(`IdleSurvival`: eat, else the temple food trip, with back-off and an
+alert).
 
 **Futile casting.** The bed square is `no_magic`
 (`world_7_79` lines 2392-2398: `bed_1b.111`, `no_magic 1`). The server
 answers every cast there with "Something blocks your spellcasting."
-(`spell_util.c:423-429`). She has ordered 11,641 minor healing casts
-(`spells_cast_total`), and 135 of her last 150 messages are that line. She
-never learns that the square blocks magic.
+(`spell_util.c:423-429`). She ordered 11,641 minor healing casts
+(`spells_cast_total`), and 135 of her last 150 messages were that line.
+PR #97's `spell_blocked_here` marks the square for an hour and heals there
+with items only. This design makes that a persistent tile fact (4.11.1).
 
 **Before the stop.** The last 500 decisions hold 25 deaths. 22 are the
 starvation loop; the other three were route deaths in the Underground City
 (`underground_city_0_0` and `_0_2`), followed by an out-damaged recall from
 a charred treant on the Burnt Forest circuit. The process counters add 5
-pack deaths and 1 resources death. ROUTING section 2 covers the Underground City incident.
-`navigation-occupant-blocked` is the commonest decision (165 of 500), mostly
-on `world_7_64`; `retreat-choice` (98) and `emergency-disengage` (80)
-follow.
+pack deaths and 1 resources death. ROUTING section 2 covers the Underground
+City incident. `navigation-occupant-blocked` is the commonest decision (165
+of 500), mostly on `world_7_64`; `retreat-choice` (98) and
+`emergency-disengage` (80) follow.
 
 **Combat totals in this process.** Slash dealt 12,201 damage in 260 hits
 (47 a hit, `damage_dealt_total{attack="slash"}`); magic bullet 3 hits.
@@ -274,9 +303,9 @@ worn `silksteel chain mail +1`, `forged meteoric steel shootingstar +3`
 against a wielded `shear steel falchion +2`, a `chimera leather cloak`
 against a worn `silk cape +2`, and `gargoyle leather combat boots of acid
 protection` against worn `manticore leather combat boots +2`. The cape is
-the clearest case: the cape archetype has no AC (`arch/items/armour/cloak/cape.arc`),
-so its "+2" adds nothing to combat (4.8), yet `gear_score` gives it 16
-points for the "+2".
+the clearest case: the cape archetype has no AC
+(`arch/items/armour/cloak/cape.arc`), so its "+2" adds nothing to combat
+(4.8), yet `gear_score` gives it 16 points for the "+2".
 
 **Keys she holds.** `Morg'eean's Ship Key`, `Forgotten Tunnels Kobold Key`,
 `Incuna Western Gate Key`, `Incuna Tavern Barn Key` and a `forged meteoric
@@ -291,14 +320,14 @@ is unverified (ROUTING section 7).
   are discarded after use.
 - **G3. No facts.** Nothing extracts a key name, a holder, a colour, a
   password, a direction, a weakness or a warning from any text.
-- **G4. Locks are binary.** A lock is open only with a matching key name in
-  inventory. Quest-granted forces, NPC-held keys and "this one never opens"
-  are not known; ROUTING P2 and P4 add the content side, but not what she
-  learned by trying.
+- **G4. Locks are binary.** A lock tile is open only with a matching key
+  name in inventory. Quest-granted forces, NPC-held keys and "this one never
+  opens" are not known; ROUTING P2 and P4 add the content side, but not what
+  she learned by trying.
 - **G5. No safe trial.** She never bumps a locked door or applies a lever to
   find out, and has no rules for doing so safely.
-- **G6. No tile facts.** A `no_magic` square, a trap square or a square
-  where she was ganked is not remembered (section 2).
+- **G6. Tile facts are short-lived.** PR #97 remembers a magic-blocking
+  square for an hour; trap squares and other refusals are not remembered.
 - **G7. No position learning.** Fights are not recorded by terrain, so
   corridors and doorways cannot be preferred on evidence.
 - **G8. "+N" is a guess.** Gear scoring counts every "+N" as 8 points,
@@ -307,6 +336,9 @@ is unverified (ROUTING section 7).
   engine oddities she meets go nowhere.
 - **G10. Book experience is wasted at low Int** (4.11.2), and she reads
   books without checking.
+- **G11. Other players' text is not separated** from the world's: signed
+  books, renamed items and player names in dialogue would flow into any
+  store built naively.
 
 ## 4. Design
 
@@ -314,29 +346,38 @@ is unverified (ROUTING section 7).
 
 1. **Her own observations only.** Every stored fact is something her client
    saw or did: a line she received, a page she read, an outcome she caused.
-   No other player's text, name or actions are stored (4.10.4). This matches
-   the repository's ordinary-player rule.
+   No other player's text, name or actions are stored. That excludes chat,
+   lines with a player-name link, books a player signed, items a player
+   renamed, and anything from a player's corpse (4.3.1, 4.10.4). This
+   matches the repository's ordinary-player rule.
 2. **Two kinds of knowledge, kept apart.** The playtester already plans from
    content-derived data (the world graph, quest catalog, analyzer). That
-   *content truth* may keep guiding routes, as ROUTING does. *Player-visible
-   knowledge* is what the hints, books and outcomes told her. Hint clarity
-   is judged only from player-visible knowledge; content truth is used only
-   to score whether her reading was right and as evidence in a report.
-   Otherwise she could never find a hint unclear.
+   *content truth* may keep guiding routes, as ROUTING does, and it is
+   **required for safety**: before she touches a lever or a scripted sign,
+   what it is connected to is resolved from authored content (4.4).
+   *Player-visible knowledge* is what the hints, books and outcomes told
+   her. Hint clarity is judged only from player-visible knowledge; content
+   truth is used only to score whether her reading was right and as
+   evidence in a report. Otherwise she could never find a hint unclear.
 3. **Deterministic first.** Parsers are regular expressions and small
    grammars over known server phrasings and authored text, with fixtures
    from real content. An LLM is optional, offline-capable, out of process
    and never required (4.3.3).
 4. **Hypotheses are not unlocks.** A fact read from a book or sign is a
    candidate until an outcome confirms it. Only a confirmed outcome becomes
-   a `Learned` atom for routing (ROUTING 4.3), and none ever satisfies a
-   `Consumes` atom.
-5. **Shadow before switch.** Each behaviour change (trying locks, terrain
-   tie-breakers, new gear scoring) first runs as "would do" decisions,
-   behind a flag that the owner turns on. Recording and the draft queue
-   change no behaviour.
-6. **Nothing leaves the machine without the owner.** Drafts stay local. The
-   GitHub token is read only to file an approved item.
+   learned access for routing (4.5), and none ever satisfies a `Consumes`
+   atom.
+5. **Shadow before switch.** Each behaviour change (trying locks, persistent
+   tile facts, terrain tie-breakers, new gear scoring, gear measurement)
+   first runs as "would do" decisions, behind a flag that the owner sets in
+   the bot's configuration on CT130. Recording and the draft queue change no
+   behaviour.
+6. **Nothing leaves the machine without the owner.** Drafts stay local. No
+   GitHub request of any kind, searches included, happens before the owner
+   approves an item. The GitHub token is read only by the filer (4.10.6).
+7. **The world is shared.** She never changes the world in a way another
+   player would notice and could not undo: no one-shot levers, no using up a
+   sign's limited readings, no marking a shared book as read (4.4, 4.6).
 
 ### 4.2 Storage
 
@@ -352,29 +393,31 @@ tick.
 -- What she read or was told, attributed where possible (G1, G2).
 CREATE TABLE observations (
   id INTEGER PRIMARY KEY,
-  server TEXT, account TEXT, character TEXT,
-  at REAL NOT NULL,
-  map TEXT, x INTEGER, y INTEGER,          -- where she stood
+  server TEXT NOT NULL, account TEXT NOT NULL, character TEXT NOT NULL,
+  first_at REAL NOT NULL, last_at REAL NOT NULL,
+  seen INTEGER NOT NULL DEFAULT 1,  -- times the same text came from it
+  map TEXT, x INTEGER, y INTEGER,   -- where she stood the first time
   source_kind TEXT NOT NULL,   -- door | gate | lever | sign | magic_mouth |
                                -- npc | book | scroll | examine | journal |
                                -- system
-  source_key TEXT,             -- stable id, see below; NULL if unattributed
+  source_key TEXT NOT NULL,    -- stable id, see below; never NULL
   source_name TEXT,            -- "big lever", "Warden Argoth", book title
   attribution TEXT NOT NULL,   -- exact | timing | content-match | none
+  authored INTEGER NOT NULL,   -- 1 when the text equals authored content
   text_hash TEXT NOT NULL,     -- sha256 of normalized text
   text TEXT NOT NULL,          -- bounded to 4000 characters
   color TEXT, msg_type INTEGER
 );
-CREATE INDEX observations_by_source ON observations
-  (server, account, character, source_key, at);
 CREATE UNIQUE INDEX observations_dedup ON observations
   (server, account, character, source_key, text_hash);
 ```
 
-`source_key` is stable across restarts: `door:/map:x,y`, `lever:/map:x,y`,
-`sign:/map:x,y`, `npc:/map:Name`, `book:Title:text_hash`. A repeat of the
-same text from the same source updates nothing but a `seen` counter kept in
-`facts`/`locks`; the unique index keeps one row.
+`source_key` is never NULL, because SQLite treats NULLs as distinct and the
+unique index would not deduplicate them. Keys are stable across restarts:
+`door:/map:x,y`, `lever:/map:x,y`, `sign:/map:x,y`, `npc:/map:Name`,
+`book:Title:text_hash`, and `system:<map>` for an unattributed line. A
+repeat of the same text from the same source is an upsert that raises
+`seen` and `last_at`.
 
 ```sql
 -- Facts extracted from observations (G3); candidates until confirmed.
@@ -384,8 +427,7 @@ CREATE TABLE facts (
   kind TEXT NOT NULL,      -- key-name | key-holder | lock-colour | password |
                            -- direction | weakness | immunity | trap-warning |
                            -- tile-property | quest-gate | unopenable
-  subject TEXT NOT NULL,   -- what it is about: a source_key, map cell,
-                           -- monster name, item name
+  subject TEXT NOT NULL,   -- a source_key, map cell, monster or item name
   value TEXT NOT NULL,     -- "orange stone giant key", "fire", "no_magic"
   confidence REAL NOT NULL,-- 0..1, parser-assigned, raised by outcomes
   status TEXT NOT NULL,    -- candidate | confirmed | refuted | expired
@@ -402,7 +444,7 @@ CREATE TABLE locks (
   first_seen REAL, last_seen REAL,
   hint_observation_id INTEGER, -- the text it showed her when refused
   state TEXT NOT NULL,        -- unknown | refused | opened | toggled |
-                              -- suspected-unopenable
+                              -- suspected-unopenable | forbidden
   opened_with TEXT,           -- item name, "force", "none"
   attempts INTEGER, refusals INTEGER, last_attempt REAL,
   hypotheses_json TEXT,       -- ranked fact ids and her verdict on each
@@ -415,13 +457,14 @@ CREATE TABLE interactions (
   id INTEGER PRIMARY KEY,
   server TEXT, account TEXT, character TEXT,
   at REAL, map TEXT, x INTEGER, y INTEGER,
-  source_key TEXT, action TEXT,   -- bump | apply | read | examine | say
-  preconditions_json TEXT,        -- hp, sp, threats, recall ready, keys held
+  source_key TEXT, action TEXT,   -- bump | apply | restore | read | examine
+  preconditions_json TEXT,        -- hp, sp, threats, recall, keys, players
+  resolved_targets_json TEXT,     -- the lever's connected objects (4.4)
   outcome TEXT,                   -- opened | refused | toggled | no-effect |
                                   -- spawned | trap | teleported | damaged |
                                   -- unknown
   effects_json TEXT,              -- tiles changed, monsters appeared, hp delta
-  observation_ids TEXT            -- the lines in its 3 s window
+  observation_ids TEXT            -- the lines in its window
 );
 
 -- Fights by terrain (G7), section 4.7.
@@ -443,26 +486,33 @@ CREATE TABLE feedback_items (
   fingerprint TEXT NOT NULL,  -- dedup key, 4.10.2
   repo TEXT NOT NULL,         -- atrinik/content | atrinik/classic
   kind TEXT NOT NULL,         -- bug | hint | balance | qol | clarity
+  target TEXT NOT NULL,       -- new-issue | comment:<issue url>
   title TEXT NOT NULL, body_md TEXT NOT NULL,
+  labels_json TEXT NOT NULL, issue_type TEXT,
   evidence_json TEXT NOT NULL,
-  status TEXT NOT NULL,       -- draft | approved | filing | filed |
+  status TEXT NOT NULL,       -- draft | approved | checking | needs-review |
+                              -- filing | filed | filed-unlabelled |
                               -- rejected | duplicate | snoozed | failed
   occurrences INTEGER NOT NULL,
   first_seen REAL, last_seen REAL,
-  remote_candidates_json TEXT,-- possible existing issues, 4.10.2
-  decided_at REAL, issue_url TEXT, error TEXT,
+  remote_candidates_json TEXT,-- possible existing issues, after approval
+  decided_at REAL, decided_via TEXT,  -- dashboard | cli
+  issue_url TEXT, error TEXT,
   UNIQUE (server, account, character, fingerprint)
 );
 CREATE TABLE feedback_filings (          -- append-only audit
-  id INTEGER PRIMARY KEY, item_id INTEGER, at REAL,
+  id INTEGER PRIMARY KEY, item_id INTEGER, at REAL, request TEXT,
   repo TEXT, http_status INTEGER, issue_url TEXT, error TEXT
 );
 ```
 
+Locks also write into ROUTING's `route_requirements` (4.5), which stays the
+only table the planner reads for requirement outcomes.
+
 Caps (starting points): observations 50,000 rows a character, oldest
 unreferenced first; interactions 20,000; fight positions 20,000; facts and
-locks unbounded in practice (one per object met), capped at 20,000; filed
-and rejected feedback kept, drafts capped at 500 with the lowest-occurrence
+locks capped at 20,000 each (one per object met in practice); filed and
+rejected feedback kept, drafts capped at 500 with the lowest-occurrence
 drafts dropped first.
 
 These tables are a subset of what
@@ -473,32 +523,55 @@ queries without migrating these rows.
 
 ### 4.3 Text understanding
 
-#### 4.3.1 Attribution
+#### 4.3.1 Ingestion and attribution
 
-DRAWINFO has no source, so attribution uses what she just did, in order of
-strength:
+Text passes an ingestion filter before anything else sees it:
+
+- **Player text is dropped.** Player chat types never enter
+  `observations`, however they are phrased (`c.PLAYER_CHAT_TYPES`, as in
+  `_handle_drawinfo`). Any line carrying `PLAYER_NAME_LINK` is dropped, the
+  rule `messages_since` already applies (`model.py:331`).
+- **Player books are dropped.** A book packet with a signer and date after
+  its text (`book.c:136-142`), or whose examine shows "(signed; permanently
+  finalized)" (`item.c:840`), was written by a player and is not stored.
+  Unsigned books whose text does not match authored or generated content
+  are stored with `authored = 0` and never used as evidence in feedback.
+- **Renamed items are dropped.** An item whose examine says "You name it
+  ..." keeps only its base archetype name in any record.
+- **Her name and other players' names are replaced.** Her own character
+  name in dialogue (the server's `{activator.name}`) becomes the literal
+  `{activator.name}`, so dialogue matches its authored form and her name
+  never reaches a draft. Names of other characters she has seen (chat
+  senders, party members, player objects in view) cause the line to be
+  dropped (4.10.4).
+
+Then attribution. DRAWINFO has no source, so it uses what she just did, in
+order of strength:
 
 1. **Exact.** Book packets, interface pages and quest books carry their own
    identity (book title, interface title = NPC name, journal).
-2. **Timing.** After she bumps a door, applies a lever or sign, or steps on
-   a square, the server's answer arrives in the same tick or the next. The
-   first non-chat line within 1.5 s whose colour matches the source type
-   (navy for door, sign and magic-mouth text, white for levers and
-   "You open the ... with the ...") is attributed to that object. Fixed
-   server phrasings ("The %s is locked.", "The %s won't budge.",
-   "You turn the %s.", "Nothing is written on it.", "You are unable to
-   decipher the strange symbols.", "You open the %s with the %s.") confirm
-   the kind.
+2. **Timing, only for her own action.** After she bumps a door, applies a
+   lever or sign, or steps on a square, the server's answer arrives in the
+   same tick or the next. The first non-chat line within 1.5 s whose colour
+   matches the source type (navy for door, sign and magic-mouth text, white
+   for levers and "You open the ... with the ...") is attributed to that
+   object. Fixed server phrasings ("The %s is locked.", "The %s won't
+   budge.", "You turn the %s.", "Nothing is written on it.", "You are unable
+   to decipher the strange symbols.", "You open the %s with the %s.")
+   confirm the kind.
 3. **Content match.** When she is on or next to a square whose authored
    object has a `msg` equal to the received text (normalized), that object
    is the source. This uses content only to name the source, not to decide
    whether the hint was clear. It also attributes magic mouths she walked
-   over, which she never chose to trigger.
-4. **None.** The line is stored unattributed (`source_kind = system`) only
-   if a parser finds a fact in it; otherwise it is not stored.
+   over.
+4. **None.** The line is stored as `system:<map>` only if a parser finds a
+   fact in it; otherwise it is not stored.
 
-Player chat types never enter `observations` (`c.PLAYER_CHAT_TYPES`, as in
-`_handle_drawinfo`), however they are phrased.
+Sign and magic-mouth text can be *broadcast* by a connection that someone
+else fired (1.1). Such a line is attributed only when she caused the
+trigger herself in its window, or when content match names a source next to
+her and no other player was in view. Otherwise it is `none` and never used
+as a lock hint.
 
 #### 4.3.2 Deterministic parsers
 
@@ -542,7 +615,8 @@ monologues, quest descriptions. It is **optional and off by default**:
 - **Offline-capable:** the default implementation is a no-op. A local model
   endpoint (on the same host or the lab) can be configured by the owner. No
   text leaves the machine unless she configures an endpoint that sends it
-  elsewhere, and the dashboard says which interpreter is active.
+  elsewhere, and the dashboard says which interpreter is active. Only
+  `authored = 1` observations are ever sent to it.
 - LLM facts are hypotheses only. They can rank which lock to try, never
   open an edge, file feedback or decide a fight on their own. A hint-clarity
   verdict (4.9) never counts an LLM fact as "the hint was clear".
@@ -552,78 +626,132 @@ monologues, quest descriptions. It is **optional and off by default**:
 A trial is a `LockTrialTask`, offered by navigation and farming when she
 passes within a few tiles of an untried object. Behind the flag
 `try_locks`, default off; with it off, it logs `lock-trial-shadow`
-decisions saying what it would have tried.
+decisions saying what it would have tried and why it would or would not.
 
-**What she tries.**
+#### 4.4.1 Resolve before touching
+
+Before the first trial of any lever, switch, button or scripted sign, the
+object's effect is resolved from authored content (principle 2):
+
+- **Connections.** Every object on the same map with the same `connected`
+  value is a target. The trial is refused, and the lock marked `forbidden`,
+  when any target is a spawn point (81), teleporter, rune (154), exit (66),
+  creator (42), firewall (62), player mover (40) or duplicator (11), or
+  when the map's difficulty or any spawned resident is above her level.
+  In the content, 7 handles drive such targets. The Altar of Loki
+  (`tol_0101` (11,8)) drives 8 spawn points of level 93-95 monsters, and
+  its twin (11,10) drives two firewalls. Zechna's temple lever drives 4
+  firewalls; a Greyton jail switch drives a creator; the other three are on
+  the editor demonstration map `/planes/creation/creation_0801`.
+- **One-shot levers.** A handle with `exp -1` stays down once pulled ("won't
+  budge" afterwards, `handle.c:50-58`); in the content there is one. It is
+  never tried: the change cannot be undone for other players.
+- **Scripts.** A sign, magic mouth or handle with an event script (65 signs
+  and mouths: 55 `trigger`, 8 `apply` and 2 `say` events, for example
+  `start_lost_memories.py`) is never applied by a trial. Quest policy can
+  use it on purpose, as it does today.
+- **Allowed** targets are gates, doors, plain signs and other handles
+  (37 handles drive gates), on maps at or below her level.
+
+The 10 s watch after a pull (4.4.4) stays as a backstop, not as the safety
+rule: by the time a level-94 monster appears it is too late.
+
+#### 4.4.2 What she tries
 
 - *Locked door or gate* (a door on a locked tile, or a closed door whose
   bump the server refused): bump it once from an adjacent square. The
   refusal text is its hint. If she holds a candidate key she has not tried,
   the bump itself tests it: the server searches her whole inventory,
   containers included (`key.c:48-66`).
-- *Sign*: apply it (no risk; `sign.c:43-108`).
-- *Magic mouth*: nothing to try; its text is recorded when she walks over it.
-- *Lever or switch*: apply once, observe for 10 s, record the outcome.
+- *Plain sign* (no event script, no read limit): apply it.
+- *Magic mouth*: nothing to try; its text is recorded when she walks over
+  it. A mouth with a read limit (`stats.food`, shared by all players,
+  `sign.c:59-68`; one in the content) is never walked over twice on
+  purpose.
+- *Allowed lever or switch*: apply once, watch, then restore (4.4.4).
 - *Inventory checker*: nothing to try; ROUTING owns checkers.
 
-**Preconditions, all required (the "safe" in the owner's request).**
+#### 4.4.3 Preconditions, all required
 
+- **ROUTING's probe limits** (ROUTING 4.6): full HP and SP; every map and
+  cell on the approach below `PROBE_MAX_DANGER_SECONDS` (300 s); the trials
+  share ROUTING's `PROBES_PER_DAY = 3` budget and its once-per-subject-a-day
+  rule; and the day's trials stop at the first failure (a refusal is not a
+  failure; damage, a spawn, a trap or a recall is).
 - No hostile within its detection radius of her or of the object (the
   `_lone_target` radii, COMBAT.md), and no unseen-contact hit in the last
   10 s.
-- HP and SP at or above the cautious farm thresholds (heal at 95%), food
-  above the hunger warning, and a ready recall source with known charges
-  (`known_charge`, COMBAT.md "Safety").
+- Food above the hunger warning (PR #97's threshold) and a ready recall
+  source with known charges (`known_charge`, COMBAT.md "Safety").
 - Not inside an owner block or a hazard cell (ROUTING 4.7, 4.4).
-- No other player in view. A lever can close a gate on someone else; a
-  spawn trap can kill someone else. Players are counted, never named.
+- **For anything that changes the world** (a lever, switch or button): no
+  other player on the map. She cannot see a whole map, and `/who` does not
+  say where players are (`commands/player/who.c:40-81`), so this means
+  `/who` reports her as the only player online ("There is 1 player
+  online."). Only that count line is parsed; the other lines name players
+  and are discarded unread. A door bump changes nothing for others and
+  needs only "no other player in view".
 - Not on a map whose region is an apartment or house other than her own
   (player housing), and not a shop's staff door.
 - She has spent no consumable to get here and will spend none: she never
   drops, gives, burns or uses an item to test a hypothesis. Keys are tested
   only by carrying them. A checker that consumes its key
   (ROUTING's `Consumes`) is never "tried".
-- Budget: at most 1 trial per object a day, 20 a day overall, and none for
-  an object already `opened`, `toggled` or `suspected-unopenable` within
-  7 days.
+- Nothing is retried within 7 days once `opened`, `toggled`,
+  `suspected-unopenable` or `forbidden`.
 
-**Traps.** Opening a door springs any rune in its inventory
-(`door.c:119-124`). Before her first trial of a door, chest or lever she
-uses Find Traps if she has it (she does, level 5) and waits for its result;
-a found trap makes the object `trapped` and she uses Remove Traps only if
-its level is within her skill (otherwise she leaves it). Without the skill,
-doors still get tried, at the cautious thresholds.
+#### 4.4.4 Traps, watching and restoring
 
-**Watching the outcome.** For 10 s after a lever, she records:
-monsters that appear within 8 tiles that were not in view before
-(`spawned`), any HP loss (`damaged`), a map change (`teleported`), tiles in
-view whose objects changed (a gate opening or closing, `toggled`), and the
-lever's own text. She does not walk into a newly opened passage as part of
-the trial; navigation sees the change on its next plan. On `spawned` or
-`damaged` she leaves at once with the existing retreat and recall, and the
-lever is marked `hazardous` and never applied again without the owner.
-The Altar of Loki (section 5.4) is the case this rule exists for.
+- **Traps.** Opening a door springs any rune in its inventory
+  (`door.c:119-124`). Before her first trial of a door, chest or lever she
+  uses Find Traps if she has it (she does, level 5). Its roll is stable per
+  trap (`rune.c:99-116`), so repeating it never helps, and "nothing found"
+  does not mean "no trap". A found trap marks the object `trapped`. She uses
+  Remove Traps only when the trap's level is at or below her Remove Traps
+  level, because a failed attempt sets the trap off with a chance of at
+  least 50% (55% plus 5% a level of difference, capped at 90%,
+  `rune.c:195-199`). Otherwise she leaves the object alone.
+- **Watching.** For 10 s after a lever, she records: monsters that appear
+  within 8 tiles that were not in view before (`spawned`), any HP loss
+  (`damaged`), a map change (`teleported`), tiles in view whose objects
+  changed (a gate opening or closing, `toggled`), and the lever's own text.
+  She does not walk into a newly opened passage as part of the trial;
+  navigation sees the change on its next plan. On `spawned` or `damaged` she
+  leaves at once with the existing retreat and recall, and the lever is
+  marked `forbidden`.
+- **Restoring.** A lever with `exp` > 0 resets itself after `exp` ticks
+  (`handle.c:76-81`, `handle.c:104-120`). Any other allowed lever is pulled
+  again after the watch, so the shared world is as she found it, and the
+  second pull is recorded as `restore`. A lever she cannot restore
+  (refused, or a threat arrived) raises an alert.
 
-**What a trial writes.** One `interactions` row; the `locks` row's state,
-attempts and hint; the hint observation; and, for a lever, which tiles
-changed. A lever whose effect was seen becomes a candidate
-`lever-opens:<tile>` fact, confirmed when the same toggle repeats it.
+**What a trial writes.** One `interactions` row with the resolved targets;
+the `locks` row's state, attempts and hint; the hint observation; and, for a
+lever, which tiles changed. A lever whose effect was seen becomes a
+candidate `lever-opens:<tile>` fact, confirmed when a later trial repeats it.
 
 ### 4.5 Unlock knowledge into routing
 
 This design produces knowledge; ROUTING consumes it. The plug points are
-ROUTING's P2 (`UnlockState`, 4.3 there) and P4 (dialogue and quest-gated
-edges, 4.2 there):
+ROUTING's P2 (`UnlockState`, 4.3 there), P4 (dialogue and quest-gated
+edges, 4.2 there) and P5 (`route_requirements`, 4.4 there):
 
-- **Confirmed openings.** A `locks` row with state `opened` and
-  `opened_with = <item name>` adds that item's name as an alias for the
-  lock's tile in `UnlockState`, the same way map-placed key names do today.
-  `opened_with = force` (a door that opened "for you", `door.c:259-260`)
-  becomes ROUTING's `Learned(edge key)` for that door's edge.
-- **Refusals.** A refusal is evidence for ROUTING's
-  `blocked-for-requirement`, with the door's own text as the message
-  evidence ROUTING 4.3 requires. The rejection clears when a related input
-  changes (a matching item arrives, a quest part completes), as there.
+- **Tile-level learned access.** Locked doors and checkers are tiles in
+  `MapNode`, not edges, so ROUTING's edge-keyed `Learned` atom does not
+  reach them. `UnlockState` gains `learned_tiles`, a map from
+  `(path, x, y)` to `passed` or `rejected`, read by `lock_allowed` in
+  addition to the item-name access set. Its source is `route_requirements`
+  rows whose subject is `lock:{path}:{x},{y}` (the table's `edge` column
+  holds any subject string; ROUTING's own edge keys are unchanged).
+- **Confirmed openings.** A trial that opens a door writes a `passed`
+  `route_requirements` row for its lock subject, with the server's "You open
+  the ... with the ..." line as `evidence` and the item's name in
+  `inputs`. An opening "for you" (a force, `door.c:259-260`) writes the same
+  with `inputs = force`. A `passed` row never satisfies a `Consumes` atom.
+- **Refusals.** A refusal writes `rejected` with the door's own text as the
+  message evidence ROUTING 4.3 requires, and lasts as ROUTING says: until a
+  related input changes (a matching item arrives, a quest part completes),
+  and at most 24 h.
 - **Hypotheses.** Candidate `key-name`, `key-holder` and `npc-key` facts do
   not open anything. They give the unlock-acquisition planner (which ROUTING
   leaves out of scope) and the quest policy a ranked list: "the orange
@@ -633,33 +761,41 @@ edges, 4.2 there):
   journal part the edge's `Quest` atom should read. P4's own parsing of
   interface XML stays authoritative.
 - **Unopenable.** `suspected-unopenable` (refused 3 times on 3 days while
-  she held every candidate she knew) lowers nothing in ROUTING by itself; it
-  is a feedback input (4.9) and stops further trials.
+  she held every candidate she knew) changes nothing in routing by itself;
+  it is a feedback input (4.9) and stops further trials.
 
 None of this lets a learned fact override a fail-closed `Unknown` atom
 without a confirmed outcome, per ROUTING 4.1.
 
 ### 4.6 Books and facts for planning and combat
 
-**Reading.** Books she finds are read once, before they are sold, as today,
-but the text is kept:
+**One rule for low Int.** Book experience is lost below Int 11 (4.11.2).
+So while her Int is 10 or less she does not read unread books at all. She
+keeps them unsold (stored in her apartment when weight requires) until her
+Int is 11 or more, then reads them for experience and facts together. A
+book is readable at all only when its level is at most Literacy + 12 +
+`book_level_mod[Int]` (`BOOK_LEVEL_DIFF`, `book.c:50`, `book.c:63-65`,
+`book.c:104-106`): with Literacy 3 that is level 15 at Int 11-15, but only
+level 7 at her depleted Int 1.
 
-- *Inventory books*: `maintain_inventory` already applies them. The book
-  packet that follows is parsed into title and body and stored as an
-  observation with `source_kind = book`.
-- *World books* (on shelves, desks and corpses): when the container is open
-  and safe, she takes the book, reads it and puts it back, unless it is
-  unpaid. She never takes an unpaid item.
+**Where books come from.**
+
+- *Inventory books*: `maintain_inventory` already applies them (subject to
+  the Int rule). The book packet that follows passes the ingestion filter
+  (4.3.1) and is stored as an observation with `source_kind = book`.
+- *World books* (on shelves, desks and map-placed corpses) are shared:
+  reading one sets `FLAG_NO_SKILL_IDENT` on the object itself
+  (`book.c:175`), so the next player gets no experience from it until the
+  map resets. She reads a world book only when its examine already says
+  "(read)" (`item.c:1059`); an unread world book is recorded as seen and
+  left alone (open question 11). She never takes an unpaid item.
+- *Player corpses and player-dropped items*: never taken, opened or read. A
+  corpse named for a character, or any container on a square where another
+  player dropped things, is out of bounds.
 - *Scrolls*: only text scrolls (no spell) are read; spell scrolls stay
   untouched, because reading one casts it.
-- *Low Int.* While her Int is 10 or less, reading forfeits the book's
-  one-time Literacy experience (4.11.2). She still reads books for facts,
-  but books are marked "read without experience" so the dashboard shows the
-  loss.
-- *Beyond comprehension.* "This book is ... beyond your comprehension"
-  (`book.c:104-126`) keeps the book unread; she stores the attempt and its
-  level gap, and keeps the book (instead of selling it) only if it was found
-  on a quest map.
+- *Beyond comprehension*: "This book is ... beyond your comprehension"
+  keeps the book unread; she stores the attempt and its level gap.
 
 **Using the facts.**
 
@@ -670,10 +806,8 @@ but the text is kept:
 - *Combat.* `weakness` and `immunity` facts join the element choice for
   storm farming (COMBAT.md "Next phase"): a confirmed immunity (her hits
   show 0 damage of that type) outranks a read one, and both outrank the
-  default. `tile-property: no_magic` makes the caster logic stop ordering
-  spells on that square and step off it to heal, fixing section 2's 11,641
-  futile casts. `tile-property` facts are confirmed by the server's own
-  refusal, so they are confirmed on first sight.
+  default. `tile-property` facts extend PR #97's one-hour
+  `spell_blocked_here` mark into a persistent fact (4.11.1).
 - *Passwords.* A `password` fact is said only to an NPC, in a dialogue the
   quest policy chose, never in public chat.
 
@@ -704,7 +838,7 @@ the peak simultaneous attackers from the same 8 s window that
 Aggregates per (feature, attackers in view, ranged present) give her a
 learned damage rate and death rate, decayed with a 7-day half-life.
 
-**Using it,** behind a flag `terrain_tactics`, after a shadow soak:
+**Using it,** behind the flag `terrain_tactics`, after a shadow soak:
 
 - *Packs of melee attackers.* When two or more are coming, `melee_kite`,
   `pack-split` retreat and `low_health_retreat` prefer a step toward a
@@ -714,9 +848,9 @@ learned damage rate and death rate, decayed with a 7-day half-life.
   and avoid `open` squares, again as a tie-breaker. This is the first
   path-level use of ranged positions, which COMBAT.md lists as a non-goal
   today; it stays a tie-breaker, never a reason to walk into a pack.
-- *Pull squares.* `_new_child` already chooses pull squares by clearance;
-  among equally clear squares it prefers the one with the lowest learned
-  peak attackers.
+- *Pull squares.* `FarmCircuitTask._new_child` already chooses pull squares
+  by clearance; among equally clear squares it prefers the one with the
+  lowest learned peak attackers.
 - *Caster kiting.* `caster_kite` keeps its 4 to 8 tile band; a corridor
   behind her also lengthens the time a pack needs to reach her, which the
   shadow data can measure.
@@ -745,12 +879,13 @@ and `types/arrow.c`:
 | Body armour (type 16) | speed cap ×(1 + N/10) | `treasure.c:846-847` |
 | Every item with +N | weight −10% a point, shop value +5,300 / +12,300 / +24,300 / +52,300 / +88,300 copper for +1 to +5 | `treasure.c:833-854` |
 | Negative N | cursed | `treasure.c:829-830` |
-| Rings, amulets, trinkets | N is never shown in the name (the description is shown instead) | `item.c:210-226` |
+| Rings, amulets, trinkets | N is never shown in the name (the description is shown instead) | `item.c:210-228` |
 
 So "+N" adds nothing to combat on an item whose archetype has no AC, WC,
 damage, block or absorb. In the locked content those are: capes and robes,
-plain girdles, sandals and low boots, hats and generic crowns, all trousers
-and skirts, plain gloves, and every light source
+plain girdles, sandals and low boots, feathered and blue hats and the
+generic crown, cloth trousers, shorts and skirts (not chain pants, chaps or
+chausses, which have AC), plain gloves, and every light source
 (`arch/items/armour/...`, `arch/items/light/...`). Artifacts can add base
 stats to such an item; then "+N" works again.
 
@@ -781,7 +916,7 @@ attached (`inventory.c:302`).
   damage types she has taken recently (`damage_taken_total` by type: impact
   and fire in section 2), AC and block against her recent hit rate, and
   caster value while Wizardry trains. `gear_score` is replaced by this model
-  only after a shadow phase in which both scores are logged.
+  only after a shadow phase in which both scores are logged (F4).
 - **Dashboard.** An Equipment panel lists each slot: worn item, best
   candidate, per-stat deltas, and why ("+2 on a cape adds no AC").
 
@@ -795,9 +930,13 @@ Two kinds of item finding are drafted, both aimed at `atrinik/classic`
   item per archetype family, aggregated into a single draft listing the
   families she has met.
 - **"Examine omits magic"**: an examined item whose base `(ac/wc/…)` differ
-  from what wearing it changed on her player doll. She can measure this
-  directly: the stats packet's AC, WC and damage before and after she
-  applies it. A measured mismatch is the evidence.
+  from what wearing it changed on her player doll. The measurement reads
+  the stats packet's AC, WC and damage before and after she applies it. It
+  runs behind the flag `measure_gear`, default off, only for identified,
+  uncursed items she would wear anyway (the upgrade the gear policy already
+  chose, or the item she already wears, re-applied), and only at a safe spot
+  with no threat in view. She never puts on an unidentified or cursed item
+  to measure it.
 
 Whether these are bugs or intended presentation is the owner's call; the
 draft says "confusing", not "wrong".
@@ -805,31 +944,35 @@ draft says "confusing", not "wrong".
 ### 4.9 Hint clarity, and when it becomes feedback
 
 A lock or quest step gets a clarity verdict once she has had a fair chance:
-she has met it at least twice on different days, read every sign and magic
-mouth within 8 tiles of it, and talked to every NPC on its map and the maps
-next to it that have dialogue.
+she has met it at least twice on different days, read every plain sign and
+magic mouth within 8 tiles of it, and talked to every NPC with dialogue on
+its map and the maps next to it. The NPC part needs the dialogue sweep in
+F13.
 
 Verdicts, from player-visible knowledge only (4.1 principle 2):
 
 - `clear`: a deterministic fact named the requirement (key name, holder or
   quest part) and the outcome confirmed it.
 - `generic`: the only text was the archetype's default ("You need a special
-  key to open this door/gate.") and no other source named a key.
+  key to open this door/gate."), no other source named a key, and a key
+  exists.
+- `false-promise`: the text tells her to find a key, but the lock is one no
+  key opens (`slaying no_entry`). This uses content truth and is marked so
+  in the draft.
 - `misleading`: a fact named something the content truth contradicts (the
   yellow force field that needs an orange key, section 5.3).
 - `no-source`: the text implies it opens ("You need a ... key") but the
   content has no key, archetype, artifact, quest reward or script that
-  provides the lock id (section 5.2). This verdict uses content truth and is
-  marked so in the draft.
+  provides the lock id (section 5.2). Uses content truth, marked so.
 - `unexplained`: she found no fact at all and is not `generic`.
 
-Only `misleading`, `no-source` and `unexplained` become drafts on their own,
-one per lock. `generic` locks are aggregated: one draft per region listing
-its generic locks with coordinates, because 107 of the 152 authored locked
-doors use the default text (section 5.1) and one issue per door would
-swamp the queue. Many are staff doors and vaults that are meant to stay
-shut; the owner can reject the aggregate, and a rejected aggregate is not
-redrafted for that region.
+`misleading`, `no-source` and `unexplained` become drafts on their own, one
+per lock. `generic` and `false-promise` locks are aggregated: one draft per
+region listing its locks with coordinates, because 86 openable locks and 21
+`no_entry` locks use the default text (section 5.1), and one issue per door
+would swamp the queue. Many are staff doors and vaults that are meant to
+stay shut; the owner can reject an aggregate, and a rejected aggregate is
+not redrafted for that region.
 
 Quests get the same treatment at the part level: a part whose journal text
 and dialogue gave her no fact that led to the place, item or NPC that
@@ -842,9 +985,9 @@ completed it (as recorded by the quest executor) is `unexplained`.
 | Kind | Meaning | Usual repo | Examples |
 | --- | --- | --- | --- |
 | `bug` | something that cannot work as written | content or classic | a door whose key exists nowhere; book experience lost at low Int |
-| `hint` | an unclear or misleading hint or quest text | content | yellow field, orange key; aggregated generic lock texts |
+| `hint` | an unclear or misleading hint or quest text | content | yellow field, orange key; aggregated default lock texts |
 | `balance` | evidence on a balance question | classic or content | melee vs. spells (as evidence on the existing issue) |
-| `qol` | a quality-of-life improvement | classic | an NPC parked on a one-tile path; no message for a `no_magic` savebed |
+| `qol` | a quality-of-life improvement | classic or content | an NPC parked on a one-tile path; no message for a `no_magic` savebed |
 | `clarity` | text or presentation that misleads | classic or content | "+N" with no effect; examine without magic; typos |
 
 Routing to a repo is by producer: lock, sign, book, dialogue and quest
@@ -857,70 +1000,90 @@ by this pipeline (open question 4).
 #### 4.10.2 Deduplication
 
 - **Local.** `fingerprint` = sha256 of (kind, repo, subject, normalized
-  claim). Subjects are stable: `lock:/map:x,y`, `region-generic:<region>`,
-  `item-family:<archetype>`, `formula:book_exp_mod`. A new occurrence of an
-  existing fingerprint increments `occurrences` and `last_seen`; it never
-  creates a second draft. A rejected fingerprint stays rejected; a filed one
-  only gains occurrences.
-- **Remote.** Each filed issue carries a hidden marker,
-  `<!-- playtester-fingerprint: <hex> -->`. Before an item can be approved,
-  the dashboard shows possible duplicates: open and closed issues in the
-  target repo containing the marker, and the top title matches for the
-  subject's map path, object or item name. The search runs once when the
-  draft is created, unauthenticated (public repositories, the search API's
-  unauthenticated limit of 10 requests a minute, queued and rate-limited),
-  and again with the token at filing. A marker match blocks filing and marks
-  the item `duplicate` with the issue's link.
+  claim), shown as `pt-` plus its first 12 hex digits. Subjects are stable:
+  `lock:/map:x,y`, `region-generic:<region>`, `item-family:<archetype>`,
+  `formula:book_exp_mod`. A new occurrence of an existing fingerprint
+  increments `occurrences` and `last_seen`; it never creates a second
+  draft. A rejected fingerprint stays rejected; a filed one only gains
+  occurrences. The local record of filed items (`issue_url`) is the
+  authoritative dedup source, so remote search is a second check only.
+- **Remote, after approval only.** Nothing is searched before the owner
+  approves (principle 6). After approval the filer searches the target
+  repo, with the token, for the fingerprint and for the subject's map path,
+  object or item name in titles. The fingerprint is a visible line in the
+  issue footer (`Playtester fingerprint: pt-4f1c2a9b0d3e`), because whether
+  GitHub search indexes HTML comments was not verified. A match outside a
+  code block sets `needs-review` with the candidates; the owner then marks
+  it a duplicate or files anyway. No match proceeds to filing.
 - **Existing balance issues.** A `balance` item whose subject matches an
   existing issue (for example
   [atrinik/classic#628](https://github.com/atrinik/classic/issues/628),
-  "magic cannot miss") is drafted as an evidence *comment* on that issue,
-  not a new issue, if the owner approves (4.11.3).
+  "magic cannot miss") is drafted as an evidence *comment* on that issue
+  (`target = comment:<url>`), not a new issue (4.11.3).
 
 #### 4.10.3 Evidence format
 
-Every draft body is generated from `evidence_json` with one template:
+Every draft body is generated from `evidence_json` with one template. Text
+from the game is never pasted as Markdown: excerpts are fenced code blocks
+whose fence is longer than any backtick run in them, with `<!--` and `-->`
+removed. Inside a code block, `@name` and `#123` neither notify nor link,
+and a forged fingerprint line is ignored, because the filer reads
+fingerprints only outside code blocks. Item, NPC and map names outside
+excerpts are wrapped in inline code for the same reason.
 
-```markdown
+````markdown
 ### What happened
-One or two sentences in plain words.
+The force field on the well says it is yellow, and the key that opens it
+is the orange stone giant key.
 
 ### Where
 Map `/shattered_islands/world_5_57_-2` (13,14) and (14,14), content v1.14.0,
 server build v5.99.0, playtester v1.64.0 (479efb5).
 
 ### What she tried
-- 2026-11-20 14:02 UTC: walked onto (13,14) holding the orange stone giant key.
-- ...
+- 2026-11-18 14:02 UTC: walked onto (13,14) without a stone giant key.
+- 2026-11-20 09:40 UTC: walked onto (13,14) carrying `orange stone giant key`;
+  no message, and she passed (14,14).
 
 ### What she saw
-> The yellow force field is preventing you from reaching the well bucket...
+```
+The yellow force field is preventing you from reaching the well bucket...
+```
+The square (14,14) shows an object named `yellow force field`.
 
 ### What she expected
-The hint names the key colour that opens it.
+A field and hint that name the key colour that opens it.
 
 ### Her state
-Level 36; Slash 34, Wizardry 15, Literacy 3; HP 275/275; carried keys:
-orange stone giant key.
+Level 36; Slash 34, Wizardry 15, Literacy 3; HP 275/275.
 
 ### Occurrences
-3 times on 2 days; first 2026-11-18, last 2026-11-20.
+2 times on 2 days; first 2026-11-18, last 2026-11-20.
 
-<!-- playtester-fingerprint: 4f1c... -->
+---
+Playtester fingerprint: pt-4f1c2a9b0d3e
 Filed by the Atrinik playtester after owner review.
-```
+````
+
+(The magic mouth has `last_sp 1`, so it speaks only to a player without the
+key, `sign.c:79-85`: she sees the yellow text while she lacks the key and
+silence once she has it. The arch at (14,14) is `forcefield_yellow_0`,
+named "yellow force field", so the fix may be the field's arch rather than
+the text; the draft says what she saw and leaves the fix open.)
 
 Message excerpts are server and NPC lines only, at most 10 lines and 1,500
-characters. Content truth, when used (a `no-source` verdict), is in its own
-"What the content says" section with file paths, so a reader can tell what
-she saw from what the maps say.
+characters, and only from `authored = 1` observations. Content truth, when
+used (`false-promise`, `no-source`, `misleading`), is in its own "What the
+content says" section with file paths, so a reader can tell what she saw
+from what the maps say.
 
 #### 4.10.4 Privacy
 
-- Player chat types never enter observations, drafts or excerpts.
-- Every excerpt line is checked against the names of other characters she
-  has seen (chat senders, party members, player objects in view, PvP kill
-  lines), case-folded; a line containing one is dropped, not masked.
+- The ingestion filter (4.3.1) already excludes chat, player-name links,
+  signed books and renamed items, and replaces her own name.
+- Every excerpt line is checked again against the names of other characters
+  she has seen (chat senders, party members, player objects in view, PvP
+  kill lines), case-folded; a line containing one is dropped, not masked.
 - No account name, server address, invite code, certificate or token ever
   appears in a draft. Her character name appears only as "she" or
   "the playtester".
@@ -928,84 +1091,107 @@ she saw from what the maps say.
   present, as a count.
 - The owner sees the exact body that will be filed and can edit it.
 
-#### 4.10.5 Approval
+#### 4.10.5 Approval and dashboard security
 
 - Drafts appear on a dashboard **Feedback** tab: list, filters by kind and
-  repo, the rendered body, possible duplicates, and buttons to approve,
-  reject, snooze (7 days) and edit title, body, labels and repo.
-- New endpoints: `GET /api/feedback`, `POST /api/feedback/<id>` with an
-  action. They follow the existing loopback and Origin rules
-  (`web_server.py:796-818`).
-- **Approval needs more than reaching the dashboard.** Today a POST with no
-  `Origin` passes, and the dashboard is reachable through the lab's reverse
-  proxy (1.9). Approval and edit actions therefore also require an approval
-  key: a random secret in an owner-only file (mode 0600) outside the
-  repository, sent in an `X-Playtester-Approval` header that the dashboard
+  repo, the rendered body, and buttons to approve, reject, snooze (7 days)
+  and edit title, body, labels and repo. After approval it shows the
+  filer's duplicate candidates for items in `needs-review`.
+- **Rendering.** All game-derived text is escaped with `esc`
+  (`web_static/app.js:8`). The body preview uses a Markdown renderer that
+  emits no raw HTML, links or images. Every response gains a
+  Content-Security-Policy (`default-src 'self'; script-src 'self';
+  object-src 'none'; frame-ancestors 'none'`).
+- **Endpoints.** `GET /api/feedback`, and `POST /api/feedback/<id>` with an
+  action, under the existing loopback and Origin rules
+  (`web_server.py:800-822`).
+- **Approval needs more than reaching the dashboard.** A POST without an
+  `Origin` passes today, and the dashboard is reachable through the lab's
+  reverse proxy, which may or may not forward `Origin` (1.9). So approval,
+  edit and reject actions also require an approval key: a random secret in
+  an owner-only file (mode 0600) outside the repository and state
+  directory, sent in an `X-Playtester-Approval` header that the dashboard
   asks for once a browser session and keeps in `sessionStorage`. Without
-  the file, the Feedback tab is read-only and approval is possible only
-  from the CLI, `atrinik-playtester feedback approve <id>`, run on CT130.
-  Whether the proxy already authenticates is open question 1.
-- Approval sets `approved`; filing is a separate step, so a click never
-  waits on GitHub.
+  the file, the Feedback tab is read-only.
+- **The CLI.** `atrinik-playtester feedback list|show|approve|reject|edit`
+  runs on CT130 and writes the same SQLite rows directly through
+  `BotMemory` (WAL, short lock timeout), with `decided_via = cli`. It works
+  whether or not the bot is running; the bot reads the queue on its next
+  poll.
+- **Behaviour flags are not dashboard-controlled.** `try_locks`,
+  `persist_tile_facts`, `terrain_tactics`, `effective_gear_scoring` and
+  `measure_gear` are read from the bot's configuration on CT130 at start.
+  The dashboard shows them read-only; no POST, with or without an Origin,
+  changes them.
 
 #### 4.10.6 Filing and the token
 
-- A `FeedbackFiler` runs in the bot process as a background task (or as
-  the `feedback file` CLI). It takes one `approved` item at a time.
-- **Token.** The only credential is a GitHub token scoped to
-  `atrinik/content` and `atrinik/classic`: Issues read and write and
-  Metadata read, nothing else (a fine-grained personal token or a GitHub
-  App installation token; open question 2). It lives outside the repository
-  and the state directory, for example as a systemd credential
-  (`LoadCredential=`) or `/etc/atrinik-playtester/feedback-token` (mode
-  0400, owned by the service user). The filer reads it at filing time,
-  uses it, and drops it. It is never in the environment of the game
-  process, in dashboard state, logs, checkpoints, metrics, decisions or
-  `doctor` output. The existing `GITHUB_TOKEN` for dependency downloads is
-  a different credential and is not used.
-- **Steps.** Re-run remote dedup with the token; on a marker match, mark
-  `duplicate`. Otherwise `POST /repos/{repo}/issues` with title, body,
-  labels and, for org issue types (`Bug`, `Feature`, `Task`), the type. Record
-  the URL and a `feedback_filings` row. On failure, `failed` with the error;
-  the owner can retry.
-- **Labels.** Only labels that already exist are used; the token cannot
-  create labels. `atrinik/content` has `bug`, `enhancement`, `maps`,
+- **A separate process.** The filer is `atrinik-playtester feedback file`,
+  run by its own systemd unit (a oneshot on a timer, or by hand). It is the
+  only process that can read the token: the game process never has it in
+  its environment, files or memory.
+- **Token.** A GitHub token scoped to `atrinik/content` and
+  `atrinik/classic`: Issues read and write and Metadata read, nothing else
+  (a fine-grained personal token or a GitHub App installation token; open
+  question 2). It is a systemd credential of the filer unit only
+  (`LoadCredential=`), or a file such as
+  `/etc/atrinik-playtester/feedback-token` (mode 0400, owned by the filer's
+  user). The filer reads it at start, uses it, and exits. It is never in
+  dashboard state, logs, checkpoints, metrics, decisions or `doctor`
+  output. The existing `GITHUB_TOKEN` for dependency downloads is a
+  different credential and is not used.
+- **Steps.** For each `approved` item, one at a time: set `checking`; run
+  the remote dedup (4.10.2); on candidates, set `needs-review` and stop;
+  otherwise set `filing`, then `POST /repos/{repo}/issues` (or
+  `/issues/{n}/comments` for a comment target) with title, body, labels and
+  type. Record the URL and a `feedback_filings` row. On failure, `failed`
+  with the error; the owner can retry.
+- **Labels and types.** The filer never creates labels; it uses only labels
+  that already exist. `atrinik/content` has `bug`, `enhancement`, `maps`,
   `question`; `atrinik/classic` has `bug`, `enhancement`,
-  `component: server`, `component: client`. A shared `playtester` label
-  would make her issues findable; whether to create one is open
+  `component: server`, `component: client`. The organization has issue
+  types `Bug`, `Feature` and `Task`. GitHub's REST API documents that labels
+  set by a caller without push access are dropped silently rather than
+  refused, and other triage fields such as the type may behave the same
+  way, so the filer reads the issue back after creating it. If labels or
+  type are missing, it marks the item `filed-unlabelled` and the dashboard
+  shows an alert; it does not retry. A shared `playtester` label is open
   question 3.
 - **Rate limits.** At most 5 filings an hour and 20 a day, at least 60 s
-  apart, and no filing while GitHub's `x-ratelimit-remaining` is under 50.
+  apart, and no request while GitHub's `x-ratelimit-remaining` is under 50.
   A 403 or 429 honours `Retry-After` and backs off exponentially from 10
   minutes. These limits are well inside GitHub's secondary limits for
   content creation.
 - **Dry run.** Without a token, an approved item stays `approved` and the
-  dashboard offers "copy as Markdown" so the owner can file it herself.
+  dashboard and CLI offer "copy as Markdown" so the owner can file it
+  herself.
 
 ### 4.11 Other pain points from her history
 
 #### 4.11.1 Tile facts
 
-The `no_magic` savebed (section 2) is the general case: fixed server
-refusals tied to her square are tile facts, confirmed on first sight, kept
-in `facts` with `kind = tile-property`. The first set: "Something blocks
-your spellcasting." (`no_magic`), "You are unable to read while blind."
-(not a tile, ignored), and the server's no-prayer and no-harm refusals.
-Caster code reads them before ordering a cast. A `qol` draft is offered for
-savebeds that block magic with no message explaining why, as a low-priority
-item the owner may reject.
+PR #97's `spell_blocked_here` already marks a square for an hour after
+"Something blocks your spellcasting." This design keeps the same signal as
+a persistent `tile-property: no_magic` fact, confirmed on first sight, so a
+savebed or quest square she returns to days later is known at once. The
+same treatment covers the server's no-prayer and no-harm refusals. Behind
+the flag `persist_tile_facts`: with it off, the persistent fact is written
+and shown, and PR #97's one-hour mark alone decides; with it on, casting
+code also reads the fact. A `qol` draft is offered for savebeds that block
+magic with no message explaining why, as a low-priority item the owner may
+reject.
 
 #### 4.11.2 Book experience at low Int
 
-`book_exp_mod` (`types/book.c:73-76`) is negative for Int 1 to 10, from
--3.00 to -1.10, then 1.00 from Int 11. The book's experience is multiplied
-by it (`book.c:163`), so it becomes negative; `calc_skill_exp` returns 0 for
-negative experience (`server/skill_util.c:192-194`); and the book is still
-marked read, so its one-time experience is gone (`book.c:175`). At Int 10, a
-"below average" character gets nothing from any book, ever. The values
-read as if the sign is wrong (0.9 to 0.0 would match the comment "less
-experience"). This is drafted as a `bug` for `atrinik/classic`, and the
-playtester stops reading for experience below Int 11 (4.6).
+`book_exp_mod` (`types/book.c:73-76`) is -3.00 at Int 0 and -2.00 at Int 1,
+rising to -1.10 at Int 10, then 1.00 from Int 11. The book's experience is
+multiplied by it (`book.c:163`), so it becomes negative; `calc_skill_exp`
+returns 0 for negative experience (`server/skill_util.c:192-194`); and the
+book is still marked read, so its one-time experience is gone
+(`book.c:175`). At Int 10, a "below average" character gets nothing from any
+book, ever. The values read as if the sign is wrong (0.9 down to 0.0 would
+match the comment "less experience"). This is drafted as a `bug` for
+`atrinik/classic`, and the playtester holds unread books until Int 11 (4.6).
 
 #### 4.11.3 Balance evidence
 
@@ -1029,16 +1215,16 @@ Sera's job is evidence, not opinions:
 `navigation-occupant-blocked` was a third of her recent decisions, mostly
 on `world_7_64`. When the same square blocks her 10 times in a day and the
 occupant is a named NPC, a `qol` draft for content lists the square and NPC
-("an NPC stands on a one-tile path"). Monsters are not reported.
+("an NPC stands on a one-tile path"). Monsters and players are not
+reported.
 
-#### 4.11.5 Feedback categories this adds
+#### 4.11.5 Feedback producers
 
-From the above, the producers in the first release are: lock clarity
-(4.9), quest-part clarity (4.9), "+N with no effect" and "examine omits
-magic" (4.8.3), typos in lock and sign text (a small dictionary of common
-slips such as "a the"), the book experience formula (4.11.2), magic-blocking
-savebeds (4.11.1), path-blocking NPCs (4.11.4) and balance evidence
-(4.11.3).
+From the above, the producers and the phase that ships each: "+N with no
+effect", the book experience formula and typos in lock and sign text,
+using a small dictionary of common slips such as "a the" (F5); "examine
+omits magic" (F11b); lock and quest-part clarity (F9); magic-blocking
+savebeds (F14); path-blocking NPCs (F15); balance evidence (F16).
 
 ### 4.12 Metrics and dashboard
 
@@ -1047,79 +1233,97 @@ New Prometheus series (same labels and caps as today):
 | Metric | Labels | Counts |
 | --- | --- | --- |
 | `observations_total` | `source` | observations stored, by source kind |
+| `observations_dropped_total` | `reason` | chat, player link, signed book, renamed item, player name |
 | `facts_total` | `kind`, `status` | facts created and their status changes |
 | `lock_trials_total` | `kind`, `outcome` | doors, levers and signs tried |
+| `lock_trials_refused_total` | `reason` | trials refused by 4.4.1 or 4.4.3 |
 | `locks_known` (gauge) | `state` | locks by state |
 | `fight_positions_total` | `feature`, `outcome` | engagements by terrain |
 | `feedback_items` (gauge) | `status`, `kind` | queue size |
-| `feedback_filed_total` | `repo`, `result` | filing attempts |
 | `futile_actions_total` | `reason` | casts refused by a tile property, reads beyond comprehension |
 
-`futile_actions_total{reason="no_magic"}` would have shown section 2's loop
-within minutes; an alert fires when it passes 20 in 10 minutes.
+The filer reports its own results in `feedback_filings`, not in the game
+process's metrics. An alert fires when `futile_actions_total` passes 20 in
+10 minutes.
 
 Dashboard tabs: **Knowledge** (recent readings, facts by kind, locks with
-state and hints, lever outcomes), **Equipment** (4.8.2), **Feedback**
-(4.10.5) and a **Terrain** panel on the Farming tab (learned rates by
-feature).
+state and hints, lever outcomes and refusals), **Equipment** (4.8.2),
+**Feedback** (4.10.5) and a **Terrain** panel on the Farming tab (learned
+rates by feature).
 
 ### 4.13 Tests
 
 - Parser fixtures from every real text quoted in section 5, with expected
-  facts, and negative fixtures (player chat that quotes a door message
-  never becomes an observation).
+  facts, and negative fixtures (player chat that quotes a door message, a
+  line with `[a=#charname]`, a signed book and a renamed item never become
+  observations).
 - Attribution: a recorded message stream after a bump attributes the navy
   line to the door; a magic mouth line on the square is attributed by
-  content match.
-- Trial safety: each precondition alone prevents a trial; a spawned monster
-  ends the trial with a retreat and marks the lever hazardous; no trial
-  with a player in view.
-- "+N" model: table-driven against archetype fixtures (cape, cloak, ball and
-  chain, bow, arrow, torch); a stats-packet before/after fixture for the
-  measured mismatch.
+  content match; a broadcast she did not cause is not attributed.
+- Trial safety: the Altar of Loki fixture is refused for its spawn points
+  before any apply; a one-shot lever is refused; a scripted sign is
+  refused; each precondition alone prevents a trial; `/who` with two
+  players blocks a lever but not a door; a spawned monster ends the trial
+  with a retreat and marks the lever forbidden; a non-resetting lever is
+  restored.
+- "+N" model: table-driven against archetype fixtures (cape, cloak, chain
+  pants, ball and chain, bow, arrow, torch); a stats-packet before/after
+  fixture for the measured mismatch.
 - Feedback: fingerprints are stable across restarts; redaction drops a line
-  naming a seen player; mocked GitHub for duplicate, success, 403 with
-  `Retry-After`, and the hourly cap; the token is never in any serialized
-  state.
+  naming a seen player; an excerpt containing a backtick fence, `<!--`,
+  `@someone` and a fingerprint line renders inert; no network call happens
+  before approval; mocked GitHub for duplicate, success, labels dropped,
+  403 with `Retry-After` and the hourly cap; the token never appears in any
+  state the game process serializes (a test serializes all of it and
+  searches); a POST without the approval key is refused; no POST changes a
+  behaviour flag.
 
 ## 5. Concrete examples from the content
 
-All from the local content checkout (see "How the evidence was gathered").
+All from the content maps (see "How the evidence was gathered").
 
-### 5.1 Generic lock texts
+### 5.1 Default lock texts and doors no key opens
 
-152 authored locked doors and gates carry a `slaying`. 107 of them use the
+152 authored locked doors and gates carry a `slaying`. 107 use the
 archetype's default text: 72 "You need a special key to open this door."
-and 35 "You need a special key to open this gate." 30 more have the
-`no_entry` lock id, which no key opens: "The prison cell is locked."
-(`world_3_59`), "The Casino is currently closed." (`world_10_45` (4,18)),
-"LandShare Industries is currently not open." (`world_10_44` (2,23)). These
-are probably decoration, and her verdict would be `suspected-unopenable`,
-not feedback, unless the owner wants "currently closed" doors flagged.
+and 35 "You need a special key to open this gate." 30 have the `no_entry`
+lock id, which no key opens. 21 of those 30 also use the default "find a
+key" text, so they are inside the 107: 86 default-text locks have a key
+somewhere, and 21 promise a key that does not exist (`false-promise`,
+4.9). The other 9 `no_entry` locks say what they are: "The prison cell is
+locked." (`world_3_59`, three), "The Casino is currently closed."
+(`world_10_45` (4,18)), "LandShare Industries is currently not open."
+(`world_10_44` (2,23)), "The door appears to be blocked by something..."
+(two, Underground City), "The entry way is locked." and "The door is
+locked." Those are probably decoration, and her verdict would be
+`suspected-unopenable`, not feedback, unless the owner wants "currently
+closed" doors flagged (open question 6).
 
 ### 5.2 A door whose key exists nowhere, with a typo
 
 `/shattered_islands/world_4_58` (Aris) (19,12), `celestial_door_bar1`,
 `slaying bar_key_aris`, text "You need a the key to open this door." No map,
-archetype, artifact, interface or script in the checkout mentions
-`bar_key_aris`. Verdict `no-source`, plus a typo. One `bug` draft for
-`atrinik/content`. (34 other locks have no key source either, but most are
-bank, vault and staff doors, or force-based doors that markers open, so
-"no source" alone is not a bug; only the text decides.)
+archetype, artifact, interface or script mentions `bar_key_aris`. Verdict
+`no-source`, plus a typo. One `bug` draft for `atrinik/content`. (34 other
+locks have no key source either, but most are bank, vault and staff doors,
+or force-based doors that markers open, so "no source" alone is not a bug;
+only the text decides.)
 
 ### 5.3 A misleading colour
 
 `/shattered_islands/world_5_57_-2` (13,14) is a magic mouth: "The yellow
-force field is preventing you from reaching the well bucket..." The square
-(14,14) holds `forcefield_yellow_0` and a checker for the **orange** stone
-giant key, which is what opens it. In the Old Outpost the colours agree:
-`old_outpost_a_0203` (22,10) says "The orange force field prevents you from
-reaching the door. [i]Xuhrexal, the stone giant[/i] is engraved on the
-door.", and Xuhrexal (level 26) carries the orange stone giant key on the
-same map. A player told "yellow" looks for a yellow key that does not
-exist. Verdict `misleading`, a `hint` draft for content. COMBAT.md already
-names the well as needing the orange key, so the playtester knows; a human
-player would not.
+force field is preventing you from reaching the well bucket..." It has
+`last_sp 1`, so only a player without the key sees it. The square (14,14)
+holds `forcefield_yellow_0`, named "yellow force field", and a checker for
+the **orange** stone giant key, which is what opens it. In the Old Outpost
+the colours agree: `old_outpost_a_0203` (22,10) says "The orange force
+field prevents you from reaching the door. [i]Xuhrexal, the stone
+giant[/i] is engraved on the door.", and Xuhrexal (level 26) carries the
+orange stone giant key on the same map. A player told "yellow", and shown a
+yellow field, looks for a yellow key that does not exist. Verdict
+`misleading`, a `hint` draft for content. The fix could be the field's arch
+(an orange one) rather than the text. COMBAT.md already names the well as
+needing the orange key, so the playtester knows; a human player would not.
 
 ### 5.4 Clear hints, for contrast and for facts
 
@@ -1138,32 +1342,36 @@ player would not.
   in Asteria possesses the first of these keys", and keys that teleport back
   unless exchanged at an "exchange point". It also says the gates open only
   for "an, as yet, unknown password". Facts: a `quest-gate` hint and a
-  `password` fact with no value, which is itself a clarity signal.
+  `password` fact with no value, which is itself a clarity signal. It is a
+  world book: she reads it only if it already shows "(read)" (4.6).
 
-### 5.5 A lever that is a trap
+### 5.5 A lever that must never be pulled
 
 `/shattered_islands/berri_lur/temple_loki/tol_0101` (11,8): a
-`handle_lever` named "Altar of Loki", text "You appear to have company...",
-connected to spawn points that release level-94 "living dead girl"
-monsters. The lever at (11,10) toggles magic walls instead. This is the
-case the lever rules in 4.4 are for: full health, no players near, observe
-10 s, retreat and never again on `spawned`.
+`handle_lever` named "Altar of Loki", text "You appear to have company...".
+Its connection 23 drives 8 spawn points at (17,4), (17,6), (17,13),
+(17,15), (21,4), (21,6), (21,13) and (21,15), each holding a "living dead
+girl" of level 93 to 95. The twin lever at (11,10) drives two firewalls.
+Both are refused by 4.4.1 before she touches them; watching after a pull
+would come too late.
 
 Other levers carry a lock: 28 levers and switches have a `slaying`, 19 of
 them Asteria's "big lever"s (`slaying asteria_walls_gate`). Without the
 key they answer "The big lever is locked." (`handle.c:45-48`), with no hint
-of what unlocks them.
+of what unlocks them. Their connections drive gates, so they pass 4.4.1.
 
 ### 5.6 A book with a useful fact
 
 `underground_city_2_3_-2`, "note: Day 6 - 7" on a corpse (level 10, so
-Literacy 3 at Int 11 or more can read it): "a ---ic bul--- was needed. It
-must be cast northwest from a special location. We have marked the spot
-with a fake torch" and "STAY OFF THE BRIDGE, IT IS A TRAP". The map has
-pedestals that react to `race bullet` (7,2) and (7,4), and one green wall
-torch among ordinary ones at (23,2). Facts: `direction` (magic bullet,
+Literacy 3 reads it at Int 11 or more): "a ---ic bul--- was needed. It must
+be cast northwest from a special location. We have marked the spot with a
+fake torch" and "STAY OFF THE BRIDGE, IT IS A TRAP". The map has pedestals
+that react to `race bullet` at (7,2) and (7,4), and one green wall torch
+among ordinary ones at (23,2). Facts: `direction` (magic bullet,
 northwest, from a marked torch), `trap-warning` (the bridge). She knows
 magic bullet. Whether the green torch is the marked spot was not verified.
+The note is a world book on a map-placed corpse, so the shared-book rule in
+4.6 applies.
 
 The blood-stained letter on `old_outpost_a_0202` ("He is guarded by magic
 doors. We will never find the keys...") gives a weaker `quest-gate` hint for
@@ -1177,86 +1385,89 @@ lighter weight and shop value, and the examine text shows no stats. Her
 `forged silksteel ball and chain +2` examines as `(wc+1)(ac+2)(block+2)
 (absorb+5%)` and gives AC 4, WC 3, block 4 and absorb 7%. Both become one
 `clarity` draft for `atrinik/classic`, with the measured before/after doll
-stats as evidence.
+stats as evidence once `measure_gear` has run.
 
 ## 6. Phased plan
 
 Each phase is one small pull request that can ship alone, with tests, and
-changes no behaviour unless it says so. S0 is not part of this design but
-blocks judging any of it on the live character.
-
-**S0. `fix(survival)`: keep an idle character alive.** With no task
-running, she eats what she carries, buys food at the temple with what she
-has, or logs out before starving. Track separately (see the open
-`fix/starvation-temple-route` branch first).
+changes no behaviour unless it says so. Idle survival is
+[PR #97](https://github.com/atrinik/playtester/pull/97) and is not
+redesigned here; it should merge before any feature below is judged on her
+live behaviour.
 
 **F1. `feat(memory)`: an observation ledger.** The `observations` table,
-attribution (4.3.1) for bumps, applies, walk-ons, interfaces, book packets
-and examines, the privacy filter, caps, and a read-only Knowledge tab.
-*Accept:* a recorded stream yields the expected attributed rows; chat is
-never stored; book packets parse into title and body; a full table evicts
-the oldest unreferenced rows; no behaviour change.
+the ingestion filter and attribution (4.3.1) for bumps, applies, walk-ons,
+interfaces, inventory book packets and examines, caps, and a read-only
+Knowledge tab with a CSP.
+*Accept:* a recorded stream yields the expected attributed rows; chat,
+player-link lines, signed books and renamed items are never stored; her
+name is replaced in dialogue; book packets parse into title and body; an
+unattributed fact line deduplicates; a full table evicts the oldest
+unreferenced rows; no behaviour change.
 
-**F2. `feat(knowledge)`: deterministic fact parsers and tile facts.** The
-`facts` table and the parsers in 4.3.2. Caster code stops casting on a
-confirmed `no_magic` square and steps off it to heal (behaviour change,
-small and safe). The `futile_actions_total` counter and alert.
+**F2. `feat(knowledge)`: deterministic fact parsers and persistent tile
+facts.** The `facts` table and the parsers in 4.3.2. Tile facts persist
+PR #97's `spell_blocked_here` signal behind `persist_tile_facts`, default
+off (shadow: the fact is written and shown, #97 alone decides).
 *Accept:* every section 5 text gives its expected facts; the section 2
-message stream produces one `no_magic` fact and at most 3 refused casts on
-that square afterwards; no LLM dependency.
+message stream produces one `no_magic` fact; with the flag on, a reconnect
+a day later casts nothing on that square; no LLM dependency.
 
 **F3. `feat(inventory)`: effective item stats and an Equipment panel.** The
 "+N" model (4.8.1), examining carried gear once, `EffectiveStats`, the
 panel, and shadow logging of old and new gear scores. No scoring change.
 *Accept:* table tests for each archetype family in 4.8.1; the live
-inventory in section 2 shows the cape's "+2" as no AC; doll before/after
-fixture matches the model.
+inventory in section 2 shows the cape's "+2" as no AC.
 
 **F4. `feat(inventory)`: score gear by effective stats.** Switch
-`gear_score` to the model behind a flag, after the owner reviews a day of
-shadow logs.
+`gear_score` to the model behind `effective_gear_scoring`, after the owner
+reviews a day of shadow logs.
 *Accept:* the shadow divergence list is attached to the PR; with the flag
 off, choices are unchanged.
 
 **F5. `feat(feedback)`: the draft queue.** `feedback_items`, fingerprints,
-the evidence builder and template, redaction, the Feedback tab (read-only
-drafts), unauthenticated remote dedup, and the first producers: "+N with no
-effect", "examine omits magic", the book experience formula, typos.
-*Accept:* drafts are deduplicated across restarts; redaction tests pass; no
-network call except rate-limited public search; nothing is filed.
+the evidence builder and template, excerpt quoting, redaction, the
+Feedback tab (read-only drafts) and the CLI's `list` and `show`, and the
+first producers: "+N with no effect", the book experience formula and
+typos. No network at all.
+*Accept:* drafts are deduplicated across restarts; redaction and quoting
+tests pass (4.13); a test proves no socket is opened; nothing is filed.
 
-**F6. `feat(feedback)`: owner approval and GitHub filing.** Approval key or
-CLI, the filer, token handling, labels, issue types, rate limits, dry run,
-audit rows, and balance evidence as comments.
+**F6. `feat(feedback)`: owner approval and GitHub filing.** The approval
+key, CLI `approve|reject|edit`, the separate filer unit and command, token
+handling, post-approval dedup and `needs-review`, labels and types with
+read-back, rate limits, dry run, comments for balance targets and audit
+rows.
 *Accept:* with no token, approval leaves the item approved with a Markdown
-copy; mocked GitHub tests for success, duplicate marker, 403 with
-`Retry-After` and the hourly cap; the token never appears in state, logs or
-metrics (a test serializes all of them and searches); a POST without the
-approval key is refused.
+copy; mocked GitHub tests for success, duplicate, labels dropped, 403 with
+`Retry-After` and the hourly cap; the game process never reads the token;
+a POST without the approval key is refused.
 
 **F7. `feat(exploration)`: safe lock and lever trials.** `locks`,
-`interactions`, `LockTrialTask` with the preconditions and lever
-observation in 4.4, Find Traps before first trials. Flag `try_locks`,
-default off; shadow decisions while off.
-*Accept:* each precondition alone blocks a trial; a synthetic spawn after a
-lever ends the trial with a retreat and marks it hazardous; budgets hold;
-the owner turns the flag on after a supervised session.
+`interactions`, `LockTrialTask` with connection resolution (4.4.1), the
+preconditions including ROUTING's probe limits and the `/who` count,
+Find Traps before first trials, the watch and restore. Flag `try_locks`,
+default off; shadow decisions while off. *Depends on* ROUTING P3 (blocks
+and care) and P5 and P6 (the route tables and the danger costs that
+`PROBE_MAX_DANGER_SECONDS` is measured in).
+*Accept:* the 4.13 trial-safety tests; trials share the 3-a-day probe
+budget; the owner turns the flag on after a supervised session.
 
-**F8. `feat(navigation)`: learned unlocks into routing.** Confirmed
-openings and refusals feed ROUTING's `UnlockState` and `Learned` atoms;
-quest-gate facts are offered to P4. Depends on PR #95's P2 (and P4 for the
-quest part).
+**F8. `feat(navigation)`: learned unlocks into routing.** Trial outcomes
+write `route_requirements` rows for `lock:` subjects, `UnlockState` gains
+`learned_tiles`, and quest-gate facts are offered to P4. *Depends on*
+ROUTING P2, P4 and P5, and on F7.
 *Accept:* a door opened with a key not in `access_item_names` becomes
-routable for her; a refusal with message evidence blocks the edge until a
+routable for her; a refusal with message evidence blocks the tile until a
 related input changes or 24 h pass; a candidate fact alone opens nothing;
 no `Consumes` atom is ever satisfied by a learned record.
 
 **F9. `feat(feedback)`: hint and quest clarity.** The fair-chance rule and
-verdicts (4.9), regional aggregation of generic texts, and quest-part
-clarity.
-*Accept:* fixtures for 5.2 (`no-source`), 5.3 (`misleading`) and 5.4
-(`clear`) produce those verdicts; generic locks aggregate to one draft per
-region; rejected aggregates are not redrafted.
+verdicts (4.9), regional aggregation of default texts, and quest-part
+clarity. *Depends on* F13 for the NPC part of the fair-chance rule.
+*Accept:* fixtures for 5.1 (`false-promise`), 5.2 (`no-source`), 5.3
+(`misleading`) and 5.4 (`clear`) produce those verdicts; default-text locks
+aggregate to one draft per region; rejected aggregates are not redrafted.
 
 **F10. `feat(combat)`: record fights by terrain.** Terrain features and
 `fight_positions`, the Terrain panel. No behaviour change.
@@ -1270,46 +1481,91 @@ when separation ties; with ranged monsters in view, a covered square wins a
 tie; separation still wins over terrain; with the flag off, steps are
 unchanged.
 
-**F12. `feat(knowledge)`: optional offline interpreter.** The
+**F11b. `feat(inventory)`: measure what gear really adds.** The
+before/after doll measurement behind `measure_gear`, and the "examine omits
+magic" producer.
+*Accept:* only identified, uncursed items the gear policy chose are
+measured, only with no threat in view; the ball and chain fixture yields
+the measured AC 4, WC 3, block 4, absorb 7%.
+
+**F12. `feat(knowledge)`: world books and text scrolls.** Reading map books
+under the shared-book rule (only already-read ones), text scrolls, the
+player-corpse ban, and holding unread inventory books until Int 11.
+*Accept:* an unread world book is recorded and left; a read one is read and
+put back; a spell scroll is never read; at Int 10 no inventory book is
+applied or sold.
+
+**F13. `feat(exploration)`: an NPC dialogue sweep.** Say `hello` to each
+unfamiliar NPC with dialogue on maps she visits, and follow only
+non-consequential links, in coordination with
+[#17](https://github.com/atrinik/playtester/issues/17): never a link whose
+interface action is `teleport`, `enemy`, a quest start or turn-in, a
+purchase, or free text. Records pages as observations.
+*Accept:* Warden Argoth's fixture records the "key" page and never follows
+the insult chain (its last step sets `enemy="player"`); a teleporting link
+is never followed.
+
+**F14. `feat(feedback)`: magic-blocking savebeds.** The `qol` producer from
+4.11.1, using F2's persistent facts.
+*Accept:* the Clearhaven bed yields one draft; a non-savebed `no_magic`
+square yields none.
+
+**F15. `feat(feedback)`: path-blocking NPCs.** The producer from 4.11.4.
+*Accept:* ten blocks by one named NPC on one square in a day yield one
+draft; monsters and players yield none.
+
+**F16. `feat(feedback)`: balance comparison reports.** The report in
+4.11.3, drafted as comments on matching issues.
+*Accept:* a recorded two-hour fixture per mode produces the table; fewer
+than two hours of a mode says "not enough data"; at most one refresh a week.
+
+**F17. `feat(knowledge)`: optional offline interpreter.** The
 `Interpreter` interface, the no-op default, an out-of-process local-model
 adapter, queueing and the dashboard indicator.
 *Accept:* with no endpoint configured, nothing runs and no text leaves the
-process; LLM facts are capped at 0.5 confidence and never produce a clarity
-verdict, unlock or draft by themselves.
+process; only authored observations are sent; LLM facts are capped at 0.5
+confidence and never produce a clarity verdict, unlock or draft by
+themselves.
 
 ## 7. Open questions for the owner
 
 1. **Approval security.** Does the lab proxy in front of
-   `playtester.atrinik.orion.milkyway` authenticate? If it does not,
-   is the approval key in an owner-only file (4.10.5) acceptable, or should
-   approval be CLI-only on CT130?
+   `playtester.atrinik.orion.milkyway` authenticate, and does it forward,
+   strip or rewrite `Origin`? One request answers the second part without
+   changing anything: a POST to a path that does not exist, with
+   `Origin: http://example.invalid`, returns 403 if `Origin` reaches the bot
+   and 404 if it is stripped. The approval key (4.10.5) is needed either
+   way; is the owner-only file acceptable, or should approval be CLI-only?
 2. **Token form.** A fine-grained personal token, or a small GitHub App
    installed on `atrinik/content` and `atrinik/classic` with Issues write?
-   Whose account files the issues?
+   Whose account files the issues? (A token without push access may get its
+   labels and type dropped, 4.10.6.)
 3. **Labels and types.** Create a `playtester` label in both repositories,
    and use the organization issue types (`Bug`, `Feature`, `Task`)?
 4. **Findings about the playtester itself** (the starvation loop, futile
    casts): dashboard-only, or also filed to `atrinik/playtester` through the
    same approval?
-5. **Generic lock texts.** One aggregated draft per region, a single global
-   one, or none (they are intended)?
-6. **"Currently closed" doors** (`no_entry` locks that suggest they might
-   open): report, or treat as decoration?
+5. **Default lock texts.** One aggregated draft per region, a single global
+   one, or none (they are intended)? Should the 21 `false-promise` locks be
+   reported separately from the 86 with a key?
+6. **"Currently closed" doors** (`no_entry` locks with their own text):
+   report, or treat as decoration?
 7. **Balance evidence.** Comments on existing issues such as
    [atrinik/classic#628](https://github.com/atrinik/classic/issues/628),
    or a separate report artifact?
-8. **Trial scope.** Are lever and door trials allowed in towns and quest
-   maps, or only away from other players' usual paths? Is 20 trials a day
-   right?
+8. **Trial scope.** Lever trials need her to be the only player online. Is
+   that acceptable, or should levers be left out entirely? Are door trials
+   allowed in towns and quest maps?
 9. **LLM.** Allowed at all? If so, local only, and on which host?
-10. **Live character.** Sera has 66 depletion points from the idle
-    starvation loop. Should S0 come first, and should she be restored or
-    restarted before the new features are evaluated?
+10. **Live character.** After PR #97, should Sera (66 depletion points) be
+    restored or restarted before the new features are evaluated?
+11. **Shared world books.** Reading an unread world book takes its one-time
+    experience from the next player until the map resets. Leave unread world
+    books alone (the default here), or read them when she is the only player
+    online?
 
 ## 8. Known uncertainties
 
-- The examples come from content `v1.14.0-4` (local checkout), not the
-  exact locked archive.
 - Monster diagonal attacks past wall corners were not checked, so `reach`
   in 4.7 is a model to be confirmed by her fights.
 - Whether the client sees the contents of her closed key ring was not
@@ -1318,9 +1574,15 @@ verdict, unlock or draft by themselves.
 - Attribution by timing assumes the server answers a bump or apply in the
   same or next tick; heavy lag could misattribute a line. Content matching
   backs it up only where authored text exists.
+- Whether the client can tell an unsigned, player-edited book from an
+  authored one is unknown; such books are kept out of evidence by the
+  `authored` check, not detected.
+- Whether GitHub search indexes HTML comments, and exactly which fields the
+  issue API drops for a token without push access, were not verified; the
+  design reads back every created issue instead of relying on either.
 - The green torch in 5.6 being the "fake torch" is an inference.
-- The stats the dashboard reports (Str 3, Int 1) were read from
+- The stats the dashboard reported (Str 3, Int 1) were read from
   `/api/state` and not cross-checked against the server.
-- The proxy's authentication (1.9) was not checked.
+- The proxy's authentication and `Origin` handling (1.9) were not checked.
 - 4.11.2 reads the book experience table as a sign error; the original
   intent was not checked in Classic history.
