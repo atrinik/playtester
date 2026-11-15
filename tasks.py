@@ -435,7 +435,7 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
     """Whether the server has refused her spells on the square she stands on.
 
     The server checks the caster's own square. A refusal is attributed to
-    the square of the last cast before it (``client.spell_cast``, recorded
+    the square of the last recent cast before it (``client.spell_cast``, recorded
     when the cast is sent), so a step taken before the answer arrives does
     not mark the wrong square; without a recorded cast, to where she stands.
     The memory lives on the client, so every safety policy shares it.
@@ -464,8 +464,11 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
                     self_improvement.from_server(entry) and
                     SPELL_BLOCKED_MESSAGE.match(str(entry[-1]).strip())):
                 continue
-            where = (cast[0] if cast is not None and cast[1] <= position
-                     else square)
+            # Only a recent cast explains the answer; otherwise it is
+            # some other use, on the square she stands on.
+            where = (cast[0] if cast is not None and cast[1] <= position and
+                     float(entry[0]) - float(cast[2]) <=
+                     SPELL_BLOCK_ATTRIBUTION_SECONDS else square)
             if not where[0]:
                 continue
             if where not in blocked:
@@ -511,19 +514,33 @@ class SafetyPolicy:
     food_retry_seconds: float = 3.0
     # The decision recorded each time it eats, if any ("idle-hunger").
     eat_action: str = ""
+    # Applications in a row without a rise in the food stat after which
+    # carried food counts as no food, for this long. Zero (the default)
+    # keeps applying it; only the engine's idle policy sets it.
+    fruitless_meal_limit: int = 0
+    fruitless_retry_seconds: float = 60.0
     _last_heal: float = field(default=0.0, init=False, repr=False)
     _last_food: float = field(default=0.0, init=False, repr=False)
     _food_attempt_level: int = field(default=-1, init=False, repr=False)
     # Food applications in a row that did not raise her food stat.
     _fruitless_meals: int = field(default=0, init=False, repr=False)
+    _fruitless_since: float = field(default=0.0, init=False, repr=False)
     _last_warning: float = field(default=0.0, init=False, repr=False)
 
-    FRUITLESS_MEALS = 3
-
     def meals_failing(self) -> bool:
-        """Three applications of carried food in a row left her food stat
-        where it was: what she carries does not feed her."""
-        return self._fruitless_meals >= self.FRUITLESS_MEALS
+        """``fruitless_meal_limit`` applications of carried food in a row left
+        her food stat where it was: what she carries does not feed her.
+
+        It lapses after ``fruitless_retry_seconds``, so she tries it again.
+        """
+        if (not self.fruitless_meal_limit or
+                self._fruitless_meals < self.fruitless_meal_limit):
+            return False
+        if (time.monotonic() - self._fruitless_since >=
+                self.fruitless_retry_seconds):
+            self._fruitless_meals = 0
+            return False
+        return True
 
     @staticmethod
     def _find(items: list[Item], patterns: tuple[str, ...]) -> Item | None:
@@ -627,7 +644,7 @@ class SafetyPolicy:
         if food_level >= self.min_food:
             self._food_attempt_level = -1
             self._fruitless_meals = 0
-        elif self._food_attempt_level >= 0:
+        elif self.fruitless_meal_limit and self._food_attempt_level >= 0:
             if food_level > self._food_attempt_level:
                 # Only a rise counts as a meal.
                 self._fruitless_meals = 0
@@ -636,6 +653,8 @@ class SafetyPolicy:
                   self.food_retry_seconds):
                 self._fruitless_meals += 1
                 self._food_attempt_level = -1
+                if self._fruitless_meals >= self.fruitless_meal_limit:
+                    self._fruitless_since = time.monotonic()
         if food_level < self.min_food and self.meals_failing():
             # What she carries does not feed her; stop applying it.
             return not waiting
@@ -7058,7 +7077,8 @@ class TaskEngine:
         self.last_task: dict[str, str | float] | None = None
         self.running = True
         self.inventory_policy = InventoryPolicy()
-        self.idle_safety = SafetyPolicy(eat_action="idle-hunger")
+        self.idle_safety = SafetyPolicy(eat_action="idle-hunger",
+                                        fruitless_meal_limit=3)
         # Feeds a connected character that has no task (autoplay's
         # IdleSurvival, which needs the world graph). Stop means "no tasks
         # except survival": in Atrinik a connected character keeps starving.

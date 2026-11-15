@@ -527,7 +527,8 @@ engine still runs a narrow survival guard (`TaskEngine._protect_idle`):
 - the idle safety policy heals her and eats carried food below its food
   threshold (`idle-hunger`, "ate ..."). Only a rise in her food stat counts
   as a meal: after three applications without one, it stops applying what
-  she carries and treats her as having no food;
+  she carries for a minute and treats her as having no food. Only this
+  idle policy does that; task safety policies keep applying food;
 - once she is hungry with nothing to eat (`hungry`, the test autoplay
   uses), `IdleSurvival` walks to the nearest reachable temple priest for the
   free food service, the trip autoplay uses (`idle-hunger`, then
@@ -538,11 +539,15 @@ engine still runs a narrow survival guard (`TaskEngine._protect_idle`):
   40, then every 60 minutes. Eating, a later trip, a task, or her food
   stat back at 180 or more clears the alert. It never loops.
 
-Stop also ends a running idle food trip (`idle-survival-hold`), and so do
-the manual dashboard actions move, dialog, apply and apply on the ground,
-which would otherwise fight it. Either way no trip starts for the next 10
-minutes (`IdleSurvival.RETRY_SECONDS`), so Stop during autoplay's own
-temple-food phase does not send her off again at once. After that hold, a
+Stop also ends a running idle food trip, and so do the manual dashboard
+actions move, dialog, apply and apply on the ground, which would otherwise
+fight it. Each records `idle-survival-hold`, trip or not. No trip starts
+for the next 10 minutes (`IdleSurvival.RETRY_SECONDS`), so Stop during
+autoplay's own temple-food phase does not send her off again at once.
+Repeated actions cannot stretch that: one hunger episode is held at most
+10 minutes from its first hold. The hold ends, or is not applied, once her
+food is below 100: food falls about a point every 4.3 s, and at zero the
+server drains her health one-for-one (`types/player.c`). After the hold, a
 still-hungry character goes again: starving is worse than overriding the
 operator. Starting any task hands her back to it; a trip in flight is
 dropped. Live,

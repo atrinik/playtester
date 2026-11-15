@@ -446,6 +446,10 @@ class IdleSurvival:
         self.child: BotTask | None = None
         self._retry_at = 0.0
         self._failures = 0
+        # The operator's hold on new trips, and when this hunger episode's
+        # first hold began (its budget is one RETRY_SECONDS).
+        self._hold_until = 0.0
+        self._hold_started: float | None = None
         # Priests whose food trip failed, until when they are passed over.
         self._failed_priests: dict[str, float] = {}
 
@@ -456,18 +460,32 @@ class IdleSurvival:
     def hold(self, client: AtrinikClient, reason: str) -> None:
         """The operator took over: end a running trip and wait a while.
 
-        No trip starts for ``RETRY_SECONDS``, so Stop (also during
+        No trip starts for up to ``RETRY_SECONDS``, so Stop (also during
         autoplay's own temple-food phase) or a manual move is not overridden
-        at once. Afterwards survival resumes.
+        at once. The hold never outlasts ``RETRY_SECONDS`` from the first
+        one of a hunger episode, however often it is renewed, and ends once
+        her food falls below the eating threshold: starving drains her
+        health one-for-one (server types/player.c).
         """
         trip, self.child = self.child, None
-        self._retry_at = max(self._retry_at,
-                             time.monotonic() + self.RETRY_SECONDS)
-        if trip is not None:
-            log.info("idle food trip %s ended: %s", trip.name, reason)
-            self._record(client, "idle-survival-hold",
-                         f"{trip.name} ended: {reason}; food trips resume "
-                         f"in {self.RETRY_SECONDS / 60:.0f} min")
+        now = time.monotonic()
+        food = int(client.state.stats.get("food", 1000) or 0)
+        if self._hold_started is None or food >= HUNGRY_FOOD:
+            # Fed: a new hunger episode starts its own hold budget.
+            self._hold_started = now
+        if food < self.safety_min_food:
+            self._hold_until = 0.0
+            held = f"not held: food {food}"
+        else:
+            self._hold_until = max(self._hold_until, min(
+                now + self.RETRY_SECONDS,
+                self._hold_started + self.RETRY_SECONDS))
+            held = (f"food trips held for "
+                    f"{max(0.0, self._hold_until - now) / 60:.0f} min")
+        ended = f"ended {trip.name}" if trip is not None else "no trip running"
+        log.info("idle survival hold (%s): %s; %s", reason, ended, held)
+        self._record(client, "idle-survival-hold",
+                     f"{reason}; {ended}; {held}")
 
     def _avoided_priests(self) -> tuple[str, ...]:
         now = time.monotonic()
@@ -502,6 +520,11 @@ class IdleSurvival:
             return await self._tick_trip(client)
         state = client.state
         food = int(state.stats.get("food", 1000) or 0)
+        if food >= HUNGRY_FOOD:
+            self._hold_started = None
+        elif food < self.safety_min_food:
+            # Starving soon: the operator's hold ends.
+            self._hold_until = 0.0
         # Carried "food" that has not raised her food stat in three
         # applications is no food.
         fruitless = safety is not None and safety.meals_failing()
@@ -509,7 +532,7 @@ class IdleSurvival:
         # the first map; the food she carries is unknown until both arrive.
         if (not getattr(state, "inventory_replay_complete", True) or
                 not getattr(getattr(state, "map", None), "path", "") or
-                time.monotonic() < self._retry_at or
+                time.monotonic() < max(self._retry_at, self._hold_until) or
                 not (hungry(client) or (fruitless and food < HUNGRY_FOOD))):
             return False
         if (food_reserve(client) and food < self.safety_min_food and

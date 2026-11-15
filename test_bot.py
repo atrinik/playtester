@@ -19859,7 +19859,7 @@ class IdleSurvivalTests(unittest.TestCase):
             # trip, never a task.
             asyncio.run(engine._protect_idle())
             self.assertIsNone(engine.idle_survival.child)
-            engine.idle_survival._retry_at = 0.0
+            engine.idle_survival._hold_until = 0.0
             self.assertTrue(asyncio.run(engine._protect_idle()))
             self.assertIsNone(engine.task)
             self.assertIsInstance(engine.idle_survival.child.task,
@@ -20001,7 +20001,7 @@ class IdleSurvivalTests(unittest.TestCase):
             asyncio.run(engine._protect_idle())
         self.assertEqual((trips, survival.child), ([1], None))
         # After the hold she goes again: starving is worse.
-        survival._retry_at = 0.0
+        survival._hold_until = 0.0
         asyncio.run(engine._protect_idle())
         self.assertEqual(trips, [1, 1])
         # A manual move ends the trip and holds it off the same way.
@@ -20012,7 +20012,7 @@ class IdleSurvivalTests(unittest.TestCase):
         self.assertEqual(trips, [1, 1])
         # Stop during autoplay's own temple-food phase does not send her
         # off on a fresh trip at once.
-        survival._retry_at = 0.0
+        survival._hold_until = 0.0
         autoplay = AutoplayTask(graph, target_level=115)
         autoplay.status = TaskStatus.RUNNING
         autoplay.phase, autoplay.child = "temple-food", TempleTrip("Talrain")
@@ -20022,6 +20022,110 @@ class IdleSurvivalTests(unittest.TestCase):
         asyncio.run(engine._protect_idle())
         self.assertEqual(trips, [1, 1])
         self.assertIsNone(survival.child)
+
+    def test_low_food_ends_the_operator_hold(self):
+        client = self.client(food=120)
+        trips = []
+
+        def trip(graph, client, exclude=()):
+            trips.append(1)
+            return TempleTrip("Friar Marcus")
+
+        engine = self.engine(client, trip)
+        survival = engine.idle_survival
+        survival.hold(client, "stopped by operator")
+        # Recorded even with no trip running.
+        self.assertEqual(self.decisions(client, "idle-survival-hold"),
+                         ["stopped by operator; no trip running; "
+                          "food trips held for 10 min"])
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [])
+        # Below the eating threshold the hold ends: she starves soon.
+        client.state.stats["food"] = 90
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1])
+        # And a new one is not applied.
+        survival.hold(client, "manual move")
+        self.assertTrue(self.decisions(client, "idle-survival-hold")[-1]
+                        .endswith("not held: food 90"))
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1, 1])
+
+    def test_repeated_actions_do_not_extend_the_hold_past_its_cap(self):
+        client = self.client(food=150)
+        trips = []
+
+        def trip(graph, client, exclude=()):
+            trips.append(1)
+            return TempleTrip("Friar Marcus")
+
+        engine = self.engine(client, trip)
+        survival = engine.idle_survival
+        survival.hold(client, "manual move")
+        # Nine minutes on, another manual action renews it only up to ten
+        # minutes from the first.
+        shift = survival.RETRY_SECONDS - 60.0
+        survival._hold_started -= shift
+        survival._hold_until -= shift
+        survival.hold(client, "manual move")
+        self.assertLessEqual(survival._hold_until - time.monotonic(), 60.0)
+        self.assertGreater(survival._hold_until - time.monotonic(), 0.0)
+        # Once the budget is spent, further actions add nothing.
+        survival._hold_started -= 60.0
+        survival._hold_until -= 60.0
+        survival.hold(client, "manual dialog")
+        self.assertLessEqual(survival._hold_until, time.monotonic())
+        asyncio.run(engine._protect_idle())
+        self.assertEqual(trips, [1])
+        # Fed, a later episode gets its own budget again.
+        survival.drop()
+        client.state.stats["food"] = 500
+        survival.hold(client, "stopped by operator")
+        self.assertGreater(survival._hold_until - time.monotonic(),
+                           survival.RETRY_SECONDS - 5)
+
+    def test_a_stale_cast_square_is_not_blamed(self):
+        from .tasks import spell_blocked_here
+
+        client = self.client(food=500)
+        spell_blocked_here(client)
+        # A cast long ago on another square; the refusal answers a use here.
+        client.spell_cast = ((self.BED, 3, 3), client.state.message_count,
+                             time.time() - 60.0)
+        client.state.add_message(0, "white",
+                                 "Something blocks your spellcasting.")
+        self.assertTrue(spell_blocked_here(client))
+        self.assertEqual(self.decisions(client, "spell-blocked"),
+                         [f"{self.BED} (16,3)"])
+
+    def test_only_the_idle_policy_gives_up_on_food_and_only_for_a_while(self):
+        dud = Item(61, item_type=c.TYPE_FOOD, quality=100,
+                   name="stale bread", quantity=5)
+        client = self.client(food=60, inventory=[dud])
+        applied = []
+
+        async def apply(tag):
+            applied.append(tag)
+
+        client.apply = apply
+        task_policy = SafetyPolicy()
+        for _ in range(6):
+            task_policy._last_food = 0.0
+            asyncio.run(task_policy.enforce(client))
+        self.assertEqual(len(applied), 6)
+        self.assertFalse(task_policy.meals_failing())
+        idle = SafetyPolicy(fruitless_meal_limit=3)
+        applied.clear()
+        for _ in range(6):
+            idle._last_food = 0.0
+            asyncio.run(idle.enforce(client))
+        self.assertEqual(len(applied), 3)
+        self.assertTrue(idle.meals_failing())
+        # A minute later she tries it again.
+        idle._fruitless_since -= idle.fruitless_retry_seconds
+        self.assertFalse(idle.meals_failing())
+        asyncio.run(idle.enforce(client))
+        self.assertEqual(len(applied), 4)
 
 
 if __name__ == "__main__":

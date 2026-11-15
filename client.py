@@ -259,7 +259,9 @@ class AtrinikClient:
         self._memory_character = ""
         self.decision_history: list[dict] = []
         # The square and message position of the last spell cast.
-        self.spell_cast: tuple[tuple[str, int, int], int] | None = None
+        # The square, message position and wall-clock time of the last
+        # spell cast.
+        self.spell_cast: tuple[tuple[str, int, int], int, float] | None = None
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: deque[list[float]] = deque(maxlen=post_mortem.MAX_LIVE_VITALS)
         # Each other character's live reports, while this client plays another.
@@ -2449,7 +2451,7 @@ class AtrinikClient:
         if item is not None and item.item_type in MAGIC_CAST_TYPES:
             m = self.state.map
             self.spell_cast = ((m.path, m.world_x, m.world_y),
-                               self.state.message_count)
+                               self.state.message_count, time.time())
 
     async def fire(self, direction: int, item_tag: int = 0) -> None:
         item = self.state.items.get(item_tag)
