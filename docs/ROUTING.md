@@ -931,6 +931,18 @@ can stop a trip (owner decision). Farm trips use selection instead (below).
   hold-fire. Each one records an `essential-route-override` decision, which
   the dashboard shows. Crossing an owner block this way is the owner's
   decision; no other trip crosses a block.
+  - **Bounded wait.** For a budget or strict-plan override, the wait for
+    care is bounded by `CARE_WAIT_SECONDS = 600`. After it she goes anyway
+    and records `essential-care-timeout`.
+  - **Owner blocks are always crossed with care.** An essential trip whose
+    only route crosses an owner block waits for care with no time limit.
+    After `CARE_WAIT_SECONDS` it raises a dashboard alert and keeps
+    waiting.
+  - **Starvation.** A food trip while starving cannot wait for full HP and
+    SP, because she may not regenerate. Its care condition is a ready recall
+    when she owns one, plus hold-fire, including when it crosses an owner
+    block. This is the one exception; it records `essential-care-starving`
+    and the dashboard shows it.
 
 **Farm selection: value minus danger.** A per-spot budget fails at the
 edges: it divides by zero when a rate is 0, goes negative when rankings mix
@@ -998,10 +1010,9 @@ score(spot) = FARM_VALUE_HORIZON_SECONDS × r_spot / r_top − D(spot)
   essential-trip care conditions: full HP and SP, a ready recall when she
   owns one, and transit hold-fire. It records a `farm-route-care` decision,
   shown on the dashboard like an override. The wait for those conditions is
-  bounded by `CARE_WAIT_SECONDS = 600`. If they are not met by then, for
+  bounded by P3's `CARE_WAIT_SECONDS`. If they are not met by then, for
   example because the recall is still recharging, that spot drops out of
-  this selection round and the next-best spot is scored. An essential trip
-  that hits the same bound goes anyway, since it must not strand her.
+  this selection round and the next-best spot is scored.
 
 The rule, and why it is one rule: danger never becomes a wall by itself
 (owner decision). It reorders spots through the score, it makes a dangerous
@@ -1022,17 +1033,19 @@ The guarantees, stated with the death rate they allow:
   0.5^(Δ / 6 h) ≥ 2/3, so for Δ ≤ 6 × log2(1.5) ≈ 3.5 h. Two deaths further
   apart do not pause her. Worst case, with every trip ending in a death: she
   travels only while D < 3000, a death lifts D to at most 4800, and it takes
-  6 × log2(4800 / 3000) ≈ 4.1 h to fall back. So the cap allows at most one
-  transit death per spot about every 4.1 h (about 6 a day) if every careful
-  trip still fails. The existing adaptation pause (an hour after repeated
+  6 × log2(4800 / 3000) ≈ 4.1 h to fall back. If every careful trip still
+  fails, that is two deaths in a burst, a third 1.6 h later (when 3600 s
+  decays to 3000), then a rate converging to one every 4.1 h: about 8
+  deaths in the first 24 h per spot, and about 6 a day after that. The existing adaptation pause (an hour after repeated
   failures at the maximum level) and the kit-hazard skip still apply on
   top.
 - **Chokepoint cap: three deaths close together pause farming.** Three
   deaths spaced Δ apart reach 4500 when 1 + x + x² ≥ 2.5, with
   x = 0.5^(Δ / 6 h), so for Δ ≤ 6 × log2(1 / 0.823) ≈ 1.7 h. Worst case, a
   death lifts D to at most 6300, and it takes 6 × log2(6300 / 4500) ≈ 2.9 h
-  to fall back, so at most one chokepoint death about every 2.9 h, always
-  on a careful trip. This is looser than the ordinary cap on purpose: a
+  to fall back. So: three deaths in a burst, a fourth 1.6 h later (when
+  5400 s decays to 4500), then a rate converging to one every 2.9 h, always
+  on careful trips. This is looser than the ordinary cap on purpose: a
   chokepoint pause stops most farming, and the care rule applies first.
 - **Consistency with #94.** A death on her savebed map adds nothing to `D`,
   so, as in #94, it blocks nothing. A chokepoint death is cost-only, as in
@@ -1259,12 +1272,16 @@ care-crossing machinery: wait for full HP and SP where it is safe, require
 a ready recall, hold fire in transit, and record an override. Essential
 trips cross a block only when it is their only route, with care and an
 `essential-route-override` record. P6 reuses both for budget and strict
-overrides, and P8 for farm-route care. Behaviour changes only when the
-owner sets a block.
+overrides, and P8 for farm-route care. It also defines `CARE_WAIT_SECONDS`
+and its rules: the bounded wait and `essential-care-timeout` for budget and
+strict-plan overrides, the unbounded wait with an alert for owner-block
+crossings, and the starving-food exception (4.5). Behaviour changes only
+when the owner sets a block.
 *Accept:* a block on a synthetic route forces the alternative; with no
 alternative, an optional trip fails with a block reason, and an essential
 trip crosses at full HP and SP with a ready recall and an override shown on
-the dashboard; a block expires on time and can be removed early; writes are
+the dashboard, waiting without limit and alerting after 600 s, while a
+starving food trip waits only for a ready recall; a block expires on time and can be removed early; writes are
 refused off loopback or cross-origin.
 
 **P4. `feat(navigation)`: quest-gated and dialogue edges, behind a flag.**
