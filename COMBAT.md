@@ -451,7 +451,13 @@ steps away and keeps her distance.
     cutting off more than half of what she reaches from the savebed
     (`ROUTE_DEATH_CHOKEPOINT_SHARE`). These keep only the planner's
     penalised cost. Blocking the town map next to her respawn would block
-    all 40 ranked spots.
+    all 40 ranked spots. Several hazards that each stay under the share,
+    but together cut off more than it, also stay cost-only. Repeated deaths
+    on such a map remain possible until the routing design's care and cap
+    rules land (docs/ROUTING.md, https://github.com/atrinik/playtester/pull/95).
+  - Without a known savebed (or with an apartment savebed whose return is
+    not recorded), reach is judged from where she stands. While she stands
+    on a death map, nothing is decided.
   - Each expansion covers the whole world (a few tenths of a second on the
     event loop). Results are cached, and at most one runs every
     `ROUTE_DEATH_SEARCH_INTERVAL_SECONDS` across all callers. None runs in
@@ -467,8 +473,10 @@ steps away and keeps her distance.
   - Live, on 2026-11-14, Sera died six times in 13 minutes at the
     underground city entrance on the way to two circuits that do not farm
     it.
-- **Recall on the way.** Off the farm map (except on her savebed map, where
-  recall leads anyway), the circuit asks the farm task's emergency recall
+- **Recall on the way.** Off the farm map (except within
+  `TRANSIT_RECALL_BED_RADIUS` tiles of her savebed, where recall leads
+  anyway; the rest of an outdoor savebed map is ordinary road), the
+  circuit asks the farm task's emergency recall
   first. It uses the same thresholds, device readiness, charge and
   in-flight handling and the same `emergency-recall` decision, before
   healing and the low-health retreat. Threats count as on the farm

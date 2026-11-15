@@ -4201,15 +4201,15 @@ _reach_search_after = [0.0]
 
 
 def route_death_origin(client: AtrinikClient, graph: "WorldGraph"
-                       ) -> tuple[str, tuple[int, int], tuple[int, int]] | None:
-    """(map, square, component key) where route-death reach is judged from.
+                       ) -> tuple[str, tuple[int, int], tuple[int, int], bool] | None:
+    """(map, square, component key, from savebed) where reach is judged from.
 
     Her savebed, where every death returns her and every farm trip after
     one starts, so verdicts do not depend on where she happens to stand
     (inside the hazard, or behind it). An apartment savebed is left by its
     recorded return. Without a known savebed, where she stands (keyed by
-    her component, so a verdict is never reused from elsewhere). None
-    while no walkable square is known.
+    her component, so a verdict is never reused from elsewhere); the last
+    field says which. None while no walkable square is known.
     """
     state = client.state
     path = getattr(state, "savebed_map", "") or ""
@@ -4217,7 +4217,8 @@ def route_death_origin(client: AtrinikClient, graph: "WorldGraph"
     if path and "/apartments/" in path:
         back = (getattr(state, "apartment_returns", {}) or {}).get(path)
         path, xy = (back[0], (int(back[1][0]), int(back[1][1]))) if back else ("", None)
-    if not path or xy is None or path not in graph.nodes:
+    savebed = bool(path and xy is not None and path in graph.nodes)
+    if not savebed:
         origin = apartment_exit_origin(client)
         path, xy = origin or (state.map.path,
                               (state.map.world_x, state.map.world_y))
@@ -4226,7 +4227,7 @@ def route_death_origin(client: AtrinikClient, graph: "WorldGraph"
     component = graph._component(path, xy)
     if not component:
         return None
-    return path, xy, min(component)
+    return path, xy, min(component), savebed
 
 
 def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
@@ -4237,7 +4238,7 @@ def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
     A search runs only with ``search``, out of combat, and at most once per
     ROUTE_DEATH_SEARCH_INTERVAL_SECONDS across all callers.
     """
-    path, xy, component = origin
+    path, xy, component, _ = origin
     key = (id(graph), path, component, avoided, access)
     if key in _reach_cache:
         return _reach_cache[key]
@@ -4281,6 +4282,10 @@ def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
     origin = route_death_origin(client, graph)
     if origin is None:
         return None
+    if not origin[3] and origin[0] in hazards:
+        # Judged from where she stands, and that is a death map: what it
+        # reaches says nothing about the way in. Wait for another square.
+        return None
     hazards.discard(origin[0])
     hazards.discard(getattr(client.state, "savebed_map", "") or "")
     access = NavigateTask(graph, origin[0])._allow_locked(client)
@@ -4300,7 +4305,14 @@ def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
         return frozenset()
     reach = _reachable_from(client, graph, origin, frozenset(blocking),
                             access, search)
-    return None if reach is None else frozenset(everywhere - reach)
+    if reach is None:
+        return None
+    # Hazards each under the share can together still cut off most of the
+    # world: then the whole set is a chokepoint and stays cost-only.
+    if (len(everywhere - reach) >
+            ROUTE_DEATH_CHOKEPOINT_SHARE * len(everywhere)):
+        return frozenset()
+    return frozenset(everywhere - reach)
 
 
 def analyzer_farm_choice(
@@ -4780,6 +4792,8 @@ class FarmCircuitTask(BotTask):
     BANK_DEPOSIT_WEALTH_OVERRIDE = 10_000
     ROUTINE_TOWN_TRIP_WEIGHT = 0.85
     MASS_IDENTIFY_WEIGHT = 0.70
+    # Within this many tiles of her savebed, a transit recall is pointless.
+    TRANSIT_RECALL_BED_RADIUS = 4
     # How long a map where a route death took combat damage is avoided; as
     # long as a route death there skips farm spots behind it.
     ROUTE_HAZARD_SECONDS = self_improvement.ROUTE_DEATH_HAZARD_SECONDS
@@ -5375,15 +5389,21 @@ class FarmCircuitTask(BotTask):
         here, with its device readiness, charge and in-flight bookkeeping
         (an applied wand is fired on a later tick, a fired recall is not
         repeated, even across a map change), and it records the same
-        emergency-recall decision. It is asked every transit tick except on
-        her savebed map: it acts only on hostile contact at a critical
+        emergency-recall decision. It is asked every transit tick except
+        beside her savebed: it acts only on hostile contact at a critical
         ratio, or to finish a recall it already started. Threats are
         counted as FarmTask counts them (FarmTask.transit_threat_count).
         """
         path = client.state.map.path
-        # Recall leads to the savebed: pointless there, and right after a
-        # recall lands her there it would only spend another charge.
-        if path and path == getattr(client.state, "savebed_map", ""):
+        # Recall leads to the savebed: pointless beside the bed itself. The
+        # rest of an outdoor savebed map is ordinary road (the live bed is
+        # on world_7_79); a recall that just landed is held off by the
+        # farm task's 30 s in-flight guard.
+        bed = getattr(client.state, "savebed_xy", None)
+        if (path and bed and path == getattr(client.state, "savebed_map", "") and
+                max(abs(client.state.map.world_x - bed[0]),
+                    abs(client.state.map.world_y - bed[1])) <=
+                self.TRANSIT_RECALL_BED_RADIUS):
             return False
         hp = int(client.state.stats.get("hp", 0) or 0)
         maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))

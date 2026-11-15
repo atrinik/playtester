@@ -84,6 +84,31 @@ def analyzer_spot(name, paths, monsters, *, aggressive=0):
             "aggressive_spawns": aggressive}
 
 
+class RouteDeathReachIsolation:
+    """Mixin for tests that record route deaths.
+
+    Route-death reach (navigation._reach_cache) is cached per process and
+    rate limited (navigation._reach_search_after): every test starts and
+    ends with neither, whatever ran before it, and searches are not rate
+    limited unless a test patches the interval back.
+    """
+
+    def setUp(self):
+        from . import navigation
+
+        super().setUp()
+
+        def reset():
+            navigation._reach_cache.clear()
+            navigation._reach_search_after[0] = 0.0
+
+        reset()
+        self.addCleanup(reset)
+        patcher = patch.object(navigation, "ROUTE_DEATH_SEARCH_INTERVAL_SECONDS", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
 class StubAnalyzer:
     """A finished farming analyzer with fixed rankings per objective."""
 
@@ -3104,7 +3129,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(cur.cstring(), "hello")
 
 
-class QuestTests(unittest.TestCase):
+class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
     def test_dashboard_experience_progress_uses_server_thresholds(self):
         thresholds = experience_thresholds()
         self.assertEqual(thresholds[9:11], (250000, 500000))
@@ -17383,7 +17408,7 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertIn("--json", command)
 
 
-class AnalyzerFarmSelectionTests(unittest.TestCase):
+class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
     TREES = "/shattered_islands/world_14_79"
     POCKET = "/shattered_islands/world_14_78"
     UPPER = "/shattered_islands/world_14_77"
@@ -17568,18 +17593,6 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
     # Where Sera respawned after each live underground city death.
     RESPAWN = "/shattered_islands/world_7_64_1", (22, 7)
 
-    def setUp(self):
-        from . import navigation
-
-        # Route-death reach is cached per process and rate limited: start
-        # every test from nothing, whatever ran before it.
-        navigation._reach_cache.clear()
-        navigation._reach_search_after[0] = 0.0
-        patcher = patch.object(navigation, "ROUTE_DEATH_SEARCH_INTERVAL_SECONDS", 0.0)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.addCleanup(navigation._reach_cache.clear)
-
     def underground_client(self):
         """Sera at her savebed with circuits A and B behind the entrance."""
         circuit_a = analyzer_spot("UC circuit A", [
@@ -17730,6 +17743,51 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
             self.assertEqual(analyzer_farm_choice(client, graph)[2]["name"],
                              "UC circuit A", where)
 
+    def test_standing_on_a_death_map_without_a_savebed_decides_nothing(self):
+        from .navigation import _farm_starts, route_death_blocked_maps
+
+        client, circuit_a, _ = self.underground_client()
+        graph = built_graph()
+        entrance = self.UC + "0_0"
+        self.route_death(client, circuit_a, entrance)
+        # No savebed (or an apartment one without its recorded return):
+        # judged from where she stands, the entrance itself must not count
+        # as her respawn and unblock itself.
+        for savebed in (("", None), (STARTER_APARTMENT, STARTER_APARTMENT_BED)):
+            client.state.savebed_map, client.state.savebed_xy = savebed
+            client.state.apartment_returns = {}
+            client.state.map.path = entrance
+            client.state.map.world_x, client.state.map.world_y = _farm_starts(
+                graph, entrance)[0]
+            self.assertIsNone(route_death_blocked_maps(client, graph), savebed)
+        # From town, it is blocked again.
+        client.state.map.path, (client.state.map.world_x,
+                                client.state.map.world_y) = self.RESPAWN
+        self.assertIn(entrance, route_death_blocked_maps(client, graph))
+
+    def test_hazards_that_together_cut_off_most_of_the_world_stay_cost_only(self):
+        from . import navigation
+        from .navigation import route_death_blocked_maps
+
+        client, circuit_a, _ = self.underground_client()
+        graph = built_graph()
+        # Ten reachable maps; each death map alone cuts off three of them,
+        # both together six: over half, so the set is a chokepoint.
+        world = {f"/m{index}" for index in range(10)}
+        cut = {"/m0": {"/m0", "/m1", "/m2"}, "/m3": {"/m3", "/m4", "/m5"}}
+
+        def reach(client, graph, origin, avoided, access, search):
+            return frozenset(world - set().union(*(cut[map_path] for map_path in avoided)))
+
+        client.state.farm_adaptations = {"x": {"kit_failures": [
+            {"time": time.time(), "cause": "route", "kind": "death",
+             "map": map_path, "map_damage": 50, "kit": {}} for map_path in cut]}}
+        with patch.object(navigation, "_reachable_from", side_effect=reach):
+            self.assertEqual(route_death_blocked_maps(client, graph), frozenset())
+            with patch.object(navigation, "ROUTE_DEATH_CHOKEPOINT_SHARE", 0.6):
+                self.assertEqual(route_death_blocked_maps(client, graph),
+                                 frozenset(cut["/m0"] | cut["/m3"]))
+
     def test_the_circuit_leaves_a_spot_only_reachable_through_a_death_map(self):
         from . import navigation
 
@@ -17851,6 +17909,24 @@ class AnalyzerFarmSelectionTests(unittest.TestCase):
                                  "brown cave pudding hit you for 40 (-40) acid damage.")
         self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
         self.assertEqual(client.fired, [(0, 0), (0, 0)])
+
+    def test_transit_recall_works_on_an_outdoor_savebed_map_away_from_the_bed(self):
+        client, trees, wand = self.recall_client()
+        circuit = self.circuit(client, trees)
+        farm = circuit.child.task
+        # The live bed is outdoors on world_7_79: on that map, far from the
+        # bed, it is ordinary road.
+        client.state.map.path = "/shattered_islands/world_7_79"
+        client.state.map.world_x, client.state.map.world_y = 2, 2
+        client.state.savebed_map, client.state.savebed_xy = client.state.map.path, (16, 3)
+        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(client.applied, [77])
+        # Beside the bed, recall is pointless.
+        fresh = self.circuit(client, trees)
+        client.state.map.world_x, client.state.map.world_y = 14, 4
+        self.assertFalse(asyncio.run(
+            fresh._transit_emergency_recall(client, fresh.child.task)))
+        self.assertEqual(client.applied, [77])
 
     def test_transit_threats_count_only_active_ones(self):
         client, trees, _ = self.recall_client()
@@ -18874,7 +18950,7 @@ class BuildInfoTests(unittest.TestCase):
             self.assertEqual(record()["label"], "unknown build")
 
 
-class WebTests(unittest.IsolatedAsyncioTestCase):
+class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = AtrinikClient(ClientConfig())
         self.engine = TaskEngine(self.client)
