@@ -478,8 +478,13 @@ steps away and keeps her distance.
     circuit keeps its plan, and stops (`farm-spots-exhausted`) only once its
     own spot is judged blocked and no other spot is usable. Meanwhile a
     plan whose leg is on, or whose route from where she stands crosses, a
-    counting route-death map is held (`farm-route-death-hold`): she heals,
-    eats and defends herself but does not walk on. Live, on 2026-11-16,
+    counting route-death map is held in transit (`farm-route-death-hold`),
+    after the transit recall, healing and the low-health retreat have run:
+    she defends herself but does not walk on. While held, a corpse or loot
+    from that defence does not hold off the search. A verdict still
+    undecided `ROUTE_DEATH_VERDICT_WAIT_SECONDS` (30 s) after the newest
+    failure blocks just the death maps themselves (never her respawn map),
+    which ends the hold and lets selection replan. Live, on 2026-11-16,
     she respawned and walked back towards the entrance that had just
     killed her for three minutes while the verdict stayed undecided. A
     pause after repeated failures rebuilds the farm task as well, so the
@@ -506,21 +511,28 @@ steps away and keeps her distance.
   the first one landed her in town. Live, she had fled at 8-16 hit points
   with a seven-charge recall wand.
 - **A recall counts once it starts.** The server drops a fire without a
-  word while a swing is still recovering (`socket_command_fire`'s
-  `action_attack` check) or when she lacks the source's skill
-  (`check_skill_to_fire`: "magic devices" for rods and wands, "wizardry
-  spells" for the spell). So no recall is fired before her action timer
-  has run out, and none from a source whose skill she visibly lacks. A
-  fire counts only when the server answers "You feel a force starting to
-  build up inside you." (`cast_wor`) within `RECALL_CONFIRM_SECONDS`; only
-  then is `emergency-recall` recorded and the 30 s guard held. An
-  unanswered or refused fire is recorded as `emergency-recall-dropped` and
-  retried on the next eligible tick, never on a square that blocks magic.
-  After `RECALL_SOURCE_REFUSALS` unanswered fires in a row a source gives
-  way to the next one for an hour. Live, on 2026-11-16, three recalls on
-  the underground city entrance, exactly 30 s apart, never started, and
-  she died there. A level-17 wand's force takes about 9 s to land
-  (72 server ticks); it is not cancelled by moving or by damage.
+  word while her previous action is still recovering
+  (`socket_command_fire`'s `action_attack` check), so no recall is fired
+  before her action timer has run out. While it waits she keeps retreating
+  and drinking potions but casts no healing spell (`recall_waiting`), which
+  would restart the timer; the readied device stays readied however long
+  the wait. A fire counts only when the server answers "You feel a force
+  starting to build up inside you." (`cast_wor`) within
+  `RECALL_CONFIRM_SECONDS` (3 s); only then is `emergency-recall` recorded
+  and the 30 s guard held. An unanswered or refused fire is recorded as
+  `emergency-recall-dropped` and retried on the next eligible tick, which
+  also waits for the timer the last fire set: a lagging answer costs at
+  most an extra charge. "Powerful countermagic cancels all spellcasting
+  here!" (`MAP_NOMAGIC`) marks the whole map as blocking magic, so she
+  stops firing anywhere on it; "Something blocks…" marks the square. A rod
+  that "whines for a while" (out of charge) or is "impossible to handle"
+  gives way to the next source for `RECALL_DEVICE_RETRY_SECONDS`. Live, on
+  2026-11-16, three recalls on the underground city entrance, exactly 30 s
+  apart, never started, and she died there. A level-17 wand's force takes
+  about 9 s to land (72 server ticks); it is not cancelled by moving or by
+  damage. The decision is recorded where she is when the answer arrives:
+  retreating across a seam in between, it is recorded on the neighbouring
+  map, and the failure review judges that map.
 - **Healing outpaced.** From the first heal in the last 8 s on, when the
   hits taken are at least what the later heals restored (her health at the
   latest heal is no higher than at the first), healing has stopped keeping

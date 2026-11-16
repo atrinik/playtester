@@ -275,10 +275,11 @@ def hazard_failure(entry: dict) -> bool:
         cause == "route" and entry.get("kind") == "death")
 
 
-def route_death_maps(adaptations: dict | None,
-                     applies: Callable[[dict], bool], *,
-                     now: float | None = None) -> set[str]:
-    """Maps she recently died on, or fled by recall from, on the way to a farm.
+def route_death_times(adaptations: dict | None,
+                      applies: Callable[[dict], bool], *,
+                      now: float | None = None) -> dict[str, float]:
+    """Maps she recently died on, or fled by recall from, on the way to a
+    farm, each with the time of its newest such failure.
 
     Each route death (hazard_failure with cause "route") keeps the map she
     actually died on, the transit map, in its kit failure. That map is a
@@ -295,7 +296,7 @@ def route_death_maps(adaptations: dict | None,
     map_damage was kept counts, a recall stored without it does not.
     """
     now = time.time() if now is None else now
-    maps: set[str] = set()
+    maps: dict[str, float] = {}
     for record in (adaptations or {}).values():
         if not isinstance(record, dict):
             continue
@@ -312,8 +313,17 @@ def route_death_maps(adaptations: dict | None,
             if (hurt and now - float(entry.get("time", 0.0) or 0.0) <=
                     ROUTE_DEATH_HAZARD_SECONDS and
                     applies(entry.get("kit") or {})):
-                maps.add(str(entry["map"]))
+                path = str(entry["map"])
+                maps[path] = max(maps.get(path, 0.0),
+                                 float(entry.get("time", 0.0) or 0.0))
     return maps
+
+
+def route_death_maps(adaptations: dict | None,
+                     applies: Callable[[dict], bool], *,
+                     now: float | None = None) -> set[str]:
+    """The maps of route_death_times."""
+    return set(route_death_times(adaptations, applies, now=now))
 
 
 def record_maps(key: str, record: dict) -> set[str]:

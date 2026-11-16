@@ -17975,21 +17975,38 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
     BUILDING = "You feel a force starting to build up inside you."
 
     def test_a_recall_waits_out_a_swing_instead_of_being_dropped(self):
+        from .tasks import FarmTask, SafetyPolicy, recall_waiting
+
         # Live, 2026-11-16: the server drops a fire while a swing recovers
         # (socket_command_fire's action_attack check) without a word.
         client, trees, wand = self.recall_client()
         wand.flags |= c.ITEM_APPLIED
+        heal = Item(72, item_type=c.TYPE_SPELL, name="minor healing",
+                    extra={"cost": 4})
+        potion = Item(73, item_type=c.TYPE_POTION, quality=80, condition=80,
+                      name="potion of minor healing")
+        client.state.place_item(heal, client.state.player_tag)
+        client.state.place_item(potion, client.state.player_tag)
         circuit = self.circuit(client, trees)
         farm = circuit.child.task
-        client.state.stats["action_time"] = 1.2
-        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        client.state.stats["action_time"] = 5.0
+        # Waiting does not hold her still: retreat and potions run, but no
+        # healing spell restarts the timer the recall waits for.
+        self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
         self.assertEqual(client.fired, [])
-        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
-        self.assertEqual(client.fired, [])
+        self.assertTrue(recall_waiting(client))
+        self.assertEqual(SafetyPolicy()._known_heal(client).tag, 73)
+        # Longer than the apply window, the readied wand is neither
+        # re-applied nor unreadied.
+        farm._emergency_recall_apply_at -= FarmTask.RECALL_APPLY_WINDOW_SECONDS + 1
+        self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertFalse(asyncio.run(farm.restore_combat_loadout(client)))
+        self.assertEqual((client.applied, client.fired), ([], []))
         # The swing has recovered: the next tick fires.
         client.state.stats["action_time"] = 0
         self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
         self.assertEqual(client.fired, [(0, 0)])
+        self.assertFalse(recall_waiting(client))
         client.state.add_message(0, "ffffff", self.BUILDING)
         self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
         self.assertEqual([entry["action"] for entry in client.decision_history
@@ -18003,10 +18020,6 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         # exactly 30 s apart, none of which started, then her death.
         client, trees, wand = self.recall_client()
         wand.flags |= c.ITEM_APPLIED
-        spell = Item(71, item_type=c.TYPE_SPELL, name="word of recall",
-                     extra={"cost": 24})
-        client.state.place_item(spell, client.state.player_tag)
-        client.state.stats["sp"] = 30
         circuit = self.circuit(client, trees)
         farm = circuit.child.task
         self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
@@ -18014,23 +18027,20 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         # Awaiting the answer, she keeps retreating and fires nothing more.
         self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
         self.assertEqual(client.fired, [(0, 0)])
-        # No answer: dropped, and fired again on this tick, not in 30 s.
+        # No answer: dropped, and fired again on this tick, not in 30 s,
+        # though not while the timer her last fire set still runs.
         farm._emergency_recall_sent_at -= FarmTask.RECALL_CONFIRM_SECONDS + 0.1
+        client.state.stats["action_time"] = 0.5
+        self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(client.fired, [(0, 0)])
+        client.state.stats["action_time"] = 0
         self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
         self.assertEqual(client.fired, [(0, 0), (0, 0)])
         actions = [entry["action"] for entry in client.decision_history]
         self.assertIn("emergency-recall-dropped", actions)
         self.assertNotIn("emergency-recall", actions)
-        # A refusal drops it at once, and nothing is fired again on a
-        # square that blocks magic;
-        client.state.add_message(0, "ffffff",
-                                 "Something blocks the magic of your wand.")
-        self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
-        self.assertEqual(client.fired, [(0, 0), (0, 0)])
-        # off it, a wand that keeps going unanswered gives way to the spell.
-        client.state.map.world_x += 1
-        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
-        self.assertEqual(client.fired, [(0, 0), (0, 0), (0, 71)])
+        # The same source is tried again: a lagging answer costs a charge,
+        # never the source.
         client.state.add_message(0, "ffffff", self.BUILDING)
         self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
         self.assertEqual([entry["action"] for entry in client.decision_history
@@ -18039,28 +18049,53 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         # Confirmed, the 30 s guard holds.
         self.assertFalse(asyncio.run(farm.emergency_recall(
             client, ratio=0.05, nearby_count=2, hostile_contact=True)))
-        self.assertEqual(len(client.fired), 3)
+        self.assertEqual(len(client.fired), 2)
 
-    def test_a_recall_device_without_its_skill_is_never_tried(self):
+    def test_countermagic_stops_recalls_on_that_map_only(self):
+        # MAP_NOMAGIC (cast_spell, server/spell_util.c) refuses every spell
+        # anywhere on the map: she stops firing there, not for an hour
+        # everywhere.
+        client, trees, wand = self.recall_client()
+        wand.flags |= c.ITEM_APPLIED
+        circuit = self.circuit(client, trees)
+        farm = circuit.child.task
+        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        client.state.add_message(
+            0, "ffffff", "Powerful countermagic cancels all spellcasting here!")
+        for _ in range(3):
+            client.state.map.world_x += 1
+            self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(client.fired, [(0, 0)])
+        self.assertIn("emergency-recall-dropped",
+                      [entry["action"] for entry in client.decision_history])
+        # On another map the same wand fires again.
+        client.state.map.path = self.UC + "0_1"
+        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(client.fired, [(0, 0), (0, 0)])
+
+    def test_an_uncharged_rod_gives_way_until_it_recharges(self):
         from .tasks import FarmTask
 
-        # check_skill_to_fire drops a wand silently without "magic devices".
-        client, _, wand = self.recall_client()
-        wand.flags |= c.ITEM_APPLIED
-        spell = Item(71, item_type=c.TYPE_SPELL, name="word of recall",
-                     extra={"cost": 24})
-        client.state.place_item(spell, client.state.player_tag)
-        client.state.stats["sp"] = 30
-        client.state.place_item(Item(
-            90, item_type=c.TYPE_SKILL, name="wizardry spells",
-            extra={"level": 10}), client.state.player_tag)
+        client, trees, wand = self.recall_client()
+        rod = Item(78, item_type=c.TYPE_ROD, quality=80, condition=80,
+                   flags=c.ITEM_APPLIED, name="rod of word of recall (lvl 17)")
+        client.state.place_item(rod, client.state.player_tag)
+        circuit = self.circuit(client, trees)
+        farm = circuit.child.task
+        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(client.fired, [(0, 0)])
+        client.state.add_message(
+            0, "ffffff",
+            "The rod of word of recall whines for a while, but nothing happens.")
+        # Dropped at once; the wand is readied next.
+        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(client.applied, [77])
         self.assertEqual([item.tag for item in
-                          FarmTask.emergency_recall_candidates(client)], [71])
-        client.state.place_item(Item(
-            91, item_type=c.TYPE_SKILL, name="magic devices",
-            extra={"level": 3}), client.state.player_tag)
+                          FarmTask.emergency_recall_candidates(client)], [77])
+        # Recharged by then, the rod is a candidate again.
+        client.recall_device_retry_at[78] = 0.0
         self.assertEqual([item.tag for item in
-                          FarmTask.emergency_recall_candidates(client)], [77, 71])
+                          FarmTask.emergency_recall_candidates(client)], [78, 77])
 
     def test_after_a_route_death_in_combat_mode_she_does_not_walk_back(self):
         from . import navigation
@@ -18127,6 +18162,82 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
             elsewhere = self.circuit(client, trees)
             self.assertFalse(asyncio.run(
                 elsewhere._hold_for_route_death_verdict(client)))
+
+    def held_after_route_death(self):
+        """Sera back at her respawn just after dying on the entrance, the
+        verdict still pending, her circuit's route crossing it."""
+        from . import navigation
+
+        entrance = self.UC + "0_0"
+        client, circuit_a, _ = self.underground_client()
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client.farm_analyzer.rankings["xp"].append(trees)
+
+        async def send(packet):
+            pass
+
+        client.send = send
+        circuit = self.circuit(client, circuit_a)
+        circuit.child.navigation.allow_ranged_hazard_fallback = True
+        self.route_death(client, circuit_a, entrance)
+        navigation._reach_cache.clear()
+        navigation._reach_search_after[0] = time.monotonic() + 3600.0
+        self.assertTrue(asyncio.run(circuit._hold_for_route_death_verdict(client)))
+        return client, circuit, entrance
+
+    def test_a_held_verdict_ends_despite_a_corpse_and_after_its_wait(self):
+        from . import navigation
+
+        client, circuit, entrance = self.held_after_route_death()
+        farm = circuit.child.task
+        # Her defence killed something: a suspected corpse is loot, not a
+        # fight, so the verdict's search still runs and she moves on.
+        farm._suspected_corpse_tiles = {(client.state.map.path, 20, 7): 1.0}
+        self.assertTrue(circuit._busy_finishing_fight_or_loot(client, farm))
+        navigation._reach_search_after[0] = 0.0
+        self.assertTrue(circuit._upgrade_progression(client, farm))
+        self.assertEqual(circuit.spot["name"], "Trees")
+        # Never decided (searches kept waiting): after the wait, the death
+        # map alone is blocked and the hold ends.
+        client, circuit, entrance = self.held_after_route_death()
+        for record in client.state.farm_adaptations.values():
+            for entry in record["kit_failures"]:
+                entry["time"] -= navigation.ROUTE_DEATH_VERDICT_WAIT_SECONDS + 1
+        self.assertEqual(navigation.route_death_blocked_maps(client, built_graph()),
+                         frozenset({entrance}))
+        self.assertFalse(asyncio.run(circuit._hold_for_route_death_verdict(client)))
+
+    def test_held_for_a_verdict_she_still_recalls_when_attacked(self):
+        client, circuit, _ = self.held_after_route_death()
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    flags=c.ITEM_APPLIED, name="pine wand of word of recall (lvl 17)")
+        client.state.place_item(wand, client.state.player_tag)
+        fired = []
+
+        async def fire(direction, tag=0):
+            fired.append((direction, tag))
+
+        async def idle(*args, **kwargs):
+            return False
+
+        client.fire = fire
+        circuit.status = TaskStatus.RUNNING
+        circuit.server_clock.sync = idle
+        for name in dir(circuit):
+            if name.startswith("_needs_"):
+                setattr(circuit, name, lambda *args, **kwargs: False)
+        # Attacked on the way (live, on world_5_64), down to critical health.
+        client.state.map.path = "/shattered_islands/world_5_64"
+        client.state.map.world_x, client.state.map.world_y = 13, 8
+        client.state.stats.update(hp=20, maxhp=197)
+        client.state.add_message(2, "ff0000",
+                                 "orc berserker hit you for 60 (-60) physical damage.")
+        asyncio.run(circuit.tick(client))
+        self.assertEqual(fired, [(0, 0)])
+        client.state.add_message(0, "ffffff", self.BUILDING)
+        asyncio.run(circuit.tick(client))
+        self.assertIn("emergency-recall",
+                      [entry["action"] for entry in client.decision_history])
 
     def test_one_damaged_route_recall_blocks_the_spots_behind_it(self):
         from .navigation import analyzer_farm_choice, route_death_blocked_maps
