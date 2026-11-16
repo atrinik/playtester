@@ -39,6 +39,7 @@ import sqlite3
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from . import constants as c
@@ -69,6 +70,16 @@ TIMEOUTS = {
 }
 PERMISSION_DENIED = "you do not have sufficient permissions for that command."
 NO_SUCH_PLAYER = "no such player."
+
+
+def hostile_contact(client: AtrinikClient, seconds: float) -> bool:
+    """``unresolved_hostile_contact`` over server lines only: a player who
+    types "... hit you ..." in chat must not stop or refuse a run."""
+    state = client.state
+    server_lines = [message for message in getattr(state, "messages", ())
+                    if message[1] not in c.PLAYER_CHAT_TYPES]
+    return unresolved_hostile_contact(
+        SimpleNamespace(state=SimpleNamespace(messages=server_lines)), seconds)
 
 
 class OperatorAssistRefused(ValueError):
@@ -297,7 +308,7 @@ class OperatorAssist:
             return "not idle: an idle food trip is running"
         if state.target_id or state.combat:
             return "not at a safe square: she has a target or combat is on"
-        if unresolved_hostile_contact(client, HOSTILE_QUIET_SECONDS):
+        if hostile_contact(client, HOSTILE_QUIET_SECONDS):
             return "not at a safe square: something attacked her recently"
         stats = state.stats
         hp, maxhp = float(stats.get("hp", 0) or 0), float(stats.get("maxhp", 0) or 0)
@@ -319,7 +330,7 @@ class OperatorAssist:
             return ""  # Her reconnect is waited out; nothing can hit her.
         if state.target_id or state.combat:
             return "she got a target or combat turned on"
-        if unresolved_hostile_contact(self.client, HOSTILE_QUIET_SECONDS):
+        if hostile_contact(self.client, HOSTILE_QUIET_SECONDS):
             return "something attacked her"
         stats = state.stats
         hp, maxhp = float(stats.get("hp", 0) or 0), float(stats.get("maxhp", 0) or 0)
@@ -401,9 +412,8 @@ class OperatorAssist:
             record.update(outcome="aborted", failed_step=self._last_step(record),
                           reason=f"{type(error).__name__}: {error}")
         finally:
-            # Release her first: these cannot fail, whatever cleanup does.
+            # Release her first: this cannot fail, whatever cleanup does.
             self.engine.operator_hold = ""
-            self.running = False
             if record["outcome"] == "running":
                 # Cancelled (the bot is shutting down).
                 record.update(outcome="aborted", reason="cancelled",
@@ -412,6 +422,9 @@ class OperatorAssist:
                 if session is not None:
                     await self._end_session(record, session, runner)
             finally:
+                # Only now, after the operator's logout: a second request
+                # during that wait is still refused as already running.
+                self.running = False
                 record["ended_at"] = self.clock()
                 record["carried_after"] = self._carried()
                 # Sera never logs out; a dropped connection of hers is
