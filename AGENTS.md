@@ -10,6 +10,18 @@
   operation and a future client automation API must not own campaign policy.
 - Behave only through ordinary player capabilities. Never depend on privileged
   server state, save-file edits, or validation bypasses.
+- One explicit, narrow exception (owner decision, 2026-11-16): the
+  owner-triggered `operator-assist` command (`operator_assist.py`). An
+  operator character on the same account logs in on a second connection,
+  uses the real `/tp` and `/create goldcoin` commands, and drops at most one
+  gold coin on the played character's square, once per 24 hours; she picks
+  it up. Only the owner starts it, through the loopback dashboard; autoplay,
+  tasks, the client and the task engine must never reference or call it.
+  It stays disabled while `ATRINIK_BOT_OPERATOR_CHARACTER` is empty, audits
+  every run and refusal in her memory, and marks her dashboard and metrics
+  as operator-assisted so later progress is never counted as earned. Do not
+  widen it (more gold, other items, other commands, automatic triggers)
+  without a new owner decision.
 - Source modules remain at repository root and CMake assembles the installable
   `atrinik_bot` package with its native extension under `build/`.
 - Keep `dependencies.lock.json`, the atomic compatibility cache installer,

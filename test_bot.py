@@ -19312,7 +19312,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=19", page)
+        self.assertIn(b"/app.js?v=20", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -19345,6 +19345,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(snapshot["inventory_ready"])
         self.assertEqual(snapshot["economy"], {
             "carried": 0, "banked": 0, "bank_known": False, "total": 0,
+            "operator_assisted_copper": 0,
         })
         self.assertEqual(snapshot["conditions"]["depletion_threshold"], 3)
         self.assertIn("suggested_level", snapshot["quests"][0])
@@ -20126,6 +20127,395 @@ class IdleSurvivalTests(unittest.TestCase):
         self.assertFalse(idle.meals_failing())
         asyncio.run(idle.enforce(client))
         self.assertEqual(len(applied), 4)
+
+
+
+class FakeOperatorSession:
+    """The operator character's connection, against a fake server that
+    shares Sera's square: /tp, /create and a drop behave as the Classic
+    server's (commands/permission/tp.c, content create.py, drop_object)."""
+
+    def __init__(self, sera, *, listed=True, permitted=True, drops=True,
+                 after_drop=None):
+        from .protocol import Event
+
+        self.Event = Event
+        self.sera, self.listed, self.permitted, self.drops = sera, listed, permitted, drops
+        self.after_drop = after_drop
+        self.state = GameState(phase="connecting")
+        self.handlers, self.commands = [], []
+        self.closed = asyncio.Event()
+
+    def add_handler(self, handler):
+        self.handlers.append(handler)
+
+    def _say(self, text):
+        for handler in self.handlers:
+            handler(self.Event("message", (c.CHAT_TYPE_GAME, "ffffff", text)))
+
+    async def run(self):
+        await asyncio.sleep(0)
+        if not self.listed:
+            self.state.phase = "characters"
+        else:
+            self.state.phase = "playing"
+            self.state.player_name = "Opal"
+            self.state.player_tag = 500
+            self.state.inventories[500] = []
+            self.state.map.path = "/hall_of_dms"
+            self.state.map.world_x = self.state.map.world_y = 2
+        await self.closed.wait()
+
+    async def command(self, command):
+        self.commands.append(command)
+        if not self.permitted:
+            self._say("You do not have sufficient permissions for that command.")
+            return
+        if command == f"/tp {self.sera.state.player_name}":
+            sera_map = self.sera.state.map
+            self.state.map.path = sera_map.path
+            self.state.map.world_x, self.state.map.world_y = sera_map.world_x, sera_map.world_y
+        elif command == "/create goldcoin":
+            self.state.items[900] = Item(900, location=500, item_type=c.TYPE_MONEY,
+                                         name="gold coin", quantity=1)
+            self.state.inventories[500].append(900)
+
+    async def move_item(self, destination, tag, quantity=0):
+        if destination != 0 or not self.drops:
+            return
+        self.state.remove_item(tag)
+        sera = self.sera.state
+        sera.items[901] = Item(901, location=0, item_type=c.TYPE_MONEY,
+                               name="gold coin", quantity=quantity)
+        sera.inventories.setdefault(0, []).append(901)
+        if self.after_drop is not None:
+            self.after_drop()
+
+    async def close(self):
+        self.closed.set()
+        self.state.phase = "disconnected"
+
+
+class SeraClient(AtrinikClient):
+    """Sera's live client with the wire replaced: a pickup moves the
+    ground item into her inventory, as the server's ITEM packets would."""
+
+    def __init__(self, memory_path):
+        super().__init__(ClientConfig(host="game", account="acct",
+                                      runtime_state_path=str(memory_path)))
+        state = self.state
+        state.phase, state.player_name, state.player_tag = "playing", "Sera", 100
+        state.inventories[100] = []
+        state.stats.update(hp=300, maxhp=300, food=900, level=20)
+        state.map.path = "/shattered_islands/world_6_59"
+        state.map.world_x, state.map.world_y = 13, 18
+        self.moves = []
+
+    async def send(self, packet):
+        pass
+
+    async def clear_actions(self):
+        self.moves.append("clear")
+
+    async def move_item(self, destination, tag, quantity=0):
+        self.moves.append((destination, tag, quantity))
+        if destination == self.state.player_tag and self.state.phase == "playing":
+            item = self.state.items[tag]
+            self.state.remove_item(tag)
+            self.state.items[902] = Item(902, location=100, item_type=c.TYPE_MONEY,
+                                         name="gold coin", quantity=quantity or item.quantity)
+            self.state.inventories[100].append(902)
+
+
+class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from .operator_assist import OperatorAssist
+
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.memory_path = Path(self.directory.name) / "memory.sqlite3"
+        self.client = SeraClient(self.memory_path)
+        self.engine = TaskEngine(self.client)
+        self.now = [1_800_000_000.0]
+        self.sessions = []
+        self.session_options = {}
+
+        def factory(client, name):
+            self.assertIs(client, self.client)
+            self.assertEqual(name, "Opal")
+            session = FakeOperatorSession(client, **self.session_options)
+            self.sessions.append(session)
+            return session
+
+        self.assist = OperatorAssist(
+            self.client, self.engine, "Opal", session_factory=factory,
+            clock=lambda: self.now[0], poll_seconds=0.005,
+            timeouts={step: 0.3 for step in ("operator-login", "teleport", "create",
+                                              "drop", "operator-logout", "pickup")})
+
+    def stored(self):
+        from .memory import BotMemory
+        from .operator_assist import MEMORY_KIND
+
+        return BotMemory(self.memory_path, server="game:1728",
+                         account="acct").load("Sera", MEMORY_KIND, [])
+
+    async def test_happy_path_hands_her_one_gold_coin_and_marks_her_assisted(self):
+        record = await self.assist.run(1, "sera")
+        self.assertEqual(record["outcome"], "completed", record)
+        session = self.sessions[0]
+        self.assertEqual(session.commands, ["/tp Sera", "/create goldcoin"])
+        self.assertTrue(session.closed.is_set())
+        self.assertEqual(self.client.moves[0], "clear")
+        self.assertEqual(self.client.moves[-1], (100, 901, 1))
+        self.assertEqual(BuyShopUpgradeTask.carried_wallet_value(self.client), 10_000)
+        self.assertEqual((record["carried_before"], record["carried_after"]), (0, 10_000))
+        self.assertEqual(record["coin"], "character")
+        self.assertTrue(record["counts"])
+        self.assertEqual([step["step"] for step in record["steps"]],
+                         ["operator-login", "teleport", "create", "drop",
+                          "operator-logout", "pickup"])
+        self.assertEqual((record["map"], record["x"], record["y"]),
+                         ("/shattered_islands/world_6_59", 13, 18))
+        self.assertEqual(self.engine.operator_hold, "")
+        self.assertFalse(self.assist.running)
+        # The audit record survives in her memory database.
+        self.assertEqual([r["outcome"] for r in self.stored()], ["completed"])
+        self.assertIn("operator-assist",
+                      [d["action"] for d in self.client.decision_history])
+        status = self.assist.status()
+        self.assertTrue(status["assisted"])
+        self.assertEqual(status["copper_total"], 10_000)
+        self.assertEqual(status["next_allowed_at"], self.now[0] + 24 * 3600)
+        # Metrics and the dashboard mark her as assisted from now on.
+        metrics = self.client.metrics.render(operator_assist=status)
+        self.assertIn('atrinik_playtester_operator_assisted{character="sera",'
+                      'server="game:1728"} 1\n', metrics)
+        self.assertIn("atrinik_playtester_operator_assist_copper{", metrics)
+        self.assertIn("} 10000\n", metrics)
+        dashboard = DashboardState(self.client, self.engine, WorldGraph(), {})
+        dashboard.operator_assist = self.assist
+        alerts = {alert["id"]: alert for alert in dashboard.alerts()}
+        self.assertEqual(alerts["operator-assist"]["level"], "info")
+        self.assertIn("not all earned", alerts["operator-assist"]["text"])
+
+    async def test_hold_keeps_tasks_and_idle_survival_from_acting(self):
+        ticks = []
+
+        class Recorder(BotTask):
+            async def tick(self, client):
+                ticks.append(1)
+
+        self.engine.operator_hold = "operator-assist"
+        self.engine.tick_rate = 0.001
+        self.engine.set_task(Recorder("recorder"))
+        runner = asyncio.create_task(self.engine.run())
+        await asyncio.sleep(0.05)
+        self.assertEqual(ticks, [])
+        self.engine.operator_hold = ""
+        await asyncio.sleep(0.05)
+        self.engine.running = False
+        await runner
+        self.assertTrue(ticks)
+
+    async def test_refuses_when_she_is_not_idle_at_a_safe_square(self):
+        from .operator_assist import OperatorAssistRefused
+
+        class Busy(BotTask):
+            async def tick(self, client):
+                pass
+
+        state = self.client.state
+        cases = {
+            "not idle: task farm": lambda: self.engine.set_task(Busy("farm")),
+            "target": lambda: setattr(state, "target_id", 7),
+            "health below": lambda: state.stats.update(hp=200),
+            "food below": lambda: state.stats.update(food=100),
+            "attacked her recently": lambda: state.add_message(
+                c.CHAT_TYPE_GAME, "ff0000", "The kobold hit you for 3 (3) damage."),
+            "not logged in": lambda: setattr(state, "phase", "disconnected"),
+        }
+        for expected, make_unsafe in cases.items():
+            with self.subTest(expected):
+                self.engine.set_task(None)
+                state.target_id, state.phase, state.messages = 0, "playing", []
+                state.stats.update(hp=300, food=900)
+                make_unsafe()
+                with self.assertRaisesRegex(OperatorAssistRefused, expected):
+                    await self.assist.run(1, "Sera")
+        self.assertEqual(self.sessions, [])
+        self.assertEqual(self.engine.operator_hold, "")
+        self.engine.set_task(None)
+        state.target_id, state.phase, state.messages = 0, "playing", []
+        state.stats.update(hp=300, food=900)
+        for gold, to, expected in ((2, "Sera", "1 to 1 gold"), (0, "Sera", "1 to 1 gold"),
+                                   ("1", "Sera", "1 to 1 gold"), (1, "Mallory", "only Sera")):
+            with self.subTest(gold=gold, to=to):
+                with self.assertRaisesRegex(OperatorAssistRefused, expected):
+                    await self.assist.run(gold, to)
+        stored = self.stored()
+        self.assertTrue(stored)
+        self.assertTrue(all(r["outcome"] == "refused" and not r["counts"] for r in stored))
+        self.assertFalse(self.assist.status()["assisted"])
+
+    async def test_one_run_per_24_hours(self):
+        from .operator_assist import OperatorAssistRefused
+
+        self.assertEqual((await self.assist.run(1, "Sera"))["outcome"], "completed")
+        self.now[0] += 23 * 3600
+        with self.assertRaisesRegex(OperatorAssistRefused, "one run per 24 h"):
+            await self.assist.run(1, "Sera")
+        self.assertEqual(len(self.sessions), 1)
+        self.now[0] += 3600 + 1
+        self.assertEqual((await self.assist.run(1, "Sera"))["outcome"], "completed")
+        self.assertEqual(self.assist.status()["copper_total"], 20_000)
+        # The limit also holds across a restart: it is read from memory.
+        from .operator_assist import OperatorAssist
+
+        restarted = OperatorAssist(SeraClient(self.memory_path), TaskEngine(self.client),
+                                   "Opal", clock=lambda: self.now[0] + 60)
+        self.assertIn("one run per 24 h", restarted.refusal(1, "Sera"))
+
+    async def test_abort_mid_sequence_logs_the_operator_out_and_restores_her(self):
+        # The operator lacks the tp permission: nothing was created, so the
+        # run does not count and may be retried at once.
+        self.session_options = {"permitted": False}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["outcome"], record["failed_step"]), ("aborted", "teleport"))
+        self.assertIn("sufficient permissions", record["reason"])
+        self.assertTrue(self.sessions[0].closed.is_set())
+        self.assertEqual((record["coin"], record["counts"]), ("none", False))
+        self.assertEqual(self.engine.operator_hold, "")
+        self.assertEqual((self.client.state.phase, record["character_phase"]),
+                         ("playing", "playing"))
+        self.assertEqual(self.assist.refusal(1, "Sera"), "")
+
+        # The operator character is not on the account.
+        self.session_options = {"listed": False}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual(record["failed_step"], "operator-login")
+        self.assertIn("not on this account", record["reason"])
+
+        # The drop never lands: the coin stays with the operator, and the
+        # run counts.
+        self.session_options = {"drops": False}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["failed_step"], record["coin"], record["counts"]),
+                         ("drop", "operator-inventory", True))
+        self.assertTrue(self.sessions[-1].closed.is_set())
+        self.assertEqual(self.engine.operator_hold, "")
+        self.assertFalse(self.assist.status()["assisted"])
+        self.assertEqual([r["outcome"] for r in self.stored()], ["aborted"] * 3)
+
+    async def test_her_connection_drop_mid_sequence_is_waited_out_or_reported(self):
+        state = self.client.state
+
+        def drop_and_return():
+            state.phase = "disconnected"
+            asyncio.get_running_loop().call_later(0.05, setattr, state, "phase", "playing")
+
+        self.session_options = {"after_drop": drop_and_return}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual(record["outcome"], "completed", record)
+
+        # She does not come back in time: the coin waits on her square.
+        self.now[0] += 25 * 3600
+        state.remove_item(902)
+        self.session_options = {"after_drop": lambda: setattr(state, "phase", "disconnected")}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["outcome"], record["failed_step"], record["coin"]),
+                         ("aborted", "pickup", "ground"))
+        self.assertEqual(record["character_phase"], "disconnected")
+        self.assertEqual(self.engine.operator_hold, "")
+
+    async def test_disabled_by_default(self):
+        from .cli import parser
+        from .operator_assist import OperatorAssist, OperatorAssistRefused
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ATRINIK_BOT_OPERATOR_CHARACTER", None)
+            self.assertEqual(parser().parse_args(["web"]).operator_character, "")
+        disabled = OperatorAssist(self.client, self.engine, "  ")
+        self.assertFalse(disabled.enabled)
+        with self.assertRaisesRegex(OperatorAssistRefused, "disabled"):
+            await disabled.run(1, "Sera")
+        self.assertFalse(disabled.status()["assisted"])
+        metrics = self.client.metrics.render(operator_assist=disabled.status())
+        self.assertIn("atrinik_playtester_operator_assisted{", metrics)
+        self.assertIn("} 0\n", metrics)
+
+    def test_autoplay_and_tasks_cannot_reach_it(self):
+        root = Path(__file__).resolve().parent
+        for module in ("autoplay", "tasks", "navigation", "catalog_quest_tasks",
+                       "quest_tasks", "client", "farm_analyzer", "self_improvement"):
+            with self.subTest(module):
+                source = (root / f"{module}.py").read_text()
+                self.assertNotRegex(source, r"import\s+operator_assist|"
+                                            r"from\s+\.?operator_assist|OperatorAssist")
+        self.assertFalse(any("operator_assist" in name for name in vars(self.client)))
+        self.assertEqual(set(name for name in vars(self.engine) if "operator" in name),
+                         {"operator_hold"})
+
+
+class OperatorAssistRouteTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = WebTests.asyncSetUp
+    asyncTearDown = WebTests.asyncTearDown
+    request = WebTests.request
+
+    def cli_args(self, *extra):
+        from .cli import parser
+
+        return parser().parse_args(["operator-assist", "--give-gold", "1", "--to", "Sera",
+                                     "--web-port", str(self.port), *extra])
+
+    async def test_route_and_cli_refuse_while_disabled(self):
+        from .cli import operator_assist
+
+        status, payload = await self.request("POST", "/api/operator-assist",
+                                             {"gold": 1, "to": "Sera"})
+        self.assertEqual(status, 409, payload)
+        self.assertIn("disabled", json.loads(payload)["error"])
+        with patch("builtins.print"):
+            self.assertEqual(await asyncio.to_thread(operator_assist, self.cli_args()), 1)
+        snapshot = json.loads((await self.request("GET", "/api/state"))[1])
+        self.assertFalse(snapshot["operator_assist"]["enabled"])
+        self.assertEqual(snapshot["economy"]["operator_assisted_copper"], 0)
+
+    async def test_cli_runs_it_through_the_running_bot_then_resumes_autoplay(self):
+        from .cli import operator_assist
+        from .operator_assist import OperatorAssist
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        client = SeraClient(Path(directory.name) / "memory.sqlite3")
+        self.server.client = client
+        self.server.engine.client = client
+        self.server.dashboard.client = client
+        sessions = []
+
+        def factory(_client, name):
+            sessions.append(FakeOperatorSession(client))
+            return sessions[-1]
+
+        assist = OperatorAssist(client, self.server.engine, "Opal",
+                                session_factory=factory, poll_seconds=0.005)
+        self.server.operator_assist = self.server.dashboard.operator_assist = assist
+        with patch("builtins.print"):
+            code = await asyncio.to_thread(operator_assist, self.cli_args("--then-autoplay"))
+        self.assertEqual(code, 0)
+        self.assertEqual(sessions[0].commands, ["/tp Sera", "/create goldcoin"])
+        self.assertIsInstance(self.server.engine.task, AutoplayTask)
+        snapshot = json.loads((await self.request("GET", "/api/state?include=economy,alerts,"
+                                                         "operator_assist"))[1])
+        self.assertEqual(snapshot["economy"]["operator_assisted_copper"], 10_000)
+        self.assertTrue(snapshot["operator_assist"]["assisted"])
+        self.assertIn("operator-assist", [alert["id"] for alert in snapshot["alerts"]])
+        # A second request the same day is refused.
+        self.server.engine.set_task(None)
+        status, payload = await self.request("POST", "/api/operator-assist",
+                                             {"gold": 1, "to": "Sera"})
+        self.assertEqual(status, 409, payload)
+        self.assertIn("24 h", json.loads(payload)["error"])
 
 
 if __name__ == "__main__":

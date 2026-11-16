@@ -28,6 +28,8 @@ from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_far
                          FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
+from .operator_assist import (OperatorAssist, OperatorAssistRefused,
+                              MAX_GOLD_PER_RUN)
 from .quest_tasks import EscapingDesertedIslandTask
 from .quests import QuestDefinition, QuestObjective, flatten_parts, load_catalog
 from .tasks import (BankTask, BotTask, BuyShopUpgradeTask, DepositItemsTask,
@@ -178,6 +180,12 @@ class DashboardState:
         self.client, self.engine = client, engine
         self.graph, self.catalog = graph, catalog
         self.started_at = time.time()
+        # The owner's operator assist, when the dashboard server runs one.
+        self.operator_assist: OperatorAssist | None = None
+
+    def operator_assist_status(self) -> dict[str, Any] | None:
+        assist = self.operator_assist
+        return assist.status() if assist is not None else None
 
     @staticmethod
     def _objective(obj: QuestObjective) -> dict[str, Any]:
@@ -512,11 +520,23 @@ class DashboardState:
                         str(getattr(task, "name", "")).startswith("autoplay"))
         # Moves happen between stats packets; the client reports disconnects.
         watch.observe(self.client.state)
-        return active_alerts(
+        alerts = active_alerts(
             self.client.state, self.client.decision_history, watch,
             autoplay_started_at=(float(getattr(task, "started_at", 0.0) or 0.0)
                                  if autoplay else None),
             task_running=task is not None)
+        assist = self.operator_assist_status()
+        if assist and assist["running"]:
+            alerts.append({"id": "operator-assist-running", "level": "warn",
+                           "text": "Operator assist running: she is held still"})
+        if assist and assist["assisted"]:
+            since = time.strftime("%Y-%m-%d", time.gmtime(assist["first_assisted_at"]))
+            alerts.append({
+                "id": "operator-assist", "level": "info",
+                "text": (f"Operator-assisted since {since} "
+                         f"({assist['copper_total'] // 10_000} gold): later "
+                         "progress is not all earned")})
+        return alerts
 
     def snapshot(self) -> dict[str, Any]:
         state, task = self.client.state, self.engine.task
@@ -590,6 +610,7 @@ class DashboardState:
                 if tag in state.items
             ],
         } for item in state.ground]
+        assist = self.operator_assist_status()
         return {
             "server_time": time.time(), "uptime": time.time() - self.started_at,
             "build": build_info(),
@@ -626,7 +647,10 @@ class DashboardState:
                 "banked": state.bank_balance,
                 "bank_known": state.bank_balance_known,
                 "total": BuyShopUpgradeTask.wallet_value(self.client),
+                # Copper an operator gave her: not earned in play.
+                "operator_assisted_copper": assist["copper_total"] if assist else 0,
             },
+            "operator_assist": assist,
             "task": task_data, "last_task": self.engine.last_task,
             "map": self.map(), "inventory": inventory, "ground": ground,
             "skills": sorted(skills, key=lambda skill: (-skill["level"], skill["name"])),
@@ -663,7 +687,8 @@ class DashboardState:
                      if state.phase == "playing" and
                      state.inventory_replay_complete else None),
             banked=state.bank_balance if state.bank_balance_known else None,
-            predicted_xp=predicted)
+            predicted_xp=predicted,
+            operator_assist=self.operator_assist_status())
 
     def analyzer_farm_spots(self) -> list[dict[str, Any]]:
         """The preferred objective's ranked spots, as manual farm circuits."""
@@ -729,13 +754,20 @@ class DashboardState:
 
 class WebControlServer:
     def __init__(self, client: AtrinikClient, engine: TaskEngine, graph: WorldGraph,
-                 host: str = "127.0.0.1", port: int = 8765):
+                 host: str = "127.0.0.1", port: int = 8765, *,
+                 operator_character: str = "",
+                 operator_assist: OperatorAssist | None = None):
         if not self._is_loopback_host(host):
             raise ValueError("the operator dashboard may only listen on loopback")
         self.client, self.engine, self.graph = client, engine, graph
         self.host, self.port = host, port
         self.catalog = load_catalog()
         self.dashboard = DashboardState(client, engine, graph, self.catalog)
+        # Only this server holds the operator assist: the client and the task
+        # engine (so autoplay and every task) have no way to reach it.
+        self.operator_assist = operator_assist or OperatorAssist(
+            client, engine, operator_character)
+        self.dashboard.operator_assist = self.operator_assist
         client.metrics.attach(engine)
         self.face_images = FaceImages(
             getattr(client, "_runtime_content_root", Path(".")))
@@ -883,6 +915,23 @@ class WebControlServer:
                 await self._reply(writer, 200, image, "image/png",
                                   cache="public, max-age=86400, immutable")
             return
+        if method == "POST" and path == "/api/operator-assist":
+            # The owner's one-shot `atrinik-playtester operator-assist`.
+            data = json.loads(body or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("expected a JSON object")
+            gold = data.get("gold")
+            try:
+                record = await self.operator_assist.run(gold, str(data.get("to", "")))
+            except OperatorAssistRefused as refusal:
+                await self._reply(writer, 409, _json_bytes({
+                    "ok": False, "outcome": "refused", "error": str(refusal),
+                    "max_gold_per_run": MAX_GOLD_PER_RUN}))
+                return
+            await self._reply(writer, 200, _json_bytes({
+                "ok": record["outcome"] == "completed",
+                "outcome": record["outcome"], "record": record}))
+            return
         if method == "POST" and path in ("/api/task", "/api/action"):
             data = json.loads(body or b"{}")
             result = (await self._set_task(data) if path == "/api/task"
@@ -922,6 +971,8 @@ class WebControlServer:
 
     async def _set_task(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
+        if getattr(self.engine, "operator_hold", "") and kind != "stop":
+            raise ValueError("an operator assist is running; start tasks after it ends")
         if kind == "stop":
             # Stop means "no tasks except survival": farming, questing and
             # navigation end, but the engine's idle guard still heals her and

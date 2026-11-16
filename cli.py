@@ -42,6 +42,12 @@ def parser() -> argparse.ArgumentParser:
         "--access-code-file", type=Path,
         help="owner-only file containing the invite code; never pass the code in argv",
     )
+    p.add_argument(
+        "--operator-character",
+        default=os.getenv("ATRINIK_BOT_OPERATOR_CHARACTER", ""),
+        help="another character on the same account with operator permissions; "
+             "enables the owner's operator-assist command (empty: disabled)",
+    )
     p.add_argument("--party-name", default=os.getenv("ATRINIK_BOT_PARTY", ""),
                    help="form or rejoin this open party after every login")
     p.add_argument(
@@ -118,6 +124,19 @@ def parser() -> argparse.ArgumentParser:
     sell.add_argument("--merchant", default="shop-floor",
                       help="legacy task label; stand on a shop floor to sell")
     sell.add_argument("--junk", action="append", required=True)
+    assist = sub.add_parser(
+        "operator-assist",
+        help="owner only: have the operator character give the running bot's "
+             "character gold (at most 1 gold coin, once a day; audited)")
+    assist.add_argument("--give-gold", type=int, required=True, metavar="COINS")
+    assist.add_argument("--to", required=True, metavar="CHARACTER",
+                        help="the character the running bot plays")
+    assist.add_argument("--listen", default="127.0.0.1",
+                        help="the running bot's dashboard address")
+    assist.add_argument("--web-port", type=int, default=8765)
+    assist.add_argument("--then-autoplay", action="store_true",
+                        help="start autoplay again once the coin is picked up")
+    assist.add_argument("--timeout", type=float, default=600.0)
     deposit = sub.add_parser("deposit")
     deposit.add_argument("--container", required=True)
     deposit.add_argument("--item", action="append", required=True)
@@ -204,7 +223,8 @@ async def main_async(args: argparse.Namespace) -> None:
             engine.set_task(AutoplayTask(
                 graph, target_level=args.until_level))
         web_server = WebControlServer(
-            client, engine, graph, args.listen, args.web_port)
+            client, engine, graph, args.listen, args.web_port,
+            operator_character=args.operator_character)
 
     async def report(event):
         if event.kind in ("playing", "characters", "map", "quests", "message"):
@@ -249,8 +269,58 @@ async def main_async(args: argparse.Namespace) -> None:
         await client.close()
 
 
+def operator_assist(args: argparse.Namespace) -> int:
+    """Ask the running bot's dashboard to run one operator assist.
+
+    The running bot does the work: it already holds the account login, and
+    it keeps its character in place meanwhile. This process only posts the
+    request to the loopback dashboard and prints the audit record.
+    """
+    import http.client
+
+    def post(path: str, data: dict) -> tuple[int, dict]:
+        connection = http.client.HTTPConnection(
+            args.listen, args.web_port, timeout=args.timeout)
+        try:
+            connection.request(
+                "POST", path, json.dumps(data),
+                {"Content-Type": "application/json", "Host": "localhost"})
+            response = connection.getresponse()
+            raw = response.read()
+        finally:
+            connection.close()
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            body = {"error": raw.decode("utf-8", "replace")[:500]}
+        return response.status, body if isinstance(body, dict) else {}
+
+    try:
+        status, result = post("/api/operator-assist",
+                              {"gold": args.give_gold, "to": args.to})
+    except OSError as error:
+        print(f"ERROR cannot reach the bot's dashboard at "
+              f"{args.listen}:{args.web_port}: {error}")
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if not result.get("ok"):
+        print(f"operator assist {result.get('outcome', 'failed')} "
+              f"(HTTP {status}): {result.get('error') or result.get('record', {}).get('reason', '')}")
+        return 1
+    if args.then_autoplay:
+        status, started = post("/api/task", {"type": "autoplay", "until_level": 115})
+        if status != 200:
+            print(f"ERROR autoplay did not start (HTTP {status}): {started.get('error', '')}")
+            return 1
+        print("autoplay started")
+    return 0
+
+
 def main() -> None:
     args = parser().parse_args()
+    if args.task == "operator-assist":
+        # Needs no game inputs: it only talks to the running bot.
+        raise SystemExit(operator_assist(args))
     try:
         lock = load_lock()
     except CompatibilityError as error:

@@ -7083,6 +7083,9 @@ class TaskEngine:
         # IdleSurvival, which needs the world graph). Stop means "no tasks
         # except survival": in Atrinik a connected character keeps starving.
         self.idle_survival: Any = None
+        # Set only while the owner's operator assist runs (web dashboard):
+        # nothing of hers acts, so she stands still on her square.
+        self.operator_hold = ""
         self._normalized_stack_locks: set[int] = set()
 
     def set_task(self, task: BotTask | None) -> None:
@@ -7161,6 +7164,9 @@ class TaskEngine:
 
     async def run(self) -> None:
         while self.running:
+            if self.operator_hold:
+                await asyncio.sleep(self.tick_rate)
+                continue
             if await self._normalize_inventory_locks():
                 await asyncio.sleep(self.tick_rate)
                 continue

@@ -241,6 +241,19 @@ class BotMetrics:
             "objective")
         self.task_info = gauge("task_info", "1 for the running top-level task type.", "task")
         self.phase_info = gauge("phase_info", "1 for the current autoplay phase.", "phase")
+        # Owner-triggered operator help (operator_assist.py): from the first
+        # completed run on, her progress is not all earned in play.
+        self.operator_assisted = gauge(
+            "operator_assisted",
+            "1 once an operator character has given her coins: later progress "
+            "is not all earned.")
+        self.operator_assist_copper = gauge(
+            "operator_assist_copper", "Copper operators have given her, in total.")
+        self.operator_assist_last = gauge(
+            "operator_assist_last_timestamp_seconds",
+            "Unix time the last completed operator assist ended.")
+        self.operator_assist_running = gauge(
+            "operator_assist_running", "1 while an operator assist holds her still.")
 
         # Counters, from what the client observes and sends.
         self.kills = counter("kills_total", "Kills reported by the server, by monster.",
@@ -485,7 +498,8 @@ class BotMetrics:
     # Scrape.
 
     def render(self, *, carried: int | None = None, banked: int | None = None,
-               predicted_xp: tuple[str, float] | None = None) -> str:
+               predicted_xp: tuple[str, float] | None = None,
+               operator_assist: dict | None = None) -> str:
         """The exposition text, with the gauges read from live state now."""
         self._accrue()
         client, base = self.client, self.base()
@@ -493,6 +507,8 @@ class BotMetrics:
         for family in (self.connected, self.level, self.experience, self.skill_level,
                        self.skill_experience, self.money_carried, self.money_banked,
                        self.depletion, self.predicted_xp, self.task_info, self.phase_info,
+                       self.operator_assisted, self.operator_assist_copper,
+                       self.operator_assist_last, self.operator_assist_running,
                        *self.vitals.values(), *self.regen.values()):
             # Gauges describe now: an earlier character's or task's are gone.
             family.samples.clear()
@@ -519,6 +535,15 @@ class BotMetrics:
             self.depletion.set(base, int(state.depletion_points or 0))
         if predicted_xp is not None:
             self.predicted_xp.set((*base, clean_label(predicted_xp[0])), predicted_xp[1])
+        if operator_assist is not None:
+            self.operator_assisted.set(base, 1 if operator_assist.get("assisted") else 0)
+            self.operator_assist_copper.set(
+                base, int(operator_assist.get("copper_total", 0) or 0))
+            self.operator_assist_running.set(
+                base, 1 if operator_assist.get("running") else 0)
+            if operator_assist.get("last_assisted_at") is not None:
+                self.operator_assist_last.set(
+                    base, float(operator_assist["last_assisted_at"]))
         task = getattr(self.engine, "task", None)
         if task is not None:
             self.task_info.set((*base, self.tasks(type(task).__name__)), 1)
