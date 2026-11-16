@@ -49,7 +49,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     healing_outpaced, recent_hostile_attackers,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
-                    wand_known_empty)
+                    combat_allowed, wand_known_empty)
 log = logging.getLogger(__name__)
 
 
@@ -3120,7 +3120,8 @@ class NavigateThenTask(BotTask):
 
     async def _defend_while_navigating(self, client: AtrinikClient) -> bool:
         """Pause an encounter approach to heal or clear an aggroed pack."""
-        if not self.combat_approach:
+        if not self.combat_approach or not combat_allowed(client):
+            # In recall mode (combat_allowed) the farm task only retreats.
             return False
         # Threat halos describe this viewport, not permanent terrain. Rebuild
         # them every defensive tick so killing a road pack opens its corridor.
@@ -4177,6 +4178,15 @@ def route_death_maps(client: AtrinikClient) -> set[str]:
     return set(route_death_times(client))
 
 
+def route_death_overdue(client: AtrinikClient) -> bool:
+    """Whether the newest counting route failure is older than
+    ROUTE_DEATH_VERDICT_WAIT_SECONDS: its verdict is searched for despite
+    contact or an unfinished fight."""
+    times = route_death_times(client)
+    return bool(times) and (time.time() - max(times.values()) >=
+                            ROUTE_DEATH_VERDICT_WAIT_SECONDS)
+
+
 def route_death_times(client: AtrinikClient) -> dict[str, float]:
     """route_death_maps, each with its newest counting failure's time."""
     adaptations = getattr(client.state, "farm_adaptations", {}) or {}
@@ -4198,9 +4208,8 @@ def route_death_times(client: AtrinikClient) -> dict[str, float]:
 # have blocked all 40 ranked spots.
 ROUTE_DEATH_CHOKEPOINT_SHARE = 0.5
 # A route death still undecided this long after it happened (she stayed in
-# contact, or the searches kept waiting) blocks just the death maps: a
-# conservative verdict, so neither selection nor the circuit's hold waits
-# for a search for good.
+# contact, or kept finishing fights) is searched anyway, still rate limited:
+# neither selection nor the circuit's hold waits for a search for good.
 ROUTE_DEATH_VERDICT_WAIT_SECONDS = 30.0
 # At most one whole-world reachability search (most of a second on the
 # event loop) per this many seconds, shared by every caller.
@@ -4253,8 +4262,8 @@ def _contact_this_life(client: AtrinikClient, seconds: float = 5.0) -> bool:
 
 
 def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
-                    avoided: frozenset[str], access, search: bool
-                    ) -> frozenset[str] | None:
+                    avoided: frozenset[str], access, search: bool,
+                    overdue: bool = False) -> frozenset[str] | None:
     """Cached reachable_maps from ``origin``; None while not yet searched.
 
     A search runs only with ``search``, without hostile contact, and at most
@@ -4262,13 +4271,14 @@ def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
     is read from the hits on her, not the combat-mode flag: the server turns
     combat mode on with every hit and keeps it through a death, so live the
     flag held a verdict undecided after a route death for as long as she
-    walked back towards the map that killed her.
+    walked back towards the map that killed her. An ``overdue`` verdict
+    (route_death_overdue) is searched despite contact.
     """
     path, xy, component, _ = origin
     key = (id(graph), path, component, avoided, access)
     if key in _reach_cache:
         return _reach_cache[key]
-    if (not search or _contact_this_life(client) or
+    if (not search or (not overdue and _contact_this_life(client)) or
             time.monotonic() < _reach_search_after[0]):
         return None
     if len(_reach_cache) > 256:
@@ -4300,24 +4310,18 @@ def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
     A death on her respawn map, or on a chokepoint, blocks nothing: it
     keeps only the planner's penalised cost. None while still undecided
     (searches are cached and rate limited, _reachable_from); empty when
-    nothing is blocked. Undecided ROUTE_DEATH_VERDICT_WAIT_SECONDS after the
-    newest failure, only the death maps themselves are blocked (still not
-    her respawn map).
+    nothing is blocked. ROUTE_DEATH_VERDICT_WAIT_SECONDS after the newest
+    failure the searches no longer wait for contact to end
+    (route_death_overdue); they stay rate limited, and None still means
+    undecided until they have run.
     """
-    times = route_death_times(client)
-    if not times:
+    hazards = route_death_maps(client)
+    if not hazards:
         return frozenset()
-    hazards = set(times)
+    overdue = route_death_overdue(client)
     origin = route_death_origin(client, graph)
-
-    def undecided() -> frozenset[str] | None:
-        if time.time() - max(times.values()) < ROUTE_DEATH_VERDICT_WAIT_SECONDS:
-            return None
-        return frozenset(hazards - {origin[0] if origin else "",
-                                    getattr(client.state, "savebed_map", "") or ""})
-
     if origin is None:
-        return undecided()
+        return None
     if not origin[3] and origin[0] in hazards:
         # Judged from where she stands, and that is a death map: what it
         # reaches says nothing about the way in. Block only the death maps
@@ -4327,16 +4331,17 @@ def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
     hazards.discard(origin[0])
     hazards.discard(getattr(client.state, "savebed_map", "") or "")
     access = NavigateTask(graph, origin[0])._allow_locked(client)
-    everywhere = _reachable_from(client, graph, origin, frozenset(), access, search)
+    everywhere = _reachable_from(client, graph, origin, frozenset(), access,
+                                 search, overdue)
     if everywhere is None:
-        return undecided()
+        return None
     limit = ROUTE_DEATH_CHOKEPOINT_SHARE * len(everywhere)
     cuts: dict[str, int] = {}
     for hazard in sorted(hazards & everywhere):
         without = _reachable_from(client, graph, origin, frozenset({hazard}),
-                                  access, search)
+                                  access, search, overdue)
         if without is None:
-            return undecided()
+            return None
         if len(everywhere - without) <= limit:
             cuts[hazard] = len(everywhere - without)
     # Hazards each under the share can together still cut off most of the
@@ -4346,9 +4351,9 @@ def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
     blocking = sorted(cuts, key=lambda hazard: (-cuts[hazard], hazard))
     while blocking:
         reach = _reachable_from(client, graph, origin, frozenset(blocking),
-                                access, search)
+                                access, search, overdue)
         if reach is None:
-            return undecided()
+            return None
         if len(everywhere - reach) <= limit:
             return frozenset(everywhere - reach)
         blocking.pop(0)
@@ -5329,7 +5334,8 @@ class FarmCircuitTask(BotTask):
         # verdict, a corpse her defence left does not hold it off.
         busy = self._busy_finishing_fight_or_loot(
             client, farm, loot=not self._verdict_hold)
-        choice = analyzer_farm_choice(client, self.graph, search=not busy)
+        choice = analyzer_farm_choice(
+            client, self.graph, search=not busy or route_death_overdue(client))
         if choice is None:
             # Nothing usable is ranked. Never keep farming a spot that live
             # failures just excluded (quarantined, or only reachable through
@@ -5466,16 +5472,21 @@ class FarmCircuitTask(BotTask):
         The circuit's transit tick asks this after recall, healing and the
         low-health retreat, so she still uses them; here she defends
         herself. While held, a corpse or loot left by that defence does not
-        count as busy (_upgrade_progression), and the verdict never takes
-        longer than ROUTE_DEATH_VERDICT_WAIT_SECONDS after the death.
+        count as busy (_upgrade_progression), and from
+        ROUTE_DEATH_VERDICT_WAIT_SECONDS after the death the verdict is
+        searched despite contact or a fight (route_death_overdue), so the
+        hold lasts at most that plus a few rate-limited searches.
         """
         if not self.analyzer_driven or self.child is None:
             self._verdict_hold = False
             return False
         deaths = route_death_maps(client)
-        if (not deaths or
-                route_death_blocked_maps(client, self.graph, search=False) is not None or
-                not self._route_crosses(client, deaths)):
+        blocked = (route_death_blocked_maps(client, self.graph, search=False)
+                   if deaths else frozenset())
+        # Undecided, or decided against this circuit while a fight delays
+        # the switch (_upgrade_progression): either way, not across it.
+        pending = blocked is None or any(path in blocked for path, _ in self.legs)
+        if not deaths or not pending or not self._route_crosses(client, deaths):
             self._verdict_hold = False
             return False
         if not self._verdict_hold:
@@ -7538,7 +7549,8 @@ class FarmCircuitTask(BotTask):
         if client.state.map.path != self.child.navigation.destination:
             self._reset_dwell_off_farm(client.state.map.path)
             if (isinstance(farm, FarmTask) and
-                    await self._transit_emergency_recall(client, farm)):
+                    (await self._transit_emergency_recall(client, farm) or
+                     await farm.recall_pending_step(client))):
                 return
             hp = int(client.state.stats.get("hp", 0) or 0)
             maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))

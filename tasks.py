@@ -386,11 +386,18 @@ def wand_known_empty(client: AtrinikClient, item: Item) -> bool:
 def recall_waiting(client: AtrinikClient) -> bool:
     """Whether a recall is waiting for her action timer to run out.
 
-    Meanwhile no healing spell is cast: a cast restarts the timer the
-    recall waits for, so the two would starve each other. Potions and
-    retreat still run.
+    This is recall mode (FarmTask.recall_pending_step): every swing or cast
+    restarts the timer the recall waits for (the server's action_attack),
+    so nothing that attacks or casts runs meanwhile: no combat mode, no
+    fight branch, no healing spell. Steps and potions, which leave the
+    timer alone, still run.
     """
     return float(getattr(client, "recall_waiting_until", 0.0) or 0.0) > time.monotonic()
+
+
+def combat_allowed(client: AtrinikClient) -> bool:
+    """The one guard every combat entry point checks: not in recall mode."""
+    return not recall_waiting(client)
 
 
 def effective_action_time(client: AtrinikClient,
@@ -4280,9 +4287,10 @@ class FarmTask(BotTask):
                 any(name in (
                     map_object_semantic(client, obj)
                 ).casefold() for name in proven_attackers))]
+        fight = combat_allowed(client)
         breakout = next((
             (x, y, obj) for x, y, obj in visible_threats
-            if obj.target_id == self._cornered_breakout_target and
+            if fight and obj.target_id == self._cornered_breakout_target and
             max(abs(x - cx), abs(y - cy)) <= 1), None)
         ratio = (int(client.state.stats.get("hp", 0) or 0) /
                  max(1, int(client.state.stats.get("maxhp", 1) or 1)))
@@ -4397,7 +4405,7 @@ class FarmTask(BotTask):
             blockers = [
                 (max(abs(x - cx), abs(y - cy)), x, y, obj)
                 for x, y, obj in visible_threats
-                if max(abs(x - cx), abs(y - cy)) <= 1]
+                if fight and max(abs(x - cx), abs(y - cy)) <= 1]
             if blockers:
                 _, x, y, obj = min(blockers, key=lambda entry: entry[0])
                 self._cornered_breakout_target = obj.target_id
@@ -4479,7 +4487,7 @@ class FarmTask(BotTask):
                              f"target={obj.target_id} adjacent={len(adjacent)} "
                              f"hp={ratio:.0%}")
                 return True
-        if (stand_candidates and not caster_stand and
+        if (stand_candidates and not caster_stand and fight and
                 self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
                 ratio > self.STAND_HEALTH_FLOOR):
             x, y, obj = min(stand_candidates, key=lambda entry: (
@@ -4537,7 +4545,7 @@ class FarmTask(BotTask):
         # Spell-only training never swings at its target while retreating.
         defensive = next((
             (x, y, obj) for x, y, obj in m.targets(friendly=False)
-            if not emergency_disengage and len(threats) == 1 and
+            if fight and not emergency_disengage and len(threats) == 1 and
             obj.target_id == engaged_id and
             not self.spell_only_training(client)), None)
         if defensive is None:
@@ -4787,26 +4795,57 @@ class FarmTask(BotTask):
                 client.recall_waiting_until = time.monotonic() + 1.0
             except AttributeError:
                 pass
+            if getattr(client.state, "combat", False):
+                # A hit turns combat mode back on (attack_player_retarget),
+                # and an auto-swing would restart the timer.
+                await client.set_combat(False)
             return False
         await self._fire_recall(client, source)
+        return True
+
+    async def recall_pending_step(self, client: AtrinikClient) -> bool:
+        """One tick of recall mode: no combat, only potions and retreat.
+
+        True while a recall waits for her action timer (recall_waiting):
+        combat mode stays off, safety may drink a potion (healing spells
+        are held back, SafetyPolicy._known_heal), and otherwise she steps
+        away; low_health_retreat neither breaks out nor stands while
+        combat_allowed is False. The recall fires on the first tick the
+        timer allows (emergency_recall).
+        """
+        if combat_allowed(client):
+            return False
+        if getattr(client.state, "combat", False):
+            await client.set_combat(False)
+        last_heal = self.safety._last_heal
+        await self.safety.enforce(client)
+        if self.safety._last_heal == last_heal:
+            await self.low_health_retreat(client)
+        self._last_action = time.monotonic()
         return True
 
     async def _fire_recall(self, client: AtrinikClient, source: Item) -> None:
         """Send the recall fire from ``source``; its answer is read later."""
         self._emergency_recall_feedback = _message_position(client)
+        try:
+            client.recall_waiting_until = 0.0
+        except AttributeError:
+            pass
         if source.item_type in (c.TYPE_ROD, c.TYPE_WAND):
             await client.fire(0)
             self._recall_fired(client, source)
+            # fire(0) names no item, so the client cannot note where the
+            # readied device was used: note it, so a "Something blocks" or
+            # countermagic answer marks the square and map she fired on.
+            note = getattr(client, "_note_spell_cast", None)
+            if note is not None:
+                note(source)
         else:
             await client.fire(0, source.tag)
         self._emergency_recall_sent_at = time.monotonic()
         self._emergency_recall_apply_at = 0.0
         self._emergency_recall_source = source.tag
         self._emergency_recall_origin = client.state.map.path
-        try:
-            client.recall_waiting_until = 0.0
-        except AttributeError:
-            pass
 
     def _recall_answer(self, client: AtrinikClient) -> bool | str | None:
         """True once the recall force builds, the refusal text if refused,
@@ -5299,6 +5338,8 @@ class FarmTask(BotTask):
                 client, ratio=ratio, nearby_count=nearby_count,
                 hostile_contact=hostile_contact, healing_outpaced=outpaced):
             self._last_action = time.monotonic()
+            return
+        if await self.recall_pending_step(client):
             return
         if (hostile_contact and self._engaged_target is None and
                 not contact_threats and set_aside_threats):

@@ -17797,7 +17797,7 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         world = {f"/m{index}" for index in range(10)}
         cut = {"/m0": {"/m0", "/m1", "/m2"}, "/m3": {"/m3", "/m4", "/m5"}}
 
-        def reach(client, graph, origin, avoided, access, search):
+        def reach(client, graph, origin, avoided, access, search, overdue=False):
             return frozenset(world - set().union(*(cut[map_path] for map_path in avoided)))
 
         client.state.farm_adaptations = {"x": {"kit_failures": [
@@ -18013,6 +18013,57 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
                           if entry["action"].startswith("emergency-recall")],
                          ["emergency-recall"])
 
+    def test_in_recall_mode_she_never_fights_until_the_recall_fires(self):
+        from .tasks import recall_waiting
+
+        # Cornered at critical health with an attacker adjacent, the swing
+        # timer still running: every swing or forced attack would restart
+        # it (action_attack), so combat stays off until the recall fires.
+        client, trees, wand = self.recall_client()
+        wand.flags |= c.ITEM_APPLIED
+        circuit = self.circuit(client, trees)
+        farm = circuit.child.task
+        combat = []
+
+        async def set_combat(enabled, force=False):
+            combat.append(enabled)
+            client.state.combat = enabled
+
+        async def send(packet):
+            pass
+
+        client.set_combat, client.send = set_combat, send
+        # Every step away is blocked: only the breakout would be left.
+        m = client.state.map
+        farm._retreat_blocked.update(
+            (m.path, m.world_x + dx, m.world_y + dy)
+            for dx, dy in c.DIRECTION_DELTAS.values() if dx or dy)
+        client.state.stats["action_time"] = 1.5
+        for _ in range(4):
+            # Each hit turns combat mode back on, server side.
+            client.state.combat = True
+            client.state.add_message(
+                2, "ff0000", "brown cave pudding hit you for 4 (-4) acid damage.")
+            self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+            self.assertTrue(recall_waiting(client))
+            self.assertTrue(asyncio.run(farm.recall_pending_step(client)))
+            self.assertFalse(asyncio.run(circuit.child._defend_while_navigating(client)))
+            asyncio.run(farm.low_health_retreat(client))
+        self.assertTrue(combat)
+        self.assertNotIn(True, combat)
+        self.assertEqual(client.fired, [])
+        self.assertEqual(farm._cornered_breakout_target, 0)
+        # The timer clears: the recall fires at once and is confirmed.
+        client.state.stats["action_time"] = 0
+        self.assertTrue(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertEqual(client.fired, [(0, 0)])
+        self.assertFalse(recall_waiting(client))
+        client.state.add_message(0, "ffffff", self.BUILDING)
+        self.assertFalse(asyncio.run(circuit._transit_emergency_recall(client, farm)))
+        self.assertIn("emergency-recall",
+                      [entry["action"] for entry in client.decision_history])
+        self.assertNotIn(True, combat)
+
     def test_an_unanswered_recall_is_retried_at_once_not_after_30_seconds(self):
         from .tasks import FarmTask
 
@@ -18197,15 +18248,41 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         navigation._reach_search_after[0] = 0.0
         self.assertTrue(circuit._upgrade_progression(client, farm))
         self.assertEqual(circuit.spot["name"], "Trees")
-        # Never decided (searches kept waiting): after the wait, the death
-        # map alone is blocked and the hold ends.
+
+    def test_an_overdue_verdict_is_searched_despite_a_fight(self):
+        from . import navigation
+
+        # Still in contact, and fighting, past the verdict's wait: no circuit
+        # behind the entrance is chosen while it is undecided, and the
+        # search then runs anyway and decides it.
         client, circuit, entrance = self.held_after_route_death()
+        farm = circuit.child.task
         for record in client.state.farm_adaptations.values():
             for entry in record["kit_failures"]:
                 entry["time"] -= navigation.ROUTE_DEATH_VERDICT_WAIT_SECONDS + 1
-        self.assertEqual(navigation.route_death_blocked_maps(client, built_graph()),
-                         frozenset({entrance}))
-        self.assertFalse(asyncio.run(circuit._hold_for_route_death_verdict(client)))
+        client.state.add_message(2, "ff0000",
+                                 "orc berserker hit you for 10 (-10) physical damage.")
+        self.assertTrue(circuit._busy_finishing_fight_or_loot(client, farm))
+        graph = built_graph()
+        # Rate limited: still undecided, nothing chosen, still held.
+        self.assertIsNone(navigation.route_death_blocked_maps(client, graph))
+        self.assertIsNone(navigation.analyzer_farm_choice(client, graph))
+        self.assertFalse(circuit._upgrade_progression(client, farm))
+        self.assertEqual(circuit.spot["name"], "UC circuit A")
+        self.assertTrue(asyncio.run(circuit._hold_for_route_death_verdict(client)))
+        # The forced search decides it, contact or not; the circuit behind
+        # the entrance stays blocked and the decided verdict keeps her held
+        # until the fight ends and the switch can happen.
+        navigation._reach_search_after[0] = 0.0
+        self.assertFalse(circuit._upgrade_progression(client, farm))
+        blocked = navigation.route_death_blocked_maps(client, graph, search=False)
+        self.assertTrue({entrance, self.UC + "2_2"} <= blocked)
+        self.assertEqual(navigation.analyzer_farm_choice(
+            client, graph, search=False)[2]["name"], "Trees")
+        self.assertTrue(asyncio.run(circuit._hold_for_route_death_verdict(client)))
+        client.state.messages.clear()
+        self.assertTrue(circuit._upgrade_progression(client, farm))
+        self.assertEqual(circuit.spot["name"], "Trees")
 
     def test_held_for_a_verdict_she_still_recalls_when_attacked(self):
         client, circuit, _ = self.held_after_route_death()

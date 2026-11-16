@@ -481,10 +481,14 @@ steps away and keeps her distance.
     counting route-death map is held in transit (`farm-route-death-hold`),
     after the transit recall, healing and the low-health retreat have run:
     she defends herself but does not walk on. While held, a corpse or loot
-    from that defence does not hold off the search. A verdict still
-    undecided `ROUTE_DEATH_VERDICT_WAIT_SECONDS` (30 s) after the newest
-    failure blocks just the death maps themselves (never her respawn map),
-    which ends the hold and lets selection replan. Live, on 2026-11-16,
+    from that defence does not hold off the search. From
+    `ROUTE_DEATH_VERDICT_WAIT_SECONDS` (30 s) after the newest failure the
+    search runs despite contact or an unfinished fight
+    (`route_death_overdue`), still rate limited, so the hold lasts at most
+    about that long plus a few searches; until a search completes the
+    verdict stays undecided and nothing behind the death map is chosen. A
+    decided verdict against her circuit keeps her held while a fight delays
+    the switch. Live, on 2026-11-16,
     she respawned and walked back towards the entrance that had just
     killed her for three minutes while the verdict stayed undecided. A
     pause after repeated failures rebuilds the farm task as well, so the
@@ -513,10 +517,15 @@ steps away and keeps her distance.
 - **A recall counts once it starts.** The server drops a fire without a
   word while her previous action is still recovering
   (`socket_command_fire`'s `action_attack` check), so no recall is fired
-  before her action timer has run out. While it waits she keeps retreating
-  and drinking potions but casts no healing spell (`recall_waiting`), which
-  would restart the timer; the readied device stays readied however long
-  the wait. A fire counts only when the server answers "You feel a force
+  before her action timer has run out. While it waits she is in recall
+  mode (`recall_waiting`, checked by `combat_allowed` at every combat
+  entry point): combat mode is kept off (a hit turns it back on server
+  side), and no fight branch, cornered breakout, pursued stand, transit
+  defence or healing spell runs, since each would restart the timer. She
+  still steps away and drinks potions, which leave it alone, and the
+  readied device stays readied however long the wait. The fire is noted
+  where she stands, so a "Something blocks" or countermagic answer marks
+  that square or map. A fire counts only when the server answers "You feel a force
   starting to build up inside you." (`cast_wor`) within
   `RECALL_CONFIRM_SECONDS` (3 s); only then is `emergency-recall` recorded
   and the 30 s guard held. An unanswered or refused fire is recorded as
