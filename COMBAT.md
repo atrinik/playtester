@@ -488,7 +488,11 @@ steps away and keeps her distance.
     about that long plus a few searches; until a search completes the
     verdict stays undecided and nothing behind the death map is chosen. A
     decided verdict against her circuit keeps her held while a fight delays
-    the switch. Live, on 2026-11-16,
+    the switch. Only an undecided overdue verdict is searched mid-fight,
+    and no town route is planned for it. While held, only her own
+    engagement or hostile contact in this life is a fight: a target the
+    server selected that has stopped attacking (a guard still in view) is
+    not. Live, on 2026-11-16,
     she respawned and walked back towards the entrance that had just
     killed her for three minutes while the verdict stayed undecided. A
     pause after repeated failures rebuilds the farm task as well, so the

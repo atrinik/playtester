@@ -4361,7 +4361,8 @@ def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
 
 
 def analyzer_farm_choice(
-        client: AtrinikClient, graph: "WorldGraph", *, search: bool = True
+        client: AtrinikClient, graph: "WorldGraph", *, search: bool = True,
+        search_verdict: bool | None = None
 ) -> tuple[str, tuple[tuple[str, str], ...], dict] | None:
     """The objective farmed now, with its highest-ranked usable spot.
 
@@ -4378,7 +4379,9 @@ def analyzer_farm_choice(
     a route death is still being judged (route_death_blocked_maps returns
     None), nothing is usable yet and None is returned. Without ``search``
     (the dashboard and metrics), only cached results are read: no
-    whole-world search runs on their behalf.
+    whole-world search runs on their behalf. ``search_verdict`` overrides
+    ``search`` for the route-death verdict alone (an overdue one is
+    searched mid-fight); town routes still follow ``search``.
 
     While depleted, a safety spot is skipped once any map on it is known not
     to reach every town service on a strictly safe route
@@ -4403,7 +4406,8 @@ def analyzer_farm_choice(
     hazardous = []
     # No pick, the fallbacks included, may send her back across a map that
     # just killed her; with no route death recorded, nothing is searched.
-    blocked = route_death_blocked_maps(client, graph, search=search)
+    blocked = route_death_blocked_maps(
+        client, graph, search=search if search_verdict is None else search_verdict)
     if blocked is None:
         return None
     for objective in dict.fromkeys(
@@ -5331,11 +5335,17 @@ class FarmCircuitTask(BotTask):
         if not self.analyzer_driven:
             return False
         # No whole-world search mid-fight or mid-loot; while held for this
-        # verdict, a corpse her defence left does not hold it off.
+        # verdict, a corpse her defence left, or a target the server
+        # selected that is not fighting her, does not hold it off.
         busy = self._busy_finishing_fight_or_loot(
-            client, farm, loot=not self._verdict_hold)
+            client, farm, held=self._verdict_hold)
+        # An overdue verdict still undecided is searched even mid-fight,
+        # that verdict alone: town routes are not planned mid-fight.
+        overdue = (route_death_overdue(client) and
+                   route_death_blocked_maps(client, self.graph, search=False) is None)
         choice = analyzer_farm_choice(
-            client, self.graph, search=not busy or route_death_overdue(client))
+            client, self.graph, search=not busy,
+            search_verdict=not busy or overdue)
         if choice is None:
             # Nothing usable is ranked. Never keep farming a spot that live
             # failures just excluded (quarantined, or only reachable through
@@ -6889,7 +6899,15 @@ class FarmCircuitTask(BotTask):
     @staticmethod
     def _busy_finishing_fight_or_loot(client: AtrinikClient,
                                       farm: FarmTask, *,
-                                      loot: bool = True) -> bool:
+                                      held: bool = False) -> bool:
+        """Whether a fight or loot is still being finished.
+
+        ``held`` (held for a route-death verdict): only an engagement of
+        hers or hostile contact in this life counts. A corpse or loot left
+        by her defence does not, nor a target the server selected for her
+        (attack_player_retarget) that has stopped attacking, such as a
+        stationary guard still in view: either would hold her for good.
+        """
         selected_is_visible = any(
             obj.target_id == client.state.target_id
             for _, _, obj in client.state.map.targets(friendly=False))
@@ -6911,10 +6929,10 @@ class FarmCircuitTask(BotTask):
             client.state.combat and client.state.target_id and
             int(client.state.stats.get("target_hp", 0) or 0) > 0)
         # Hits from before her last death were her last life's fight.
-        fighting = bool(
-            selected_is_visible or selected_is_alive or
-            _contact_this_life(client) or farm._engaged_target)
-        return fighting or loot and bool(
+        fighting = bool(_contact_this_life(client) or farm._engaged_target)
+        if held:
+            return fighting
+        return fighting or selected_is_visible or selected_is_alive or bool(
             corpse_with_contents or
             corpse_operation or farm._suspected_corpse_tiles or
             farm._suspected_corpse_probe)

@@ -18284,6 +18284,54 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertTrue(circuit._upgrade_progression(client, farm))
         self.assertEqual(circuit.spot["name"], "Trees")
 
+    def test_a_server_selected_bystander_does_not_hold_her(self):
+        from . import navigation
+
+        # The server selects whoever hits her (attack_player_retarget); a
+        # stationary guard that stopped attacking stays selected and in
+        # view. Held for the verdict, that is not a fight to finish.
+        client, circuit, _ = self.held_after_route_death()
+        farm = circuit.child.task
+        m = client.state.map
+        m.tile(m.width // 2 + 2, m.height // 2).objects[3] = MapObject(
+            3, 1, 0, 0, name="guard", target_id=300, target_hp=100)
+        client.state.target_id = 300
+        self.assertTrue(circuit._busy_finishing_fight_or_loot(client, farm))
+        self.assertFalse(circuit._busy_finishing_fight_or_loot(client, farm, held=True))
+        navigation._reach_search_after[0] = 0.0
+        self.assertTrue(circuit._upgrade_progression(client, farm))
+        self.assertEqual(circuit.spot["name"], "Trees")
+
+    def test_a_decided_verdict_is_not_searched_again_mid_fight(self):
+        from . import navigation
+
+        client, circuit, _ = self.held_after_route_death()
+        farm = circuit.child.task
+        for record in client.state.farm_adaptations.values():
+            for entry in record["kit_failures"]:
+                entry["time"] -= navigation.ROUTE_DEATH_VERDICT_WAIT_SECONDS + 1
+        client.state.add_message(2, "ff0000",
+                                 "orc berserker hit you for 10 (-10) physical damage.")
+        calls = []
+        real = navigation.analyzer_farm_choice
+
+        def spy(*args, **kwargs):
+            calls.append((kwargs.get("search"), kwargs.get("search_verdict")))
+            return real(*args, **kwargs)
+
+        with patch.object(navigation, "analyzer_farm_choice", side_effect=spy):
+            # Overdue and undecided: the verdict alone is searched; town
+            # routes are not planned mid-fight.
+            circuit._upgrade_progression(client, farm)
+            self.assertEqual(calls[-1], (False, True))
+            navigation._reach_search_after[0] = 0.0
+            circuit._upgrade_progression(client, farm)
+            self.assertIsNotNone(navigation.route_death_blocked_maps(
+                client, built_graph(), search=False))
+            # Decided: nothing more is searched while the fight lasts.
+            circuit._upgrade_progression(client, farm)
+            self.assertEqual(calls[-1], (False, False))
+
     def test_held_for_a_verdict_she_still_recalls_when_attacked(self):
         client, circuit, _ = self.held_after_route_death()
         wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
