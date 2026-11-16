@@ -570,10 +570,13 @@ fights or moves:
 - during the run `TaskEngine.operator_hold` skips every engine tick: no
   task, no idle survival (#97) and no idle safety policy, so the food-trip
   guard cannot walk her off the square the coin lands on. The hold usually
-  lasts seconds; the step timeouts bound it to about three and a half
-  minutes (a food loss of about 50), and it is always released, also when
-  a step fails;
-- dashboard task requests other than Stop are refused while it holds her.
+  lasts seconds; the step timeouts bound it to under three minutes (a
+  food loss of about 40), and it is always released, also when a step
+  fails or the run is cancelled;
+- the run aborts, and releases her at once, if she gets a target, combat
+  turns on, something hits her or her health falls below 90%;
+- dashboard task requests other than Stop, and manual actions, are refused
+  while it holds her.
 
 The money still pays for the depletion removal through the ordinary temple
 service. Her dashboard and metrics keep an `operator-assisted` marker from

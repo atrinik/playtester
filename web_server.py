@@ -1152,6 +1152,10 @@ class WebControlServer:
 
     async def _action(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
+        if (getattr(self.engine, "operator_hold", "") and
+                kind not in ("farm_objective", "refresh_quests")):
+            # A manual order would move her or her gold mid-run.
+            raise ValueError("an operator assist is running; act after it ends")
         if kind in ("move", "dialog", "apply", "apply_ground"):
             # A manual order would fight a running idle food trip.
             self._hold_idle_survival(f"manual {kind}")

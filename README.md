@@ -264,7 +264,8 @@ the coin reached her. The running bot then:
    logged in, no task or idle food trip, no target or combat, nothing hit her
    in the last 10 seconds, health at least 90% and food at least 300;
 2. holds her still (`TaskEngine.operator_hold`: no task, idle survival or
-   inventory upkeep acts) and cancels her queued movement;
+   inventory upkeep acts; dashboard tasks other than Stop and manual
+   actions are refused) and cancels her queued movement;
 3. logs the operator character in on a second connection. The Classic server
    lets one account play several characters at once; it only replaces a
    second session of the same character (`player_login`). She stays logged
@@ -274,16 +275,24 @@ the coin reached her. The running bot then:
    inventory), drops exactly that coin and logs out;
 5. has her pick the coin up from her square, then releases the hold.
 
-Each step has a timeout. Any failure aborts the run: the operator is logged
-out, the hold is released, and the record says which step failed and where
-the coin is (`none`, `operator-inventory`, `ground` on her recorded square,
-or `character`). If her own connection drops meanwhile, her normal reconnect
-restores her and the pickup waits up to a minute for her. A run that failed
-before `/create` does not count toward the daily limit.
+Each step has a timeout, and before every order and on every poll it checks
+that holding her is still safe (no target or combat, no hit on her, health
+at least 90%), because the hold also suspends her idle healing. Any failure
+aborts the run: the operator is logged out, the hold is released, and the
+record says which step failed and where the coin is (`none`,
+`operator-inventory`, `ground` on her recorded square, or `character`). If
+her own connection drops meanwhile, her normal reconnect restores her and
+the pickup waits for her. A run that failed before `/create`, or whose
+`/create` the server refused for lack of permission, does not count toward
+the daily limit; a run whose counted record cannot be saved never sends
+`/create`.
 
-Every run and refusal is an audit record in her memory database
-(`memory.sqlite3`, kind `operator_assist`, the last 200) and in the decision
-log (`operator-assist`). From the first completed run on, the dashboard shows
+Every run and refusal while enabled is an audit record in her memory
+database (`memory.sqlite3`, kind `operator_assist`) and in the decision log
+(`operator-assist`). The list keeps 200 records, trimming only refusals and
+runs that never reached `/create`, so the daily limit and the assisted mark
+can never be pushed out. Gold counts as given once the coin left the
+operator (it reached her square or her pack). From then on, the dashboard shows
 an `Operator-assisted since …` header notice and the coins given next to her
 wealth, and the metrics above mark her as assisted: progress after it is not
 counted as earned.

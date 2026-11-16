@@ -65,7 +65,7 @@ TIMEOUTS = {
     "create": 15.0,
     "drop": 15.0,
     "operator-logout": 10.0,
-    "pickup": 60.0,
+    "pickup": 30.0,
 }
 PERMISSION_DENIED = "you do not have sufficient permissions for that command."
 NO_SUCH_PLAYER = "no such player."
@@ -98,6 +98,21 @@ def gold_stack(items: list) -> tuple[int, Any]:
         if largest is None or item.quantity > largest.quantity:
             largest = item
     return total, largest
+
+
+def _well_formed(record: Any) -> bool:
+    """A stored record the status can read: a damaged one is skipped."""
+    if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+        return False
+    return all(isinstance(record.get(key, 0), (int, float)) and
+               not isinstance(record.get(key, 0), bool)
+               for key in ("started_at", "ended_at", "copper"))
+
+
+def _keeps_evidence(record: dict) -> bool:
+    """Whether a record bounds the daily limit or proves she was given gold:
+    such records are never trimmed."""
+    return bool(record.get("counts")) or record.get("coin") in ("ground", "character")
 
 
 class OperatorSession(AtrinikClient):
@@ -173,12 +188,13 @@ class OperatorAssist:
                 log.warning("could not read operator-assist records: %s", error)
                 return []
             self._cache = (key, [record for record in stored
-                                 if isinstance(record, dict)]
+                                 if _well_formed(record)]
                            if isinstance(stored, list) else [])
         return self._cache[1]
 
-    def _save(self, record: dict) -> None:
-        """Insert or update ``record`` in the played character's audit list."""
+    def _save(self, record: dict) -> bool:
+        """Insert or update ``record`` in the played character's audit list;
+        False when the memory database could not store it."""
         character = record["character"]
         records = list(self.records()) if (
             self._character().casefold() == character.casefold()) else []
@@ -188,25 +204,41 @@ class OperatorAssist:
                 break
         else:
             records.append(dict(record))
-        del records[:-MAX_RECORDS]
+        # Refusals and runs that never reached /create are trimmed oldest
+        # first; evidence of a counted run or given gold is kept for good.
+        excess = len(records) - MAX_RECORDS
+        if excess > 0:
+            kept = []
+            for existing in records:
+                if excess > 0 and not _keeps_evidence(existing) and (
+                        existing.get("id") != record["id"]):
+                    excess -= 1
+                    continue
+                kept.append(existing)
+            records = kept
         self._cache = (character.casefold(), records)
+        saved = True
         try:
             self.client._memory_store().save(character, MEMORY_KIND, records)
         except (OSError, sqlite3.Error) as error:
             # The log line below still carries the record.
             log.error("could not save operator-assist record: %s", error)
+            saved = False
         level = (logging.INFO if record["outcome"] in ("running", "completed")
                  else logging.WARNING)
         log.log(level, "operator assist %s: %s", record["outcome"], {
             key: record.get(key) for key in (
                 "id", "character", "operator_character", "gold", "map", "x",
                 "y", "failed_step", "reason", "coin")})
+        return saved
 
     def status(self) -> dict[str, Any]:
         """The dashboard's and metrics' view: whether, when and how much."""
         records = self.records()
+        # Given: the coin reached her square or her pack. A coin left on
+        # her square by an aborted run is hers to loot, so it counts too.
         completed = [record for record in records
-                     if record.get("outcome") == "completed"]
+                     if record.get("coin") in ("ground", "character")]
         counted = [float(record.get("started_at", 0.0))
                    for record in records if record.get("counts")]
         last = max(counted) if counted else None
@@ -214,13 +246,14 @@ class OperatorAssist:
             "enabled": self.enabled,
             "running": self.running,
             "assisted": bool(completed),
-            "completed_runs": len(completed),
+            "completed_runs": sum(1 for record in records
+                                  if record.get("outcome") == "completed"),
             "copper_total": sum(int(record.get("copper", 0) or 0)
                                 for record in completed),
-            "first_assisted_at": (min(float(record["ended_at"]) for record in completed)
-                                  if completed else None),
-            "last_assisted_at": (max(float(record["ended_at"]) for record in completed)
-                                 if completed else None),
+            "first_assisted_at": (min(float(record.get("ended_at", record.get("started_at", 0.0)))
+                                      for record in completed) if completed else None),
+            "last_assisted_at": (max(float(record.get("ended_at", record.get("started_at", 0.0)))
+                                     for record in completed) if completed else None),
             "next_allowed_at": last + COOLDOWN_SECONDS if last is not None else None,
             "max_gold_per_run": MAX_GOLD_PER_RUN,
             "records": [dict(record) for record in records[-10:]],
@@ -277,6 +310,29 @@ class OperatorAssist:
 
     # The sequence.
 
+
+    def _danger(self) -> str:
+        """Why holding her still is no longer safe, or "": checked on every
+        poll, since the hold also suspends her idle healing and fleeing."""
+        state = self.client.state
+        if state.phase != "playing":
+            return ""  # Her reconnect is waited out; nothing can hit her.
+        if state.target_id or state.combat:
+            return "she got a target or combat turned on"
+        if unresolved_hostile_contact(self.client, HOSTILE_QUIET_SECONDS):
+            return "something attacked her"
+        stats = state.stats
+        hp, maxhp = float(stats.get("hp", 0) or 0), float(stats.get("maxhp", 0) or 0)
+        if maxhp > 0 and hp < MIN_HEALTH_FRACTION * maxhp:
+            return f"her health fell below {MIN_HEALTH_FRACTION:.0%}"
+        return ""
+
+    def _ensure_safe(self, step: str) -> None:
+        """Before each order to the server: abort while holding her is unsafe."""
+        danger = self._danger()
+        if danger:
+            raise OperatorAssistAborted(step, f"not safe to hold her: {danger}")
+
     async def run(self, gold: Any, to: str) -> dict:
         """Run the assist once; return its audit record.
 
@@ -291,7 +347,7 @@ class OperatorAssist:
             "started_at": now,
             "character": state.player_name or self.client.config.character,
             "operator_character": self.operator_character,
-            "gold": gold if isinstance(gold, int) else 0,
+            "gold": gold if isinstance(gold, int) and not isinstance(gold, bool) else 0,
             "copper": (gold * GOLD_COPPER
                        if isinstance(gold, int) and not isinstance(gold, bool) else 0),
             "map": state.map.path, "x": state.map.world_x, "y": state.map.world_y,
@@ -304,26 +360,28 @@ class OperatorAssist:
         }
         reason = self.refusal(gold, to)
         if reason:
-            if record["character"]:
+            # A disabled feature keeps no records: nothing could have run.
+            if record["character"] and self.enabled:
                 record.update(outcome="refused", reason=reason, ended_at=now)
                 self._save(record)
             raise OperatorAssistRefused(reason)
+        # Nothing awaits between the refusal check and this flag.
         self.running = True
-        record["carried_before"] = self._carried()
-        self._save(record)
-        self.client.record_action(
-            "operator-assist",
-            f"started: {gold} gold for {record['character']} from operator "
-            f"{self.operator_character} at {record['map']} "
-            f"({record['x']}, {record['y']})")
-        # Nothing of hers runs meanwhile: no task, no idle survival, no
-        # inventory upkeep. She stands still on the recorded square.
-        self.engine.operator_hold = "operator-assist"
-        survival = getattr(self.engine, "idle_survival", None)
-        if survival is not None:
-            survival.drop()
         session, runner = None, None
         try:
+            record["carried_before"] = self._carried()
+            self._save(record)
+            self.client.record_action(
+                "operator-assist",
+                f"started: {gold} gold for {record['character']} from operator "
+                f"{self.operator_character} at {record['map']} "
+                f"({record['x']}, {record['y']})")
+            # Nothing of hers runs meanwhile: no task, no idle survival, no
+            # inventory upkeep. She stands still on the recorded square.
+            self.engine.operator_hold = "operator-assist"
+            survival = getattr(self.engine, "idle_survival", None)
+            if survival is not None:
+                survival.drop()
             with contextlib.suppress(ConnectionError):
                 await self.client.clear_actions()
             session = self.session_factory(self.client, self.operator_character)
@@ -340,34 +398,38 @@ class OperatorAssist:
                           reason=error.reason)
         except Exception as error:
             log.exception("operator assist failed")
-            record.update(outcome="aborted",
-                          failed_step=record["steps"][-1]["step"]
-                          if record["steps"] else "start",
+            record.update(outcome="aborted", failed_step=self._last_step(record),
                           reason=f"{type(error).__name__}: {error}")
         finally:
-            if record["outcome"] == "running":
-                # Cancelled (the bot is shutting down): still clean up.
-                record.update(outcome="aborted", reason="cancelled",
-                              failed_step=record["steps"][-1]["step"]
-                              if record["steps"] else "start")
-            if session is not None:
-                await self._end_session(record, session, runner)
+            # Release her first: these cannot fail, whatever cleanup does.
             self.engine.operator_hold = ""
             self.running = False
-            record["ended_at"] = self.clock()
-            record["carried_after"] = self._carried()
-            # Sera never logs out; a dropped connection of hers is restored
-            # by her own reconnect loop.
-            record["character_phase"] = self.client.state.phase
-            self._save(record)
-            detail = (f"{record['outcome']}: {gold} gold "
-                      f"({record['copper']} copper) from operator "
-                      f"{self.operator_character}")
-            if record["outcome"] != "completed":
-                detail += (f" at {record.get('failed_step')}: "
-                           f"{record.get('reason')}; coin {record['coin']}")
-            self.client.record_action("operator-assist", detail)
+            if record["outcome"] == "running":
+                # Cancelled (the bot is shutting down).
+                record.update(outcome="aborted", reason="cancelled",
+                              failed_step=self._last_step(record))
+            try:
+                if session is not None:
+                    await self._end_session(record, session, runner)
+            finally:
+                record["ended_at"] = self.clock()
+                record["carried_after"] = self._carried()
+                # Sera never logs out; a dropped connection of hers is
+                # restored by her own reconnect loop.
+                record["character_phase"] = self.client.state.phase
+                self._save(record)
+                detail = (f"{record['outcome']}: {gold} gold "
+                          f"({record['copper']} copper) from operator "
+                          f"{self.operator_character}")
+                if record["outcome"] != "completed":
+                    detail += (f" at {record.get('failed_step')}: "
+                               f"{record.get('reason')}; coin {record['coin']}")
+                self.client.record_action("operator-assist", detail)
         return dict(record)
+
+    @staticmethod
+    def _last_step(record: dict) -> str:
+        return record["steps"][-1]["step"] if record["steps"] else "start"
 
     def _carried(self) -> int:
         return gold_stack(self.client.state.inventory)[0] * GOLD_COPPER
@@ -379,14 +441,18 @@ class OperatorAssist:
                     runner: asyncio.Task | None = None,
                     messages: list[str] | None = None, since: int = 0,
                     failures: tuple[str, ...] = ()) -> None:
-        """Poll until ``ready()``; abort on a failure line among the
-        operator's ``messages`` from index ``since`` on, a lost operator
-        connection, or the step's timeout."""
+        """Poll until ``ready()``; abort when holding her is no longer safe,
+        on a failure line among the operator's ``messages`` from index
+        ``since`` on, a lost operator connection, or the step's timeout."""
         deadline = time.monotonic() + self.timeouts[step]
         seen = since
         while True:
+            # Readiness first, so the record tells where the coin is.
             if ready():
                 return
+            danger = self._danger()
+            if danger:
+                raise OperatorAssistAborted(step, f"not safe to hold her: {danger}")
             if messages is not None:
                 for text in messages[seen:]:
                     if text in failures:
@@ -422,6 +488,7 @@ class OperatorAssist:
             return (ops.map.path, ops.map.world_x, ops.map.world_y) == square
 
         self._step(record, "teleport", f"/tp {name}")
+        self._ensure_safe("teleport")
         mark = len(messages)
         await session.command(f"/tp {name}")
         await self._wait("teleport", on_square, runner=runner, messages=messages,
@@ -431,24 +498,45 @@ class OperatorAssist:
             raise OperatorAssistAborted("teleport", f"{name} left her square")
 
         before, _ = gold_stack(ops.inventory)
+        stacks_before = {item.tag: item.quantity for item in ops.inventory}
         command = (f"/create {GOLD_ARCHETYPE}" if gold == 1 else
                    f"/create {gold} {GOLD_ARCHETYPE}")
         self._step(record, "create", command)
-        # From here a coin may exist: the run counts toward the daily limit.
+        self._ensure_safe("create")
+        # From here a coin may exist: the run counts toward the daily limit,
+        # and it must not start unless that is on record.
         record["counts"] = True
-        self._save(record)
+        if not self._save(record):
+            record["counts"] = False
+            raise OperatorAssistAborted(
+                "create", "the audit record could not be saved; nothing created")
         mark = len(messages)
         await session.command(command)
-        await self._wait("create", lambda: gold_stack(ops.inventory)[0] >= before + gold,
-                         runner=runner, messages=messages, since=mark,
-                         failures=(PERMISSION_DENIED,))
+        try:
+            await self._wait("create",
+                             lambda: gold_stack(ops.inventory)[0] >= before + gold,
+                             runner=runner, messages=messages, since=mark,
+                             failures=(PERMISSION_DENIED,))
+        except OperatorAssistAborted as error:
+            if PERMISSION_DENIED in error.reason:
+                # The server checks permission before the command runs
+                # (commands_handle): nothing was created.
+                record["counts"] = False
+            raise
         record["coin"] = "operator-inventory"
 
         if not on_square():
             raise OperatorAssistAborted("drop", "the operator left her square")
-        _, stack = gold_stack(ops.inventory)
+        # The stack the new coin landed in (a fresh one, or one that grew).
+        grown = [item for item in ops.inventory
+                 if item.item_type == c.TYPE_MONEY and
+                 item.quantity > stacks_before.get(item.tag, 0) and
+                 gold_stack([item])[0] and not item.flags & c.ITEM_LOCKED]
+        if not grown:
+            raise OperatorAssistAborted("drop", "cannot tell which gold stack is new")
         self._step(record, "drop", f"{gold} gold coin(s) at {square}")
-        await session.move_item(0, stack.tag, gold)
+        self._ensure_safe("drop")
+        await session.move_item(0, grown[0].tag, gold)
         await self._wait("drop", lambda: gold_stack(ops.inventory)[0] <= before,
                          runner=runner)
         record["coin"] = "ground"
@@ -484,5 +572,7 @@ class OperatorAssist:
             record.setdefault("cleanup", []).append(f"logout: {error}")
         if runner is not None and not runner.done():
             runner.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await runner
+            # Wait for the runner without absorbing a cancellation of ours.
+            await asyncio.wait({runner})
+        if runner is not None and runner.done() and not runner.cancelled():
+            runner.exception()  # Retrieved: its failure is already recorded.

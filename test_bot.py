@@ -20136,12 +20136,13 @@ class FakeOperatorSession:
     server's (commands/permission/tp.c, content create.py, drop_object)."""
 
     def __init__(self, sera, *, listed=True, permitted=True, drops=True,
-                 after_drop=None):
+                 after_drop=None, denied=(), stall=False, after_teleport=None):
         from .protocol import Event
 
         self.Event = Event
         self.sera, self.listed, self.permitted, self.drops = sera, listed, permitted, drops
-        self.after_drop = after_drop
+        self.after_drop, self.denied, self.stall = after_drop, denied, stall
+        self.after_teleport = after_teleport
         self.state = GameState(phase="connecting")
         self.handlers, self.commands = [], []
         self.closed = asyncio.Event()
@@ -20155,7 +20156,9 @@ class FakeOperatorSession:
 
     async def run(self):
         await asyncio.sleep(0)
-        if not self.listed:
+        if self.stall:
+            pass
+        elif not self.listed:
             self.state.phase = "characters"
         else:
             self.state.phase = "playing"
@@ -20168,13 +20171,15 @@ class FakeOperatorSession:
 
     async def command(self, command):
         self.commands.append(command)
-        if not self.permitted:
+        if not self.permitted or command in self.denied:
             self._say("You do not have sufficient permissions for that command.")
             return
         if command == f"/tp {self.sera.state.player_name}":
             sera_map = self.sera.state.map
             self.state.map.path = sera_map.path
             self.state.map.world_x, self.state.map.world_y = sera_map.world_x, sera_map.world_y
+            if self.after_teleport is not None:
+                self.after_teleport()
         elif command == "/create goldcoin":
             self.state.items[900] = Item(900, location=500, item_type=c.TYPE_MONEY,
                                          name="gold coin", quantity=1)
@@ -20372,7 +20377,8 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
         # The limit also holds across a restart: it is read from memory.
         from .operator_assist import OperatorAssist
 
-        restarted = OperatorAssist(SeraClient(self.memory_path), TaskEngine(self.client),
+        fresh = SeraClient(self.memory_path)
+        restarted = OperatorAssist(fresh, TaskEngine(fresh),
                                    "Opal", clock=lambda: self.now[0] + 60)
         self.assertIn("one run per 24 h", restarted.refusal(1, "Sera"))
 
@@ -20427,6 +20433,57 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
                          ("aborted", "pickup", "ground"))
         self.assertEqual(record["character_phase"], "disconnected")
         self.assertEqual(self.engine.operator_hold, "")
+        # The coin left the operator, so even this run marks her assisted.
+        status = self.assist.status()
+        self.assertEqual((status["copper_total"], status["completed_runs"]), (20_000, 1))
+
+    async def test_an_attack_while_held_aborts_the_run(self):
+        state = self.client.state
+        self.session_options = {"after_teleport": lambda: state.add_message(
+            c.CHAT_TYPE_GAME, "ff0000", "The kobold hit you for 3 (3) damage.")}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["outcome"], record["failed_step"], record["coin"]),
+                         ("aborted", "create", "none"))
+        self.assertIn("attacked her", record["reason"])
+        self.assertEqual(self.engine.operator_hold, "")
+        self.assertTrue(self.sessions[0].closed.is_set())
+
+    async def test_a_denied_create_does_not_use_up_the_day(self):
+        self.session_options = {"denied": ("/create goldcoin",)}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["failed_step"], record["counts"], record["coin"]),
+                         ("create", False, "none"))
+        self.assertEqual(self.assist.refusal(1, "Sera"), "")
+
+    async def test_cancellation_releases_her(self):
+        self.session_options = {"stall": True}
+        self.assist.timeouts["operator-login"] = 30.0
+        run = asyncio.create_task(self.assist.run(1, "Sera"))
+        for _ in range(100):
+            if self.sessions:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(self.engine.operator_hold, "operator-assist")
+        run.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await run
+        self.assertEqual(self.engine.operator_hold, "")
+        self.assertFalse(self.assist.running)
+        self.assertTrue(self.sessions[0].closed.is_set())
+        self.assertEqual(self.stored()[-1]["reason"], "cancelled")
+
+    async def test_trimming_never_drops_the_counted_run(self):
+        from .operator_assist import MAX_RECORDS, OperatorAssistRefused
+
+        self.assertEqual((await self.assist.run(1, "Sera"))["outcome"], "completed")
+        for _ in range(MAX_RECORDS + 20):
+            with self.assertRaises(OperatorAssistRefused):
+                await self.assist.run(1, "Sera")
+        stored = self.stored()
+        self.assertEqual(len(stored), MAX_RECORDS)
+        self.assertEqual(stored[0]["outcome"], "completed")
+        self.assertTrue(self.assist.status()["assisted"])
+        self.assertIn("one run per 24 h", self.assist.refusal(1, "Sera"))
 
     async def test_disabled_by_default(self):
         from .cli import parser
@@ -20440,6 +20497,7 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(OperatorAssistRefused, "disabled"):
             await disabled.run(1, "Sera")
         self.assertFalse(disabled.status()["assisted"])
+        self.assertEqual(self.stored(), [])
         metrics = self.client.metrics.render(operator_assist=disabled.status())
         self.assertIn("atrinik_playtester_operator_assisted{", metrics)
         self.assertIn("} 0\n", metrics)
@@ -20516,6 +20574,18 @@ class OperatorAssistRouteTests(unittest.IsolatedAsyncioTestCase):
                                              {"gold": 1, "to": "Sera"})
         self.assertEqual(status, 409, payload)
         self.assertIn("24 h", json.loads(payload)["error"])
+
+    async def test_dashboard_orders_wait_while_she_is_held(self):
+        self.server.engine.operator_hold = "operator-assist"
+        status, payload = await self.request("POST", "/api/action",
+                                             {"type": "move", "x": 1, "y": 1})
+        self.assertEqual(status, 400, payload)
+        self.assertIn("operator assist is running", json.loads(payload)["error"])
+        status, _ = await self.request("POST", "/api/task", {"type": "autoplay"})
+        self.assertEqual(status, 400)
+        status, payload = await self.request("POST", "/api/operator-assist",
+                                             {"gold": True, "to": "Sera"})
+        self.assertEqual(status, 409, payload)
 
 
 if __name__ == "__main__":

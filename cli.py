@@ -277,6 +277,17 @@ def operator_assist(args: argparse.Namespace) -> int:
     request to the loopback dashboard and prints the audit record.
     """
     import http.client
+    import ipaddress
+
+    try:
+        loopback = (args.listen.casefold() == "localhost" or
+                    ipaddress.ip_address(args.listen).is_loopback)
+    except ValueError:
+        loopback = False
+    if not loopback:
+        print("ERROR --listen must be a loopback address: the dashboard "
+              "only listens there")
+        return 2
 
     def post(path: str, data: dict) -> tuple[int, dict]:
         connection = http.client.HTTPConnection(
@@ -298,6 +309,10 @@ def operator_assist(args: argparse.Namespace) -> int:
     try:
         status, result = post("/api/operator-assist",
                               {"gold": args.give_gold, "to": args.to})
+    except TimeoutError:
+        print(f"ERROR no answer within {args.timeout:g} s; the run may still "
+              "be in progress: check the dashboard and its operator_assist record")
+        return 2
     except OSError as error:
         print(f"ERROR cannot reach the bot's dashboard at "
               f"{args.listen}:{args.web_port}: {error}")
@@ -308,7 +323,11 @@ def operator_assist(args: argparse.Namespace) -> int:
               f"(HTTP {status}): {result.get('error') or result.get('record', {}).get('reason', '')}")
         return 1
     if args.then_autoplay:
-        status, started = post("/api/task", {"type": "autoplay", "until_level": 115})
+        try:
+            status, started = post("/api/task", {"type": "autoplay", "until_level": 115})
+        except OSError as error:
+            print(f"ERROR autoplay did not start: {error}")
+            return 1
         if status != 200:
             print(f"ERROR autoplay did not start (HTTP {status}): {started.get('error', '')}")
             return 1
