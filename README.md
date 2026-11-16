@@ -274,9 +274,12 @@ the dashboard and runs, on the same machine, as the bot's service user so
 the command can read the key (for example `sudo -u playtester`):
 
 ```sh
-sudo -u playtester atrinik-playtester operator-assist --give-gold 1 --to Sera \
-  --web-port 8765 --then-autoplay
+sudo -u playtester /opt/atrinik-playtester/current/venv/bin/atrinik-playtester \
+  operator-assist --give-gold 1 --to Sera --web-port 8765 --then-autoplay
 ```
+
+The full path is the release installed by the home-lab role. That role puts
+no `atrinik-playtester` on sudo's secure PATH.
 
 Give `--key-file` when the key is elsewhere. The command posts to the
 running bot's loopback dashboard, prints the audit record, and exits 0 only
