@@ -383,6 +383,23 @@ def wand_known_empty(client: AtrinikClient, item: Item) -> bool:
             wand_charges(client).get(item.tag) == 0)
 
 
+def recall_waiting(client: AtrinikClient) -> bool:
+    """Whether a recall is waiting for her action timer to run out.
+
+    This is recall mode (FarmTask.recall_pending_step): every swing or cast
+    restarts the timer the recall waits for (the server's action_attack),
+    so nothing that attacks or casts runs meanwhile: no combat mode, no
+    fight branch, no healing spell. Steps and potions, which leave the
+    timer alone, still run.
+    """
+    return float(getattr(client, "recall_waiting_until", 0.0) or 0.0) > time.monotonic()
+
+
+def combat_allowed(client: AtrinikClient) -> bool:
+    """The one guard every combat entry point checks: not in recall mode."""
+    return not recall_waiting(client)
+
+
 def effective_action_time(client: AtrinikClient,
                           now: float | None = None) -> float:
     """Return the server timer after locally applying its elapsed countdown."""
@@ -422,6 +439,40 @@ MAGIC_BLOCKED_TYPES = MAGIC_CAST_TYPES
 # not start the spam again; a message older than this is not attributed.
 SPELL_BLOCK_MEMORY_SECONDS = 60 * 60.0
 SPELL_BLOCK_ATTRIBUTION_SECONDS = 10.0
+# A spell cast on a map flagged no-magic: cast_spell() (server/spell_util.c,
+# MAP_NOMAGIC) refuses every spell anywhere on it, so the whole map is
+# remembered as blocked, not just the square.
+MAP_NOMAGIC_MESSAGE = re.compile(
+    r"^Powerful countermagic cancels all spellcasting here!", re.I)
+# A Word of Recall that really started: cast_wor (server/spell_effect.c)
+# answers with this as it inserts the delayed recall force. Without it no
+# recall is coming. The server drops a fire without a word while the
+# previous action is still recovering (socket_command_fire's action_attack
+# check), and refuses one with a message on a blocked square or map,
+# without mana, or from a device that cannot fire now.
+RECALL_BUILDING_MESSAGE = re.compile(
+    r"^You feel a force starting to build up inside you\.", re.I)
+RECALL_REFUSED_MESSAGE = re.compile(
+    r"^(?:Something blocks (?:your spellcasting|your spell|"
+    r"the magic of your .+)|Powerful countermagic cancels .+|"
+    r"You don't have enough mana|You can't cast that spell on .+|"
+    r"The .+ (?:whines for a while, but nothing happens|"
+    r"is impossible to handle for you))[.!]?$",
+    re.I)
+# What a device answers when it cannot fire now (types/rod.c): a rod out of
+# charge recharges over time, and one above her skill may be usable later.
+# Such a device gives way to the next recall source for this long.
+RECALL_DEVICE_REFUSED_MESSAGE = re.compile(
+    r"^The .+ (?:whines for a while, but nothing happens|"
+    r"is impossible to handle for you)\.", re.I)
+RECALL_DEVICE_RETRY_SECONDS = 20.0
+
+
+def _message_position(client: AtrinikClient) -> int:
+    """The position after her newest message (GameState.message_count)."""
+    state = client.state
+    return (int(getattr(state, "message_offset", 0) or 0) +
+            len(getattr(state, "messages", ()) or ()))
 
 
 def _square(client: AtrinikClient) -> tuple[str, int, int]:
@@ -460,9 +511,11 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
         fresh = time.time() - SPELL_BLOCK_ATTRIBUTION_SECONDS
         for position in range(max(mark, offset), count):
             entry = messages[position - offset]
+            text = str(entry[-1]).strip()
+            whole_map = bool(MAP_NOMAGIC_MESSAGE.match(text))
             if not (float(entry[0]) >= fresh and
                     self_improvement.from_server(entry) and
-                    SPELL_BLOCKED_MESSAGE.match(str(entry[-1]).strip())):
+                    (whole_map or SPELL_BLOCKED_MESSAGE.match(text))):
                 continue
             # Only a recent cast explains the answer; otherwise it is
             # some other use, on the square she stands on.
@@ -471,12 +524,17 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
                      SPELL_BLOCK_ATTRIBUTION_SECONDS else square)
             if not where[0]:
                 continue
+            if whole_map:
+                # Countermagic covers the whole map (MAP_NOMAGIC).
+                where = (where[0], -1, -1)
             if where not in blocked:
                 log.warning("spellcasting blocked at %s (%d,%d); "
-                            "no more casts on this square", *where)
+                            "no more casts on this %s", *where,
+                            "map" if whole_map else "square")
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("spell-blocked",
+                             f"{where[0]} (whole map)" if whole_map else
                              f"{where[0]} ({where[1]},{where[2]})")
             blocked[where] = now
         try:
@@ -486,7 +544,7 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
     for key, since in list(blocked.items()):
         if now - since >= SPELL_BLOCK_MEMORY_SECONDS:
             del blocked[key]
-    return square in blocked
+    return square in blocked or (square[0], -1, -1) in blocked
 
 
 class TaskStatus(str, Enum):
@@ -567,11 +625,12 @@ class SafetyPolicy:
         """A healing item, or a healing spell she may cast where she stands.
 
         No spell, scroll, rod or wand on a square where the server blocks
-        spellcasting.
+        spellcasting, nor while a recall waits for her action timer
+        (recall_waiting).
         """
         items = client.state.inventory
-        if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items) and \
-                spell_blocked_here(client):
+        if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items) and (
+                recall_waiting(client) or spell_blocked_here(client)):
             items = [item for item in items
                      if item.item_type not in MAGIC_BLOCKED_TYPES]
         return self._find(items, self.healing_patterns)
@@ -1644,6 +1703,10 @@ class FarmTask(BotTask):
         self._emergency_recall_apply_at = 0.0
         self._emergency_recall_cast_at = 0.0
         self._emergency_recall_origin = ""
+        # A recall fire sent but not yet answered (monotonic), and the
+        # message position from which its answer is read.
+        self._emergency_recall_sent_at = 0.0
+        self._emergency_recall_feedback = 0
         # A recall wand fired (tag, wall-clock time), to catch "says poof";
         # a recall wand examined for its charges, and those examined once.
         self._recall_wand_fired: tuple[int, float] | None = None
@@ -4224,9 +4287,10 @@ class FarmTask(BotTask):
                 any(name in (
                     map_object_semantic(client, obj)
                 ).casefold() for name in proven_attackers))]
+        fight = combat_allowed(client)
         breakout = next((
             (x, y, obj) for x, y, obj in visible_threats
-            if obj.target_id == self._cornered_breakout_target and
+            if fight and obj.target_id == self._cornered_breakout_target and
             max(abs(x - cx), abs(y - cy)) <= 1), None)
         ratio = (int(client.state.stats.get("hp", 0) or 0) /
                  max(1, int(client.state.stats.get("maxhp", 1) or 1)))
@@ -4341,7 +4405,7 @@ class FarmTask(BotTask):
             blockers = [
                 (max(abs(x - cx), abs(y - cy)), x, y, obj)
                 for x, y, obj in visible_threats
-                if max(abs(x - cx), abs(y - cy)) <= 1]
+                if fight and max(abs(x - cx), abs(y - cy)) <= 1]
             if blockers:
                 _, x, y, obj = min(blockers, key=lambda entry: entry[0])
                 self._cornered_breakout_target = obj.target_id
@@ -4423,7 +4487,7 @@ class FarmTask(BotTask):
                              f"target={obj.target_id} adjacent={len(adjacent)} "
                              f"hp={ratio:.0%}")
                 return True
-        if (stand_candidates and not caster_stand and
+        if (stand_candidates and not caster_stand and fight and
                 self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
                 ratio > self.STAND_HEALTH_FLOOR):
             x, y, obj = min(stand_candidates, key=lambda entry: (
@@ -4481,7 +4545,7 @@ class FarmTask(BotTask):
         # Spell-only training never swings at its target while retreating.
         defensive = next((
             (x, y, obj) for x, y, obj in m.targets(friendly=False)
-            if not emergency_disengage and len(threats) == 1 and
+            if fight and not emergency_disengage and len(threats) == 1 and
             obj.target_id == engaged_id and
             not self.spell_only_training(client)), None)
         if defensive is None:
@@ -4510,14 +4574,19 @@ class FarmTask(BotTask):
     def emergency_recall_candidates(client: AtrinikClient) -> list[Item]:
         """Return paid, identified recall sources in survival-first order.
 
-        A wand known to be empty (see observe_wand_feedback) is left out.
+        A wand known to be empty (see observe_wand_feedback) is left out,
+        and so, until RECALL_DEVICE_RETRY_SECONDS have passed, is a device
+        that just said it cannot fire (an uncharged rod).
         """
+        retry = getattr(client, "recall_device_retry_at", {}) or {}
+        now = time.monotonic()
         policy = InventoryPolicy()
         candidates = [
             item for item in client.state.inventory
             if re.search(r"\bword of recall\b", item.name, re.I) and
             not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)
             and not wand_known_empty(client, item)
+            and float(retry.get(item.tag, 0.0)) <= now
             and (
                 item.item_type == c.TYPE_SPELL and
                 int(item.extra.get("cost", 0) or 0) <=
@@ -4599,6 +4668,21 @@ class FarmTask(BotTask):
         takes damage, so subsequent ticks continue normal retreat instead of
         standing still. This method returns true only while readying/firing a
         device consumes the current action tick.
+
+        A fire counts only once the server answers it (RECALL_BUILDING_MESSAGE
+        within RECALL_CONFIRM_SECONDS): only then is the emergency-recall
+        decision recorded and the RECALL_IN_FLIGHT_SECONDS guard held. The
+        server drops a fire without a word while her previous action is
+        still recovering (socket_command_fire's action_attack check), so
+        none is sent before her action timer has run out; meanwhile she
+        keeps retreating and drinking potions, but casts no healing spell
+        (recall_waiting), which would restart the timer. Live, Sera
+        "recalled" three times, 30 s apart, on the underground city
+        entrance and died there: no recall had started, and each guard
+        waited out its 30 s. An unanswered or refused fire is recorded as
+        emergency-recall-dropped and retried on the next eligible tick; a
+        lagging answer costs at most an extra charge, since the retry also
+        waits for the timer her last fire set.
         """
         now = time.monotonic()
         if self._recall_wand_fired is not None:
@@ -4608,6 +4692,7 @@ class FarmTask(BotTask):
                 # coming, so the next candidate may be tried at once.
                 self._recall_wand_fired = None
                 self._emergency_recall_cast_at = 0.0
+                self._emergency_recall_sent_at = 0.0
                 self._emergency_recall_source = 0
                 self.note_recall_wand_empty(client)
                 recorder = getattr(client, "record_action", None)
@@ -4615,6 +4700,16 @@ class FarmTask(BotTask):
                     recorder("recall-wand-empty", f"tag={tag}")
             elif time.time() - fired_at > 5.0:
                 self._recall_wand_fired = None
+        if self._emergency_recall_sent_at:
+            answer = self._recall_answer(client)
+            if answer is None and (now - self._emergency_recall_sent_at <=
+                                   self.RECALL_CONFIRM_SECONDS):
+                # Awaiting the server's answer: keep retreating meanwhile.
+                return False
+            if answer is True:
+                self._confirm_recall(client)
+            else:
+                self._drop_recall(client, answer or "no answer from the server")
         if self._emergency_recall_cast_at:
             # A recall in flight is never followed by another within 30 s,
             # even on another map: either it has landed her at the savebed,
@@ -4623,7 +4718,7 @@ class FarmTask(BotTask):
             # Clearing on the map change fired a second recall (and a second
             # emergency-recall decision, which escalates the farm review)
             # the moment it arrived.
-            if now - self._emergency_recall_cast_at <= 30.0:
+            if now - self._emergency_recall_cast_at <= self.RECALL_IN_FLIGHT_SECONDS:
                 return False
             # A no-magic square can fizzle the delayed force. Permit a later
             # retry instead of suppressing recall forever in this FarmTask.
@@ -4631,18 +4726,15 @@ class FarmTask(BotTask):
             self._emergency_recall_source = 0
         if self._emergency_recall_apply_at:
             source = client.state.items.get(self._emergency_recall_source)
-            if source is not None and source.flags & c.ITEM_APPLIED:
-                await client.fire(0)
-                self._recall_fired(client, source)
-                self._emergency_recall_cast_at = now
-                self._emergency_recall_apply_at = 0.0
-                self._emergency_recall_origin = client.state.map.path
-                recorder = getattr(client, "record_action", None)
-                if recorder is not None:
-                    recorder("emergency-recall", f"via {source.name}")
-                return True
+            ready = source is not None and (
+                source.item_type == c.TYPE_SPELL or
+                bool(source.flags & c.ITEM_APPLIED))
+            if ready:
+                assert source is not None
+                return await self._fire_when_recovered(client, source)
             if (now - self._emergency_recall_apply_at <=
                     self.RECALL_APPLY_WINDOW_SECONDS):
+                # Waiting for the readied device's applied state.
                 return True
             self._emergency_recall_apply_at = 0.0
             self._emergency_recall_source = 0
@@ -4669,27 +4761,141 @@ class FarmTask(BotTask):
         if not critical:
             return False
         candidates = self.emergency_recall_candidates(client)
-        if not candidates:
+        # Every recall source is magic: none works where magic is blocked.
+        if not candidates or spell_blocked_here(client):
             return False
         source = candidates[0]
         self._emergency_recall_source = source.tag
         await client.clear_actions()
         await client.set_combat(False)
+        if (source.item_type in (c.TYPE_ROD, c.TYPE_WAND) and
+                not source.flags & c.ITEM_APPLIED):
+            await client.apply(source.tag)
+            self._emergency_recall_apply_at = now
+            return True
+        self._emergency_recall_apply_at = now
+        return await self._fire_when_recovered(client, source)
+
+    # How long a sent recall fire waits for the server's answer, and how
+    # long a confirmed recall holds off another one.
+    RECALL_CONFIRM_SECONDS = 3.0
+    RECALL_IN_FLIGHT_SECONDS = 30.0
+
+    async def _fire_when_recovered(self, client: AtrinikClient,
+                                   source: Item) -> bool:
+        """Fire the ready ``source`` once her action timer has run out.
+
+        Until then the source stays readied (its apply time is renewed, so
+        loadout upkeep leaves it alone however long the timer) and False is
+        returned, so the caller's retreat and potions still run.
+        """
+        if effective_action_time(client):
+            self._emergency_recall_apply_at = time.monotonic()
+            try:
+                client.recall_waiting_until = time.monotonic() + 1.0
+            except AttributeError:
+                pass
+            if getattr(client.state, "combat", False):
+                # A hit turns combat mode back on (attack_player_retarget),
+                # and an auto-swing would restart the timer.
+                await client.set_combat(False)
+            return False
+        await self._fire_recall(client, source)
+        return True
+
+    async def recall_pending_step(self, client: AtrinikClient) -> bool:
+        """One tick of recall mode: no combat, only potions and retreat.
+
+        True while a recall waits for her action timer (recall_waiting):
+        combat mode stays off, safety may drink a potion (healing spells
+        are held back, SafetyPolicy._known_heal), and otherwise she steps
+        away; low_health_retreat neither breaks out nor stands while
+        combat_allowed is False. The recall fires on the first tick the
+        timer allows (emergency_recall).
+        """
+        if combat_allowed(client):
+            return False
+        if getattr(client.state, "combat", False):
+            await client.set_combat(False)
+        last_heal = self.safety._last_heal
+        await self.safety.enforce(client)
+        if self.safety._last_heal == last_heal:
+            await self.low_health_retreat(client)
+        self._last_action = time.monotonic()
+        return True
+
+    async def _fire_recall(self, client: AtrinikClient, source: Item) -> None:
+        """Send the recall fire from ``source``; its answer is read later."""
+        self._emergency_recall_feedback = _message_position(client)
+        try:
+            client.recall_waiting_until = 0.0
+        except AttributeError:
+            pass
         if source.item_type in (c.TYPE_ROD, c.TYPE_WAND):
-            if not source.flags & c.ITEM_APPLIED:
-                await client.apply(source.tag)
-                self._emergency_recall_apply_at = now
-                return True
             await client.fire(0)
             self._recall_fired(client, source)
+            # fire(0) names no item, so the client cannot note where the
+            # readied device was used: note it, so a "Something blocks" or
+            # countermagic answer marks the square and map she fired on.
+            note = getattr(client, "_note_spell_cast", None)
+            if note is not None:
+                note(source)
         else:
             await client.fire(0, source.tag)
-        self._emergency_recall_cast_at = now
+        self._emergency_recall_sent_at = time.monotonic()
+        self._emergency_recall_apply_at = 0.0
+        self._emergency_recall_source = source.tag
         self._emergency_recall_origin = client.state.map.path
+
+    def _recall_answer(self, client: AtrinikClient) -> bool | str | None:
+        """True once the recall force builds, the refusal text if refused,
+        None while the server has not answered the sent fire."""
+        state = client.state
+        messages = list(getattr(state, "messages", ()))
+        offset = int(getattr(state, "message_offset", 0) or 0)
+        for entry in messages[max(0, self._emergency_recall_feedback - offset):]:
+            if not self_improvement.from_server(entry):
+                continue
+            text = str(entry[-1]).strip()
+            if RECALL_BUILDING_MESSAGE.match(text):
+                return True
+            if RECALL_REFUSED_MESSAGE.match(text):
+                return text
+        return None
+
+    def _confirm_recall(self, client: AtrinikClient) -> None:
+        """The recall force is building: hold off another, and record it."""
+        self._emergency_recall_cast_at = self._emergency_recall_sent_at
+        self._emergency_recall_sent_at = 0.0
+        source = client.state.items.get(self._emergency_recall_source)
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
-            recorder("emergency-recall", f"via {source.name}")
-        return True
+            recorder("emergency-recall",
+                     f"via {source.name if source is not None else 'recall'}")
+
+    def _drop_recall(self, client: AtrinikClient, reason: str) -> None:
+        """No recall is coming from the sent fire: allow another at once.
+
+        A device that said it cannot fire now (an uncharged rod) gives way
+        to the next source for RECALL_DEVICE_RETRY_SECONDS. A blocked square
+        or map is remembered by spell_blocked_here.
+        """
+        tag = self._emergency_recall_source
+        source = client.state.items.get(tag)
+        if RECALL_DEVICE_REFUSED_MESSAGE.match(reason):
+            retry = getattr(client, "recall_device_retry_at", None)
+            if retry is None:
+                retry = client.recall_device_retry_at = {}
+            retry[tag] = time.monotonic() + RECALL_DEVICE_RETRY_SECONDS
+        self._emergency_recall_sent_at = 0.0
+        self._emergency_recall_cast_at = 0.0
+        self._emergency_recall_source = 0
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("emergency-recall-dropped",
+                     f"via {source.name if source is not None else tag}: {reason}")
+        log.warning("emergency recall via %s did not start: %s",
+                    source.name if source is not None else tag, reason)
 
     async def check_recall_wand(self, client: AtrinikClient) -> None:
         """Examine a recall wand of unknown charge while nothing threatens.
@@ -5132,6 +5338,8 @@ class FarmTask(BotTask):
                 client, ratio=ratio, nearby_count=nearby_count,
                 hostile_contact=hostile_contact, healing_outpaced=outpaced):
             self._last_action = time.monotonic()
+            return
+        if await self.recall_pending_step(client):
             return
         if (hostile_contact and self._engaged_target is None and
                 not contact_threats and set_aside_threats):

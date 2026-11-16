@@ -445,7 +445,11 @@ steps away and keeps her distance.
   savebed, it is judged from where she stands, keyed by her component. The
   coarse map graph is not enough: it reaches the underground city's
   circuits around the entrance through seams she cannot walk.
-  - Exceptions: a route recall, a death on a map that did not hurt her, a
+  - A route emergency recall counts like a death when that map hurt her
+    (`map_damage` above 0); it still does not count toward kit hazards.
+    Live, on 2026-11-16, three recalls on the underground city entrance
+    taught only a route cost, and then she died there.
+  - Exceptions: a recall or death on a map that did not hurt her, a
     death with a kit she has since improved on, a death on her savebed
     map, and a death on a chokepoint block nothing. A chokepoint is a map
     cutting off more than half of what she reaches from the savebed
@@ -463,12 +467,37 @@ steps away and keeps her distance.
     elsewhere sends her off it.
   - Each expansion covers the whole world (a few tenths of a second on the
     event loop). Results are cached, and at most one runs every
-    `ROUTE_DEATH_SEARCH_INTERVAL_SECONDS` across all callers. None runs in
-    combat, while the circuit finishes a fight or loot, or for the
-    dashboard and Prometheus, which read cached results only.
+    `ROUTE_DEATH_SEARCH_INTERVAL_SECONDS` across all callers. None runs
+    while she is being hit, while the circuit finishes a fight or loot, or
+    for the dashboard and Prometheus, which read cached results only. Hits
+    from before her last death do not count as contact, and the combat
+    mode flag does not either: the server turns it on with every hit and
+    keeps it through a death. The circuit also turns combat mode off once
+    after each death.
   - While a route death is still being judged, nothing is usable. The
     circuit keeps its plan, and stops (`farm-spots-exhausted`) only once its
-    own spot is judged blocked and no other spot is usable.
+    own spot is judged blocked and no other spot is usable. Meanwhile a
+    plan whose leg is on, or whose route from where she stands crosses, a
+    counting route-death map is held in transit (`farm-route-death-hold`),
+    after the transit recall, healing and the low-health retreat have run:
+    she defends herself but does not walk on. While held, a corpse or loot
+    from that defence does not hold off the search. From
+    `ROUTE_DEATH_VERDICT_WAIT_SECONDS` (30 s) after the newest failure the
+    search runs despite contact or an unfinished fight
+    (`route_death_overdue`), still rate limited, so the hold lasts at most
+    about that long plus a few searches; until a search completes the
+    verdict stays undecided and nothing behind the death map is chosen. A
+    decided verdict against her circuit keeps her held while a fight delays
+    the switch. Only an undecided overdue verdict is searched mid-fight,
+    and no town route is planned for it. While held, only her own
+    engagement or hostile contact in this life is a fight: a target the
+    server selected that has stopped attacking (a guard still in view) is
+    not. Live, on 2026-11-16,
+    she respawned and walked back towards the entrance that had just
+    killed her for three minutes while the verdict stayed undecided. A
+    pause after repeated failures rebuilds the farm task as well, so the
+    fatal fight's engagement does not read as a fight still being
+    finished.
   - Walks between a usable circuit's legs are not routed around blocked
     maps: learned route hazards only cost the planner more there. Every leg
     is reachable from the savebed without entering one, so a penalised
@@ -489,6 +518,34 @@ steps away and keeps her distance.
   fired a second recall, and with it a second failure review, as soon as
   the first one landed her in town. Live, she had fled at 8-16 hit points
   with a seven-charge recall wand.
+- **A recall counts once it starts.** The server drops a fire without a
+  word while her previous action is still recovering
+  (`socket_command_fire`'s `action_attack` check), so no recall is fired
+  before her action timer has run out. While it waits she is in recall
+  mode (`recall_waiting`, checked by `combat_allowed` at every combat
+  entry point): combat mode is kept off (a hit turns it back on server
+  side), and no fight branch, cornered breakout, pursued stand, transit
+  defence or healing spell runs, since each would restart the timer. She
+  still steps away and drinks potions, which leave it alone, and the
+  readied device stays readied however long the wait. The fire is noted
+  where she stands, so a "Something blocks" or countermagic answer marks
+  that square or map. A fire counts only when the server answers "You feel a force
+  starting to build up inside you." (`cast_wor`) within
+  `RECALL_CONFIRM_SECONDS` (3 s); only then is `emergency-recall` recorded
+  and the 30 s guard held. An unanswered or refused fire is recorded as
+  `emergency-recall-dropped` and retried on the next eligible tick, which
+  also waits for the timer the last fire set: a lagging answer costs at
+  most an extra charge. "Powerful countermagic cancels all spellcasting
+  here!" (`MAP_NOMAGIC`) marks the whole map as blocking magic, so she
+  stops firing anywhere on it; "Something blocks…" marks the square. A rod
+  that "whines for a while" (out of charge) or is "impossible to handle"
+  gives way to the next source for `RECALL_DEVICE_RETRY_SECONDS`. Live, on
+  2026-11-16, three recalls on the underground city entrance, exactly 30 s
+  apart, never started, and she died there. A level-17 wand's force takes
+  about 9 s to land (72 server ticks); it is not cancelled by moving or by
+  damage. The decision is recorded where she is when the answer arrives:
+  retreating across a seam in between, it is recorded on the neighbouring
+  map, and the failure review judges that map.
 - **Healing outpaced.** From the first heal in the last 8 s on, when the
   hits taken are at least what the later heals restored (her health at the
   latest heal is no higher than at the first), healing has stopped keeping
