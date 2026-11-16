@@ -20136,13 +20136,15 @@ class FakeOperatorSession:
     server's (commands/permission/tp.c, content create.py, drop_object)."""
 
     def __init__(self, sera, *, listed=True, permitted=True, drops=True,
-                 after_drop=None, denied=(), stall=False, after_teleport=None):
+                 after_drop=None, denied=(), stall=False, after_teleport=None,
+                 unknown=(), silent=(), sub_layer=None):
         from .protocol import Event
 
         self.Event = Event
         self.sera, self.listed, self.permitted, self.drops = sera, listed, permitted, drops
         self.after_drop, self.denied, self.stall = after_drop, denied, stall
         self.after_teleport = after_teleport
+        self.unknown, self.silent, self.sub_layer = unknown, silent, sub_layer
         self.state = GameState(phase="connecting")
         self.handlers, self.commands = [], []
         self.closed = asyncio.Event()
@@ -20171,6 +20173,11 @@ class FakeOperatorSession:
 
     async def command(self, command):
         self.commands.append(command)
+        if command in self.unknown:
+            self._say(f"'{command.split()[0]}' is not a valid command.")
+            return
+        if command in self.silent:
+            return
         if not self.permitted or command in self.denied:
             self._say("You do not have sufficient permissions for that command.")
             return
@@ -20178,6 +20185,8 @@ class FakeOperatorSession:
             sera_map = self.sera.state.map
             self.state.map.path = sera_map.path
             self.state.map.world_x, self.state.map.world_y = sera_map.world_x, sera_map.world_y
+            self.state.map.player_sub_layer = (sera_map.player_sub_layer
+                                               if self.sub_layer is None else self.sub_layer)
             if self.after_teleport is not None:
                 self.after_teleport()
         elif command == "/create goldcoin":
@@ -20456,6 +20465,30 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
             c.CHAT_TYPE_LOCAL, "ffffff", "Mallory says: it hit you for 9")}
         self.assertEqual((await self.assist.run(1, "Sera"))["outcome"], "completed")
 
+    async def test_an_unknown_create_command_does_not_count(self):
+        self.session_options = {"unknown": ("/create goldcoin",)}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["failed_step"], record["counts"], record["coin"]),
+                         ("create", False, "none"))
+        self.assertIn("not a valid command", record["reason"])
+
+    async def test_a_silent_create_leaves_the_coin_unknown_and_counts_as_given(self):
+        self.session_options = {"silent": ("/create goldcoin",)}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["failed_step"], record["counts"], record["coin"]),
+                         ("create", True, "unknown"))
+        status = self.assist.status()
+        self.assertTrue(status["assisted"])
+        self.assertIn("one run per 24 h", self.assist.refusal(1, "Sera"))
+
+    async def test_the_operator_must_reach_her_sub_layer(self):
+        self.client.state.map.player_sub_layer = 1
+        self.session_options = {"sub_layer": 0}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["failed_step"], record["coin"], record["sub_layer"]),
+                         ("teleport", "none", 1))
+        self.assertEqual(self.sessions[0].commands, ["/tp Sera"])
+
     async def test_a_denied_create_does_not_use_up_the_day(self):
         self.session_options = {"denied": ("/create goldcoin",)}
         record = await self.assist.run(1, "Sera")
@@ -20524,22 +20557,61 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OperatorAssistRouteTests(unittest.IsolatedAsyncioTestCase):
-    asyncSetUp = WebTests.asyncSetUp
     asyncTearDown = WebTests.asyncTearDown
     request = WebTests.request
+
+    async def asyncSetUp(self):
+        from .operator_assist import ensure_operator_key
+
+        await WebTests.asyncSetUp(self)
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.key_file = Path(self.directory) / "operator-assist.key"
+        self.key = ensure_operator_key(self.key_file)
 
     def cli_args(self, *extra):
         from .cli import parser
 
         return parser().parse_args(["operator-assist", "--give-gold", "1", "--to", "Sera",
-                                     "--web-port", str(self.port), *extra])
+                                     "--web-port", str(self.port),
+                                     "--key-file", str(self.key_file), *extra])
+
+    async def assist_post(self, data, *, key=None, content_type="application/json"):
+        from .operator_assist import KEY_HEADER
+
+        headers = {"Content-Type": content_type}
+        if key is not False:
+            headers[KEY_HEADER] = self.key if key is None else key
+        return await self.request("POST", "/api/operator-assist", data, headers)
+
+    def use_sera(self, **options):
+        """Serve a playing Sera with an enabled assist and the owner key."""
+        from .operator_assist import OperatorAssist
+
+        client = SeraClient(Path(self.directory) / "memory.sqlite3")
+        self.server.client = self.server.dashboard.client = client
+        self.server.engine.client = client
+        self.sessions = []
+
+        def factory(_client, name):
+            self.sessions.append(FakeOperatorSession(client))
+            return self.sessions[-1]
+
+        assist = OperatorAssist(client, self.server.engine, "Opal",
+                                session_factory=factory, poll_seconds=0.005, **options)
+        self.server.operator_assist = self.server.dashboard.operator_assist = assist
+        self.server.operator_key = self.key
+        return client, assist
+
+    def stored(self, client):
+        from .operator_assist import MEMORY_KIND
+
+        return client._memory_store().load("Sera", MEMORY_KIND, [])
 
     async def test_route_and_cli_refuse_while_disabled(self):
         from .cli import operator_assist
 
-        status, payload = await self.request("POST", "/api/operator-assist",
-                                             {"gold": 1, "to": "Sera"})
-        self.assertEqual(status, 409, payload)
+        status, payload = await self.assist_post({"gold": 1, "to": "Sera"})
+        self.assertEqual(status, 403, payload)
         self.assertIn("disabled", json.loads(payload)["error"])
         with patch("builtins.print"):
             self.assertEqual(await asyncio.to_thread(operator_assist, self.cli_args()), 1)
@@ -20547,29 +20619,53 @@ class OperatorAssistRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(snapshot["operator_assist"]["enabled"])
         self.assertEqual(snapshot["economy"]["operator_assisted_copper"], 0)
 
-    async def test_cli_runs_it_through_the_running_bot_then_resumes_autoplay(self):
+    async def test_route_requires_the_owner_key_as_json(self):
+        client, assist = self.use_sera()
+        cases = (({"key": False}, 403), ({"key": "0" * 64}, 403),
+                 ({"key": ""}, 403), ({"content_type": "text/plain"}, 415),
+                 ({"content_type": "application/x-www-form-urlencoded"}, 415))
+        with self.assertLogs("atrinik_bot.web_server", "WARNING") as logs:
+            for options, expected in cases:
+                with self.subTest(**options):
+                    status, payload = await self.assist_post(
+                        {"gold": 1, "to": "Sera"}, **options)
+                    self.assertEqual(status, expected, payload)
+        # One rate-limited line for the three key refusals; nothing stored.
+        self.assertEqual(len([line for line in logs.output if "operator key" in line]), 1)
+        self.assertEqual(self.sessions, [])
+        self.assertEqual(self.stored(client), [])
+        self.assertNotIn(self.key, "".join(logs.output))
+
+    def test_the_cli_key_module_needs_no_game_imports(self):
+        # The operator-assist CLI runs before the content bundle is set up.
+        source = (Path(__file__).resolve().parent / "operator_key.py").read_text()
+        self.assertNotRegex(source, r"from \.|import atrinik")
+
+    async def test_key_file_is_owner_only_and_reused(self):
+        from .operator_assist import (OperatorKeyError, ensure_operator_key,
+                                      read_operator_key)
+
+        self.assertEqual(self.key_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(ensure_operator_key(self.key_file), self.key)
+        self.assertEqual(len(self.key), 64)
+        self.key_file.chmod(0o640)
+        with self.assertRaisesRegex(OperatorKeyError, "mode 0600"):
+            read_operator_key(self.key_file)
+        with self.assertRaisesRegex(OperatorKeyError, "cannot read"):
+            read_operator_key(Path(self.directory) / "missing.key")
         from .cli import operator_assist
-        from .operator_assist import OperatorAssist
 
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        client = SeraClient(Path(directory.name) / "memory.sqlite3")
-        self.server.client = client
-        self.server.engine.client = client
-        self.server.dashboard.client = client
-        sessions = []
+        with patch("builtins.print"):
+            self.assertEqual(await asyncio.to_thread(operator_assist, self.cli_args()), 2)
 
-        def factory(_client, name):
-            sessions.append(FakeOperatorSession(client))
-            return sessions[-1]
+    async def test_cli_sends_the_key_runs_it_and_resumes_autoplay(self):
+        from .cli import operator_assist
 
-        assist = OperatorAssist(client, self.server.engine, "Opal",
-                                session_factory=factory, poll_seconds=0.005)
-        self.server.operator_assist = self.server.dashboard.operator_assist = assist
+        self.use_sera()
         with patch("builtins.print"):
             code = await asyncio.to_thread(operator_assist, self.cli_args("--then-autoplay"))
         self.assertEqual(code, 0)
-        self.assertEqual(sessions[0].commands, ["/tp Sera", "/create goldcoin"])
+        self.assertEqual(self.sessions[0].commands, ["/tp Sera", "/create goldcoin"])
         self.assertIsInstance(self.server.engine.task, AutoplayTask)
         snapshot = json.loads((await self.request("GET", "/api/state?include=economy,alerts,"
                                                          "operator_assist"))[1])
@@ -20578,8 +20674,7 @@ class OperatorAssistRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("operator-assist", [alert["id"] for alert in snapshot["alerts"]])
         # A second request the same day is refused.
         self.server.engine.set_task(None)
-        status, payload = await self.request("POST", "/api/operator-assist",
-                                             {"gold": 1, "to": "Sera"})
+        status, payload = await self.assist_post({"gold": 1, "to": "Sera"})
         self.assertEqual(status, 409, payload)
         self.assertIn("24 h", json.loads(payload)["error"])
 
@@ -20593,30 +20688,19 @@ class OperatorAssistRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 400)
 
     async def test_route_refuses_a_second_run_while_one_is_running(self):
-        from .operator_assist import OperatorAssist
-
-        assist = OperatorAssist(self.server.client, self.server.engine, "Opal")
-        self.server.operator_assist = self.server.dashboard.operator_assist = assist
+        _, assist = self.use_sera()
         assist.running = True
-        status, payload = await self.request("POST", "/api/operator-assist",
-                                             {"gold": 1, "to": "Sera"})
+        status, payload = await self.assist_post({"gold": 1, "to": "Sera"})
         self.assertEqual(status, 409, payload)
         self.assertIn("already running", json.loads(payload)["error"])
 
     async def test_route_refuses_non_integer_gold(self):
-        from .operator_assist import OperatorAssist
-
-        directory = self.enterContext(tempfile.TemporaryDirectory())
-        client = SeraClient(Path(directory) / "memory.sqlite3")
-        assist = OperatorAssist(client, TaskEngine(client), "Opal")
-        self.server.operator_assist = self.server.dashboard.operator_assist = assist
+        self.use_sera()
         for gold in (True, 1.0, "1", None, [1]):
             with self.subTest(gold=gold):
-                status, payload = await self.request(
-                    "POST", "/api/operator-assist", {"gold": gold, "to": "Sera"})
+                status, payload = await self.assist_post({"gold": gold, "to": "Sera"})
                 self.assertEqual(status, 409, payload)
                 self.assertIn("gold coin(s) per run", json.loads(payload)["error"])
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,8 +28,8 @@ from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_far
                          FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
-from .operator_assist import (OperatorAssist, OperatorAssistRefused,
-                              MAX_GOLD_PER_RUN)
+from .operator_assist import (KEY_HEADER, MAX_GOLD_PER_RUN, OperatorAssist,
+                              OperatorAssistRefused, key_matches)
 from .quest_tasks import EscapingDesertedIslandTask
 from .quests import QuestDefinition, QuestObjective, flatten_parts, load_catalog
 from .tasks import (BankTask, BotTask, BuyShopUpgradeTask, DepositItemsTask,
@@ -756,7 +756,8 @@ class WebControlServer:
     def __init__(self, client: AtrinikClient, engine: TaskEngine, graph: WorldGraph,
                  host: str = "127.0.0.1", port: int = 8765, *,
                  operator_character: str = "",
-                 operator_assist: OperatorAssist | None = None):
+                 operator_assist: OperatorAssist | None = None,
+                 operator_key: str = ""):
         if not self._is_loopback_host(host):
             raise ValueError("the operator dashboard may only listen on loopback")
         self.client, self.engine, self.graph = client, engine, graph
@@ -768,6 +769,10 @@ class WebControlServer:
         self.operator_assist = operator_assist or OperatorAssist(
             client, engine, operator_character)
         self.dashboard.operator_assist = self.operator_assist
+        # The owner-only key /api/operator-assist requires; empty refuses all.
+        self.operator_key = operator_key
+        self._key_refusals_logged_at = 0.0
+        self._key_refusals_unlogged = 0
         client.metrics.attach(engine)
         self.face_images = FaceImages(
             getattr(client, "_runtime_content_root", Path(".")))
@@ -821,7 +826,7 @@ class WebControlServer:
                      cache: str = "no-store") -> None:
         labels = {200: "OK", 201: "Created", 204: "No Content",
                   400: "Bad Request", 403: "Forbidden", 404: "Not Found",
-                  405: "Method Not Allowed",
+                  405: "Method Not Allowed", 415: "Unsupported Media Type",
                   409: "Conflict", 413: "Content Too Large", 500: "Internal Server Error"}
         header = (f"HTTP/1.1 {status} {labels.get(status, 'Error')}\r\n"
                   f"Content-Type: {content_type}\r\nContent-Length: {len(body)}\r\n"
@@ -859,7 +864,8 @@ class WebControlServer:
                 return
             body = await reader.readexactly(length) if length else b""
             target = urlsplit(raw_target)
-            await self._route(writer, method, target.path, body, target.query)
+            await self._route(writer, method, target.path, body, target.query,
+                              headers)
         except (ValueError, json.JSONDecodeError, asyncio.IncompleteReadError) as exc:
             await self._reply(writer, 400, _json_bytes({"error": str(exc)}))
         except Exception as exc:
@@ -873,7 +879,8 @@ class WebControlServer:
                 pass
 
     async def _route(self, writer: asyncio.StreamWriter, method: str,
-                     path: str, body: bytes, query: str = "") -> None:
+                     path: str, body: bytes, query: str = "",
+                     headers: dict[str, str] | None = None) -> None:
         if method == "GET" and path == "/api/state":
             snapshot = self.dashboard.snapshot()
             include = {
@@ -917,6 +924,25 @@ class WebControlServer:
             return
         if method == "POST" and path == "/api/operator-assist":
             # The owner's one-shot `atrinik-playtester operator-assist`.
+            # Reaching the dashboard is not enough (the lab proxy reaches
+            # it with a loopback Host, and a POST without Origin passes):
+            # the request must carry the owner-only key, as JSON, which an
+            # HTML form cannot send cross-site.
+            headers = headers or {}
+            content_type = headers.get("content-type", "").split(";")[0].strip()
+            if content_type.casefold() != "application/json":
+                await self._reply(writer, 415, _json_bytes({
+                    "ok": False, "error": "send application/json"}))
+                return
+            if not key_matches(self.operator_key, headers.get(KEY_HEADER.casefold(), "")):
+                # Nothing is recorded: no SQLite row, and a bounded log.
+                self._log_key_refusal()
+                await self._reply(writer, 403, _json_bytes({
+                    "ok": False, "outcome": "refused",
+                    "error": ("operator assist is disabled"
+                              if not self.operator_key else
+                              "the operator key is missing or wrong")}))
+                return
             data = json.loads(body or b"{}")
             if not isinstance(data, dict):
                 raise ValueError("expected a JSON object")
@@ -946,6 +972,18 @@ class WebControlServer:
             await self._reply(writer, 200, (STATIC / filename).read_bytes(), content_type)
             return
         await self._reply(writer, 404, _json_bytes({"error": "not found"}))
+
+    KEY_REFUSAL_LOG_SECONDS = 60.0
+
+    def _log_key_refusal(self) -> None:
+        """At most one log line a minute, counting the refusals between."""
+        now = time.monotonic()
+        if now - self._key_refusals_logged_at < self.KEY_REFUSAL_LOG_SECONDS:
+            self._key_refusals_unlogged += 1
+            return
+        log.warning("refused an operator-assist request without the operator key"
+                    " (%d more since the last report)", self._key_refusals_unlogged)
+        self._key_refusals_logged_at, self._key_refusals_unlogged = now, 0
 
     async def _replace_task(self, task: BotTask) -> dict[str, Any]:
         previous = self.engine.task

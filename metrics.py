@@ -251,7 +251,7 @@ class BotMetrics:
             "operator_assist_copper", "Copper operators have given her, in total.")
         self.operator_assist_last = gauge(
             "operator_assist_last_timestamp_seconds",
-            "Unix time the last completed operator assist ended.")
+            "Unix time the last operator assist whose coin left the operator ended.")
         self.operator_assist_running = gauge(
             "operator_assist_running", "1 while an operator assist holds her still.")
 

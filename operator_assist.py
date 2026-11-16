@@ -17,14 +17,22 @@ Server facts it relies on (Classic server and ``atrinik/content@main``):
 - ``/tp NAME`` puts the operator on Sera's exact square
   (``commands/permission/tp.c``); ``/create goldcoin`` puts one gold coin
   in the operator's inventory (``maps/python/commands/create.py``). Both are
-  permission commands: the operator character needs ``tp`` and ``create``,
-  for example the ``[OP]`` group (``permissions.cfg``).
+  permission commands: grant the operator character exactly ``tp`` and
+  ``create`` (``/cmd_permission NAME add tp``, ``/cmd_permission NAME add
+  create``). Never give a character this bot logs into ``[OP]`` or ``*``:
+  that includes ``/console``, a server Python console.
+- Logging the operator in disconnects any other session of that character
+  (``player_login``), and its logout saves it on Sera's square.
 - The operator drops the coin on that square and logs out; Sera picks it
   up. A drop and a pickup are journaled item moves like any other.
 
 Every run, and every refusal, is kept as an audit record in Sera's memory
-(``memory.sqlite3``, kind ``operator_assist``), and a completed one marks her
-dashboard and metrics as operator-assisted from then on.
+(``memory.sqlite3``, kind ``operator_assist``), and a run whose coin left the
+operator marks her dashboard and metrics as operator-assisted from then on.
+
+The dashboard route also requires the owner-only operator key (see
+``ensure_operator_key``), so reaching the dashboard is not enough to start
+a run.
 """
 
 from __future__ import annotations
@@ -44,6 +52,8 @@ from typing import Any, Callable
 
 from . import constants as c
 from .client import COIN_VALUES, AtrinikClient
+from .operator_key import (KEY_HEADER, OperatorKeyError, ensure_operator_key,
+                           key_matches, operator_key_path, read_operator_key)
 from .tasks import unresolved_hostile_contact
 
 log = logging.getLogger(__name__)
@@ -70,7 +80,14 @@ TIMEOUTS = {
 }
 PERMISSION_DENIED = "you do not have sufficient permissions for that command."
 NO_SUCH_PLAYER = "no such player."
-
+# commands_handle (server/commands.c) for a command nobody registered, such
+# as /create when the content's Python commands are not loaded.
+UNKNOWN_TP = "'/tp' is not a valid command."
+UNKNOWN_CREATE = "'/create' is not a valid command."
+# Server answers proving the command did nothing.
+NOTHING_CREATED = (PERMISSION_DENIED, UNKNOWN_CREATE)
+# Where the coin is when nothing can tell: it may exist, so it counts.
+GIVEN_COIN_STATES = ("ground", "character", "unknown")
 
 def hostile_contact(client: AtrinikClient, seconds: float) -> bool:
     """``unresolved_hostile_contact`` over server lines only: a player who
@@ -123,7 +140,7 @@ def _well_formed(record: Any) -> bool:
 def _keeps_evidence(record: dict) -> bool:
     """Whether a record bounds the daily limit or proves she was given gold:
     such records are never trimmed."""
-    return bool(record.get("counts")) or record.get("coin") in ("ground", "character")
+    return bool(record.get("counts")) or record.get("coin") in GIVEN_COIN_STATES
 
 
 class OperatorSession(AtrinikClient):
@@ -151,12 +168,16 @@ class OperatorSession(AtrinikClient):
 def operator_session(client: AtrinikClient, character: str) -> OperatorSession:
     """A connection like ``client``'s, playing ``character`` once."""
     scratch = Path(tempfile.mkdtemp(prefix="atrinik-operator-"))
-    config = dataclasses.replace(
-        client.config, character=character, register=False,
-        create_character=False, reconnect=False, party_name="",
-        runtime_state_path=str(scratch / "operator.sqlite3"),
-        runtime_content_path=str(getattr(client, "_runtime_content_root", "")))
-    return OperatorSession(config, scratch)
+    try:
+        config = dataclasses.replace(
+            client.config, character=character, register=False,
+            create_character=False, reconnect=False, party_name="",
+            runtime_state_path=str(scratch / "operator.sqlite3"),
+            runtime_content_path=str(getattr(client, "_runtime_content_root", "")))
+        return OperatorSession(config, scratch)
+    except BaseException:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise
 
 
 class OperatorAssist:
@@ -240,16 +261,17 @@ class OperatorAssist:
         log.log(level, "operator assist %s: %s", record["outcome"], {
             key: record.get(key) for key in (
                 "id", "character", "operator_character", "gold", "map", "x",
-                "y", "failed_step", "reason", "coin")})
+                "y", "sub_layer", "failed_step", "reason", "coin")})
         return saved
 
     def status(self) -> dict[str, Any]:
         """The dashboard's and metrics' view: whether, when and how much."""
         records = self.records()
-        # Given: the coin reached her square or her pack. A coin left on
-        # her square by an aborted run is hers to loot, so it counts too.
+        # Given: the coin left the operator, to her square or her pack, or
+        # it may have (unknown). A coin left on her square by an aborted run
+        # is hers to loot, so it counts too.
         completed = [record for record in records
-                     if record.get("coin") in ("ground", "character")]
+                     if record.get("coin") in GIVEN_COIN_STATES]
         counted = [float(record.get("started_at", 0.0))
                    for record in records if record.get("counts")]
         last = max(counted) if counted else None
@@ -362,6 +384,7 @@ class OperatorAssist:
             "copper": (gold * GOLD_COPPER
                        if isinstance(gold, int) and not isinstance(gold, bool) else 0),
             "map": state.map.path, "x": state.map.world_x, "y": state.map.world_y,
+            "sub_layer": state.map.player_sub_layer,
             "outcome": "running",
             # Whether it counts toward the daily limit: from the /create on.
             "counts": False,
@@ -420,7 +443,10 @@ class OperatorAssist:
                               failed_step=self._last_step(record))
             try:
                 if session is not None:
-                    await self._end_session(record, session, runner)
+                    try:
+                        await self._settle_coin(record, session, gold)
+                    finally:
+                        await self._end_session(record, session, runner)
             finally:
                 # Only now, after the operator's logout: a second request
                 # during that wait is still refused as already running.
@@ -439,6 +465,27 @@ class OperatorAssist:
                                f"{record.get('reason')}; coin {record['coin']}")
                 self.client.record_action("operator-assist", detail)
         return dict(record)
+
+    async def _settle_coin(self, record: dict, session: Any, gold: Any) -> None:
+        """After an abort past /create, look once more where the coin is.
+
+        Updates arrive after the orders: a coin that timed out may still
+        land. Whatever no inventory or square accounts for is ``unknown``,
+        which counts as given, so the assisted mark errs on the safe side.
+        """
+        if (record["outcome"] == "completed" or not record["counts"] or
+                record["coin"] not in ("none", "operator-inventory") or
+                not isinstance(gold, int)):
+            return
+        await asyncio.sleep(min(1.0, self.timeouts["drop"]))
+        before = int(record.get("operator_gold_before", 0))
+        if gold_stack(session.state.inventory)[0] >= before + gold:
+            record["coin"] = "operator-inventory"
+        elif gold_stack(self.client.state.ground)[0] >= gold and (
+                record["coin"] == "operator-inventory"):
+            record["coin"] = "ground"
+        else:
+            record["coin"] = "unknown"
 
     @staticmethod
     def _last_step(record: dict) -> str:
@@ -498,19 +545,24 @@ class OperatorAssist:
         await self._wait("operator-login", logged_in, runner=runner)
 
         def on_square() -> bool:
-            return (ops.map.path, ops.map.world_x, ops.map.world_y) == square
+            # The sub-layer too: a drop lands on the dropper's sub-layer
+            # (drop_object), and /tp does not set it.
+            return ((ops.map.path, ops.map.world_x, ops.map.world_y) == square and
+                    ops.map.player_sub_layer == record["sub_layer"])
 
         self._step(record, "teleport", f"/tp {name}")
         self._ensure_safe("teleport")
         mark = len(messages)
         await session.command(f"/tp {name}")
         await self._wait("teleport", on_square, runner=runner, messages=messages,
-                         since=mark, failures=(PERMISSION_DENIED, NO_SUCH_PLAYER))
+                         since=mark,
+                         failures=(PERMISSION_DENIED, NO_SUCH_PLAYER, UNKNOWN_TP))
         if (client.state.map.path, client.state.map.world_x,
                 client.state.map.world_y) != square:
             raise OperatorAssistAborted("teleport", f"{name} left her square")
 
         before, _ = gold_stack(ops.inventory)
+        record["operator_gold_before"] = before
         stacks_before = {item.tag: item.quantity for item in ops.inventory}
         command = (f"/create {GOLD_ARCHETYPE}" if gold == 1 else
                    f"/create {gold} {GOLD_ARCHETYPE}")
@@ -529,10 +581,10 @@ class OperatorAssist:
             await self._wait("create",
                              lambda: gold_stack(ops.inventory)[0] >= before + gold,
                              runner=runner, messages=messages, since=mark,
-                             failures=(PERMISSION_DENIED,))
+                             failures=NOTHING_CREATED)
         except OperatorAssistAborted as error:
-            if PERMISSION_DENIED in error.reason:
-                # The server checks permission before the command runs
+            if any(text in error.reason for text in NOTHING_CREATED):
+                # The server refused before the command ran
                 # (commands_handle): nothing was created.
                 record["counts"] = False
             raise

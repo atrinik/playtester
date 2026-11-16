@@ -17,7 +17,9 @@
   gold coin on the played character's square, once per 24 hours; she picks
   it up. Only the owner starts it, through the loopback dashboard; autoplay,
   tasks, the client and the task engine must never reference or call it.
-  It stays disabled while `ATRINIK_BOT_OPERATOR_CHARACTER` is empty, audits
+  Its dashboard route requires an owner-only key file (mode 0600), and the
+  operator character gets only the `tp` and `create` permissions, never
+  `[OP]` or `*`. It stays disabled while `ATRINIK_BOT_OPERATOR_CHARACTER` is empty, audits
   every run and refusal in her memory, and marks her dashboard and metrics
   as operator-assisted so later progress is never counted as earned. Do not
   widen it (more gold, other items, other commands, automatic triggers)
