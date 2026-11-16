@@ -445,7 +445,11 @@ steps away and keeps her distance.
   savebed, it is judged from where she stands, keyed by her component. The
   coarse map graph is not enough: it reaches the underground city's
   circuits around the entrance through seams she cannot walk.
-  - Exceptions: a route recall, a death on a map that did not hurt her, a
+  - A route emergency recall counts like a death when that map hurt her
+    (`map_damage` above 0); it still does not count toward kit hazards.
+    Live, on 2026-11-16, three recalls on the underground city entrance
+    taught only a route cost, and then she died there.
+  - Exceptions: a recall or death on a map that did not hurt her, a
     death with a kit she has since improved on, a death on her savebed
     map, and a death on a chokepoint block nothing. A chokepoint is a map
     cutting off more than half of what she reaches from the savebed
@@ -463,12 +467,24 @@ steps away and keeps her distance.
     elsewhere sends her off it.
   - Each expansion covers the whole world (a few tenths of a second on the
     event loop). Results are cached, and at most one runs every
-    `ROUTE_DEATH_SEARCH_INTERVAL_SECONDS` across all callers. None runs in
-    combat, while the circuit finishes a fight or loot, or for the
-    dashboard and Prometheus, which read cached results only.
+    `ROUTE_DEATH_SEARCH_INTERVAL_SECONDS` across all callers. None runs
+    while she is being hit, while the circuit finishes a fight or loot, or
+    for the dashboard and Prometheus, which read cached results only. Hits
+    from before her last death do not count as contact, and the combat
+    mode flag does not either: the server turns it on with every hit and
+    keeps it through a death. The circuit also turns combat mode off once
+    after each death.
   - While a route death is still being judged, nothing is usable. The
     circuit keeps its plan, and stops (`farm-spots-exhausted`) only once its
-    own spot is judged blocked and no other spot is usable.
+    own spot is judged blocked and no other spot is usable. Meanwhile a
+    plan whose leg is on, or whose route from where she stands crosses, a
+    counting route-death map is held (`farm-route-death-hold`): she heals,
+    eats and defends herself but does not walk on. Live, on 2026-11-16,
+    she respawned and walked back towards the entrance that had just
+    killed her for three minutes while the verdict stayed undecided. A
+    pause after repeated failures rebuilds the farm task as well, so the
+    fatal fight's engagement does not read as a fight still being
+    finished.
   - Walks between a usable circuit's legs are not routed around blocked
     maps: learned route hazards only cost the planner more there. Every leg
     is reachable from the savebed without entering one, so a penalised
@@ -489,6 +505,22 @@ steps away and keeps her distance.
   fired a second recall, and with it a second failure review, as soon as
   the first one landed her in town. Live, she had fled at 8-16 hit points
   with a seven-charge recall wand.
+- **A recall counts once it starts.** The server drops a fire without a
+  word while a swing is still recovering (`socket_command_fire`'s
+  `action_attack` check) or when she lacks the source's skill
+  (`check_skill_to_fire`: "magic devices" for rods and wands, "wizardry
+  spells" for the spell). So no recall is fired before her action timer
+  has run out, and none from a source whose skill she visibly lacks. A
+  fire counts only when the server answers "You feel a force starting to
+  build up inside you." (`cast_wor`) within `RECALL_CONFIRM_SECONDS`; only
+  then is `emergency-recall` recorded and the 30 s guard held. An
+  unanswered or refused fire is recorded as `emergency-recall-dropped` and
+  retried on the next eligible tick, never on a square that blocks magic.
+  After `RECALL_SOURCE_REFUSALS` unanswered fires in a row a source gives
+  way to the next one for an hour. Live, on 2026-11-16, three recalls on
+  the underground city entrance, exactly 30 s apart, never started, and
+  she died there. A level-17 wand's force takes about 9 s to land
+  (72 server ticks); it is not cancelled by moving or by damage.
 - **Healing outpaced.** From the first heal in the last 8 s on, when the
   hits taken are at least what the later heals restored (her health at the
   latest heal is no higher than at the first), healing has stopped keeping

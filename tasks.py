@@ -383,6 +383,39 @@ def wand_known_empty(client: AtrinikClient, item: Item) -> bool:
             wand_charges(client).get(item.tag) == 0)
 
 
+def recall_source_refusals(client: AtrinikClient) -> dict[int, tuple[int, float]]:
+    """Unconfirmed recall fires per source tag: (count in a row, last at).
+
+    Kept on the client, so a rebuilt farm task does not try a source the
+    server keeps ignoring again from scratch.
+    """
+    refusals = getattr(client, "recall_source_refusals", None)
+    if refusals is None:
+        refusals = client.recall_source_refusals = {}
+    return refusals
+
+
+def recall_source_refused(client: AtrinikClient, item: Item) -> bool:
+    """Whether recall fires from ``item`` keep going unanswered.
+
+    Her skills are known from the inventory: a rod or wand without "magic
+    devices", or a spell without "wizardry spells", is dropped by the
+    server without a word (check_skill_to_fire), so it is never a recall
+    source. Otherwise a source is passed over after RECALL_SOURCE_REFUSALS
+    unconfirmed fires in a row, for RECALL_SOURCE_REFUSED_SECONDS.
+    """
+    skills = {skill.name.casefold() for skill in client.state.inventory
+              if skill.item_type == c.TYPE_SKILL}
+    if skills:
+        needed = ("magic devices" if item.item_type in (c.TYPE_ROD, c.TYPE_WAND)
+                  else "wizardry spells" if item.item_type == c.TYPE_SPELL else "")
+        if needed and needed not in skills:
+            return True
+    count, last = recall_source_refusals(client).get(item.tag, (0, 0.0))
+    return (count >= RECALL_SOURCE_REFUSALS and
+            time.monotonic() - last <= RECALL_SOURCE_REFUSED_SECONDS)
+
+
 def effective_action_time(client: AtrinikClient,
                           now: float | None = None) -> float:
     """Return the server timer after locally applying its elapsed countdown."""
@@ -422,6 +455,31 @@ MAGIC_BLOCKED_TYPES = MAGIC_CAST_TYPES
 # not start the spam again; a message older than this is not attributed.
 SPELL_BLOCK_MEMORY_SECONDS = 60 * 60.0
 SPELL_BLOCK_ATTRIBUTION_SECONDS = 10.0
+# A Word of Recall that really started: cast_wor (server/spell_effect.c)
+# answers with this as it inserts the delayed recall force. Without it no
+# recall is coming: the server drops a fire silently while a swing is
+# still recovering (socket_command_fire's action_attack check) or when she
+# lacks the device's skill (check_skill_to_fire), and refuses it with a
+# message on a blocked square or without mana.
+RECALL_BUILDING_MESSAGE = re.compile(
+    r"^You feel a force starting to build up inside you\.", re.I)
+RECALL_REFUSED_MESSAGE = re.compile(
+    r"^(?:Something blocks (?:your spellcasting|your spell|"
+    r"the magic of your .+)|Powerful countermagic cancels .+|"
+    r"You don't have enough mana|You can't cast that spell on .+)[.!]?$",
+    re.I)
+# A recall source whose fires went unconfirmed this many times in a row is
+# passed over for RECALL_SOURCE_REFUSED_SECONDS: without its skill (or
+# otherwise refused) it never works, and the next source must get a turn.
+RECALL_SOURCE_REFUSALS = 2
+RECALL_SOURCE_REFUSED_SECONDS = 60 * 60.0
+
+
+def _message_position(client: AtrinikClient) -> int:
+    """The position after her newest message (GameState.message_count)."""
+    state = client.state
+    return (int(getattr(state, "message_offset", 0) or 0) +
+            len(getattr(state, "messages", ()) or ()))
 
 
 def _square(client: AtrinikClient) -> tuple[str, int, int]:
@@ -1644,6 +1702,10 @@ class FarmTask(BotTask):
         self._emergency_recall_apply_at = 0.0
         self._emergency_recall_cast_at = 0.0
         self._emergency_recall_origin = ""
+        # A recall fire sent but not yet answered (monotonic), and the
+        # message position from which its answer is read.
+        self._emergency_recall_sent_at = 0.0
+        self._emergency_recall_feedback = 0
         # A recall wand fired (tag, wall-clock time), to catch "says poof";
         # a recall wand examined for its charges, and those examined once.
         self._recall_wand_fired: tuple[int, float] | None = None
@@ -4510,7 +4572,9 @@ class FarmTask(BotTask):
     def emergency_recall_candidates(client: AtrinikClient) -> list[Item]:
         """Return paid, identified recall sources in survival-first order.
 
-        A wand known to be empty (see observe_wand_feedback) is left out.
+        A wand known to be empty (see observe_wand_feedback) is left out,
+        and so is a source the server will not fire for her
+        (recall_source_refused).
         """
         policy = InventoryPolicy()
         candidates = [
@@ -4518,6 +4582,7 @@ class FarmTask(BotTask):
             if re.search(r"\bword of recall\b", item.name, re.I) and
             not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)
             and not wand_known_empty(client, item)
+            and not recall_source_refused(client, item)
             and (
                 item.item_type == c.TYPE_SPELL and
                 int(item.extra.get("cost", 0) or 0) <=
@@ -4599,6 +4664,17 @@ class FarmTask(BotTask):
         takes damage, so subsequent ticks continue normal retreat instead of
         standing still. This method returns true only while readying/firing a
         device consumes the current action tick.
+
+        A fire counts only once the server answers it (RECALL_BUILDING_MESSAGE
+        within RECALL_CONFIRM_SECONDS): only then is the emergency-recall
+        decision recorded and the RECALL_IN_FLIGHT_SECONDS guard held. The
+        server drops a fire silently while a swing is recovering, so none is
+        sent before her action timer has run out. Live, Sera "recalled"
+        three times, 30 s apart, on the underground city entrance and died
+        there: no recall had started, and each guard waited out its 30 s.
+        An unanswered or refused fire is recorded as emergency-recall-dropped
+        and retried on the next eligible tick; a source that keeps going
+        unanswered gives way to the next (recall_source_refused).
         """
         now = time.monotonic()
         if self._recall_wand_fired is not None:
@@ -4608,6 +4684,7 @@ class FarmTask(BotTask):
                 # coming, so the next candidate may be tried at once.
                 self._recall_wand_fired = None
                 self._emergency_recall_cast_at = 0.0
+                self._emergency_recall_sent_at = 0.0
                 self._emergency_recall_source = 0
                 self.note_recall_wand_empty(client)
                 recorder = getattr(client, "record_action", None)
@@ -4615,6 +4692,16 @@ class FarmTask(BotTask):
                     recorder("recall-wand-empty", f"tag={tag}")
             elif time.time() - fired_at > 5.0:
                 self._recall_wand_fired = None
+        if self._emergency_recall_sent_at:
+            answer = self._recall_answer(client)
+            if answer is None and (now - self._emergency_recall_sent_at <=
+                                   self.RECALL_CONFIRM_SECONDS):
+                # Awaiting the server's answer: keep retreating meanwhile.
+                return False
+            if answer is True:
+                self._confirm_recall(client)
+            else:
+                self._drop_recall(client, answer or "no answer from the server")
         if self._emergency_recall_cast_at:
             # A recall in flight is never followed by another within 30 s,
             # even on another map: either it has landed her at the savebed,
@@ -4623,23 +4710,21 @@ class FarmTask(BotTask):
             # Clearing on the map change fired a second recall (and a second
             # emergency-recall decision, which escalates the farm review)
             # the moment it arrived.
-            if now - self._emergency_recall_cast_at <= 30.0:
+            if now - self._emergency_recall_cast_at <= self.RECALL_IN_FLIGHT_SECONDS:
                 return False
             # A no-magic square can fizzle the delayed force. Permit a later
             # retry instead of suppressing recall forever in this FarmTask.
             self._emergency_recall_cast_at = 0.0
             self._emergency_recall_source = 0
         if self._emergency_recall_apply_at:
+            # Readying the device, or waiting out a swing before the fire.
             source = client.state.items.get(self._emergency_recall_source)
-            if source is not None and source.flags & c.ITEM_APPLIED:
-                await client.fire(0)
-                self._recall_fired(client, source)
-                self._emergency_recall_cast_at = now
-                self._emergency_recall_apply_at = 0.0
-                self._emergency_recall_origin = client.state.map.path
-                recorder = getattr(client, "record_action", None)
-                if recorder is not None:
-                    recorder("emergency-recall", f"via {source.name}")
+            ready = source is not None and (
+                source.item_type == c.TYPE_SPELL or
+                bool(source.flags & c.ITEM_APPLIED))
+            if ready and not effective_action_time(client):
+                assert source is not None
+                await self._fire_recall(client, source)
                 return True
             if (now - self._emergency_recall_apply_at <=
                     self.RECALL_APPLY_WINDOW_SECONDS):
@@ -4669,27 +4754,88 @@ class FarmTask(BotTask):
         if not critical:
             return False
         candidates = self.emergency_recall_candidates(client)
-        if not candidates:
+        # Every recall source is magic: none works on a blocked square.
+        if not candidates or spell_blocked_here(client):
             return False
         source = candidates[0]
         self._emergency_recall_source = source.tag
         await client.clear_actions()
         await client.set_combat(False)
+        if (source.item_type in (c.TYPE_ROD, c.TYPE_WAND) and
+                not source.flags & c.ITEM_APPLIED):
+            await client.apply(source.tag)
+            self._emergency_recall_apply_at = now
+            return True
+        if effective_action_time(client):
+            # A swing is still recovering: the server would drop the fire
+            # without a word. Fire on the first tick after it.
+            self._emergency_recall_apply_at = now
+            return True
+        await self._fire_recall(client, source)
+        return True
+
+    # How long a sent recall fire waits for the server's answer, and how
+    # long a confirmed recall holds off another one.
+    RECALL_CONFIRM_SECONDS = 2.0
+    RECALL_IN_FLIGHT_SECONDS = 30.0
+
+    async def _fire_recall(self, client: AtrinikClient, source: Item) -> None:
+        """Send the recall fire from ``source``; its answer is read later."""
+        self._emergency_recall_feedback = _message_position(client)
         if source.item_type in (c.TYPE_ROD, c.TYPE_WAND):
-            if not source.flags & c.ITEM_APPLIED:
-                await client.apply(source.tag)
-                self._emergency_recall_apply_at = now
-                return True
             await client.fire(0)
             self._recall_fired(client, source)
         else:
             await client.fire(0, source.tag)
-        self._emergency_recall_cast_at = now
+        self._emergency_recall_sent_at = time.monotonic()
+        self._emergency_recall_apply_at = 0.0
+        self._emergency_recall_source = source.tag
         self._emergency_recall_origin = client.state.map.path
+
+    def _recall_answer(self, client: AtrinikClient) -> bool | str | None:
+        """True once the recall force builds, the refusal text if refused,
+        None while the server has not answered the sent fire."""
+        state = client.state
+        messages = list(getattr(state, "messages", ()))
+        offset = int(getattr(state, "message_offset", 0) or 0)
+        for entry in messages[max(0, self._emergency_recall_feedback - offset):]:
+            if not self_improvement.from_server(entry):
+                continue
+            text = str(entry[-1]).strip()
+            if RECALL_BUILDING_MESSAGE.match(text):
+                return True
+            if RECALL_REFUSED_MESSAGE.match(text):
+                return text
+        return None
+
+    def _confirm_recall(self, client: AtrinikClient) -> None:
+        """The recall force is building: hold off another, and record it."""
+        self._emergency_recall_cast_at = self._emergency_recall_sent_at
+        self._emergency_recall_sent_at = 0.0
+        recall_source_refusals(client).pop(self._emergency_recall_source, None)
+        source = client.state.items.get(self._emergency_recall_source)
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
-            recorder("emergency-recall", f"via {source.name}")
-        return True
+            recorder("emergency-recall",
+                     f"via {source.name if source is not None else 'recall'}")
+
+    def _drop_recall(self, client: AtrinikClient, reason: str) -> None:
+        """No recall is coming from the sent fire: allow another at once."""
+        tag = self._emergency_recall_source
+        source = client.state.items.get(tag)
+        refusals = recall_source_refusals(client)
+        count = refusals.get(tag, (0, 0.0))[0] + 1
+        refusals[tag] = (count, time.monotonic())
+        self._emergency_recall_sent_at = 0.0
+        self._emergency_recall_cast_at = 0.0
+        self._emergency_recall_source = 0
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("emergency-recall-dropped",
+                     f"via {source.name if source is not None else tag}: "
+                     f"{reason}; unanswered {count} in a row")
+        log.warning("emergency recall via %s did not start: %s",
+                    source.name if source is not None else tag, reason)
 
     async def check_recall_wand(self, client: AtrinikClient) -> None:
         """Examine a recall wand of unknown charge while nothing threatens.

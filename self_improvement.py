@@ -278,17 +278,21 @@ def hazard_failure(entry: dict) -> bool:
 def route_death_maps(adaptations: dict | None,
                      applies: Callable[[dict], bool], *,
                      now: float | None = None) -> set[str]:
-    """Maps she recently died on while travelling to a farm spot.
+    """Maps she recently died on, or fled by recall from, on the way to a farm.
 
     Each route death (hazard_failure with cause "route") keeps the map she
     actually died on, the transit map, in its kit failure. That map is a
     farm-selection hazard for ROUTE_DEATH_HAZARD_SECONDS, for every spot
     whose route enters it, whichever spot she was heading to. ``applies``
     judges the kit the death happened with (a genuinely improved kit clears
-    it). Route recalls do not count: she survived them. Nor does a death on
-    a map that did not hurt her (map_damage 0: she died of earlier hits
-    after crossing onto it), as for the navigation's learned route hazards;
-    an entry stored before map_damage was kept counts.
+    it). A route emergency recall counts the same way when that map hurt
+    her (map_damage above 0): live, three recalls on the underground city
+    entrance did not stop the circuit routing through it, and then she
+    died there. Recalls still do not count toward kit
+    hazards (hazard_failure). Neither counts on a map that did not hurt her
+    (map_damage 0: she died of earlier hits after crossing onto it), as for
+    the navigation's learned route hazards; a death stored before
+    map_damage was kept counts, a recall stored without it does not.
     """
     now = time.time() if now is None else now
     maps: set[str] = set()
@@ -296,10 +300,16 @@ def route_death_maps(adaptations: dict | None,
         if not isinstance(record, dict):
             continue
         for entry in record.get("kit_failures", ()):
-            if (isinstance(entry, dict) and entry.get("cause") == "route" and
-                    hazard_failure(entry) and entry.get("map") and
-                    int(entry.get("map_damage", 1) or 0) > 0 and
-                    now - float(entry.get("time", 0.0) or 0.0) <=
+            if not (isinstance(entry, dict) and entry.get("cause") == "route" and
+                    entry.get("map")):
+                continue
+            if hazard_failure(entry):
+                hurt = int(entry.get("map_damage", 1) or 0) > 0
+            elif entry.get("kind") == "emergency-recall":
+                hurt = int(entry.get("map_damage", 0) or 0) > 0
+            else:
+                continue
+            if (hurt and now - float(entry.get("time", 0.0) or 0.0) <=
                     ROUTE_DEATH_HAZARD_SECONDS and
                     applies(entry.get("kit") or {})):
                 maps.add(str(entry["map"]))
