@@ -3,7 +3,8 @@
 Atrinik playtester is an autonomous, headless end-to-end player for Atrinik.
 It connects through ordinary player protocols, observes live game state, and
 runs navigation, quest, combat, equipment, economy, and survival policies
-without privileged server access.
+without privileged server access. The one exception is the owner-triggered
+[operator assist](#operator-assist), which autoplay never uses.
 
 The product goal is one reproducible unattended campaign from a new account
 and character through a versioned full-game completion contract. The initial
@@ -196,7 +197,13 @@ Gauges, read from live state on each scrape:
 - `farm_predicted_xp_per_hour{objective}`: the farming analyzer's estimate for
   its first-ranked spot;
 - `task_info{task}` and `phase_info{phase}`: 1 for the running top-level task
-  type and autoplay phase.
+  type and autoplay phase;
+- `operator_assisted`: 1 once an [operator assist](#operator-assist) has
+  given her coins, so progress from then on is not all earned in play;
+  `operator_assist_copper` (copper given in total),
+  `operator_assist_last_timestamp_seconds` (when the last run whose coin
+  left the operator ended) and
+  `operator_assist_running` (1 while one holds her still).
 
 Counters:
 
@@ -229,6 +236,100 @@ example, a target or a kite step means fighting, and a step or route decision
 means travelling. Actions that mark none, such as applying an item, keep the
 current state. A task that has not yet done anything that marks a state is
 `busy`; with no task running, she is `idle`.
+
+## Operator assist
+
+The owner can have an operator character hand the played character gold.
+This is the one, narrow exception to playing only through ordinary player
+capabilities (owner decision, 2026-11-16, when Sera was 1,827 copper short
+of the temple's remove-depletion fee). Nothing automatic ever starts it:
+autoplay, tasks, the client and the task engine hold no reference to it.
+
+It is disabled until `ATRINIK_BOT_OPERATOR_CHARACTER` (or
+`--operator-character`) names another character on the same account. Grant
+that character exactly the two commands it needs, from a game master's
+session:
+
+```text
+/cmd_permission <name> add tp
+/cmd_permission <name> add create
+```
+
+Do not give `[OP]` or `*` to any character this bot logs into: those grant
+every command, including `/console`, a server Python console.
+
+When enabled, the bot creates an owner-only key at start-up, if none exists:
+`operator-assist.key` (mode 0600, owned by the service user) next to its
+runtime state (`ATRINIK_BOT_RUNTIME_STATE`), else in
+`/var/lib/atrinik-playtester`, or at `ATRINIK_BOT_OPERATOR_KEY_FILE`.
+`POST /api/operator-assist` requires that key in the
+`X-Playtester-Operator-Key` header (compared in constant time) and a
+`Content-Type: application/json` body; reaching the dashboard is not enough.
+Requests without the right key are refused with 403, write no audit record,
+and are logged at most once a minute. As defence in depth, the lab's
+reverse proxy should deny `/api/operator-assist` outright.
+
+With the bot running (`web` or `autoplay`), the owner stops autoplay from
+the dashboard and runs, on the same machine, as the bot's service user so
+the command can read the key (for example `sudo -u playtester`):
+
+```sh
+sudo -u playtester /opt/atrinik-playtester/current/venv/bin/atrinik-playtester \
+  operator-assist --give-gold 1 --to Sera --web-port 8765 --then-autoplay
+```
+
+The full path is the release installed by the home-lab role. That role puts
+no `atrinik-playtester` on sudo's secure PATH.
+
+Give `--key-file` when the key is elsewhere. The command posts to the
+running bot's loopback dashboard, prints the audit record, and exits 0 only
+when the coin reached her. The running bot then:
+
+1. refuses unless the feature is enabled, `--to` names the character it
+   plays, the amount is 1 gold coin (the cap), the last run that reached
+   `/create` was more than 24 hours ago, and she is idle at a safe square:
+   logged in, no task or idle food trip, no target or combat, nothing hit her
+   in the last 10 seconds, health at least 90% and food at least 300;
+2. holds her still (`TaskEngine.operator_hold`: no task, idle survival or
+   inventory upkeep acts; dashboard tasks other than Stop and manual
+   actions are refused) and cancels her queued movement;
+3. logs the operator character in on a second connection. The Classic server
+   lets one account play several characters at once; it only replaces a
+   second session of the same character (`player_login`). She stays logged
+   in throughout. If the owner is playing the operator character at that
+   moment, that session is disconnected, and after the run the operator
+   character stays saved on her square;
+4. as the operator, sends `/tp Sera` (onto her exact square), waits until
+   the operator is on her square and her sub-layer (a drop lands on the
+   dropper's sub-layer, and `/tp` does not set it), then sends
+   `/create goldcoin` (one gold coin, 10,000 copper, into the operator's
+   inventory), drops exactly that coin and logs out;
+5. has her pick the coin up from her square, then releases the hold.
+
+Each step has a timeout, and before every order and on every poll it checks
+that holding her is still safe (no target or combat, no hit on her, health
+at least 90%), because the hold also suspends her idle healing. Any failure
+aborts the run: the operator is logged out, the hold is released, and the
+record says which step failed and where the coin is (`none`,
+`operator-inventory`, `ground` on her recorded square and sub-layer,
+`character`, or `unknown`). After an abort past `/create` it looks once
+more, a second later, at the operator's inventory and her square; a coin
+neither accounts for, such as one whose `/create` went unanswered, is
+`unknown`. If her own connection drops meanwhile, her normal reconnect
+restores her and the pickup waits for her. A run that failed before
+`/create`, or whose `/create` the server refused (no permission, or
+`'/create' is not a valid command.`), does not count toward the daily
+limit; a run whose counted record cannot be saved never sends `/create`.
+
+Every run and refusal while enabled is an audit record in her memory
+database (`memory.sqlite3`, kind `operator_assist`) and in the decision log
+(`operator-assist`). The list keeps 200 records, trimming only refusals and
+runs that never reached `/create`, so the daily limit and the assisted mark
+can never be pushed out. Gold counts as given once the coin left the
+operator (it reached her square or her pack) or may have (`unknown`). From then on, the dashboard shows
+an `Operator-assisted since …` header notice and the coins given next to her
+wealth, and the metrics above mark her as assisted: progress after it is not
+counted as earned.
 
 ## Farming analyzer
 

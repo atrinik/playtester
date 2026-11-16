@@ -28,6 +28,8 @@ from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_far
                          FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
+from .operator_assist import (KEY_HEADER, MAX_GOLD_PER_RUN, OperatorAssist,
+                              OperatorAssistRefused, key_matches)
 from .quest_tasks import EscapingDesertedIslandTask
 from .quests import QuestDefinition, QuestObjective, flatten_parts, load_catalog
 from .tasks import (BankTask, BotTask, BuyShopUpgradeTask, DepositItemsTask,
@@ -178,6 +180,12 @@ class DashboardState:
         self.client, self.engine = client, engine
         self.graph, self.catalog = graph, catalog
         self.started_at = time.time()
+        # The owner's operator assist, when the dashboard server runs one.
+        self.operator_assist: OperatorAssist | None = None
+
+    def operator_assist_status(self) -> dict[str, Any] | None:
+        assist = self.operator_assist
+        return assist.status() if assist is not None else None
 
     @staticmethod
     def _objective(obj: QuestObjective) -> dict[str, Any]:
@@ -512,11 +520,23 @@ class DashboardState:
                         str(getattr(task, "name", "")).startswith("autoplay"))
         # Moves happen between stats packets; the client reports disconnects.
         watch.observe(self.client.state)
-        return active_alerts(
+        alerts = active_alerts(
             self.client.state, self.client.decision_history, watch,
             autoplay_started_at=(float(getattr(task, "started_at", 0.0) or 0.0)
                                  if autoplay else None),
             task_running=task is not None)
+        assist = self.operator_assist_status()
+        if assist and assist["running"]:
+            alerts.append({"id": "operator-assist-running", "level": "warn",
+                           "text": "Operator assist running: she is held still"})
+        if assist and assist["assisted"]:
+            since = time.strftime("%Y-%m-%d", time.gmtime(assist["first_assisted_at"]))
+            alerts.append({
+                "id": "operator-assist", "level": "info",
+                "text": (f"Operator-assisted since {since} "
+                         f"({assist['copper_total'] // 10_000} gold): later "
+                         "progress is not all earned")})
+        return alerts
 
     def snapshot(self) -> dict[str, Any]:
         state, task = self.client.state, self.engine.task
@@ -590,6 +610,7 @@ class DashboardState:
                 if tag in state.items
             ],
         } for item in state.ground]
+        assist = self.operator_assist_status()
         return {
             "server_time": time.time(), "uptime": time.time() - self.started_at,
             "build": build_info(),
@@ -626,7 +647,10 @@ class DashboardState:
                 "banked": state.bank_balance,
                 "bank_known": state.bank_balance_known,
                 "total": BuyShopUpgradeTask.wallet_value(self.client),
+                # Copper an operator gave her: not earned in play.
+                "operator_assisted_copper": assist["copper_total"] if assist else 0,
             },
+            "operator_assist": assist,
             "task": task_data, "last_task": self.engine.last_task,
             "map": self.map(), "inventory": inventory, "ground": ground,
             "skills": sorted(skills, key=lambda skill: (-skill["level"], skill["name"])),
@@ -663,7 +687,8 @@ class DashboardState:
                      if state.phase == "playing" and
                      state.inventory_replay_complete else None),
             banked=state.bank_balance if state.bank_balance_known else None,
-            predicted_xp=predicted)
+            predicted_xp=predicted,
+            operator_assist=self.operator_assist_status())
 
     def analyzer_farm_spots(self) -> list[dict[str, Any]]:
         """The preferred objective's ranked spots, as manual farm circuits."""
@@ -729,13 +754,25 @@ class DashboardState:
 
 class WebControlServer:
     def __init__(self, client: AtrinikClient, engine: TaskEngine, graph: WorldGraph,
-                 host: str = "127.0.0.1", port: int = 8765):
+                 host: str = "127.0.0.1", port: int = 8765, *,
+                 operator_character: str = "",
+                 operator_assist: OperatorAssist | None = None,
+                 operator_key: str = ""):
         if not self._is_loopback_host(host):
             raise ValueError("the operator dashboard may only listen on loopback")
         self.client, self.engine, self.graph = client, engine, graph
         self.host, self.port = host, port
         self.catalog = load_catalog()
         self.dashboard = DashboardState(client, engine, graph, self.catalog)
+        # Only this server holds the operator assist: the client and the task
+        # engine (so autoplay and every task) have no way to reach it.
+        self.operator_assist = operator_assist or OperatorAssist(
+            client, engine, operator_character)
+        self.dashboard.operator_assist = self.operator_assist
+        # The owner-only key /api/operator-assist requires; empty refuses all.
+        self.operator_key = operator_key
+        self._key_refusals_logged_at = 0.0
+        self._key_refusals_unlogged = 0
         client.metrics.attach(engine)
         self.face_images = FaceImages(
             getattr(client, "_runtime_content_root", Path(".")))
@@ -789,7 +826,7 @@ class WebControlServer:
                      cache: str = "no-store") -> None:
         labels = {200: "OK", 201: "Created", 204: "No Content",
                   400: "Bad Request", 403: "Forbidden", 404: "Not Found",
-                  405: "Method Not Allowed",
+                  405: "Method Not Allowed", 415: "Unsupported Media Type",
                   409: "Conflict", 413: "Content Too Large", 500: "Internal Server Error"}
         header = (f"HTTP/1.1 {status} {labels.get(status, 'Error')}\r\n"
                   f"Content-Type: {content_type}\r\nContent-Length: {len(body)}\r\n"
@@ -827,7 +864,8 @@ class WebControlServer:
                 return
             body = await reader.readexactly(length) if length else b""
             target = urlsplit(raw_target)
-            await self._route(writer, method, target.path, body, target.query)
+            await self._route(writer, method, target.path, body, target.query,
+                              headers)
         except (ValueError, json.JSONDecodeError, asyncio.IncompleteReadError) as exc:
             await self._reply(writer, 400, _json_bytes({"error": str(exc)}))
         except Exception as exc:
@@ -841,7 +879,8 @@ class WebControlServer:
                 pass
 
     async def _route(self, writer: asyncio.StreamWriter, method: str,
-                     path: str, body: bytes, query: str = "") -> None:
+                     path: str, body: bytes, query: str = "",
+                     headers: dict[str, str] | None = None) -> None:
         if method == "GET" and path == "/api/state":
             snapshot = self.dashboard.snapshot()
             include = {
@@ -883,6 +922,42 @@ class WebControlServer:
                 await self._reply(writer, 200, image, "image/png",
                                   cache="public, max-age=86400, immutable")
             return
+        if method == "POST" and path == "/api/operator-assist":
+            # The owner's one-shot `atrinik-playtester operator-assist`.
+            # Reaching the dashboard is not enough (the lab proxy reaches
+            # it with a loopback Host, and a POST without Origin passes):
+            # the request must carry the owner-only key, as JSON, which an
+            # HTML form cannot send cross-site.
+            headers = headers or {}
+            content_type = headers.get("content-type", "").split(";")[0].strip()
+            if content_type.casefold() != "application/json":
+                await self._reply(writer, 415, _json_bytes({
+                    "ok": False, "error": "send application/json"}))
+                return
+            if not key_matches(self.operator_key, headers.get(KEY_HEADER.casefold(), "")):
+                # Nothing is recorded: no SQLite row, and a bounded log.
+                self._log_key_refusal()
+                await self._reply(writer, 403, _json_bytes({
+                    "ok": False, "outcome": "refused",
+                    "error": ("operator assist is disabled"
+                              if not self.operator_key else
+                              "the operator key is missing or wrong")}))
+                return
+            data = json.loads(body or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("expected a JSON object")
+            gold = data.get("gold")
+            try:
+                record = await self.operator_assist.run(gold, str(data.get("to", "")))
+            except OperatorAssistRefused as refusal:
+                await self._reply(writer, 409, _json_bytes({
+                    "ok": False, "outcome": "refused", "error": str(refusal),
+                    "max_gold_per_run": MAX_GOLD_PER_RUN}))
+                return
+            await self._reply(writer, 200, _json_bytes({
+                "ok": record["outcome"] == "completed",
+                "outcome": record["outcome"], "record": record}))
+            return
         if method == "POST" and path in ("/api/task", "/api/action"):
             data = json.loads(body or b"{}")
             result = (await self._set_task(data) if path == "/api/task"
@@ -897,6 +972,18 @@ class WebControlServer:
             await self._reply(writer, 200, (STATIC / filename).read_bytes(), content_type)
             return
         await self._reply(writer, 404, _json_bytes({"error": "not found"}))
+
+    KEY_REFUSAL_LOG_SECONDS = 60.0
+
+    def _log_key_refusal(self) -> None:
+        """At most one log line a minute, counting the refusals between."""
+        now = time.monotonic()
+        if now - self._key_refusals_logged_at < self.KEY_REFUSAL_LOG_SECONDS:
+            self._key_refusals_unlogged += 1
+            return
+        log.warning("refused an operator-assist request without the operator key"
+                    " (%d more since the last report)", self._key_refusals_unlogged)
+        self._key_refusals_logged_at, self._key_refusals_unlogged = now, 0
 
     async def _replace_task(self, task: BotTask) -> dict[str, Any]:
         previous = self.engine.task
@@ -922,6 +1009,8 @@ class WebControlServer:
 
     async def _set_task(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
+        if getattr(self.engine, "operator_hold", "") and kind != "stop":
+            raise ValueError("an operator assist is running; start tasks after it ends")
         if kind == "stop":
             # Stop means "no tasks except survival": farming, questing and
             # navigation end, but the engine's idle guard still heals her and
@@ -1101,6 +1190,10 @@ class WebControlServer:
 
     async def _action(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
+        if (getattr(self.engine, "operator_hold", "") and
+                kind not in ("farm_objective", "refresh_quests")):
+            # A manual order would move her or her gold mid-run.
+            raise ValueError("an operator assist is running; act after it ends")
         if kind in ("move", "dialog", "apply", "apply_ground"):
             # A manual order would fight a running idle food trip.
             self._hold_idle_survival(f"manual {kind}")

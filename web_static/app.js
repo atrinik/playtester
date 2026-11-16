@@ -294,7 +294,8 @@ function renderCharacter() {
     `<div class="skill"><span>${esc(k.name)}</span><b>${k.level}</b><div class="bar"><i style="width:${k.progress_percent || 0}%"></i></div></div>`).join("") || '<span class="muted">No skills yet</span>';
   $("#protections").innerHTML = Object.entries(live.protections || {}).filter(([, v]) => v).map(([k, v]) => `<span>${esc(k)} ${v}%</span>`).join("") || '<span class="muted">None</span>';
   const e = live.economy || {};
-  $("#wealth").textContent = `Carried ${coins(e.carried)} · Bank ${e.bank_known ? coins(e.banked) : "unknown"}`;
+  $("#wealth").textContent = `Carried ${coins(e.carried)} · Bank ${e.bank_known ? coins(e.banked) : "unknown"}` +
+    (e.operator_assisted_copper ? ` · ${coins(e.operator_assisted_copper)} given by an operator, not earned` : "");
   const cond = live.conditions || {};
   $("#depletion").textContent = cond.depletion_points_known
     ? `Depletion ${cond.depletion_points} / ${cond.depletion_threshold} before a priest visit`
