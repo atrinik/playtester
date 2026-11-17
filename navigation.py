@@ -4374,7 +4374,9 @@ def analyzer_farm_choice(
     every circuit behind the map, not only the one she was heading to; and
     a spot rated hazardous for her current kit (kit_hazardous_spot) is
     skipped until her survivability improves, unless every usable spot is
-    hazardous; then the least dangerous of them is farmed. Route-death
+    hazardous; then the least dangerous of them is farmed. Among usable
+    spots, those with a known, safe approach from her savebed
+    (farm_analyzer.risky_approach) come before the rest. Route-death
     spots are never that fallback, nor any depletion fallback below. While
     a route death is still being judged (route_death_blocked_maps returns
     None), nothing is usable yet and None is returned. Without ``search``
@@ -4424,6 +4426,10 @@ def analyzer_farm_choice(
         # dangerous one rather than idle until the hazard ages out.
         usable = [min(hazardous, key=lambda entry: float(
             entry[2].get("danger", 0.0) or 0.0))]
+    # Spots whose approach from her savebed is known and safe come first, in
+    # rank order (the sort is stable); an unknown or lethal approach is
+    # farmed only when nothing else is usable.
+    usable.sort(key=lambda entry: farm_analyzer_plan.risky_approach(entry[2]))
     if not depleted_for_temple(client.state):
         return usable[0] if usable else None
     budget = [1 if search else 0]

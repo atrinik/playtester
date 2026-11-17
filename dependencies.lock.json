@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "bundle_version": "protocol-v5.106.0-pathfinding-v5.48.0-content-v1.14.0-analyzer-v3.8.0-server-v5.99.0",
+  "bundle_version": "protocol-v5.106.0-pathfinding-v5.48.0-content-v1.14.0-analyzer-v3.10.0-server-v5.99.0",
   "inputs": {
     "content": {
       "repository": "atrinik/content",
@@ -67,14 +67,14 @@
     },
     "farming_analyzer": {
       "repository": "atrinik/tools",
-      "release": "v3.8.0",
-      "revision": "c624e500fd59ca43835022ef58e64186ee71e9d0",
+      "release": "v3.10.0",
+      "revision": "dcb1ef9e415e5c507fba409eb0440ebfc304004f",
       "license": "MIT",
       "disposition": "external farm-ranking tool run as a separate process; not distributed",
-      "artifact": "atrinik-tools-farming-analyzer-3.8.0.tar.gz",
-      "url": "https://github.com/atrinik/tools/releases/download/v3.8.0/atrinik-tools-farming-analyzer-3.8.0.tar.gz",
-      "sha256": "3adcce5154e3a8c5f5a909f775c68efe7a65ffad859f1ab38a0596b8b1f1f25d",
-      "root": "atrinik-tools-farming-analyzer-3.8.0",
+      "artifact": "atrinik-tools-farming-analyzer-3.10.0.tar.gz",
+      "url": "https://github.com/atrinik/tools/releases/download/v3.10.0/atrinik-tools-farming-analyzer-3.10.0.tar.gz",
+      "sha256": "441db410150acc205e41f929d4c824d39ce47ef323e46015f97a92db3f7d0de9",
+      "root": "atrinik-tools-farming-analyzer-3.10.0",
       "max_download_bytes": 1048576,
       "max_members": 200,
       "max_unpacked_bytes": 8388608,

@@ -34,10 +34,10 @@ they are cached external inputs and are not covered by this repository's MIT
 License.
 
 Farm spots are ranked by the separately distributed `farming_analyzer` from the
-`atrinik/tools` `v3.8.0` release at commit
-`c624e500fd59ca43835022ef58e64186ee71e9d0`. Its MIT release asset
-`atrinik-tools-farming-analyzer-3.8.0.tar.gz`
-(`sha256:3adcce5154e3a8c5f5a909f775c68efe7a65ffad859f1ab38a0596b8b1f1f25d`)
+`atrinik/tools` `v3.10.0` release at commit
+`dcb1ef9e415e5c507fba409eb0440ebfc304004f`. Its MIT release asset
+`atrinik-tools-farming-analyzer-3.10.0.tar.gz`
+(`sha256:441db410150acc205e41f929d4c824d39ce47ef323e46015f97a92db3f7d0de9`)
 is cached and run as a separate process; it is not vendored or imported into
 the playtester process. The analyzer reads the Classic server's experience and
 skill tables as text from the GPL-2.0-or-later `atrinik/classic` `v5.99.0`

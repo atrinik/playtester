@@ -7,7 +7,9 @@ bot keeps playing. It is fed the character's live combat profile (the
 killing skill's level and the player doll's DAM, WC, weapon speed, AC and
 protections; while training Wizardry, the spell's observed damage per cast,
 cast delay and mana instead of the weapon) and re-runs when that profile
-changes materially or the result ages out. One ``--ranking all`` run yields every objective, so switching the
+changes materially, her savebed moves, or the result ages out. A spot is
+judged from her savebed: the analyzer charges the maps crossed from there to
+the spot (approach danger) against her maximum health. One ``--ranking all`` run yields every objective, so switching the
 preferred objective never needs a new run.
 """
 
@@ -108,7 +110,37 @@ SUMMARY_FIELDS = (
     "path", "name", "region", "location", "map_paths", "monsters", "xp_hour",
     "money_hour", "loot_hour", "danger", "score", "safety_score",
     "aggressive_spawns", "max_aggro_pack", "max_monster_level", "danger_flags",
+    # Approach danger (analyzer v3.10.0): safety_score is the lower of the
+    # spot's own safety and the safety of the maps crossed to reach it.
+    "spot_safety_score", "approach_status", "approach_origin", "approach_maps",
+    "approach_danger", "approach_safety_score", "approach_worst_map",
+    "approach_danger_flags", "approach_unknown",
 )
+# The approach safety an unreachable spot is capped at. The analyzer's walk
+# follows exits and tiled seams only (no ships, scripts or keys), so
+# "unreachable" means "not modelled", not "deadly": half credit ranks such a
+# spot below every spot with a known safe approach in the balanced and safety
+# views, but above a known lethal approach.
+UNREACHABLE_APPROACH_SAFETY = 0.5
+# Below this approach safety (maximum health / the worst approach pack's
+# expected damage) crossing to the spot is expected to cost more than her
+# whole health bar. The analyzer does not model fight variance, so anything
+# short of full safety counts as a dangerous approach.
+APPROACH_SAFETY_FLOOR = 1.0
+
+
+def risky_approach(spot: dict) -> bool:
+    """Whether the way to a ranked spot is unknown or expected to be lethal.
+
+    Autoplay prefers spots with a known, safe approach and farms a risky one
+    only when no other spot is usable. Results without approach fields (an
+    analyzer before v3.10.0) are not penalized.
+    """
+    if spot.get("approach_unknown") is True or spot.get("approach_status") == "unreachable":
+        return True
+    score = spot.get("approach_safety_score")
+    return (isinstance(score, (int, float)) and not isinstance(score, bool) and
+            score < APPROACH_SAFETY_FLOOR)
 
 
 @dataclass(frozen=True)
@@ -353,7 +385,12 @@ class FarmAnalyzer:
     # After a failure, retry no sooner than this.
     RETRY_SECONDS = 900.0
     TIMEOUT_SECONDS = 900.0
-    TOP = 10
+    # Results kept per objective. Raw rankings list every permutation of a
+    # circuit: at Sera's level 36 profile the XP view holds 23 Underground
+    # City circuits behind one dangerous entrance (and one unreachable spot)
+    # before the first spot with a safe approach, at rank 25, so ten would
+    # leave autoplay nothing safe to prefer.
+    TOP = 40
 
     def __init__(self, analyzer_root: Path, content_root: Path, server_root: Path, *,
                  python: str = sys.executable,
@@ -366,6 +403,9 @@ class FarmAnalyzer:
         self.status = "idle"
         self.error = ""
         self.profile: CombatProfile | None = None
+        # The approach origin (her savebed map) the current report was
+        # ranked from; empty for the analyzer's default origins.
+        self.origin = ""
         self.report: dict | None = None
         self.started_at = 0.0
         self.finished_at = 0.0
@@ -392,8 +432,26 @@ class FarmAnalyzer:
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
-    def command(self, profile: CombatProfile) -> list[str]:
-        """The isolated analyzer invocation for one profile."""
+    def approach_origin(self, state) -> str:
+        """Her savebed map, if known and in the locked content, else "".
+
+        The analyzer rejects an unknown origin map, so a savebed outside the
+        content (or not yet known) falls back to its default origins.
+        """
+        path = str(getattr(state, "savebed_map", "") or "")
+        relative = Path(path.lstrip("/"))
+        if (not path.startswith("/") or ".." in relative.parts or
+                not relative.parts or
+                not (self.content_root / "maps" / relative).is_file()):
+            return ""
+        return path
+
+    def command(self, profile: CombatProfile, origin: str = "") -> list[str]:
+        """The isolated analyzer invocation for one profile.
+
+        With an ``origin`` (her savebed map) the approach to every spot is
+        judged from there alone, as she actually travels.
+        """
         bootstrap = (
             "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
             "sys.argv[0] = 'farming_analyzer'; "
@@ -404,11 +462,14 @@ class FarmAnalyzer:
             "--content-root", str(self.content_root),
             "--server-root", str(self.server_root),
             "--ranking", "all", "--top", str(self.TOP), "--json",
+            "--unreachable-approach-safety", f"{UNREACHABLE_APPROACH_SAFETY:g}",
         ]
+        if origin:
+            command += ["--approach-origin", origin, "--approach-origins-only"]
         nice = shutil.which("nice")
         return [nice, "-n", "10", *command] if nice else command
 
-    def due(self, profile: CombatProfile | None) -> bool:
+    def due(self, profile: CombatProfile | None, origin: str = "") -> bool:
         if profile is None or self.running:
             return False
         now = self.clock()
@@ -421,6 +482,7 @@ class FarmAnalyzer:
         if self.report is None:
             return True
         return (profile.materially_differs(self.profile) or
+                origin != self.origin or
                 now - self.reported_at >= self.REFRESH_SECONDS)
 
     def observe_spells(self, client) -> None:
@@ -470,7 +532,8 @@ class FarmAnalyzer:
                 self.status = "unsupported"
                 self.error = "no melee weapon school to simulate"
             return False
-        if not self.due(profile):
+        origin = self.approach_origin(client.state)
+        if not self.due(profile, origin):
             return False
         self._last_attempt_at = self.clock()
         # Report the run as soon as it is scheduled, not when it first runs.
@@ -478,11 +541,11 @@ class FarmAnalyzer:
         self.error = ""
         self.started_at = self._last_attempt_at
         self.runs += 1
-        self._task = asyncio.get_running_loop().create_task(self._run(profile))
+        self._task = asyncio.get_running_loop().create_task(self._run(profile, origin))
         return True
 
-    async def _run(self, profile: CombatProfile) -> None:
-        command = self.command(profile)
+    async def _run(self, profile: CombatProfile, origin: str = "") -> None:
+        command = self.command(profile, origin)
         log.info("farming analyzer started for %s %d", profile.skill, profile.skill_level)
         try:
             self._process = await asyncio.create_subprocess_exec(
@@ -515,6 +578,7 @@ class FarmAnalyzer:
         else:
             self.report = report
             self.profile = profile
+            self.origin = origin
             self.status = "ready"
             self.reported_at = self.clock()
             log.info("farming analyzer finished in %.1fs; top xp spot: %s",
@@ -548,8 +612,10 @@ class FarmAnalyzer:
             "finished_at": self.finished_at or None,
             "duration": round(self.duration, 1) if self.duration else None,
             "profile": self.profile.describe() if self.profile else None,
+            "approach_origin": self.origin or None,
             "ranking": [
-                {key: item.get(key) for key in SUMMARY_FIELDS}
+                {**{key: item.get(key) for key in SUMMARY_FIELDS},
+                 "approach_risky": risky_approach(item)}
                 for item in self.ranking(objective)[:5]
             ],
         }

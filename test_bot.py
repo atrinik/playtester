@@ -17095,15 +17095,30 @@ missing = [flag for flag in need if flag not in args]
 if missing:
     print("missing " + " ".join(missing), file=sys.stderr)
     raise SystemExit(2)
-def spot(name, xp, money):
-    return {"path": "/" + name, "name": name, "region": "test", "location": name,
-            "map_paths": ["maps/" + name], "monsters": ["rat L%d" % level],
-            "xp_hour": xp, "money_hour": money, "loot_hour": 1.0, "danger": 1.0,
-            "score": 1.0, "safety_score": 1.0, "aggressive_spawns": 0,
-            "max_aggro_pack": 0, "max_monster_level": level, "danger_flags": []}
-rankings = {key: [spot("grind", 900.0, 5.0), spot("gold", 100.0, 50.0)]
+origin = (args[args.index("--approach-origin") + 1]
+          if "--approach-origin" in args else "/world/world_1_1")
+def spot(name, xp, money, approach):
+    result = {"path": "/" + name, "name": name, "region": "test", "location": name,
+              "map_paths": ["maps/" + name], "monsters": ["rat L%d" % level],
+              "xp_hour": xp, "money_hour": money, "loot_hour": 1.0, "danger": 1.0,
+              "score": 1.0, "safety_score": approach, "aggressive_spawns": 0,
+              "max_aggro_pack": 0, "max_monster_level": level, "danger_flags": [],
+              "spot_safety_score": 1.0, "approach_status": "path",
+              "approach_origin": "maps" + origin, "approach_maps": ["maps/gate"],
+              "approach_danger": 288.0, "approach_safety_score": approach,
+              "approach_worst_map": "maps/gate", "approach_danger_flags": ["fire×3"],
+              "approach_unknown": False}
+    if approach is None:
+        result.update(approach_status="unreachable", approach_origin="",
+                      approach_maps=[], approach_danger=0.0, approach_worst_map="",
+                      approach_danger_flags=[], approach_unknown=True,
+                      approach_safety_score=float(
+                          args[args.index("--unreachable-approach-safety") + 1]),
+                      safety_score=0.5)
+    return result
+rankings = {key: [spot("grind", 900.0, 5.0, 0.85), spot("gold", 100.0, 50.0, None)]
             for key in ("balanced", "xp", "safety", "maneuverability", "loot")}
-rankings["money"] = [spot("gold", 100.0, 50.0), spot("grind", 900.0, 5.0)]
+rankings["money"] = [spot("gold", 100.0, 50.0, None), spot("grind", 900.0, 5.0, 0.85)]
 print(json.dumps({"results": rankings["xp"], "rankings": rankings, "args": args}))
 """
 
@@ -17395,6 +17410,95 @@ class FarmAnalyzerTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_ranked_spots_keep_the_approach_danger_fields(self):
+        async def scenario():
+            analyzer = self.analyzer()
+            self.assertTrue(analyzer.poll(self.client()))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "ready", analyzer.error)
+            grind, gold = analyzer.snapshot("xp")["ranking"]
+            self.assertEqual(
+                {key: grind[key] for key in (
+                    "spot_safety_score", "safety_score", "approach_status",
+                    "approach_origin", "approach_maps", "approach_danger",
+                    "approach_safety_score", "approach_worst_map",
+                    "approach_danger_flags", "approach_unknown")},
+                {"spot_safety_score": 1.0, "safety_score": 0.85,
+                 "approach_status": "path", "approach_origin": "maps/world/world_1_1",
+                 "approach_maps": ["maps/gate"], "approach_danger": 288.0,
+                 "approach_safety_score": 0.85, "approach_worst_map": "maps/gate",
+                 "approach_danger_flags": ["fire×3"], "approach_unknown": False})
+            # An expected 288 damage on the way against 244 HP is risky.
+            self.assertTrue(grind["approach_risky"])
+            # Unreachable: capped by --unreachable-approach-safety, and risky.
+            self.assertEqual((gold["approach_status"], gold["approach_unknown"],
+                              gold["approach_safety_score"]), ("unreachable", True, 0.5))
+            self.assertTrue(gold["approach_risky"])
+            await analyzer.close()
+
+        asyncio.run(scenario())
+
+    def test_risky_approach_reads_unknown_and_lethal_ways_there(self):
+        from .farm_analyzer import risky_approach
+
+        self.assertFalse(risky_approach({"approach_status": "path",
+                                         "approach_safety_score": 1.0}))
+        self.assertFalse(risky_approach({"approach_status": "origin",
+                                         "approach_safety_score": 1.0}))
+        self.assertTrue(risky_approach({"approach_status": "path",
+                                        "approach_safety_score": 0.68}))
+        self.assertTrue(risky_approach({"approach_status": "unreachable",
+                                        "approach_unknown": True,
+                                        "approach_safety_score": 1.0}))
+        # A report without approach fields (analyzer before v3.10.0).
+        self.assertFalse(risky_approach({"safety_score": 0.2}))
+
+    def test_her_savebed_is_the_only_approach_origin(self):
+        async def scenario():
+            now = [1000.0]
+            analyzer = self.analyzer(clock=lambda: now[0])
+            bed = "/shattered_islands/world_7_79"
+            content_map = analyzer.content_root / "maps" / bed.lstrip("/")
+            content_map.parent.mkdir(parents=True)
+            content_map.write_text("arch map\nend\n")
+            client = self.client()
+            # Unknown savebed: the analyzer's default origins.
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            args = analyzer.report["args"]
+            self.assertNotIn("--approach-origin", args)
+            self.assertNotIn("--approach-origins-only", args)
+            self.assertEqual(args[args.index("--unreachable-approach-safety") + 1], "0.5")
+            # Her max HP is the approach's health budget.
+            self.assertEqual(args[args.index("--max-health") + 1], "188")
+            self.assertIsNone(analyzer.snapshot("xp")["approach_origin"])
+            # Her savebed becomes known: re-ranked from there alone.
+            client.state.savebed_map, client.state.savebed_xy = bed, (16, 3)
+            now[0] += analyzer.MIN_INTERVAL_SECONDS + 1
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            args = analyzer.report["args"]
+            self.assertEqual(args[args.index("--approach-origin") + 1], bed)
+            self.assertIn("--approach-origins-only", args)
+            self.assertEqual(analyzer.snapshot("xp")["approach_origin"], bed)
+            self.assertEqual(analyzer.best("xp")["approach_origin"], "maps" + bed)
+            # An unchanged savebed and profile are not re-ranked.
+            now[0] += analyzer.MIN_INTERVAL_SECONDS + 1
+            self.assertFalse(analyzer.poll(client))
+            # A savebed outside the locked content (or a malformed path) is
+            # never passed: the analyzer rejects unknown maps.
+            for path in ("/shattered_islands/no_such_map", "../maps/world_7_79",
+                         "/shattered_islands/../shattered_islands/world_7_79"):
+                client.state.savebed_map = path
+                self.assertEqual(analyzer.approach_origin(client.state), "", path)
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertNotIn("--approach-origin", analyzer.report["args"])
+            self.assertEqual(analyzer.origin, "")
+            await analyzer.close()
+
+        asyncio.run(scenario())
+
     def test_command_is_isolated_and_low_priority(self):
         from .farm_analyzer import combat_profile
 
@@ -17500,6 +17604,43 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
             FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS)
         self.assertEqual(FarmCircuitTask.failure_backoff(
             "temple service took payment but depletion remained", 1800.0), 1800.0)
+
+    def test_a_spot_with_a_dangerous_approach_loses_to_a_safer_one(self):
+        from .navigation import analyzer_farm_selection
+
+        # Live, 2026-11-17: Sera (197 HP) kept choosing Underground City
+        # circuits, the XP leaders, whose entrance pack costs far more than
+        # her health bar on the way in. With her savebed as the approach
+        # origin, a spot with a safe approach ranked lower wins.
+        graph = built_graph()
+
+        def ranked(name, path, monster, **approach):
+            return {**analyzer_spot(name, [path], [monster]), **approach}
+
+        circuit = ranked(
+            "UC circuit", self.POCKET, "evil treant L13", xp_hour=7.0e6,
+            safety_score=0.27, spot_safety_score=0.42, approach_status="path",
+            approach_safety_score=0.27, approach_danger=735.0,
+            approach_worst_map="maps" + self.UC + "0_0", approach_unknown=False)
+        muddy = ranked(
+            "Muddy pit", self.UPPER, "Kotung L17", xp_hour=6.6e6,
+            approach_status="unreachable", approach_unknown=True,
+            approach_safety_score=0.5)
+        forest = ranked(
+            "Burnt forest", self.TREES, "evil treant L13", xp_hour=6.5e6,
+            safety_score=1.0, spot_safety_score=1.0, approach_status="path",
+            approach_safety_score=1.0, approach_danger=71.0, approach_unknown=False)
+        client = self.client({"xp": [circuit, muddy, forest]})
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Burnt forest")
+        # With no safe approach left, the analyzer's order decides.
+        client.farm_analyzer.rankings["xp"] = [circuit, muddy]
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "UC circuit")
+        # Results without approach fields keep the analyzer's order.
+        plain = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        client.farm_analyzer.rankings["xp"] = [plain, forest]
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
 
     def test_selection_follows_the_objective_and_skips_live_failures(self):
         from .navigation import analyzer_farm_selection

@@ -86,7 +86,7 @@ from already downloaded files without network access:
 atrinik-playtester dependencies \
   --source-archive /media/atrinik-content-1.14.0.tar.gz \
   --runtime-archive /media/atrinik-content-1.14.0-classic-runtime.tar.gz \
-  --analyzer-archive /media/atrinik-tools-farming-analyzer-3.8.0.tar.gz \
+  --analyzer-archive /media/atrinik-tools-farming-analyzer-3.10.0.tar.gz \
   --server-archive /media/atrinik-classic-server-5.99.0.tar.gz \
   --offline
 ```
@@ -344,6 +344,23 @@ ranking is six hours old, it starts one `nice` analyzer process with
 Runs are at least ten minutes apart, failures back off for fifteen minutes, and
 a failed run keeps the previous ranking. Only melee weapon schools are
 simulated so far.
+
+A spot is only as safe as the way there. Once her savebed is known and exists
+in the locked content, each run passes it as `--approach-origin MAP
+--approach-origins-only`, and a savebed move triggers a new run. The analyzer
+then charges the most dangerous pack crossed between the savebed and the spot
+against her live maximum HP (`--max-health`), and reports the spot's
+`safety_score` as the lower of the spot's own safety and that approach safety.
+Otherwise the analyzer's default origins apply. A spot the analyzer finds no
+path to is capped at an approach safety of 0.5
+(`--unreachable-approach-safety`), because its walk does not model ships,
+scripts or keys. Autoplay farms spots with a known approach safety of 100%
+before any spot whose approach is unknown or expected to cost more than her
+whole health bar, keeping the analyzer's order within each group, and takes
+a risky approach only when nothing else is usable. Raw rankings list every
+circuit permutation, so each run keeps the top 40 per objective. The Farming
+tab shows each spot's approach: its safety, worst map and danger, or that it
+is unknown.
 
 The dashboard's **Farming** tab shows the run status, the simulated profile and
 the top spots for the preferred objective: XP, money or loot per hour,
