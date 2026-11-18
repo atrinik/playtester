@@ -1,7 +1,8 @@
 """Dashboard alerts: what needs the operator's attention right now.
 
 Raised for repeated deaths, starvation, an idle character that cannot reach
-food, a character that is stuck while autoplay runs, and a lost connection.
+food, a character that is stuck while autoplay runs, a lost connection, and
+a task engine whose steps keep failing.
 The client keeps a ``ProgressWatch`` current; the dashboard serves the active
 alerts on every live poll.
 """
@@ -22,6 +23,11 @@ HUNGRY_FOOD = 180
 # eats since; IdleSurvival retries at most hourly.
 IDLE_FOOD_ALERT_SECONDS = 2 * 3600.0
 IDLE_HUNGER_ACTIONS = ("idle-hunger", "idle-hunger-fed", "idle-hunger-failed")
+# Consecutive failed task engine steps before the engine-error alert, and
+# how long they last before it turns critical. A failing step runs no task
+# and no idle survival, so she stands there.
+ENGINE_ERROR_STEPS = 5
+ENGINE_ERROR_CRITICAL_SECONDS = 10 * 60.0
 
 
 class ProgressWatch:
@@ -91,15 +97,26 @@ def idle_food_failure(decisions: Iterable[dict], now: float) -> dict | None:
 
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
            autoplay_started_at: float | None, task_running: bool = False,
+           engine_error: dict | None = None,
            now: float | None = None) -> list[dict[str, str]]:
     """The alerts that apply right now, most severe first.
 
     ``autoplay_started_at`` is when the running autoplay task started, or
     None when autoplay is not running; ``task_running`` is whether any task
-    runs.
+    runs; ``engine_error`` is the task engine's run of failed steps
+    (``error``, ``count``, ``since``), or None.
     """
     now = time.time() if now is None else now
     alerts: list[dict[str, str]] = []
+    if engine_error and int(engine_error.get("count", 0)) > ENGINE_ERROR_STEPS:
+        since = float(engine_error.get("since", now) or now)
+        minutes = int(max(0.0, now - since) // 60)
+        alerts.append({
+            "id": "engine-error",
+            "level": ("critical" if now - since >= ENGINE_ERROR_CRITICAL_SECONDS
+                      else "warn"),
+            "text": (f"Task engine failing: {engine_error['count']} steps in a "
+                     f"row for {minutes} min: {engine_error.get('error', '')}")})
     if (watch.disconnected_since is not None and
             now - watch.disconnected_since >= DISCONNECTED_SECONDS):
         minutes = int((now - watch.disconnected_since) // 60)

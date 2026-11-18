@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,9 @@ MAGIC_CAST_TYPES = frozenset((c.TYPE_SPELL, c.TYPE_SCROLL, c.TYPE_ROD,
 # The longest a death waits for a locked memory database (seconds).
 POST_MORTEM_SAVE_TIMEOUT = 0.25
 log = logging.getLogger(__name__)
+
+# Memory kind holding the owner's persisted Stop (see operator_stopped).
+OPERATOR_STOP_KIND = "operator_stop"
 
 # Words that open a line with a comma without addressing anyone ("Hi, ..."),
 # matched with stretched letters folded ("Heyy,", "Hmmm," and "Hellooo,").
@@ -547,6 +551,40 @@ class AtrinikClient:
                 self._memory_path, server=self._memory_server_key,
                 account=self.config.account)
         return self.memory
+
+    def operator_stopped(self) -> bool:
+        """Whether the owner's last dashboard order was Stop, not autoplay.
+
+        Persisted per server, account and the configured ``--character``
+        (the one key known before login), so the ``autoplay`` subcommand
+        does not resume after a crash or restart the owner's Stop. Without a
+        configured character nothing is persisted and this is False.
+        Storage errors propagate: the caller decides how to fail.
+        """
+        character = self.config.character
+        if not character:
+            return False
+        value = self._memory_store().load(character, OPERATOR_STOP_KIND, {})
+        return isinstance(value, dict) and value.get("stopped") is True
+
+    def set_operator_stopped(self, stopped: bool) -> bool:
+        """Persist the owner's Stop (True) or Start autoplay (False).
+
+        Returns whether it was saved. A storage error is logged, never
+        raised: the order itself still takes effect in this process.
+        """
+        character = self.config.character
+        if not character:
+            return False
+        try:
+            self._memory_store().save(
+                character, OPERATOR_STOP_KIND,
+                {"stopped": bool(stopped), "at": time.time()}, timeout=2.0)
+        except (OSError, sqlite3.Error):
+            log.exception("could not persist the operator %s",
+                          "stop" if stopped else "autoplay start")
+            return False
+        return True
 
     def set_depletion_points(self, points: int) -> None:
         self.state.depletion_points = max(0, int(points))

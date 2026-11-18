@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 
@@ -452,10 +453,14 @@ class IdleSurvival:
         self._hold_started: float | None = None
         # Priests whose food trip failed, until when they are passed over.
         self._failed_priests: dict[str, float] = {}
+        # Bumped by drop and hold, which the dashboard and the engine call
+        # while a tick awaits: the tick then leaves the trip as they left it.
+        self._generation = 0
 
     def drop(self) -> None:
         """Forget a trip in flight; a still-hungry character starts afresh."""
         self.child = None
+        self._generation += 1
 
     def hold(self, client: AtrinikClient, reason: str) -> None:
         """The operator took over: end a running trip and wait a while.
@@ -468,6 +473,7 @@ class IdleSurvival:
         health one-for-one (server types/player.c).
         """
         trip, self.child = self.child, None
+        self._generation += 1
         now = time.monotonic()
         food = int(client.state.stats.get("food", 1000) or 0)
         if self._hold_started is None or food >= HUNGRY_FOOD:
@@ -544,22 +550,42 @@ class IdleSurvival:
         if trip is None:
             self._give_up(client, "no temple priest is reachable")
             return False
+        generation = self._generation
         try:
             await client.clear_actions()
             await client.set_combat(False)
             await client.clear_target()
+            if self._generation != generation:
+                # Stop (or a task) took over while those were sent.
+                return False
             self.child = trip
             await trip.start(client)
         except ConnectionError as exc:
             # Never end the engine: the reconnect starts afresh.
             log.warning("idle food trip lost its connection while starting "
                         "(%s)", exc or "closed")
-            self.child = None
+            if self.child is trip:
+                self.child = None
             return True
+        except Exception as exc:  # A trip bug must not end the engine.
+            log.exception("idle food trip failed to start")
+            if self.child is trip:
+                self.child = None
+            self._give_up(client, f"{trip.name} did not start: {exc}")
+            return False
+        if self.child is not trip:
+            # Held or dropped while it started: undo what it sent.
+            await self._clear_stale(client)
+            return False
         self._record(client, "idle-hunger",
                      f"food {int(state.stats.get('food', 0) or 0)}; "
                      f"{trip.name}")
         return True
+
+    @staticmethod
+    async def _clear_stale(client: AtrinikClient) -> None:
+        with contextlib.suppress(ConnectionError):
+            await client.clear_actions()
 
     async def _tick_trip(self, client: AtrinikClient) -> bool:
         trip = self.child
@@ -570,11 +596,19 @@ class IdleSurvival:
             # Rebuilt from the server's state once she is playing again.
             log.warning("idle food trip lost its connection (%s)",
                         exc or "closed")
-            self.child = None
+            if self.child is trip:
+                self.child = None
             return True
         except Exception as exc:  # A trip bug must not end the engine.
             log.exception("idle food trip failed")
             trip.fail(str(exc))
+        if self.child is not trip:
+            # Stop's hold (or a task) ended this trip while it ticked: not a
+            # failure to back off from, and not hers to finish. Whatever the
+            # rest of the tick sent after Stop's clear is cleared too, so
+            # the stale trip does not keep walking.
+            await self._clear_stale(client)
+            return False
         if trip.status == TaskStatus.COMPLETE:
             self.child = None
             self._failures = 0

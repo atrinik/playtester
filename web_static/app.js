@@ -8,7 +8,7 @@ const $$ = s => [...document.querySelectorAll(s)];
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
 
-const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts";
+const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts,engine_error";
 const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
