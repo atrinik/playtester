@@ -19992,12 +19992,143 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         walk = recovery._home_walk
         self.assertEqual(walk.navigation.destination, self.HOME[0])
         self.assertTrue(walk.navigation.strict_safety)
-        # No other errand starts before she is home.
+        # No other errand starts before she is home, and the one walk
+        # carries on rather than being planned afresh every tick.
         self.assertIsNone(recovery.services._cure_funding)
         for _ in range(3):
             asyncio.run(recovery.tick(client))
+            self.assertIs(recovery._home_walk, walk)
+        self.assertNotEqual(self.moves, [])
+        self.assertIsNone(recovery.services._cure_funding)
         self.assertEqual(rebinds, [])
         self.assertIsNone(recovery.services._bed_binding)
+
+    def test_with_no_strictly_safe_way_out_she_still_walks_home(self):
+        # Live: no strictly safe route led home from any Burnt Forest map.
+        client, _ = self.client(depletion=92)
+        graph = built_graph()
+        node = graph.nodes[self.TREES]
+        start = next((x, y) for x in range(node.width // 2, node.width)
+                     for y in range(node.height // 2, node.height)
+                     if node.walkable(x, y))
+        self.place(client, (self.TREES, start))
+        client.state.route_hazards = {
+            edge.destination: time.time() + 3600 for edge in node.edges
+            if edge.destination != self.TREES}
+        self.assertTrue(client.state.route_hazards)
+        recovery, _ = self.recovery(client)
+        for _ in range(3):
+            asyncio.run(recovery.tick(client))
+        self.assertIn("recovery-home-unsafe-route", self.actions(client))
+        walk = recovery._home_walk
+        self.assertFalse(walk.navigation.strict_safety)
+        self.assertEqual(walk.navigation.destination, self.HOME[0])
+        self.assertNotEqual(self.moves, [])
+        # The cure stays strict and starts only from her savebed.
+        self.assertIsNone(recovery.services._restoration)
+
+    def test_hit_with_nothing_under_way_she_defends_instead_of_errands(self):
+        client, _ = self.client(depletion=92)
+        recovery, _ = self.recovery(client)
+        defended = []
+
+        async def defend(client):
+            defended.append(1)
+            return True
+
+        recovery._defense._defend_while_navigating = defend
+        client.state.add_message(2, "ff0000",
+                                 "singed deer hit you for 22 (-15) impact damage.")
+        asyncio.run(recovery.tick(client))
+        self.assertEqual(defended, [1])
+        # The cure she can afford waits until the fight is over.
+        self.assertIsNone(recovery.services._restoration)
+
+    def autoplay_farming(self, client):
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        return autoplay
+
+    @staticmethod
+    def deplete(client):
+        client.state.depletion_points = 92
+        client.state.depletion_points_known = True
+        client.state.place_item(Item(
+            502, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
+            client.state.player_tag)
+
+    def test_the_switch_drops_discretionary_trips_and_waits_for_essentials(self):
+        from .navigation import RecoveryTask
+
+        client, _ = self.client()
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        circuit._shopping = BotTask("upgrade sweep")
+        circuit._bed_binding = BotTask("savebed")
+        circuit._banking = BotTask("deposit")
+        self.deplete(client)
+        asyncio.run(autoplay.tick(client))
+        # The upgrade sweep and the rebinding end at once; the deposit runs.
+        self.assertIsNone(circuit._shopping)
+        self.assertIsNone(circuit._bed_binding)
+        self.assertIn("recovery-handover-dropped", self.actions(client))
+        self.assertIs(autoplay.child, circuit)
+        circuit._banking = None
+        asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+
+    def test_a_farm_fight_finishes_under_farm_combat_before_the_switch(self):
+        from .navigation import RecoveryTask
+
+        client, _ = self.client()
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        node = built_graph().nodes[self.TREES]
+        start = next((x, y) for x in range(node.width // 2, node.width)
+                     for y in range(node.height // 2, node.height)
+                     if node.walkable(x, y))
+        self.place(client, (self.TREES, start))
+        client.state.messages.append((time.time(), 2, "ff0000",
+                                      "evil treant hit you for 22 (-15) impact damage."))
+        self.deplete(client)
+        self.assertFalse(circuit.ready_for_handover(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertIs(autoplay.child, circuit)
+        # The fight is over: no hit for a while, nothing engaged.
+        client.state.messages.clear()
+        client.state.messages.append((time.time() - 60, 2, "ff0000",
+                                      "evil treant hit you for 22 (-15) impact damage."))
+        circuit.child.task._engaged_target = None
+        client.state.target_id = 0
+        asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+
+    def test_a_failed_ship_key_raises_recall_unavailable_across_a_restart(self):
+        client, _ = self.client()
+        self.empty_wands(client, 77)
+        recovery, _ = self.recovery(client)
+        recovery.services._ship_key = _DoneErrand(
+            status=TaskStatus.FAILED, error="Morg'eean did not answer")
+        asyncio.run(recovery.tick(client))
+        alerts = recovery.alerts(client)
+        self.assertEqual(self.ids(alerts), ["recall-unavailable"])
+        self.assertIn("ship key", alerts[0]["text"])
+        # Persisted: a new run (after Stop) still shows it.
+        fresh, _ = self.recovery(client)
+        self.assertEqual(self.ids(fresh.alerts(client)), ["recall-unavailable"])
+        self.assertTrue(client.state.recall_unavailable_at)
+
+    def test_cure_unfunded_hides_only_while_a_funding_trip_runs(self):
+        client, _ = self.client(depletion=92, bank=1_038)
+        recovery, _ = self.recovery(client)
+        # A funding trip is due but not running: the alert stands.
+        self.assertTrue(recovery.services._needs_cure_funding(client))
+        self.assertEqual(self.ids(recovery.alerts(client)), ["cure-unfunded"])
+        asyncio.run(recovery.tick(client))
+        self.assertIsNotNone(recovery.services._cure_funding)
+        self.assertEqual(recovery.alerts(client), [])
 
     def test_a_hit_during_recovery_never_walks_the_farm_route(self):
         from .navigation import RecoveryTask

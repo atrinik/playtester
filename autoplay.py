@@ -39,6 +39,10 @@ class AutoplayTask(BotTask):
     # level 24 (troll elite soldiers): wait until she outlevels them well.
     MANA_CRYSTAL_UPGRADE_LEVEL = 30
     MANA_CRYSTAL_UPGRADE_RETRY = 24 * 60 * 60
+    # A switch to the recovery phase waits at most this long for the
+    # circuit's essential trip or farm fight: farm combat can pull the next
+    # target, and a cure trip can stall.
+    HANDOVER_SECONDS = 120.0
     # A priest whose food trip failed is passed over this long.
     TEMPLE_PRIEST_RETRY = 60 * 60
 
@@ -63,6 +67,9 @@ class AutoplayTask(BotTask):
         # circuit inherits them, so it does not restart an errand that just
         # failed (live: the walk to a full apartment chest, every cycle).
         self._circuit_backoffs: dict[str, float] = {}
+        # Since when a due switch to the recovery phase waits for the
+        # circuit (AutoplayTask.HANDOVER_SECONDS).
+        self._handover_since: float | None = None
         # What the recovery phase learned (RecoveryTask.memory), kept across
         # the temple food trips that interrupt it, until farming resumes.
         self._recovery_memory: dict = {}
@@ -268,6 +275,7 @@ class AutoplayTask(BotTask):
         await client.clear_actions()
         await client.set_combat(False)
         await client.clear_target()
+        self._handover_since = None
         await self._set_child(client, "recovery", RecoveryTask(
             self.graph, backoffs=self._circuit_backoffs,
             memory=self._recovery_memory))
@@ -334,15 +342,28 @@ class AutoplayTask(BotTask):
             return
 
         if self.child is not None:
-            # Unsafe to farm: the recovery phase replaces the circuit once
-            # no maintenance trip of its own is under way.
+            # Unsafe to farm: the recovery phase replaces the circuit. Its
+            # discretionary trips end now; an essential trip, or a fight on
+            # the farm map, finishes first, for at most HANDOVER_SECONDS.
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
-                    not self.child.maintenance_running() and
                     farming_unsafe_reason(client)):
-                self._circuit_backoffs = self.child.backoffs()
-                await self._start_recovery(client)
-                return
+                dropped = self.child.drop_discretionary_trips()
+                if dropped:
+                    await client.clear_actions()
+                    recorder = getattr(client, "record_action", None)
+                    if recorder is not None:
+                        recorder("recovery-handover-dropped", ", ".join(dropped))
+                now = time.monotonic()
+                if self._handover_since is None:
+                    self._handover_since = now
+                if (self.child.ready_for_handover(client) or
+                        now - self._handover_since >= self.HANDOVER_SECONDS):
+                    self._circuit_backoffs = self.child.backoffs()
+                    await self._start_recovery(client)
+                    return
+            else:
+                self._handover_since = None
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
                     self.child.safe_for_progression_detour(client)):

@@ -642,9 +642,15 @@ which objective she farmed, because farming was what paid the fee.
   recall source is not held; recall shopping buys her first one.
 
 While either holds, autoplay runs a recovery phase (`RecoveryTask`)
-instead of a farm circuit, whether or not the analyzer ranks a spot. A
-running circuit is replaced once none of its own maintenance trips is
-under way. Each tick the recovery phase:
+instead of a farm circuit, whether or not the analyzer ranks a spot.
+When the switch is due, the circuit's discretionary trips end at once
+(upgrade sweep, spell purchase, utility and recall shopping, savebed
+rebinding). Essential trips finish first (food, bank, identify, storage,
+the cure and its funding), and so does a fight on the farm map, under the
+farm's own combat and emergency recall. The wait lasts at most
+`HANDOVER_SECONDS` (120 s). A fight on the road is no reason to wait,
+since waiting would walk her on along the farm route. Each tick the
+recovery phase:
 
 - while she is hit, fires the emergency recall by the farm's own rule,
   then heals, takes the low-health retreat, or defends where she stands.
@@ -652,8 +658,12 @@ under way. Each tick the recovery phase:
   resume;
 - heals and eats. Hunger with nothing to eat is autoplay's temple food
   trip, as before;
-- off her savebed with nothing running, walks home on a strict route, so
-  every errand starts from her savebed;
+- off her savebed with nothing running, walks home on a strict route.
+  Where none exists it takes the ordinary route, which only costs learned
+  hazards more, and records `recovery-home-unsafe-route`. Recovery
+  usually starts on the farm, and live no strictly safe route led home
+  from any Burnt Forest map. Errands start only from her savebed, and the
+  cure and funding trips stay strict;
 - depleted: the strict temple cure when she can pay (a depletion potion
   first); otherwise the cure-funding path (identify-all, junk sale,
   deposit, the apartment chest);
@@ -673,18 +683,22 @@ clears as soon as its condition does:
 
 - `farming-suspended` (warning), with the live reason, in any autoplay
   phase;
-- `cure-unfunded`: depleted, short of the fee, and no funding trip can
-  run. Operator assist can give her the gold;
+- `cure-unfunded`: depleted, short of the fee, and no funding trip under
+  way (one that is merely due does not hide it). Operator assist can give
+  her the gold;
 - `cure-unreachable`: three strict temple trips in a row refused for want
   of a safe route from her savebed;
 - `recall-unfunded`: under the 1,250 copper recall shopping needs.
   Operator assist can give her the gold;
-- `recall-unavailable`: the last recall shopping failed or bought nothing.
+- `recall-unavailable`: the last recall shopping failed or bought nothing,
+  or getting the ship key it needs failed. The reason is kept in her
+  persisted state (`recall_unavailable`) for a day, so it survives Stop
+  and restarts.
 
 The `stuck` alert is left out only while she waits at her savebed on one
 of these blockers. A cure walk or other errand that stalls still raises
-it. A temple food trip interrupts the phase, and what it learned (refused
-cure routes, a fruitless shop) carries over to the next one.
+it. A temple food trip interrupts the phase, and its count of refused
+cure routes carries over to the next one.
 
 Before a farm circuit walks out, it examines every recall wand of unknown
 charge and waits for the answers (or the 5 s timeout). The empty mark is

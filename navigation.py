@@ -6593,11 +6593,41 @@ class FarmCircuitTask(BotTask):
                     if service is not None and service is not self._capability]
         return bool(blocking) and self._expedition_return is None
 
-    def maintenance_running(self) -> bool:
-        """Whether a maintenance or food trip of the circuit is under way:
-        autoplay lets it finish before replacing the circuit."""
-        return self._resupply is not None or any(
-            service is not None for service in self._maintenance_services())
+    # Trips autoplay drops at once when farming turns unsafe: discretionary
+    # purchases, recall shopping (the recovery phase shops from her
+    # savebed itself) and savebed rebinding. Every other trip is an
+    # essential (food, bank, identify, storage, the cure and its funding,
+    # the ship key) and finishes first.
+    DROPPED_AT_HANDOVER = ("_shopping", "_spell_purchase", "_utility_shopping",
+                           "_recall_shopping", "_bed_binding")
+
+    def drop_discretionary_trips(self) -> list[str]:
+        """End the trips in DROPPED_AT_HANDOVER; the names of those ended."""
+        dropped = []
+        for name in self.DROPPED_AT_HANDOVER:
+            task = getattr(self, name)
+            if task is not None:
+                dropped.append(task.name)
+                setattr(self, name, None)
+        return dropped
+
+    def ready_for_handover(self, client: AtrinikClient) -> bool:
+        """Whether autoplay may replace this circuit by its recovery phase.
+
+        Not while an essential trip is under way, nor while she fights on
+        the farm map: the farm's own combat and emergency recall finish
+        that fight. On the road a fight is no reason to wait: that would
+        walk her on along the farm route, and recovery defends her itself.
+        """
+        if self._resupply is not None or any(
+                service is not None for service in self._maintenance_services()):
+            return False
+        farm = self.child.task if self.child is not None else None
+        on_farm = (self.child is not None and
+                   client.state.map.path == self.child.navigation.destination)
+        return not (on_farm and isinstance(farm, FarmTask) and (
+            _contact_this_life(client) or
+            self._busy_finishing_fight_or_loot(client, farm, held=True)))
 
     def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
         """Return whether autoplay may replace this circuit between pulls."""
@@ -7863,8 +7893,9 @@ class RecoveryTask(BotTask):
       walk under way defends itself. There is no farm route to resume;
     - healing and eating (her safety policy; autoplay's temple food trip
       covers hunger with nothing to eat);
-    - off her savebed with nothing running: a strict walk home, so every
-      errand starts from her savebed;
+    - off her savebed with nothing running: a walk home, strictly safe
+      where such a route exists and otherwise by the ordinary route
+      (recovery-home-unsafe-route). Every errand starts from her savebed;
     - depleted: the temple cure when she can pay (a depletion potion
       first), otherwise the cure-funding path: identify-all, junk sale,
       deposit, the apartment chest. Depletion comes first: no recall is
@@ -7907,8 +7938,9 @@ class RecoveryTask(BotTask):
         self._home_walk: NavigateThenTask | None = None
         self._home_retry_at = 0.0
         # What outlives a temple food trip, which replaces this phase:
-        # consecutive strict-route refusals of the cure, and the last
-        # recall shopping that bought nothing. Autoplay keeps it.
+        # consecutive strict-route refusals of the cure. Autoplay keeps it.
+        # Why a recall replacement came to nothing is persisted instead
+        # (GameState.recall_unavailable), so it survives Stop and restarts.
         self.memory = memory if memory is not None else {}
         self.reason = ""
 
@@ -7963,14 +7995,14 @@ class RecoveryTask(BotTask):
         return (not self.busy() and self.at_home(client) and
                 not _contact_this_life(client))
 
-    # Funding trips; while any runs or can start, the cure is not unfunded.
-    def _funding_possible(self, client: AtrinikClient) -> bool:
+    def _funding_running(self) -> bool:
+        """Whether a funding trip is under way: only then is a short cure
+        not yet unfunded. A trip that is merely due does not count, so the
+        alert does not flap with every retry deadline."""
         s = self.services
-        return bool(
-            s._cure_funding or s._selling or s._identification or
-            s._banking or s._bank_sync or s._needs_cure_funding(client) or
-            s._needs_junk_sale(client) or s._needs_mass_identification(client) or
-            s._needs_bank_sync(client))
+        return any(task is not None for task in (
+            s._cure_funding, s._selling, s._identification, s._banking,
+            s._bank_sync))
 
     def alerts(self, client: AtrinikClient) -> list[dict[str, str]]:
         """What blocks her way out, from live state: each clears as soon
@@ -7981,7 +8013,7 @@ class RecoveryTask(BotTask):
         assist = "; the owner can give her gold with the operator assist"
         if depleted_for_temple(client.state):
             if s._cure_shortfall(client):
-                if self._funding_possible(client):
+                if self._funding_running():
                     return []
                 cost = s._depletion_service_cost(client)
                 return [{"id": "cure-unfunded", "level": "critical",
@@ -8004,8 +8036,12 @@ class RecoveryTask(BotTask):
                      "text": "Recall unfunded: recall shopping needs "
                              f"{format_money(s.RECALL_SHOP_MINIMUM_WALLET)}, "
                              f"she has {format_money(wallet)}" + assist}]
-        unavailable = self.memory.get("recall_unavailable", "")
-        if unavailable and s._recall_shopping is None:
+        unavailable = getattr(client.state, "recall_unavailable", "") or ""
+        at = float(getattr(client.state, "recall_unavailable_at", 0.0) or 0.0)
+        # A note older than recall shopping's interval is stale: shopping
+        # is due again by then.
+        if (unavailable and s._recall_shopping is None and s._ship_key is None
+                and time.time() - at < s.RECALL_SHOP_INTERVAL):
             return [{"id": "recall-unavailable", "level": "critical",
                      "text": f"Recall unavailable: {unavailable}"}]
         return []
@@ -8013,7 +8049,7 @@ class RecoveryTask(BotTask):
     async def _tick_services(self, client: AtrinikClient) -> bool:
         """The circuit's trip under way, noting the outcomes alerts need."""
         s = self.services
-        restoration, shopping = s._restoration, s._recall_shopping
+        restoration, shopping, key = s._restoration, s._recall_shopping, s._ship_key
         ran = await s._tick_running_service(client)
         if restoration is not None and s._restoration is not restoration:
             if restoration.status == TaskStatus.FAILED:
@@ -8028,15 +8064,30 @@ class RecoveryTask(BotTask):
         if shopping is not None and s._recall_shopping is None:
             shopper = shopping.task
             if shopping.status == TaskStatus.FAILED:
-                self.memory["recall_unavailable"] = (
-                    f"recall shopping failed: {shopping.error}")
+                self._recall_unavailable(
+                    client, f"recall shopping failed: {shopping.error}")
             elif not (isinstance(shopper, BuyDialogueStockTask) and
                       shopper.purchased):
-                self.memory["recall_unavailable"] = (
-                    "recall shopping found no recall source to buy")
+                self._recall_unavailable(
+                    client, "recall shopping found no recall source to buy")
             else:
-                self.memory.pop("recall_unavailable", None)
+                self._recall_unavailable(client, "")
+        if (key is not None and s._ship_key is None and
+                key.status == TaskStatus.FAILED):
+            self._recall_unavailable(
+                client, "recall shopping needs Morg'eean's ship key, and "
+                f"getting it failed: {key.error}")
         return ran
+
+    @staticmethod
+    def _recall_unavailable(client: AtrinikClient, detail: str) -> None:
+        """Persist why replacing her recall source came to nothing."""
+        setter = getattr(client, "set_recall_unavailable", None)
+        if setter is not None:
+            setter(detail)
+        else:
+            client.state.recall_unavailable = detail
+            client.state.recall_unavailable_at = time.time() if detail else 0.0
 
     async def _start(self, client: AtrinikClient, errand: str, task) -> bool:
         await client.clear_actions()
@@ -8079,18 +8130,48 @@ class RecoveryTask(BotTask):
             return await self._start(
                 client, "_banking", s._new_bank_deposit(client))
         if s._needs_ship_key(client):
+            self._recall_unavailable(client, "")
             return await self._start(
                 client, "_ship_key", MorgeeanShipKeyTask(self.graph))
         if s._needs_recall_shopping(client):
-            self.memory.pop("recall_unavailable", None)
+            self._recall_unavailable(client, "")
             return await self._start(
                 client, "_recall_shopping", s._new_recall_shopping(client))
         return False
 
+    def _new_home_walk(self, home: tuple[str, tuple[int, int]], *,
+                       strict: bool) -> NavigateThenTask:
+        walk = NavigateThenTask(self.graph, home[0], _ArriveTask("savebed"),
+                                destination_xy=home[1], combat_approach=True)
+        walk.navigation.tolerance = 1
+        walk.navigation.strict_safety = strict
+        return walk
+
     async def _tick_home_walk(self, client: AtrinikClient) -> None:
+        """One step of the walk home: strictly safe, and when no such route
+        exists, by the ordinary route that only costs learned hazards more.
+
+        Recovery usually starts where her wands were found empty, on the
+        farm, and live no strictly safe route led home from any Burnt
+        Forest map: holding out for one stranded her on a respawning map.
+        The errands still start only from her savebed, strictly.
+        """
         walk = self._home_walk
         assert walk is not None
         await walk.tick(client)
+        if (walk.status == TaskStatus.FAILED and
+                walk.navigation.strict_safety and
+                FarmCircuitTask.failure_backoff(walk.error, 0.0) ==
+                FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS):
+            home = self._home(client)
+            assert home is not None
+            log.warning("recovery: no strictly safe route home (%s); taking "
+                        "the ordinary route", walk.error)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("recovery-home-unsafe-route", walk.error)
+            walk = self._home_walk = self._new_home_walk(home, strict=False)
+            await walk.tick(client)
         if walk.status == TaskStatus.FAILED:
             log.warning("recovery: walk to her savebed failed: %s", walk.error)
             self._home_retry_at = self.clock() + self.HOME_RETRY_SECONDS
@@ -8154,11 +8235,10 @@ class RecoveryTask(BotTask):
                 self.clock() >= self._home_retry_at):
             await client.clear_actions()
             await client.set_combat(False)
-            walk = NavigateThenTask(self.graph, home[0], _ArriveTask("savebed"),
-                                    destination_xy=home[1], combat_approach=True)
-            walk.navigation.tolerance = 1
-            walk.navigation.strict_safety = True
-            self._home_walk = walk
+            self._home_walk = self._new_home_walk(home, strict=True)
             await self._tick_home_walk(client)
             return
-        await self._start_errand(client, reason)
+        # Every errand starts from her savebed; off it, she waits for the
+        # next walk home.
+        if self.at_home(client):
+            await self._start_errand(client, reason)
