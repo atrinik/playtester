@@ -23,8 +23,9 @@ all of the following:
    deduplicated findings with evidence in a draft queue on her dashboard.
    Only an item the owner approves is filed as a GitHub issue: on
    `atrinik/content` for content, on `atrinik/classic` for engine and client
-   bugs. The only credential is a narrowly scoped token, used only when an
-   item is filed.
+   bugs, and on `atrinik/playtester` for findings about the bot itself. The
+   only credential is a small GitHub App with Issues write, whose key only
+   the separate filer reads, and only when an item is filed.
 6. **Anything else her history shows,** including equipment comparison,
    clearer item examination (what "+N" really does), and evidence-based
    balance comparisons. She does not duplicate the balance issues that
@@ -374,7 +375,7 @@ is unverified (ROUTING section 7).
    behaviour.
 6. **Nothing leaves the machine without the owner.** Drafts stay local. No
    GitHub request of any kind, searches included, happens before the owner
-   approves an item. The GitHub token is read only by the filer (4.10.6).
+   approves an item. The GitHub App key is read only by the filer (4.10.6).
 7. **The world is shared.** She never changes the world in a way another
    player would notice and could not undo: no one-shot levers, no using up a
    sign's limited readings, no marking a shared book as read (4.4, 4.6).
@@ -674,6 +675,18 @@ rule: by the time a level-94 monster appears it is too late.
   purpose.
 - *Allowed lever or switch*: apply once, watch, then restore (4.4.4).
 - *Inventory checker*: nothing to try; ROUTING owns checkers.
+- *Any other appliable object* (owner decision, 2026-11-18): every 4.4.1
+  resolution and refusal applies to it as well, so an object with a
+  connection to a refused target, an event script or a one-shot effect is
+  never tried. In addition to that offline resolution, she examines it in
+  game first, and reads plain signs nearby and only those books that
+  4.6 allows (never an unread world book). She records what they say. She
+  applies it only when the examine text or a hint positively states that
+  its only effect is opening or closing a gate or door, or showing text;
+  one that toggles a gate or door counts as a lever for 4.4.3 and 4.4.4.
+  She records what happened.
+  Everything else is shadow-only: a `lock-trial-shadow` decision with what
+  she read, until a supervised session.
 
 #### 4.4.3 Preconditions, all required
 
@@ -692,7 +705,8 @@ rule: by the time a level-94 monster appears it is too late.
 - Food above the hunger warning (PR #97's threshold) and a ready recall
   source with known charges (`known_charge`, COMBAT.md "Safety").
 - Not inside an owner block or a hazard cell (ROUTING 4.7, 4.4).
-- **For anything that changes the world** (a lever, switch or button): no
+- **For anything that changes the world** (a lever, switch or button, or
+  any other object that toggles a gate or door, 4.4.2): no
   other player on the map. She cannot see a whole map, and `/who` does not
   say where players are (`commands/player/who.c:40-81`), so this means
   `/who` reports her as the only player online ("There is 1 player
@@ -731,8 +745,9 @@ rule: by the time a level-94 monster appears it is too late.
 - **Restoring.** A lever with `exp` > 0 resets itself after `exp` ticks
   (`handle.c:76-81`, `handle.c:104-120`). Any other allowed lever is pulled
   again after the watch, so the shared world is as she found it, and the
-  second pull is recorded as `restore`. A lever she cannot restore
-  (refused, or a threat arrived) raises an alert.
+  second pull is recorded as `restore`. Any other object that toggled a gate
+  or door (4.4.2) is restored the same way, by applying it again. A lever she
+  cannot restore (refused, or a threat arrived) raises an alert.
 
 **What a trial writes.** One `interactions` row with the resolved targets;
 the `locks` row's state, attempts and hint; the hint observation; and, for a
@@ -1008,10 +1023,10 @@ completed it (as recorded by the quest executor) is `unexplained`.
 
 Routing to a repo is by producer: lock, sign, book, dialogue and quest
 findings go to `atrinik/content`; item presentation, client display and
-server formulas go to `atrinik/classic`. The owner can change the repo
-before approving. Findings about the playtester itself (section 2's
-starvation loop) are a separate internal list on the dashboard, never filed
-by this pipeline (open question 4).
+server formulas go to `atrinik/classic`; findings about the playtester
+itself (section 2's starvation loop, futile casts) go to
+`atrinik/playtester` through the same approval (owner decision,
+2026-11-18). The owner can change the repo before approving.
 
 #### 4.10.2 Deduplication
 
@@ -1024,13 +1039,13 @@ by this pipeline (open question 4).
   occurrences. The local record of filed items (`issue_url`) is the
   authoritative dedup source, so remote search is a second check only.
 - **Remote, after approval only.** Nothing is searched before the owner
-  approves (principle 6). After approval the filer searches the target
-  repo, with the token, for the fingerprint and for the subject's map path,
-  object or item name in titles. The fingerprint is a visible line in the
-  issue footer (`Playtester fingerprint: pt-4f1c2a9b0d3e`), because whether
-  GitHub search indexes HTML comments was not verified. A match outside a
-  code block sets `needs-review` with the candidates; the owner then marks
-  it a duplicate or files anyway. No match proceeds to filing.
+  approves (principle 6). After approval the filer searches the target repo,
+  with its installation token, for the fingerprint and for the subject's map
+  path, object or item name in titles. The fingerprint is a visible line in
+  the issue footer (`Playtester fingerprint: pt-4f1c2a9b0d3e`), because
+  whether GitHub search indexes HTML comments was not verified. A match
+  outside a code block sets `needs-review` with the candidates; the owner then
+  marks it a duplicate or files anyway. No match proceeds to filing.
 - **Existing balance issues.** A `balance` item whose subject matches an
   existing issue (for example
   [atrinik/classic#628](https://github.com/atrinik/classic/issues/628),
@@ -1144,22 +1159,23 @@ from what the maps say.
   The dashboard shows them read-only; no POST, with or without an Origin,
   changes them.
 
-#### 4.10.6 Filing and the token
+#### 4.10.6 Filing and the credential
 
 - **A separate process.** The filer is `atrinik-playtester feedback file`,
   run by its own systemd unit (a oneshot on a timer, or by hand). It is the
-  only process that can read the token: the game process never has it in
-  its environment, files or memory.
-- **Token.** A GitHub token scoped to `atrinik/content` and
-  `atrinik/classic`: Issues read and write and Metadata read, nothing else
-  (a fine-grained personal token or a GitHub App installation token; open
-  question 2). It is a systemd credential of the filer unit only
-  (`LoadCredential=`), or a file such as
-  `/etc/atrinik-playtester/feedback-token` (mode 0400, owned by the filer's
-  user). The filer reads it at start, uses it, and exits. It is never in
-  dashboard state, logs, checkpoints, metrics, decisions or `doctor`
-  output. The existing `GITHUB_TOKEN` for dependency downloads is a
-  different credential and is not used.
+  only process that can read the credential: the game process never has it
+  in its environment, files or memory.
+- **Credential.** A small GitHub App (owner decision, 2026-11-18) installed
+  on `atrinik/content`, `atrinik/classic` and `atrinik/playtester` with
+  Issues read and write and Metadata read, nothing else. Its private key is
+  a systemd credential of the filer unit only (`LoadCredential=`), or a file
+  such as `/etc/atrinik-playtester/feedback-app.pem` (mode 0400, owned by
+  the filer's user). At start the filer signs a short-lived JWT with it,
+  mints an installation token for the one repository it is filing to,
+  limited to `issues: write`, uses that token, and exits. Neither the key,
+  the JWT nor a token is ever in dashboard state, logs, checkpoints,
+  metrics, decisions or `doctor` output. The existing `GITHUB_TOKEN` for
+  dependency downloads is a different credential and is not used.
 - **Steps.** For each `approved` item, one at a time: set `checking`; run
   the remote dedup (4.10.2); on candidates, set `needs-review` and stop;
   otherwise set `filing`, then `POST /repos/{repo}/issues` (or
@@ -1168,21 +1184,21 @@ from what the maps say.
   with the error; the owner can retry.
 - **Labels and types.** The filer never creates labels; it uses only labels
   that already exist. `atrinik/content` has `bug`, `enhancement`, `maps`,
-  `question`; `atrinik/classic` has `bug`, `enhancement`,
-  `component: server`, `component: client`. The organization has issue
-  types `Bug`, `Feature` and `Task`. GitHub's REST API documents that labels
-  set by a caller without push access are dropped silently rather than
-  refused, and other triage fields such as the type may behave the same
-  way, so the filer reads the issue back after creating it. If labels or
-  type are missing, it marks the item `filed-unlabelled` and the dashboard
-  shows an alert; it does not retry. A shared `playtester` label is open
-  question 3.
+  `question`; `atrinik/classic` has `bug`, `enhancement`, `component: server`,
+  `component: client`; the labels of `atrinik/playtester` are read when the
+  filer starts. The organization has issue types `Bug`, `Feature` and `Task`.
+  GitHub's REST API documents that labels set by a caller without push access
+  are dropped silently rather than refused, and other triage fields such as
+  the type may behave the same way, so the filer reads the issue back after
+  creating it. If labels or type are missing, it marks the item
+  `filed-unlabelled` and the dashboard shows an alert; it does not retry. A
+  shared `playtester` label is open question 3.
 - **Rate limits.** At most 5 filings an hour and 20 a day, at least 60 s
   apart, and no request while GitHub's `x-ratelimit-remaining` is under 50.
   A 403 or 429 honours `Retry-After` and backs off exponentially from 10
   minutes. These limits are well inside GitHub's secondary limits for
   content creation.
-- **Dry run.** Without a token, an approved item stays `approved` and the
+- **Dry run.** Without the App key, an approved item stays `approved` and the
   dashboard and CLI offer "copy as Markdown" so the owner can file it
   herself.
 
@@ -1292,11 +1308,11 @@ rates by feature).
 - Feedback: fingerprints are stable across restarts; redaction drops a line
   naming a seen player; an excerpt containing a backtick fence, `<!--`,
   `@someone` and a fingerprint line renders inert; no network call happens
-  before approval; mocked GitHub for duplicate, success, labels dropped,
-  403 with `Retry-After` and the hourly cap; the token never appears in any
-  state the game process serializes (a test serializes all of it and
-  searches); a POST without the approval key is refused; no POST changes a
-  behaviour flag.
+  before approval; mocked GitHub for duplicate, success, labels dropped, 403
+  with `Retry-After` and the hourly cap; neither the App key, its file path, a
+  JWT nor a token appears in any state the game process serializes (a test
+  serializes all of it and searches); a POST without the approval key is
+  refused; no POST changes a behaviour flag.
 
 ## 5. Concrete examples from the content
 
@@ -1458,14 +1474,15 @@ typos. No network at all.
 *Accept:* drafts are deduplicated across restarts; redaction and quoting
 tests pass (4.13); a test proves no socket is opened; nothing is filed.
 
-**F6. `feat(feedback)`: owner approval and GitHub filing.** The approval
-key, CLI `approve|reject|edit`, the separate filer unit and command, token
-handling, post-approval dedup and `needs-review`, labels and types with
-read-back, rate limits, dry run, comments for balance targets and audit
-rows.
-*Accept:* with no token, approval leaves the item approved with a Markdown
+**F6. `feat(feedback)`: owner approval and GitHub filing.** The approval key,
+CLI `approve|reject|edit`, the separate filer unit and command, App key and
+installation-token handling, post-approval dedup and `needs-review`, labels
+and types with read-back, rate limits, dry run, comments for balance targets
+and audit rows.
+*Accept:* with no App key, approval leaves the item approved with a Markdown
 copy; mocked GitHub tests for success, duplicate, labels dropped, 403 with
-`Retry-After` and the hourly cap; the game process never reads the token;
+`Retry-After` and the hourly cap; the game process never reads the App key
+or a token;
 a POST without the approval key is refused.
 
 **F7. `feat(exploration)`: safe lock and lever trials.** `locks`,
@@ -1478,7 +1495,11 @@ ROUTING P3 (blocks and care) and P5 and P6 (the route tables and the
 danger costs that `PROBE_MAX_DANGER_SECONDS` is measured in).
 *Accept:* the 4.13 trial-safety tests; an unknown target type is refused;
 trials and ROUTING probes share one 3-a-day budget; a refusal does not
-stop the day's trials and, before F8, writes no `rejected` row; the owner turns the flag on after a supervised session.
+stop the day's trials and, before F8, writes no `rejected` row; another
+appliable object is applied only when its examine text or a hint states
+that its only effect is opening or closing a gate or door, or showing
+text, and an unread world book is never read for a hint; the
+owner turns the flag on after a supervised session.
 
 **F8. `feat(navigation)`: learned unlocks into routing.** Trial outcomes
 write `route_requirements` rows for `lock:` subjects, `UnlockState` gains
@@ -1565,6 +1586,45 @@ themselves.
 
 ## 7. Open questions for the owner
 
+Settled on 2026-11-18. These answers override the questions below and are
+folded into the sections cited:
+
+- **Token form (question 2).** A small GitHub App with Issues write only,
+  installed on `atrinik/content`, `atrinik/classic` and `atrinik/playtester`.
+  Only the separate filer process reads its key; the game process never
+  does (4.10.6). The filer still reads every issue back and keeps
+  `filed-unlabelled`, since dropped labels and types are unverified (section
+  8).
+- **Findings about the playtester itself (question 4).** Drafted like any
+  other feedback and, once the owner approves them, filed to
+  `atrinik/playtester` through the same queue (4.10.1).
+- **Trial scope (question 8).** All of these are allowed, under 4.4.1 and
+  the preconditions in 4.4.3:
+  - door trials in the wild and in dungeons;
+  - door trials in towns and quest maps;
+  - lever trials only while she is the only player online, restoring the
+    lever afterwards (4.4.3, 4.4.4).
+
+  Other appliable objects she meets are in scope too (4.4.2, F7). Every
+  4.4.1 refusal still applies. She examines the object and reads nearby
+  plain signs and books (only those that 4.6 allows) before applying it.
+  She applies it only when they positively state that its only effect is
+  opening or closing a gate or door, or showing text; anything else stays
+  shadow-only.
+- **LLM (question 9).** Allowed, local only: an offline model on a lab
+  host, so no game text leaves the lab. Which host is decided when F17 is
+  next. Every limit in 4.3.3 still applies.
+- **Live character (question 10).** Overtaken by events: on 2026-11-18,
+  after an owner-triggered operator assist gave her one gold coin, Sera paid
+  the temple and was cured of depletion; she was not restarted. Her
+  dashboard and metrics already mark her operator-assisted (the operator
+  assist's own `operator-assist` alert and `operator_assisted` metric),
+  which matters when these features are evaluated.
+
+Questions 1, 3, 5, 6, 7 and 11 remain open. Each is asked before the phase
+that needs it: question 1 before F6, question 3 before F6, questions 5 and
+6 before F9, question 7 before F16, and question 11 before F12.
+
 1. **Approval security.** Does the lab proxy in front of
    `playtester.atrinik.orion.milkyway` authenticate, and does it forward,
    strip or rewrite `Origin`? One request answers the second part without
@@ -1576,7 +1636,7 @@ themselves.
    installed on `atrinik/content` and `atrinik/classic` with Issues write?
    Whose account files the issues? (A token without push access may get its
    labels and type dropped, 4.10.6.)
-3. **Labels and types.** Create a `playtester` label in both repositories,
+3. **Labels and types.** Create a `playtester` label in all three repositories,
    and use the organization issue types (`Bug`, `Feature`, `Task`)?
 4. **Findings about the playtester itself** (the starvation loop, futile
    casts): dashboard-only, or also filed to `atrinik/playtester` through the
