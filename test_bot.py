@@ -21479,7 +21479,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=22", page)
+        self.assertIn(b"/app.js?v=23", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -22950,6 +22950,10 @@ OBSERVATION_ARCH = {
     "sign.arc": "Object sign\ntype 98\nname sign\nend\n",
     "lever.arc": "Object handle_lever\ntype 93\nname big lever\nend\n",
     "monster.arc": "Object kobold\ntype 80\nmonster 1\nend\n",
+    "items.arc": ("Object sword\ntype 15\nend\nObject shield\ntype 33\nend\n"
+                  "Object axe\ntype 15\nend\nObject chest\ntype 122\nend\n"
+                  "Object book\ntype 8\nname book\nend\n"),
+    "materials": "material_real 1\nname black iron\nend\n",
     "messages": ("# books\nMSG\nThe old tale of the drowned king.\n"
                  "He sleeps below the lake.\nENDMSG\n"),
 }
@@ -22989,6 +22993,14 @@ name Warden Argoth
 x 1
 y 1
 end
+arch book
+name harbour notice
+msg
+The ferry leaves at dawn.
+endmsg
+x 2
+y 2
+end
 """
 
 
@@ -23001,10 +23013,6 @@ def observation_content(directory: Path):
     for name, text in OBSERVATION_ARCH.items():
         (arch / name).write_text(text)
     (maps / "room").write_text(OBSERVATION_MAP)
-    # The words NPC scripts may say (the authored vocabulary).
-    (maps / "warden.py").write_text(
-        'say("Welcome, {}. The gate is shut.".format(activator.name))\n'
-        'say("The following items have been sent to you: #{} {} ({})")\n')
     (maps / "notes.txt").write_text("arch is not a map\nmsg\nNot authored.\nendmsg\n")
     return AuthoredContent.scan(Path(directory) / "content")
 
@@ -23090,7 +23098,7 @@ class ObservationTests(unittest.TestCase):
     def test_a_recorded_stream_yields_the_expected_attributed_rows(self):
         client = self.client()
         lever = Item(70, location=0, item_type=93, name="big lever")
-        book = Item(71, item_type=c.TYPE_BOOK, name="old tale")
+        book = Item(71, item_type=c.TYPE_BOOK, name="meet me at the tower")
         sword = Item(72, item_type=c.TYPE_WEAPON, name="sword +2")
         client.state.place_item(book, client.state.player_tag)
         client.state.place_item(sword, client.state.player_tag)
@@ -23105,13 +23113,13 @@ class ObservationTests(unittest.TestCase):
         client.state.place_item(lever, 0)
         asyncio.run(client.apply(70))
         self.say(client, "You turn the big lever.")
-        # Dialogue names her: the stored page reads as authored.
+        # Dialogue pages are not kept in this phase.
         raw = interface_packet("Warden Argoth", "Welcome, Sera. The gate is shut.")
         asyncio.run(client._handle_interface(Cursor(raw), raw))
-        # An authored book from her bag.
+        # An authored book from her bag, retitled by a player: kept under
+        # its authored title.
         asyncio.run(client.apply(71))
-        raw = book_packet("old tale", "The old tale of the drowned king.\n"
-                                       "He sleeps below the lake.\n")
+        raw = book_packet("meet me at the tower", "The ferry leaves at dawn.\n")
         asyncio.run(client._handle_book(Cursor(raw), raw))
         # An examine answer, ended by its blank line.
         asyncio.run(client.examine(72))
@@ -23129,10 +23137,9 @@ class ObservationTests(unittest.TestCase):
         rows = {row["source_key"]: row for row in self.rows(client)}
         self.assertEqual(set(rows), {
             "door:/test/room:5,4", "mouth:/test/room:3,3", "lever:/test/room:6,6",
-            "npc:/test/room:Warden Argoth",
-            "book:old tale:" + __import__("hashlib").sha256(
-                b"The old tale of the drowned king. He sleeps below the lake.").hexdigest(),
-            "examine:sword +2", "system:/test/room"})
+            "book:harbour notice:" + __import__("hashlib").sha256(
+                b"The ferry leaves at dawn.").hexdigest(),
+            "examine:sword", "system:/test/room"})
         door = rows["door:/test/room:5,4"]
         self.assertEqual((door["source_kind"], door["attribution"], door["authored"],
                           door["x"], door["y"]), ("door", "timing", 1, 5, 5))
@@ -23141,16 +23148,13 @@ class ObservationTests(unittest.TestCase):
                          ("content-match", "magic_mouth"))
         self.assertEqual((rows["lever:/test/room:6,6"]["attribution"],
                           rows["lever:/test/room:6,6"]["source_name"]), ("timing", "big lever"))
-        npc = rows["npc:/test/room:Warden Argoth"]
-        self.assertEqual((npc["attribution"], npc["text"]),
-                         ("exact", "Welcome, {activator.name}. The gate is shut."))
         book_row = next(row for key, row in rows.items() if key.startswith("book:"))
         self.assertEqual((book_row["source_kind"], book_row["source_name"], book_row["authored"],
                           book_row["text"]),
-                         ("book", "old tale", 1,
-                          "The old tale of the drowned king.\nHe sleeps below the lake."))
-        self.assertEqual(rows["examine:sword +2"]["text"],
-                         "That is a sword +2\nIt needs a level of 5 to use.\nQua: 80 Con: 70.")
+                         ("book", "harbour notice", 1, "The ferry leaves at dawn."))
+        self.assertNotIn("tower", json.dumps(self.rows(client)))
+        self.assertEqual(rows["examine:sword"]["text"],
+                         "That is sword\nIt needs a level of 5 to use.\nQua: 80 Con: 70.")
         system = rows["system:/test/room"]
         self.assertEqual((system["seen"], system["attribution"]), (3, "none"))
         self.assertNotIn("Sera", json.dumps(self.rows(client)))
@@ -23210,11 +23214,11 @@ class ObservationTests(unittest.TestCase):
         self.assertIn("mallory", client.observations.player_names)
         self.assertIn("zoey", client.observations.player_names)
         drops = client.metrics.registry.render()
-        for reason in ("chat", "player-link", "who-list", "player-name", "signed-book",
+        for reason in ("chat", "player-link", "who-list", "signed-book",
                        "unmatched-book", "renamed-item"):
             self.assertIn(f'reason="{reason}"}}', drops)
 
-    def test_without_the_index_only_fixed_server_phrases_are_kept(self):
+    def test_without_the_index_only_fact_lines_are_kept(self):
         client = self.client(content=False)
         raw = book_packet("old tale", "The old tale of the drowned king.\n")
         asyncio.run(client._handle_book(Cursor(raw), raw))
@@ -23224,19 +23228,23 @@ class ObservationTests(unittest.TestCase):
         self.say(client, "Guard says: Halt, Bob!", color="00ffff")
         self.at("/test/room", 5, 4, client)
         self.say(client, "A voice whispers.", color="00ffff")
-        # Dialogue cannot be checked against authored words either.
-        raw = interface_packet("Warden Argoth", "Welcome, Sera. The gate is shut.")
-        asyncio.run(client._handle_interface(Cursor(raw), raw))
-        # The server's own phrase answering her one bump in the window is.
+        # Nor a door phrase: no authored door can be checked at the target.
         later = time.time() + 2
         client.observations.clock = lambda: later
         asyncio.run(client.move(1))
         self.say(client, "You open the door with the brass key.")
+        # An examine: its name cannot be checked either.
+        client.state.place_item(Item(72, item_type=c.TYPE_WEAPON, name="sword"),
+                                client.state.player_tag)
+        asyncio.run(client.examine(72))
+        self.say(client, "That is a sword")
+        self.say(client, " ")
+        self.say(client, "Something blocks your spellcasting.")
         self.assertEqual([row["source_key"] for row in self.rows(client)],
-                         ["door:/test/room:5,3"])
+                         ["system:/test/room"])
         drops = client.metrics.registry.render()
         self.assertIn('reason="book-unverified"}', drops)
-        self.assertIn('reason="unauthored-words"}', drops)
+        self.assertIn('reason="unauthored-item"}', drops)
 
     def test_lines_inside_a_timing_window_are_not_the_sources(self):
         client = self.client()
@@ -23277,16 +23285,60 @@ class ObservationTests(unittest.TestCase):
         self.at("/test/room", 5, 5, client)
         client.state.map.tile(9, 9).objects.clear()
         self.assertIn("quinlan", client.observations.player_names)
-        raw = interface_packet("Warden Argoth", "Welcome, Quinlan. The gate is shut.")
-        asyncio.run(client._handle_interface(Cursor(raw), raw))
-        # Mail built from player data: words no script or map holds.
-        raw = interface_packet("Warden Argoth",
-                               "The following items have been sent to you: #1 sword (Bob)")
-        asyncio.run(client._handle_interface(Cursor(raw), raw))
+        self.assertEqual(client.observations._players_in_view(client.state), set())
+        self.assertIsNone(client.observations._clean("Quinlan waits here.", client.state))
+        self.assertEqual(client.observations._clean("Sera waits here.", client.state),
+                         "{activator.name} waits here.")
+        # Her name split by markup is dropped, not kept half-replaced.
+        self.assertIsNone(client.observations._clean("[b]Se[/b]ra waits.", client.state))
+
+    def test_dialogue_pages_are_never_kept(self):
+        client = self.client()
+        pages = [("Post office clerk",
+                  "The following items have been sent to you:\n"
+                  "#1: sword (Zoey) ([a=:withdraw 1]withdraw[/a], [a=:delete 1]delete[/a])"),
+                 ("Warden Argoth", "meet me at the old tower tonight bring gold"),
+                 ("Guild guard", "Welcome, Alice the Master Smith."),
+                 ("Warden Argoth", "Welcome, Sera. The gate is shut.")]
+        for title, text in pages:
+            raw = interface_packet(title, text)
+            asyncio.run(client._handle_interface(Cursor(raw), raw))
         self.assertEqual(self.rows(client), [])
-        drops = client.metrics.registry.render()
-        self.assertIn('reason="player-name"}', drops)
-        self.assertIn('reason="unauthored-words"}', drops)
+
+    def test_player_titled_items_and_book_lines_are_not_sources(self):
+        client = self.client()
+        for tag, name in ((80, "diary of tom: meet at the tower"), (81, "chest [Captain]")):
+            client.state.place_item(Item(tag, item_type=c.TYPE_BOOK, name=name),
+                                    client.state.player_tag)
+        # A player-edited unsigned book: its shown name is the player's title.
+        asyncio.run(client.examine(80))
+        self.say(client, "That is diary of tom: meet at the tower (unread)")
+        self.say(client, "Something is written in it.")
+        self.say(client, " ")
+        # A container a guild titled with a rank.
+        asyncio.run(client.examine(81))
+        self.say(client, "That is chest [Captain]")
+        self.say(client, " ")
+        # Book lines that open like a door's answer, after a bump at the door.
+        asyncio.run(client.move(1))
+        self.say(client, "You open the door with the brass key and start reading.")
+        self.say(client, "You open the door with the brass key and find it empty.")
+        # A door phrase where no authored door stands at the bump target,
+        # and a lever phrase where no lever stands.
+        later = time.time() + 2
+        client.observations.clock = lambda: later
+        asyncio.run(client.move(5))
+        self.say(client, "You open the door with the brass key.")
+        client.state.place_item(Item(70, location=0, item_type=93, name="big lever"), 0)
+        asyncio.run(client.apply(70))
+        self.say(client, "You turn the big lever.")
+        # The lever's authored name must match too.
+        self.at("/test/room", 6, 6, client)
+        client.observations.clock = lambda: later + 5
+        asyncio.run(client.apply(70))
+        self.say(client, "You turn the little lever.")
+        self.assertEqual(self.rows(client), [])
+        self.assertIn('reason="unauthored-item"}', client.metrics.registry.render())
 
     def test_examines_keep_only_their_own_answer(self):
         client = self.client()
@@ -23319,8 +23371,8 @@ class ObservationTests(unittest.TestCase):
             self.say(client, "It weighs 2.000 kg.")
             self.say(client, " ")
         rows = {row["source_key"]: row["text"] for row in self.rows(client)}
-        self.assertEqual(rows, {"examine:sword": "That is a sword\nIt weighs 2.000 kg.",
-                                "examine:shield": "That is a shield\nIt weighs 2.000 kg."})
+        self.assertEqual(rows, {"examine:sword": "That is sword\nIt weighs 2.000 kg.",
+                                "examine:shield": "That is shield\nIt weighs 2.000 kg."})
 
     def test_a_full_table_evicts_the_oldest_unreferenced_rows(self):
         from . import memory as memory_module

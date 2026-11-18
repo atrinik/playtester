@@ -591,7 +591,7 @@ function renderKnowledge(k) {
   if (select.dataset.sig !== options) { select.innerHTML = options; select.value = chosen; select.dataset.sig = options; }
   const total = kinds.reduce((sum, x) => sum + counts[x], 0);
   $("#knowledge-summary").textContent = `${total.toLocaleString()} reading${total === 1 ? "" : "s"} kept` +
-    (k.authored_index ? "" : " · authored-text index unavailable: books, dialogue and sign, door and magic-mouth text are not kept") +
+    (k.authored_index ? "" : " · authored-text index unavailable: only fact lines are kept") +
     (k.busy ? " · the database is busy; try again shortly" : "");
   const when = t => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   $("#knowledge").innerHTML = (k.observations || []).map(o => `<div class="reading">

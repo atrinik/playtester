@@ -1458,31 +1458,45 @@ server:
   server colours players white, green (her party) or red (PvP), and
   creatures by level (`request.c`), so a white name, or a green or red name
   that no authored object carries, is a player. MAP2 has no player flag.
+- **Only what matches authored content exactly is kept.** Review showed
+  that each looser rule let other players' text through, so F1 is
+  narrower than 4.3.1:
+  - Sign, door, magic-mouth and custom lever text must equal the authored
+    message of an object on or next to her square; timing only labels
+    such a match `timing`. The timing window alone never attributes a
+    line: the server sends unrelated lines in it that name players
+    without a link ("%s starved to death.", "%s says: ..." from NPC talk
+    and `Object.Say`, "%s casts ... on you", guard shouts).
+  - Fixed phrasings ("You open the %s with the %s.", "The %s is opened
+    for you.", "The %s is locked.", "The %s won't budge.", "You turn the
+    %s.", "Nothing is written on it.", "You are unable to decipher the
+    strange symbols.") are kept only when an authored door or gate of that
+    name stands at or next to her bump's target, or an authored lever of
+    that name (or a sign) under her apply. Each consumes the one bump or
+    ground apply of its kind in the window; with two in the window
+    nothing is kept. Lines ending "and start reading." or "and find it
+    empty." (`book.c`, whose book name a player sets) are never a door's.
+  - Books are kept only when the body's hash is authored text, under the
+    authored title from the index (the name of the map or archetype book
+    carrying that message; empty for the book message file's texts),
+    never the received title, which a player can set on an unsigned copy.
+  - An examine is kept only when the shown name, less count, item race,
+    material, "+N" and parenthesised states, is an authored object or
+    archetype name (or plural); the row and its first line use that
+    authored name. A player-titled book or a guild-ranked container is
+    dropped (`unauthored-item`).
+  - **Dialogue pages are not kept in F1.** NPC scripts build pages from
+    player data (post-office senders, auction sellers, guild ranks,
+    jailed players), and no word-level check separates it from authored
+    text. Dialogue capture moves to F13.
 - The authored-text index holds the messages of maps, archetypes, artifacts
-  and the book message file (`arch/messages`). The server's other generated
-  books (bestiary, artifact and spell path texts, `readable.c`) are not
-  indexed, so they are dropped as unmatched, like player-edited books.
-  The index is scanned once when `web` or `autoplay` starts (a second or
-  two); without it books are dropped (`book-unverified`), and so are
-  dialogue and all sign, door and magic-mouth text.
-- Attribution fails closed, narrower than 4.3.1: the timing window alone
-  never attributes a line, because the server sends unrelated lines in it
-  that name players without a link ("%s starved to death.", "%s says:
-  ..." from NPC talk and `Object.Say`, "%s casts ... on you", guard
-  shouts). Sign, door, magic-mouth and custom lever text must equal the
-  authored message of an object on or next to her square; timing only
-  labels such a match `timing`. Beyond that, only the fixed phrasings
-  ("You open the %s with the %s.", "The %s is opened for you.", "The %s
-  is locked.", "The %s won't budge.", "You turn the %s.", "Nothing is
-  written on it.", "You are unable to decipher the strange symbols.") are
-  kept, each consuming the one bump or ground apply of its kind in the
-  window; with two in the window nothing is kept.
-- Dialogue pages (exact by interface title) are kept only when every word
-  of the page and its title is a word of the authored content (maps, map
-  scripts, archetypes). Scripts build pages from player data, such as the
-  post-office clerk's senders and recipients, which no authored text
-  holds. Book titles pass the same check, since a player can retitle an
-  unsigned copy of an authored book.
+  and the book message file (`arch/messages`), authored book titles,
+  object and archetype names and plurals, and material names
+  (`arch/materials`). The server's other generated books (bestiary,
+  artifact and spell path texts, `readable.c`) are not indexed, so they are
+  dropped as unmatched, like player-edited books. The index is scanned once
+  when `web` or `autoplay` starts (about 1.3 s); without it only
+  unattributed fact lines are kept.
 - "Characters she has seen" are chat senders, `/who` names and players in
   view since the process started; they are kept only in memory, so the set
   starts empty after a restart.
@@ -1498,7 +1512,6 @@ server:
   with her examines oldest first.
 - Book packets answer only her own apply, so they need no timing window.
   The quest journal is not stored (`quests.parse_quest_book` reads it).
-- Dialogue pages store the interface text, not its links.
 - "Oldest" for eviction means least recently seen (`last_at`); rows cited
   by `facts.observation_id` or `locks.hint_observation_id` are kept once
   those tables exist.
@@ -1614,7 +1627,12 @@ unfamiliar NPC with dialogue on maps she visits, and follow only
 non-consequential links, in coordination with
 [#17](https://github.com/atrinik/playtester/issues/17): never a link whose
 interface action is `teleport`, `enemy`, a quest start or turn-in, a
-purchase, or free text. Records pages as observations.
+purchase, or free text. Records pages as observations, but only pages of
+an explicit allowlist of NPC scripts whose text is literal authored
+strings: the index gains the hashes of those scripts' string literals
+(with `{activator.name}` and other substitutions resolved to fixed forms),
+and a page is kept only when it matches them exactly. F1 keeps no
+dialogue, because scripts build pages from player data (4.10.4).
 *Accept:* Warden Argoth's fixture records the "key" page and never follows
 the insult chain (its last step sets `enemy="player"`); a teleporting link
 is never followed.

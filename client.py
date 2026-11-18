@@ -300,7 +300,7 @@ class AtrinikClient:
         self.farm_analyzer = None
         # Her own readings (observations.py), kept in memory's observations
         # table. The authored-text index is loaded by the CLI at start-up;
-        # without it books are not kept and attribution is by timing only.
+        # without it only unattributed fact lines are kept.
         self.authored_content: AuthoredContent | None = None
         self.observations = ObservationRecorder(
             lambda: self.authored_content, self._observation_dropped)
@@ -2469,7 +2469,6 @@ class AtrinikClient:
                 raise ProtocolError(f"unknown interface field {kind}")
         interface.text = "".join(texts)
         self.state.interface = interface
-        self._observe(lambda recorder: recorder.on_interface(self.state, interface))
         if update_bank_balance(self.state, interface.text):
             self.set_bank_balance(self.state.bank_balance)
         await self.emit("interface", interface)

@@ -239,7 +239,7 @@ async def main_async(args: argparse.Namespace) -> None:
     elif args.task in ("web", "autoplay"):
         graph = WorldGraph().build()
         # The authored-text index her observation ledger attributes and
-        # verifies books with; about a second, before play starts.
+        # verifies books with; about 1.3 s, before play starts.
         from .observations import load_authored_content
         client.authored_content = load_authored_content()
         bundle = getattr(args, "bundle", None)

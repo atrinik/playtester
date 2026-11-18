@@ -1,20 +1,24 @@
 """Her own observations: the ingestion filter, attribution and authored text.
 
-What she reads or is told goes through two steps before anything keeps it
-(docs/LEARNING_AND_FEEDBACK.md 4.3.1):
+What she reads goes through two steps before anything keeps it
+(docs/LEARNING_AND_FEEDBACK.md 4.3.1; "F1 as built" there records how
+this differs from the design):
 
 1. **The ingestion filter** drops other players' text: chat channels, lines
-   carrying the player-name link, ``/who`` roster lines, books a player
-   signed, unsigned books whose text matches nothing authored, renamed items,
-   and any line naming another character she has seen. Her own name becomes
-   the literal ``{activator.name}``, so dialogue reads as authored.
-2. **Attribution** ties a line to the object that produced it. DRAWINFO has
-   no source, so it uses her own bump, apply, step or examine in the last
-   ``WINDOW`` seconds (``timing``), an authored object on or next to her
-   square whose message equals the text (``content-match``), or the
-   packet's own identity (``exact``: book packets, interface pages,
-   examines). An unattributed line is kept, as ``system:<map>``, only when
-   it is a fact line (``FACT_LINES``); otherwise it is not stored.
+   carrying the player-name link, ``/who`` roster lines, signed books,
+   renamed items, examines that name a player, and any line naming another
+   character she has seen in this process. Her own name becomes the
+   literal ``{activator.name}``.
+2. **Exact matching against authored content.** Only what can be matched
+   exactly against the authored-text index is kept: sign, door and magic
+   mouth text equal to the authored message of an object on or next to her
+   square (``timing`` when her own bump, apply or step reached it, else
+   ``content-match``); a fixed server phrase answering her one bump or
+   apply, naming the authored door, gate or lever where it reached;
+   authored books, under their authored title; examines of items whose
+   shown name is an authored name, every line of a known examine form.
+   Dialogue pages are not kept (phase F13). An unattributed line is kept,
+   as ``system:<map>``, only when it is a fact line (``FACT_LINES``).
 
 This module only decides; ``AtrinikClient`` persists what it returns
 through ``BotMemory.record_observation``. Nothing here changes what she
@@ -33,7 +37,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import constants as c
-from .model import CHAT_MESSAGE_TYPES, PLAYER_NAME_LINK, GameState, InterfaceState, Item
+from .model import CHAT_MESSAGE_TYPES, PLAYER_NAME_LINK, GameState, Item
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +45,7 @@ log = logging.getLogger(__name__)
 WINDOW = 1.5
 # Characters kept of any stored text.
 TEXT_LIMIT = 4000
-# Her own name in stored text: the form authored dialogue uses.
+# Her own name in stored text: the form authored text uses.
 ACTIVATOR = "{activator.name}"
 # Other characters' names remembered for the filter, newest kept.
 MAX_PLAYER_NAMES = 500
@@ -58,7 +62,9 @@ TYPE_DOOR, TYPE_HANDLE, TYPE_SIGN = 20, 93, 98
 
 # Fixed server phrasings that confirm the kind of source (door.c,
 # handle.c, sign.c). A door's own refusal text is its authored ``msg``.
-DOOR_OPENED = re.compile(r"^You open the (?P<name>.+?) with the .+\.$")
+DOOR_OPENED = re.compile(r"^You open the (?P<name>.+?) with the (?P<key>.+)\.$")
+# Book lines with the same opening (book.c): never a door's.
+NOT_DOOR = re.compile(r"(?:and start reading|and find it empty)\.$")
 DOOR_OPENED_FOR_YOU = re.compile(r"^The (?P<name>.+?) is opened for you\.$")
 LEVER_PHRASES = (re.compile(r"^The (?P<name>.+?) is locked\.$"),
                  re.compile(r"^The (?P<name>.+?) won't budge\.$"),
@@ -114,13 +120,20 @@ EXAMINE_LINES = tuple(re.compile(pattern) for pattern in (
     r"^This shop will pay you [a-z0-9 ,]+\.$",
 ))
 SOULBOUND_TO = re.compile(rf"^{_IS} soulbound to .+\.$")
-# Words, for the authored-vocabulary check of dialogue and book titles.
-WORD = re.compile(r"[^\W\d_]+")
+# Prefixes and suffixes of an item's shown name (item.c object_get_name,
+# object_get_short_name; race.c item_races) around its authored name.
+COUNT_WORDS = frozenset((
+    "a", "an", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+    "eighteen", "nineteen", "twenty"))
+ITEM_RACES = frozenset(("dwarven", "elven", "gnomish", "drow", "orcish", "goblin",
+                        "kobold", "giant", "tiny", "demonish", "draconish", "ogre"))
+TRAILING_PARTS = re.compile(r"(?:\s*\([^()]*\)|\s+[+-]\d+|\s+\*)+$")
 
 # observations_dropped_total reasons.
 DROP_REASONS = ("chat", "player-link", "who-list", "player-name", "signed-book",
                 "unmatched-book", "book-unverified", "renamed-item",
-                "examine-interrupted", "unauthored-words")
+                "examine-interrupted", "unauthored-item")
 
 
 def normalize(text: str) -> str:
@@ -188,14 +201,15 @@ class AuthoredContent:
     artifacts and the book message file); ``sources`` the doors, levers,
     signs and magic mouths by square; ``names`` every authored object and
     archetype name, case folded, so a creature in view is told from a
-    player.
+    player and an examined item is known to be authored; ``book_titles``
+    the authored names of the books carrying each message; ``materials``
+    the material names the server prefixes to item names.
     """
     texts: set[str] = field(default_factory=set)
     sources: dict[tuple[str, int, int], list[AuthoredSource]] = field(default_factory=dict)
     names: set[str] = field(default_factory=set)
-    # Every word of the authored content (maps, map scripts, archetypes),
-    # case folded: what an NPC page may consist of.
-    words: set[str] = field(default_factory=set)
+    book_titles: dict[str, set[str]] = field(default_factory=dict)
+    materials: set[str] = field(default_factory=set)
 
     def at(self, map_path: str, x: int, y: int) -> list[AuthoredSource]:
         return self.sources.get((map_path, x, y), [])
@@ -214,17 +228,20 @@ class AuthoredContent:
             except OSError:
                 continue
             if not data.startswith(b"arch map\n"):
-                if path.suffix in (".py", ".xml", ".json", ".txt"):
-                    content._add_words(data.decode("utf-8", "replace"))
                 continue
             key = "/" + path.relative_to(map_root).as_posix()
-            text = data.decode("utf-8", "replace")
-            content._add_words(text)
-            content._scan_map(key, text, defaults)
+            content._scan_map(key, data.decode("utf-8", "replace"), defaults)
         return content
 
-    def _add_words(self, text: str) -> None:
-        self.words.update(WORD.findall(text.casefold()))
+    def book_title(self, digest: str) -> str:
+        """The authored name of a book with this message, or ""."""
+        titles = self.book_titles.get(digest)
+        return min(titles) if titles else ""
+
+    def _add_book(self, digest: str, name: str, title: str) -> None:
+        if digest and name:
+            full = normalize(f"{name} {title or ''}")
+            self.book_titles.setdefault(digest, set()).add(full)
 
     def _add_text(self, lines: list[str]) -> str:
         msg = "\n".join(lines)
@@ -242,13 +259,19 @@ class AuthoredContent:
         for path in sorted(arch_root.rglob("*")):
             if not path.is_file() or not (
                     path.suffix in (".arc", ".art") or
-                    path.name in ("messages", "artifacts")):
+                    path.name in ("messages", "artifacts", "materials")):
                 continue
             try:
                 text = path.read_text(errors="replace")
             except OSError:
                 continue
-            self._add_words(text)
+            if path.name == "materials":
+                # lib/materials: the real materials' names (material.c).
+                for line in text.split("\n"):
+                    key, _, value = line.strip().partition(" ")
+                    if key == "name" and value:
+                        self.materials.add(normalize(value).casefold())
+                continue
             if path.name == "messages":
                 # lib/messages: MSG ... ENDMSG (readable.c init_msgfile).
                 body: list[str] | None = None
@@ -292,11 +315,15 @@ class AuthoredContent:
                 elif key == "end":
                     depth = max(0, depth - 1)
                     if depth == 0:
+                        if current is not None and current.get("type") == "8":
+                            self._add_book(current.get("msg", ""),
+                                           current.get("name") or current["arch"],
+                                           current.get("title", ""))
                         current = None
                 elif current is not None and depth == 1 and key in (
-                        "type", "name", "sys_object"):
+                        "type", "name", "name_pl", "sys_object", "title"):
                     current.setdefault(key, value)
-                    if key == "name" and value:
+                    if key in ("name", "name_pl") and value:
                         self.names.add(value.casefold())
         return defaults
 
@@ -323,7 +350,7 @@ class AuthoredContent:
             elif word == "end":
                 if stack:
                     self._map_object(key, stack.pop(), stack, defaults)
-            elif stack and word in ("type", "name", "x", "y", "sys_object"):
+            elif stack and word in ("type", "name", "name_pl", "title", "x", "y", "sys_object"):
                 stack[-1][word] = value
 
     def _map_object(self, key: str, obj: dict[str, Any], parents: list[dict[str, Any]],
@@ -333,11 +360,16 @@ class AuthoredContent:
             return
         base = defaults.get(arch, {})
         name = obj.get("name") or base.get("name") or arch.replace("_", " ")
-        if name:
-            self.names.add(str(name).casefold())
+        for shown in (name, obj.get("name_pl")):
+            if shown:
+                self.names.add(str(shown).casefold())
         try:
             obj_type = int(obj.get("type") or base.get("type") or 0)
         except ValueError:
+            return
+        if obj_type == c.TYPE_BOOK:
+            self._add_book(obj.get("msg", base.get("msg", "")), str(name),
+                           obj.get("title", base.get("title", "")))
             return
         if obj_type not in (TYPE_DOOR, TYPE_HANDLE, TYPE_SIGN):
             return
@@ -364,10 +396,33 @@ class AuthoredContent:
             AuthoredSource(kind, str(name), key, x, y, msg or ""))
 
 
+def authored_item_name(content: AuthoredContent, shown: str) -> str | None:
+    """The authored name inside an item's shown name, case folded, or None.
+
+    The server shows [count] [item race] [material] name [title or
+    "+N"] [(state)...]; the name between must be an authored object or
+    archetype name, and anything else (a player's title) gives None.
+    """
+    # Not markup-stripped: a "[rank]" title is a player's, not markup.
+    shown = TRAILING_PARTS.sub("", normalize(shown).casefold())
+    words = shown.split()
+    if words and (words[0] in COUNT_WORDS or words[0].isdigit()):
+        words = words[1:]
+    if words and words[0] in ITEM_RACES:
+        words = words[1:]
+    for start in range(len(words)):
+        if start and " ".join(words[:start]) not in content.materials:
+            continue
+        name = " ".join(words[start:])
+        if name in content.names:
+            return name
+    return None
+
+
 def load_authored_content() -> AuthoredContent | None:
     """The authored-text index of the locked content, or None without it.
 
-    Scans a few thousand map files once (about a second); call it at
+    Scans a few thousand map files once (about 1.3 s); call it at
     start-up, never from the tick loop.
     """
     try:
@@ -381,8 +436,8 @@ def load_authored_content() -> AuthoredContent | None:
                  len(content.texts), len(content.sources), time.monotonic() - started)
         return content
     except Exception:
-        log.exception("authored text index unavailable: books are not kept "
-                      "and lines are attributed by timing only")
+        log.exception("authored text index unavailable: only unattributed "
+                      "fact lines are kept")
         return None
 
 
@@ -448,8 +503,9 @@ class ObservationRecorder:
 
     It fails closed: a line is kept only when it is certainly the source's
     own answer: authored text (its hash is in the index), a fixed server
-    phrasing that answers the one action it consumes, an enumerated examine
-    line, or a dialogue page whose every word is authored vocabulary.
+    phrasing that answers the one action it consumes and names the authored
+    source where it reached, or an examine of an item whose shown name is
+    authored, every line of a known form.
     """
 
     def __init__(self, content: Callable[[], AuthoredContent | None] = lambda: None,
@@ -671,14 +727,20 @@ class ObservationRecorder:
         if group.rejected:
             self.dropped(group.rejected)
             return None
-        name = normalize(MARKUP.sub("", group.name))
-        if not name or "corpse" in name.casefold():
+        # The shown name must be an authored one: a player can title a
+        # book or a container, and that text is never kept. The row names
+        # the item by its authored name, not by the line she received.
+        content = self.content()
+        name = (authored_item_name(content, group.lines[0][len("That is "):])
+                if content is not None else None)
+        if not name or "corpse" in name:
+            self.dropped("unauthored-item")
             return None
-        text = self._clean("\n".join(group.lines), state)
+        text = self._clean("\n".join([f"That is {name}", *group.lines[1:]]), state)
         if text is None:
             return None
         return Observation(group.at, group.map, group.x, group.y, "examine",
-                           f"examine:{name.casefold()}", name, "exact", False, text,
+                           f"examine:{name}", name, "exact", False, text,
                            WHITE, c.CHAT_TYPE_GAME)
 
     def _attribute(self, state: GameState, msg_type: int, color: str, text: str,
@@ -717,42 +779,52 @@ class ObservationRecorder:
                     return self._observation(state, now, source.map, source.kind,
                                              source.key, source.name, attribution, True,
                                              text, color, msg_type)
-        # Fixed server phrasings, each the answer to one action it consumes.
-        # With two bumps or two applies in the window, which one the line
-        # answers is unknown: nothing is kept.
-        if color == WHITE:
+        # Fixed server phrasings, each the answer to one action it consumes,
+        # and only when an authored source of that kind and name stands
+        # where the action reached. With two bumps or two applies in the
+        # window, which one the line answers is unknown: nothing is kept.
+        if color == WHITE and content is not None and not NOT_DOOR.search(stripped):
             kinds = [(a.kind, a.ground) for a in recent]
             for action in recent:
                 if action.map != m.path or kinds.count((action.kind, action.ground)) != 1:
                     continue
+                source = None
                 if action.kind == "move":
                     opened = DOOR_OPENED.match(stripped) or DOOR_OPENED_FOR_YOU.match(stripped)
                     if opened:
-                        self._consume(action)
                         tx, ty = action.target
-                        return self._observation(state, now, m.path, "door",
-                                                 f"door:{m.path}:{tx},{ty}",
-                                                 opened.group("name"), "timing", False,
-                                                 text, color, msg_type)
+                        source = self._source_named(
+                            content, m.path, {(tx + dx, ty + dy) for dx in (-1, 0, 1)
+                                              for dy in (-1, 0, 1)},
+                            ("door", "gate"), opened.group("name"))
                 elif action.kind == "apply" and action.ground:
-                    x, y = action.target
                     named = next((p.match(stripped) for p in LEVER_PHRASES
                                   if p.match(stripped)), None)
                     if action.item_type == TYPE_HANDLE and named:
-                        self._consume(action)
-                        return self._observation(state, now, m.path, "lever",
-                                                 f"lever:{m.path}:{x},{y}",
-                                                 named.group("name"), "timing", False,
-                                                 text, color, msg_type)
-                    if action.item_type == TYPE_SIGN and stripped.casefold() in SIGN_PHRASES:
-                        self._consume(action)
-                        return self._observation(state, now, m.path, "sign",
-                                                 f"sign:{m.path}:{x},{y}", action.item_name,
-                                                 "timing", False, text, color, msg_type)
+                        source = self._source_named(content, m.path, {action.target},
+                                                    ("lever",), named.group("name"))
+                    elif action.item_type == TYPE_SIGN and stripped.casefold() in SIGN_PHRASES:
+                        source = self._source_named(content, m.path, {action.target},
+                                                    ("sign",), None)
+                if source is not None:
+                    self._consume(action)
+                    return self._observation(state, now, m.path, source.kind, source.key,
+                                             source.name, "timing", False, text, color,
+                                             msg_type)
         if stripped.casefold() in FACT_LINES and m.path:
             return self._observation(state, now, m.path, "system", f"system:{m.path}", "",
                                      "none", False, text, color, msg_type)
         return None
+
+    @staticmethod
+    def _source_named(content: AuthoredContent, map_path: str,
+                      squares: set[tuple[int, int]], kinds: tuple[str, ...],
+                      name: str | None) -> AuthoredSource | None:
+        """The one authored source of these kinds (and name) on these squares."""
+        found = {s.key: s for x, y in squares for s in content.at(map_path, x, y)
+                 if s.kind in kinds and (name is None or
+                                         s.name.casefold() == normalize(name).casefold())}
+        return next(iter(found.values())) if len(found) == 1 else None
 
     def _observation(self, state: GameState, now: float, map_path: str, kind: str,
                      key: str, name: str, attribution: str, authored: bool,
@@ -778,39 +850,6 @@ class ObservationRecorder:
         if group is not None:
             self.dropped(group.rejected or "examine-interrupted")
 
-    def _authored_words(self, text: str) -> bool:
-        """Whether every word of ``text`` (her name aside) is authored."""
-        content = self.content()
-        if content is None:
-            return False
-        words = WORD.findall(MARKUP.sub(" ", text.replace(ACTIVATOR, " ")).casefold())
-        return all(word in content.words for word in words)
-
-    def on_interface(self, state: GameState, interface: InterfaceState) -> list[Observation]:
-        now = self.clock()
-        out = self.flush(state, now)
-        title = normalize(MARKUP.sub("", interface.title or ""))
-        if not normalize(interface.text) or not title:
-            return out
-        m = state.map
-        own = normalize(state.player_name)
-        if own:
-            title = _name_pattern(own).sub(ACTIVATOR, title)
-        text = self._clean(interface.text, state)
-        if text is None or self._names_another(title, state):
-            if text is not None:
-                self.dropped("player-name")
-            return out
-        # Scripts build pages from player data (mail senders, recipients):
-        # a page is kept only when every word in it, and in its title, is a
-        # word of the authored content.
-        if not (self._authored_words(title) and self._authored_words(text)):
-            self.dropped("unauthored-words")
-            return out
-        out.append(Observation(now, m.path, m.world_x, m.world_y, "npc",
-                               f"npc:{m.path}:{title}", title, "exact", False, text))
-        return out
-
     def on_book(self, state: GameState, raw: bytes) -> list[Observation]:
         now = self.clock()
         out = self.flush(state, now)
@@ -833,11 +872,9 @@ class ObservationRecorder:
             return out
         recent = [a for a in self._recent(now) if a.kind == "apply"]
         kind = "scroll" if recent and recent[-1].item_type == c.TYPE_SCROLL else "book"
-        title = normalize(MARKUP.sub("", page.title))
-        # A player can retitle an unsigned copy of an authored book.
-        if self._names_another(title, state) or not self._authored_words(title):
-            self.dropped("player-name")
-            return out
+        # The received title is never kept: a player can retitle an unsigned
+        # copy of an authored book. The row carries the authored title.
+        title = content.book_title(digest)
         text = self._clean(page.body.strip("\n"), state)
         if text is None:
             return out
