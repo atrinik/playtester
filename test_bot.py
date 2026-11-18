@@ -22388,6 +22388,23 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.moves[-1], (100, 901, 1))
         self.assertEqual(state.items[800].quantity, 3)
 
+    async def test_pickup_finds_the_coin_merged_with_gold_underfoot(self):
+        # object_insert_map keeps the dropped coin and folds the old stack
+        # into it: the old tag vanishes, the new one holds the sum.
+        state = self.client.state
+        state.items[800] = Item(800, location=0, name="gold coins", quantity=3)
+        state.inventories.setdefault(0, []).append(800)
+
+        def merge():
+            state.remove_item(800)
+            state.items[901].quantity += 3
+            state.items[901].name = "gold coins"
+
+        self.session_options = {"after_drop": merge}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual(record["outcome"], "completed", record)
+        self.assertEqual(self.client.moves[-1], (100, 901, 1))
+
     def test_ground_gold_is_read_by_name_as_the_look_window_sends_no_type(self):
         from .operator_assist import gold_stack
 

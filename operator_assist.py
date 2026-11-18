@@ -650,7 +650,9 @@ class OperatorAssist:
         def coin_underfoot():
             if client.state.phase != "playing":
                 return None
-            # The stack the coin landed in: a new one, or one it merged into.
+            # The stack the coin landed in: object_insert_map keeps the
+            # dropped object, adds any gold already there to it and removes
+            # that stack, so it shows under a tag not seen before.
             return next((item for item in client.state.ground
                          if gold_stack([item], ground=True)[0] and
                          item.quantity - ground_before.get(item.tag, 0) >= gold),
