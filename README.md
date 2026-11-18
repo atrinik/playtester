@@ -164,8 +164,11 @@ an authenticated local tunnel instead of exposing it directly.
 The dashboard's Stop outlives a restart. It is stored in the runtime state
 database for the configured `--character`, and the `autoplay` command then
 starts idle (survival only) until Start autoplay clears it, so a service
-manager that restarts the bot does not undo the owner's Stop. Without
-`--character` nothing is stored.
+manager that restarts the bot does not undo the owner's Stop. Other
+dashboard tasks (quests, navigation, farming and so on) do not clear it, so
+after one of them a restart still starts idle. Without `--character`
+nothing is stored: the bot logs a warning once, and the dashboard's last
+task says the Stop is not kept across a restart.
 
 `atrinik-playtester --version`, the startup log line, and the dashboard header
 name the build: its release tag (with `+N` when the commit is N commits past

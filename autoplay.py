@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 
@@ -566,12 +567,25 @@ class IdleSurvival:
             if self.child is trip:
                 self.child = None
             return True
+        except Exception as exc:  # A trip bug must not end the engine.
+            log.exception("idle food trip failed to start")
+            if self.child is trip:
+                self.child = None
+            self._give_up(client, f"{trip.name} did not start: {exc}")
+            return False
         if self.child is not trip:
+            # Held or dropped while it started: undo what it sent.
+            await self._clear_stale(client)
             return False
         self._record(client, "idle-hunger",
                      f"food {int(state.stats.get('food', 0) or 0)}; "
                      f"{trip.name}")
         return True
+
+    @staticmethod
+    async def _clear_stale(client: AtrinikClient) -> None:
+        with contextlib.suppress(ConnectionError):
+            await client.clear_actions()
 
     async def _tick_trip(self, client: AtrinikClient) -> bool:
         trip = self.child
@@ -590,7 +604,10 @@ class IdleSurvival:
             trip.fail(str(exc))
         if self.child is not trip:
             # Stop's hold (or a task) ended this trip while it ticked: not a
-            # failure to back off from, and not hers to finish.
+            # failure to back off from, and not hers to finish. Whatever the
+            # rest of the tick sent after Stop's clear is cleared too, so
+            # the stale trip does not keep walking.
+            await self._clear_stale(client)
             return False
         if trip.status == TaskStatus.COMPLETE:
             self.child = None

@@ -772,6 +772,8 @@ class WebControlServer:
         # The owner-only key /api/operator-assist requires; empty refuses all.
         self.operator_key = operator_key
         self._key_refusals_logged_at = 0.0
+        # Whether the unpersistable-Stop warning was logged (once).
+        self._unkept_stop_warned = False
         self._key_refusals_unlogged = 0
         client.metrics.attach(engine)
         self.face_images = FaceImages(
@@ -986,6 +988,12 @@ class WebControlServer:
         self._key_refusals_logged_at, self._key_refusals_unlogged = now, 0
 
     async def _replace_task(self, task: BotTask) -> dict[str, Any]:
+        # The new task owns her: end an idle food trip now, as Stop does, so
+        # one in flight cannot race the task (the engine drops it only on
+        # its next step).
+        survival = getattr(self.engine, "idle_survival", None)
+        if survival is not None:
+            survival.drop()
         previous = self.engine.task
         if previous is not None:
             previous.fail("replaced by operator")
@@ -1021,7 +1029,7 @@ class WebControlServer:
             # And it outlives a crash or restart: the ``autoplay`` command
             # stays idle until Start autoplay (systemd restarted a crashed
             # bot straight back into autoplay).
-            self._persist_operator_stop(True)
+            unkept = self._persist_operator_stop(True)
             previous = self.engine.task
             if previous:
                 previous.fail("stopped by operator")
@@ -1032,6 +1040,14 @@ class WebControlServer:
                     "error": previous.error, "started_at": previous.started_at,
                     "ended_at": time.time(),
                 }
+            if unkept:
+                # The dashboard says so: a restart would autoplay again.
+                now = time.time()
+                last = self.engine.last_task if previous else {
+                    "name": "stop", "status": "failed",
+                    "started_at": now, "ended_at": now}
+                last["error"] = f"stopped by operator; {unkept}"
+                self.engine.last_task = last
             self.engine.set_task(None)
             if self.client.state.phase == "playing":
                 await self.client.clear_actions()
@@ -1187,10 +1203,20 @@ class WebControlServer:
             raise ValueError("inventory item no longer exists")
         return item
 
-    def _persist_operator_stop(self, stopped: bool) -> None:
+    def _persist_operator_stop(self, stopped: bool) -> str:
+        """Persist Stop (True) or Start autoplay; "" or why it is not kept."""
         setter = getattr(self.client, "set_operator_stopped", None)
-        if setter is not None:
-            setter(stopped)
+        if setter is None or setter(stopped):
+            return ""
+        config = getattr(self.client, "config", None)
+        if not getattr(config, "character", ""):
+            reason = "not kept across a restart: no --character configured"
+            if not self._unkept_stop_warned:
+                self._unkept_stop_warned = True
+                log.warning("operator Stop is %s", reason)
+            return reason
+        # The client logged why the save failed.
+        return "not kept across a restart: saving it failed"
 
     def _hold_idle_survival(self, reason: str) -> None:
         """End the idle food trip and hold it off, as the operator took over."""

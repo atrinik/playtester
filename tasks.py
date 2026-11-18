@@ -7279,8 +7279,14 @@ class BindSavebedTask(BotTask):
 
 
 class TaskEngine:
-    # The pause after an unexpected error in an engine step (seconds).
+    # The pause after an unexpected error in an engine step (seconds): it
+    # doubles with each consecutive failed step up to the maximum, and a
+    # clean step resets it.
     error_backoff = 1.0
+    error_backoff_max = 60.0
+    # A repeated identical error logs its traceback once, then a count at
+    # most this often (seconds).
+    error_report_seconds = 60.0
 
     def __init__(self, client: AtrinikClient, tick_rate: float = 0.25):
         self.client = client
@@ -7299,6 +7305,11 @@ class TaskEngine:
         # nothing of hers acts, so she stands still on her square.
         self.operator_hold = ""
         self._normalized_stack_locks: set[int] = set()
+        # The last engine step error, its unreported repeats and when it
+        # was last reported (``_report_step_error``).
+        self._error_key: tuple | None = None
+        self._error_repeats = 0
+        self._error_reported_at = 0.0
 
     def set_task(self, task: BotTask | None) -> None:
         self.task = task
@@ -7375,7 +7386,13 @@ class TaskEngine:
             self.client.action_context = ""
 
     def _end_task(self, task: BotTask) -> None:
-        """Record ``task``'s end and clear it, if it is still the task."""
+        """Clear ``task``, if it is still the task, and record its end.
+
+        Cleared first: a bookkeeping error then never leaves an ended task
+        current to be ticked again.
+        """
+        if self.task is task:
+            self.task = None
         log.info("task %s ended: %s %s", task.name, task.status.value,
                  task.error)
         self.last_task = {
@@ -7389,8 +7406,6 @@ class TaskEngine:
         if recorder is not None:
             recorder("task-end", f"{task.name} {task.status.value}"
                      + (f": {task.error}" if task.error else ""))
-        if self.task is task:
-            self.task = None
 
     async def _tick_task(self, task: BotTask) -> None:
         """Tick ``task`` once and end it once it completes or fails.
@@ -7461,7 +7476,28 @@ class TaskEngine:
             return
         await self._tick_task(task)
 
+    def _report_step_error(self, exc: Exception) -> None:
+        """Log an engine step error: a new one in full, a repeat counted."""
+        frame = exc.__traceback__
+        while frame is not None and frame.tb_next is not None:
+            frame = frame.tb_next
+        key = (type(exc).__name__, str(exc),
+               (frame.tb_frame.f_code.co_filename, frame.tb_lineno)
+               if frame is not None else None)
+        now = time.monotonic()
+        if key != self._error_key:
+            self._error_key, self._error_repeats = key, 0
+            self._error_reported_at = now
+            log.error("task engine step failed", exc_info=exc)
+            return
+        self._error_repeats += 1
+        if now - self._error_reported_at >= self.error_report_seconds:
+            log.error("task engine step failed %d more times: %s: %s",
+                      self._error_repeats, type(exc).__name__, exc)
+            self._error_repeats, self._error_reported_at = 0, now
+
     async def run(self) -> None:
+        failures = 0
         while self.running:
             try:
                 await self._step()
@@ -7473,25 +7509,15 @@ class TaskEngine:
             except Exception as exc:
                 # Nothing ends the engine but ``running``: before, an error
                 # here ended the whole process, and systemd restarted it
-                # straight into autoplay. Drop what was running instead.
-                log.exception("task engine step failed")
+                # straight into autoplay. A task's own tick errors fail it in
+                # ``_tick_task``; anything else here (upkeep, bookkeeping, a
+                # stale tick's cleanup) is not the task's, which is kept.
                 self.client.action_context = ""
-                survival = self.idle_survival
-                if survival is not None:
-                    survival.drop()
-                task = self.task
-                if task is not None:
-                    if task.status not in (TaskStatus.COMPLETE,
-                                           TaskStatus.FAILED):
-                        task.fail(f"task engine error: {exc}")
-                    try:
-                        self._end_task(task)
-                    except Exception:
-                        log.exception("recording the end of task %s failed",
-                                      task.name)
-                    if self.task is task:
-                        self.task = None
-                # A bug that recurs every step is not logged at tick rate.
-                await asyncio.sleep(max(self.tick_rate, self.error_backoff))
+                self._report_step_error(exc)
+                failures += 1
+                await asyncio.sleep(max(self.tick_rate, min(
+                    self.error_backoff_max,
+                    self.error_backoff * 2 ** min(failures - 1, 16))))
                 continue
+            failures = 0
             await asyncio.sleep(self.tick_rate)
