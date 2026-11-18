@@ -20,15 +20,18 @@ import types
 from collections.abc import Callable, Iterable, Sequence
 
 try:
-    from tools.world_content_audit import (ROOT as CONTENT_ROOT, flatten,
+    from tools.world_content_audit import (ROOT as CONTENT_ROOT,
+                                           artifact_inventory, flatten,
                                            load_archetypes, map_files,
                                            parse_blocks)
 except ModuleNotFoundError:
-    from world_content_audit import (ROOT as CONTENT_ROOT, flatten,
-                                     load_archetypes, map_files, parse_blocks)
+    from world_content_audit import (ROOT as CONTENT_ROOT, artifact_inventory,
+                                     flatten, load_archetypes, map_files,
+                                     parse_blocks)
 
 from . import constants as c
 from . import requirements as req
+from . import unlocks
 from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
 
@@ -288,32 +291,6 @@ def _coord(node: dict, parent: dict | None, name: str) -> int:
     return int(value or 0)
 
 
-def carried_items(state) -> list:
-    """Every object she carries, walking containers like ``check_inv()``.
-
-    A container whose contents the client has seen stands for those
-    contents, as on the server; one never opened stands for itself, because
-    what it holds is unknown.
-    """
-    inventories = getattr(state, "inventories", None)
-    player_tag = getattr(state, "player_tag", None)
-    if not isinstance(inventories, dict) or player_tag not in inventories:
-        return list(getattr(state, "inventory", ()))
-    items = getattr(state, "items", {})
-    carried, pending, seen = [], list(inventories[player_tag]), set()
-    while pending:
-        tag = pending.pop()
-        if tag in seen or tag not in items:
-            continue
-        seen.add(tag)
-        contents = inventories.get(tag)
-        if contents:
-            pending.extend(contents)
-        else:
-            carried.append(items[tag])
-    return carried
-
-
 def _checker_requirement(attrs: dict, base: dict
                          ) -> tuple[Requirement, bool, str] | None:
     """Compile one inventory checker (type 64) as the server evaluates it.
@@ -504,6 +481,8 @@ class WorldGraph:
             tuple[str, ...], dict[str, int], tuple[int, ...],
             tuple[int, ...], tuple[MapEdge, ...]
         ] | None = None
+        # route() under an access set, per set (_gated_route_snapshot).
+        self._gated_route_snapshots: dict = {}
 
     def build(self) -> "WorldGraph":
         archetypes = load_archetypes()
@@ -1025,6 +1004,12 @@ class WorldGraph:
                         edge.destination, {}).items():
                     roaming[identity] = max(
                         level, roaming.get(identity, 0))
+        # Keys that no map places: quest rewards and NPC gifts are archetypes
+        # or artifacts with the lock's slaying (unlocks.py).
+        for lock_id, names in unlocks.content_key_aliases(
+                unlocks.gate_counts(self), archetypes,
+                artifact_inventory()).items():
+            self.access_item_names[lock_id].update(names)
         return self
 
     @staticmethod
@@ -1617,8 +1602,8 @@ class WorldGraph:
     def routes_into_component(self, source: str, destination: str,
                               points: list[tuple[int, int]], *,
                               source_point: tuple[int, int] | None = None,
-                              excluded: set[tuple[str, str]] | None = None
-                              ) -> list[list[MapEdge]]:
+                              excluded: set[tuple[str, str]] | None = None,
+                              access=None) -> list[list[MapEdge]]:
         """Find routes which enter the destination component containing points."""
         routes: list[list[MapEdge]] = []
         for node in self.nodes.values():
@@ -1628,12 +1613,14 @@ class WorldGraph:
                 if excluded and (edge.source, edge.destination) in excluded:
                     continue
                 arrivals = self._entry_points(edge)
-                if not any(self.local_path(destination, arrival, point)
+                if not any(self.local_path(destination, arrival, point,
+                                           allow_locked=False if access is None else access)
                            for arrival in arrivals for point in points):
                     continue
                 try:
                     prefix = self.route(source, edge.source,
-                                        excluded=excluded)
+                                        excluded=excluded, access=access,
+                                        source_xy=source_point)
                 except ValueError:
                     continue
                 route = prefix + [edge]
@@ -1642,17 +1629,15 @@ class WorldGraph:
                 if (source_point is not None and route[0].source == source and
                         not self.local_path(
                             source, source_point,
-                            (route[0].x, route[0].y))):
+                            (route[0].x, route[0].y),
+                            allow_locked=False if access is None else access)):
                     continue
                 routes.append(route)
         routes.sort(key=len)
         return routes
 
-    def route(self, source: str, destination: str, *,
-              excluded: set[tuple[str, str]] | None = None,
-              avoided_maps: set[str] | None = None) -> list[MapEdge]:
-        if source == destination:
-            return []
+    def _route_base(self):
+        """The map-level search graph: one state per map, gates ignored."""
         if self._world_search_snapshot is None:
             paths = tuple(self.nodes)
             state_ids = {
@@ -1673,25 +1658,177 @@ class WorldGraph:
                 paths, state_ids, tuple(offsets), tuple(targets),
                 tuple(route_edges),
             )
-        paths, state_ids, offsets, targets, route_edges = (
-            self._world_search_snapshot)
+            self._gated_route_snapshots = {}
+        return self._world_search_snapshot
+
+    def _edge_endpoints(self, edge: MapEdge
+                        ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+        """The (departure, arrival) squares an edge can be crossed by.
+
+        An exit has one; a cardinal tile seam has one per shared border
+        row or column, as ``_tile_transitions`` crosses it; a corner seam
+        has its corner squares. A tile declaration inside the map has none,
+        as in ``_transition``.
+        """
+        source = self.nodes.get(edge.source)
+        destination = self.nodes.get(edge.destination)
+        if source is None or destination is None:
+            return []
+        if edge.kind != "tile":
+            return [((edge.x, edge.y), (
+                edge.destination_x if edge.destination_x >= 0
+                else destination.enter_x,
+                edge.destination_y if edge.destination_y >= 0
+                else destination.enter_y))]
+        west, east = edge.x < 0, edge.x >= source.width
+        north, south = edge.y < 0, edge.y >= source.height
+        if (west or east) and (north or south):
+            return [((0 if west else source.width - 1,
+                      0 if north else source.height - 1),
+                     (destination.width - 1 if west else 0,
+                      destination.height - 1 if north else 0))]
+        if west or east:
+            return [((0 if west else source.width - 1, y),
+                     (destination.width - 1 if west else 0, y))
+                    for y in range(min(source.height, destination.height))]
+        if north or south:
+            return [((x, 0 if north else source.height - 1),
+                     (x, destination.height - 1 if north else 0))
+                    for x in range(min(source.width, destination.width))]
+        return []
+
+    def _gated_route_snapshot(self, access):
+        """The map-level search graph under one access set.
+
+        A map where ``access`` leaves a gated tile closed becomes one state
+        per walkable component its edges touch, as ``route_points`` sees
+        it; every other map stays one state. Cached per access set, and
+        rebuilt with the map-level graph.
+        """
+        paths, state_ids, _, _, route_edges = self._route_base()
+        key = access if isinstance(access, bool) else frozenset(access)
+        cached = self._gated_route_snapshots.get(key)
+        if cached is not None:
+            return cached
+        split = {path for path, node in self.nodes.items() if node.locks and
+                 not all(requirement.met(access)
+                         for requirement in node.locks.values())}
+        state_maps = list(paths)
+        components: dict[tuple[str, tuple[int, int]], int] = {}
+
+        def state_of(path: str, point: tuple[int, int]) -> int | None:
+            if path not in split:
+                return state_ids[path]
+            node = self.nodes[path]
+            if not node.walkable(*point, allow_locked=access):
+                return None
+            component = self._component(path, point, allow_locked=access)
+            # A walk-on exit joins the component only as its start: key
+            # by the rest, so leaving by it and arriving beside it agree.
+            rest = component - node.automatic_exits
+            if not rest:
+                return None
+            identity = path, min(rest)
+            if identity not in components:
+                components[identity] = len(state_maps)
+                state_maps.append(path)
+            return components[identity]
+
+        adjacency: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        for index, edge in enumerate(route_edges):
+            if edge.source not in split and edge.destination not in split:
+                adjacency[state_ids[edge.source]].append(
+                    (state_ids[edge.destination], index))
+                continue
+            pairs = set()
+            for departure, arrival in self._edge_endpoints(edge):
+                start = state_of(edge.source, departure)
+                end = state_of(edge.destination, arrival)
+                if start is not None and end is not None:
+                    pairs.add((start, end))
+            for start, end in sorted(pairs):
+                adjacency[start].append((end, index))
+        offsets, targets, metadata = [0], [], []
+        for state in range(len(state_maps)):
+            for target, index in adjacency.get(state, ()):
+                targets.append(target)
+                metadata.append(index)
+            offsets.append(len(targets))
+        map_states: dict[str, list[int]] = defaultdict(list)
+        for state, path in enumerate(state_maps):
+            if path not in split or state >= len(paths):
+                map_states[path].append(state)
+        snapshot = (dict(map_states), components, tuple(offsets),
+                    tuple(targets), tuple(metadata), split)
+        if len(self._gated_route_snapshots) >= 8:
+            self._gated_route_snapshots.clear()
+        self._gated_route_snapshots[key] = snapshot
+        return snapshot
+
+    def route(self, source: str, destination: str, *,
+              excluded: set[tuple[str, str]] | None = None,
+              avoided_maps: set[str] | None = None,
+              access=None,
+              source_xy: tuple[int, int] | None = None) -> list[MapEdge]:
+        """The fewest map transitions from ``source`` to ``destination``.
+
+        A map-level estimate: walking inside a map is not checked. With
+        ``access`` (her access set, unlocks.py), a gate it leaves closed
+        splits its map into the components the gate separates, so the route
+        never passes it; ``source_xy`` then picks her component of a split
+        source map, otherwise any of them may start the route. Without
+        ``access`` gates are ignored (tests and offline tools).
+        """
+        if source == destination:
+            return []
+        paths, state_ids, offsets, targets, route_edges = self._route_base()
         if source not in state_ids or destination not in state_ids:
             raise ValueError(f"no route from {source} to {destination}")
-        excluded_edges = (
-            index for index, edge in enumerate(route_edges)
-            if ((excluded and (edge.source, edge.destination) in excluded) or
+
+        def skipped(edge: MapEdge) -> bool:
+            return bool(
+                (excluded and (edge.source, edge.destination) in excluded) or
                 (avoided_maps and edge.destination in avoided_maps and
                  edge.destination != destination) or
                 ("/apartments/apartment_" in edge.destination and
                  edge.destination != destination))
-        )
-        result = graph_search(
-            offsets, targets, state_ids[source], (state_ids[destination],),
-            metadata=range(len(route_edges)), excluded_edges=excluded_edges,
-        )
-        if result.status != "found":
+
+        if access is None:
+            result = graph_search(
+                offsets, targets, state_ids[source], (state_ids[destination],),
+                metadata=range(len(route_edges)),
+                excluded_edges=(index for index, edge in enumerate(route_edges)
+                                if skipped(edge)),
+            )
+            if result.status != "found":
+                raise ValueError(f"no route from {source} to {destination}")
+            return [route_edges[index] for index in result.transitions]
+        map_states, components, offsets, targets, metadata, split = (
+            self._gated_route_snapshot(access))
+        starts = map_states.get(source, [])
+        if source in split and source_xy is not None:
+            component = self._component(source, source_xy,
+                                        allow_locked=access)
+            rest = component - self.nodes[source].automatic_exits
+            if rest:
+                # Her part of the map; one no edge touches has no way out.
+                mine = components.get((source, min(rest)))
+                starts = [] if mine is None else [mine]
+        goals = tuple(map_states.get(destination, ()))
+        excluded_edges = frozenset(
+            position for position, index in enumerate(metadata)
+            if skipped(route_edges[index]))
+        best: list[MapEdge] | None = None
+        for start in starts:
+            result = graph_search(
+                offsets, targets, start, goals, metadata=metadata,
+                excluded_edges=excluded_edges)
+            if result.status == "found" and (
+                    best is None or len(result.transitions) < len(best)):
+                best = [route_edges[index] for index in result.transitions]
+        if best is None:
             raise ValueError(f"no route from {source} to {destination}")
-        return [route_edges[index] for index in result.transitions]
+        return best
 
 
 class NavigateTask(BotTask):
@@ -1813,18 +1950,10 @@ class NavigateTask(BotTask):
         super().complete()
 
     def _allow_locked(self, client: AtrinikClient):
+        """Her access set: the unlock state's, unless the task overrides it."""
         if self._allow_locked_override is not None:
             return self._allow_locked_override
-        raw_names = {item.name for item in carried_items(client.state)}
-        names = {name.casefold().strip() for name in raw_names}
-        # A name lock mirrors the server's exact, case-sensitive comparison
-        # of the object's name; slaying locks go through the key catalogue.
-        return frozenset(
-            requirement for requirement, aliases
-            in getattr(self.graph, "access_item_names", {}).items()
-            if (requirement[len(NAME_LOCK_PREFIX):] in raw_names
-                if requirement.startswith(NAME_LOCK_PREFIX)
-                else names & aliases))
+        return unlocks.unlock_state(client, self.graph).access
 
     def _goal_points(self) -> list[tuple[int, int]]:
         if self.destination_xy is None:
@@ -4253,12 +4382,10 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
     learned = {map_path: until for map_path, until in
                (getattr(client.state, "route_hazards", None) or {}).items()
                if until > now}
-    # Containers walked here: the proxy below has no container contents.
-    inventory = carried_items(client.state)
     proxy = types.SimpleNamespace(state=types.SimpleNamespace(
-        stats={"level": level}, route_hazards=learned, inventory=inventory,
+        stats={"level": level}, route_hazards=learned,
         map=types.SimpleNamespace(path=path, world_x=0, world_y=0)))
-    access = NavigateTask(graph, path)._allow_locked(proxy)
+    access = unlocks.unlock_state(client, graph).access
     key = (id(graph), path, level, frozenset(learned), access)
     if key not in _town_reach_cache and len(_town_reach_cache) > 512:
         _town_reach_cache.clear()
@@ -4274,7 +4401,9 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
                     results[pair] = False
                 else:
                     proxy.state.map.world_x, proxy.state.map.world_y = start
-                    navigation = NavigateTask(graph, destination, destination_xy=xy)
+                    # Her own access set: the proxy carries no inventory.
+                    navigation = NavigateTask(graph, destination, destination_xy=xy,
+                                              allow_locked=access)
                     navigation.strict_safety = True
                     if tolerance:
                         navigation.tolerance = tolerance
@@ -4727,14 +4856,20 @@ SAVEBED_CANDIDATES = 6
 
 
 def _nearest_spot_maps(graph: WorldGraph, source: str,
-                       spot_maps: Iterable[str]) -> tuple[int, list[str]] | None:
-    """The fewest map transitions from ``source`` to a spot map, and those maps."""
+                       spot_maps: Iterable[str], *, access=False,
+                       source_xy: tuple[int, int] | None = None
+                       ) -> tuple[int, list[str]] | None:
+    """The fewest map transitions from ``source`` to a spot map, and those maps.
+
+    Gates follow ``access``, her access set, as the exact walks do.
+    """
     best: tuple[int, list[str]] | None = None
     for spot in spot_maps:
         if source == spot:
             return 0, [spot]
         try:
-            hops = len(graph.route(source, spot))
+            hops = len(graph.route(source, spot, access=access,
+                                   source_xy=source_xy))
         except (ValueError, KeyError):
             continue
         if best is None or hops < best[0]:
@@ -4767,7 +4902,7 @@ def _edge_arrival(graph: WorldGraph, edge: MapEdge) -> tuple[int, int]:
 
 
 def _segment_steps(graph: WorldGraph, map_path: str, here: tuple[int, int],
-                   edge: MapEdge) -> int:
+                   edge: MapEdge, access=False) -> int:
     """Moves on ``map_path`` from ``here`` through ``edge``'s departure.
 
     Follows the authored terrain (``local_path``) so walls, counters and
@@ -4780,7 +4915,8 @@ def _segment_steps(graph: WorldGraph, map_path: str, here: tuple[int, int],
     if node is not None:
         target = (max(0, min(node.width - 1, edge.x)),
                   max(0, min(node.height - 1, edge.y)))
-    path = graph.local_path(map_path, here, target) if node is not None else []
+    path = (graph.local_path(map_path, here, target, allow_locked=access)
+            if node is not None else [])
     steps = (len(path) - 1 if path else
              max(abs(target[0] - here[0]), abs(target[1] - here[1])))
     return steps + (1 if edge.kind == "tile" else 0)
@@ -4796,20 +4932,20 @@ def _spawn_points(graph: WorldGraph, map_path: str) -> list[tuple[int, int]]:
 
 
 def _reaches(graph: WorldGraph, map_path: str, point: tuple[int, int],
-             targets: list[tuple[int, int]]) -> bool:
+             targets: list[tuple[int, int]], access=False) -> bool:
     """Whether point shares a walkable component with a target (or none known)."""
     if not targets:
         return True
-    component = graph._component(map_path, point)
+    component = graph._component(map_path, point, allow_locked=access)
     return any(target in component for target in targets)
 
 
 def _route_walk(graph: WorldGraph, start_map: str, start_xy: tuple[int, int],
-                edges: Sequence[MapEdge]) -> int:
+                edges: Sequence[MapEdge], access=False) -> int:
     """Moves along a planned route until it enters its destination map."""
     tiles, here, current = 0, start_xy, start_map
     for edge in edges:
-        tiles += _segment_steps(graph, current, here, edge)
+        tiles += _segment_steps(graph, current, here, edge, access)
         here, current = _edge_arrival(graph, edge), edge.destination
     return tiles
 
@@ -4818,7 +4954,8 @@ ApartmentReturns = dict[str, tuple[str, tuple[int, int]]]
 
 
 def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
-              spot_maps: Sequence[str], returns: ApartmentReturns):
+              spot_maps: Sequence[str], returns: ApartmentReturns,
+              access=False):
     """Generator: yields once per exact route; returns the walk options.
 
     Each option is (walk, first edge) for one route found, ``first`` being
@@ -4826,10 +4963,13 @@ def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
     can be priced by their own steps to each route's first edge. An apartment's exit
     returns to the per-player entrance recorded at runtime, not to the
     graph's static alternatives, so its walk continues from the observed
-    return point in ``returns``; without one it is unknown (None).
+    return point in ``returns``; without one it is unknown (None). Gates
+    follow ``access``, her access set, so a keyed shortcut such as
+    Morg'eean's ship counts only with its key.
     """
     targets = {spot: _spawn_points(graph, spot) for spot in spot_maps}
-    if bed_map in spot_maps and _reaches(graph, bed_map, point, targets[bed_map]):
+    if bed_map in spot_maps and _reaches(graph, bed_map, point, targets[bed_map],
+                                         access):
         return [(0, None)]
     start_map, start_xy, base, first = bed_map, point, 0, None
     if "/apartments/" in bed_map:
@@ -4838,40 +4978,48 @@ def _bed_walk(graph: WorldGraph, bed_map: str, point: tuple[int, int],
         if back is None or node is None:
             return []
         exits = [edge for edge in node.edges if edge.kind != "tile" and (
-            graph.local_path(bed_map, point, (edge.x, edge.y)) or
+            graph.local_path(bed_map, point, (edge.x, edge.y),
+                             allow_locked=access) or
             (edge.x, edge.y) == point)]
         if not exits:
             return []
-        first = min(exits, key=lambda edge: _segment_steps(graph, bed_map, point, edge))
-        base = _segment_steps(graph, bed_map, point, first)
+        first = min(exits, key=lambda edge: _segment_steps(
+            graph, bed_map, point, edge, access))
+        base = _segment_steps(graph, bed_map, point, first, access)
         start_map, start_xy = back[0], tuple(back[1])
-        if start_map in spot_maps and _reaches(graph, start_map, start_xy, targets[start_map]):
+        if start_map in spot_maps and _reaches(graph, start_map, start_xy,
+                                               targets[start_map], access):
             return [(base, first)]
     options = []
     for spot in spot_maps:
         try:
             # Arrive in the part of the circuit map the farm's spawns are
             # in: a bed (or arrival) in a disconnected room does not count.
-            edges = graph.route_points(start_map, start_xy, spot, targets[spot])
+            edges = graph.route_points(start_map, start_xy, spot, targets[spot],
+                                       allow_locked=access)
         except (ValueError, KeyError):
             edges = None
         yield
         if not edges:
             continue
-        options.append((base + _route_walk(graph, start_map, start_xy, edges),
+        options.append((base + _route_walk(graph, start_map, start_xy, edges,
+                                           access),
                         first or edges[0]))
     return options
 
 
 def savebed_walk(graph: WorldGraph, bed_map: str, bed_xy: tuple[int, int],
                  spot_maps: Iterable[str], *,
-                 returns: ApartmentReturns | None = None) -> int | None:
+                 returns: ApartmentReturns | None = None,
+                 access=False) -> int | None:
     """Moves walked from a respawn on this bed to the nearest circuit map.
 
     Every reachable circuit map is routed and walked along its authored
-    paths; None when none is reachable (or an apartment's return is unknown).
+    paths, through the gates ``access`` opens; None when none is reachable
+    (or an apartment's return is unknown).
     """
-    steps = _bed_walk(graph, bed_map, tuple(bed_xy), tuple(spot_maps), returns or {})
+    steps = _bed_walk(graph, bed_map, tuple(bed_xy), tuple(spot_maps), returns or {},
+                      access)
     try:
         while True:
             next(steps)
@@ -4887,7 +5035,9 @@ class SavebedSearch:
     known (``returns``). Each exact walk is a tile-level route, so ``step()``
     computes at most one per call and a live caller spreads the search over
     ticks. ``result`` is (map, bed tile, walk tiles) or None; with
-    ``current`` (map, tile), ``current_walk`` is that bed's walk.
+    ``current`` (map, tile), ``current_walk`` is that bed's walk. Gates
+    follow ``access``, her access set (unlocks.py), in the shortlist and
+    the walks alike.
     """
 
     def __init__(self, graph: WorldGraph, spot_maps: Iterable[str], *,
@@ -4895,10 +5045,12 @@ class SavebedSearch:
                  excluded: Iterable[str] = (),
                  excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = (),
                  current: tuple[str, tuple[int, int]] | None = None,
-                 returns: ApartmentReturns | None = None):
+                 returns: ApartmentReturns | None = None,
+                 access=False):
         self.result: tuple[str, tuple[int, int], int] | None = None
         self.current_walk: int | None = None
         self.done = False
+        self.access = access
         self._steps = self._search(
             graph, tuple(dict.fromkeys(spot_maps)), set(owned), set(excluded),
             {(path, tuple(point)) for path, point in excluded_tiles}, current,
@@ -4942,11 +5094,15 @@ class SavebedSearch:
             if "/apartments/" in bed_map:
                 back = returns.get(bed_map)
                 nearest = (None if back is None else
-                           _nearest_spot_maps(graph, back[0], spot_maps))
+                           _nearest_spot_maps(graph, back[0], spot_maps,
+                                              access=self.access,
+                                              source_xy=tuple(back[1])))
                 if nearest is not None:
                     nearest = (nearest[0] + 1, nearest[1])
             else:
-                nearest = _nearest_spot_maps(graph, bed_map, spot_maps)
+                # Any bed's component may start: the exact walks decide.
+                nearest = _nearest_spot_maps(graph, bed_map, spot_maps,
+                                             access=self.access)
             if nearest is not None:
                 hops[bed_map] = nearest[0]
                 eligible[bed_map] = tiles
@@ -4967,13 +5123,14 @@ class SavebedSearch:
             # Beds in one walkable component share everything after their
             # first exit; beds in another component get their own route.
             groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+            access = self.access
             for point in eligible[bed_map]:
-                component = graph._component(bed_map, point)
+                component = graph._component(bed_map, point, allow_locked=access)
                 groups.setdefault(min(component) if component else point, []).append(point)
             for group in groups.values():
                 anchor = group[0]
                 options = yield from _bed_walk(
-                    graph, bed_map, anchor, spot_maps, returns)
+                    graph, bed_map, anchor, spot_maps, returns, access)
                 for point in group:
                     # Each bed takes whichever leg's route suits it best: a
                     # bed beside another exit is priced through that exit.
@@ -4981,17 +5138,20 @@ class SavebedSearch:
                     for walk, first in options:
                         if point == anchor or first is None:
                             prices.append(walk)
-                        elif graph.local_path(bed_map, point, (first.x, first.y)):
+                        elif graph.local_path(bed_map, point, (first.x, first.y),
+                                              allow_locked=access):
                             prices.append(
-                                walk - _segment_steps(graph, bed_map, anchor, first) +
-                                _segment_steps(graph, bed_map, point, first))
+                                walk - _segment_steps(graph, bed_map, anchor, first,
+                                                      access) +
+                                _segment_steps(graph, bed_map, point, first, access))
                     if prices:
                         self._consider(bed_map, point, min(prices))
                         priced = True
             priced_maps += priced
         if current is not None and current[0] in graph.nodes:
             options = yield from _bed_walk(
-                graph, current[0], tuple(current[1]), spot_maps, returns)
+                graph, current[0], tuple(current[1]), spot_maps, returns,
+                self.access)
             self.current_walk = min((walk for walk, _ in options), default=None)
 
 
@@ -4999,11 +5159,12 @@ def nearest_savebed(graph: WorldGraph, spot_maps: Iterable[str], *,
                     owned: Iterable[str] = (STARTER_APARTMENT,),
                     excluded: Iterable[str] = (),
                     excluded_tiles: Iterable[tuple[str, tuple[int, int]]] = (),
-                    returns: ApartmentReturns | None = None
-                    ) -> tuple[str, tuple[int, int], int] | None:
+                    returns: ApartmentReturns | None = None,
+                    access=False) -> tuple[str, tuple[int, int], int] | None:
     """The usable savebed whose respawn is the shortest walk from the spot."""
     return SavebedSearch(graph, spot_maps, owned=owned, excluded=excluded,
-                         excluded_tiles=excluded_tiles, returns=returns).run().result
+                         excluded_tiles=excluded_tiles, returns=returns,
+                         access=access).run().result
 
 
 class FarmCircuitTask(BotTask):
@@ -6231,12 +6392,14 @@ class FarmCircuitTask(BotTask):
         bed_xy = getattr(client.state, "savebed_xy", None)
         current = (bed_map, tuple(bed_xy)) if bed_map and bed_xy else None
         returns = dict(getattr(client.state, "apartment_returns", {}) or {})
+        # Her keys open shortcuts such as Morg'eean's ship for the walks too.
+        access = unlocks.unlock_state(client, self.graph).access
         key = (self._spot_maps(), frozenset(self._bed_failed), current,
-               frozenset(returns.items()))
+               frozenset(returns.items()), access)
         if self._bed_search is None or self._bed_search[0] != key:
             self._bed_search = (key, SavebedSearch(
                 self.graph, key[0], excluded_tiles=self._bed_failed, current=current,
-                returns=returns))
+                returns=returns, access=access))
         return self._bed_search[1]
 
     def _needs_savebed(self, client: AtrinikClient) -> bool:

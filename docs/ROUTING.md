@@ -1294,8 +1294,8 @@ server source:
   folded into that tile's requirement.
 - The six Greyton jail exclusions change no route: their tiles are also
   blocked by the cell bars. Only the three `world_13_62` tiles open, and
-  only for plans that know her inventory; `route()` without an access set
-  keeps every gated tile closed until P2.
+  only for plans that know her inventory. The map-level `route()` ignored
+  gates altogether until P2.
 - `Consumes` is satisfied by what she carries now; counting quantity along
   a route waits for the planner phases.
 - Containers are walked as far as the client has seen their contents; a
@@ -1308,6 +1308,53 @@ rewards.** Add `unlocks.py`; `_allow_locked`, savebed walks and `route()`
 use it; the dashboard shows unlocks read-only.
 *Accept:* Sera's live inventory yields the Incuna gate and barn lock ids;
 savebed walks use the ship with the key; existing tests pass.
+*Landed:* `unlocks.py` holds `UnlockState`. Notes against the text above:
+- **Inventory.** Containers are walked as in P1. A container the client
+  shows open (its open flag) has current contents, even empty ones. One
+  that is closed counts what it held when last seen open, shown as
+  `remembered`; one never opened counts as itself. The memory lives for
+  one connection, in process: after a restart she has to open the key ring
+  again before its keys count. It is dropped when the container leaves her
+  inventory.
+- **Key aliases.** `WorldGraph.build` adds the names of archetypes and
+  artifacts whose `slaying` is a lock id that gates a tile. This keeps a
+  weapon's race `slaying` out. An artifact without its own `name` uses its
+  `def_arch`'s name and plural. Quest rewards (`<object arch=...>`) name an
+  archetype or artifact, so they need no separate parser. In the locked
+  content this adds the two Incuna keys and the Underground City skull key.
+  20 of the 57 lock ids that gate a tile still have no key item. Many
+  map-placed keys share the archetype name "strange key", so carrying any
+  strange key opens every lock it is an alias for. P2 keeps that existing
+  behaviour; the client cannot see which `slaying` a strange key carries.
+- **One access set.** `NavigateTask._allow_locked`, the strict town-service
+  check, #94's reachability verdicts, the farm circuit's savebed search and
+  `route()` all read `unlock_state(client, graph).access`. The snapshot is
+  cached until her carried objects, her journal or its loaded flag change.
+- **`route()`.** It takes `access` and an optional `source_xy`. A map where
+  the access set leaves a gated tile closed is split into one state per
+  walkable component its edges touch, so the route never passes that gate.
+  Every other map stays one state, as before, so the result is still an
+  estimate: it does not see a component sealed by walls on a neighbouring
+  map. Without `access` it ignores gates as before. That form is kept for
+  tests and offline tools only. The split graph is cached per access set
+  (about 0.07 s to build for the locked content).
+- **Savebed walks.** `SavebedSearch`, `nearest_savebed`, `savebed_walk` and
+  the shortlist pass the access set to `route()`, `route_points` and the
+  in-map walks. From the `world_1_67_1` bed to Morg'eean's yard
+  (`world_6_51`) the walk is 112 moves with the ship key and 600 without.
+- **Quest journal.** `UnlockState.quests` holds the journal's (quest, part,
+  status) rows by the names the client shows. `quest_part()` returns None
+  until the journal has loaded. Mapping names to part uids is left to P4,
+  which compiles the first `Quest` atoms.
+- **Learned.** `UnlockState.learned_tiles` and `tile_allowed()` are the
+  hook LEARNING F8 fills. They are always empty here, and the component
+  planner does not read them yet; F8 amends 4.3 as LEARNING 4.5 says.
+  `fingerprint` is the item and quest state digest 4.4's `inputs` uses.
+- **Dashboard.** `/api/state` has an `unlocks` field, and the Tasks tab has
+  a read-only **Unlocks** section. It lists the lock ids she can open, with
+  the matching items, where each is carried and the gated tile count, plus
+  the state fingerprint. Quest gates and transports wait for P4, which
+  compiles them.
 
 **P3. `feat(dashboard)`: owner route and map blocks.** The `route_blocks`
 table, the dashboard form (subject, 1 h to 7 d), the list with expiry and

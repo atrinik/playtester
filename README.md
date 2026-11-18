@@ -499,7 +499,13 @@ Navigation plans over a world graph compiled from the locked content: tile
 seams, exits, apartments, locked doors and inventory checkers. Checkers
 follow the server: one requires or forbids a matching object, matched by its
 `slaying` or its name, and some use the object up as she passes. The keys she
-carries are read from her inventory, including containers she has opened. A map where
+carries are read from her inventory, including containers she has opened; a
+closed container counts what it held when she last opened it. Keys that no
+map places, such as quest rewards and NPC gifts, are recognised from their
+archetypes and artifacts. Every plan, savebed choice and map-level route uses
+this one unlock state, so a keyed shortcut such as Morg'eean's ship counts
+only while she carries its key. The Tasks tab's **Unlocks** section shows the
+keys she carries, where, and how many gated tiles each opens. A map where
 she recently died on the way somewhere is avoided for a while when another
 route exists. The proposed design for
 alternative routes, unlocks such as keys, quests and NPC voyages, and costs
