@@ -645,10 +645,13 @@ While either holds, autoplay runs a recovery phase (`RecoveryTask`)
 instead of a farm circuit, whether or not the analyzer ranks a spot.
 When the switch is due, the circuit's discretionary trips end at once
 (upgrade sweep, spell purchase, utility and recall shopping, savebed
-rebinding). Essential trips finish first (food, bank, identify, storage,
-the cure and its funding), and so does a fight on the farm map, under the
-farm's own combat and emergency recall. The wait lasts at most
-`HANDOVER_SECONDS` (120 s). A fight on the road is no reason to wait,
+rebinding). The exceptions are a shop trip still settling a purchase and
+any trip while she carries unpaid stock: those finish paying first.
+Essential trips finish first (food, bank, identify, storage, the cure and
+its funding), and so does a fight on the farm map, under the farm's own
+combat and emergency recall. Meanwhile the farm pulls no new target
+(`FarmTask.hold_new_pulls`): it finishes the engaged one and fights what
+comes at her. The wait lasts at most `HANDOVER_SECONDS` (120 s). A fight on the road is no reason to wait,
 since waiting would walk her on along the farm route. Each tick the
 recovery phase:
 
@@ -693,7 +696,8 @@ clears as soon as its condition does:
 - `recall-unavailable`: the last recall shopping failed or bought nothing,
   or getting the ship key it needs failed. The reason is kept in her
   persisted state (`recall_unavailable`) for a day, so it survives Stop
-  and restarts.
+  and restarts. It is cleared whenever a missing recall is not what holds
+  farming, so a later recall loss never shows an old reason.
 
 The `stuck` alert is left out only while she waits at her savebed on one
 of these blockers. A cure walk or other errand that stalls still raises

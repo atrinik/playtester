@@ -6133,6 +6133,23 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         dx, dy = c.DIRECTION_DELTAS[direction]
         self.assertTrue(node.walkable(dx, dy))
 
+    def test_farm_pulls_no_new_target_while_a_recovery_switch_waits(self):
+        def run(hold):
+            client = self._combat_client()
+            client.state.map.tiles.clear()
+            client.state.map.tile(14, 8).objects[3] = MapObject(
+                3, 1, 0, 0, name="kobold chief", target_id=100,
+                target_hp=100)
+            task = FarmTask(zone="/test", target="kobold chief")
+            task.hold_new_pulls = hold
+            asyncio.run(task.tick(client))
+            return client.targets + client.moves + client.direct_moves
+
+        # Six tiles away, beyond its detection radius and not attacking: a
+        # pull, unless farming is about to stop (FarmTask.hold_new_pulls).
+        self.assertTrue(run(False))
+        self.assertEqual(run(True), [])
+
     def test_water_lure_waits_for_authoritative_position_ack(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
@@ -20065,9 +20082,9 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client, _ = self.client()
         autoplay = self.autoplay_farming(client)
         circuit = autoplay.child
-        circuit._shopping = BotTask("upgrade sweep")
-        circuit._bed_binding = BotTask("savebed")
-        circuit._banking = BotTask("deposit")
+        circuit._shopping = _DoneErrand(status=TaskStatus.RUNNING)
+        circuit._bed_binding = _DoneErrand(status=TaskStatus.RUNNING)
+        circuit._banking = _DoneErrand(status=TaskStatus.RUNNING)
         self.deplete(client)
         asyncio.run(autoplay.tick(client))
         # The upgrade sweep and the rebinding end at once; the deposit runs.
@@ -20096,6 +20113,8 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertFalse(circuit.ready_for_handover(client))
         asyncio.run(autoplay.tick(client))
         self.assertIs(autoplay.child, circuit)
+        # Meanwhile the farm finishes this fight but pulls no new target.
+        self.assertTrue(circuit.child.task.hold_new_pulls)
         # The fight is over: no hit for a while, nothing engaged.
         client.state.messages.clear()
         client.state.messages.append((time.time() - 60, 2, "ff0000",
@@ -20104,6 +20123,48 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.target_id = 0
         asyncio.run(autoplay.tick(client))
         self.assertIsInstance(autoplay.child, RecoveryTask)
+
+    def test_a_purchase_being_paid_for_finishes_before_the_switch(self):
+        client, _ = self.client()
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        sweep = _DoneErrand(status=TaskStatus.RUNNING)
+        sweep.settlement = object()
+        circuit._shopping = sweep
+        self.deplete(client)
+        asyncio.run(autoplay.tick(client))
+        # Crossing the shop mat to pay: kept, and the switch waits.
+        self.assertIs(circuit._shopping, sweep)
+        self.assertIs(autoplay.child, circuit)
+        # Unpaid stock in her pack keeps any shop trip too.
+        circuit._shopping = None
+        utility = _DoneErrand(status=TaskStatus.RUNNING)
+        circuit._utility_shopping = utility
+        client.state.place_item(Item(
+            610, flags=c.ITEM_UNPAID, item_type=c.TYPE_FOOD,
+            name="staple food"), client.state.player_tag)
+        asyncio.run(autoplay.tick(client))
+        self.assertIs(circuit._utility_shopping, utility)
+        self.assertIs(autoplay.child, circuit)
+        # Paid: now it is dropped and the switch happens.
+        client.state.items[610].flags = 0
+        asyncio.run(autoplay.tick(client))
+        self.assertIsNone(circuit._utility_shopping)
+        self.assertNotIsInstance(autoplay.child, FarmCircuitTask)
+
+    def test_the_recall_note_is_forgotten_once_recall_is_not_the_reason(self):
+        client, _ = self.client()
+        self.empty_wands(client, 77)
+        client.set_recall_unavailable("recall shopping found no recall source")
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        # Still the reason: kept.
+        self.assertTrue(client.state.recall_unavailable)
+        # Depleted now: the cure comes first, and the note goes.
+        self.deplete(client)
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(client.state.recall_unavailable, "")
+        self.assertEqual(client.state.recall_unavailable_at, 0.0)
 
     def test_a_failed_ship_key_raises_recall_unavailable_across_a_restart(self):
         client, _ = self.client()

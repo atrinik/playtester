@@ -9,7 +9,8 @@ import time
 from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
-from .navigation import (FarmCircuitTask, NavigateThenTask, RecoveryTask,
+from .navigation import (NO_RECALL_REASON, FarmCircuitTask,
+                         NavigateThenTask, RecoveryTask,
                          WorldGraph, analyzer_farm_selection,
                          farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
@@ -280,6 +281,20 @@ class AutoplayTask(BotTask):
             self.graph, backoffs=self._circuit_backoffs,
             memory=self._recovery_memory))
 
+    @staticmethod
+    def _forget_stale_recall_note(client: AtrinikClient) -> None:
+        """Clear the persisted recall-unavailable note once a missing recall
+        is not what holds farming (cured, a working source, or depletion
+        first), so a later recall loss never shows an old reason."""
+        if (getattr(client.state, "recall_unavailable", "") and
+                farming_unsafe_reason(client) != NO_RECALL_REASON):
+            setter = getattr(client, "set_recall_unavailable", None)
+            if setter is not None:
+                setter("")
+            else:
+                client.state.recall_unavailable = ""
+                client.state.recall_unavailable_at = 0.0
+
     def recovery_alerts(self, client: AtrinikClient
                         ) -> tuple[list[dict[str, str]], bool]:
         """Dashboard alerts while farming is unsafe, from live state, and
@@ -333,6 +348,7 @@ class AutoplayTask(BotTask):
         if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
             return
 
+        self._forget_stale_recall_note(client)
         if (self._needs_temple_food(client) and
                 await self._start_temple_food(client)):
             return
@@ -348,7 +364,7 @@ class AutoplayTask(BotTask):
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
                     farming_unsafe_reason(client)):
-                dropped = self.child.drop_discretionary_trips()
+                dropped = self.child.drop_discretionary_trips(client)
                 if dropped:
                     await client.clear_actions()
                     recorder = getattr(client, "record_action", None)
@@ -362,6 +378,7 @@ class AutoplayTask(BotTask):
                     self._circuit_backoffs = self.child.backoffs()
                     await self._start_recovery(client)
                     return
+                self.child.hold_new_pulls()
             else:
                 self._handover_since = None
             if (self.phase == "adaptive-farming" and

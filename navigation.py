@@ -6601,15 +6601,30 @@ class FarmCircuitTask(BotTask):
     DROPPED_AT_HANDOVER = ("_shopping", "_spell_purchase", "_utility_shopping",
                            "_recall_shopping", "_bed_binding")
 
-    def drop_discretionary_trips(self) -> list[str]:
-        """End the trips in DROPPED_AT_HANDOVER; the names of those ended."""
+    def drop_discretionary_trips(self, client: AtrinikClient) -> list[str]:
+        """End the trips in DROPPED_AT_HANDOVER; the names of those ended.
+
+        A shop trip settling a purchase (its ``settlement`` set), or any
+        trip while she carries unpaid stock, is kept: it finishes paying
+        before the switch.
+        """
+        unpaid = any(item.flags & c.ITEM_UNPAID
+                     for item in client.state.inventory)
         dropped = []
         for name in self.DROPPED_AT_HANDOVER:
             task = getattr(self, name)
-            if task is not None:
+            if task is not None and not unpaid and getattr(
+                    task, "settlement", None) is None:
                 dropped.append(task.name)
                 setattr(self, name, None)
         return dropped
+
+    def hold_new_pulls(self) -> None:
+        """While the switch to recovery waits: the farm pulls no new target
+        (FarmTask.hold_new_pulls); a rebuilt farm child is held again."""
+        farm = self.child.task if self.child is not None else None
+        if isinstance(farm, FarmTask):
+            farm.hold_new_pulls = True
 
     def ready_for_handover(self, client: AtrinikClient) -> bool:
         """Whether autoplay may replace this circuit by its recovery phase.
