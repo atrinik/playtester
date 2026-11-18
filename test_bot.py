@@ -949,6 +949,40 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_a_connection_error_or_disconnect_does_not_clear_an_engine_error(self):
+        async def scenario():
+            client, engine, _ = self.playing_engine()
+            engine.error_backoff_max = 0.001
+            mode = ["fail"]
+
+            async def normalize():
+                if mode[0] == "fail":
+                    raise RuntimeError("bug in upkeep " + "x" * 400)
+                if mode[0] == "drop":
+                    raise ConnectionError("closed")
+                return False
+
+            engine._normalize_inventory_locks = normalize
+            with self.assertLogs(TaskEngine.__module__, "WARNING"):
+                runner = asyncio.create_task(engine.run())
+                await self.until(lambda: engine.step_error_count >= 3)
+                self.assertLessEqual(len(engine.step_error), 200)
+                count, since = engine.step_error_count, engine.step_error_since
+                mode[0] = "drop"
+                await asyncio.sleep(0.05)
+                self.assertGreaterEqual(engine.step_error_count, count)
+                self.assertEqual(engine.step_error_since, since)
+                mode[0] = "clean"
+                client.state.phase = "connecting"
+                await asyncio.sleep(0.05)
+                self.assertGreaterEqual(engine.step_error_count, count)
+                client.state.phase = "playing"
+                await self.until(lambda: engine.step_error_count == 0)
+            engine.running = False
+            await runner
+
+        asyncio.run(scenario())
+
     def test_engine_error_alert_needs_more_than_a_few_failed_steps(self):
         from .alerts import (ENGINE_ERROR_CRITICAL_SECONDS, ENGINE_ERROR_STEPS,
                              ProgressWatch, active)

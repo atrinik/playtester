@@ -7517,7 +7517,9 @@ class TaskEngine:
         if not self.step_error_count:
             self.step_error_since = time.time()
         self.step_error_count += 1
-        self.step_error = f"{type(exc).__name__}: {exc}"
+        # Escaped on the dashboard, but kept short so the alert bar stays
+        # readable when an exception carries a packet or a long path list.
+        self.step_error = f"{type(exc).__name__}: {exc}"[:200]
 
     def _step_succeeded(self) -> None:
         self._flush_step_errors()
@@ -7535,6 +7537,10 @@ class TaskEngine:
                 # task survives it as it does between ticks.
                 log.warning("task engine step lost its connection (%s)",
                             exc or "closed")
+                # Neither clean nor failed: a flapping connection must not
+                # reset a run of upkeep failures or its alert.
+                await asyncio.sleep(self.tick_rate)
+                continue
             except Exception as exc:
                 # Nothing ends the engine but ``running``: before, an error
                 # here ended the whole process, and systemd restarted it
@@ -7548,6 +7554,8 @@ class TaskEngine:
                     self.error_backoff * 2 ** min(
                         self.step_error_count - 1, 16))))
                 continue
-            if self.step_error_count:
+            # A step only counts as clean when it ran in play: while she is
+            # disconnected ``_step`` returns early without running upkeep.
+            if self.step_error_count and self.client.state.phase == "playing":
                 self._step_succeeded()
             await asyncio.sleep(self.tick_rate)
