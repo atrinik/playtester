@@ -1,7 +1,8 @@
 # Routing: alternative routes, unlocks and learned costs
 
-Status: design proposal, not implemented. Nothing here changes behaviour
-until the phased pull requests at the end land.
+Status: design proposal, being implemented phase by phase (section 5).
+Sections 1 to 3 record the navigator as it was before P1; each landed phase
+says so in section 5.
 
 The owner wants the navigator to reach a place another way when one route is
 dangerous. That includes the world's shortcuts: one-way and two-way ones,
@@ -1268,6 +1269,28 @@ three `world_13_62` checkers become exclusions; the five `last_heal`
 checkers compile as `Consumes`; no change to routes in the content
 regression set except where a forbid-checker opens; `ACCESS_ITEM` removed or
 used.
+*Landed:* `requirements.py` holds the `Item`, `NotItem`, `Consumes` and
+`Unknown` atoms; `MapNode.locks` maps each gated tile to its requirement;
+`ACCESS_ITEM` is removed. Notes against the text above, checked in the
+server source:
+- Two blocking checkers leave `sp` at its archetype default 0 and so match
+  by name: the orange and blue stone giant keys (`world_5_57_-2`,
+  `old_outpost_a_0203`). Their lock ids are now `name:<name>`, which
+  replaces the `set_individual_value` alias.
+- In `underground_city_5_3_-1` (4,12) the consuming checker is a second,
+  non-blocking one on the gate's tile. Consumption happens on stepping on
+  any checker with `last_sp` and `last_heal`, blocking or not, so it is
+  folded into that tile's requirement.
+- The six Greyton jail exclusions change no route: their tiles are also
+  blocked by the cell bars. Only the three `world_13_62` tiles open, and
+  only for plans that know her inventory; `route()` without an access set
+  keeps every gated tile closed until P2.
+- `Consumes` is satisfied by what she carries now; counting quantity along
+  a route waits for the planner phases.
+- Containers are walked as far as the client has seen their contents; a
+  container never opened counts as itself. Checkers that match by object
+  type (`hp`) or archetype (`race`), and a filterless forbidding checker,
+  compile as `Unknown`; none blocks in the locked content.
 
 **P2. `feat(navigation)`: an unlock state from inventory, artifacts and quest
 rewards.** Add `unlocks.py`; `_allow_locked`, savebed walks and `route()`

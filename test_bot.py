@@ -21,8 +21,10 @@ from .navigation import (BuySpellTask, FarmCircuitTask, FoodProfile,
                          MapEdge, MapNode,
                          MorgeeanShipKeyTask, NamedSpawn,
                          NavigateTask, NavigateThenTask, ServerGameClock,
-                         ShopUpgradeSweepTask, WorldGraph, _coordinate_name,
-                         content_attr, CONTENT_ROOT)
+                         ShopUpgradeSweepTask, WorldGraph, _checker_requirement,
+                         _coordinate_name, carried_items, content_attr,
+                         CONTENT_ROOT)
+from . import requirements as req
 from .catalog_quest_tasks import (ApplyAtTask, ApplyGroundTask, ArrivedTask,
                                   CatalogQuestTask, DialogAtTask,
                                   AcquireContainerItemTask,
@@ -16157,7 +16159,7 @@ class NavigationTests(unittest.TestCase):
         graph = built_graph()
         node = graph.nodes["/shattered_islands/world_2_70"]
         self.assertEqual(
-            node.lock_requirements[(2, 8)], "morgeean_ship_key")
+            node.locks[(2, 8)], req.requires(req.Item("morgeean_ship_key")))
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         task = NavigateTask(graph, "/shattered_islands/world_5_46")
@@ -16174,7 +16176,8 @@ class NavigationTests(unittest.TestCase):
                 "underground_city_5_2_-1")
         node = graph.nodes[path]
         self.assertEqual(
-            node.lock_requirements[(7, 3)], "underground_city_key_drow")
+            node.locks[(7, 3)],
+            req.requires(req.Item("underground_city_key_drow")))
         self.assertFalse(node.walkable(7, 3, allow_locked=frozenset()))
         self.assertTrue(node.walkable(
             7, 3, allow_locked=frozenset({"underground_city_key_drow"})))
@@ -16183,8 +16186,8 @@ class NavigationTests(unittest.TestCase):
         graph = built_graph()
         node = graph.nodes["/shattered_islands/world_4_67_-1"]
         self.assertEqual(
-            node.lock_requirements[(10, 15)],
-            "underground_city_key_drow")
+            node.locks[(10, 15)],
+            req.requires(req.Item("underground_city_key_drow")))
         self.assertFalse(node.walkable(
             10, 15, allow_locked=frozenset()))
         self.assertTrue(node.walkable(
@@ -16194,8 +16197,11 @@ class NavigationTests(unittest.TestCase):
     def test_personalized_stone_giant_key_unlocks_named_checker(self):
         graph = built_graph()
         node = graph.nodes["/shattered_islands/world_5_57_-2"]
+        # The checker leaves sp at its archetype default 0, so the server
+        # matches the carried object's name, not its slaying.
         self.assertEqual(
-            node.lock_requirements[(14, 14)], "orange stone giant key")
+            node.locks[(14, 14)],
+            req.requires(req.Item("name:orange stone giant key")))
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         task = NavigateTask(graph, "/shattered_islands/world_5_57_-2")
@@ -16204,6 +16210,188 @@ class NavigationTests(unittest.TestCase):
         client.state.place_item(Item(1, name="orange stone giant key"), 7)
         self.assertTrue(node.walkable(
             14, 14, allow_locked=task._allow_locked(client)))
+
+    # Inventory checkers, as check_inv.c and blocked_tile() in map.c
+    # evaluate them (docs/ROUTING.md 1.2, 4.2). The archetype defaults are
+    # last_sp 1 and sp 0.
+    CHECKER_BASE = {"type": "64", "last_sp": "1"}
+
+    def checker(self, **attrs):
+        return _checker_requirement(
+            {key: [str(value)] for key, value in attrs.items()},
+            self.CHECKER_BASE)
+
+    def test_checker_requires_a_slaying_match_when_sp_is_set(self):
+        self.assertEqual(
+            self.checker(slaying="door_key", sp=1, last_grace=1),
+            (req.requires(req.Item("door_key")), True, ""))
+
+    def test_checker_requires_a_name_match_when_sp_is_zero(self):
+        expected = (req.requires(req.Item("name:brass key")), True, "")
+        self.assertEqual(
+            self.checker(slaying="Brass Key", last_grace=1), expected)
+        self.assertEqual(
+            self.checker(slaying="Brass Key", sp=0, last_grace=1), expected)
+
+    def test_checker_forbids_a_match_when_last_sp_is_zero(self):
+        self.assertEqual(
+            self.checker(slaying="jail_force", sp=1, last_sp=0,
+                         last_grace=1),
+            (req.requires(req.NotItem("jail_force")), True, ""))
+        self.assertEqual(
+            self.checker(slaying="cursed idol", last_sp=0, last_grace=1),
+            (req.requires(req.NotItem("name:cursed idol")), True, ""))
+
+    def test_checker_with_last_heal_consumes_what_it_requires(self):
+        self.assertEqual(
+            self.checker(slaying="force", sp=1, last_grace=1, last_heal=1),
+            (req.requires(req.Consumes("force")), True, "force"))
+        # A forbidding checker never matches what she carries, so it never
+        # takes anything.
+        self.assertEqual(
+            self.checker(slaying="force", sp=1, last_sp=0, last_grace=1,
+                         last_heal=1),
+            (req.requires(req.NotItem("force")), True, ""))
+
+    def test_checker_without_last_grace_only_matters_when_it_consumes(self):
+        self.assertIsNone(self.checker(slaying="door_key", sp=1))
+        self.assertIsNone(self.checker(slaying="door_key", sp=1, last_sp=0))
+        self.assertEqual(
+            self.checker(slaying="force", sp=1, last_heal=1),
+            (req.requires(req.Consumes("force")), False, "force"))
+
+    def test_checker_matching_by_type_or_archetype_fails_closed(self):
+        for attrs in ({"hp": 15}, {"race": "key_brown"}):
+            requirement, blocking, _ = self.checker(
+                slaying="door_key", sp=1, last_grace=1, **attrs)
+            self.assertTrue(blocking)
+            self.assertIn(req.Item("door_key"), requirement.atoms)
+            self.assertFalse(requirement.met(frozenset({"door_key"})))
+            self.assertTrue(requirement.met(True))
+
+    def test_checker_without_a_filter_matches_any_carried_object(self):
+        # Requiring any object at all is open in practice and stays
+        # unmodelled; forbidding every object closes the tile.
+        self.assertIsNone(self.checker(last_grace=1))
+        requirement, blocking, _ = self.checker(last_sp=0, last_grace=1)
+        self.assertTrue(blocking)
+        self.assertFalse(requirement.met(frozenset()))
+
+    def test_requirement_evaluation_against_access_sets(self):
+        need = req.requires(req.Item("a"))
+        forbid = req.requires(req.NotItem("b"))
+        consume = req.requires(req.Consumes("c"))
+        unknown = req.requires(req.Unknown("unparsed"))
+        both = req.requires(req.Item("a"), req.NotItem("b"))
+        for access, expected in (
+                (False, (False, False, False, False, False)),
+                (None, (False, False, False, False, False)),
+                (True, (True, True, True, True, True)),
+                (frozenset(), (False, True, False, False, False)),
+                (frozenset({"a"}), (True, True, False, False, True)),
+                (frozenset({"a", "b", "c"}),
+                 (True, False, True, False, False))):
+            with self.subTest(access=access):
+                self.assertEqual(
+                    tuple(requirement.met(access) for requirement in
+                          (need, forbid, consume, unknown, both)),
+                    expected)
+        self.assertTrue(req.NONE.met(False))
+        # Requiring and consuming the same lock is one Consumes atom.
+        self.assertEqual(
+            req.requires(req.Item("c"), req.Consumes("c")), consume)
+        self.assertEqual(
+            req.requires(req.Consumes("c"), req.Item("c")), consume)
+
+    def test_forbidding_tile_opens_unless_she_carries_the_match(self):
+        node = MapNode("/cell", width=3, height=1,
+                       terrain={(x, 0): 1 for x in range(3)})
+        node.locks[(1, 0)] = req.requires(req.NotItem("jail_force"))
+        self.assertTrue(node.walkable(1, 0, allow_locked=frozenset()))
+        self.assertTrue(node.walkable(
+            1, 0, allow_locked=frozenset({"morgeean_ship_key"})))
+        self.assertFalse(node.walkable(
+            1, 0, allow_locked=frozenset({"jail_force"})))
+        # Unknown inventory keeps every gated tile closed.
+        self.assertFalse(node.walkable(1, 0, allow_locked=False))
+
+    def test_carried_items_walk_opened_containers(self):
+        state = GameState(phase="playing", player_tag=7)
+        state.place_item(Item(1, name="key ring", item_type=c.TYPE_CONTAINER), 7)
+        state.place_item(Item(2, name="Morg'eean's Ship Key"), 1)
+        state.place_item(Item(3, name="pouch", item_type=c.TYPE_CONTAINER), 1)
+        state.place_item(Item(4, name="orange stone giant key"), 3)
+        state.place_item(Item(5, name="sack", item_type=c.TYPE_CONTAINER), 7)
+        state.place_item(Item(6, name="bread"), 7)
+        self.assertEqual(
+            sorted(item.name for item in carried_items(state)),
+            ["Morg'eean's Ship Key", "bread", "orange stone giant key",
+             "sack"])
+        # A state without container bookkeeping falls back to the top level.
+        flat = type("State", (), {"inventory": [Item(8, name="torch")]})()
+        self.assertEqual([item.name for item in carried_items(flat)],
+                         ["torch"])
+
+    def test_key_in_a_key_ring_still_opens_its_lock(self):
+        graph = built_graph()
+        node = graph.nodes["/shattered_islands/world_2_70"]
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        task = NavigateTask(graph, "/shattered_islands/world_5_46")
+        client.state.place_item(
+            Item(1, name="key ring", item_type=c.TYPE_CONTAINER), 7)
+        client.state.place_item(Item(2, name="Morg'eean's Ship Key"), 1)
+        self.assertIn("morgeean_ship_key", task._allow_locked(client))
+        self.assertTrue(node.walkable(
+            2, 8, allow_locked=task._allow_locked(client)))
+
+    def test_content_forbidding_checkers_compile_as_exclusions(self):
+        graph = built_graph()
+        jail = graph.nodes[
+            "/shattered_islands/strakewood_island/greyton/jail/jail"]
+        stench = graph.nodes["/shattered_islands/world_13_62"]
+        forbidding = {
+            (path, point): requirement
+            for path, node in graph.nodes.items()
+            for point, requirement in node.locks.items()
+            if requirement.lock_ids(req.NotItem)}
+        self.assertEqual(
+            {(path, point) for path, point in forbidding},
+            {(jail.path, point) for point in
+             ((5, 3), (5, 9), (5, 15), (9, 3), (9, 9), (9, 15))} |
+            {(stench.path, (x, 22)) for x in (11, 12, 13)})
+        for (path, _), requirement in forbidding.items():
+            self.assertEqual(
+                requirement,
+                req.requires(req.NotItem(
+                    "jail_force" if path == jail.path else
+                    "berri_lur_stench")))
+        # The Berri Lur stench gate opens to anyone not carrying the stench.
+        self.assertTrue(stench.walkable(12, 22, allow_locked=frozenset()))
+        self.assertFalse(stench.walkable(
+            12, 22, allow_locked=frozenset({"berri_lur_stench"})))
+
+    def test_content_last_heal_checkers_compile_as_consumes(self):
+        graph = built_graph()
+        consuming = {
+            (path, point): requirement.lock_ids(req.Consumes)
+            for path, node in graph.nodes.items()
+            for point, requirement in node.locks.items()
+            if requirement.lock_ids(req.Consumes)}
+        prefix = "/shattered_islands/strakewood_island/underground_city/"
+        self.assertEqual(consuming, {
+            (prefix + "underground_city_5_2_-1", (8, 3)):
+                {"underground_city_force_drow"},
+            # A separate non-blocking checker on the gate's tile consumes.
+            (prefix + "underground_city_5_3_-1", (4, 12)):
+                {"underground_city_force1"},
+            ("/shattered_islands/lyondale_archipelago/morliana/hierro/"
+             "hierro_lair", (10, 4)): {"hierro_lair_door"},
+            ("/planes/creation/creation_0801", (11, 18)):
+                {"creation_house_connection_marker"},
+            ("/shattered_islands/world_12_65", (5, 19)):
+                {"berri_lur_stench"},
+        })
 
     def test_graph_compiles_authored_town_npcs_as_peaceful(self):
         graph = built_graph()
@@ -17422,7 +17610,7 @@ class NavigationTests(unittest.TestCase):
     def test_john_bank_gate_requires_access_item(self):
         interior = "/shattered_islands/world_4_83_-1"
         node = self.graph.nodes[interior]
-        self.assertIn((1, 11), node.locked)
+        self.assertIn((1, 11), node.locks)
         self.assertFalse(node.walkable(1, 11))
         self.assertTrue(node.walkable(1, 11, allow_locked=True))
         self.assertFalse(self.graph.local_path(

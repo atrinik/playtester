@@ -445,7 +445,10 @@ When the analyzer gets a spot wrong, the fix belongs in the analyzer.
 ## Route planning
 
 Navigation plans over a world graph compiled from the locked content: tile
-seams, exits, apartments, locked doors and inventory checkers. A map where
+seams, exits, apartments, locked doors and inventory checkers. Checkers
+follow the server: one requires or forbids a matching object, matched by its
+`slaying` or its name, and some use the object up as she passes. The keys she
+carries are read from her inventory, including containers she has opened. A map where
 she recently died on the way somewhere is avoided for a while when another
 route exists. The proposed design for
 alternative routes, unlocks such as keys, quests and NPC voyages, and costs
