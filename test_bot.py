@@ -22952,7 +22952,8 @@ OBSERVATION_ARCH = {
     "monster.arc": "Object kobold\ntype 80\nmonster 1\nend\n",
     "items.arc": ("Object sword\ntype 15\nend\nObject shield\ntype 33\nend\n"
                   "Object axe\ntype 15\nend\nObject chest\ntype 122\nend\n"
-                  "Object book\ntype 8\nname book\nend\n"),
+                  "Object book\ntype 8\nname book\nend\n"
+                  "Object brass_key\ntype 21\nname brass key\nend\n"),
     "materials": "material_real 1\nname black iron\nend\n",
     "messages": ("# books\nMSG\nThe old tale of the drowned king.\n"
                  "He sleeps below the lake.\nENDMSG\n"),
@@ -23244,7 +23245,7 @@ class ObservationTests(unittest.TestCase):
                          ["system:/test/room"])
         drops = client.metrics.registry.render()
         self.assertIn('reason="book-unverified"}', drops)
-        self.assertIn('reason="unauthored-item"}', drops)
+        self.assertIn('reason="examine-unverified"}', drops)
 
     def test_lines_inside_a_timing_window_are_not_the_sources(self):
         client = self.client()
@@ -23307,8 +23308,10 @@ class ObservationTests(unittest.TestCase):
 
     def test_player_titled_items_and_book_lines_are_not_sources(self):
         client = self.client()
-        for tag, name in ((80, "diary of tom: meet at the tower"), (81, "chest [Captain]")):
-            client.state.place_item(Item(tag, item_type=c.TYPE_BOOK, name=name),
+        for tag, kind, name in ((80, c.TYPE_BOOK, "diary of tom: meet at the tower"),
+                                (81, c.TYPE_CONTAINER, "chest [Captain]"),
+                                (82, c.TYPE_BOOK, "warden argoth")):
+            client.state.place_item(Item(tag, item_type=kind, name=name),
                                     client.state.player_tag)
         # A player-edited unsigned book: its shown name is the player's title.
         asyncio.run(client.examine(80))
@@ -23318,6 +23321,11 @@ class ObservationTests(unittest.TestCase):
         # A container a guild titled with a rank.
         asyncio.run(client.examine(81))
         self.say(client, "That is chest [Captain]")
+        self.say(client, " ")
+        # A book a player named after an authored name: no book examine is kept.
+        asyncio.run(client.examine(82))
+        self.say(client, "That is warden argoth")
+        self.say(client, "Something is written in it.")
         self.say(client, " ")
         # Book lines that open like a door's answer, after a bump at the door.
         asyncio.run(client.move(1))
@@ -23338,7 +23346,29 @@ class ObservationTests(unittest.TestCase):
         asyncio.run(client.apply(70))
         self.say(client, "You turn the little lever.")
         self.assertEqual(self.rows(client), [])
-        self.assertIn('reason="unauthored-item"}', client.metrics.registry.render())
+        drops = client.metrics.registry.render()
+        self.assertIn('reason="unauthored-item"}', drops)
+        self.assertIn('reason="book-examine"}', drops)
+
+    def test_door_phrases_need_an_authored_key_and_books_keep_authored_spacing(self):
+        client = self.client()
+        later = [time.time()]
+        client.observations.clock = lambda: later[0]
+        # A key with a player's words in its name is not authored.
+        asyncio.run(client.move(1))
+        self.say(client, "You open the door with the key to Zoey's room.")
+        later[0] += 2
+        asyncio.run(client.move(1))
+        self.say(client, "You open the door with the brass key.")
+        # A book's received spacing could carry a message: the normalized
+        # authored form is kept.
+        raw = book_packet("harbour notice", "The   ferry\nleaves  at\tdawn.  \n")
+        asyncio.run(client._handle_book(Cursor(raw), raw))
+        rows = {row["source_key"]: row["text"] for row in self.rows(client)}
+        self.assertEqual(rows["door:/test/room:5,4"], "You open the door with the brass key.")
+        self.assertEqual(next(text for key, text in rows.items() if key.startswith("book:")),
+                         "The ferry leaves at dawn.")
+        self.assertEqual(len(rows), 2)
 
     def test_examines_keep_only_their_own_answer(self):
         client = self.client()

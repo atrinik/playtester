@@ -133,7 +133,8 @@ TRAILING_PARTS = re.compile(r"(?:\s*\([^()]*\)|\s+[+-]\d+|\s+\*)+$")
 # observations_dropped_total reasons.
 DROP_REASONS = ("chat", "player-link", "who-list", "player-name", "signed-book",
                 "unmatched-book", "book-unverified", "renamed-item",
-                "examine-interrupted", "unauthored-item")
+                "examine-interrupted", "unauthored-item", "examine-unverified",
+                "book-examine")
 
 
 def normalize(text: str) -> str:
@@ -492,6 +493,7 @@ class _Examine:
     story_next: bool = False
     # A line made the whole answer unsafe to keep.
     rejected: str = ""
+    item_type: int = 0
 
 
 class ObservationRecorder:
@@ -715,7 +717,8 @@ class ObservationRecorder:
         self._consume(action)
         m = state.map
         self._examine = _Examine(now, now, action.item_name, m.path,
-                                 m.world_x, m.world_y, [stripped])
+                                 m.world_x, m.world_y, [stripped],
+                                 item_type=action.item_type)
         if "(signed; permanently finalized)" in stripped:
             self._examine.rejected = "signed-book"
         return True, None
@@ -730,9 +733,16 @@ class ObservationRecorder:
         # The shown name must be an authored one: a player can title a
         # book or a container, and that text is never kept. The row names
         # the item by its authored name, not by the line she received.
+        # A player can name a book anything, an authored name included
+        # (book_edit.c): books are kept from their packets, never examines.
+        if group.item_type == c.TYPE_BOOK:
+            self.dropped("book-examine")
+            return None
         content = self.content()
-        name = (authored_item_name(content, group.lines[0][len("That is "):])
-                if content is not None else None)
+        if content is None:
+            self.dropped("examine-unverified")
+            return None
+        name = authored_item_name(content, group.lines[0][len("That is "):])
         if not name or "corpse" in name:
             self.dropped("unauthored-item")
             return None
@@ -791,7 +801,10 @@ class ObservationRecorder:
                 source = None
                 if action.kind == "move":
                     opened = DOOR_OPENED.match(stripped) or DOOR_OPENED_FOR_YOU.match(stripped)
-                    if opened:
+                    # The key's name, when the phrase gives one, must be
+                    # authored too (key.c names it by its base name).
+                    key = opened.groupdict().get("key") if opened else None
+                    if opened and (key is None or authored_item_name(content, key)):
                         tx, ty = action.target
                         source = self._source_named(
                             content, m.path, {(tx + dx, ty + dy) for dx in (-1, 0, 1)
@@ -875,7 +888,9 @@ class ObservationRecorder:
         # The received title is never kept: a player can retitle an unsigned
         # copy of an authored book. The row carries the authored title.
         title = content.book_title(digest)
-        text = self._clean(page.body.strip("\n"), state)
+        # The normalized form that matched, not the received body: its
+        # spacing is the sender's, a side channel.
+        text = self._clean(normalize(page.body), state)
         if text is None:
             return out
         m = state.map

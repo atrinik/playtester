@@ -1475,16 +1475,23 @@ server:
     that name (or a sign) under her apply. Each consumes the one bump or
     ground apply of its kind in the window; with two in the window
     nothing is kept. Lines ending "and start reading." or "and find it
-    empty." (`book.c`, whose book name a player sets) are never a door's.
+    empty." (`book.c`, whose book name a player sets) are never a door's,
+    and the key named in "You open the %s with the %s." must be an
+    authored name too.
   - Books are kept only when the body's hash is authored text, under the
     authored title from the index (the name of the map or archetype book
     carrying that message; empty for the book message file's texts),
     never the received title, which a player can set on an unsigned copy.
+    The stored text is the normalized form that matched, so the received
+    spacing (a possible side channel) is not kept.
   - An examine is kept only when the shown name, less count, item race,
     material, "+N" and parenthesised states, is an authored object or
     archetype name (or plural); the row and its first line use that
     authored name. A player-titled book or a guild-ranked container is
-    dropped (`unauthored-item`).
+    dropped (`unauthored-item`). Examines of books are never kept
+    (`book-examine`): a player can name a book anything, an authored name
+    included (`book_edit.c`), and books are captured from their packets.
+    Without the index, examines are dropped as `examine-unverified`.
   - **Dialogue pages are not kept in F1.** NPC scripts build pages from
     player data (post-office senders, auction sellers, guild ranks,
     jailed players), and no word-level check separates it from authored

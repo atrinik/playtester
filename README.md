@@ -244,7 +244,7 @@ Counters:
 | `tasks_finished_total` | `task`, `status` | top-level tasks that completed, failed or were stopped from the dashboard (stopping counts as failed); a task replaced by another is not counted |
 | `state_seconds_total` | `state` | seconds `fighting`, `resting`, `travelling`, `shopping` (shops, temple, NPC dialogue), `busy`, `idle` or `disconnected` (not playing) |
 | `observations_total` | `source` | [observations](#observation-ledger) stored, by source kind; a repeat of a stored reading counts again |
-| `observations_dropped_total` | `reason` | readings the ingestion filter refused: `chat`, `player-link`, `who-list`, `player-name`, `signed-book`, `unmatched-book`, `book-unverified`, `renamed-item`, `examine-interrupted`, `unauthored-item` |
+| `observations_dropped_total` | `reason` | readings the ingestion filter refused: `chat`, `player-link`, `who-list`, `player-name`, `signed-book`, `unmatched-book`, `book-unverified`, `renamed-item`, `examine-interrupted`, `unauthored-item`, `examine-unverified`, `book-examine` |
 
 The time in each state follows the latest recorded action that marks one. For
 example, a target or a kite step means fighting, and a step or route decision
@@ -261,8 +261,8 @@ runtime state database (`observations.py`, `memory.py`; the design is
 
 - **Only her own observations.** Player chat channels, lines carrying a
   player-name link, `/who` roster lines, books a player signed, unsigned
-  books whose text matches no authored text, renamed items and any line or
-  page naming another character she has seen (chat senders, `/who`, players
+  books whose text matches no authored text, renamed items and any line
+  naming another character she has seen (chat senders, `/who`, players
   in view) are never stored. Her own name becomes `{activator.name}`, as in
   authored text. Other players' names are held only in memory, to
   filter with, so after a restart only players seen since then are known.
@@ -275,7 +275,9 @@ runtime state database (`observations.py`, `memory.py`; the design is
   written on it.") is kept only when an authored door, lever or sign of
   that name stands where her one bump or apply in the window reached.
   Books are kept when their text is authored, under the authored title,
-  never the one received. An examine is kept only when the item's shown
+  never the one received, and as the normalized authored form, never the
+  received spacing. Examines of books are not kept (a player can name a
+  book anything); an examine is kept only when the item's shown
   name is an authored name and every line is one of the forms the server's
   examine sends; one soulbound to someone is dropped. Dialogue pages are
   not kept (NPC scripts build them from player data; see the design's
