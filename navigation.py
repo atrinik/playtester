@@ -4374,7 +4374,11 @@ def analyzer_farm_choice(
     every circuit behind the map, not only the one she was heading to; and
     a spot rated hazardous for her current kit (kit_hazardous_spot) is
     skipped until her survivability improves, unless every usable spot is
-    hazardous; then the least dangerous of them is farmed. Route-death
+    hazardous; then the least dangerous of them is farmed (the safer
+    approach on a tie). Within each objective's ranking, usable spots with
+    a known, safe approach from her savebed (farm_analyzer.risky_approach)
+    come first in rank order, then the rest from the safest down (the
+    analyzer's safety_score, else farm_analyzer.approach_safety). Route-death
     spots are never that fallback, nor any depletion fallback below. While
     a route death is still being judged (route_death_blocked_maps returns
     None), nothing is usable yet and None is returned. Without ``search``
@@ -4410,20 +4414,43 @@ def analyzer_farm_choice(
         client, graph, search=search if search_verdict is None else search_verdict)
     if blocked is None:
         return None
-    for objective in dict.fromkeys(
-            (effective_farm_objective(client.state), chosen)):
-        for spot in analyzer.ranking(objective):
+    plan = farm_analyzer_plan
+    order: dict[int, tuple[int, int]] = {}
+    for position, objective in enumerate(dict.fromkeys(
+            (effective_farm_objective(client.state), chosen))):
+        for rank, spot in enumerate(analyzer.ranking(objective)):
             legs = analyzer_spot_legs(spot, graph)
             if (legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
                              for path, _ in legs) and
                     not any(path in blocked for path, _ in legs)):
+                entry = (objective, legs, spot)
+                order[id(entry)] = (position, rank)
                 (hazardous if kit_hazardous_spot(client, spot, legs)
-                 else usable).append((objective, legs, spot))
+                 else usable).append(entry)
     if not usable and hazardous:
         # Every usable spot is hazardous for her kit: farm the least
-        # dangerous one rather than idle until the hazard ages out.
-        usable = [min(hazardous, key=lambda entry: float(
-            entry[2].get("danger", 0.0) or 0.0))]
+        # dangerous one rather than idle until the hazard ages out, the
+        # one with the safer approach on a tie.
+        usable = [min(hazardous, key=lambda entry: (
+            float(entry[2].get("danger", 0.0) or 0.0),
+            -plan.approach_safety(entry[2]), order[id(entry)]))]
+
+    def preference(entry) -> tuple:
+        # Within each objective's ranking (the effective one first, so the
+        # depletion safety rule holds): spots with a known, safe approach
+        # from her savebed in rank order, then the risky ones from the
+        # safest down by the analyzer's safety_score (the lower of spot and
+        # approach safety), or by approach safety (unreachable counts as
+        # UNREACHABLE_APPROACH_SAFETY) without one, in rank order on ties.
+        position, rank = order[id(entry)]
+        spot = entry[2]
+        risky = plan.risky_approach(spot)
+        overall = spot.get("safety_score")
+        safety = (float(overall) if isinstance(overall, (int, float)) and
+                  not isinstance(overall, bool) else plan.approach_safety(spot))
+        return (position, risky, -safety if risky else 0.0, rank)
+
+    usable.sort(key=preference)
     if not depleted_for_temple(client.state):
         return usable[0] if usable else None
     budget = [1 if search else 0]

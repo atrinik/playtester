@@ -237,7 +237,7 @@ class BotMetrics:
                                "depletion force appeared.")
         self.predicted_xp = gauge(
             "farm_predicted_xp_per_hour",
-            "The farming analyzer's estimated XP per hour at the spot it ranks first.",
+            "The farming analyzer's estimated XP per hour at the spot autoplay farms.",
             "objective")
         self.task_info = gauge("task_info", "1 for the running top-level task type.", "task")
         self.phase_info = gauge("phase_info", "1 for the current autoplay phase.", "phase")

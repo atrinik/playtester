@@ -41,8 +41,8 @@ And, in a second round of answers:
   still apply to every other trip (4.5, 4.7).
 - **Route cost stays in the playtester.** Learned route cost is a
   playtester-side filter only. The `atrinik/tools` analyzer stays
-  content-only; its issue #34 adds content approach danger to the analyzer
-  (4.9).
+  content-only; its issue #34 added content approach danger to the analyzer,
+  locked since v3.10.0 (4.9).
 - **Deaths to other players are excluded** from route danger (4.4).
 - **The three `savebed` voyages are excluded from routing permanently.**
   Quest tasks may still take them on purpose (1.4, 4.2).
@@ -991,19 +991,20 @@ score(spot) = FARM_VALUE_HORIZON_SECONDS × r_spot / r_top − D(spot)
   while farming are not route events; they feed the spot's adaptation
   records and the analyzer as today. Her savebed map is excluded, since
   leaving the map she stands on is free.
-- **Content danger, now and after tools #34.** The analyzer is to own
-  content danger (owner decision), and tools #34 adds approach danger to it.
-  #34 is in review; it now rates approach danger per component, and scores
-  the Underground City circuits at 0.85 at 244 HP. Until the locked analyzer
-  includes it, content transit danger would be in neither the analyzer nor
-  the score. So, until then, the score also subtracts navigation's content
-  priors for the route's maps (4.4). The caps and the care threshold below
-  use learned `D` only, so a content prior can never pause or slow farming
-  without a death: that would be a content wall. Once the analyzer lock
-  moves to a release with #34's approach danger, detected by the
-  `approach_status` field being present in its output (with
-  `approach_safety_score`), the priors leave the score so content danger is
-  not counted twice.
+- **Content danger and tools #34.** The analyzer owns content danger (owner
+  decision). Tools #34 added approach danger to it, and the analyzer lock
+  moved to that release, v3.10.0, in
+  https://github.com/atrinik/playtester/pull/100: each result's
+  `safety_score` is the lower of the spot's safety and its approach safety
+  from her savebed, and autoplay already prefers spots with a known, safe
+  approach. At Sera's recorded profile (2.25 s per swing) the locked release
+  charges the Underground City entrance about 735 expected damage, an
+  approach safety of 0.27 at 197 HP and 0.33 at 244 HP. (The 0.85 at 244 HP
+  quoted during #34's review was for a 1.0 s weapon.) So the score here does
+  not subtract navigation's content priors for the route's maps: that would
+  count content danger twice. The caps and the care threshold below use
+  learned `D` only, so content danger can never pause or slow farming
+  without a death: that would be a content wall.
 - **Cap.** A spot that is not behind a chokepoint is not farmed while
   `D ≥ FARM_MAX_TRANSIT_DANGER_SECONDS` (3000 s), even when it is the only
   one.
@@ -1158,9 +1159,9 @@ category as the quarantines and `kit_hazard` filters that
   version).
 - The analyzer's ranking is unchanged. Learned route cost stays on the
   playtester side and is never fed to the analyzer (owner decision). The
-  analyzer stays content-only; `atrinik/tools` issue #34 adds content
-  approach danger to it. So `D(spot)` keeps navigation's content priors
-  only until a locked analyzer release has that approach danger (4.5).
+  analyzer stays content-only; `atrinik/tools` issue #34 added content
+  approach danger to it, and the lock carries it since v3.10.0. So `D(spot)`
+  uses no content priors (4.5).
 - Savebed selection ranks beds by route cost, not tiles. The ship then counts
   for a Brynknot bed serving Asteria spots.
 - `_observe_farm_death` already blames the destination for a transit death
@@ -1223,8 +1224,8 @@ exactly one of them decides farm selection, so no death counts twice:
     do not, savebed-map deaths add nothing, chokepoint danger skips the
     per-spot cap but pauses all spots behind it at 4500 s, a farm route at
     `D ≥ 1800` waits at most 600 s for the care conditions, then drops out
-    of the round, and content priors affect only the score, never the caps
-    or care, and only while the analyzer output lacks `approach_status`;
+    of the round, and content priors never enter the score, the caps or
+    care (the locked analyzer reports `approach_status`);
   - deaths to other players record nothing.
 - **Content regression tests** against the locked bundle, like
   `test_lost_memories_uses_quest_sam_not_departure_sam`:
@@ -1407,8 +1408,8 @@ tactics, a feedback queue). It will feed unlock knowledge into P2 and P4.
   (horizon and both caps) are starting points. The replay and the shadow
   soak calibrate them.
 - 1.9 and 4.9 follow #94 as merged (`c97661b`).
-- `atrinik/tools` #34 was not read for this revision; its status comes from
-  the coordinator. `D(spot)` keeps navigation's content priors until a
-  locked analyzer release carries #34's approach danger.
+- `atrinik/tools` #34 shipped in v3.10.0, which the lock carries since
+  https://github.com/atrinik/playtester/pull/100, so `D(spot)` uses no
+  content priors.
 - Whether `underground_city_0_0` is a chokepoint by #94's test was reasoned
   from the static graph, not computed with #94's code.
