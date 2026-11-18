@@ -159,7 +159,11 @@ diagnostics, but ordinary runs use the locked cached runtime by default.
 Use `atrinik-playtester --help` for transport, registration, character,
 dashboard, navigation, quest, farming, banking, selling, and storage options.
 The dashboard binds to loopback and rejects cross-origin control requests; use
-an authenticated local tunnel instead of exposing it directly.
+an authenticated local tunnel instead of exposing it directly. Every response
+carries a Content-Security-Policy (`default-src 'self'; script-src 'self';
+object-src 'none'; frame-ancestors 'none'; base-uri 'none'`): the page loads
+nothing from elsewhere, runs no inline script, and sets element styles
+through CSSOM rather than inline `style` attributes, which the policy refuses.
 
 The dashboard's Stop outlives a restart. It is stored in the runtime state
 database for the configured `--character`, and the `autoplay` command then
@@ -239,12 +243,50 @@ Counters:
 | `tasks_started_total` | `task` | top-level tasks started |
 | `tasks_finished_total` | `task`, `status` | top-level tasks that completed, failed or were stopped from the dashboard (stopping counts as failed); a task replaced by another is not counted |
 | `state_seconds_total` | `state` | seconds `fighting`, `resting`, `travelling`, `shopping` (shops, temple, NPC dialogue), `busy`, `idle` or `disconnected` (not playing) |
+| `observations_total` | `source` | [observations](#observation-ledger) stored, by source kind; a repeat of a stored reading counts again |
+| `observations_dropped_total` | `reason` | readings the ingestion filter refused: `chat`, `player-link`, `who-list`, `player-name`, `signed-book`, `unmatched-book`, `book-unverified`, `renamed-item` |
 
 The time in each state follows the latest recorded action that marks one. For
 example, a target or a kite step means fighting, and a step or route decision
 means travelling. Actions that mark none, such as applying an item, keep the
 current state. A task that has not yet done anything that marks a state is
 `busy`; with no task running, she is `idle`.
+
+## Observation ledger
+
+She keeps what she reads or is told in the `observations` table of the
+runtime state database (`observations.py`, `memory.py`; the design is
+[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md) 4.2 and
+4.3.1, phase F1). Recording changes nothing she does.
+
+- **Only her own observations.** Player chat channels, lines carrying a
+  player-name link, `/who` roster lines, books a player signed, unsigned
+  books whose text matches no authored text, renamed items and any line or
+  page naming another character she has seen (chat senders, `/who`, players
+  in view) are never stored. Her own name becomes `{activator.name}`, as in
+  authored dialogue. Other players' names are held only in memory, to
+  filter with.
+- **Attributed.** A door's, sign's or magic mouth's text is tied to its
+  object by her own bump, apply or step in the previous 1.5 seconds
+  (`timing`), or by an authored object on or next to her square whose
+  message equals the text (`content-match`; a broadcast she did not cause,
+  with another player in view, is not hers). Dialogue pages, authored books
+  and her examines carry their own identity (`exact`). An unattributed line
+  is stored, as `system:<map>`, only when it is a fact line (for now "Something
+  blocks your spellcasting."); others are not kept. The same text from the same
+  source raises the row's `seen` count.
+- **The authored-text index** is scanned from the locked content (maps,
+  archetypes, artifacts and the book message file, about a second) when the
+  `web` or `autoplay` command starts. Without it, books are not kept and
+  doors and magic mouths are attributed by timing alone.
+- **Bounded.** At most 50,000 rows a character, 4,000 characters of text a
+  row; when full, the least recently seen rows that no later table refers to
+  are evicted first. Writes wait at most 0.25 seconds for a locked database
+  and otherwise drop the reading, never the game line.
+
+The dashboard's read-only **Knowledge** tab lists recent readings by source
+(`GET /api/knowledge?kind=SOURCE&limit=N`, newest first, up to 1000, under
+the same loopback and `Host` rules as `/api/state`).
 
 ## Operator assist
 

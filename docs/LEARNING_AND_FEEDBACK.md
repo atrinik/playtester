@@ -1,7 +1,9 @@
 # Learning from the world and playtester feedback
 
-Status: design proposal, not implemented. Nothing here changes behaviour
-until the phased pull requests at the end land.
+Status: design proposal. Phase F1 (the observation ledger) is implemented;
+"F1 as built" in section 6 records where it differs from this text. Nothing
+else here is implemented, and nothing here changes behaviour until the
+phased pull requests at the end land.
 
 The owner wants Sera to learn from what she reads and does in the world, and
 to turn what confuses her into feedback that improves the game. She chose
@@ -1444,6 +1446,40 @@ task trace, messages) renders unchanged under the CSP; her
 name is replaced in dialogue; book packets parse into title and body; an
 unattributed fact line deduplicates; a full table evicts the oldest
 unreferenced rows; no behaviour change.
+
+*F1 as built* (`observations.py`, `memory.py`, the Knowledge tab). Where
+the code and the server differ from the text above, the code follows the
+server:
+
+- Magic mouths use the key `mouth:/map:x,y` (the prefix the `locks` table
+  in 4.2 already uses), and the row's `x`, `y` are where she stood; the key
+  carries the source's square.
+- Players in view are told from creatures by the MAP2 name colour: the
+  server colours players white, green (her party) or red (PvP), and
+  creatures by level (`request.c`), so a white name, or a green or red name
+  that no authored object carries, is a player. MAP2 has no player flag.
+- The authored-text index holds the messages of maps, archetypes, artifacts
+  and the book message file (`arch/messages`). The server's other generated
+  books (bestiary, artifact and spell path texts, `readable.c`) are not
+  indexed, so they are dropped as unmatched, like player-edited books.
+  The index is scanned once when `web` or `autoplay` starts (about a
+  second); without it books are dropped (`book-unverified`) and a navy line
+  after a bump becomes the door's if she stayed and a magic mouth's if she
+  stepped onto the square.
+- Until F2's parsers exist, the only unattributed fact lines are the
+  no-magic refusals "Something blocks your spellcasting." and "Something
+  blocks your spell." The variant naming her item ("...the magic of your
+  %s") is not kept, because a player-renamed item could carry its name.
+- An examine is the consecutive white game lines from "That is ..." within
+  0.25 s of each other. An examine of a renamed item or a signed book is
+  dropped whole, because its first line already carries the custom name.
+- Book packets answer only her own apply, so they need no timing window.
+  The quest journal is not stored (`quests.parse_quest_book` reads it).
+- Dialogue pages store the interface text, not its links.
+- "Oldest" for eviction means least recently seen (`last_at`); rows cited
+  by `facts.observation_id` or `locks.hint_observation_id` are kept once
+  those tables exist.
+- The CSP adds `base-uri 'none'` to the policy in 4.10.5.
 
 **F2. `feat(knowledge)`: deterministic fact parsers and persistent tile
 facts.** The `facts` table and the parsers in 4.3.2. Tile facts persist
