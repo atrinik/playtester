@@ -28,6 +28,8 @@ except ModuleNotFoundError:
                                      load_archetypes, map_files, parse_blocks)
 
 from . import constants as c
+from . import requirements as req
+from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
 
 from .alerts import HUNGRY_FOOD
@@ -35,7 +37,7 @@ from .client import AtrinikClient, format_money, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import farm_analyzer as farm_analyzer_plan
 from . import self_improvement
-from .model import STARTER_APARTMENT
+from .model import STARTER_APARTMENT, Item
 from .pathfinding import graph_search, grid_reachable, grid_search
 from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
@@ -245,9 +247,9 @@ class MapNode:
     edges: list[MapEdge] = field(default_factory=list)
     terrain: dict[tuple[int, int], int] = field(default_factory=dict)
     blocked: set[tuple[int, int]] = field(default_factory=set)
-    locked: set[tuple[int, int]] = field(default_factory=set)
-    lock_requirements: dict[tuple[int, int], str] = field(default_factory=dict)
-    lock_exclusions: dict[tuple[int, int], str] = field(default_factory=dict)
+    # Gated tiles: locked doors and blocking inventory checkers, each with
+    # what passing requires (requirements.py).
+    locks: dict[tuple[int, int], Requirement] = field(default_factory=dict)
     doors: set[tuple[int, int]] = field(default_factory=set)
     occupied: set[tuple[int, int]] = field(default_factory=set)
     automatic_exits: set[tuple[int, int]] = field(default_factory=set)
@@ -255,20 +257,9 @@ class MapNode:
     caster_identities: set[str] = field(default_factory=set)
 
     def lock_allowed(self, point: tuple[int, int], access=False) -> bool:
-        """Check one locked tile against an exact authored requirement."""
-        if point not in self.locked:
-            return True
-        if access is True:
-            return True
-        if not access:
-            return False
-        requirement = self.lock_requirements.get(point, "")
-        if requirement and requirement not in access:
-            return False
-        exclusion = self.lock_exclusions.get(point, "")
-        if exclusion and exclusion in access:
-            return False
-        return bool(requirement or exclusion)
+        """Check one gated tile against an access set (requirements.py)."""
+        requirement = self.locks.get(point)
+        return requirement is None or requirement.met(access)
 
     def walkable(self, x: int, y: int, *, allow_locked=False) -> bool:
         """Return static player walkability compiled from authored content."""
@@ -295,6 +286,78 @@ def _coord(node: dict, parent: dict | None, name: str) -> int:
     if value is None and parent is not None:
         value = one(parent["attrs"], name)
     return int(value or 0)
+
+
+def carried_items(state) -> list:
+    """Every object she carries, walking containers like ``check_inv()``.
+
+    A container whose contents the client has seen stands for those
+    contents, as on the server; one never opened stands for itself, because
+    what it holds is unknown.
+    """
+    inventories = getattr(state, "inventories", None)
+    player_tag = getattr(state, "player_tag", None)
+    if not isinstance(inventories, dict) or player_tag not in inventories:
+        return list(getattr(state, "inventory", ()))
+    items = getattr(state, "items", {})
+    carried, pending, seen = [], list(inventories[player_tag]), set()
+    while pending:
+        tag = pending.pop()
+        if tag in seen or tag not in items:
+            continue
+        seen.add(tag)
+        contents = inventories.get(tag)
+        if contents:
+            pending.extend(contents)
+        else:
+            carried.append(items[tag])
+    return carried
+
+
+def _checker_requirement(attrs: dict, base: dict
+                         ) -> tuple[Requirement, bool, str] | None:
+    """Compile one inventory checker (type 64) as the server evaluates it.
+
+    The server's ``check_inv()`` walks the player's inventory, descending
+    into containers, and matches an object by ``slaying`` when the checker's
+    ``sp`` is non-zero and by ``name`` otherwise; ``hp`` narrows by object
+    type and ``race`` by archetype. ``blocked_tile()`` applies a checker
+    only when ``last_grace`` is set: then a set ``last_sp`` requires a match
+    and a zero one forbids it. Stepping on a checker with ``last_sp`` and
+    ``last_heal`` set uses up the matched object, blocking or not.
+
+    Returns the tile's requirement, whether the checker blocks, and the lock
+    id it consumes (empty if none), or None if it has no routing effect.
+    """
+    def number(key: str) -> int:
+        try:
+            return int(one(attrs, key, base.get(key)) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    slaying = str(one(attrs, "slaying", base.get("slaying")) or "")
+    required, blocking = number("last_sp") != 0, number("last_grace") != 0
+    consumes = required and number("last_heal") != 0
+    if not blocking and not consumes:
+        return None
+    lock_id = ""
+    if slaying:
+        lock_id = slaying if number("sp") != 0 else name_lock_id(slaying)
+    atoms = []
+    if number("hp") or one(attrs, "race", base.get("race")):
+        # Matching by object type or archetype is not visible to the client.
+        atoms.append(req.Unknown("checker matches by object type or archetype"))
+    if lock_id:
+        atoms.append(req.Consumes(lock_id) if consumes else
+                     req.Item(lock_id) if required else
+                     req.NotItem(lock_id))
+    elif not atoms:
+        # No filter at all matches the first object she carries. Requiring
+        # one is open in practice; forbidding one is closed.
+        if required:
+            return None
+        atoms.append(req.Unknown("checker forbids carrying anything"))
+    return req.requires(*atoms), blocking, lock_id if consumes else ""
 
 
 def _multipart_footprints(
@@ -508,6 +571,7 @@ class WorldGraph:
         auto_exits: dict[str, list[tuple[int, int, int, str, bool]]] = defaultdict(list)
         apartment_entrances: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
         apartment_returns: dict[str, list[tuple[str, int, int, str, bool]]] = defaultdict(list)
+        consumed_locks: dict[tuple[str, int, int], set[str]] = defaultdict(set)
         for source, (path, parsed) in parsed_maps.items():
             node = self.nodes[source]
             header_attrs = parsed["header"]["attrs"]
@@ -708,29 +772,33 @@ class WorldGraph:
                         (("locked" in obj["arch"].casefold() and
                           door_lock_id) or
                          one(attrs, "locked", base.get("locked")) == "1")):
-                    node.locked.add((x, y))
-                    if door_lock_id:
-                        node.lock_requirements[(x, y)] = door_lock_id
-                if (obj_type == "64" and lock_id and
-                        one(attrs, "last_grace",
-                            base.get("last_grace")) == "1"):
-                    # Blocking inventory checkers are authoritative access
-                    # gates even when no locked door occupies their tile.
-                    node.locked.add((x, y))
-                    if one(attrs, "sp", base.get("sp")) == "0":
-                        node.lock_exclusions[(x, y)] = lock_id
-                    else:
-                        node.lock_requirements[(x, y)] = lock_id
+                    node.locks[(x, y)] = node.locks.get(
+                        (x, y), req.NONE) & req.requires(
+                            req.Item(door_lock_id) if door_lock_id else
+                            req.Unknown("locked door without a key id"))
+                if obj_type == "64":
+                    checker = _checker_requirement(attrs, base)
+                    if checker is not None:
+                        requirement, blocking, consumed = checker
+                        if blocking:
+                            # Blocking inventory checkers are authoritative
+                            # access gates even when no locked door occupies
+                            # their tile.
+                            node.locks[(x, y)] = node.locks.get(
+                                (x, y), req.NONE) & requirement
+                        if consumed:
+                            consumed_locks[(source, x, y)].add(consumed)
+                        for atom in requirement.atoms:
+                            lock = getattr(atom, "lock_id", "")
+                            if lock.startswith(NAME_LOCK_PREFIX):
+                                # A name match needs no key catalogue: the
+                                # carried object's own name is the id.
+                                self.access_item_names[lock].add(
+                                    lock[len(NAME_LOCK_PREFIX):])
                 if (lock_id and name and
                         ("key" in obj["arch"].casefold() or
                          "key" in name.casefold())):
                     self.access_item_names[lock_id].add(name.casefold())
-                    if lock_id == "set_individual_value":
-                        # These keys receive their effective slaying value from
-                        # the server-side pickup script; their unique authored
-                        # name is the checker requirement visible in the maps.
-                        self.access_item_names[name.casefold()].add(
-                            name.casefold())
                 if name:
                     point = Waypoint(source, x, y, name, obj["arch"])
                     self.landmarks.append(point)
@@ -882,6 +950,19 @@ class WorldGraph:
                                           base.get("sub_type")) or 0)
                         auto_exits[source].append(
                             (x, y, subtype, name or obj["arch"], automatic))
+
+        # A consuming checker (last_heal) need not be the blocking one: in
+        # underground_city_5_3_-1 a separate, non-blocking checker on the
+        # gate's tile takes the force. Either way, passing that tile uses up
+        # what it requires.
+        for (source, x, y), lock_ids in consumed_locks.items():
+            node = self.nodes[source]
+            requirement = node.locks.get((x, y))
+            if requirement is None:
+                continue
+            node.locks[(x, y)] = requirement & req.requires(*(
+                req.Consumes(lock_id) for lock_id in sorted(lock_ids)
+                if lock_id in requirement.lock_ids(req.Item)))
 
         # Apartment-out scripts return to the exact authored teleporter
         # recorded on entry. Compile all entrances for the region because the
@@ -1626,7 +1707,6 @@ class NavigateTask(BotTask):
     # Learned stall blockers are guesses. Once they leave no route at all and
     # the character has not moved for this long, they are the trap.
     LEARNED_BLOCK_RESET_SECONDS = 5.0
-    ACCESS_ITEM = re.compile(r"\b(key|talisman|amulet|pass|token)\b", re.I)
     EARLY_ROUTE_HAZARD = re.compile(
         r"(?:rock thrower|battle thrower|skel(?:eton)? mage|"
         r"skeleton (?:novice )?archer|lost soul)", re.I)
@@ -1735,12 +1815,16 @@ class NavigateTask(BotTask):
     def _allow_locked(self, client: AtrinikClient):
         if self._allow_locked_override is not None:
             return self._allow_locked_override
-        inventory = getattr(client.state, "inventory", ())
-        names = {item.name.casefold().strip() for item in inventory}
+        raw_names = {item.name for item in carried_items(client.state)}
+        names = {name.casefold().strip() for name in raw_names}
+        # A name lock mirrors the server's exact, case-sensitive comparison
+        # of the object's name; slaying locks go through the key catalogue.
         return frozenset(
             requirement for requirement, aliases
             in getattr(self.graph, "access_item_names", {}).items()
-            if names & aliases)
+            if (requirement[len(NAME_LOCK_PREFIX):] in raw_names
+                if requirement.startswith(NAME_LOCK_PREFIX)
+                else names & aliases))
 
     def _goal_points(self) -> list[tuple[int, int]]:
         if self.destination_xy is None:
@@ -4169,7 +4253,8 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
     learned = {map_path: until for map_path, until in
                (getattr(client.state, "route_hazards", None) or {}).items()
                if until > now}
-    inventory = list(getattr(client.state, "inventory", ()))
+    # Containers walked here: the proxy below has no container contents.
+    inventory = carried_items(client.state)
     proxy = types.SimpleNamespace(state=types.SimpleNamespace(
         stats={"level": level}, route_hazards=learned, inventory=inventory,
         map=types.SimpleNamespace(path=path, world_x=0, world_y=0)))
