@@ -26,8 +26,11 @@ NAME_LOCK_PREFIX = "name:"
 
 
 def name_lock_id(name: str) -> str:
-    """The lock id of a checker that matches an object's name."""
-    return NAME_LOCK_PREFIX + name.casefold().strip()
+    """The lock id of a checker that matches an object's name.
+
+    The server compares names exactly, case included, so this keeps them.
+    """
+    return NAME_LOCK_PREFIX + name
 
 
 @dataclass(slots=True, frozen=True)
@@ -86,6 +89,8 @@ class Requirement:
                 if atom.lock_id not in access:
                     return False
             elif isinstance(atom, NotItem):
+                # Forces the client cannot see (jail_force, berri_lur_stench)
+                # always read as not carried: see docs/ROUTING.md, P1.
                 if atom.lock_id in access:
                     return False
             else:

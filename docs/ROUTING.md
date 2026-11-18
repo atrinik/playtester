@@ -1276,7 +1276,18 @@ server source:
 - Two blocking checkers leave `sp` at its archetype default 0 and so match
   by name: the orange and blue stone giant keys (`world_5_57_-2`,
   `old_outpost_a_0203`). Their lock ids are now `name:<name>`, which
-  replaces the `set_individual_value` alias.
+  replaces the `set_individual_value` alias. Like the server, the match is
+  exact and case-sensitive, but it compares the name the client is sent: an
+  item renamed with a custom name cannot be told apart client-side and may
+  still mismatch.
+- Forbid atoms judge forces the client cannot see as not carried. Both
+  forbidding lock ids in the content, `jail_force` and `berri_lur_stench`,
+  are such forces, so their tiles read as open. That is intended: the jail
+  tiles are barred anyway, and nothing in the content grants the stench.
+  If content ever grants such a force, the server blocks the tile without
+  the planner knowing, and the learned-blocker logic has to catch it. A
+  later phase can track granted forces, as P10 does for marker-granted
+  ones.
 - In `underground_city_5_3_-1` (4,12) the consuming checker is a second,
   non-blocking one on the gate's tile. Consumption happens on stepping on
   any checker with `last_sp` and `last_heal`, blocking or not, so it is

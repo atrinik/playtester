@@ -16207,7 +16207,11 @@ class NavigationTests(unittest.TestCase):
         task = NavigateTask(graph, "/shattered_islands/world_5_57_-2")
         self.assertFalse(node.walkable(
             14, 14, allow_locked=task._allow_locked(client)))
-        client.state.place_item(Item(1, name="orange stone giant key"), 7)
+        # The server compares names exactly, case included.
+        client.state.place_item(Item(1, name="Orange Stone Giant Key"), 7)
+        self.assertFalse(node.walkable(
+            14, 14, allow_locked=task._allow_locked(client)))
+        client.state.place_item(Item(2, name="orange stone giant key"), 7)
         self.assertTrue(node.walkable(
             14, 14, allow_locked=task._allow_locked(client)))
 
@@ -16227,7 +16231,7 @@ class NavigationTests(unittest.TestCase):
             (req.requires(req.Item("door_key")), True, ""))
 
     def test_checker_requires_a_name_match_when_sp_is_zero(self):
-        expected = (req.requires(req.Item("name:brass key")), True, "")
+        expected = (req.requires(req.Item("name:Brass Key")), True, "")
         self.assertEqual(
             self.checker(slaying="Brass Key", last_grace=1), expected)
         self.assertEqual(

@@ -28,9 +28,8 @@ except ModuleNotFoundError:
                                      load_archetypes, map_files, parse_blocks)
 
 from . import constants as c
-from .requirements import (NAME_LOCK_PREFIX, NONE as NO_REQUIREMENT,
-                           Consumes, Item, NotItem, Requirement, Unknown,
-                           name_lock_id, requires)
+from . import requirements as req
+from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
 
 from .alerts import HUNGRY_FOOD
@@ -347,17 +346,18 @@ def _checker_requirement(attrs: dict, base: dict
     atoms = []
     if number("hp") or one(attrs, "race", base.get("race")):
         # Matching by object type or archetype is not visible to the client.
-        atoms.append(Unknown("checker matches by object type or archetype"))
+        atoms.append(req.Unknown("checker matches by object type or archetype"))
     if lock_id:
-        atoms.append(Consumes(lock_id) if consumes else
-                     Item(lock_id) if required else NotItem(lock_id))
+        atoms.append(req.Consumes(lock_id) if consumes else
+                     req.Item(lock_id) if required else
+                     req.NotItem(lock_id))
     elif not atoms:
         # No filter at all matches the first object she carries. Requiring
         # one is open in practice; forbidding one is closed.
         if required:
             return None
-        atoms.append(Unknown("checker forbids carrying anything"))
-    return requires(*atoms), blocking, lock_id if consumes else ""
+        atoms.append(req.Unknown("checker forbids carrying anything"))
+    return req.requires(*atoms), blocking, lock_id if consumes else ""
 
 
 def _multipart_footprints(
@@ -773,9 +773,9 @@ class WorldGraph:
                           door_lock_id) or
                          one(attrs, "locked", base.get("locked")) == "1")):
                     node.locks[(x, y)] = node.locks.get(
-                        (x, y), NO_REQUIREMENT) & requires(
-                            Item(door_lock_id) if door_lock_id else
-                            Unknown("locked door without a key id"))
+                        (x, y), req.NONE) & req.requires(
+                            req.Item(door_lock_id) if door_lock_id else
+                            req.Unknown("locked door without a key id"))
                 if obj_type == "64":
                     checker = _checker_requirement(attrs, base)
                     if checker is not None:
@@ -785,7 +785,7 @@ class WorldGraph:
                             # access gates even when no locked door occupies
                             # their tile.
                             node.locks[(x, y)] = node.locks.get(
-                                (x, y), NO_REQUIREMENT) & requirement
+                                (x, y), req.NONE) & requirement
                         if consumed:
                             consumed_locks[(source, x, y)].add(consumed)
                         for atom in requirement.atoms:
@@ -960,9 +960,9 @@ class WorldGraph:
             requirement = node.locks.get((x, y))
             if requirement is None:
                 continue
-            node.locks[(x, y)] = requirement & requires(*(
-                Consumes(lock_id) for lock_id in sorted(lock_ids)
-                if lock_id in requirement.lock_ids(Item)))
+            node.locks[(x, y)] = requirement & req.requires(*(
+                req.Consumes(lock_id) for lock_id in sorted(lock_ids)
+                if lock_id in requirement.lock_ids(req.Item)))
 
         # Apartment-out scripts return to the exact authored teleporter
         # recorded on entry. Compile all entrances for the region because the
@@ -1815,12 +1815,16 @@ class NavigateTask(BotTask):
     def _allow_locked(self, client: AtrinikClient):
         if self._allow_locked_override is not None:
             return self._allow_locked_override
-        names = {item.name.casefold().strip()
-                 for item in carried_items(client.state)}
+        raw_names = {item.name for item in carried_items(client.state)}
+        names = {name.casefold().strip() for name in raw_names}
+        # A name lock mirrors the server's exact, case-sensitive comparison
+        # of the object's name; slaying locks go through the key catalogue.
         return frozenset(
             requirement for requirement, aliases
             in getattr(self.graph, "access_item_names", {}).items()
-            if names & aliases)
+            if (requirement[len(NAME_LOCK_PREFIX):] in raw_names
+                if requirement.startswith(NAME_LOCK_PREFIX)
+                else names & aliases))
 
     def _goal_points(self) -> list[tuple[int, int]]:
         if self.destination_xy is None:
