@@ -248,6 +248,11 @@ class GameState:
     active_upgrade_shop_sweep_policy: int = 0
     active_upgrade_shop_sweep_cursor: int = 0
     last_recall_shop_check_at: float = 0.0
+    # Why the last attempt to replace her recall source came to nothing
+    # (a failed or fruitless recall shop, a failed ship key), and when:
+    # the recovery phase's recall-unavailable alert, kept across restarts.
+    recall_unavailable: str = ""
+    recall_unavailable_at: float = 0.0
     last_utility_shop_check_at: float = 0.0
     # Wall-clock time before which a paid-but-ineffective temple restoration
     # is not attempted again.

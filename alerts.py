@@ -2,7 +2,8 @@
 
 Raised for repeated deaths, starvation, an idle character that cannot reach
 food, a character that is stuck while autoplay runs, a lost connection, and
-a task engine whose steps keep failing.
+a task engine whose steps keep failing. Autoplay adds its own while farming
+is unsafe (AutoplayTask.recovery_alerts).
 The client keeps a ``ProgressWatch`` current; the dashboard serves the active
 alerts on every live poll.
 """
@@ -98,13 +99,17 @@ def idle_food_failure(decisions: Iterable[dict], now: float) -> dict | None:
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
            autoplay_started_at: float | None, task_running: bool = False,
            engine_error: dict | None = None,
+           waiting_explained: bool = False,
            now: float | None = None) -> list[dict[str, str]]:
     """The alerts that apply right now, most severe first.
 
     ``autoplay_started_at`` is when the running autoplay task started, or
     None when autoplay is not running; ``task_running`` is whether any task
     runs; ``engine_error`` is the task engine's run of failed steps
-    (``error``, ``count``, ``since``), or None.
+    (``error``, ``count``, ``since``), or None. ``waiting_explained``:
+    autoplay's recovery phase waits at her savebed on a blocker it alerts
+    itself (cure-unfunded and the like), so no stuck alert; a stalled
+    errand still raises one.
     """
     now = time.time() if now is None else now
     alerts: list[dict[str, str]] = []
@@ -144,7 +149,7 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
     if autoplay_started_at is not None and getattr(state, "phase", "") == "playing":
         # Inactivity before this autoplay run started is not being stuck.
         since = max(watch.exp_changed_at, watch.moved_at, autoplay_started_at)
-        if now - since >= STUCK_SECONDS:
+        if not waiting_explained and now - since >= STUCK_SECONDS:
             alerts.append({"id": "stuck", "level": "warn",
                            "text": f"No XP or movement for {int((now - since) // 60)} min"})
     return alerts

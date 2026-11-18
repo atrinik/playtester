@@ -522,19 +522,24 @@ class DashboardState:
                 "since": float(getattr(self.engine, "step_error_since", 0.0))}
 
     def alerts(self) -> list[dict[str, str]]:
-        """Alerts for the operator: deaths, starvation, stuck, disconnected."""
+        """Alerts for the operator: deaths, starvation, stuck, disconnected,
+        and while farming is unsafe its suspension and what blocks it."""
         watch = self.client.progress_watch
         task = self.engine.task
         autoplay = bool(task is not None and
                         str(getattr(task, "name", "")).startswith("autoplay"))
         # Moves happen between stats packets; the client reports disconnects.
         watch.observe(self.client.state)
+        recovery = getattr(task, "recovery_alerts", None) if autoplay else None
+        unsafe, waiting = recovery(self.client) if recovery else ([], False)
         alerts = active_alerts(
             self.client.state, self.client.decision_history, watch,
             autoplay_started_at=(float(getattr(task, "started_at", 0.0) or 0.0)
                                  if autoplay else None),
-            task_running=task is not None,
+            task_running=task is not None, waiting_explained=waiting,
             engine_error=self.engine_error())
+        alerts[0:0] = [alert for alert in unsafe if alert["level"] == "critical"]
+        alerts += [alert for alert in unsafe if alert["level"] != "critical"]
         assist = self.operator_assist_status()
         if assist and assist["running"]:
             alerts.append({"id": "operator-assist-running", "level": "warn",

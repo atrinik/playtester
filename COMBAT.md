@@ -612,6 +612,111 @@ on 2026-11-14, Stop left Sera idle, without food or money, on her savebed in
 Clearhaven; she starved to death 22 times, about every 50 minutes, and her
 depletion rose from 41 to 67.
 
+## No farming while unsafe (owner decision, 2026-11-17)
+
+Live, on 2026-11-17, Sera died ten times in under three hours, eight of
+them on the Burnt Forest circuits and the roads to them. Depletion rose
+from 68 to 92 and her maximum health fell from 197 to 134. Both her recall
+wands were empty, and she had 1,038 copper against a 2,865 cure. Every
+safeguard above held as designed and none stopped her. The kit hazard
+marked every Burnt Forest circuit, but with every usable spot hazardous
+she farmed the least dangerous one. Pauses quarantined one leg map at a
+time, so she moved to a sibling circuit. The temple threshold only changed
+which objective she farmed, because farming was what paid the fee.
+
+`farming_unsafe_reason` now holds farming in two cases:
+
+- depletion at the temple-service threshold (`DEPLETION_SERVICE_THRESHOLD`,
+  3 points, shown as `conditions.depletion_threshold`, with the live
+  depletion force). The circuit already treated that as the point where
+  the lowered stats make her spots deadly. The fee does not grow with the
+  points, and every death adds one, so a higher limit would only allow
+  more deaths. Maximum-health loss cannot serve as the limit: the client
+  has no undepleted baseline, and level and gear move it too. The kit
+  comparison is relative between failures, and its fallback is what kept
+  her farming;
+- from level 18 (`RECALL_REQUIRED_LEVEL`, where recall shopping starts),
+  owning recall sources none of which works: every wand known empty, and
+  no rod ready or spell known (`emergency_recall_unusable`). A wand of
+  unknown charge counts until examined. A character who never owned a
+  recall source is not held; recall shopping buys her first one.
+
+While either holds, autoplay runs a recovery phase (`RecoveryTask`)
+instead of a farm circuit, whether or not the analyzer ranks a spot.
+When the switch is due, the circuit's discretionary trips end at once
+(upgrade sweep, spell purchase, utility and recall shopping, savebed
+rebinding). The exceptions are a shop trip still settling a purchase and,
+while she carries unpaid stock, the one trip paying for it: those finish
+paying first.
+Essential trips finish first (food, bank, identify, storage, the cure and
+its funding), and so does a fight on the farm map, under the farm's own
+combat and emergency recall. Meanwhile the farm pulls no new target
+(`FarmTask.hold_new_pulls`): it finishes the engaged one and fights what
+comes at her; if farming turns safe again before the switch, the hold
+lifts. The wait lasts at most `HANDOVER_SECONDS` (120 s), or
+`HANDOVER_UNPAID_SECONDS` (300 s) while she still carries unpaid stock,
+so a payment is not cut off. A fight on the road is no reason to wait,
+since waiting would walk her on along the farm route. Each tick the
+recovery phase:
+
+- while she is hit, fires the emergency recall by the farm's own rule,
+  then heals, takes the low-health retreat, or defends where she stands.
+  A walk or errand under way defends itself. There is no farm route to
+  resume;
+- heals and eats. Hunger with nothing to eat is autoplay's temple food
+  trip, as before;
+- off her savebed with nothing running, walks home on a strict route.
+  Where none exists it takes the ordinary route, which only costs learned
+  hazards more, and records `recovery-home-unsafe-route`. Recovery
+  usually starts on the farm, and live no strictly safe route led home
+  from any Burnt Forest map. Errands start only from her savebed, and the
+  cure and funding trips stay strict;
+- depleted: the strict temple cure when she can pay (a depletion potion
+  first); otherwise the cure-funding path (identify-all, junk sale,
+  deposit, the apartment chest);
+- not depleted, without a working recall: recall shopping, with the free
+  ship key it needs. Depletion wins: no recall is bought with the cure's
+  money;
+- otherwise waits at her savebed.
+
+It never walks a farm route, rebinds her savebed or makes a discretionary
+purchase. Its trips are the farm circuit's own, with their retry
+deadlines (`FarmCircuitTask._tick_running_service`). Once nothing is
+unsafe and nothing is under way, it records `farming-resumed`, and
+autoplay starts a circuit again.
+
+The dashboard reads its alerts from live state on every poll, so each one
+clears as soon as its condition does:
+
+- `farming-suspended` (warning), with the live reason, in any autoplay
+  phase;
+- `cure-unfunded`: depleted, short of the fee, and no funding trip under
+  way (one that is merely due does not hide it). Operator assist can give
+  her the gold;
+- `cure-unreachable`: three strict temple trips in a row refused for want
+  of a safe route from her savebed. Each refusal is a recorded decision
+  (`cure-route-refused`, reset by `cure-route-cleared` or
+  `farming-resumed`), so the count survives Stop and restarts;
+- `recall-unfunded`: under the 1,250 copper recall shopping needs.
+  Operator assist can give her the gold;
+- `recall-unavailable`: the last recall shopping failed or bought nothing,
+  or getting the ship key it needs failed. The reason is kept in her
+  persisted state (`recall_unavailable`) for a day, so it survives Stop
+  and restarts. It is cleared once recall works again (or below level
+  18), so a later recall loss never shows an old reason; depletion taking
+  priority does not clear it.
+
+The `stuck` alert is left out only while she waits at her savebed on one
+of these blockers. A cure walk or other errand that stalls still raises
+it.
+
+Before a farm circuit walks out, it examines every recall wand of unknown
+charge and waits for the answers (or the 5 s timeout). The empty mark is
+kept by item tag, and live, each life brought new tags for the same two
+wands (most likely her checkpoint relogs), so she walked back out and
+fired them again. Nobody sells recall charges: recharging needs the
+recharge spell, so an empty wand is replaced, never refilled.
+
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 
 Sera needed 2,865 copper for the temple's remove-depletion prayer and had

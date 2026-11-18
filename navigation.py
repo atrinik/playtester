@@ -4048,6 +4048,71 @@ def effective_farm_objective(state) -> str:
     return "safety" if depleted_for_temple(state) else chosen
 
 
+# From this level recall shopping replaces a recall source
+# (FarmCircuitTask._needs_recall_shopping); below it nothing would.
+RECALL_REQUIRED_LEVEL = 18
+NO_RECALL_REASON = "no working emergency recall source"
+
+
+def emergency_recall_unusable(client: AtrinikClient) -> bool:
+    """Whether she owns a recall source but none of them works now.
+
+    A source is what FarmTask.emergency_recall_candidates fires, read
+    without its mana check: a known Word of Recall spell, or a paid,
+    identified, uncursed rod or wand. It works unless it is a wand known to
+    be empty (observe_wand_feedback) or a device waiting out
+    RECALL_DEVICE_RETRY_SECONDS after it said it cannot fire. A wand of
+    unknown charge works until its examine text says otherwise. Owning
+    none at all is not this: that character never relied on one, and
+    recall shopping buys the first.
+    """
+    retry = getattr(client, "recall_device_retry_at", {}) or {}
+    now = time.monotonic()
+    policy = InventoryPolicy()
+    owned = False
+    for item in getattr(client.state, "inventory", ()):
+        if (not re.search(r"\bword of recall\b", item.name, re.I) or
+                item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)):
+            continue
+        if item.item_type == c.TYPE_SPELL:
+            return False
+        if (item.item_type in (c.TYPE_ROD, c.TYPE_WAND) and
+                policy.identified(item)):
+            owned = True
+            if (not wand_known_empty(client, item) and
+                    float(retry.get(item.tag, 0.0)) <= now):
+                return False
+    return owned
+
+
+def farming_unsafe_reason(client: AtrinikClient) -> str:
+    """Why farming must wait, or "" while it is safe enough to farm.
+
+    Two conditions, each of which kept farming going into a death spiral
+    live (2026-11-17: ten deaths in under three hours, depletion 68 to 92):
+
+    - depletion at the temple-service threshold (depleted_for_temple). That
+      is where the circuit already holds that the lowered stats make the
+      chosen spots deadly (effective_farm_objective). Every death adds a
+      point and the fee does not grow with them, so farming on to pay the
+      fee only adds deaths;
+    - from RECALL_REQUIRED_LEVEL, recall sources that no longer work
+      (emergency_recall_unusable): no charges left and none ready.
+
+    While either holds, autoplay runs its recovery phase (RecoveryTask)
+    instead of farming: only food, the bank, the cure, its funding and a
+    recall replacement, and otherwise a wait at her savebed.
+    """
+    state = client.state
+    if depleted_for_temple(state):
+        return (f"depletion {int(state.depletion_points)} at or above "
+                f"{FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD}")
+    level = int((getattr(state, "stats", {}) or {}).get("level", 0) or 0)
+    if level >= RECALL_REQUIRED_LEVEL and emergency_recall_unusable(client):
+        return NO_RECALL_REASON
+    return ""
+
+
 # Services a depleted character must reach for her cure and its funding, all
 # planned with strict_safety: the bank, the apartment chest, the Brynknot shop
 # floor, Kulgar's identify-all and Saruthar's temple.
@@ -4396,9 +4461,10 @@ def analyzer_farm_choice(
 
     If depletion prefers safety but no safety spot qualifies, the chosen
     objective's spot applies, and failing that the best usable safety spot.
-    The circuit removes depletion before any farming whenever an item or the
-    temple fee allows, and farming is what pays that fee; holding instead
-    could leave her depleted for good.
+    While she is depleted that far, autoplay does not farm at all
+    (farming_unsafe_reason, RecoveryTask): it removes depletion first, funds
+    the fee from what she owns, and otherwise waits for money rather than
+    farm for it, so this pick matters only to a circuit started by hand.
     """
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
@@ -4861,6 +4927,8 @@ class FarmCircuitTask(BotTask):
     PROGRESS_CHECKPOINT_INTERVAL = 5 * 60
     UPGRADE_SWEEP_INTERVAL = 24 * 60 * 60
     RECALL_SHOP_INTERVAL = 24 * 60 * 60
+    # Recall shopping starts only with this much money (wallet_value).
+    RECALL_SHOP_MINIMUM_WALLET = 1_250
     UTILITY_SHOP_INTERVAL = 24 * 60 * 60
     UPGRADE_SWEEP_WALLET_GROWTH = 5_000
     UPGRADE_SWEEP_POLICY = 8
@@ -6525,6 +6593,75 @@ class FarmCircuitTask(BotTask):
                     if service is not None and service is not self._capability]
         return bool(blocking) and self._expedition_return is None
 
+    # Trips autoplay drops at once when farming turns unsafe: discretionary
+    # purchases, recall shopping (the recovery phase shops from her
+    # savebed itself) and savebed rebinding. Every other trip is an
+    # essential (food, bank, identify, storage, the cure and its funding,
+    # the ship key) and finishes first.
+    DROPPED_AT_HANDOVER = ("_shopping", "_spell_purchase", "_utility_shopping",
+                           "_recall_shopping", "_bed_binding")
+
+    def drop_discretionary_trips(self, client: AtrinikClient) -> list[str]:
+        """End the trips in DROPPED_AT_HANDOVER; the names of those ended.
+
+        A shop trip settling a purchase (its ``settlement`` set) is kept,
+        and so, while she carries unpaid stock, is the one trip paying for
+        it (_paying_trip): each finishes paying before the switch.
+        """
+        paying = self._paying_trip(client)
+        dropped = []
+        for name in self.DROPPED_AT_HANDOVER:
+            task = getattr(self, name)
+            if (task is not None and name != paying and
+                    getattr(task, "settlement", None) is None):
+                dropped.append(task.name)
+                setattr(self, name, None)
+        return dropped
+
+    @staticmethod
+    def carries_unpaid(client: AtrinikClient) -> bool:
+        return any(item.flags & c.ITEM_UNPAID for item in client.state.inventory)
+
+    def _paying_trip(self, client: AtrinikClient) -> str:
+        """The trip in DROPPED_AT_HANDOVER that pays for her unpaid stock,
+        or "": the one settling a purchase, else a shop-floor trip under way
+        (an upgrade sweep, then utility shopping). Food bought on a shop
+        floor is the resupply's, an essential that is never dropped."""
+        if not self.carries_unpaid(client) or self._resupply is not None:
+            return ""
+        running = [name for name in self.DROPPED_AT_HANDOVER
+                   if getattr(self, name) is not None]
+        return next((name for name in running if getattr(
+            getattr(self, name), "settlement", None) is not None), next((
+                name for name in ("_shopping", "_utility_shopping")
+                if name in running), ""))
+
+    def hold_new_pulls(self, hold: bool = True) -> None:
+        """While the switch to recovery waits: the farm pulls no new target
+        (FarmTask.hold_new_pulls); a rebuilt farm child is held again.
+        ``hold`` False lifts it once farming is safe again."""
+        farm = self.child.task if self.child is not None else None
+        if isinstance(farm, FarmTask):
+            farm.hold_new_pulls = hold
+
+    def ready_for_handover(self, client: AtrinikClient) -> bool:
+        """Whether autoplay may replace this circuit by its recovery phase.
+
+        Not while an essential trip is under way, nor while she fights on
+        the farm map: the farm's own combat and emergency recall finish
+        that fight. On the road a fight is no reason to wait: that would
+        walk her on along the farm route, and recovery defends her itself.
+        """
+        if self._resupply is not None or any(
+                service is not None for service in self._maintenance_services()):
+            return False
+        farm = self.child.task if self.child is not None else None
+        on_farm = (self.child is not None and
+                   client.state.map.path == self.child.navigation.destination)
+        return not (on_farm and isinstance(farm, FarmTask) and (
+            _contact_this_life(client) or
+            self._busy_finishing_fight_or_loot(client, farm, held=True)))
+
     def safe_for_progression_detour(self, client: AtrinikClient) -> bool:
         """Return whether autoplay may replace this circuit between pulls."""
         if (self._resupply is not None or not self.can_feed_her() or
@@ -6626,9 +6763,11 @@ class FarmCircuitTask(BotTask):
             for item in client.state.inventory)
 
     def _needs_recall_shopping(self, client: AtrinikClient) -> bool:
-        if (int(client.state.stats.get("level", 0) or 0) < 18 or
+        if (int(client.state.stats.get("level", 0) or 0) <
+                RECALL_REQUIRED_LEVEL or
                 not self._has_ship_key(client) or
-                BuyShopUpgradeTask.wallet_value(client) < 1_250 or
+                BuyShopUpgradeTask.wallet_value(client) <
+                self.RECALL_SHOP_MINIMUM_WALLET or
                 self.clock() < self._recall_shopping_retry_at):
             return False
         wizardry = self._skill_level(client, "wizardry spells")
@@ -7042,57 +7181,34 @@ class FarmCircuitTask(BotTask):
             self._expedition_return.route = []
         return True
 
-    async def tick(self, client: AtrinikClient) -> None:
-        if self.status == TaskStatus.READY:
-            await self.start(client)
-        if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
-            return
-        self._current_exp = int(client.state.stats.get("exp", 0) or 0)
-        self._current_map_path = client.state.map.path
-        self._adaptations = getattr(client.state, "farm_adaptations", {}) or {}
-        if await self._tick_expedition_return(client):
-            return
-        # PLAYER precedes the authoritative inventory replay on login and
-        # reconnect. Do not infer a missing weapon skill, food stack, key,
-        # spell, cure, device, or equipped upgrade in that short gap. Such an
-        # inference can select the wrong combat tier or launch a cross-world
-        # maintenance trip which remains queued after the real bag arrives.
-        if not self._inventory_ready(client):
-            return
-        level = self._combat_progression_level(client)
-        self._progression_level = level
-        await self._clear_combat_after_death(client)
-        if self._observe_farm_death(client):
-            farm = self.child.task if self.child is not None else None
-            if isinstance(farm, FarmTask) and self._upgrade_progression(
-                    client, farm):
-                return
-        if (self.level_until and
-                int(client.state.stats.get("level", 0)) >= self.level_until):
-            self.complete()
-            return
-        self._observe_disease(client)
-        if await self.server_clock.sync(client):
-            return
-        assert self.child is not None
-        farm = self.child.task
-        if isinstance(farm, FarmTask) and self._upgrade_progression(
-                client, farm):
-            return
-        if (isinstance(farm, FarmTask) and
-                self._review_combat_build(client, farm)):
-            return
-        if (not self._leg_ready(self.leg_index, level) and
-                isinstance(farm, FarmTask) and
-                not self._busy_finishing_fight_or_loot(client, farm)):
-            self.leg_index = self._next_ready_leg(
-                self.leg_index + 1, level)
-            self.child = self._new_child()
-            self._farm_started_at = 0.0
-            self._empty_spawn_since = 0.0
-            log.info("scheduled farm leg unavailable; switching to %s",
-                     self.legs[self.leg_index][0])
-            return
+    async def _await_recall_wand_charges(self, client: AtrinikClient,
+                                         farm: FarmTask) -> bool:
+        """Hold the walk while a recall wand of unknown charge is examined.
+
+        True while an examine waits for its answer (FarmTask.check_recall_wand
+        gives up after 5 s), so she walks out only once every wand's charge
+        is known or its examine timed out. The farm examines on its own quiet
+        ticks, but only on the farm map: live, each life brought new tags for
+        her two empty wands (most likely her checkpoint relogs), the empty
+        marks were lost with the old tags, and she walked back out to fight
+        with no escape. An empty wand found here makes farming unsafe
+        (farming_unsafe_reason), and autoplay switches to its recovery phase.
+        Never while she is being hit.
+        """
+        if getattr(client, "examine", None) is None or _contact_this_life(client):
+            return False
+        await farm.check_recall_wand(client)
+        if farm._wand_examine is None:
+            # That answer settled one wand: start the next, if any.
+            await farm.check_recall_wand(client)
+        return farm._wand_examine is not None
+
+    async def _tick_running_service(self, client: AtrinikClient) -> bool:
+        """Tick the maintenance trip under way, if any, and settle its end.
+
+        True when one ran this tick. Autoplay's recovery phase
+        (RecoveryTask) runs the same trips through this.
+        """
         if self._bank_sync is not None:
             await self._bank_sync.tick(client)
             if self._bank_sync.status in (TaskStatus.COMPLETE,
@@ -7113,7 +7229,7 @@ class FarmCircuitTask(BotTask):
                     await client.clear_actions()
                     await client.set_combat(False)
                     await self._restoration.tick(client)
-            return
+            return True
         if self._capability is not None:
             purpose = self._capability.purpose
             await self._capability.tick(client)
@@ -7138,7 +7254,7 @@ class FarmCircuitTask(BotTask):
                     self._capability_retry_at[purpose] = (
                         self.clock() + 30 * 60)
                 self._capability = None
-            return
+            return True
         if self._cure is not None:
             await self._cure.tick(client)
             if self._cure.status in (TaskStatus.COMPLETE, TaskStatus.FAILED):
@@ -7150,7 +7266,7 @@ class FarmCircuitTask(BotTask):
                     log.info("cure-illness potion acquired; leaving shop to pay")
                     self._cure_retry_at = self.clock() + 30.0
                 self._cure = None
-            return
+            return True
         if self._restoration is not None:
             await self._restoration.tick(client)
             if self._restoration.status in (TaskStatus.COMPLETE,
@@ -7171,7 +7287,7 @@ class FarmCircuitTask(BotTask):
                     log.info("depletion removed; returning to farm")
                     self._restoration_retry_at = self.clock() + 30.0
                 self._restoration = None
-            return
+            return True
         if self._ship_key is not None:
             await self._ship_key.tick(client)
             if self._ship_key.status in (TaskStatus.COMPLETE, TaskStatus.FAILED):
@@ -7183,7 +7299,7 @@ class FarmCircuitTask(BotTask):
                     log.info("Morg'eean ship key acquired; shortcuts enabled")
                     self._ship_key_retry_at = self.clock() + 86400.0
                 self._ship_key = None
-            return
+            return True
         if self._spell_purchase is not None:
             await self._spell_purchase.tick(client)
             if self._spell_purchase.status in (
@@ -7196,7 +7312,7 @@ class FarmCircuitTask(BotTask):
                     log.info("magic bullet learned; returning to farm")
                     self._spell_retry_at = self.clock() + 86400.0
                 self._spell_purchase = None
-            return
+            return True
         if self._recall_shopping is not None:
             await self._recall_shopping.tick(client)
             if self._recall_shopping.status in (
@@ -7221,7 +7337,7 @@ class FarmCircuitTask(BotTask):
                         " with purchase" if purchased else "")
                     self._recall_shopping_retry_at = self.clock() + 60.0
                 self._recall_shopping = None
-            return
+            return True
         if self._utility_shopping is not None:
             await self._utility_shopping.tick(client)
             if self._utility_shopping.status in (
@@ -7247,7 +7363,7 @@ class FarmCircuitTask(BotTask):
                         "purchase(s); returning to farm", purchases)
                     self._utility_shopping_retry_at = self.clock() + 60.0
                 self._utility_shopping = None
-            return
+            return True
         if self._shopping is not None:
             previous_shop_index = self._shopping.index
             await self._shopping.tick(client)
@@ -7315,7 +7431,7 @@ class FarmCircuitTask(BotTask):
                         client.state.active_upgrade_shop_sweep_policy = 0
                     self._shopping_retry_at = self.clock() + 7200.0
                 self._shopping = None
-            return
+            return True
         if self._banking is not None:
             await self._banking.tick(client)
             if self._banking.status == TaskStatus.FAILED:
@@ -7333,7 +7449,7 @@ class FarmCircuitTask(BotTask):
                 self._banking_retry_at = self.clock() + 3600.0
                 self._force_bank_deposit = False
                 self._banking = None
-            return
+            return True
         if self._selling is not None:
             await self._selling.tick(client)
             if self._selling.status == TaskStatus.FAILED:
@@ -7355,7 +7471,7 @@ class FarmCircuitTask(BotTask):
                 self._banking_retry_at = 0.0
                 self._force_bank_deposit = True
                 self._selling = None
-            return
+            return True
         if self._identification is not None:
             await self._identification.tick(client)
             if self._identification.status == TaskStatus.FAILED:
@@ -7368,20 +7484,20 @@ class FarmCircuitTask(BotTask):
                 # Evaluate the newly revealed batch before returning to a
                 # spawn map, where an immediate target could otherwise defer
                 # a weapon or armour upgrade indefinitely.
-                farm = self.child.task
+                farm = self.child.task if self.child is not None else None
                 if (isinstance(farm, FarmTask) and
                         await farm.maintain_inventory(client)):
-                    return
+                    return True
                 log.info("mass identification complete; returning to farm")
                 self._identification_retry_at = self.clock() + 3600.0
                 self._identification = None
-            return
+            return True
         if self._cure_funding is not None:
             await self._cure_funding.tick(client)
             if self._cure_funding.status in (TaskStatus.FAILED,
                                              TaskStatus.COMPLETE):
                 self._settle_cure_funding(client)
-            return
+            return True
         if self._storage is not None:
             await self._storage.tick(client)
             if self._storage.status == TaskStatus.FAILED:
@@ -7393,7 +7509,7 @@ class FarmCircuitTask(BotTask):
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
                 self._storage = None
-            return
+            return True
         if self._bed_binding is not None:
             await self._bed_binding.tick(client)
             target = self._bed_target or ("?", (0, 0), 0)
@@ -7409,10 +7525,65 @@ class FarmCircuitTask(BotTask):
                 log.info("savebed bound at %s %s, about %d tiles from the farm",
                          target[0], target[1], target[2])
                 self._bed_binding = None
-            return
+            return True
         if self._resupply is not None:
             await self._resupply.tick(client)
             self._settle_resupply(client)
+            return True
+        return False
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
+            return
+        self._current_exp = int(client.state.stats.get("exp", 0) or 0)
+        self._current_map_path = client.state.map.path
+        self._adaptations = getattr(client.state, "farm_adaptations", {}) or {}
+        if await self._tick_expedition_return(client):
+            return
+        # PLAYER precedes the authoritative inventory replay on login and
+        # reconnect. Do not infer a missing weapon skill, food stack, key,
+        # spell, cure, device, or equipped upgrade in that short gap. Such an
+        # inference can select the wrong combat tier or launch a cross-world
+        # maintenance trip which remains queued after the real bag arrives.
+        if not self._inventory_ready(client):
+            return
+        level = self._combat_progression_level(client)
+        self._progression_level = level
+        await self._clear_combat_after_death(client)
+        if self._observe_farm_death(client):
+            farm = self.child.task if self.child is not None else None
+            if isinstance(farm, FarmTask) and self._upgrade_progression(
+                    client, farm):
+                return
+        if (self.level_until and
+                int(client.state.stats.get("level", 0)) >= self.level_until):
+            self.complete()
+            return
+        self._observe_disease(client)
+        if await self.server_clock.sync(client):
+            return
+        assert self.child is not None
+        farm = self.child.task
+        if isinstance(farm, FarmTask) and self._upgrade_progression(
+                client, farm):
+            return
+        if (isinstance(farm, FarmTask) and
+                self._review_combat_build(client, farm)):
+            return
+        if (not self._leg_ready(self.leg_index, level) and
+                isinstance(farm, FarmTask) and
+                not self._busy_finishing_fight_or_loot(client, farm)):
+            self.leg_index = self._next_ready_leg(
+                self.leg_index + 1, level)
+            self.child = self._new_child()
+            self._farm_started_at = 0.0
+            self._empty_spawn_since = 0.0
+            log.info("scheduled farm leg unavailable; switching to %s",
+                     self.legs[self.leg_index][0])
+            return
+        if await self._tick_running_service(client):
             return
         farm = self.child.task
         # All active maintenance branches returned above. Checkpoint only at
@@ -7615,6 +7786,9 @@ class FarmCircuitTask(BotTask):
             if (isinstance(farm, FarmTask) and
                     await self._hold_for_route_death_verdict(client)):
                 return
+            if (isinstance(farm, FarmTask) and
+                    await self._await_recall_wand_charges(client, farm)):
+                return
             # A newly selected circuit leg can begin while the previous farm's
             # pack is still pursuing across a seam. Defend/retreat before route
             # planning so an exceptional disconnected start square cannot fail
@@ -7726,3 +7900,405 @@ class FarmCircuitTask(BotTask):
         self._farm_started_at = 0.0
         self._empty_spawn_since = 0.0
         log.info("farm circuit switching to %s", self.legs[self.leg_index][0])
+
+
+class _ArriveTask(BotTask):
+    """Nothing to do on arrival: a walk whose only purpose is to get there."""
+
+    def __init__(self, name: str = "arrive"):
+        super().__init__(name)
+
+    async def tick(self, client: AtrinikClient) -> None:
+        self.complete()
+
+
+class RecoveryTask(BotTask):
+    """Autoplay's recovery phase while farming is unsafe (farming_unsafe_reason).
+
+    Live, on 2026-11-17, Sera kept farming the Burnt Forest depleted to 92
+    points, with both recall wands empty and the cure unaffordable, and
+    died ten times in under three hours. Autoplay runs this phase instead of
+    a farm circuit whenever farming is unsafe, whether or not the farming
+    analyzer ranks a spot. Each tick:
+
+    - while she is hit: the emergency recall, by the farm's own rule, then
+      healing, the low-health retreat and defence where she stands, or the
+      walk under way defends itself. There is no farm route to resume;
+    - healing and eating (her safety policy; autoplay's temple food trip
+      covers hunger with nothing to eat);
+    - off her savebed with nothing running: a walk home, strictly safe
+      where such a route exists and otherwise by the ordinary route
+      (recovery-home-unsafe-route). Every errand starts from her savebed;
+    - depleted: the temple cure when she can pay (a depletion potion
+      first), otherwise the cure-funding path: identify-all, junk sale,
+      deposit, the apartment chest. Depletion comes first: no recall is
+      bought with the cure's money;
+    - not depleted, without a working recall: recall shopping, with the
+      free ship key it needs;
+    - otherwise she waits at her savebed. No farm walk, savebed rebinding
+      or discretionary purchase runs.
+
+    The trips are the farm circuit's own (``services``, a FarmCircuitTask
+    that is never started), with their retry deadlines; ``alerts`` reads
+    what blocks her from live state on every call. Completes, recording
+    farming-resumed, once nothing is unsafe and nothing is under way.
+    """
+
+    survives_disconnect = False
+    # A strict temple trip refused this many times in a row for want of a
+    # safe route raises cure-unreachable.
+    CURE_ROUTE_ATTEMPTS = 3
+    # A strict walk home that found no route waits this long.
+    HOME_RETRY_SECONDS = FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS
+    # Within this many tiles of her savebed she is home.
+    HOME_TOLERANCE = 2
+
+    def __init__(self, graph: WorldGraph, *,
+                 backoffs: dict[str, float] | None = None,
+                 clock: Callable[[], float] = time.monotonic):
+        super().__init__("recovery")
+        self.graph = graph
+        self.clock = clock
+        self.services = FarmCircuitTask(
+            graph, [("/recovery", "")], backoffs=backoffs, clock=clock)
+        # Fights only through emergency_recall, low_health_retreat and the
+        # defence below; it never farms.
+        self.guard = FarmTask()
+        self.safety = SafetyPolicy()
+        self._defense = NavigateThenTask(graph, "/recovery", _ArriveTask(),
+                                         combat_approach=True)
+        self._home_walk: NavigateThenTask | None = None
+        self._home_retry_at = 0.0
+        # Strict-route refusals of the cure are recorded decisions
+        # (cure_route_refusals), and why a recall replacement came to
+        # nothing is persisted state (GameState.recall_unavailable): both
+        # outlive a temple food trip, Stop and restarts.
+        self.reason = ""
+
+    def backoffs(self) -> dict[str, float]:
+        return self.services.backoffs()
+
+    async def start(self, client: AtrinikClient) -> None:
+        await super().start(client)
+        self.reason = farming_unsafe_reason(client)
+        log.warning("farming suspended: %s", self.reason or "?")
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("farming-suspended", self.reason)
+
+    def _home(self, client: AtrinikClient) -> tuple[str, tuple[int, int]] | None:
+        """Her savebed, if known and mapped."""
+        path = getattr(client.state, "savebed_map", "") or ""
+        xy = getattr(client.state, "savebed_xy", None)
+        if not path or xy is None or path not in self.graph.nodes:
+            return None
+        return path, (int(xy[0]), int(xy[1]))
+
+    def at_home(self, client: AtrinikClient) -> bool:
+        """At her savebed; with none known, wherever she stands."""
+        home = self._home(client)
+        if home is None:
+            return True
+        m = client.state.map
+        return (m.path == home[0] and
+                max(abs(m.world_x - home[1][0]),
+                    abs(m.world_y - home[1][1])) <= self.HOME_TOLERANCE)
+
+    @property
+    def child(self) -> BotTask | None:
+        """The trip or walk under way, for the dashboard's task tree."""
+        if self._home_walk is not None:
+            return self._home_walk
+        return next((service for service in (
+            *self.services._maintenance_services(), self.services._resupply)
+            if service is not None), None)
+
+    def busy(self) -> bool:
+        """Whether a trip or the walk home is under way."""
+        walking = (self._home_walk is not None and
+                   self._home_walk.status in (TaskStatus.READY,
+                                              TaskStatus.RUNNING))
+        return walking or any(service is not None for service in (
+            *self.services._maintenance_services(), self.services._resupply))
+
+    def waiting(self, client: AtrinikClient) -> bool:
+        """Idle at her savebed: nothing under way, and not being hit."""
+        return (not self.busy() and self.at_home(client) and
+                not _contact_this_life(client))
+
+    def _funding_running(self) -> bool:
+        """Whether a funding trip is under way: only then is a short cure
+        not yet unfunded. A trip that is merely due does not count, so the
+        alert does not flap with every retry deadline."""
+        s = self.services
+        return any(task is not None for task in (
+            s._cure_funding, s._selling, s._identification, s._banking,
+            s._bank_sync))
+
+    def alerts(self, client: AtrinikClient) -> list[dict[str, str]]:
+        """What blocks her way out, from live state: each clears as soon
+        as its condition does."""
+        reason = farming_unsafe_reason(client)
+        s = self.services
+        wallet = BuyShopUpgradeTask.wallet_value(client)
+        assist = "; the owner can give her gold with the operator assist"
+        if depleted_for_temple(client.state):
+            if s._cure_shortfall(client):
+                if self._funding_running():
+                    return []
+                cost = s._depletion_service_cost(client)
+                return [{"id": "cure-unfunded", "level": "critical",
+                         "text": "Cure unfunded: remove depletion costs "
+                                 f"{format_money(cost)}, "
+                                 f"she has {format_money(wallet)} and nothing "
+                                 "left to sell" + assist}]
+            failures, error = self.cure_route_refusals(client)
+            if failures >= self.CURE_ROUTE_ATTEMPTS:
+                return [{"id": "cure-unreachable", "level": "critical",
+                         "text": "Cure unreachable: no strictly safe route to "
+                                 f"the temple from her savebed after {failures} "
+                                 f"attempts: {error}"}]
+            return []
+        if reason != NO_RECALL_REASON:
+            return []
+        if wallet < s.RECALL_SHOP_MINIMUM_WALLET:
+            return [{"id": "recall-unfunded", "level": "critical",
+                     "text": "Recall unfunded: recall shopping needs "
+                             f"{format_money(s.RECALL_SHOP_MINIMUM_WALLET)}, "
+                             f"she has {format_money(wallet)}" + assist}]
+        unavailable = getattr(client.state, "recall_unavailable", "") or ""
+        at = float(getattr(client.state, "recall_unavailable_at", 0.0) or 0.0)
+        # A note older than recall shopping's interval is stale: shopping
+        # is due again by then.
+        if (unavailable and s._recall_shopping is None and s._ship_key is None
+                and time.time() - at < s.RECALL_SHOP_INTERVAL):
+            return [{"id": "recall-unavailable", "level": "critical",
+                     "text": f"Recall unavailable: {unavailable}"}]
+        return []
+
+    # Refusals older than this no longer count toward cure-unreachable.
+    CURE_ROUTE_WINDOW_SECONDS = 24 * 3600.0
+    CURE_ROUTE_ACTIONS = ("cure-route-refused", "cure-route-cleared",
+                          "farming-resumed")
+
+    @classmethod
+    def cure_route_refusals(cls, client: AtrinikClient) -> tuple[int, str]:
+        """Strict temple trips refused in a row, and the latest refusal.
+
+        Read from her persisted decisions, so the count survives temple
+        food trips, Stop and restarts: refusals since the last
+        cure-route-cleared or farming-resumed, within a day.
+        """
+        count, error = 0, ""
+        cutoff = time.time() - cls.CURE_ROUTE_WINDOW_SECONDS
+        for record in getattr(client, "decision_history", ()):
+            if (not isinstance(record, dict) or
+                    record.get("action") not in cls.CURE_ROUTE_ACTIONS):
+                continue
+            if record.get("action") != "cure-route-refused":
+                count, error = 0, ""
+            elif float(record.get("time", 0.0) or 0.0) >= cutoff:
+                count, error = count + 1, str(record.get("detail", ""))
+        return count, error
+
+    @staticmethod
+    def _record(client: AtrinikClient, action: str, detail: str) -> None:
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder(action, detail)
+
+    async def _tick_services(self, client: AtrinikClient) -> bool:
+        """The circuit's trip under way, noting the outcomes alerts need."""
+        s = self.services
+        restoration, shopping, key = s._restoration, s._recall_shopping, s._ship_key
+        ran = await s._tick_running_service(client)
+        if restoration is not None and s._restoration is not restoration:
+            if restoration.status == TaskStatus.FAILED:
+                if (s.failure_backoff(restoration.error, 0.0) ==
+                        s.STRICT_ROUTE_RETRY_SECONDS):
+                    self._record(client, "cure-route-refused",
+                                 restoration.error)
+            elif self.cure_route_refusals(client)[0]:
+                self._record(client, "cure-route-cleared",
+                             f"temple trip {restoration.status.value}")
+        if shopping is not None and s._recall_shopping is None:
+            shopper = shopping.task
+            if shopping.status == TaskStatus.FAILED:
+                self._recall_unavailable(
+                    client, f"recall shopping failed: {shopping.error}")
+            elif not (isinstance(shopper, BuyDialogueStockTask) and
+                      shopper.purchased):
+                self._recall_unavailable(
+                    client, "recall shopping found no recall source to buy")
+            else:
+                self._recall_unavailable(client, "")
+        if (key is not None and s._ship_key is None and
+                key.status == TaskStatus.FAILED):
+            self._recall_unavailable(
+                client, "recall shopping needs Morg'eean's ship key, and "
+                f"getting it failed: {key.error}")
+        return ran
+
+    @staticmethod
+    def _recall_unavailable(client: AtrinikClient, detail: str) -> None:
+        """Persist why replacing her recall source came to nothing."""
+        setter = getattr(client, "set_recall_unavailable", None)
+        if setter is not None:
+            setter(detail)
+        else:
+            client.state.recall_unavailable = detail
+            client.state.recall_unavailable_at = time.time() if detail else 0.0
+
+    async def _start(self, client: AtrinikClient, errand: str, task) -> bool:
+        await client.clear_actions()
+        await client.set_combat(False)
+        setattr(self.services, errand, task)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("recovery-errand", task.name)
+        await self._tick_services(client)
+        return True
+
+    async def _start_errand(self, client: AtrinikClient, reason: str) -> bool:
+        s = self.services
+        if s._needs_bank_sync(client):
+            return await self._start(client, "_bank_sync", s._new_bank_sync(
+                refresh=client.state.bank_balance_known))
+        if depleted_for_temple(client.state):
+            if s._queue_inventory_capability(
+                    client, InventoryCapabilityTask.PURPOSE_DEPLETION):
+                return await self._start(client, "_capability", s._capability)
+            if s._needs_depletion_service(client):
+                return await self._start(
+                    client, "_restoration", s._new_depletion_service(client))
+            if s._needs_mass_identification(client):
+                return await self._start(
+                    client, "_identification", s._new_mass_identification())
+            if s._needs_junk_sale(client):
+                return await self._start(
+                    client, "_selling", s._new_junk_sale(client))
+            if s._needs_bank_deposit(client):
+                return await self._start(
+                    client, "_banking", s._new_bank_deposit(client))
+            if s._needs_cure_funding(client):
+                return await self._start(
+                    client, "_cure_funding", s._new_cure_funding(client))
+            return False
+        if reason != NO_RECALL_REASON:
+            return False
+        if s._needs_bank_deposit(client):
+            return await self._start(
+                client, "_banking", s._new_bank_deposit(client))
+        if s._needs_ship_key(client):
+            self._recall_unavailable(client, "")
+            return await self._start(
+                client, "_ship_key", MorgeeanShipKeyTask(self.graph))
+        if s._needs_recall_shopping(client):
+            self._recall_unavailable(client, "")
+            return await self._start(
+                client, "_recall_shopping", s._new_recall_shopping(client))
+        return False
+
+    def _new_home_walk(self, home: tuple[str, tuple[int, int]], *,
+                       strict: bool) -> NavigateThenTask:
+        walk = NavigateThenTask(self.graph, home[0], _ArriveTask("savebed"),
+                                destination_xy=home[1], combat_approach=True)
+        walk.navigation.tolerance = 1
+        walk.navigation.strict_safety = strict
+        return walk
+
+    async def _tick_home_walk(self, client: AtrinikClient) -> None:
+        """One step of the walk home: strictly safe, and when no such route
+        exists, by the ordinary route that only costs learned hazards more.
+
+        Recovery usually starts where her wands were found empty, on the
+        farm, and live no strictly safe route led home from any Burnt
+        Forest map: holding out for one stranded her on a respawning map.
+        The errands still start only from her savebed, strictly.
+        """
+        walk = self._home_walk
+        assert walk is not None
+        await walk.tick(client)
+        if (walk.status == TaskStatus.FAILED and
+                walk.navigation.strict_safety and
+                FarmCircuitTask.failure_backoff(walk.error, 0.0) ==
+                FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS):
+            home = self._home(client)
+            assert home is not None
+            log.warning("recovery: no strictly safe route home (%s); taking "
+                        "the ordinary route", walk.error)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("recovery-home-unsafe-route", walk.error)
+            walk = self._home_walk = self._new_home_walk(home, strict=False)
+            await walk.tick(client)
+        if walk.status == TaskStatus.FAILED:
+            log.warning("recovery: walk to her savebed failed: %s", walk.error)
+            self._home_retry_at = self.clock() + self.HOME_RETRY_SECONDS
+            self._home_walk = None
+        elif walk.status == TaskStatus.COMPLETE:
+            self._home_walk = None
+
+    async def _defend(self, client: AtrinikClient) -> None:
+        """Hit with nothing under way: heal, flee or fight back here."""
+        hp = int(client.state.stats.get("hp", 0) or 0)
+        maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
+        last_heal = self.safety._last_heal
+        await self.safety.enforce(client)
+        if self.safety._last_heal != last_heal:
+            return
+        if (hp / maxhp <= self.safety.flee_below and
+                await self.guard.low_health_retreat(client)):
+            return
+        home = self._home(client)
+        self._defense.navigation.destination = (
+            home[0] if home is not None else client.state.map.path)
+        await self._defense._defend_while_navigating(client)
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        if (self.status != TaskStatus.RUNNING or
+                client.state.phase != "playing" or
+                not client.state.inventory_replay_complete):
+            return
+        contact = _contact_this_life(client)
+        if contact and await self.services._transit_emergency_recall(
+                client, self.guard):
+            return
+        # A recall waiting for her action timer: no combat, only potions
+        # and stepping away (FarmTask.recall_pending_step).
+        if await self.guard.recall_pending_step(client):
+            return
+        if await self._tick_services(client):
+            return
+        if self._home_walk is not None:
+            await self._tick_home_walk(client)
+            return
+        if contact:
+            await self._defend(client)
+            return
+        if not await self.safety.enforce(client):
+            return
+        await self.guard.check_recall_wand(client)
+        reason = farming_unsafe_reason(client)
+        if not reason:
+            log.info("farming resumed (was suspended: %s)", self.reason)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("farming-resumed", f"was suspended: {self.reason}")
+            self.complete()
+            return
+        self.reason = reason
+        home = self._home(client)
+        if (home is not None and not self.at_home(client) and
+                self.clock() >= self._home_retry_at):
+            await client.clear_actions()
+            await client.set_combat(False)
+            self._home_walk = self._new_home_walk(home, strict=True)
+            await self._tick_home_walk(client)
+            return
+        # Every errand starts from her savebed; off it, she waits for the
+        # next walk home.
+        if self.at_home(client):
+            await self._start_errand(client, reason)

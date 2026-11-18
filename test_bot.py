@@ -6133,6 +6133,23 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         dx, dy = c.DIRECTION_DELTAS[direction]
         self.assertTrue(node.walkable(dx, dy))
 
+    def test_farm_pulls_no_new_target_while_a_recovery_switch_waits(self):
+        def run(hold):
+            client = self._combat_client()
+            client.state.map.tiles.clear()
+            client.state.map.tile(14, 8).objects[3] = MapObject(
+                3, 1, 0, 0, name="kobold chief", target_id=100,
+                target_hp=100)
+            task = FarmTask(zone="/test", target="kobold chief")
+            task.hold_new_pulls = hold
+            asyncio.run(task.tick(client))
+            return client.targets + client.moves + client.direct_moves
+
+        # Six tiles away, beyond its detection radius and not attacking: a
+        # pull, unless farming is about to stop (FarmTask.hold_new_pulls).
+        self.assertTrue(run(False))
+        self.assertEqual(run(True), [])
+
     def test_water_lure_waits_for_authoritative_position_ack(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
@@ -19812,6 +19829,645 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual((circuit.child.task.safety.flee_below,
                           circuit.child.task.safety.heal_below),
                          FarmCircuitTask.PASSIVE_SAFETY)
+
+
+class _DoneErrand(BotTask):
+    """A maintenance trip that ends on its next tick, as given."""
+
+    def __init__(self, status=TaskStatus.COMPLETE, task=None, error=""):
+        super().__init__("errand")
+        self.outcome, self.outcome_error = status, error
+        self.task = task or BotTask("x")
+
+    async def tick(self, client):
+        self.status, self.error = self.outcome, self.outcome_error
+
+
+class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
+    """No farming while unsafe: autoplay's recovery phase (RecoveryTask).
+
+    Live, 2026-11-17: depleted from 68 to 92 points, with two empty recall
+    wands and 1,038 copper against a 2,865 cure, Sera kept farming the
+    Burnt Forest and died ten times in under three hours.
+    """
+
+    TREES = "/shattered_islands/world_14_79"
+    # Her savebed for these tests: the bank square, a walkable town tile.
+    HOME = ("/shattered_islands/world_0_67", (19, 15))
+    SHOP = ("/shattered_islands/world_0_69", (15, 7))
+
+    def client(self, *, bank=5_000, depletion=0, level=36, ranked=True,
+               config=None):
+        client = AtrinikClient(config or ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": level, "exp": 1000, "hp": 134,
+                                   "maxhp": 134, "sp": 20, "maxsp": 20,
+                                   "food": 900})
+        client.state.bank_balance = bank
+        client.state.bank_balance_known = True
+        client.state.bank_balance_observed_at = time.time()
+        client.state.savebed_map, client.state.savebed_xy = self.HOME
+        self.place(client, self.HOME)
+        if depletion:
+            client.state.depletion_points = depletion
+            client.state.depletion_points_known = True
+            client.state.place_item(Item(
+                502, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
+                client.state.player_tag)
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client.farm_analyzer = StubAnalyzer(
+            {"xp": [trees], "safety": [trees]} if ranked else {})
+        client.state.quests_loaded = True
+        client.state.quests = {
+            EscapingDesertedIslandTask.QUEST: QuestProgress(
+                EscapingDesertedIslandTask.QUEST, status="completed"),
+            AutoplayTask.MANA_CRYSTAL_QUEST: QuestProgress(
+                AutoplayTask.MANA_CRYSTAL_QUEST, status="completed")}
+        self.moves = []
+
+        async def send(packet):
+            pass
+
+        async def move(direction, run=False):
+            self.moves.append(direction)
+
+        client.send = send
+        client.move = move
+        return client, trees
+
+    @staticmethod
+    def place(client, where):
+        client.state.map.path = where[0]
+        client.state.map.world_x, client.state.map.world_y = where[1]
+
+    def recovery(self, client, now=None):
+        from .navigation import RecoveryTask
+
+        now = now if now is not None else [1_000.0]
+        task = RecoveryTask(built_graph(), clock=lambda: now[0])
+        return task, now
+
+    @staticmethod
+    def empty_wands(client, *tags):
+        from .tasks import wand_charges
+
+        for tag in tags:
+            client.state.place_item(Item(
+                tag, item_type=c.TYPE_WAND, quality=80, condition=80,
+                name="pine wand of word of recall (lvl 17)"),
+                client.state.player_tag)
+            wand_charges(client)[tag] = 0
+
+    @staticmethod
+    def actions(client):
+        return [entry["action"] for entry in client.decision_history]
+
+    @staticmethod
+    def ids(alerts):
+        return [alert["id"] for alert in alerts]
+
+    def test_unsafe_reasons_follow_the_depletion_threshold_and_recall(self):
+        from .navigation import NO_RECALL_REASON, farming_unsafe_reason
+        from .tasks import wand_charges
+
+        client, _ = self.client()
+        # No recall source ever owned: nothing to replace, farming is safe.
+        self.assertEqual(farming_unsafe_reason(client), "")
+        # Two empty wands, as live: no working source.
+        self.empty_wands(client, 77, 78)
+        self.assertEqual(farming_unsafe_reason(client), NO_RECALL_REASON)
+        # A wand of unknown charge counts until its examine says otherwise.
+        wand_charges(client).pop(78)
+        self.assertEqual(farming_unsafe_reason(client), "")
+        wand_charges(client)[78] = 0
+        # A rod that just said it cannot fire is not ready meanwhile.
+        client.state.place_item(Item(
+            79, item_type=c.TYPE_ROD, quality=80, condition=80,
+            name="rod of word of recall"), client.state.player_tag)
+        self.assertEqual(farming_unsafe_reason(client), "")
+        client.recall_device_retry_at = {79: time.monotonic() + 20.0}
+        self.assertEqual(farming_unsafe_reason(client), NO_RECALL_REASON)
+        # A known spell is a source whatever her mana.
+        client.state.stats["sp"] = 0
+        client.state.place_item(Item(
+            71, item_type=c.TYPE_SPELL, name="word of recall",
+            extra={"cost": 24}), client.state.player_tag)
+        self.assertEqual(farming_unsafe_reason(client), "")
+        # Below recall shopping's level nothing could replace a source.
+        client, _ = self.client(level=17)
+        self.empty_wands(client, 77)
+        self.assertEqual(farming_unsafe_reason(client), "")
+        # Depleted at the temple threshold, whatever her recall.
+        client, _ = self.client(
+            depletion=FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD - 1)
+        self.assertEqual(farming_unsafe_reason(client), "")
+        client.state.depletion_points += 1
+        self.assertIn("depletion 3", farming_unsafe_reason(client))
+        # The counter alone, without the live force, is no depletion.
+        client.state.remove_item(502)
+        self.assertEqual(farming_unsafe_reason(client), "")
+
+    def test_a_fresh_run_without_a_ranking_starts_the_cure_while_depleted(self):
+        from .alerts import STUCK_SECONDS, ProgressWatch, active
+        from .navigation import RecoveryTask
+
+        client, _ = self.client(depletion=92, ranked=False)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+        asyncio.run(autoplay.tick(client))
+        restoration = autoplay.child.services._restoration
+        self.assertIsInstance(restoration.task, TempleServiceTask)
+        self.assertTrue(restoration.navigation.strict_safety)
+        self.assertIn("farming-suspended", self.actions(client))
+        # The cure walk is under way: only the general warning, and a cure
+        # walk that stalls is still reported as stuck.
+        alerts, waiting = autoplay.recovery_alerts(client)
+        self.assertEqual(self.ids(alerts), ["farming-suspended"])
+        self.assertIn("depletion 92", alerts[0]["text"])
+        self.assertFalse(waiting)
+        watch = ProgressWatch(now=time.time() - 2 * STUCK_SECONDS)
+        self.assertIn("stuck", self.ids(active(
+            client.state, client.decision_history, watch,
+            autoplay_started_at=time.time() - 2 * STUCK_SECONDS,
+            task_running=True, waiting_explained=waiting)))
+
+    def test_she_walks_home_after_an_errand_and_never_rebinds_her_savebed(self):
+        client, _ = self.client(depletion=92, bank=1_038)
+        recovery, now = self.recovery(client)
+        rebinds = []
+        recovery.services._needs_savebed = (
+            lambda client: rebinds.append(1) or True)
+        # A junk sale just finished on the shop floor.
+        self.place(client, self.SHOP)
+        recovery.services._selling = _DoneErrand()
+        asyncio.run(recovery.tick(client))
+        self.assertIsNone(recovery.services._selling)
+        self.assertEqual(self.moves, [])
+        asyncio.run(recovery.tick(client))
+        walk = recovery._home_walk
+        self.assertEqual(walk.navigation.destination, self.HOME[0])
+        self.assertTrue(walk.navigation.strict_safety)
+        # No other errand starts before she is home, and the one walk
+        # carries on rather than being planned afresh every tick.
+        self.assertIsNone(recovery.services._cure_funding)
+        for _ in range(3):
+            asyncio.run(recovery.tick(client))
+            self.assertIs(recovery._home_walk, walk)
+        self.assertNotEqual(self.moves, [])
+        self.assertIsNone(recovery.services._cure_funding)
+        self.assertEqual(rebinds, [])
+        self.assertIsNone(recovery.services._bed_binding)
+
+    def test_with_no_strictly_safe_way_out_she_still_walks_home(self):
+        # Live: no strictly safe route led home from any Burnt Forest map.
+        client, _ = self.client(depletion=92)
+        graph = built_graph()
+        node = graph.nodes[self.TREES]
+        start = next((x, y) for x in range(node.width // 2, node.width)
+                     for y in range(node.height // 2, node.height)
+                     if node.walkable(x, y))
+        self.place(client, (self.TREES, start))
+        client.state.route_hazards = {
+            edge.destination: time.time() + 3600 for edge in node.edges
+            if edge.destination != self.TREES}
+        self.assertTrue(client.state.route_hazards)
+        recovery, _ = self.recovery(client)
+        for _ in range(3):
+            asyncio.run(recovery.tick(client))
+        self.assertIn("recovery-home-unsafe-route", self.actions(client))
+        walk = recovery._home_walk
+        self.assertFalse(walk.navigation.strict_safety)
+        self.assertEqual(walk.navigation.destination, self.HOME[0])
+        self.assertNotEqual(self.moves, [])
+        # The cure stays strict and starts only from her savebed.
+        self.assertIsNone(recovery.services._restoration)
+
+    def test_hit_with_nothing_under_way_she_defends_instead_of_errands(self):
+        client, _ = self.client(depletion=92)
+        recovery, _ = self.recovery(client)
+        defended = []
+
+        async def defend(client):
+            defended.append(1)
+            return True
+
+        recovery._defense._defend_while_navigating = defend
+        client.state.add_message(2, "ff0000",
+                                 "singed deer hit you for 22 (-15) impact damage.")
+        asyncio.run(recovery.tick(client))
+        self.assertEqual(defended, [1])
+        # The cure she can afford waits until the fight is over.
+        self.assertIsNone(recovery.services._restoration)
+
+    def autoplay_farming(self, client):
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        return autoplay
+
+    @staticmethod
+    def deplete(client):
+        client.state.depletion_points = 92
+        client.state.depletion_points_known = True
+        client.state.place_item(Item(
+            502, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
+            client.state.player_tag)
+
+    def test_the_switch_drops_discretionary_trips_and_waits_for_essentials(self):
+        from .navigation import RecoveryTask
+
+        client, _ = self.client()
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        circuit._shopping = _DoneErrand(status=TaskStatus.RUNNING)
+        circuit._bed_binding = _DoneErrand(status=TaskStatus.RUNNING)
+        circuit._banking = _DoneErrand(status=TaskStatus.RUNNING)
+        self.deplete(client)
+        asyncio.run(autoplay.tick(client))
+        # The upgrade sweep and the rebinding end at once; the deposit runs.
+        self.assertIsNone(circuit._shopping)
+        self.assertIsNone(circuit._bed_binding)
+        self.assertIn("recovery-handover-dropped", self.actions(client))
+        self.assertIs(autoplay.child, circuit)
+        circuit._banking = None
+        asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+
+    def test_a_farm_fight_finishes_under_farm_combat_before_the_switch(self):
+        from .navigation import RecoveryTask
+
+        client, _ = self.client()
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        node = built_graph().nodes[self.TREES]
+        start = next((x, y) for x in range(node.width // 2, node.width)
+                     for y in range(node.height // 2, node.height)
+                     if node.walkable(x, y))
+        self.place(client, (self.TREES, start))
+        client.state.messages.append((time.time(), 2, "ff0000",
+                                      "evil treant hit you for 22 (-15) impact damage."))
+        self.deplete(client)
+        self.assertFalse(circuit.ready_for_handover(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertIs(autoplay.child, circuit)
+        # Meanwhile the farm finishes this fight but pulls no new target.
+        self.assertTrue(circuit.child.task.hold_new_pulls)
+        # The fight is over: no hit for a while, nothing engaged.
+        client.state.messages.clear()
+        client.state.messages.append((time.time() - 60, 2, "ff0000",
+                                      "evil treant hit you for 22 (-15) impact damage."))
+        circuit.child.task._engaged_target = None
+        client.state.target_id = 0
+        asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+
+    def test_a_purchase_being_paid_for_finishes_before_the_switch(self):
+        client, _ = self.client()
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        sweep = _DoneErrand(status=TaskStatus.RUNNING)
+        sweep.settlement = object()
+        circuit._shopping = sweep
+        self.deplete(client)
+        asyncio.run(autoplay.tick(client))
+        # Crossing the shop mat to pay: kept, and the switch waits.
+        self.assertIs(circuit._shopping, sweep)
+        self.assertIs(autoplay.child, circuit)
+        # Unpaid stock in her pack keeps any shop trip too.
+        circuit._shopping = None
+        utility = _DoneErrand(status=TaskStatus.RUNNING)
+        circuit._utility_shopping = utility
+        client.state.place_item(Item(
+            610, flags=c.ITEM_UNPAID, item_type=c.TYPE_FOOD,
+            name="staple food"), client.state.player_tag)
+        asyncio.run(autoplay.tick(client))
+        self.assertIs(circuit._utility_shopping, utility)
+        self.assertIs(autoplay.child, circuit)
+        # Paid: now it is dropped and the switch happens.
+        client.state.items[610].flags = 0
+        asyncio.run(autoplay.tick(client))
+        self.assertIsNone(circuit._utility_shopping)
+        self.assertNotIsInstance(autoplay.child, FarmCircuitTask)
+
+    def test_the_recall_note_is_forgotten_once_recall_works(self):
+        client, _ = self.client()
+        self.empty_wands(client, 77)
+        client.set_recall_unavailable("recall shopping found no recall source")
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        # Still the reason: kept.
+        self.assertTrue(client.state.recall_unavailable)
+        # Depleted now: the cure comes first, but the recall is still
+        # missing, so the note stays.
+        self.deplete(client)
+        asyncio.run(autoplay.tick(client))
+        self.assertTrue(client.state.recall_unavailable)
+        # A working wand: the note goes.
+        client.state.place_item(Item(
+            80, item_type=c.TYPE_WAND, quality=80, condition=80,
+            name="pine wand of word of recall (lvl 17)"),
+            client.state.player_tag)
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(client.state.recall_unavailable, "")
+        self.assertEqual(client.state.recall_unavailable_at, 0.0)
+        # Below level 18 nothing would replace a recall: no note either.
+        client.set_recall_unavailable("recall shopping failed: closed")
+        client.state.remove_item(80)
+        client.state.stats["level"] = 17
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(client.state.recall_unavailable, "")
+
+    def test_the_new_pull_hold_lifts_when_farming_is_safe_again(self):
+        client, _ = self.client()
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        node = built_graph().nodes[self.TREES]
+        start = next((x, y) for x in range(node.width // 2, node.width)
+                     for y in range(node.height // 2, node.height)
+                     if node.walkable(x, y))
+        self.place(client, (self.TREES, start))
+        client.state.messages.append((time.time(), 2, "ff0000",
+                                      "evil treant hit you for 22 (-15) impact damage."))
+        # Her rod just said it cannot fire: no working recall for 20 s.
+        client.state.place_item(Item(
+            79, item_type=c.TYPE_ROD, quality=80, condition=80,
+            name="rod of word of recall"), client.state.player_tag)
+        client.recall_device_retry_at = {79: time.monotonic() + 20.0}
+        asyncio.run(autoplay.tick(client))
+        self.assertIs(autoplay.child, circuit)
+        self.assertTrue(circuit.child.task.hold_new_pulls)
+        # The retry ran out before the switch: she farms on, pulling again.
+        client.recall_device_retry_at = {}
+        asyncio.run(autoplay.tick(client))
+        self.assertIs(autoplay.child, circuit)
+        self.assertFalse(circuit.child.task.hold_new_pulls)
+
+    def test_unpaid_stock_keeps_only_its_paying_trip_past_the_cap(self):
+        from .navigation import RecoveryTask
+
+        client, _ = self.client()
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        sweep = _DoneErrand(status=TaskStatus.RUNNING)
+        circuit._shopping = sweep
+        circuit._spell_purchase = _DoneErrand(status=TaskStatus.RUNNING)
+        client.state.place_item(Item(
+            610, flags=c.ITEM_UNPAID, item_type=c.TYPE_ARMOUR,
+            name="fine boots"), client.state.player_tag)
+        self.deplete(client)
+        # Past the ordinary cap: the sweep paying for the boots stays, and
+        # only it; the switch waits.
+        autoplay._handover_since = time.monotonic() - 150.0
+        asyncio.run(autoplay.tick(client))
+        self.assertIs(circuit._shopping, sweep)
+        self.assertIsNone(circuit._spell_purchase)
+        self.assertIs(autoplay.child, circuit)
+        # Not past the longer limit for a payment.
+        autoplay._handover_since = (
+            time.monotonic() - AutoplayTask.HANDOVER_UNPAID_SECONDS - 1)
+        asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+
+    def test_start_autoplay_after_a_persisted_stop_goes_into_recovery(self):
+        from .cli import autoplay_hold_reason
+        from .navigation import RecoveryTask
+        from .web_server import WebControlServer
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = ClientConfig(character="Sera", runtime_state_path=str(
+                Path(directory) / "memory.sqlite3"))
+            self.assertTrue(AtrinikClient(config).set_operator_stopped(True))
+            # After the restart: depleted, and the autoplay command idle.
+            client, _ = self.client(depletion=92, config=config)
+            self.assertTrue(autoplay_hold_reason(client))
+            engine = TaskEngine(client)
+            server = WebControlServer(client, engine, built_graph())
+            self.assertIsNone(engine.task)
+            asyncio.run(server._set_task({"type": "autoplay"}))
+            self.assertEqual(autoplay_hold_reason(client), "")
+            autoplay = engine.task
+            for _ in range(3):
+                asyncio.run(autoplay.tick(client))
+        # Straight into recovery: the cure, not a farm circuit.
+        self.assertEqual(autoplay.phase, "recovery")
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+        self.assertIsInstance(autoplay.child.services._restoration.task,
+                              TempleServiceTask)
+
+    def test_a_failed_ship_key_raises_recall_unavailable_across_a_restart(self):
+        client, _ = self.client()
+        self.empty_wands(client, 77)
+        recovery, _ = self.recovery(client)
+        recovery.services._ship_key = _DoneErrand(
+            status=TaskStatus.FAILED, error="Morg'eean did not answer")
+        asyncio.run(recovery.tick(client))
+        alerts = recovery.alerts(client)
+        self.assertEqual(self.ids(alerts), ["recall-unavailable"])
+        self.assertIn("ship key", alerts[0]["text"])
+        # Persisted: a new run (after Stop) still shows it.
+        fresh, _ = self.recovery(client)
+        self.assertEqual(self.ids(fresh.alerts(client)), ["recall-unavailable"])
+        self.assertTrue(client.state.recall_unavailable_at)
+
+    def test_cure_unfunded_hides_only_while_a_funding_trip_runs(self):
+        client, _ = self.client(depletion=92, bank=1_038)
+        recovery, _ = self.recovery(client)
+        # A funding trip is due but not running: the alert stands.
+        self.assertTrue(recovery.services._needs_cure_funding(client))
+        self.assertEqual(self.ids(recovery.alerts(client)), ["cure-unfunded"])
+        asyncio.run(recovery.tick(client))
+        self.assertIsNotNone(recovery.services._cure_funding)
+        self.assertEqual(recovery.alerts(client), [])
+
+    def test_a_hit_during_recovery_never_walks_the_farm_route(self):
+        from .navigation import RecoveryTask
+
+        client, trees = self.client(bank=1_038)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        circuit = autoplay.child
+        # Her last recall wand said poof, and something is hitting her.
+        self.empty_wands(client, 77)
+        client.state.add_message(2, "ff0000",
+                                 "singed deer hit you for 22 (-15) impact damage.")
+        for _ in range(3):
+            asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+        # The circuit's farm walk never ran, and recovery has none.
+        self.assertEqual(circuit.child.navigation.status, TaskStatus.READY)
+        self.assertIsNone(autoplay.child._home_walk)
+        self.assertIsNone(autoplay.child.child)
+        self.assertEqual(self.moves, [])
+
+    def test_no_strict_route_to_the_temple_raises_cure_unreachable(self):
+        client, _ = self.client(depletion=92)
+        # Saruthar's map is itself a learned hazard: no strict route.
+        client.state.route_hazards["/shattered_islands/world_3_58"] = (
+            time.time() + 3600)
+        recovery, now = self.recovery(client)
+        for attempt in range(recovery.CURE_ROUTE_ATTEMPTS):
+            self.assertNotIn("cure-unreachable", self.ids(recovery.alerts(client)))
+            asyncio.run(recovery.tick(client))
+            asyncio.run(recovery.tick(client))
+            self.assertIsNone(recovery.services._restoration)
+            now[0] += FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS + 1
+        alerts = recovery.alerts(client)
+        self.assertEqual(self.ids(alerts), ["cure-unreachable"])
+        self.assertIn("known hazard", alerts[0]["text"])
+        self.assertTrue(recovery.waiting(client))
+        # The count is read from her persisted decisions: after Stop and
+        # Start, a new recovery phase still knows.
+        fresh, _ = self.recovery(client)
+        self.assertEqual(self.ids(fresh.alerts(client)), ["cure-unreachable"])
+        # Cured some other way (a potion): the alert is gone at once.
+        client.state.remove_item(502)
+        self.assertEqual(recovery.alerts(client), [])
+
+    def test_recall_shopping_that_buys_nothing_raises_recall_unavailable(self):
+        client, _ = self.client(bank=1_038)
+        self.empty_wands(client, 77, 78)
+        recovery, now = self.recovery(client)
+        # Under the 1,250 recall shopping needs: unfunded, for the owner.
+        alerts = recovery.alerts(client)
+        self.assertEqual(self.ids(alerts), ["recall-unfunded"])
+        self.assertIn("operator assist", alerts[0]["text"])
+        client.state.bank_balance = 5_000
+        self.assertEqual(recovery.alerts(client), [])
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        shopped = []
+
+        def shop(client):
+            shopped.append(_DoneErrand(task=BotTask("stock")))
+            return shopped[-1]
+
+        recovery.services._new_recall_shopping = shop
+        asyncio.run(recovery.tick(client))
+        asyncio.run(recovery.tick(client))
+        self.assertEqual(len(shopped), 1)
+        alerts = recovery.alerts(client)
+        self.assertEqual(self.ids(alerts), ["recall-unavailable"])
+        self.assertIn("no recall source", alerts[0]["text"])
+        # A working wand: nothing is unsafe, no alert, and recovery ends.
+        client.state.place_item(Item(
+            80, item_type=c.TYPE_WAND, quality=80, condition=80,
+            name="pine wand of word of recall (lvl 17)"),
+            client.state.player_tag)
+        self.assertEqual(recovery.alerts(client), [])
+        asyncio.run(recovery.tick(client))
+        self.assertEqual(recovery.status, TaskStatus.COMPLETE)
+        self.assertIn("farming-resumed", self.actions(client))
+
+    def test_depletion_wins_over_recall_shopping(self):
+        client, _ = self.client(depletion=92)
+        self.empty_wands(client, 77)
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        recovery, _ = self.recovery(client)
+        recovery.services._new_recall_shopping = lambda client: self.fail(
+            "recall bought with the cure's money")
+        asyncio.run(recovery.tick(client))
+        self.assertIsInstance(recovery.services._restoration.task,
+                              TempleServiceTask)
+
+    def test_money_arriving_mid_run_clears_cure_unfunded(self):
+        from .alerts import STUCK_SECONDS, ProgressWatch, active
+        from .client import format_money
+
+        client, _ = self.client(depletion=92, bank=1_038)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        recovery = autoplay.child
+        # The chest trip found nothing to sell: funding waits its retry.
+        recovery.services._cure_funding_retry_at = (
+            recovery.clock() + FarmCircuitTask.CURE_FUNDING_RETRY_SECONDS)
+        for _ in range(3):
+            asyncio.run(autoplay.tick(client))
+        alerts, waiting = autoplay.recovery_alerts(client)
+        self.assertEqual(self.ids(alerts), ["cure-unfunded", "farming-suspended"])
+        self.assertIn(format_money(2_865), alerts[0]["text"])
+        self.assertIn("operator assist", alerts[0]["text"])
+        # Waiting at her savebed on an alerted blocker is not being stuck.
+        self.assertTrue(waiting)
+        watch = ProgressWatch(now=time.time() - 2 * STUCK_SECONDS)
+        self.assertNotIn("stuck", self.ids(active(
+            client.state, client.decision_history, watch,
+            autoplay_started_at=time.time() - 2 * STUCK_SECONDS,
+            task_running=True, waiting_explained=waiting)))
+        self.assertEqual(self.moves, [])
+        # Operator assist: a gold coin. The alert clears before any tick...
+        client.state.place_item(Item(
+            600, item_type=c.TYPE_MONEY, quality=0, name="gold coin"),
+            client.state.player_tag)
+        self.assertEqual(self.ids(autoplay.recovery_alerts(client)[0]),
+                         ["farming-suspended"])
+        # ...and the cure starts on the next.
+        asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(recovery.services._restoration.task,
+                              TempleServiceTask)
+
+    def test_farming_resumes_after_the_cure(self):
+        client, _ = self.client(depletion=92)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
+        # The temple removed the force.
+        autoplay.child.services._restoration = None
+        client.state.remove_item(502)
+        client.state.depletion_points = 0
+        self.assertEqual(autoplay.recovery_alerts(client), ([], False))
+        asyncio.run(autoplay.tick(client))
+        self.assertIn("farming-resumed", self.actions(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        self.assertIsInstance(autoplay.child, FarmCircuitTask)
+
+    def test_the_walk_out_waits_for_recall_wand_examines(self):
+        from .navigation import analyzer_spot_legs
+
+        client, trees = self.client()
+        # A relog renumbered her wand: its charge is unknown again.
+        client.state.place_item(Item(
+            90, item_type=c.TYPE_WAND, quality=80, condition=80,
+            name="pine wand of word of recall (lvl 17)"),
+            client.state.player_tag)
+        examined = []
+
+        async def examine(tag):
+            examined.append(tag)
+
+        client.examine = examine
+        circuit = FarmCircuitTask(built_graph(), list(analyzer_spot_legs(
+            trees, built_graph())), analyzer_driven=True, spot=trees)
+        circuit.child = circuit._new_child()
+        circuit.status = TaskStatus.RUNNING
+
+        async def idle(*args, **kwargs):
+            return False
+
+        circuit.server_clock.sync = idle
+        for name in dir(circuit):
+            if name.startswith("_needs_"):
+                setattr(circuit, name, lambda *args, **kwargs: False)
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        # Asked once, and she has not moved while the answer is pending.
+        self.assertEqual(examined, [90])
+        self.assertEqual(self.moves, [])
+        self.assertNotEqual(circuit.child.navigation.status, TaskStatus.RUNNING)
+        client.state.add_message(0, "ffffff", "It has 5 charges left.")
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        self.assertEqual(circuit.child.navigation.status, TaskStatus.RUNNING)
+        self.assertNotEqual(self.moves, [])
 
 
 class RouteFailureTests(unittest.TestCase):

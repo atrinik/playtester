@@ -1635,6 +1635,10 @@ class FarmTask(BotTask):
             for spawn, goal in (pull_squares or {}).items()
         }
         self._priority_target_ids: dict[int, int] = {}
+        # Set by the farm circuit while autoplay's switch to its recovery
+        # phase waits for this fight: finish the engaged target and fight
+        # what attacks her, but pull nothing new.
+        self.hold_new_pulls = False
         # Peaceful creatures seen occupying a named spawn; attacked with force.
         self._spawn_blocker_ids: set[int] = set()
         self._visible_target_count = 0
@@ -5591,6 +5595,14 @@ class FarmTask(BotTask):
                 targets = threats
             targets = [entry for entry in targets
                        if entry[3].target_id not in pulled_aside_ids]
+        if self.hold_new_pulls and engaged is None:
+            # Farming is about to stop (hold_new_pulls): no new pull, only
+            # what is beside her or already coming at her.
+            targets = [entry for entry in targets
+                       if entry[0] <= 1 or active_threat(entry)]
+            if not targets:
+                self._last_action = time.monotonic()
+                return
         if engaged is None and self.single_target_wizardry(client):
             # Pull only a lone creature (see _lone_target); one already
             # beside her or coming at her is fought regardless.

@@ -9,8 +9,11 @@ import time
 from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
-from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
-                         analyzer_farm_selection, food_reserve, hungry,
+from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
+                         NavigateThenTask, RecoveryTask,
+                         emergency_recall_unusable,
+                         WorldGraph, analyzer_farm_selection,
+                         farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
 from .alerts import HUNGRY_FOOD
 from .quest_tasks import EscapingDesertedIslandTask
@@ -38,6 +41,12 @@ class AutoplayTask(BotTask):
     # level 24 (troll elite soldiers): wait until she outlevels them well.
     MANA_CRYSTAL_UPGRADE_LEVEL = 30
     MANA_CRYSTAL_UPGRADE_RETRY = 24 * 60 * 60
+    # A switch to the recovery phase waits at most this long for the
+    # circuit's essential trip or farm fight: farm combat can pull the next
+    # target, and a cure trip can stall.
+    HANDOVER_SECONDS = 120.0
+    # While she carries unpaid stock, the wait for its settling trip.
+    HANDOVER_UNPAID_SECONDS = 300.0
     # A priest whose food trip failed is passed over this long.
     TEMPLE_PRIEST_RETRY = 60 * 60
 
@@ -62,6 +71,9 @@ class AutoplayTask(BotTask):
         # circuit inherits them, so it does not restart an errand that just
         # failed (live: the walk to a full apartment chest, every cycle).
         self._circuit_backoffs: dict[str, float] = {}
+        # Since when a due switch to the recovery phase waits for the
+        # circuit (AutoplayTask.HANDOVER_SECONDS).
+        self._handover_since: float | None = None
         self.safety = SafetyPolicy()
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
@@ -259,6 +271,53 @@ class AutoplayTask(BotTask):
                 self.child = None
             raise
 
+    async def _start_recovery(self, client: AtrinikClient) -> None:
+        """Run the recovery phase while farming is unsafe (RecoveryTask)."""
+        await client.clear_actions()
+        await client.set_combat(False)
+        await client.clear_target()
+        self._handover_since = None
+        await self._set_child(client, "recovery", RecoveryTask(
+            self.graph, backoffs=self._circuit_backoffs))
+
+    @staticmethod
+    def _forget_stale_recall_note(client: AtrinikClient) -> None:
+        """Clear the persisted recall-unavailable note once recall works
+        again (a working source, or below RECALL_REQUIRED_LEVEL), so a
+        later recall loss never shows an old reason. Depletion taking
+        priority does not clear it: the recall is still missing."""
+        level = int(client.state.stats.get("level", 0) or 0)
+        if (getattr(client.state, "recall_unavailable", "") and
+                (level < RECALL_REQUIRED_LEVEL or
+                 not emergency_recall_unusable(client))):
+            setter = getattr(client, "set_recall_unavailable", None)
+            if setter is not None:
+                setter("")
+            else:
+                client.state.recall_unavailable = ""
+                client.state.recall_unavailable_at = 0.0
+
+    def recovery_alerts(self, client: AtrinikClient
+                        ) -> tuple[list[dict[str, str]], bool]:
+        """Dashboard alerts while farming is unsafe, from live state, and
+        whether she is waiting at her savebed on an alerted blocker (then
+        the stuck alert would say nothing new).
+
+        The farming-suspended warning follows the live reason in any phase;
+        the specific blockers come from the recovery phase.
+        """
+        reason = farming_unsafe_reason(client)
+        if not reason or self.status != TaskStatus.RUNNING:
+            return [], False
+        alerts = [{"id": "farming-suspended", "level": "warn",
+                   "text": f"Farming suspended: {reason}"}]
+        waiting = False
+        if isinstance(self.child, RecoveryTask):
+            blockers = self.child.alerts(client)
+            alerts = blockers + alerts
+            waiting = bool(blockers) and self.child.waiting(client)
+        return alerts, waiting
+
     async def _set_child(self, client: AtrinikClient, phase: str,
                          child: BotTask) -> None:
         self.phase = phase
@@ -291,6 +350,7 @@ class AutoplayTask(BotTask):
         if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
             return
 
+        self._forget_stale_recall_note(client)
         if (self._needs_temple_food(client) and
                 await self._start_temple_food(client)):
             return
@@ -300,6 +360,39 @@ class AutoplayTask(BotTask):
             return
 
         if self.child is not None:
+            # Unsafe to farm: the recovery phase replaces the circuit. Its
+            # discretionary trips end now; an essential trip, or a fight on
+            # the farm map, finishes first, for at most HANDOVER_SECONDS.
+            if (self.phase == "adaptive-farming" and
+                    isinstance(self.child, FarmCircuitTask) and
+                    farming_unsafe_reason(client)):
+                dropped = self.child.drop_discretionary_trips(client)
+                if dropped:
+                    await client.clear_actions()
+                    recorder = getattr(client, "record_action", None)
+                    if recorder is not None:
+                        recorder("recovery-handover-dropped", ", ".join(dropped))
+                now = time.monotonic()
+                if self._handover_since is None:
+                    self._handover_since = now
+                waited = now - self._handover_since
+                # A payment under way is never cut off at the cap: unpaid
+                # stock waits for its settling trip, up to the longer limit.
+                capped = waited >= (
+                    self.HANDOVER_UNPAID_SECONDS
+                    if self.child.carries_unpaid(client)
+                    else self.HANDOVER_SECONDS)
+                if self.child.ready_for_handover(client) or capped:
+                    self._circuit_backoffs = self.child.backoffs()
+                    await self._start_recovery(client)
+                    return
+                self.child.hold_new_pulls()
+            else:
+                self._handover_since = None
+                if isinstance(self.child, FarmCircuitTask):
+                    # Safe again before the switch (a rod's retry ran out):
+                    # farm normally.
+                    self.child.hold_new_pulls(False)
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
                     self.child.safe_for_progression_detour(client)):
@@ -314,7 +407,7 @@ class AutoplayTask(BotTask):
                     return
             try:
                 await self.child.tick(client)
-                if isinstance(self.child, FarmCircuitTask):
+                if isinstance(self.child, (FarmCircuitTask, RecoveryTask)):
                     self._circuit_backoffs = self.child.backoffs()
             except ConnectionError as exc:
                 # The child's dialogue, transfer, or purchase may be half done;
@@ -378,6 +471,11 @@ class AutoplayTask(BotTask):
             self.complete()
             return
 
+        # Unsafe to farm: recovery, whether or not any spot is ranked, and
+        # no progression detour.
+        if farming_unsafe_reason(client):
+            await self._start_recovery(client)
+            return
         if self._needs_mana_crystal_start(client):
             await self._start_mana_crystal_detour(client)
             return

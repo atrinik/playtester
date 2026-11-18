@@ -409,6 +409,14 @@ class AtrinikClient:
             except (TypeError, ValueError):
                 self.state.last_recall_shop_check_at = 0.0
             try:
+                self.state.recall_unavailable = str(
+                    record.get("recall_unavailable", "") or "")[:500]
+                self.state.recall_unavailable_at = max(
+                    0.0, float(record.get("recall_unavailable_at", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                self.state.recall_unavailable = ""
+                self.state.recall_unavailable_at = 0.0
+            try:
                 self.state.last_utility_shop_check_at = max(
                     0.0, float(record.get(
                         "last_utility_shop_check_at", 0.0)))
@@ -520,6 +528,8 @@ class AtrinikClient:
             self.state.active_upgrade_shop_sweep_policy = 0
             self.state.active_upgrade_shop_sweep_cursor = 0
             self.state.last_recall_shop_check_at = 0.0
+            self.state.recall_unavailable = ""
+            self.state.recall_unavailable_at = 0.0
             self.state.last_utility_shop_check_at = 0.0
             self.state.paid_restoration_retry_until = 0.0
             self.state.route_hazards = {}
@@ -644,6 +654,19 @@ class AtrinikClient:
             return
         self._runtime_memory.setdefault(character, {})[
             "last_recall_shop_check_at"] = self.state.last_recall_shop_check_at
+        self._persist_character_memory()
+
+    def set_recall_unavailable(self, detail: str) -> None:
+        """Persist why replacing her recall source came to nothing ("" once
+        an attempt starts or succeeds)."""
+        self.state.recall_unavailable = str(detail or "")[:500]
+        self.state.recall_unavailable_at = time.time() if detail else 0.0
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        memory = self._runtime_memory.setdefault(character, {})
+        memory["recall_unavailable"] = self.state.recall_unavailable
+        memory["recall_unavailable_at"] = self.state.recall_unavailable_at
         self._persist_character_memory()
 
     def set_last_utility_shop_check(self, timestamp: float) -> None:
