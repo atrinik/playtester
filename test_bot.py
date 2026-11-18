@@ -22367,11 +22367,23 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
         record = await self.assist.run(1, "Sera")
         self.assertEqual(record["outcome"], "completed", record)
 
+    async def test_gold_already_underfoot_is_not_taken_for_the_dropped_coin(self):
+        state = self.client.state
+        state.items[800] = Item(800, location=0, name="gold coin", quantity=1)
+        state.inventories.setdefault(0, []).append(800)
+        # The drop never lands: the old coin must not read as the new one.
+        self.session_options = {"drops": False}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["failed_step"], record["coin"], record["ground_gold_before"]),
+                         ("drop", "operator-inventory", 1))
+        self.assertNotIn((100, 800, 1), self.client.moves)
+
     def test_ground_gold_is_read_by_name_as_the_look_window_sends_no_type(self):
         from .operator_assist import gold_stack
 
         ground = [Item(1, name="gold coin", quantity=1),
-                  Item(2, name="12 gold coins", quantity=12),
+                  Item(2, name="gold coins", quantity=12),
+                  Item(6, name="12 gold coins", quantity=12),
                   Item(3, name="gold ring", quantity=1),
                   Item(4, name="silver coin", quantity=5),
                   Item(5, name="gold coin", item_type=c.TYPE_RING, quantity=1)]

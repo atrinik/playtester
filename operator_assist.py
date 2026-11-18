@@ -73,9 +73,10 @@ COOLDOWN_SECONDS = 24 * 60 * 60
 GOLD_ARCHETYPE = "goldcoin"
 GOLD_COPPER = COIN_VALUES["gold"]
 # coin_gold.arc: weight 10 (grams).
-GOLD_WEIGHT_KG = 0.01
-# A gold coin as the look window names it: "gold coin" or "12 gold coins".
-GROUND_GOLD_NAME = re.compile(r"(?:\d+ )?gold coins?")
+GOLD_WEIGHT_GRAMS = 10
+# A gold coin as the look window names it (object_get_display_name:
+# material, then name or name_pl; the count travels in UPD_NROF).
+GROUND_GOLD_NAME = re.compile(r"gold coins?")
 # Safe to stand still for the few seconds a run takes.
 MIN_HEALTH_FRACTION = 0.9
 MIN_FOOD = 300
@@ -357,13 +358,15 @@ class OperatorAssist:
                     f"{MIN_HEALTH_FRACTION:.0%}")
         if int(stats.get("food", 0) or 0) < MIN_FOOD:
             return f"not at a safe square: food below {MIN_FOOD}"
-        limit = float(stats.get("weight_limit", 0) or 0)
-        carried = sum(item.weight * item.quantity for item in state.inventory)
-        if limit > 0 and carried + gold * GOLD_WEIGHT_KG >= limit:
+        # In whole grams, as the server counts (the client divides by 1000).
+        limit = round(float(stats.get("weight_limit", 0) or 0) * 1000)
+        carried = sum(round(item.weight * 1000) * item.quantity
+                      for item in state.inventory)
+        if limit > 0 and carried + gold * GOLD_WEIGHT_GRAMS >= limit:
             # player_can_carry: the server would refuse her pickup.
             return (f"she cannot pick up the coin: she carries "
-                    f"{carried:.2f} kg of her {limit:.2f} kg limit; "
-                    "free some weight first")
+                    f"{carried / 1000:.2f} kg of her {limit / 1000:.2f} kg "
+                    "limit; free some weight first")
         return ""
 
     # The sequence.
@@ -506,7 +509,8 @@ class OperatorAssist:
         before = int(record.get("operator_gold_before", 0))
         if gold_stack(session.state.inventory)[0] >= before + gold:
             record["coin"] = "operator-inventory"
-        elif gold_stack(self.client.state.ground, ground=True)[0] >= gold and (
+        elif gold_stack(self.client.state.ground, ground=True)[0] >= (
+                int(record.get("ground_gold_before", 0)) + gold) and (
                 record["coin"] == "operator-inventory"):
             record["coin"] = "ground"
         else:
@@ -626,6 +630,9 @@ class OperatorAssist:
             raise OperatorAssistAborted("drop", "cannot tell which gold stack is new")
         self._step(record, "drop", f"{gold} gold coin(s) at {square}")
         self._ensure_safe("drop")
+        # Gold already lying on her square is not the operator's coin.
+        ground_before = gold_stack(client.state.ground, ground=True)[0]
+        record["ground_gold_before"] = ground_before
         await session.move_item(0, grown[0].tag, gold)
         await self._wait("drop", lambda: gold_stack(ops.inventory)[0] <= before,
                          runner=runner)
@@ -640,8 +647,9 @@ class OperatorAssist:
         def coin_underfoot():
             if client.state.phase != "playing":
                 return None
-            _, coin = gold_stack(client.state.ground, ground=True)
-            return coin if coin is not None and coin.quantity >= gold else None
+            total, coin = gold_stack(client.state.ground, ground=True)
+            return (coin if coin is not None and coin.quantity >= gold and
+                    total >= ground_before + gold else None)
 
         await self._wait("pickup", lambda: coin_underfoot() is not None)
         await client.move_item(client.state.player_tag, coin_underfoot().tag, gold)
