@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import re
@@ -7278,6 +7279,9 @@ class BindSavebedTask(BotTask):
 
 
 class TaskEngine:
+    # The pause after an unexpected error in an engine step (seconds).
+    error_backoff = 1.0
+
     def __init__(self, client: AtrinikClient, tick_rate: float = 0.25):
         self.client = client
         self.tick_rate = tick_rate
@@ -7370,62 +7374,124 @@ class TaskEngine:
         finally:
             self.client.action_context = ""
 
+    def _end_task(self, task: BotTask) -> None:
+        """Record ``task``'s end and clear it, if it is still the task."""
+        log.info("task %s ended: %s %s", task.name, task.status.value,
+                 task.error)
+        self.last_task = {
+            "name": task.name,
+            "status": task.status.value,
+            "error": task.error,
+            "started_at": task.started_at,
+            "ended_at": time.time(),
+        }
+        recorder = getattr(self.client, "record_action", None)
+        if recorder is not None:
+            recorder("task-end", f"{task.name} {task.status.value}"
+                     + (f": {task.error}" if task.error else ""))
+        if self.task is task:
+            self.task = None
+
+    async def _tick_task(self, task: BotTask) -> None:
+        """Tick ``task`` once and end it once it completes or fails.
+
+        The dashboard's Stop and task replacement (``web_server``) set
+        ``self.task`` while this awaits the tick: live, Stop shortly after
+        start-up set it to None mid-tick and the status check after the
+        await killed the process (and with it Stop, as systemd restarted
+        autoplay). So only the ``task`` passed in is read after an await,
+        and a task that is no longer current is left as its replacer left
+        it: Stop already failed and recorded it.
+        """
+        self.client.action_context = task.name
+        try:
+            await task.tick(self.client)
+        except ConnectionError as exc:
+            # The server went away mid-tick (live: a MAIN upgrade shut
+            # it down while autoplay was clearing actions, and autoplay
+            # ended for good). Hold a task that rebuilds its in-flight
+            # work through the reconnect, like a disconnect noticed
+            # between ticks; any other task fails as before.
+            if getattr(task, "survives_disconnect", False):
+                log.warning("task %s paused: connection lost (%s)",
+                            task.name, exc or "closed")
+            elif self.task is task:
+                log.exception("task %s failed", task.name)
+                task.fail(str(exc))
+        except Exception as exc:
+            if self.task is task:
+                log.exception("task %s failed", task.name)
+                task.fail(str(exc))
+            else:
+                # Stopped or replaced meanwhile: keep the operator's reason.
+                log.warning("task %s raised after it was %s: %s", task.name,
+                            task.error or "replaced", exc, exc_info=True)
+        finally:
+            self.client.action_context = ""
+        if self.task is not task:
+            # The handler cleared her actions before the rest of this tick
+            # ran, which may have sent more: undo them before the next task
+            # (or idle survival) starts from a clean slate.
+            if self.client.state.phase == "playing":
+                with contextlib.suppress(ConnectionError):
+                    await self.client.clear_actions()
+                    await self.client.set_combat(False)
+                    await self.client.clear_target()
+            return
+        if task.status in (TaskStatus.COMPLETE, TaskStatus.FAILED):
+            self._end_task(task)
+
+    async def _step(self) -> None:
+        if self.operator_hold:
+            return
+        if await self._normalize_inventory_locks():
+            return
+        if await self._protect_idle():
+            return
+        # Read once: the awaits above may have changed it.
+        task = self.task
+        if task is None:
+            return
+        state = self.client.state
+        if state.phase != "playing" or not state.map.path:
+            # Hold the task through a whole reconnect: while disconnected
+            # or connecting there is no writer to send on, and "playing"
+            # arrives before the first MAP2, so do not plan against the
+            # empty map that login just reset either.
+            return
+        await self._tick_task(task)
+
     async def run(self) -> None:
         while self.running:
-            if self.operator_hold:
-                await asyncio.sleep(self.tick_rate)
-                continue
-            if await self._normalize_inventory_locks():
-                await asyncio.sleep(self.tick_rate)
-                continue
-            if await self._protect_idle():
-                await asyncio.sleep(self.tick_rate)
-                continue
-            state = self.client.state
-            if (self.task is not None and
-                    (state.phase != "playing" or not state.map.path)):
-                # Hold the task through a whole reconnect: while disconnected
-                # or connecting there is no writer to send on, and "playing"
-                # arrives before the first MAP2, so do not plan against the
-                # empty map that login just reset either.
-                await asyncio.sleep(self.tick_rate)
-                continue
-            if self.task is not None:
-                self.client.action_context = self.task.name
-                try:
-                    await self.task.tick(self.client)
-                except ConnectionError as exc:
-                    # The server went away mid-tick (live: a MAIN upgrade shut
-                    # it down while autoplay was clearing actions, and autoplay
-                    # ended for good). Hold a task that rebuilds its in-flight
-                    # work through the reconnect, like a disconnect noticed
-                    # between ticks; any other task fails as before.
-                    if getattr(self.task, "survives_disconnect", False):
-                        log.warning("task %s paused: connection lost (%s)",
-                                    self.task.name, exc or "closed")
-                    else:
-                        log.exception("task %s failed", self.task.name)
-                        self.task.fail(str(exc))
-                except Exception as exc:
-                    log.exception("task %s failed", self.task.name)
-                    self.task.fail(str(exc))
-                if self.task.status in (TaskStatus.COMPLETE, TaskStatus.FAILED):
-                    log.info("task %s ended: %s %s", self.task.name,
-                             self.task.status.value, self.task.error)
-                    self.last_task = {
-                        "name": self.task.name,
-                        "status": self.task.status.value,
-                        "error": self.task.error,
-                        "started_at": self.task.started_at,
-                        "ended_at": time.time(),
-                    }
-                    recorder = getattr(self.client, "record_action", None)
-                    if recorder is not None:
-                        recorder(
-                            "task-end",
-                            f"{self.task.name} {self.task.status.value}"
-                            + (f": {self.task.error}"
-                               if self.task.error else ""))
-                    self.task = None
+            try:
+                await self._step()
+            except ConnectionError as exc:
+                # Upkeep raced a disconnect: the reconnect carries on, and a
+                # task survives it as it does between ticks.
+                log.warning("task engine step lost its connection (%s)",
+                            exc or "closed")
+            except Exception as exc:
+                # Nothing ends the engine but ``running``: before, an error
+                # here ended the whole process, and systemd restarted it
+                # straight into autoplay. Drop what was running instead.
+                log.exception("task engine step failed")
                 self.client.action_context = ""
+                survival = self.idle_survival
+                if survival is not None:
+                    survival.drop()
+                task = self.task
+                if task is not None:
+                    if task.status not in (TaskStatus.COMPLETE,
+                                           TaskStatus.FAILED):
+                        task.fail(f"task engine error: {exc}")
+                    try:
+                        self._end_task(task)
+                    except Exception:
+                        log.exception("recording the end of task %s failed",
+                                      task.name)
+                    if self.task is task:
+                        self.task = None
+                # A bug that recurs every step is not logged at tick rate.
+                await asyncio.sleep(max(self.tick_rate, self.error_backoff))
+                continue
             await asyncio.sleep(self.tick_rate)

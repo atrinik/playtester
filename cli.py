@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 from .build_info import build_info
@@ -149,6 +150,24 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def autoplay_hold_reason(client) -> str:
+    """Why the ``autoplay`` command must start idle, or "" to autoplay.
+
+    The owner's dashboard Stop is persisted (``set_operator_stopped``) and
+    outlives a crash or restart: the service restarts this command, which
+    would otherwise override the Stop. An unreadable flag also holds.
+    """
+    try:
+        if client.operator_stopped():
+            return "stopped by operator (kept across restart)"
+    except Exception:
+        # Unknown: stay idle rather than override a Stop.
+        logging.getLogger(__name__).exception(
+            "cannot read the persisted operator stop")
+        return "persisted operator stop unreadable"
+    return ""
+
+
 async def main_async(args: argparse.Namespace) -> None:
     from .autoplay import AutoplayTask, IdleSurvival
     from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
@@ -226,8 +245,21 @@ async def main_async(args: argparse.Namespace) -> None:
         # her fed (no tasks except survival).
         engine.idle_survival = IdleSurvival(graph)
         if args.task == "autoplay":
-            engine.set_task(AutoplayTask(
-                graph, target_level=args.until_level))
+            held = autoplay_hold_reason(client)
+            if held:
+                # The owner pressed Stop before this restart: honour it.
+                # Start autoplay on the dashboard clears it.
+                logging.getLogger(__name__).warning(
+                    "autoplay not started: %s; use Start autoplay on the "
+                    "dashboard to resume", held)
+                now = time.time()
+                engine.last_task = {
+                    "name": "autoplay", "status": "failed", "error": held,
+                    "started_at": now, "ended_at": now,
+                }
+            else:
+                engine.set_task(AutoplayTask(
+                    graph, target_level=args.until_level))
         operator_key = ""
         if args.operator_character:
             from .operator_key import (OperatorKeyError, ensure_operator_key,

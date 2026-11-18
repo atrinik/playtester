@@ -652,6 +652,239 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def playing_engine(self):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.map.path = "/shattered_islands/world_14_77"
+        sent = []
+
+        async def send(packet):
+            sent.append(packet)
+
+        client.send = send
+        engine = TaskEngine(client, tick_rate=0.01)
+        engine.error_backoff = 0.01
+        return client, engine, sent
+
+    def test_stop_while_the_engine_awaits_a_tick_does_not_raise(self):
+        # Live 2026-11-18: Stop shortly after start-up set engine.task to
+        # None while autoplay's tick awaited, and the status check after the
+        # await raised AttributeError, which ended the whole process.
+        from .web_server import WebControlServer
+
+        async def scenario():
+            client, engine, sent = self.playing_engine()
+            server = WebControlServer(client, engine, WorldGraph())
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            class Slow(BotTask):
+                ticks = 0
+                raise_after = False
+
+                async def tick(self, client):
+                    type(self).ticks += 1
+                    entered.set()
+                    await release.wait()
+                    if self.raise_after:
+                        raise RuntimeError("child failed after the stop")
+
+            for raise_after in (False, True):
+                entered.clear()
+                release.clear()
+                slow = Slow("slow")
+                slow.raise_after = raise_after
+                slow.status = TaskStatus.RUNNING
+                engine.set_task(slow)
+                runner = asyncio.create_task(engine.run())
+                await asyncio.wait_for(entered.wait(), 1)
+                self.assertEqual(await server._set_task({"type": "stop"}),
+                                 {"ok": True, "task": None})
+                del sent[:]
+                release.set()
+                await asyncio.sleep(0.05)
+                self.assertFalse(runner.done())
+                self.assertIsNone(engine.task)
+                # The operator's reason survives what the tick did after.
+                self.assertEqual((slow.status, slow.error),
+                                 (TaskStatus.FAILED, "stopped by operator"))
+                self.assertEqual(engine.last_task["error"], "stopped by operator")
+                # Whatever the rest of the stale tick sent was cleared.
+                self.assertTrue(sent)
+                engine.running = False
+                await runner
+                engine.running = True
+
+            # Replacement mid-tick keeps the new task and ticks it.
+            entered.clear()
+            release.clear()
+            old = Slow("old")
+            old.status = TaskStatus.RUNNING
+            engine.set_task(old)
+            runner = asyncio.create_task(engine.run())
+            await asyncio.wait_for(entered.wait(), 1)
+
+            class Done(BotTask):
+                async def tick(self, client):
+                    self.status = TaskStatus.COMPLETE
+
+            new = Done("new")
+            await server._replace_task(new)
+            release.set()
+            await asyncio.sleep(0.05)
+            engine.running = False
+            await runner
+            self.assertEqual((old.status, old.error),
+                             (TaskStatus.FAILED, "replaced by operator"))
+            self.assertEqual(new.status, TaskStatus.COMPLETE)
+            self.assertIsNone(engine.task)
+            self.assertEqual(engine.last_task["name"], "new")
+
+        asyncio.run(scenario())
+
+    def test_an_exception_in_the_engine_does_not_end_run(self):
+        async def scenario():
+            client, engine, _ = self.playing_engine()
+
+            class Broken(BotTask):
+                async def tick(self, client):
+                    raise RuntimeError("bug in a tick")
+
+            broken = Broken("broken")
+            engine.set_task(broken)
+            runner = asyncio.create_task(engine.run())
+            await asyncio.sleep(0.05)
+            self.assertFalse(runner.done())
+            self.assertIsNone(engine.task)
+            self.assertEqual((broken.status, broken.error),
+                             (TaskStatus.FAILED, "bug in a tick"))
+
+            # An error outside the task's tick (here idle survival) does
+            # not end the engine either; it drops what was running.
+            class BrokenSurvival:
+                drops = 0
+
+                def drop(self):
+                    self.drops += 1
+
+                async def tick(self, client, safety=None):
+                    raise RuntimeError("bug in idle survival")
+
+            survival = BrokenSurvival()
+            engine.idle_survival = survival
+            await asyncio.sleep(0.05)
+            self.assertFalse(runner.done())
+            self.assertGreater(survival.drops, 0)
+
+            # So is a bug in the engine's own bookkeeping after a tick: the
+            # task is dropped and the next one still runs.
+            engine.idle_survival = None
+
+            class Ends(BotTask):
+                async def tick(self, client):
+                    self.status = TaskStatus.COMPLETE
+
+            recorded = []
+
+            def record_action(action, detail=""):
+                recorded.append(action)
+                if action == "task-end" and len(recorded) == 2:
+                    raise RuntimeError("bug in the recorder")
+
+            client.record_action = record_action
+            first = Ends("first")
+            engine.set_task(first)
+            await asyncio.sleep(0.05)
+            self.assertFalse(runner.done())
+            self.assertIsNone(engine.task)
+            second = Ends("second")
+            engine.set_task(second)
+            await asyncio.sleep(0.05)
+            self.assertEqual(second.status, TaskStatus.COMPLETE)
+            self.assertIsNone(engine.task)
+            self.assertEqual(engine.last_task["name"], "second")
+            engine.running = False
+            await runner
+
+        asyncio.run(scenario())
+
+    def test_stop_during_an_idle_food_trip_tick_is_not_a_failed_trip(self):
+        from .autoplay import IdleSurvival
+
+        async def scenario():
+            client, _, _ = self.playing_engine()
+            survival = IdleSurvival(WorldGraph())
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            class Trip(BotTask):
+                async def tick(self, client):
+                    entered.set()
+                    await release.wait()
+                    self.fail("route ended by the stop")
+
+            trip = Trip("temple food")
+            survival.child = trip
+            ticking = asyncio.create_task(survival.tick(client))
+            await asyncio.wait_for(entered.wait(), 1)
+            survival.hold(client, "stopped by operator")
+            release.set()
+            self.assertFalse(await ticking)
+            self.assertIsNone(survival.child)
+            # No failure backoff: the operator ended it, not the route.
+            self.assertEqual((survival._failures, survival._retry_at), (0, 0.0))
+
+        asyncio.run(scenario())
+
+    def test_operator_stop_persists_across_a_restart_until_autoplay(self):
+        from . import cli as cli_module
+        from . import client as client_module
+        from .cli import autoplay_hold_reason
+        from .web_server import WebControlServer
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "memory.sqlite3")
+
+            def restart():
+                client = AtrinikClient(ClientConfig(
+                    character="Sera", runtime_state_path=path))
+                engine = TaskEngine(client)
+                return client, engine, WebControlServer(client, engine, WorldGraph())
+
+            client, engine, server = restart()
+            self.assertEqual(autoplay_hold_reason(client), "")
+            engine.set_task(AutoplayTask(WorldGraph(), target_level=115))
+            asyncio.run(server._set_task({"type": "stop"}))
+            # The crash and systemd restart: autoplay stays stopped.
+            client, engine, server = restart()
+            self.assertEqual(autoplay_hold_reason(client),
+                             "stopped by operator (kept across restart)")
+            client, engine, server = restart()
+            self.assertTrue(autoplay_hold_reason(client))
+            # Start autoplay clears it for the next restart.
+            result = asyncio.run(server._set_task({"type": "autoplay"}))
+            self.assertEqual(result["task"], engine.task.name)
+            client, engine, server = restart()
+            self.assertEqual(autoplay_hold_reason(client), "")
+            asyncio.run(server._set_task({"type": "stop"}))
+            client, engine, server = restart()
+            self.assertTrue(autoplay_hold_reason(client))
+            # An unreadable flag holds too: never override a Stop blindly.
+            with patch.object(AtrinikClient, "operator_stopped",
+                              side_effect=OSError("disk gone")), \
+                    self.assertLogs(cli_module.__name__, "ERROR"):
+                self.assertEqual(autoplay_hold_reason(client),
+                                 "persisted operator stop unreadable")
+            # A failed save is logged, never raised: Stop still works.
+            with patch.object(client_module.BotMemory, "save",
+                              side_effect=OSError("read-only")), \
+                    self.assertLogs(client_module.__name__, "ERROR"):
+                self.assertFalse(client.set_operator_stopped(True))
+        # Without a configured character nothing is persisted.
+        client = AtrinikClient(ClientConfig())
+        with patch.object(client_module, "BotMemory") as memory:
+            self.assertFalse(client.set_operator_stopped(True))
+            self.assertFalse(client.operator_stopped())
+            memory.assert_not_called()
+
     def test_autoplay_rebuilds_its_child_after_a_lost_connection(self):
         from .autoplay import AutoplayTask
         from .tasks import BotTask

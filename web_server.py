@@ -1018,6 +1018,10 @@ class WebControlServer:
             # connected Atrinik character keeps starving. Stop also ends a
             # running idle food trip and holds the next one off a while.
             self._hold_idle_survival("stopped by operator")
+            # And it outlives a crash or restart: the ``autoplay`` command
+            # stays idle until Start autoplay (systemd restarted a crashed
+            # bot straight back into autoplay).
+            self._persist_operator_stop(True)
             previous = self.engine.task
             if previous:
                 previous.fail("stopped by operator")
@@ -1036,6 +1040,7 @@ class WebControlServer:
             return {"ok": True, "task": None}
         if kind == "autoplay":
             until = max(1, min(115, int(data.get("until_level", 115) or 115)))
+            self._persist_operator_stop(False)
             return await self._replace_task(AutoplayTask(self.graph, target_level=until))
         if kind == "quest":
             name = str(data.get("name", ""))
@@ -1181,6 +1186,11 @@ class WebControlServer:
         if item is None or item.location != self.client.state.player_tag:
             raise ValueError("inventory item no longer exists")
         return item
+
+    def _persist_operator_stop(self, stopped: bool) -> None:
+        setter = getattr(self.client, "set_operator_stopped", None)
+        if setter is not None:
+            setter(stopped)
 
     def _hold_idle_survival(self, reason: str) -> None:
         """End the idle food trip and hold it off, as the operator took over."""
