@@ -19856,8 +19856,9 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
     HOME = ("/shattered_islands/world_0_67", (19, 15))
     SHOP = ("/shattered_islands/world_0_69", (15, 7))
 
-    def client(self, *, bank=5_000, depletion=0, level=36, ranked=True):
-        client = AtrinikClient(ClientConfig())
+    def client(self, *, bank=5_000, depletion=0, level=36, ranked=True,
+               config=None):
+        client = AtrinikClient(config or ClientConfig())
         client.state.phase = "playing"
         client.state.stats.update({"level": level, "exp": 1000, "hp": 134,
                                    "maxhp": 134, "sp": 20, "maxsp": 20,
@@ -20165,6 +20166,32 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(autoplay.tick(client))
         self.assertEqual(client.state.recall_unavailable, "")
         self.assertEqual(client.state.recall_unavailable_at, 0.0)
+
+    def test_start_autoplay_after_a_persisted_stop_goes_into_recovery(self):
+        from .cli import autoplay_hold_reason
+        from .navigation import RecoveryTask
+        from .web_server import WebControlServer
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = ClientConfig(character="Sera", runtime_state_path=str(
+                Path(directory) / "memory.sqlite3"))
+            self.assertTrue(AtrinikClient(config).set_operator_stopped(True))
+            # After the restart: depleted, and the autoplay command idle.
+            client, _ = self.client(depletion=92, config=config)
+            self.assertTrue(autoplay_hold_reason(client))
+            engine = TaskEngine(client)
+            server = WebControlServer(client, engine, built_graph())
+            self.assertIsNone(engine.task)
+            asyncio.run(server._set_task({"type": "autoplay"}))
+            self.assertEqual(autoplay_hold_reason(client), "")
+            autoplay = engine.task
+            for _ in range(3):
+                asyncio.run(autoplay.tick(client))
+        # Straight into recovery: the cure, not a farm circuit.
+        self.assertEqual(autoplay.phase, "recovery")
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+        self.assertIsInstance(autoplay.child.services._restoration.task,
+                              TempleServiceTask)
 
     def test_a_failed_ship_key_raises_recall_unavailable_across_a_restart(self):
         client, _ = self.client()
