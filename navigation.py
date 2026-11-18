@@ -37,7 +37,7 @@ from .client import AtrinikClient, format_money, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import farm_analyzer as farm_analyzer_plan
 from . import self_improvement
-from .model import STARTER_APARTMENT
+from .model import STARTER_APARTMENT, Item
 from .pathfinding import graph_search, grid_reachable, grid_search
 from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
