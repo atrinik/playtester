@@ -1565,6 +1565,42 @@ themselves.
 
 ## 7. Open questions for the owner
 
+Settled on 2026-11-18. These answers override the questions below:
+
+- **Token form (question 2).** A small GitHub App, installed on
+  `atrinik/content`, `atrinik/classic` and `atrinik/playtester` with Issues
+  write only. Issues show as filed by the app, which can set labels and issue
+  types. Its private key is read only by the separate filer process (F6),
+  never by the game process.
+- **Findings about the playtester itself (question 4).** Drafted like any
+  other feedback and, once the owner approves them, filed to
+  `atrinik/playtester` through the same queue.
+- **Trial scope (question 8).** All of these are allowed, under the probe
+  limits and preconditions in 4.4.3:
+  - door trials in the wild and in dungeons;
+  - door trials in towns and quest maps;
+  - lever trials only while she is the only player online, restoring the
+    lever afterwards.
+
+  F7's scope also widens to other objects she meets: anything appliable
+  that 4.4.2 does not list. Before applying such an object, she examines it
+  and reads any sign, book or other hint nearby, as 4.4.1 does for
+  connections. She records what the examine text and the hints say it does.
+  She applies it only when they show no hazard the 4.4.3 preconditions
+  forbid, and records what happened. An object whose effect stays unknown is
+  shadow-only until a supervised session, like F7 itself.
+- **LLM (question 9).** Allowed, local only: an offline model on a lab
+  host, so no game text leaves the lab. Which host is decided when F17 is
+  next. The limits in 4.3.3 still apply (confidence at most 0.5, and never
+  on its own a verdict, an unlock or a draft).
+- **Live character (question 10).** Overtaken by events: on 2026-11-18 Sera
+  was cured of depletion (an owner-triggered operator assist paid the
+  temple), not restarted.
+
+Questions 1, 3, 5, 6, 7 and 11 remain open. Each is asked before the phase
+that needs it: question 1 before F6, question 3 before F6, questions 5 and
+6 before F9, question 7 before F16, and question 11 before F12.
+
 1. **Approval security.** Does the lab proxy in front of
    `playtester.atrinik.orion.milkyway` authenticate, and does it forward,
    strip or rewrite `Origin`? One request answers the second part without
