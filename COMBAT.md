@@ -639,6 +639,31 @@ The money still pays for the depletion removal through the ordinary temple
 service. Her dashboard and metrics keep an `operator-assisted` marker from
 then on, so later progress is not counted as earned.
 
+## Approach danger: known limitations
+
+Since analyzer v3.10.0, autoplay prefers spots whose approach from her
+savebed is known and fully safe (see the README's "Farming analyzer").
+
+- **Navigation does not follow the analyzer's approach.** The analyzer
+  charges the maps on its own least-dangerous path (`approach_maps`), but
+  `NavigateTask` plans its own shortest route around known hazards. Checked
+  on the real graph from her savebed on `world_7_79` (16, 3) to the ten
+  Burnt Forest circuits she now prefers: every route crosses 1 to 6 surface
+  maps outside `approach_maps`. Most are harmless (`world_7_78` has no spawns;
+  `world_15_75` and `world_15_76` are weaker than the charged maps), but some
+  are stronger than the charged worst map. For example, the route to the
+  `world_17_73` circuits crosses `world_16_73` (spot danger 81) and
+  `world_15_73` (47) instead of the charged `world_16_74` (56). All of these
+  stay within one health bar at 197 HP, so the preference still holds there,
+  but in general the approach safety describes a path she may not walk.
+  Following `approach_maps` in navigation is not built yet.
+- **Bed rebinding can re-rank in a loop.** Autoplay moves her savebed toward
+  the chosen circuit, the move changes the approach origin, and the new
+  origin starts a new analysis that may prefer another circuit, whose bed
+  the next trip moves to. Runs stay at least ten minutes apart, and an
+  entrance pack like the Underground City's is charged from every origin,
+  but the loop is not otherwise damped.
+
 ## Next phase: storm farming (owner decisions, 2026-10-22)
 
 At Wizardry 15 the single-target restriction should give way to area spells.

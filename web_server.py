@@ -18,7 +18,7 @@ from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                   POLICIES, RECOMMENDED_QUEST_ORDER)
 from .autoplay import AutoplayTask
 from .build_info import build_info
-from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
+from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_approach
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .face_images import FaceImages
@@ -674,13 +674,13 @@ class DashboardState:
         client = self.client
         state = client.state
         predicted = None
-        analyzer = getattr(client, "farm_analyzer", None)
-        if analyzer is not None:
-            objective = self._farmed_objective()
-            ranked = analyzer.ranking(objective)
-            rate = ranked[0].get("xp_hour") if ranked else None
+        choice = self._farm_choice()
+        if choice is not None:
+            # The spot autoplay farms, not the analyzer's #1 (approach
+            # preference and live failures can pass over it).
+            rate = choice[2].get("xp_hour")
             if isinstance(rate, (int, float)) and not isinstance(rate, bool):
-                predicted = (objective, float(rate))
+                predicted = (choice[0], float(rate))
         return client.metrics.render(
             # An empty inventory before it loads is not an empty purse.
             carried=(BuyShopUpgradeTask.carried_wallet_value(client)
@@ -708,20 +708,28 @@ class DashboardState:
                 })
         return spots
 
-    def _farmed_objective(self) -> str:
-        """The objective she farms now, after depletion and its fallback.
+    def _farm_choice(self):
+        """analyzer_farm_choice's (objective, legs, spot) for now, or None.
 
         Read-only: the dashboard and Prometheus never run a whole-world
         route search on the event loop (cached results only).
         """
-        choice = analyzer_farm_choice(self.client, self.graph, search=False)
+        if getattr(self.client, "farm_analyzer", None) is None:
+            return None
+        return analyzer_farm_choice(self.client, self.graph, search=False)
+
+    def _farmed_objective(self) -> str:
+        """The objective she farms now, after depletion and its fallback."""
+        choice = self._farm_choice()
         return (choice[0] if choice is not None
                 else effective_farm_objective(self.client.state))
 
     def farming_analysis(self) -> dict[str, Any]:
         analyzer = getattr(self.client, "farm_analyzer", None)
         chosen = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
-        objective = self._farmed_objective()
+        choice = self._farm_choice()
+        objective = (choice[0] if choice is not None
+                     else effective_farm_objective(self.client.state))
         if analyzer is None:
             snapshot = {"status": "unavailable", "objective": objective,
                         "objectives": OBJECTIVES, "ranking": []}
@@ -729,6 +737,16 @@ class DashboardState:
             snapshot = dict(analyzer.snapshot(objective))
         # The ranking follows what she farms now; the toggle shows the choice.
         snapshot["selected_objective"] = chosen
+        # The spot autoplay farms, with its rank in that objective's ranking.
+        snapshot["farmed_spot"] = None
+        if choice is not None:
+            spot = choice[2]
+            ranked = [item.get("path") for item in analyzer.ranking(choice[0])]
+            snapshot["farmed_spot"] = {
+                **{key: spot.get(key) for key in SUMMARY_FIELDS},
+                "approach_risky": risky_approach(spot),
+                "rank": (ranked.index(spot.get("path")) + 1
+                         if spot.get("path") in ranked else None)}
         snapshot["objective_override"] = (
             {"reason": "depletion",
              "points": int(self.client.state.depletion_points)}
