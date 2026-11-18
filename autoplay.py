@@ -10,8 +10,8 @@ from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
 from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
-                         analyzer_farm_selection, food_reserve, hungry,
-                         temple_food_trip)
+                         analyzer_farm_selection, farming_unsafe_reason,
+                         food_reserve, hungry, temple_food_trip)
 from .alerts import HUNGRY_FOOD
 from .quest_tasks import EscapingDesertedIslandTask
 from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
@@ -300,8 +300,11 @@ class AutoplayTask(BotTask):
             return
 
         if self.child is not None:
+            # No progression detour while farming is unsafe: the circuit
+            # does only essentials then (farming_unsafe_reason).
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
+                    not farming_unsafe_reason(client) and
                     self.child.safe_for_progression_detour(client)):
                 if self._needs_mana_crystal_start(client):
                     await self._start_mana_crystal_detour(client)
@@ -378,15 +381,19 @@ class AutoplayTask(BotTask):
             self.complete()
             return
 
-        if self._needs_mana_crystal_start(client):
-            await self._start_mana_crystal_detour(client)
-            return
-        if self._needs_mana_crystal_recovery(client):
-            await self._start_mana_crystal_recovery(client)
-            return
-        if self._needs_mana_crystal_upgrade(client):
-            await self._start_mana_crystal_upgrade(client)
-            return
+        # While farming is unsafe, the farm circuit runs only its essentials
+        # (food, bank, the cure and its funding, a recall replacement); no
+        # progression detour starts.
+        if not farming_unsafe_reason(client):
+            if self._needs_mana_crystal_start(client):
+                await self._start_mana_crystal_detour(client)
+                return
+            if self._needs_mana_crystal_recovery(client):
+                await self._start_mana_crystal_recovery(client)
+                return
+            if self._needs_mana_crystal_upgrade(client):
+                await self._start_mana_crystal_upgrade(client)
+                return
 
         # The farming analyzer is the only source of farm spots. Until its
         # first ranking (or a usable, unquarantined spot) exists, stay safe

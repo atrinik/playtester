@@ -1,8 +1,9 @@
 """Dashboard alerts: what needs the operator's attention right now.
 
 Raised for repeated deaths, starvation, an idle character that cannot reach
-food, a character that is stuck while autoplay runs, a lost connection, and
-a task engine whose steps keep failing.
+food, farming suspended while unsafe (and money that blocks its end), a
+character that is stuck while autoplay runs, a lost connection, and a task
+engine whose steps keep failing.
 The client keeps a ``ProgressWatch`` current; the dashboard serves the active
 alerts on every live poll.
 """
@@ -28,6 +29,11 @@ IDLE_HUNGER_ACTIONS = ("idle-hunger", "idle-hunger-fed", "idle-hunger-failed")
 # and no idle survival, so she stands there.
 ENGINE_ERROR_STEPS = 5
 ENGINE_ERROR_CRITICAL_SECONDS = 10 * 60.0
+# The farm circuit's unsafe-farming decisions (navigation.farming_unsafe_reason):
+# suspended with its reason, money that blocks the way out, and resumed.
+FARMING_SUSPENDED = "farming-suspended"
+FARMING_RESUMED = "farming-resumed"
+UNFUNDED_ACTIONS = ("cure-unfunded", "recall-unfunded")
 
 
 class ProgressWatch:
@@ -95,6 +101,32 @@ def idle_food_failure(decisions: Iterable[dict], now: float) -> dict | None:
     return latest
 
 
+def farming_suspension(decisions: Iterable[dict], since: float
+                       ) -> tuple[dict | None, dict | None]:
+    """The suspension still in force and its money blocker, if any.
+
+    Only records since ``since`` (the running autoplay's start) and after
+    the latest farming-resumed count: a new run records its own.
+    """
+    suspended = unfunded = None
+    for record in sorted(
+            (record for record in decisions if isinstance(record, dict) and
+             float(record.get("time", 0.0) or 0.0) >= since and
+             record.get("action") in (FARMING_SUSPENDED, FARMING_RESUMED,
+                                      *UNFUNDED_ACTIONS)),
+            key=lambda record: float(record.get("time", 0.0) or 0.0)):
+        action = record.get("action")
+        if action == FARMING_RESUMED:
+            suspended = unfunded = None
+        elif action == FARMING_SUSPENDED:
+            # A new reason starts a new episode: its money blocker, if
+            # any, is recorded again after it.
+            suspended, unfunded = record, None
+        else:
+            unfunded = record
+    return suspended, unfunded if suspended is not None else None
+
+
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
            autoplay_started_at: float | None, task_running: bool = False,
            engine_error: dict | None = None,
@@ -141,10 +173,24 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
         alerts.append({"id": "idle-food", "level": "critical",
                        "text": "Idle and cannot reach food: "
                                f"{failure.get('detail', '')}"})
+    suspended = None
+    if autoplay_started_at is not None:
+        suspended, unfunded = farming_suspension(decisions, autoplay_started_at)
+        if unfunded is not None:
+            action = str(unfunded.get("action"))
+            label = "Cure" if action == "cure-unfunded" else "Recall"
+            alerts.append({"id": action, "level": "critical",
+                           "text": f"{label} unfunded: "
+                                   f"{unfunded.get('detail', '')}"})
+        if suspended is not None:
+            alerts.append({"id": FARMING_SUSPENDED, "level": "warn",
+                           "text": "Farming suspended: "
+                                   f"{suspended.get('detail', '')}"})
     if autoplay_started_at is not None and getattr(state, "phase", "") == "playing":
-        # Inactivity before this autoplay run started is not being stuck.
+        # Inactivity before this autoplay run started is not being stuck,
+        # and neither is waiting out a farming suspension.
         since = max(watch.exp_changed_at, watch.moved_at, autoplay_started_at)
-        if now - since >= STUCK_SECONDS:
+        if suspended is None and now - since >= STUCK_SECONDS:
             alerts.append({"id": "stuck", "level": "warn",
                            "text": f"No XP or movement for {int((now - since) // 60)} min"})
     return alerts

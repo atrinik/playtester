@@ -4048,6 +4048,71 @@ def effective_farm_objective(state) -> str:
     return "safety" if depleted_for_temple(state) else chosen
 
 
+# From this level recall shopping replaces a recall source
+# (FarmCircuitTask._needs_recall_shopping); below it nothing would.
+RECALL_REQUIRED_LEVEL = 18
+NO_RECALL_REASON = "no working emergency recall source"
+
+
+def emergency_recall_unusable(client: AtrinikClient) -> bool:
+    """Whether she owns a recall source but none of them works now.
+
+    A source is what FarmTask.emergency_recall_candidates fires, read
+    without its mana check: a known Word of Recall spell, or a paid,
+    identified, uncursed rod or wand. It works unless it is a wand known to
+    be empty (observe_wand_feedback) or a device waiting out
+    RECALL_DEVICE_RETRY_SECONDS after it said it cannot fire. A wand of
+    unknown charge works until its examine text says otherwise. Owning
+    none at all is not this: that character never relied on one, and
+    recall shopping buys the first.
+    """
+    retry = getattr(client, "recall_device_retry_at", {}) or {}
+    now = time.monotonic()
+    policy = InventoryPolicy()
+    owned = False
+    for item in getattr(client.state, "inventory", ()):
+        if (not re.search(r"\bword of recall\b", item.name, re.I) or
+                item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)):
+            continue
+        if item.item_type == c.TYPE_SPELL:
+            return False
+        if (item.item_type in (c.TYPE_ROD, c.TYPE_WAND) and
+                policy.identified(item)):
+            owned = True
+            if (not wand_known_empty(client, item) and
+                    float(retry.get(item.tag, 0.0)) <= now):
+                return False
+    return owned
+
+
+def farming_unsafe_reason(client: AtrinikClient) -> str:
+    """Why farming must wait, or "" while it is safe enough to farm.
+
+    Two conditions, each of which kept farming going into a death spiral
+    live (2026-11-17: ten deaths in under three hours, depletion 68 to 92):
+
+    - depletion at the temple-service threshold (depleted_for_temple). That
+      is where the circuit already holds that the lowered stats make the
+      chosen spots deadly (effective_farm_objective). Every death adds a
+      point and the fee does not grow with them, so farming on to pay the
+      fee only adds deaths;
+    - from RECALL_REQUIRED_LEVEL, recall sources that no longer work
+      (emergency_recall_unusable): no charges left and none ready.
+
+    While either holds, the farm circuit does only essentials (food, its
+    savebed, the bank, the cure, its funding and a recall replacement) and
+    otherwise waits at her savebed (FarmCircuitTask._hold_while_unsafe).
+    """
+    state = client.state
+    if depleted_for_temple(state):
+        return (f"depletion {int(state.depletion_points)} at or above "
+                f"{FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD}")
+    level = int((getattr(state, "stats", {}) or {}).get("level", 0) or 0)
+    if level >= RECALL_REQUIRED_LEVEL and emergency_recall_unusable(client):
+        return NO_RECALL_REASON
+    return ""
+
+
 # Services a depleted character must reach for her cure and its funding, all
 # planned with strict_safety: the bank, the apartment chest, the Brynknot shop
 # floor, Kulgar's identify-all and Saruthar's temple.
@@ -4396,9 +4461,10 @@ def analyzer_farm_choice(
 
     If depletion prefers safety but no safety spot qualifies, the chosen
     objective's spot applies, and failing that the best usable safety spot.
-    The circuit removes depletion before any farming whenever an item or the
-    temple fee allows, and farming is what pays that fee; holding instead
-    could leave her depleted for good.
+    While she is depleted that far, farming itself is suspended
+    (farming_unsafe_reason): the circuit removes depletion first, funds the
+    fee from what she owns, and otherwise waits for money rather than farm
+    for it, so this pick is only what the dashboard shows meanwhile.
     """
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
@@ -4861,6 +4927,8 @@ class FarmCircuitTask(BotTask):
     PROGRESS_CHECKPOINT_INTERVAL = 5 * 60
     UPGRADE_SWEEP_INTERVAL = 24 * 60 * 60
     RECALL_SHOP_INTERVAL = 24 * 60 * 60
+    # Recall shopping starts only with this much money (wallet_value).
+    RECALL_SHOP_MINIMUM_WALLET = 1_250
     UTILITY_SHOP_INTERVAL = 24 * 60 * 60
     UPGRADE_SWEEP_WALLET_GROWTH = 5_000
     UPGRADE_SWEEP_POLICY = 8
@@ -5016,6 +5084,13 @@ class FarmCircuitTask(BotTask):
         self._restoration_retry_at = 0.0
         self._expedition_origin: tuple[str, int, int] | None = None
         self._expedition_return: NavigateTask | None = None
+        # Farming suspended while unsafe (farming_unsafe_reason): the reason
+        # recorded, whether the money alert was recorded this episode, and
+        # the walk back to her savebed.
+        self._unsafe_reason = ""
+        self._unfunded_recorded = ""
+        self._unsafe_return: NavigateTask | None = None
+        self._unsafe_return_retry_at = 0.0
         self._expedition_abort_reason = ""
         self._decision_history_index = 0
         self._decision_history_time = 0.0
@@ -5381,7 +5456,9 @@ class FarmCircuitTask(BotTask):
             # route death is still being judged, or a fight or loot is
             # being finished, keep the current plan.
             blocked = route_death_blocked_maps(client, self.graph, search=False)
-            if blocked is None or busy:
+            # While farming is suspended the circuit farms nothing anyway,
+            # and only it runs the cure, its funding and recall shopping.
+            if blocked is None or busy or farming_unsafe_reason(client):
                 return False
             quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
             now = time.time()
@@ -6534,6 +6611,119 @@ class FarmCircuitTask(BotTask):
         return (isinstance(farm, FarmTask) and
                 not self._busy_finishing_fight_or_loot(client, farm))
 
+    # A walk back to her savebed that failed is retried after this long;
+    # meanwhile she waits where she is.
+    UNSAFE_RETURN_RETRY_SECONDS = 120.0
+
+    def _savebed_home(self, client: AtrinikClient
+                      ) -> tuple[str, tuple[int, int]] | None:
+        """Her savebed, where every death returns her, if known and mapped."""
+        path = getattr(client.state, "savebed_map", "") or ""
+        xy = getattr(client.state, "savebed_xy", None)
+        if not path or xy is None or path not in self.graph.nodes:
+            return None
+        return path, (int(xy[0]), int(xy[1]))
+
+    def _money_blocker(self, client: AtrinikClient, reason: str
+                       ) -> tuple[str, str] | None:
+        """(decision, detail) when only money stands between her and safe
+        farming: the temple cure, or a replacement recall source."""
+        wallet = BuyShopUpgradeTask.wallet_value(client)
+        if self._cure_shortfall(client):
+            return ("cure-unfunded",
+                    f"remove depletion costs "
+                    f"{format_money(self._depletion_service_cost(client))}, "
+                    f"she has {format_money(wallet)} and nothing left to "
+                    "sell; farming waits for money (operator assist)")
+        if (reason == NO_RECALL_REASON and
+                wallet < self.RECALL_SHOP_MINIMUM_WALLET):
+            return ("recall-unfunded",
+                    f"recall shopping needs "
+                    f"{format_money(self.RECALL_SHOP_MINIMUM_WALLET)}, she "
+                    f"has {format_money(wallet)}; farming waits for money "
+                    "(operator assist)")
+        return None
+
+    async def _hold_while_unsafe(self, client: AtrinikClient, farm: FarmTask,
+                                 reason: str) -> bool:
+        """No farming while unsafe (farming_unsafe_reason): wait at her savebed.
+
+        Reached only once every essential errand above (food, savebed, bank,
+        the cure, its funding, recall shopping) had nothing to start. When
+        money is what blocks, a "cure-unfunded" or "recall-unfunded"
+        decision raises the dashboard alert, once per episode. A fight in
+        progress (hits on her in this life) is left to the ordinary farm and
+        transit handling, which defend, heal and flee; holding still under
+        attack would be worse. Otherwise she walks back to her savebed and
+        waits there, healing and eating; with no known savebed, or while a
+        failed walk waits to be retried, where she stands. Wands of unknown
+        charge are examined meanwhile, so an empty one stops counting.
+        Returns False only when the fight is left to that handling.
+        """
+        recorder = getattr(client, "record_action", None)
+        if reason != self._unsafe_reason:
+            self._unsafe_reason = reason
+            self._unfunded_recorded = ""
+            self._unsafe_return = None
+            log.warning("farming suspended: %s", reason)
+            if recorder is not None:
+                recorder("farming-suspended", reason)
+        if _contact_this_life(client):
+            return False
+        await farm.check_recall_wand(client)
+        blocker = self._money_blocker(client, reason)
+        if blocker is None:
+            self._unfunded_recorded = ""
+        elif blocker[0] != self._unfunded_recorded:
+            self._unfunded_recorded = blocker[0]
+            log.warning("%s: %s", *blocker)
+            if recorder is not None:
+                recorder(*blocker)
+        home = self._savebed_home(client)
+        navigation = self._unsafe_return
+        if (home is not None and navigation is not None and
+                navigation.status == TaskStatus.FAILED and
+                self.clock() >= self._unsafe_return_retry_at):
+            navigation = self._unsafe_return = None
+        if home is not None and navigation is None:
+            await client.clear_actions()
+            await client.set_combat(False)
+            await client.clear_target()
+            navigation = self._unsafe_return = NavigateTask(
+                self.graph, home[0], home[1], tolerance=1)
+        if navigation is not None and navigation.status in (
+                TaskStatus.READY, TaskStatus.RUNNING):
+            if not await self.child.safety.enforce(client):
+                return True
+            await navigation.tick(client)
+            if navigation.status == TaskStatus.FAILED:
+                log.warning("unsafe-farming return to savebed failed: %s",
+                            navigation.error)
+                self._unsafe_return_retry_at = (
+                    self.clock() + self.UNSAFE_RETURN_RETRY_SECONDS)
+            return True
+        await self.child.safety.enforce(client)
+        return True
+
+    def _resume_farming(self, client: AtrinikClient) -> None:
+        """Farming is safe again: record it and let the circuit walk on.
+
+        After a walk back to her savebed the farm child is rebuilt, so its
+        route to the spot is planned from where she now stands.
+        """
+        log.info("farming resumed (was suspended: %s)", self._unsafe_reason)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("farming-resumed", f"was suspended: {self._unsafe_reason}")
+        walked = self._unsafe_return is not None
+        self._unsafe_reason = ""
+        self._unfunded_recorded = ""
+        self._unsafe_return = None
+        if walked:
+            self.child = self._new_child()
+            self._farm_started_at = 0.0
+            self._empty_spawn_since = 0.0
+
     async def _maintain_safe_inventory(self, client: AtrinikClient,
                                        farm: FarmTask) -> bool:
         """Reconcile loot between pulls even on continuously respawning maps."""
@@ -6626,9 +6816,11 @@ class FarmCircuitTask(BotTask):
             for item in client.state.inventory)
 
     def _needs_recall_shopping(self, client: AtrinikClient) -> bool:
-        if (int(client.state.stats.get("level", 0) or 0) < 18 or
+        if (int(client.state.stats.get("level", 0) or 0) <
+                RECALL_REQUIRED_LEVEL or
                 not self._has_ship_key(client) or
-                BuyShopUpgradeTask.wallet_value(client) < 1_250 or
+                BuyShopUpgradeTask.wallet_value(client) <
+                self.RECALL_SHOP_MINIMUM_WALLET or
                 self.clock() < self._recall_shopping_retry_at):
             return False
         wizardry = self._skill_level(client, "wizardry spells")
@@ -7546,6 +7738,10 @@ class FarmCircuitTask(BotTask):
             self._banking = self._new_bank_deposit(client)
             await self._banking.tick(client)
             return
+        # While farming is unsafe only essentials run: a recall replacement
+        # and the free ship key it needs, but no discretionary purchase,
+        # which would spend the cure's money.
+        unsafe = farming_unsafe_reason(client)
         if (isinstance(farm, FarmTask) and
                 self._needs_ship_key(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
@@ -7554,7 +7750,7 @@ class FarmCircuitTask(BotTask):
             self._ship_key = MorgeeanShipKeyTask(self.graph)
             await self._ship_key.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not unsafe and
                 self._needs_spell_purchase(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -7570,7 +7766,7 @@ class FarmCircuitTask(BotTask):
             self._recall_shopping = self._new_recall_shopping(client)
             await self._recall_shopping.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not unsafe and
                 self._needs_utility_shopping(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -7578,7 +7774,7 @@ class FarmCircuitTask(BotTask):
             self._utility_shopping = self._new_utility_shopping(client)
             await self._utility_shopping.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not unsafe and
                 self._needs_upgrade_shopping(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -7586,6 +7782,22 @@ class FarmCircuitTask(BotTask):
             self._shopping = self._new_upgrade_shopping(client)
             await self._shopping.tick(client)
             return
+        if isinstance(farm, FarmTask):
+            if unsafe:
+                if await self._hold_while_unsafe(client, farm, unsafe):
+                    return
+            else:
+                if (self._unsafe_reason and
+                        not self._busy_finishing_fight_or_loot(client, farm)):
+                    self._resume_farming(client)
+                if (client.state.map.path != self.child.navigation.destination
+                        and not _contact_this_life(client)):
+                    # Before walking out, learn the charges of a recall wand
+                    # of unknown charge, as the farm does on its quiet
+                    # ticks: live, each life brought new tags for her two
+                    # empty wands (most likely her checkpoint relogs), and a
+                    # wand known empty under an old tag passed for an escape.
+                    await farm.check_recall_wand(client)
         # Once a leg changes, leave the respawning farm directly. The generic
         # combat-aware wrapper is intentionally biased toward clearing every
         # visible pack, which can make departure from a farm impossible. Keep

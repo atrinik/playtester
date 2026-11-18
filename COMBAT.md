@@ -612,6 +612,57 @@ on 2026-11-14, Stop left Sera idle, without food or money, on her savebed in
 Clearhaven; she starved to death 22 times, about every 50 minutes, and her
 depletion rose from 41 to 67.
 
+## No farming while unsafe (owner decision, 2026-11-17)
+
+Live, on 2026-11-17, Sera died ten times in under three hours, eight of
+them on the Burnt Forest circuits and the roads to them. Depletion rose
+from 68 to 92 and her maximum health fell from 197 to 134. Both her recall
+wands were empty, and she had 1,038 copper against a 2,865 cure. Every
+safeguard above held as designed and none stopped her. The kit hazard
+marked every Burnt Forest circuit, but with every usable spot hazardous
+she farmed the least dangerous one. Pauses quarantined one leg map at a
+time, so she moved to a sibling circuit. The temple threshold only changed
+which objective she farmed, because farming was what paid the fee.
+
+`farming_unsafe_reason` now suspends farming in two cases:
+
+- depletion at the temple-service threshold (`DEPLETION_SERVICE_THRESHOLD`,
+  3 points, shown as `conditions.depletion_threshold`, with the live
+  depletion force). The circuit already treated that as the point where
+  the lowered stats make her spots deadly. The fee does not grow with the
+  points, and every death adds one, so a higher limit would only allow
+  more deaths. Maximum-health loss cannot serve as the limit: the client
+  has no undepleted baseline, and level and gear move it too. The kit
+  comparison is relative between failures, and its fallback is what kept
+  her farming;
+- from level 18 (`RECALL_REQUIRED_LEVEL`, where recall shopping starts),
+  owning recall sources none of which works: every wand known empty, and
+  no rod ready or spell known (`emergency_recall_unusable`). A wand of
+  unknown charge counts until examined. Before she walks out, the circuit
+  examines such a wand: the empty mark is kept by item tag, and live each
+  life brought new tags for the same two wands (most likely her
+  checkpoint relogs), so she fired both again. A character who never
+  owned a recall source is not held; recall shopping buys her first one.
+
+While suspended, the circuit runs only essentials: food, its savebed, bank
+sync and deposits, the temple cure, the cure-funding path (apartment
+stock, junk sale, identify-all) and recall shopping with the free ship key
+it needs. It runs no spell, utility or upgrade purchases, which would
+spend the cure's money, and autoplay starts no Gandyld detour. Otherwise
+she walks back to her savebed and waits there (`farming-suspended`). An
+attack in progress is left to the ordinary farm and transit handling,
+which defend, heal and flee.
+
+If only money stands in the way, the circuit records `cure-unfunded`
+(depletion) or `recall-unfunded` (under the 1,250 copper recall shopping
+needs) once per episode. The dashboard shows it as a critical alert next
+to the `farming-suspended` warning, and the `stuck` alert is not raised
+while she waits. The owner can then give her gold with the operator
+assist. The cure then runs through the ordinary temple flow, and once
+nothing is unsafe the circuit records `farming-resumed` and walks to its
+spot again. Nobody sells recall charges: recharging needs the recharge
+spell, so an empty wand is replaced, never refilled.
+
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 
 Sera needed 2,865 copper for the temple's remove-depletion prayer and had
