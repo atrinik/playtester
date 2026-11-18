@@ -9,9 +9,10 @@ import time
 from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
-from .navigation import (FarmCircuitTask, NavigateThenTask, WorldGraph,
-                         analyzer_farm_selection, farming_unsafe_reason,
-                         food_reserve, hungry, temple_food_trip)
+from .navigation import (FarmCircuitTask, NavigateThenTask, RecoveryTask,
+                         WorldGraph, analyzer_farm_selection,
+                         farming_unsafe_reason, food_reserve, hungry,
+                         temple_food_trip)
 from .alerts import HUNGRY_FOOD
 from .quest_tasks import EscapingDesertedIslandTask
 from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
@@ -62,6 +63,9 @@ class AutoplayTask(BotTask):
         # circuit inherits them, so it does not restart an errand that just
         # failed (live: the walk to a full apartment chest, every cycle).
         self._circuit_backoffs: dict[str, float] = {}
+        # What the recovery phase learned (RecoveryTask.memory), kept across
+        # the temple food trips that interrupt it, until farming resumes.
+        self._recovery_memory: dict = {}
         self.safety = SafetyPolicy()
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
@@ -259,6 +263,36 @@ class AutoplayTask(BotTask):
                 self.child = None
             raise
 
+    async def _start_recovery(self, client: AtrinikClient) -> None:
+        """Run the recovery phase while farming is unsafe (RecoveryTask)."""
+        await client.clear_actions()
+        await client.set_combat(False)
+        await client.clear_target()
+        await self._set_child(client, "recovery", RecoveryTask(
+            self.graph, backoffs=self._circuit_backoffs,
+            memory=self._recovery_memory))
+
+    def recovery_alerts(self, client: AtrinikClient
+                        ) -> tuple[list[dict[str, str]], bool]:
+        """Dashboard alerts while farming is unsafe, from live state, and
+        whether she is waiting at her savebed on an alerted blocker (then
+        the stuck alert would say nothing new).
+
+        The farming-suspended warning follows the live reason in any phase;
+        the specific blockers come from the recovery phase.
+        """
+        reason = farming_unsafe_reason(client)
+        if not reason or self.status != TaskStatus.RUNNING:
+            return [], False
+        alerts = [{"id": "farming-suspended", "level": "warn",
+                   "text": f"Farming suspended: {reason}"}]
+        waiting = False
+        if isinstance(self.child, RecoveryTask):
+            blockers = self.child.alerts(client)
+            alerts = blockers + alerts
+            waiting = bool(blockers) and self.child.waiting(client)
+        return alerts, waiting
+
     async def _set_child(self, client: AtrinikClient, phase: str,
                          child: BotTask) -> None:
         self.phase = phase
@@ -300,11 +334,17 @@ class AutoplayTask(BotTask):
             return
 
         if self.child is not None:
-            # No progression detour while farming is unsafe: the circuit
-            # does only essentials then (farming_unsafe_reason).
+            # Unsafe to farm: the recovery phase replaces the circuit once
+            # no maintenance trip of its own is under way.
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
-                    not farming_unsafe_reason(client) and
+                    not self.child.maintenance_running() and
+                    farming_unsafe_reason(client)):
+                self._circuit_backoffs = self.child.backoffs()
+                await self._start_recovery(client)
+                return
+            if (self.phase == "adaptive-farming" and
+                    isinstance(self.child, FarmCircuitTask) and
                     self.child.safe_for_progression_detour(client)):
                 if self._needs_mana_crystal_start(client):
                     await self._start_mana_crystal_detour(client)
@@ -317,7 +357,7 @@ class AutoplayTask(BotTask):
                     return
             try:
                 await self.child.tick(client)
-                if isinstance(self.child, FarmCircuitTask):
+                if isinstance(self.child, (FarmCircuitTask, RecoveryTask)):
                     self._circuit_backoffs = self.child.backoffs()
             except ConnectionError as exc:
                 # The child's dialogue, transfer, or purchase may be half done;
@@ -362,6 +402,8 @@ class AutoplayTask(BotTask):
                 checkpoint = getattr(client, "checkpoint_reconnect", None)
                 if checkpoint is not None and await checkpoint():
                     return
+            elif completed_phase == "recovery":
+                self._recovery_memory = {}
             elif completed_phase == "adaptive-farming":
                 if int(client.state.stats.get("level", 0) or 0) >= \
                         self.target_level:
@@ -381,19 +423,20 @@ class AutoplayTask(BotTask):
             self.complete()
             return
 
-        # While farming is unsafe, the farm circuit runs only its essentials
-        # (food, bank, the cure and its funding, a recall replacement); no
-        # progression detour starts.
-        if not farming_unsafe_reason(client):
-            if self._needs_mana_crystal_start(client):
-                await self._start_mana_crystal_detour(client)
-                return
-            if self._needs_mana_crystal_recovery(client):
-                await self._start_mana_crystal_recovery(client)
-                return
-            if self._needs_mana_crystal_upgrade(client):
-                await self._start_mana_crystal_upgrade(client)
-                return
+        # Unsafe to farm: recovery, whether or not any spot is ranked, and
+        # no progression detour.
+        if farming_unsafe_reason(client):
+            await self._start_recovery(client)
+            return
+        if self._needs_mana_crystal_start(client):
+            await self._start_mana_crystal_detour(client)
+            return
+        if self._needs_mana_crystal_recovery(client):
+            await self._start_mana_crystal_recovery(client)
+            return
+        if self._needs_mana_crystal_upgrade(client):
+            await self._start_mana_crystal_upgrade(client)
+            return
 
         # The farming analyzer is the only source of farm spots. Until its
         # first ranking (or a usable, unquarantined spot) exists, stay safe

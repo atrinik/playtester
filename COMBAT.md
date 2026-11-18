@@ -624,7 +624,7 @@ she farmed the least dangerous one. Pauses quarantined one leg map at a
 time, so she moved to a sibling circuit. The temple threshold only changed
 which objective she farmed, because farming was what paid the fee.
 
-`farming_unsafe_reason` now suspends farming in two cases:
+`farming_unsafe_reason` now holds farming in two cases:
 
 - depletion at the temple-service threshold (`DEPLETION_SERVICE_THRESHOLD`,
   3 points, shown as `conditions.depletion_threshold`, with the live
@@ -638,30 +638,60 @@ which objective she farmed, because farming was what paid the fee.
 - from level 18 (`RECALL_REQUIRED_LEVEL`, where recall shopping starts),
   owning recall sources none of which works: every wand known empty, and
   no rod ready or spell known (`emergency_recall_unusable`). A wand of
-  unknown charge counts until examined. Before she walks out, the circuit
-  examines such a wand: the empty mark is kept by item tag, and live each
-  life brought new tags for the same two wands (most likely her
-  checkpoint relogs), so she fired both again. A character who never
-  owned a recall source is not held; recall shopping buys her first one.
+  unknown charge counts until examined. A character who never owned a
+  recall source is not held; recall shopping buys her first one.
 
-While suspended, the circuit runs only essentials: food, its savebed, bank
-sync and deposits, the temple cure, the cure-funding path (apartment
-stock, junk sale, identify-all) and recall shopping with the free ship key
-it needs. It runs no spell, utility or upgrade purchases, which would
-spend the cure's money, and autoplay starts no Gandyld detour. Otherwise
-she walks back to her savebed and waits there (`farming-suspended`). An
-attack in progress is left to the ordinary farm and transit handling,
-which defend, heal and flee.
+While either holds, autoplay runs a recovery phase (`RecoveryTask`)
+instead of a farm circuit, whether or not the analyzer ranks a spot. A
+running circuit is replaced once none of its own maintenance trips is
+under way. Each tick the recovery phase:
 
-If only money stands in the way, the circuit records `cure-unfunded`
-(depletion) or `recall-unfunded` (under the 1,250 copper recall shopping
-needs) once per episode. The dashboard shows it as a critical alert next
-to the `farming-suspended` warning, and the `stuck` alert is not raised
-while she waits. The owner can then give her gold with the operator
-assist. The cure then runs through the ordinary temple flow, and once
-nothing is unsafe the circuit records `farming-resumed` and walks to its
-spot again. Nobody sells recall charges: recharging needs the recharge
-spell, so an empty wand is replaced, never refilled.
+- while she is hit, fires the emergency recall by the farm's own rule,
+  then heals, takes the low-health retreat, or defends where she stands.
+  A walk or errand under way defends itself. There is no farm route to
+  resume;
+- heals and eats. Hunger with nothing to eat is autoplay's temple food
+  trip, as before;
+- off her savebed with nothing running, walks home on a strict route, so
+  every errand starts from her savebed;
+- depleted: the strict temple cure when she can pay (a depletion potion
+  first); otherwise the cure-funding path (identify-all, junk sale,
+  deposit, the apartment chest);
+- not depleted, without a working recall: recall shopping, with the free
+  ship key it needs. Depletion wins: no recall is bought with the cure's
+  money;
+- otherwise waits at her savebed.
+
+It never walks a farm route, rebinds her savebed or makes a discretionary
+purchase. Its trips are the farm circuit's own, with their retry
+deadlines (`FarmCircuitTask._tick_running_service`). Once nothing is
+unsafe and nothing is under way, it records `farming-resumed`, and
+autoplay starts a circuit again.
+
+The dashboard reads its alerts from live state on every poll, so each one
+clears as soon as its condition does:
+
+- `farming-suspended` (warning), with the live reason, in any autoplay
+  phase;
+- `cure-unfunded`: depleted, short of the fee, and no funding trip can
+  run. Operator assist can give her the gold;
+- `cure-unreachable`: three strict temple trips in a row refused for want
+  of a safe route from her savebed;
+- `recall-unfunded`: under the 1,250 copper recall shopping needs.
+  Operator assist can give her the gold;
+- `recall-unavailable`: the last recall shopping failed or bought nothing.
+
+The `stuck` alert is left out only while she waits at her savebed on one
+of these blockers. A cure walk or other errand that stalls still raises
+it. A temple food trip interrupts the phase, and what it learned (refused
+cure routes, a fruitless shop) carries over to the next one.
+
+Before a farm circuit walks out, it examines every recall wand of unknown
+charge and waits for the answers (or the 5 s timeout). The empty mark is
+kept by item tag, and live, each life brought new tags for the same two
+wands (most likely her checkpoint relogs), so she walked back out and
+fired them again. Nobody sells recall charges: recharging needs the
+recharge spell, so an empty wand is replaced, never refilled.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 

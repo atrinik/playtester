@@ -19814,8 +19814,20 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
                          FarmCircuitTask.PASSIVE_SAFETY)
 
 
+class _DoneErrand(BotTask):
+    """A maintenance trip that ends on its next tick, as given."""
+
+    def __init__(self, status=TaskStatus.COMPLETE, task=None, error=""):
+        super().__init__("errand")
+        self.outcome, self.outcome_error = status, error
+        self.task = task or BotTask("x")
+
+    async def tick(self, client):
+        self.status, self.error = self.outcome, self.outcome_error
+
+
 class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
-    """No farming while unsafe (navigation.farming_unsafe_reason).
+    """No farming while unsafe: autoplay's recovery phase (RecoveryTask).
 
     Live, 2026-11-17: depleted from 68 to 92 points, with two empty recall
     wands and 1,038 copper against a 2,865 cure, Sera kept farming the
@@ -19825,8 +19837,9 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
     TREES = "/shattered_islands/world_14_79"
     # Her savebed for these tests: the bank square, a walkable town tile.
     HOME = ("/shattered_islands/world_0_67", (19, 15))
+    SHOP = ("/shattered_islands/world_0_69", (15, 7))
 
-    def client(self, *, bank=5_000, depletion=0, level=36):
+    def client(self, *, bank=5_000, depletion=0, level=36, ranked=True):
         client = AtrinikClient(ClientConfig())
         client.state.phase = "playing"
         client.state.stats.update({"level": level, "exp": 1000, "hp": 134,
@@ -19836,8 +19849,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.bank_balance_known = True
         client.state.bank_balance_observed_at = time.time()
         client.state.savebed_map, client.state.savebed_xy = self.HOME
-        client.state.map.path = self.HOME[0]
-        client.state.map.world_x, client.state.map.world_y = self.HOME[1]
+        self.place(client, self.HOME)
         if depletion:
             client.state.depletion_points = depletion
             client.state.depletion_points_known = True
@@ -19845,33 +19857,37 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
                 502, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
                 client.state.player_tag)
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
-        client.farm_analyzer = StubAnalyzer({"xp": [trees], "safety": [trees]})
-        self.sent = []
+        client.farm_analyzer = StubAnalyzer(
+            {"xp": [trees], "safety": [trees]} if ranked else {})
+        client.state.quests_loaded = True
+        client.state.quests = {
+            EscapingDesertedIslandTask.QUEST: QuestProgress(
+                EscapingDesertedIslandTask.QUEST, status="completed"),
+            AutoplayTask.MANA_CRYSTAL_QUEST: QuestProgress(
+                AutoplayTask.MANA_CRYSTAL_QUEST, status="completed")}
+        self.moves = []
 
         async def send(packet):
-            self.sent.append(packet)
+            pass
+
+        async def move(direction, run=False):
+            self.moves.append(direction)
 
         client.send = send
+        client.move = move
         return client, trees
 
-    def circuit(self, client, spot, *, essentials=()):
-        """A running circuit whose maintenance checks are all idle, but for
-        the ``essentials`` named, which keep their real test."""
-        from .navigation import analyzer_spot_legs
+    @staticmethod
+    def place(client, where):
+        client.state.map.path = where[0]
+        client.state.map.world_x, client.state.map.world_y = where[1]
 
-        circuit = FarmCircuitTask(built_graph(), list(analyzer_spot_legs(
-            spot, built_graph())), analyzer_driven=True, spot=spot)
-        circuit.child = circuit._new_child()
-        circuit.status = TaskStatus.RUNNING
+    def recovery(self, client, now=None):
+        from .navigation import RecoveryTask
 
-        async def idle(*args, **kwargs):
-            return False
-
-        circuit.server_clock.sync = idle
-        for name in dir(circuit):
-            if name.startswith("_needs_") and name not in essentials:
-                setattr(circuit, name, lambda *args, **kwargs: False)
-        return circuit
+        now = now if now is not None else [1_000.0]
+        task = RecoveryTask(built_graph(), clock=lambda: now[0])
+        return task, now
 
     @staticmethod
     def empty_wands(client, *tags):
@@ -19888,6 +19904,10 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
     def actions(client):
         return [entry["action"] for entry in client.decision_history]
 
+    @staticmethod
+    def ids(alerts):
+        return [alert["id"] for alert in alerts]
+
     def test_unsafe_reasons_follow_the_depletion_threshold_and_recall(self):
         from .navigation import NO_RECALL_REASON, farming_unsafe_reason
         from .tasks import wand_charges
@@ -19898,8 +19918,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # Two empty wands, as live: no working source.
         self.empty_wands(client, 77, 78)
         self.assertEqual(farming_unsafe_reason(client), NO_RECALL_REASON)
-        # A wand of unknown charge counts until its examine says otherwise
-        # (live, relogs renumbered her wands and lost what was known).
+        # A wand of unknown charge counts until its examine says otherwise.
         wand_charges(client).pop(78)
         self.assertEqual(farming_unsafe_reason(client), "")
         wand_charges(client)[78] = 0
@@ -19930,139 +19949,204 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.remove_item(502)
         self.assertEqual(farming_unsafe_reason(client), "")
 
-    def test_heavy_depletion_stops_farming_and_starts_the_cure(self):
-        client, trees = self.client(depletion=92)
-        circuit = self.circuit(client, trees, essentials=(
-            "_needs_depletion_service", "_needs_bank_sync"))
-        asyncio.run(circuit.tick(client))
-        # The temple cure is the first thing she does, not the farm.
-        self.assertIsNotNone(circuit._restoration)
-        self.assertIsInstance(circuit._restoration.task, TempleServiceTask)
-        self.assertEqual(circuit.child.navigation.status, TaskStatus.READY)
-        # A failed removal waits out its backoff: she still does not farm.
-        circuit._restoration = None
-        circuit._restoration_retry_at = circuit.clock() + 1800.0
-        for _ in range(3):
-            asyncio.run(circuit.tick(client))
-        self.assertIsNone(circuit._restoration)
-        self.assertEqual(circuit.child.navigation.status, TaskStatus.READY)
-        self.assertEqual(self.actions(client).count("farming-suspended"), 1)
-        self.assertNotIn("cure-unfunded", self.actions(client))
+    def test_a_fresh_run_without_a_ranking_starts_the_cure_while_depleted(self):
+        from .alerts import STUCK_SECONDS, ProgressWatch, active
+        from .navigation import RecoveryTask
 
-    def test_no_recall_source_stops_farming_until_one_is_bought(self):
-        from .navigation import NO_RECALL_REASON
+        client, _ = self.client(depletion=92, ranked=False)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+        asyncio.run(autoplay.tick(client))
+        restoration = autoplay.child.services._restoration
+        self.assertIsInstance(restoration.task, TempleServiceTask)
+        self.assertTrue(restoration.navigation.strict_safety)
+        self.assertIn("farming-suspended", self.actions(client))
+        # The cure walk is under way: only the general warning, and a cure
+        # walk that stalls is still reported as stuck.
+        alerts, waiting = autoplay.recovery_alerts(client)
+        self.assertEqual(self.ids(alerts), ["farming-suspended"])
+        self.assertIn("depletion 92", alerts[0]["text"])
+        self.assertFalse(waiting)
+        watch = ProgressWatch(now=time.time() - 2 * STUCK_SECONDS)
+        self.assertIn("stuck", self.ids(active(
+            client.state, client.decision_history, watch,
+            autoplay_started_at=time.time() - 2 * STUCK_SECONDS,
+            task_running=True, waiting_explained=waiting)))
+
+    def test_she_walks_home_after_an_errand_and_never_rebinds_her_savebed(self):
+        client, _ = self.client(depletion=92, bank=1_038)
+        recovery, now = self.recovery(client)
+        rebinds = []
+        recovery.services._needs_savebed = (
+            lambda client: rebinds.append(1) or True)
+        # A junk sale just finished on the shop floor.
+        self.place(client, self.SHOP)
+        recovery.services._selling = _DoneErrand()
+        asyncio.run(recovery.tick(client))
+        self.assertIsNone(recovery.services._selling)
+        self.assertEqual(self.moves, [])
+        asyncio.run(recovery.tick(client))
+        walk = recovery._home_walk
+        self.assertEqual(walk.navigation.destination, self.HOME[0])
+        self.assertTrue(walk.navigation.strict_safety)
+        # No other errand starts before she is home.
+        self.assertIsNone(recovery.services._cure_funding)
+        for _ in range(3):
+            asyncio.run(recovery.tick(client))
+        self.assertEqual(rebinds, [])
+        self.assertIsNone(recovery.services._bed_binding)
+
+    def test_a_hit_during_recovery_never_walks_the_farm_route(self):
+        from .navigation import RecoveryTask
 
         client, trees = self.client(bank=1_038)
-        self.empty_wands(client, 77, 78)
-        circuit = self.circuit(client, trees)
-        asyncio.run(circuit.tick(client))
-        asyncio.run(circuit.tick(client))
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        circuit = autoplay.child
+        # Her last recall wand said poof, and something is hitting her.
+        self.empty_wands(client, 77)
+        client.state.add_message(2, "ff0000",
+                                 "singed deer hit you for 22 (-15) impact damage.")
+        for _ in range(3):
+            asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(autoplay.child, RecoveryTask)
+        # The circuit's farm walk never ran, and recovery has none.
         self.assertEqual(circuit.child.navigation.status, TaskStatus.READY)
-        suspended = [entry for entry in client.decision_history
-                     if entry["action"] == "farming-suspended"]
-        self.assertEqual([entry["detail"] for entry in suspended],
-                         [NO_RECALL_REASON])
-        # Recall shopping needs 1,250: money blocks the replacement.
-        self.assertIn("recall-unfunded", self.actions(client))
-        # Recall shopping stays an essential while farming waits.
-        bought = []
+        self.assertIsNone(autoplay.child._home_walk)
+        self.assertIsNone(autoplay.child.child)
+        self.assertEqual(self.moves, [])
+
+    def test_no_strict_route_to_the_temple_raises_cure_unreachable(self):
+        client, _ = self.client(depletion=92)
+        # Saruthar's map is itself a learned hazard: no strict route.
+        client.state.route_hazards["/shattered_islands/world_3_58"] = (
+            time.time() + 3600)
+        recovery, now = self.recovery(client)
+        for attempt in range(recovery.CURE_ROUTE_ATTEMPTS):
+            self.assertNotIn("cure-unreachable", self.ids(recovery.alerts(client)))
+            asyncio.run(recovery.tick(client))
+            asyncio.run(recovery.tick(client))
+            self.assertIsNone(recovery.services._restoration)
+            now[0] += FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS + 1
+        alerts = recovery.alerts(client)
+        self.assertEqual(self.ids(alerts), ["cure-unreachable"])
+        self.assertIn("known hazard", alerts[0]["text"])
+        self.assertTrue(recovery.waiting(client))
+        # Cured some other way (a potion): the alert is gone at once.
+        client.state.remove_item(502)
+        self.assertEqual(recovery.alerts(client), [])
+
+    def test_recall_shopping_that_buys_nothing_raises_recall_unavailable(self):
+        client, _ = self.client(bank=1_038)
+        self.empty_wands(client, 77, 78)
+        recovery, now = self.recovery(client)
+        # Under the 1,250 recall shopping needs: unfunded, for the owner.
+        alerts = recovery.alerts(client)
+        self.assertEqual(self.ids(alerts), ["recall-unfunded"])
+        self.assertIn("operator assist", alerts[0]["text"])
+        client.state.bank_balance = 5_000
+        self.assertEqual(recovery.alerts(client), [])
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        shopped = []
 
         def shop(client):
-            task = NavigateThenTask(built_graph(), self.HOME[0], BotTask("shop"),
-                                    destination_xy=self.HOME[1])
-            bought.append(task)
-            return task
+            shopped.append(_DoneErrand(task=BotTask("stock")))
+            return shopped[-1]
 
-        circuit._needs_recall_shopping = lambda client: True
-        circuit._new_recall_shopping = shop
-        asyncio.run(circuit.tick(client))
-        self.assertEqual(len(bought), 1)
-        self.assertIs(circuit._recall_shopping, bought[0])
-        # A new wand: farming resumes and the farm walk starts.
-        circuit._recall_shopping = None
-        circuit._needs_recall_shopping = lambda client: False
+        recovery.services._new_recall_shopping = shop
+        asyncio.run(recovery.tick(client))
+        asyncio.run(recovery.tick(client))
+        self.assertEqual(len(shopped), 1)
+        alerts = recovery.alerts(client)
+        self.assertEqual(self.ids(alerts), ["recall-unavailable"])
+        self.assertIn("no recall source", alerts[0]["text"])
+        # A working wand: nothing is unsafe, no alert, and recovery ends.
         client.state.place_item(Item(
             80, item_type=c.TYPE_WAND, quality=80, condition=80,
             name="pine wand of word of recall (lvl 17)"),
             client.state.player_tag)
-        asyncio.run(circuit.tick(client))
+        self.assertEqual(recovery.alerts(client), [])
+        asyncio.run(recovery.tick(client))
+        self.assertEqual(recovery.status, TaskStatus.COMPLETE)
         self.assertIn("farming-resumed", self.actions(client))
-        self.assertNotEqual(circuit.child.navigation.status, TaskStatus.READY)
 
-    def test_unfunded_cure_raises_the_alert_and_idles_at_her_savebed(self):
+    def test_depletion_wins_over_recall_shopping(self):
+        client, _ = self.client(depletion=92)
+        self.empty_wands(client, 77)
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        recovery, _ = self.recovery(client)
+        recovery.services._new_recall_shopping = lambda client: self.fail(
+            "recall bought with the cure's money")
+        asyncio.run(recovery.tick(client))
+        self.assertIsInstance(recovery.services._restoration.task,
+                              TempleServiceTask)
+
+    def test_money_arriving_mid_run_clears_cure_unfunded(self):
         from .alerts import STUCK_SECONDS, ProgressWatch, active
         from .client import format_money
 
-        started = time.time() - 1
-        client, trees = self.client(bank=1_038, depletion=92)
-        circuit = self.circuit(client, trees, essentials=(
-            "_needs_depletion_service", "_needs_cure_funding",
-            "_needs_junk_sale", "_needs_bank_sync"))
+        client, _ = self.client(depletion=92, bank=1_038)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        recovery = autoplay.child
         # The chest trip found nothing to sell: funding waits its retry.
-        circuit._cure_funding_retry_at = (
-            circuit.clock() + circuit.CURE_FUNDING_RETRY_SECONDS)
+        recovery.services._cure_funding_retry_at = (
+            recovery.clock() + FarmCircuitTask.CURE_FUNDING_RETRY_SECONDS)
         for _ in range(3):
-            asyncio.run(circuit.tick(client))
-        self.assertEqual(circuit.child.navigation.status, TaskStatus.READY)
-        self.assertEqual(self.actions(client).count("cure-unfunded"), 1)
-        unfunded = next(entry for entry in client.decision_history
-                        if entry["action"] == "cure-unfunded")
-        self.assertIn(format_money(2_865), unfunded["detail"])
-        # She waits at her savebed: the walk there is already complete.
-        self.assertEqual(circuit._unsafe_return.status, TaskStatus.COMPLETE)
-        watch = ProgressWatch(now=started - STUCK_SECONDS)
-        alerts = {alert["id"]: alert for alert in active(
+            asyncio.run(autoplay.tick(client))
+        alerts, waiting = autoplay.recovery_alerts(client)
+        self.assertEqual(self.ids(alerts), ["cure-unfunded", "farming-suspended"])
+        self.assertIn(format_money(2_865), alerts[0]["text"])
+        self.assertIn("operator assist", alerts[0]["text"])
+        # Waiting at her savebed on an alerted blocker is not being stuck.
+        self.assertTrue(waiting)
+        watch = ProgressWatch(now=time.time() - 2 * STUCK_SECONDS)
+        self.assertNotIn("stuck", self.ids(active(
             client.state, client.decision_history, watch,
-            autoplay_started_at=started - STUCK_SECONDS,
-            task_running=True)}
-        self.assertEqual(alerts["cure-unfunded"]["level"], "critical")
-        self.assertIn("operator assist", alerts["cure-unfunded"]["text"])
-        self.assertIn("depletion 92", alerts["farming-suspended"]["text"])
-        # Waiting out a suspension is not being stuck.
-        self.assertNotIn("stuck", alerts)
-        # A later autoplay run does not inherit the old alert.
-        self.assertEqual(active(client.state, client.decision_history, watch,
-                                autoplay_started_at=time.time() + 1,
-                                task_running=True), [])
-        # Operator assist gives her a gold coin: the cure runs next.
+            autoplay_started_at=time.time() - 2 * STUCK_SECONDS,
+            task_running=True, waiting_explained=waiting)))
+        self.assertEqual(self.moves, [])
+        # Operator assist: a gold coin. The alert clears before any tick...
         client.state.place_item(Item(
             600, item_type=c.TYPE_MONEY, quality=0, name="gold coin"),
             client.state.player_tag)
-        asyncio.run(circuit.tick(client))
-        self.assertIsNotNone(circuit._restoration)
+        self.assertEqual(self.ids(autoplay.recovery_alerts(client)[0]),
+                         ["farming-suspended"])
+        # ...and the cure starts on the next.
+        asyncio.run(autoplay.tick(client))
+        self.assertIsInstance(recovery.services._restoration.task,
+                              TempleServiceTask)
 
-    def test_once_cured_farming_resumes(self):
-        from .alerts import farming_suspension
-
-        started = time.time() - 1
-        client, trees = self.client(bank=1_038, depletion=92)
-        circuit = self.circuit(client, trees)
-        # Away from her savebed when it starts: she walks back first.
-        client.state.map.path = "/shattered_islands/world_0_68"
-        client.state.map.world_x, client.state.map.world_y = 5, 8
-        asyncio.run(circuit.tick(client))
-        self.assertEqual(circuit.child.navigation.status, TaskStatus.READY)
-        self.assertEqual(circuit._unsafe_return.destination, self.HOME[0])
-        self.assertIsNotNone(farming_suspension(
-            client.decision_history, started)[0])
+    def test_farming_resumes_after_the_cure(self):
+        client, _ = self.client(depletion=92)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
         # The temple removed the force.
+        autoplay.child.services._restoration = None
         client.state.remove_item(502)
         client.state.depletion_points = 0
-        previous = circuit.child
-        asyncio.run(circuit.tick(client))
+        self.assertEqual(autoplay.recovery_alerts(client), ([], False))
+        asyncio.run(autoplay.tick(client))
         self.assertIn("farming-resumed", self.actions(client))
-        self.assertIsNone(circuit._unsafe_return)
-        # Rebuilt after the walk home: the farm route starts from here.
-        self.assertIsNot(circuit.child, previous)
-        self.assertNotEqual(circuit.child.navigation.status, TaskStatus.READY)
-        self.assertEqual(farming_suspension(client.decision_history, started),
-                         (None, None))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        self.assertIsInstance(autoplay.child, FarmCircuitTask)
 
-    def test_a_wand_of_unknown_charge_is_examined_before_she_walks_out(self):
-        from .navigation import NO_RECALL_REASON
+    def test_the_walk_out_waits_for_recall_wand_examines(self):
+        from .navigation import analyzer_spot_legs
 
         client, trees = self.client()
-        # A relog renumbered her empty wand: its charge is unknown again.
+        # A relog renumbered her wand: its charge is unknown again.
         client.state.place_item(Item(
             90, item_type=c.TYPE_WAND, quality=80, condition=80,
             name="pine wand of word of recall (lvl 17)"),
@@ -20073,39 +20157,29 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             examined.append(tag)
 
         client.examine = examine
-        circuit = self.circuit(client, trees)
-        asyncio.run(circuit.tick(client))
+        circuit = FarmCircuitTask(built_graph(), list(analyzer_spot_legs(
+            trees, built_graph())), analyzer_driven=True, spot=trees)
+        circuit.child = circuit._new_child()
+        circuit.status = TaskStatus.RUNNING
+
+        async def idle(*args, **kwargs):
+            return False
+
+        circuit.server_clock.sync = idle
+        for name in dir(circuit):
+            if name.startswith("_needs_"):
+                setattr(circuit, name, lambda *args, **kwargs: False)
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        # Asked once, and she has not moved while the answer is pending.
         self.assertEqual(examined, [90])
-        client.state.add_message(0, "ffffff", "It has 0 charges left.")
-        asyncio.run(circuit.tick(client))
-        asyncio.run(circuit.tick(client))
-        self.assertIn({"action": "farming-suspended", "detail": NO_RECALL_REASON},
-                      [{key: entry[key] for key in ("action", "detail")}
-                       for entry in client.decision_history])
-
-    def test_a_fight_in_progress_is_left_to_the_farm(self):
-        client, trees = self.client(depletion=92, bank=1_038)
-        circuit = self.circuit(client, trees)
-        client.state.add_message(2, "ff0000",
-                                 "singed deer hit you for 22 (-15) impact damage.")
-        self.assertFalse(asyncio.run(circuit._hold_while_unsafe(
-            client, circuit.child.task, "depletion 92 at or above 3")))
-        self.assertIsNone(circuit._unsafe_return)
-
-    def test_autoplay_starts_no_progression_detour_while_unsafe(self):
-        client, trees = self.client(depletion=92)
-        client.state.quests_loaded = True
-        client.state.quests = {
-            EscapingDesertedIslandTask.QUEST: QuestProgress(
-                EscapingDesertedIslandTask.QUEST, status="completed")}
-        autoplay = AutoplayTask(built_graph(), target_level=115)
-        asyncio.run(autoplay.tick(client))
-        asyncio.run(autoplay.tick(client))
-        # Gandyld's starter is due at her level, but she is depleted: the
-        # farm circuit, which runs the cure, starts instead.
-        self.assertTrue(autoplay._needs_mana_crystal_start(client))
-        self.assertEqual(autoplay.phase, "adaptive-farming")
-        self.assertIsInstance(autoplay.child, FarmCircuitTask)
+        self.assertEqual(self.moves, [])
+        self.assertNotEqual(circuit.child.navigation.status, TaskStatus.RUNNING)
+        client.state.add_message(0, "ffffff", "It has 5 charges left.")
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        self.assertEqual(circuit.child.navigation.status, TaskStatus.RUNNING)
+        self.assertNotEqual(self.moves, [])
 
 
 class RouteFailureTests(unittest.TestCase):
