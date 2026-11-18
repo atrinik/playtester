@@ -9,8 +9,9 @@ import time
 from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
-from .navigation import (NO_RECALL_REASON, FarmCircuitTask,
+from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          NavigateThenTask, RecoveryTask,
+                         emergency_recall_unusable,
                          WorldGraph, analyzer_farm_selection,
                          farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
@@ -44,6 +45,8 @@ class AutoplayTask(BotTask):
     # circuit's essential trip or farm fight: farm combat can pull the next
     # target, and a cure trip can stall.
     HANDOVER_SECONDS = 120.0
+    # While she carries unpaid stock, the wait for its settling trip.
+    HANDOVER_UNPAID_SECONDS = 300.0
     # A priest whose food trip failed is passed over this long.
     TEMPLE_PRIEST_RETRY = 60 * 60
 
@@ -71,9 +74,6 @@ class AutoplayTask(BotTask):
         # Since when a due switch to the recovery phase waits for the
         # circuit (AutoplayTask.HANDOVER_SECONDS).
         self._handover_since: float | None = None
-        # What the recovery phase learned (RecoveryTask.memory), kept across
-        # the temple food trips that interrupt it, until farming resumes.
-        self._recovery_memory: dict = {}
         self.safety = SafetyPolicy()
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
@@ -278,16 +278,18 @@ class AutoplayTask(BotTask):
         await client.clear_target()
         self._handover_since = None
         await self._set_child(client, "recovery", RecoveryTask(
-            self.graph, backoffs=self._circuit_backoffs,
-            memory=self._recovery_memory))
+            self.graph, backoffs=self._circuit_backoffs))
 
     @staticmethod
     def _forget_stale_recall_note(client: AtrinikClient) -> None:
-        """Clear the persisted recall-unavailable note once a missing recall
-        is not what holds farming (cured, a working source, or depletion
-        first), so a later recall loss never shows an old reason."""
+        """Clear the persisted recall-unavailable note once recall works
+        again (a working source, or below RECALL_REQUIRED_LEVEL), so a
+        later recall loss never shows an old reason. Depletion taking
+        priority does not clear it: the recall is still missing."""
+        level = int(client.state.stats.get("level", 0) or 0)
         if (getattr(client.state, "recall_unavailable", "") and
-                farming_unsafe_reason(client) != NO_RECALL_REASON):
+                (level < RECALL_REQUIRED_LEVEL or
+                 not emergency_recall_unusable(client))):
             setter = getattr(client, "set_recall_unavailable", None)
             if setter is not None:
                 setter("")
@@ -373,14 +375,24 @@ class AutoplayTask(BotTask):
                 now = time.monotonic()
                 if self._handover_since is None:
                     self._handover_since = now
-                if (self.child.ready_for_handover(client) or
-                        now - self._handover_since >= self.HANDOVER_SECONDS):
+                waited = now - self._handover_since
+                # A payment under way is never cut off at the cap: unpaid
+                # stock waits for its settling trip, up to the longer limit.
+                capped = waited >= (
+                    self.HANDOVER_UNPAID_SECONDS
+                    if self.child.carries_unpaid(client)
+                    else self.HANDOVER_SECONDS)
+                if self.child.ready_for_handover(client) or capped:
                     self._circuit_backoffs = self.child.backoffs()
                     await self._start_recovery(client)
                     return
                 self.child.hold_new_pulls()
             else:
                 self._handover_since = None
+                if isinstance(self.child, FarmCircuitTask):
+                    # Safe again before the switch (a rod's retry ran out):
+                    # farm normally.
+                    self.child.hold_new_pulls(False)
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
                     self.child.safe_for_progression_detour(client)):
@@ -440,8 +452,6 @@ class AutoplayTask(BotTask):
                 checkpoint = getattr(client, "checkpoint_reconnect", None)
                 if checkpoint is not None and await checkpoint():
                     return
-            elif completed_phase == "recovery":
-                self._recovery_memory = {}
             elif completed_phase == "adaptive-farming":
                 if int(client.state.stats.get("level", 0) or 0) >= \
                         self.target_level:

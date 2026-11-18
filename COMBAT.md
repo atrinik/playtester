@@ -645,13 +645,17 @@ While either holds, autoplay runs a recovery phase (`RecoveryTask`)
 instead of a farm circuit, whether or not the analyzer ranks a spot.
 When the switch is due, the circuit's discretionary trips end at once
 (upgrade sweep, spell purchase, utility and recall shopping, savebed
-rebinding). The exceptions are a shop trip still settling a purchase and
-any trip while she carries unpaid stock: those finish paying first.
+rebinding). The exceptions are a shop trip still settling a purchase and,
+while she carries unpaid stock, the one trip paying for it: those finish
+paying first.
 Essential trips finish first (food, bank, identify, storage, the cure and
 its funding), and so does a fight on the farm map, under the farm's own
 combat and emergency recall. Meanwhile the farm pulls no new target
 (`FarmTask.hold_new_pulls`): it finishes the engaged one and fights what
-comes at her. The wait lasts at most `HANDOVER_SECONDS` (120 s). A fight on the road is no reason to wait,
+comes at her; if farming turns safe again before the switch, the hold
+lifts. The wait lasts at most `HANDOVER_SECONDS` (120 s), or
+`HANDOVER_UNPAID_SECONDS` (300 s) while she still carries unpaid stock,
+so a payment is not cut off. A fight on the road is no reason to wait,
 since waiting would walk her on along the farm route. Each tick the
 recovery phase:
 
@@ -690,19 +694,21 @@ clears as soon as its condition does:
   way (one that is merely due does not hide it). Operator assist can give
   her the gold;
 - `cure-unreachable`: three strict temple trips in a row refused for want
-  of a safe route from her savebed;
+  of a safe route from her savebed. Each refusal is a recorded decision
+  (`cure-route-refused`, reset by `cure-route-cleared` or
+  `farming-resumed`), so the count survives Stop and restarts;
 - `recall-unfunded`: under the 1,250 copper recall shopping needs.
   Operator assist can give her the gold;
 - `recall-unavailable`: the last recall shopping failed or bought nothing,
   or getting the ship key it needs failed. The reason is kept in her
   persisted state (`recall_unavailable`) for a day, so it survives Stop
-  and restarts. It is cleared whenever a missing recall is not what holds
-  farming, so a later recall loss never shows an old reason.
+  and restarts. It is cleared once recall works again (or below level
+  18), so a later recall loss never shows an old reason; depletion taking
+  priority does not clear it.
 
 The `stuck` alert is left out only while she waits at her savebed on one
 of these blockers. A cure walk or other errand that stalls still raises
-it. A temple food trip interrupts the phase, and its count of refused
-cure routes carries over to the next one.
+it.
 
 Before a farm circuit walks out, it examines every recall wand of unknown
 charge and waits for the answers (or the 5 s timeout). The empty mark is

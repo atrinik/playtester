@@ -6604,27 +6604,45 @@ class FarmCircuitTask(BotTask):
     def drop_discretionary_trips(self, client: AtrinikClient) -> list[str]:
         """End the trips in DROPPED_AT_HANDOVER; the names of those ended.
 
-        A shop trip settling a purchase (its ``settlement`` set), or any
-        trip while she carries unpaid stock, is kept: it finishes paying
-        before the switch.
+        A shop trip settling a purchase (its ``settlement`` set) is kept,
+        and so, while she carries unpaid stock, is the one trip paying for
+        it (_paying_trip): each finishes paying before the switch.
         """
-        unpaid = any(item.flags & c.ITEM_UNPAID
-                     for item in client.state.inventory)
+        paying = self._paying_trip(client)
         dropped = []
         for name in self.DROPPED_AT_HANDOVER:
             task = getattr(self, name)
-            if task is not None and not unpaid and getattr(
-                    task, "settlement", None) is None:
+            if (task is not None and name != paying and
+                    getattr(task, "settlement", None) is None):
                 dropped.append(task.name)
                 setattr(self, name, None)
         return dropped
 
-    def hold_new_pulls(self) -> None:
+    @staticmethod
+    def carries_unpaid(client: AtrinikClient) -> bool:
+        return any(item.flags & c.ITEM_UNPAID for item in client.state.inventory)
+
+    def _paying_trip(self, client: AtrinikClient) -> str:
+        """The trip in DROPPED_AT_HANDOVER that pays for her unpaid stock,
+        or "": the one settling a purchase, else a shop-floor trip under way
+        (an upgrade sweep, then utility shopping). Food bought on a shop
+        floor is the resupply's, an essential that is never dropped."""
+        if not self.carries_unpaid(client) or self._resupply is not None:
+            return ""
+        running = [name for name in self.DROPPED_AT_HANDOVER
+                   if getattr(self, name) is not None]
+        return next((name for name in running if getattr(
+            getattr(self, name), "settlement", None) is not None), next((
+                name for name in ("_shopping", "_utility_shopping")
+                if name in running), ""))
+
+    def hold_new_pulls(self, hold: bool = True) -> None:
         """While the switch to recovery waits: the farm pulls no new target
-        (FarmTask.hold_new_pulls); a rebuilt farm child is held again."""
+        (FarmTask.hold_new_pulls); a rebuilt farm child is held again.
+        ``hold`` False lifts it once farming is safe again."""
         farm = self.child.task if self.child is not None else None
         if isinstance(farm, FarmTask):
-            farm.hold_new_pulls = True
+            farm.hold_new_pulls = hold
 
     def ready_for_handover(self, client: AtrinikClient) -> bool:
         """Whether autoplay may replace this circuit by its recovery phase.
@@ -7937,7 +7955,6 @@ class RecoveryTask(BotTask):
 
     def __init__(self, graph: WorldGraph, *,
                  backoffs: dict[str, float] | None = None,
-                 memory: dict | None = None,
                  clock: Callable[[], float] = time.monotonic):
         super().__init__("recovery")
         self.graph = graph
@@ -7952,11 +7969,10 @@ class RecoveryTask(BotTask):
                                          combat_approach=True)
         self._home_walk: NavigateThenTask | None = None
         self._home_retry_at = 0.0
-        # What outlives a temple food trip, which replaces this phase:
-        # consecutive strict-route refusals of the cure. Autoplay keeps it.
-        # Why a recall replacement came to nothing is persisted instead
-        # (GameState.recall_unavailable), so it survives Stop and restarts.
-        self.memory = memory if memory is not None else {}
+        # Strict-route refusals of the cure are recorded decisions
+        # (cure_route_refusals), and why a recall replacement came to
+        # nothing is persisted state (GameState.recall_unavailable): both
+        # outlive a temple food trip, Stop and restarts.
         self.reason = ""
 
     def backoffs(self) -> dict[str, float]:
@@ -8036,13 +8052,12 @@ class RecoveryTask(BotTask):
                                  f"{format_money(cost)}, "
                                  f"she has {format_money(wallet)} and nothing "
                                  "left to sell" + assist}]
-            failures = int(self.memory.get("cure_route_failures", 0) or 0)
+            failures, error = self.cure_route_refusals(client)
             if failures >= self.CURE_ROUTE_ATTEMPTS:
                 return [{"id": "cure-unreachable", "level": "critical",
                          "text": "Cure unreachable: no strictly safe route to "
                                  f"the temple from her savebed after {failures} "
-                                 "attempts: "
-                                 f"{self.memory.get('cure_route_error', '')}"}]
+                                 f"attempts: {error}"}]
             return []
         if reason != NO_RECALL_REASON:
             return []
@@ -8061,6 +8076,37 @@ class RecoveryTask(BotTask):
                      "text": f"Recall unavailable: {unavailable}"}]
         return []
 
+    # Refusals older than this no longer count toward cure-unreachable.
+    CURE_ROUTE_WINDOW_SECONDS = 24 * 3600.0
+    CURE_ROUTE_ACTIONS = ("cure-route-refused", "cure-route-cleared",
+                          "farming-resumed")
+
+    @classmethod
+    def cure_route_refusals(cls, client: AtrinikClient) -> tuple[int, str]:
+        """Strict temple trips refused in a row, and the latest refusal.
+
+        Read from her persisted decisions, so the count survives temple
+        food trips, Stop and restarts: refusals since the last
+        cure-route-cleared or farming-resumed, within a day.
+        """
+        count, error = 0, ""
+        cutoff = time.time() - cls.CURE_ROUTE_WINDOW_SECONDS
+        for record in getattr(client, "decision_history", ()):
+            if (not isinstance(record, dict) or
+                    record.get("action") not in cls.CURE_ROUTE_ACTIONS):
+                continue
+            if record.get("action") != "cure-route-refused":
+                count, error = 0, ""
+            elif float(record.get("time", 0.0) or 0.0) >= cutoff:
+                count, error = count + 1, str(record.get("detail", ""))
+        return count, error
+
+    @staticmethod
+    def _record(client: AtrinikClient, action: str, detail: str) -> None:
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder(action, detail)
+
     async def _tick_services(self, client: AtrinikClient) -> bool:
         """The circuit's trip under way, noting the outcomes alerts need."""
         s = self.services
@@ -8070,12 +8116,11 @@ class RecoveryTask(BotTask):
             if restoration.status == TaskStatus.FAILED:
                 if (s.failure_backoff(restoration.error, 0.0) ==
                         s.STRICT_ROUTE_RETRY_SECONDS):
-                    self.memory["cure_route_failures"] = int(
-                        self.memory.get("cure_route_failures", 0) or 0) + 1
-                    self.memory["cure_route_error"] = restoration.error
-            else:
-                self.memory.pop("cure_route_failures", None)
-                self.memory.pop("cure_route_error", None)
+                    self._record(client, "cure-route-refused",
+                                 restoration.error)
+            elif self.cure_route_refusals(client)[0]:
+                self._record(client, "cure-route-cleared",
+                             f"temple trip {restoration.status.value}")
         if shopping is not None and s._recall_shopping is None:
             shopper = shopping.task
             if shopping.status == TaskStatus.FAILED:
