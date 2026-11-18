@@ -298,7 +298,11 @@ when the coin reached her. The running bot then:
    plays, the amount is 1 gold coin (the cap), the last run that reached
    `/create` was more than 24 hours ago, and she is idle at a safe square:
    logged in, no task or idle food trip, no target or combat, nothing hit her
-   in the last 10 seconds, health at least 90% and food at least 300;
+   in the last 10 seconds, health at least 90% and food at least 300; and
+   she can carry the coin (the server refuses a pickup unless what she
+   carries plus the coin stays under her weight limit, which depletion
+   lowers with Str: on 2026-11-18 Sera carried 40.6 kg against 25 kg, so
+   shed weight first);
 2. holds her still (`TaskEngine.operator_hold`: no task, idle survival or
    inventory upkeep acts; dashboard tasks other than Stop and manual
    actions are refused) and cancels her queued movement;
@@ -313,7 +317,9 @@ when the coin reached her. The running bot then:
    dropper's sub-layer, and `/tp` does not set it), then sends
    `/create goldcoin` (one gold coin, 10,000 copper, into the operator's
    inventory), drops exactly that coin and logs out;
-5. has her pick the coin up from her square, then releases the hold.
+5. has her pick the coin up from her square, then releases the hold. The
+   ground window sends no item types, so the coin underfoot is the item
+   named `gold coin`.
 
 Each step has a timeout, and before every order and on every poll it checks
 that holding her is still safe (no target or combat, no hit on her, health

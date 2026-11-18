@@ -22173,7 +22173,8 @@ class FakeOperatorSession:
             return
         self.state.remove_item(tag)
         sera = self.sera.state
-        sera.items[901] = Item(901, location=0, item_type=c.TYPE_MONEY,
+        # The look window sends no item type (esrv_draw_look).
+        sera.items[901] = Item(901, location=0, weight=0.01,
                                name="gold coin", quantity=quantity)
         sera.inventories.setdefault(0, []).append(901)
         if self.after_drop is not None:
@@ -22345,6 +22346,78 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stored)
         self.assertTrue(all(r["outcome"] == "refused" and not r["counts"] for r in stored))
         self.assertFalse(self.assist.status()["assisted"])
+
+    async def test_refuses_when_she_cannot_carry_the_coin(self):
+        # Depletion lowers Str and so her weight limit (player_can_carry):
+        # an overloaded character cannot pick the coin up, so nothing is
+        # created. Live, 2026-11-18: 40.6 kg carried against a 25 kg limit.
+        from .operator_assist import OperatorAssistRefused
+
+        state = self.client.state
+        state.stats["weight_limit"] = 25.0
+        state.items[700] = Item(700, location=100, weight=40.6,
+                                item_type=c.TYPE_ARMOUR, name="ring mail")
+        state.inventories[100].append(700)
+        with self.assertRaisesRegex(OperatorAssistRefused,
+                                    "cannot pick up the coin.*40.60 kg of her 25.00 kg"):
+            await self.assist.run(1, "Sera")
+        self.assertEqual(self.sessions, [])
+        self.assertFalse(self.stored()[-1]["counts"])
+        state.items[700].weight = 24.9
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual(record["outcome"], "completed", record)
+
+    async def test_gold_already_underfoot_is_not_taken_for_the_dropped_coin(self):
+        state = self.client.state
+        state.items[800] = Item(800, location=0, name="gold coin", quantity=1)
+        state.inventories.setdefault(0, []).append(800)
+        # The drop never lands: the old coin must not read as the new one.
+        self.session_options = {"drops": False}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual((record["failed_step"], record["coin"], record["ground_gold_before"]),
+                         ("drop", "operator-inventory", 1))
+        self.assertNotIn((100, 800, 1), self.client.moves)
+
+    async def test_pickup_takes_the_dropped_coin_not_older_gold_underfoot(self):
+        state = self.client.state
+        state.items[800] = Item(800, location=0, name="gold coins", quantity=3)
+        state.inventories.setdefault(0, []).append(800)
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual(record["outcome"], "completed", record)
+        self.assertEqual(record["ground_gold_before"], 3)
+        self.assertEqual(self.client.moves[-1], (100, 901, 1))
+        self.assertEqual(state.items[800].quantity, 3)
+
+    async def test_pickup_finds_the_coin_merged_with_gold_underfoot(self):
+        # object_insert_map keeps the dropped coin and folds the old stack
+        # into it: the old tag vanishes, the new one holds the sum.
+        state = self.client.state
+        state.items[800] = Item(800, location=0, name="gold coins", quantity=3)
+        state.inventories.setdefault(0, []).append(800)
+
+        def merge():
+            state.remove_item(800)
+            state.items[901].quantity += 3
+            state.items[901].name = "gold coins"
+
+        self.session_options = {"after_drop": merge}
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual(record["outcome"], "completed", record)
+        self.assertEqual(self.client.moves[-1], (100, 901, 1))
+
+    def test_ground_gold_is_read_by_name_as_the_look_window_sends_no_type(self):
+        from .operator_assist import gold_stack
+
+        ground = [Item(1, name="gold coin", quantity=1),
+                  Item(2, name="gold coins", quantity=12),
+                  Item(6, name="12 gold coins", quantity=12),
+                  Item(3, name="gold ring", quantity=1),
+                  Item(4, name="silver coin", quantity=5),
+                  Item(5, name="gold coin", item_type=c.TYPE_RING, quantity=1)]
+        total, largest = gold_stack(ground, ground=True)
+        self.assertEqual((total, largest.tag), (13, 2))
+        # In an inventory the type is always sent: untyped items never count.
+        self.assertEqual(gold_stack(ground), (0, None))
 
     async def test_one_run_per_24_hours(self):
         from .operator_assist import OperatorAssistRefused

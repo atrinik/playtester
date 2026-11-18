@@ -25,6 +25,13 @@ Server facts it relies on (Classic server and ``atrinik/content@main``):
   (``player_login``), and its logout saves it on Sera's square.
 - The operator drops the coin on that square and logs out; Sera picks it
   up. A drop and a pickup are journaled item moves like any other.
+- The ground (look) window leaves out item types (``esrv_draw_look``,
+  server ``socket/item.c``, sends no ``UPD_TYPE``), so a coin underfoot is
+  known by its name alone.
+- A pickup is refused unless ``carrying + weight < weight_limit[Str]``
+  (``player_can_carry``, ``types/player.c``). Depletion lowers Str, so a
+  depleted character may already carry more than she may pick up: the run
+  is refused before anything is created.
 
 Every run, and every refusal, is kept as an audit record in Sera's memory
 (``memory.sqlite3``, kind ``operator_assist``), and a run whose coin left the
@@ -41,6 +48,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import re
 import secrets
 import shutil
 import sqlite3
@@ -64,6 +72,11 @@ MAX_GOLD_PER_RUN = 1
 COOLDOWN_SECONDS = 24 * 60 * 60
 GOLD_ARCHETYPE = "goldcoin"
 GOLD_COPPER = COIN_VALUES["gold"]
+# coin_gold.arc: weight 10 (grams).
+GOLD_WEIGHT_GRAMS = 10
+# A gold coin as the look window names it (object_get_display_name:
+# material, then name or name_pl; the count travels in UPD_NROF).
+GROUND_GOLD_NAME = re.compile(r"gold coins?")
 # Safe to stand still for the few seconds a run takes.
 MIN_HEALTH_FRACTION = 0.9
 MIN_FOOD = 300
@@ -111,16 +124,22 @@ class OperatorAssistAborted(RuntimeError):
         self.step, self.reason = step, reason
 
 
-def gold_stack(items: list) -> tuple[int, Any]:
-    """Gold coins among ``items``: their count, and the largest stack."""
+def gold_stack(items: list, *, ground: bool = False) -> tuple[int, Any]:
+    """Gold coins among ``items``: their count, and the largest stack.
+
+    ``ground``: the items come from the look window, which sends no item
+    type (``esrv_draw_look``); an untyped item counts when its whole name
+    is a gold coin's."""
     total, largest = 0, None
     for item in items:
-        if item.item_type != c.TYPE_MONEY:
-            continue
         name = item.name.casefold()
-        # The first denomination named, as carried_wallet_value reads it.
-        denomination = next((coin for coin in COIN_VALUES if coin in name), None)
-        if denomination != "gold":
+        if item.item_type == c.TYPE_MONEY:
+            # The first denomination named, as carried_wallet_value reads it.
+            denomination = next((coin for coin in COIN_VALUES if coin in name), None)
+            if denomination != "gold":
+                continue
+        elif not (ground and not item.item_type and
+                  GROUND_GOLD_NAME.fullmatch(name.strip())):
             continue
         total += item.quantity
         if largest is None or item.quantity > largest.quantity:
@@ -339,6 +358,15 @@ class OperatorAssist:
                     f"{MIN_HEALTH_FRACTION:.0%}")
         if int(stats.get("food", 0) or 0) < MIN_FOOD:
             return f"not at a safe square: food below {MIN_FOOD}"
+        # In whole grams, as the server counts (the client divides by 1000).
+        limit = round(float(stats.get("weight_limit", 0) or 0) * 1000)
+        carried = sum(round(item.weight * 1000) * item.quantity
+                      for item in state.inventory)
+        if limit > 0 and carried + gold * GOLD_WEIGHT_GRAMS >= limit:
+            # player_can_carry: the server would refuse her pickup.
+            return (f"she cannot pick up the coin: she carries "
+                    f"{carried / 1000:.2f} kg of her {limit / 1000:.2f} kg "
+                    "limit; free some weight first")
         return ""
 
     # The sequence.
@@ -481,7 +509,9 @@ class OperatorAssist:
         before = int(record.get("operator_gold_before", 0))
         if gold_stack(session.state.inventory)[0] >= before + gold:
             record["coin"] = "operator-inventory"
-        elif gold_stack(self.client.state.ground)[0] >= gold and (
+        elif "ground_gold_before" in record and gold_stack(
+                self.client.state.ground, ground=True)[0] >= (
+                int(record["ground_gold_before"]) + gold) and (
                 record["coin"] == "operator-inventory"):
             record["coin"] = "ground"
         else:
@@ -588,6 +618,11 @@ class OperatorAssist:
                 # (commands_handle): nothing was created.
                 record["counts"] = False
             raise
+        # Gold already lying on her square is not the operator's coin: the
+        # stacks there now, before the coin can leave the operator.
+        ground_before = {item.tag: item.quantity for item in client.state.ground
+                         if gold_stack([item], ground=True)[0]}
+        record["ground_gold_before"] = sum(ground_before.values())
         record["coin"] = "operator-inventory"
 
         if not on_square():
@@ -615,8 +650,13 @@ class OperatorAssist:
         def coin_underfoot():
             if client.state.phase != "playing":
                 return None
-            _, coin = gold_stack(client.state.ground)
-            return coin if coin is not None and coin.quantity >= gold else None
+            # The stack the coin landed in: object_insert_map keeps the
+            # dropped object, adds any gold already there to it and removes
+            # that stack, so it shows under a tag not seen before.
+            return next((item for item in client.state.ground
+                         if gold_stack([item], ground=True)[0] and
+                         item.quantity - ground_before.get(item.tag, 0) >= gold),
+                        None)
 
         await self._wait("pickup", lambda: coin_underfoot() is not None)
         await client.move_item(client.state.player_tag, coin_underfoot().tag, gold)
