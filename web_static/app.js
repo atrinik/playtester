@@ -143,10 +143,11 @@ const since = t => { const s = Math.max(0, Date.now() / 1000 - t); return s < 90
 let lastFarmingSig = "";
 // The way to a spot from her savebed (analyzer approach danger).
 const pct = v => `${Math.round((+v || 0) * 100)}%`;
-function approachLine(r) {
+function approachLine(r, fromBed) {
   if (!r.approach_status || r.approach_status === "disabled") return "";
   const worst = String(r.approach_worst_map || "").replace(/^.*\//, "");
-  const text = r.approach_status === "unreachable" ? "Approach unknown: no modelled path from her savebed"
+  const text = r.approach_status === "unreachable"
+    ? `Approach unknown: no modelled path from ${fromBed ? "her savebed" : "any savebed or town"}`
     : r.approach_status === "origin" ? "Approach: starts at an origin"
     : `Approach ${pct(r.approach_safety_score)} safe${worst ? ` · worst ${esc(worst)} (danger ${Math.round(+r.approach_danger || 0)})` : ""} · ${(r.approach_maps || []).length} maps`;
   return `<small class="${r.approach_risky ? "warn-text" : "muted"}" title="Spot safety ${pct(r.spot_safety_score)} · overall ${pct(r.safety_score)}${r.approach_risky ? " · farmed only when no spot with a safe approach is usable" : ""}">${text}</small>`;
@@ -154,7 +155,7 @@ function approachLine(r) {
 function renderFarming() {
   const fa = slow.farming_analysis;
   if (!fa) return;
-  const sig = JSON.stringify([fa.status, fa.objective, fa.selected_objective, fa.objective_override, fa.finished_at, fa.error, fa.running, fa.self_improvement, fa.savebed]);
+  const sig = JSON.stringify([fa.status, fa.objective, fa.selected_objective, fa.objective_override, fa.finished_at, fa.error, fa.running, fa.self_improvement, fa.savebed, fa.farmed_spot && fa.farmed_spot.path]);
   const status = $("#fa-status");
   status.classList.toggle("warn-text", fa.status === "failed" || fa.status === "unsupported");
   status.textContent = fa.running ? "Analyzing…"
@@ -174,12 +175,16 @@ function renderFarming() {
   $("#fa-profile").textContent = override + (p
     ? `Simulating ${p.skill} ${p.skill_level}${p.max_aggro_pack ? ` (≤${p.max_aggro_pack} aggro)` : ''} · ${p.spell_damage > 0 ? `spells only: ${p.spell_damage} ${p.spell_attack}/cast · ${p.cast_delay}s/cast · ${p.mana_cost} of ${p.max_mana} SP · ${p.mana_regen} SP/s` : `DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing`} · HP ${p.max_health} · AC ${p.armour_class}`
     : "") + (fa.approach_origin ? ` · approach from ${String(fa.approach_origin).replace(/^.*\//, "")}` : "");
-  $("#fa-ranking").innerHTML = (fa.ranking || []).map((r, i) => `
-    <div class="spot${i === 0 ? " top" : ""}">
-      <div class="spot-head"><b>#${i + 1} ${esc(r.name)}</b><span class="flag">${esc(String(r.region || "").replace(/_/g, " "))}</span></div>
+  // Mark the spot autoplay farms; list it first when it ranks below the top five.
+  const farmed = fa.farmed_spot;
+  const shown = (fa.ranking || []).map((r, i) => [r, i + 1]);
+  if (farmed && !shown.some(([r]) => r.path === farmed.path)) shown.unshift([farmed, farmed.rank]);
+  $("#fa-ranking").innerHTML = shown.map(([r, rank]) => `
+    <div class="spot${(farmed ? r.path === farmed.path : rank === 1) ? " top" : ""}">
+      <div class="spot-head"><b>#${rank ?? "?"} ${esc(r.name)}</b>${farmed && r.path === farmed.path ? '<span class="flag">farming</span>' : ""}<span class="flag">${esc(String(r.region || "").replace(/_/g, " "))}</span></div>
       <small>${esc(r.location || (r.map_paths || []).join(", "))}</small>
       <div class="spot-metrics"><span title="Estimated XP per hour">XP ${rate(r.xp_hour)}/h</span><span title="Estimated money per hour">${coins(r.money_hour, 2)}/h</span><span title="Estimated loot drops per hour">Loot ${rate(r.loot_hour)}/h</span><span title="Estimated incoming damage per clear">Danger ${Math.round(+r.danger || 0)}</span></div>
-      ${approachLine(r)}
+      ${approachLine(r, !!fa.approach_origin)}
       <small class="muted">${esc((r.monsters || []).slice(0, 5).join(", "))}${(r.monsters || []).length > 5 ? " …" : ""}</small>
     </div>`).join("") || '<span class="muted">No ranking yet.</span>';
   const learning = fa.self_improvement || {};

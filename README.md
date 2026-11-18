@@ -195,7 +195,7 @@ Gauges, read from live state on each scrape:
 - `money_carried_copper`, `money_banked_copper` (only once a balance is
   known);
 - `farm_predicted_xp_per_hour{objective}`: the farming analyzer's estimate for
-  its first-ranked spot;
+  the spot autoplay farms (its usable pick, not always the first-ranked);
 - `task_info{task}` and `phase_info{phase}`: 1 for the running top-level task
   type and autoplay phase;
 - `operator_assisted`: 1 once an [operator assist](#operator-assist) has
@@ -356,11 +356,15 @@ path to is capped at an approach safety of 0.5
 (`--unreachable-approach-safety`), because its walk does not model ships,
 scripts or keys. Autoplay farms spots with a known approach safety of 100%
 before any spot whose approach is unknown or expected to cost more than her
-whole health bar, keeping the analyzer's order within each group, and takes
-a risky approach only when nothing else is usable. Raw rankings list every
+whole health bar, keeping the analyzer's order within each objective's ranking. A risky
+approach is taken only when nothing else is usable, and then the safest one
+first (unreachable counts as 0.5). An apartment savebed is judged from its
+recorded return, since the apartment is left only through a script the
+analyzer does not follow, and an origin the analyzer rejects is retried once
+from the default origins and not passed again. Raw rankings list every
 circuit permutation, so each run keeps the top 40 per objective. The Farming
 tab shows each spot's approach: its safety, worst map and danger, or that it
-is unknown.
+is unknown, and marks the spot autoplay farms with its rank.
 
 The dashboard's **Farming** tab shows the run status, the simulated profile and
 the top spots for the preferred objective: XP, money or loot per hour,

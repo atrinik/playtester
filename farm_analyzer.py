@@ -129,6 +129,17 @@ UNREACHABLE_APPROACH_SAFETY = 0.5
 APPROACH_SAFETY_FLOOR = 1.0
 
 
+def approach_safety(spot: dict) -> float:
+    """A ranked spot's approach safety: an unreachable spot counts as
+    UNREACHABLE_APPROACH_SAFETY, a result without approach fields as 1."""
+    if spot.get("approach_unknown") is True or spot.get("approach_status") == "unreachable":
+        return UNREACHABLE_APPROACH_SAFETY
+    score = spot.get("approach_safety_score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        return float(score)
+    return 1.0
+
+
 def risky_approach(spot: dict) -> bool:
     """Whether the way to a ranked spot is unknown or expected to be lethal.
 
@@ -375,6 +386,10 @@ def combat_profile(client, spell_damage: float = 0.0,
         max_aggro_pack=max_aggro_pack, **caster)
 
 
+class _TimedOut(RuntimeError):
+    """An analyzer run that hit FarmAnalyzer.TIMEOUT_SECONDS."""
+
+
 class FarmAnalyzer:
     """Owns at most one background analyzer process and its latest ranking."""
 
@@ -406,6 +421,8 @@ class FarmAnalyzer:
         # The approach origin (her savebed map) the current report was
         # ranked from; empty for the analyzer's default origins.
         self.origin = ""
+        # Origins the analyzer rejected; their runs use the default origins.
+        self.rejected_origins: set[str] = set()
         self.report: dict | None = None
         self.started_at = 0.0
         self.finished_at = 0.0
@@ -433,12 +450,23 @@ class FarmAnalyzer:
         return self._task is not None and not self._task.done()
 
     def approach_origin(self, state) -> str:
-        """Her savebed map, if known and in the locked content, else "".
+        """Where her trips start, if known and in the locked content, else "".
 
-        The analyzer rejects an unknown origin map, so a savebed outside the
-        content (or not yet known) falls back to its default origins.
+        That is her savebed map, or for an apartment savebed its recorded
+        return: an apartment is left only through a script, which the
+        analyzer's walk does not follow, so from inside it every spot would
+        be unreachable (as navigation.route_death_origin judges reach). The
+        analyzer rejects an unknown origin map, so a savebed outside the
+        content, an apartment without a recorded return, an origin the
+        analyzer already rejected, or none yet fall back to its default
+        origins.
         """
         path = str(getattr(state, "savebed_map", "") or "")
+        if "/apartments/" in path:
+            back = (getattr(state, "apartment_returns", {}) or {}).get(path)
+            path = str(back[0]) if back else ""
+        if path in self.rejected_origins:
+            return ""
         relative = Path(path.lstrip("/"))
         if (not path.startswith("/") or ".." in relative.parts or
                 not relative.parts or
@@ -544,29 +572,46 @@ class FarmAnalyzer:
         self._task = asyncio.get_running_loop().create_task(self._run(profile, origin))
         return True
 
+    async def _analyze(self, command: list[str]) -> dict:
+        """One analyzer process's validated report, or RuntimeError."""
+        self._process = await asyncio.create_subprocess_exec(
+            *command, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                self._process.communicate(), self.TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            self._process.kill()
+            await self._process.wait()
+            raise _TimedOut(f"timed out after {self.TIMEOUT_SECONDS:.0f}s")
+        if self._process.returncode != 0:
+            detail = stderr.decode(errors="replace").strip().splitlines()[-1:] or [""]
+            raise RuntimeError(
+                f"exited with status {self._process.returncode}: {detail[0][:300]}")
+        report = json.loads(stdout)
+        rankings = report.get("rankings") if isinstance(report, dict) else None
+        if not isinstance(rankings, dict) or not all(
+                isinstance(rankings.get(name), list) for name in OBJECTIVES):
+            raise RuntimeError("report has no ranking for every objective")
+        return report
+
     async def _run(self, profile: CombatProfile, origin: str = "") -> None:
-        command = self.command(profile, origin)
         log.info("farming analyzer started for %s %d", profile.skill, profile.skill_level)
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                *command, stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    self._process.communicate(), self.TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                self._process.kill()
-                await self._process.wait()
-                raise RuntimeError(f"timed out after {self.TIMEOUT_SECONDS:.0f}s")
-            if self._process.returncode != 0:
-                detail = stderr.decode(errors="replace").strip().splitlines()[-1:] or [""]
-                raise RuntimeError(
-                    f"exited with status {self._process.returncode}: {detail[0][:300]}")
-            report = json.loads(stdout)
-            rankings = report.get("rankings") if isinstance(report, dict) else None
-            if not isinstance(rankings, dict) or not all(
-                    isinstance(rankings.get(name), list) for name in OBJECTIVES):
-                raise RuntimeError("report has no ranking for every objective")
+                report = await self._analyze(self.command(profile, origin))
+            except _TimedOut:
+                raise
+            except (RuntimeError, ValueError) as error:
+                if not origin:
+                    raise
+                # Retry once from the default origins. Only if that works
+                # was the origin at fault; it is then never passed again.
+                log.warning("farming analyzer failed from origin %s (%s); "
+                            "retrying from the default origins", origin, error)
+                report = await self._analyze(self.command(profile))
+                self.rejected_origins.add(origin)
+                origin = ""
         except asyncio.CancelledError:
             if self._process is not None and self._process.returncode is None:
                 self._process.kill()

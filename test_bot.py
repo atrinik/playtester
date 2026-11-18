@@ -17088,6 +17088,10 @@ import json, os, sys
 args = sys.argv[1:]
 if os.path.exists(os.path.join(os.path.dirname(sys.argv[0]), "FAIL")):
     raise SystemExit(3)
+if ("--approach-origin" in args and
+        os.path.exists(os.path.join(os.path.dirname(sys.argv[0]), "REJECT_ORIGIN"))):
+    print("error: unknown approach origin map", file=sys.stderr)
+    raise SystemExit(2)
 level = int(args[0])
 need = ("--melee-damage", "--weapon-class", "--weapon-speed", "--content-root",
         "--server-root", "--ranking", "--json")
@@ -17499,6 +17503,62 @@ class FarmAnalyzerTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_an_apartment_savebed_is_judged_from_its_recorded_return(self):
+        from .model import STARTER_APARTMENT
+
+        analyzer = self.analyzer()
+        door = "/shattered_islands/strakewood_island/world_5_65"
+        for path in (STARTER_APARTMENT, door):
+            content_map = analyzer.content_root / "maps" / path.lstrip("/")
+            content_map.parent.mkdir(parents=True, exist_ok=True)
+            content_map.write_text("arch map\nend\n")
+        state = self.client().state
+        state.savebed_map, state.savebed_xy = STARTER_APARTMENT, (4, 1)
+        # The apartment exists in the content, but it is left only through a
+        # script: from inside it every spot would be unreachable. With no
+        # recorded return, the default origins apply.
+        self.assertEqual(analyzer.approach_origin(state), "")
+        state.apartment_returns = {STARTER_APARTMENT: (door, (12, 7))}
+        self.assertEqual(analyzer.approach_origin(state), door)
+        state.apartment_returns = {STARTER_APARTMENT: ("/no/such/map", (1, 1))}
+        self.assertEqual(analyzer.approach_origin(state), "")
+
+    def test_a_rejected_origin_retries_once_from_the_default_origins(self):
+        async def scenario():
+            now = [1000.0]
+            analyzer = self.analyzer(clock=lambda: now[0])
+            bed = "/shattered_islands/world_7_79"
+            content_map = analyzer.content_root / "maps" / bed.lstrip("/")
+            content_map.parent.mkdir(parents=True)
+            content_map.write_text("arch map\nend\n")
+            (analyzer.analyzer_root / "farming_analyzer" / "REJECT_ORIGIN").write_text("")
+            client = self.client()
+            client.state.savebed_map, client.state.savebed_xy = bed, (16, 3)
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            # The same run fell back to the default origins and succeeded.
+            self.assertEqual(analyzer.status, "ready", analyzer.error)
+            self.assertNotIn("--approach-origin", analyzer.report["args"])
+            self.assertEqual(analyzer.origin, "")
+            self.assertEqual(analyzer.rejected_origins, {bed})
+            # The rejected origin is never passed again, so an unchanged
+            # profile is not re-ranked for it.
+            self.assertEqual(analyzer.approach_origin(client.state), "")
+            now[0] += analyzer.MIN_INTERVAL_SECONDS + 1
+            self.assertFalse(analyzer.poll(client))
+            # A failure from the default origins too is a plain failure: the
+            # origin is not blamed.
+            analyzer.rejected_origins.clear()
+            (analyzer.analyzer_root / "farming_analyzer" / "FAIL").write_text("")
+            now[0] += analyzer.MIN_INTERVAL_SECONDS + 1
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "failed")
+            self.assertEqual(analyzer.rejected_origins, set())
+            await analyzer.close()
+
+        asyncio.run(scenario())
+
     def test_command_is_isolated_and_low_priority(self):
         from .farm_analyzer import combat_profile
 
@@ -17633,14 +17693,68 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         client = self.client({"xp": [circuit, muddy, forest]})
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
                          "Burnt forest")
-        # With no safe approach left, the analyzer's order decides.
+        # With no safe approach left, the least dangerous approach wins:
+        # unreachable (counted as 0.5) over a known 0.27.
         client.farm_analyzer.rankings["xp"] = [circuit, muddy]
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Muddy pit")
+        # Equal approach safety: the analyzer's order decides.
+        twin = {**circuit, "name": "UC twin", "path": "twin",
+                "map_paths": ["maps" + self.UPPER], "monsters": ["Kotung L17"]}
+        client.farm_analyzer.rankings["xp"] = [circuit, twin]
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
                          "UC circuit")
         # Results without approach fields keep the analyzer's order.
         plain = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
         client.farm_analyzer.rankings["xp"] = [plain, forest]
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Pocket")
+
+    @staticmethod
+    def approach(spot, safety, *, unknown=False):
+        return {**spot, "approach_status": "unreachable" if unknown else "path",
+                "approach_unknown": unknown, "approach_safety_score": safety}
+
+    def test_with_every_safe_spot_quarantined_the_least_dangerous_approach_wins(self):
+        from .navigation import analyzer_farm_selection
+
+        graph = built_graph()
+        safe = self.approach(analyzer_spot(
+            "Safe", [self.TREES], ["evil treant L13"]), 1.0)
+        lethal = self.approach(analyzer_spot(
+            "Lethal", [self.POCKET], ["evil treant L13"]), 0.27)
+        risky = self.approach(analyzer_spot(
+            "Risky", [self.UPPER], ["Kotung L17"]), 0.8)
+        client = self.client({"xp": [safe, lethal, risky]})
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Safe")
+        client.state.farm_zone_quarantine = {self.TREES: time.time() + 3600}
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Risky")
+
+    def test_depleted_approach_preference_stays_within_each_objective(self):
+        from .navigation import analyzer_farm_selection
+
+        graph = built_graph()
+        safe_xp = self.approach(analyzer_spot(
+            "Safe xp", [self.TREES], ["evil treant L13"]), 1.0)
+        risky_safety = self.approach(analyzer_spot(
+            "Risky safety", [self.POCKET], ["evil treant L13"]), 0.6)
+        safe_safety = self.approach(analyzer_spot(
+            "Safe safety", [self.TREES], ["evil treant L13"]), 1.0)
+        client = self.client({"xp": [safe_xp],
+                              "safety": [risky_safety, safe_safety]})
+        client.state.depletion_points_known = True
+        client.state.depletion_points = FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD
+        client.state.place_item(Item(
+            501, item_type=c.TYPE_FORCE, quality=0, name="depletion"),
+            client.state.player_tag)
+        # Depleted, the safety ranking comes first; within it, the safe
+        # approach beats the higher-ranked risky one.
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Safe safety")
+        # A risky safety spot still beats the chosen objective's safe spot:
+        # the approach preference never reorders the two rankings.
+        client.farm_analyzer.rankings["safety"] = [risky_safety]
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Risky safety")
 
     def test_selection_follows_the_objective_and_skips_live_failures(self):
         from .navigation import analyzer_farm_selection
@@ -19675,6 +19789,24 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         analysis = json.loads(payload)["farming_analysis"]
         self.assertEqual(analysis["objective"], "xp")
         self.assertIsNone(analysis["objective_override"])
+        self.assertEqual((analysis["farmed_spot"]["name"], analysis["farmed_spot"]["rank"]),
+                         ("Trees", 1))
+        # The farmed spot, not the analyzer's #1, is marked and predicted.
+        self.client.state.depletion_points = 0
+        lethal = {**analyzer_spot("Lethal", ["/shattered_islands/world_14_78"],
+                                  ["evil treant L13"]),
+                  "xp_hour": 9000.0, "approach_status": "path",
+                  "approach_safety_score": 0.27, "approach_unknown": False}
+        trees = {**analyzer_spot("Trees", ["/shattered_islands/world_14_79"],
+                                 ["evil treant L13"]),
+                 "xp_hour": 5000.0, "approach_status": "path",
+                 "approach_safety_score": 1.0, "approach_unknown": False}
+        self.client.farm_analyzer = StubAnalyzer({"xp": [lethal, trees]})
+        status, payload = await self.request("GET", "/api/state?include=farming_analysis")
+        farmed = json.loads(payload)["farming_analysis"]["farmed_spot"]
+        self.assertEqual((farmed["name"], farmed["rank"], farmed["approach_risky"]),
+                         ("Trees", 2, False))
+        self.assertIn('objective="xp"} 5000', self.server.dashboard.prometheus())
         self.client.farm_analyzer = None
         self.client.state.depletion_points = 0
         status, payload = await self.request(
