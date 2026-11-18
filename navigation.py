@@ -4377,8 +4377,8 @@ def analyzer_farm_choice(
     hazardous; then the least dangerous of them is farmed (the safer
     approach on a tie). Within each objective's ranking, usable spots with
     a known, safe approach from her savebed (farm_analyzer.risky_approach)
-    come first in rank order, then the rest from the safest approach down
-    (farm_analyzer.approach_safety). Route-death
+    come first in rank order, then the rest from the safest down (the
+    analyzer's safety_score, else farm_analyzer.approach_safety). Route-death
     spots are never that fallback, nor any depletion fallback below. While
     a route death is still being judged (route_death_blocked_maps returns
     None), nothing is usable yet and None is returned. Without ``search``
@@ -4439,12 +4439,16 @@ def analyzer_farm_choice(
         # Within each objective's ranking (the effective one first, so the
         # depletion safety rule holds): spots with a known, safe approach
         # from her savebed in rank order, then the risky ones from the
-        # safest approach down (unreachable counts as
-        # UNREACHABLE_APPROACH_SAFETY), in rank order on ties.
+        # safest down by the analyzer's safety_score (the lower of spot and
+        # approach safety), or by approach safety (unreachable counts as
+        # UNREACHABLE_APPROACH_SAFETY) without one, in rank order on ties.
         position, rank = order[id(entry)]
-        risky = plan.risky_approach(entry[2])
-        return (position, risky,
-                -plan.approach_safety(entry[2]) if risky else 0.0, rank)
+        spot = entry[2]
+        risky = plan.risky_approach(spot)
+        overall = spot.get("safety_score")
+        safety = (float(overall) if isinstance(overall, (int, float)) and
+                  not isinstance(overall, bool) else plan.approach_safety(spot))
+        return (position, risky, -safety if risky else 0.0, rank)
 
     usable.sort(key=preference)
     if not depleted_for_temple(client.state):

@@ -17090,8 +17090,8 @@ if os.path.exists(os.path.join(os.path.dirname(sys.argv[0]), "FAIL")):
     raise SystemExit(3)
 if ("--approach-origin" in args and
         os.path.exists(os.path.join(os.path.dirname(sys.argv[0]), "REJECT_ORIGIN"))):
-    print("error: unknown approach origin map", file=sys.stderr)
-    raise SystemExit(2)
+    raise SystemExit("unknown approach origin map: " +
+                     args[args.index("--approach-origin") + 1])
 level = int(args[0])
 need = ("--melee-damage", "--weapon-class", "--weapon-speed", "--content-root",
         "--server-root", "--ranking", "--json")
@@ -17546,14 +17546,16 @@ class FarmAnalyzerTests(unittest.TestCase):
             self.assertEqual(analyzer.approach_origin(client.state), "")
             now[0] += analyzer.MIN_INTERVAL_SECONDS + 1
             self.assertFalse(analyzer.poll(client))
-            # A failure from the default origins too is a plain failure: the
-            # origin is not blamed.
+            self.assertEqual(analyzer.snapshot("xp")["rejected_origins"], [bed])
+            # Any other failure with an origin is an ordinary failure: no
+            # retry, and the origin is not blamed.
             analyzer.rejected_origins.clear()
             (analyzer.analyzer_root / "farming_analyzer" / "FAIL").write_text("")
             now[0] += analyzer.MIN_INTERVAL_SECONDS + 1
             self.assertTrue(analyzer.poll(client))
             await analyzer._task
             self.assertEqual(analyzer.status, "failed")
+            self.assertIn("status 3", analyzer.error)
             self.assertEqual(analyzer.rejected_origins, set())
             await analyzer.close()
 
@@ -17698,7 +17700,18 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         client.farm_analyzer.rankings["xp"] = [circuit, muddy]
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
                          "Muddy pit")
-        # Equal approach safety: the analyzer's order decides.
+        # Equal approach safety: the safer spot wins. Live, from an apartment
+        # return, Muddy Pit (spot 0.33) and the Burnt Forest (spot 1.0) were
+        # both unreachable; the analyzer's safety_score (the lower of spot
+        # and approach) tells them apart.
+        burnt = {**muddy, "name": "Burnt unreachable", "path": "burnt",
+                 "map_paths": ["maps" + self.TREES], "monsters": ["evil treant L13"],
+                 "spot_safety_score": 1.0, "safety_score": 0.5}
+        client.farm_analyzer.rankings["xp"] = [
+            {**muddy, "spot_safety_score": 0.33, "safety_score": 0.33}, burnt]
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Burnt unreachable")
+        # Equal safety: the analyzer's order decides.
         twin = {**circuit, "name": "UC twin", "path": "twin",
                 "map_paths": ["maps" + self.UPPER], "monsters": ["Kotung L17"]}
         client.farm_analyzer.rankings["xp"] = [circuit, twin]

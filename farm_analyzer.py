@@ -386,8 +386,12 @@ def combat_profile(client, spell_damage: float = 0.0,
         max_aggro_pack=max_aggro_pack, **caster)
 
 
-class _TimedOut(RuntimeError):
-    """An analyzer run that hit FarmAnalyzer.TIMEOUT_SECONDS."""
+class _OriginRejected(RuntimeError):
+    """The analyzer refused the approach origin map (tools cli.py raises
+    ``SystemExit("unknown approach origin map: ...")``, exit status 1)."""
+
+
+ORIGIN_REJECTED_TEXT = "unknown approach origin map"
 
 
 class FarmAnalyzer:
@@ -583,10 +587,13 @@ class FarmAnalyzer:
         except asyncio.TimeoutError:
             self._process.kill()
             await self._process.wait()
-            raise _TimedOut(f"timed out after {self.TIMEOUT_SECONDS:.0f}s")
+            raise RuntimeError(f"timed out after {self.TIMEOUT_SECONDS:.0f}s")
         if self._process.returncode != 0:
-            detail = stderr.decode(errors="replace").strip().splitlines()[-1:] or [""]
-            raise RuntimeError(
+            text = stderr.decode(errors="replace")
+            detail = text.strip().splitlines()[-1:] or [""]
+            error = (_OriginRejected if ORIGIN_REJECTED_TEXT in text
+                     else RuntimeError)
+            raise error(
                 f"exited with status {self._process.returncode}: {detail[0][:300]}")
         report = json.loads(stdout)
         rankings = report.get("rankings") if isinstance(report, dict) else None
@@ -600,18 +607,17 @@ class FarmAnalyzer:
         try:
             try:
                 report = await self._analyze(self.command(profile, origin))
-            except _TimedOut:
-                raise
-            except (RuntimeError, ValueError) as error:
+            except _OriginRejected as error:
                 if not origin:
                     raise
-                # Retry once from the default origins. Only if that works
-                # was the origin at fault; it is then never passed again.
-                log.warning("farming analyzer failed from origin %s (%s); "
+                # The analyzer refused the origin itself: it is never passed
+                # again, and this run retries once from the default origins.
+                # Any other failure is an ordinary one.
+                log.warning("farming analyzer rejected origin %s (%s); "
                             "retrying from the default origins", origin, error)
-                report = await self._analyze(self.command(profile))
                 self.rejected_origins.add(origin)
                 origin = ""
+                report = await self._analyze(self.command(profile))
         except asyncio.CancelledError:
             if self._process is not None and self._process.returncode is None:
                 self._process.kill()
@@ -658,6 +664,7 @@ class FarmAnalyzer:
             "duration": round(self.duration, 1) if self.duration else None,
             "profile": self.profile.describe() if self.profile else None,
             "approach_origin": self.origin or None,
+            "rejected_origins": sorted(self.rejected_origins),
             "ranking": [
                 {**{key: item.get(key) for key in SUMMARY_FIELDS},
                  "approach_risky": risky_approach(item)}
