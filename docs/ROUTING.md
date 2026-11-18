@@ -648,12 +648,13 @@ A new `unlocks.py` module computes an `UnlockState` snapshot. It is immutable
 per plan and cached until one of its inputs changes.
 
 - **Inventory**, walked recursively through containers, as `check_inv()`
-  does. Container contents are known only once she has opened the container;
-  the last seen contents of her own containers are remembered (the key ring
-  case) and dropped when the container leaves her inventory.
+  does. Container contents are known only while the client lists them, so
+  a key in a closed key ring counts once she opens it; a container never
+  counts as itself (P2 notes in section 5).
 - **Key aliases** come from map-placed keys (today), plus archetypes and
   artifacts (`*.art`) with a `slaying`, plus quest reward objects
   (`<object arch=...>` in quest XML). This closes G7 for the Incuna keys.
+  Only KEY objects count, and a name shared by several lock ids opens none.
 - **Quest journal**: `client.state.quests` (part names and status), mapped to
   part uids through the quest catalog already loaded by `quests.py`.
   `Quest` atoms compare uids. Before the journal has loaded, quest atoms are
@@ -1138,7 +1139,8 @@ Dashboard, Navigation section:
 
 - the active route with each edge's time, danger and the subjects that
   dominate it; for a declined trip, why and against what budget;
-- **Unlocks**: keys detected (and where: inventory, container, remembered),
+- **Unlocks**: keys detected (and where: inventory or an open container),
+  ambiguous key names,
   quest gates open or closed, transports available or unavailable and why;
 - **Learned**: the 25 highest-cost subjects with their signals, last event
   and when their cost drops below half;
@@ -1309,35 +1311,57 @@ use it; the dashboard shows unlocks read-only.
 *Accept:* Sera's live inventory yields the Incuna gate and barn lock ids;
 savebed walks use the ship with the key; existing tests pass.
 *Landed:* `unlocks.py` holds `UnlockState`. Notes against the text above:
-- **Inventory.** Containers are walked as in P1. A container the client
-  shows open (its open flag) has current contents, even empty ones. One
-  that is closed counts what it held when last seen open, shown as
-  `remembered`; one never opened counts as itself. The memory lives for
-  one connection, in process: after a restart she has to open the key ring
-  again before its keys count. It is dropped when the container leaves her
-  inventory.
-- **Key aliases.** `WorldGraph.build` adds the names of archetypes and
-  artifacts whose `slaying` is a lock id that gates a tile. This keeps a
-  weapon's race `slaying` out. An artifact without its own `name` uses its
-  `def_arch`'s name and plural. Quest rewards (`<object arch=...>`) name an
-  archetype or artifact, so they need no separate parser. In the locked
-  content this adds the two Incuna keys and the Underground City skull key.
-  20 of the 57 lock ids that gate a tile still have no key item. Many
-  map-placed keys share the archetype name "strange key", so carrying any
-  strange key opens every lock it is an alias for. P2 keeps that existing
-  behaviour; the client cannot see which `slaying` a strange key carries.
+- **Inventory.** Only what the client shows now counts: her top-level
+  inventory and the contents of containers it currently lists. This
+  departs from 4.3: closed containers are not remembered. The client's
+  open flag is not reliable for inventory containers (the server sends
+  the container's flags before it marks it open, and again before it
+  clears its contents on closing), and a key used up or picked up into a
+  closed container is invisible. A container never counts as an object
+  itself, open or not: the server's `key_match()` takes only KEY and
+  FORCE objects, and `check_inv()` never matches a container that holds
+  something. The cost is a false negative: a key in a closed key ring
+  counts only once she opens the ring.
+- **Key aliases.** Only KEY objects (type 21) are aliases, map-placed or
+  from content. Before P2 the map heuristic also took any object with
+  "key" in its name or archetype, so the key ring placed with slaying
+  `locked` on `world_3_85` opened the 9 `locked` tiles (the celestial gate
+  on `world_3_44_-1`, the Everlink gates and the Brynknot sewers lab).
+  `WorldGraph.build` adds the names of KEY archetypes and artifacts whose
+  `slaying` is a lock id that gates a tile, and keeps only lock ids that
+  gate a tile. An artifact without its own `name` uses its `def_arch`'s
+  name and plural. Quest rewards (`<object arch=...>`) name an archetype
+  or artifact, so they need no separate parser. In the locked content this
+  adds the two Incuna keys and the Underground City skull key. 21 of the
+  57 lock ids that gate a tile have no key item.
+- **Ambiguous names.** A name that is an alias of more than one lock id
+  opens none of them, and the dashboard lists it as ambiguous. This is
+  more conservative than before P2, when carrying any "strange key" (the
+  generic `key2` archetype name) opened every lock it was an alias for.
+  The client cannot see which `slaying` a strange key carries, and
+  planning through a gate she cannot pass sent savebed and route choices
+  into gates that would refuse her. In the locked content "strange key"
+  names 10 lock ids. 8 of them (`incuna_bank`, `incuna_docks`,
+  `incuna_ellamin`, `incuna_jail`, `incuna_marshes`, `incuna_tavern`,
+  `rockforge_tavern`, `wizards_tower_archmage_treasury`) have no other key
+  name, so planning never opens them. LEARNING F8's learned tiles are the
+  way to open them from experience.
 - **One access set.** `NavigateTask._allow_locked`, the strict town-service
   check, #94's reachability verdicts, the farm circuit's savebed search and
   `route()` all read `unlock_state(client, graph).access`. The snapshot is
   cached until her carried objects, her journal or its loaded flag change.
-- **`route()`.** It takes `access` and an optional `source_xy`. A map where
+- **`route()`.** It takes `access` and an optional `source_xy`. A
+  `source_xy` that is not walkable under the access set (she stands on a
+  closed gate or an unmapped margin) lets any component of the source map
+  start. A map where
   the access set leaves a gated tile closed is split into one state per
   walkable component its edges touch, so the route never passes that gate.
   Every other map stays one state, as before, so the result is still an
   estimate: it does not see a component sealed by walls on a neighbouring
   map. Without `access` it ignores gates as before. That form is kept for
   tests and offline tools only. The split graph is cached per access set
-  (about 0.07 s to build for the locked content).
+  (about 0.07 s to build for the locked content), and the walkable
+  component cache keeps at most four access sets.
 - **Savebed walks.** `SavebedSearch`, `nearest_savebed`, `savebed_walk` and
   the shortlist pass the access set to `route()`, `route_points` and the
   in-map walks. From the `world_1_67_1` bed to Morg'eean's yard
@@ -1352,8 +1376,8 @@ savebed walks use the ship with the key; existing tests pass.
   `fingerprint` is the item and quest state digest 4.4's `inputs` uses.
 - **Dashboard.** `/api/state` has an `unlocks` field, and the Tasks tab has
   a read-only **Unlocks** section. It lists the lock ids she can open, with
-  the matching items, where each is carried and the gated tile count, plus
-  the state fingerprint. Quest gates and transports wait for P4, which
+  the matching items, where each is carried and the gated tile count, the
+  ambiguous key names she carries, and the state fingerprint. Quest gates and transports wait for P4, which
   compiles them.
 
 **P3. `feat(dashboard)`: owner route and map blocks.** The `route_blocks`

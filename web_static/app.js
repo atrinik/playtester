@@ -564,7 +564,7 @@ $("#sell-junk").onclick = e => task(e.target, "Selling junk", { type: "sell_junk
 
 // ---------- unlocks (read-only; docs/ROUTING.md 4.3) ----------
 // Built with DOM nodes and classes only: no markup strings, no inline styles.
-const UNLOCK_WHERE = { inventory: "carried", container: "in an open container", remembered: "remembered in a closed container" };
+const UNLOCK_WHERE = { inventory: "carried", container: "in an open container" };
 function unlockRow(title, flag, note) {
   const row = document.createElement("div");
   row.className = "quest";
@@ -599,6 +599,7 @@ function renderUnlocks() {
       rows.push(unlockRow(key.lock, `${key.tiles} gated tile${key.tiles === 1 ? "" : "s"}`, items));
     }
     if (!(u.keys || []).length) rows.push(unlockRow("No keys", u.inventory_known ? "none carried" : "inventory loading", ""));
+    for (const a of u.ambiguous || []) rows.push(unlockRow(a.name, "ambiguous: opens nothing", `could be any of ${a.locks.join(", ")}`));
     const notes = [`${(u.keys || []).length} of ${u.locks_known} lock ids open`, u.quests_loaded ? `${u.quest_parts_done} journal parts done` : "journal not loaded"];
     if (u.override) notes.push("override: every gate open");
     const summary = document.createElement("small");

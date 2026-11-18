@@ -774,9 +774,10 @@ class WorldGraph:
                                 # carried object's own name is the id.
                                 self.access_item_names[lock].add(
                                     lock[len(NAME_LOCK_PREFIX):])
-                if (lock_id and name and
-                        ("key" in obj["arch"].casefold() or
-                         "key" in name.casefold())):
+                if lock_id and name and obj_type == str(c.TYPE_KEY):
+                    # Only KEY objects (type 21) carry a lock's slaying to
+                    # the server's key_match(); a key ring container with
+                    # slaying "locked" is not a key.
                     self.access_item_names[lock_id].add(name.casefold())
                 if name:
                     point = Waypoint(source, x, y, name, obj["arch"])
@@ -1006,10 +1007,15 @@ class WorldGraph:
                         level, roaming.get(identity, 0))
         # Keys that no map places: quest rewards and NPC gifts are archetypes
         # or artifacts with the lock's slaying (unlocks.py).
+        gated = unlocks.gate_counts(self)
         for lock_id, names in unlocks.content_key_aliases(
-                unlocks.gate_counts(self), archetypes,
-                artifact_inventory()).items():
+                gated, archetypes, artifact_inventory()).items():
             self.access_item_names[lock_id].update(names)
+        # Only lock ids that gate a tile matter, and only they decide
+        # whether a key name is ambiguous (unlocks.py).
+        for lock_id in [lock_id for lock_id in self.access_item_names
+                        if lock_id not in gated]:
+            del self.access_item_names[lock_id]
         return self
 
     @staticmethod
@@ -1242,11 +1248,27 @@ class WorldGraph:
         return [(state % node.width, state // node.width)
                 for state in result.path]
 
+    # Components are cached per access set; the cache keeps this many sets
+    # (her access set changes only when her keys do).
+    COMPONENT_ACCESS_SETS = 4
+
+    def _note_component_access(self, access) -> None:
+        order = self.__dict__.setdefault("_component_access_order", [])
+        if access in order:
+            return
+        order.append(access)
+        if len(order) > self.COMPONENT_ACCESS_SETS:
+            dropped = order.pop(0)
+            for key in [key for key in self._component_cache
+                        if key[1] == dropped]:
+                del self._component_cache[key]
+
     def _component(self, map_path: str, start: tuple[int, int], *,
                    allow_locked: bool = False) -> frozenset[tuple[int, int]]:
         """Return the complete static walkable component containing start."""
         node = self.nodes.get(map_path)
         cache_key = map_path, allow_locked, start
+        self._note_component_access(allow_locked)
         cached = self._component_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -1806,7 +1828,10 @@ class WorldGraph:
         map_states, components, offsets, targets, metadata, split = (
             self._gated_route_snapshot(access))
         starts = map_states.get(source, [])
-        if source in split and source_xy is not None:
+        if (source in split and source_xy is not None and
+                self.nodes[source].walkable(*source_xy, allow_locked=access)):
+            # An unwalkable live square (a closed gate she stands on, an
+            # unmapped margin) keeps every component as a possible start.
             component = self._component(source, source_xy,
                                         allow_locked=access)
             rest = component - self.nodes[source].automatic_exits
@@ -2575,13 +2600,14 @@ class NavigateTask(BotTask):
             candidates = [(x, edge_y) for x in range(node.width)]
             outward = (0, -1 if world_y < 0 else 1)
         start = (m.world_x, m.world_y)
+        access = self._allow_locked(client)
         paths = [
             path for point in candidates
             if point not in blocked and node.walkable(
-                *point, allow_locked=self._allow_locked(client))
+                *point, allow_locked=access)
             if (path := self.graph.local_path(
                 m.path, start, point,
-                allow_locked=self._allow_locked(client), excluded=blocked))
+                allow_locked=access, excluded=blocked))
         ]
         if not paths:
             return False
@@ -2797,18 +2823,17 @@ class NavigateTask(BotTask):
                 for x in range(min(source.width, destination.width))]
 
         candidates = []
+        access = self._allow_locked(client)
         for crossing, departure, arrival, orthogonal in crossings:
             key = (edge.source, edge.destination, *crossing)
             if (key in self._failed_tile_crossings or
-                    not source.walkable(
-                        *departure, allow_locked=self._allow_locked(client)) or
-                    not destination.walkable(
-                        *arrival, allow_locked=self._allow_locked(client)) or
+                    not source.walkable(*departure, allow_locked=access) or
+                    not destination.walkable(*arrival, allow_locked=access) or
                     arrival in destination.occupied):
                 continue
             path = self.graph.local_path(
                 edge.source, start, departure,
-                allow_locked=self._allow_locked(client),
+                allow_locked=access,
                 excluded=(self._runtime_blocked | self._threat_blocked |
                           self._rejected_departures_on(edge.source, start)))
             if path:

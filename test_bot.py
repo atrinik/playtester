@@ -16321,7 +16321,7 @@ class NavigationTests(unittest.TestCase):
         # Unknown inventory keeps every gated tile closed.
         self.assertFalse(node.walkable(1, 0, allow_locked=False))
 
-    def test_carried_objects_walk_opened_containers(self):
+    def test_carried_objects_walk_listed_containers_only(self):
         state = GameState(phase="playing", player_tag=7)
         state.place_item(Item(1, name="key ring", item_type=c.TYPE_CONTAINER), 7)
         state.place_item(Item(2, name="Morg'eean's Ship Key"), 1)
@@ -16329,52 +16329,26 @@ class NavigationTests(unittest.TestCase):
         state.place_item(Item(4, name="orange stone giant key"), 3)
         state.place_item(Item(5, name="sack", item_type=c.TYPE_CONTAINER), 7)
         state.place_item(Item(6, name="bread"), 7)
+        # A container never stands for itself: neither the listed key ring
+        # nor the sack whose contents are not listed counts.
         self.assertEqual(
             sorted((obj.name, obj.where, obj.container)
                    for obj in unlocks.carried_objects(state)),
             [("Morg'eean's Ship Key", unlocks.CONTAINER, "key ring"),
              ("bread", unlocks.INVENTORY, ""),
-             ("orange stone giant key", unlocks.CONTAINER, "pouch"),
-             ("sack", unlocks.INVENTORY, "")])
+             ("orange stone giant key", unlocks.CONTAINER, "pouch")])
+        # Closing the ring deletes its listed contents
+        # (esrv_close_container): its key no longer counts until reopened.
+        state.remove_item(2)
+        state.remove_item(3)
+        self.assertEqual([obj.name for obj in unlocks.carried_objects(state)],
+                         ["bread"])
         # A state without container bookkeeping falls back to the top level.
-        flat = type("State", (), {"inventory": [Item(8, name="torch")]})()
+        flat = type("State", (), {"inventory": [
+            Item(8, name="torch"),
+            Item(9, name="key ring", item_type=c.TYPE_CONTAINER)]})()
         self.assertEqual([obj.name for obj in unlocks.carried_objects(flat)],
                          ["torch"])
-
-    def test_closed_container_contents_are_remembered_until_it_leaves(self):
-        state = GameState(phase="playing", player_tag=7)
-        ring = Item(1, name="key ring", item_type=c.TYPE_CONTAINER,
-                    flags=c.ITEM_CONTAINER_OPEN)
-        state.place_item(ring, 7)
-        state.place_item(Item(2, name="Morg'eean's Ship Key"), 1)
-        memory = unlocks.ContainerMemory()
-        unlocks.carried_objects(state, memory)
-        # Closing sends a delete for its contents (esrv_close_container) and
-        # clears the open flag: the key is remembered, not lost.
-        state.remove_item(2)
-        ring.flags = 0
-        self.assertEqual(
-            [(obj.name, obj.where, obj.container)
-             for obj in unlocks.carried_objects(state, memory)],
-            [("Morg'eean's Ship Key", unlocks.REMEMBERED, "key ring")])
-        # Without a memory a closed container stands for itself.
-        self.assertEqual([obj.name for obj in unlocks.carried_objects(state)],
-                         ["key ring"])
-        # Opened again and seen empty: the key is gone.
-        ring.flags = c.ITEM_CONTAINER_OPEN
-        self.assertEqual([obj.name for obj in
-                          unlocks.carried_objects(state, memory)], ["key ring"])
-        ring.flags = 0
-        self.assertEqual([obj.name for obj in
-                          unlocks.carried_objects(state, memory)], ["key ring"])
-        # A container that leaves her inventory takes its memory with it.
-        ring.flags = c.ITEM_CONTAINER_OPEN
-        state.place_item(Item(3, name="Morg'eean's Ship Key"), 1)
-        unlocks.carried_objects(state, memory)
-        self.assertIn(1, memory.contents)
-        state.remove_item(1)
-        unlocks.carried_objects(state, memory)
-        self.assertEqual(memory.contents, {})
 
     def test_key_in_a_key_ring_still_opens_its_lock(self):
         graph = built_graph()
@@ -16484,9 +16458,12 @@ class NavigationTests(unittest.TestCase):
             client)
         # The two Incuna keys are Lost Memories rewards from
         # incuna/artifacts.art; no map places them (ROUTING G7).
-        self.assertLessEqual(
+        # Exactly these: the unopened key ring opens nothing (P1-1 of the
+        # review: it once opened the `locked` celestial gates).
+        self.assertEqual(
+            access,
             {"incuna_western_gate_key", "incuna_tavern_barn",
-             "morgeean_ship_key", "forgotten_tunnels_kobold_key"}, access)
+             "morgeean_ship_key", "forgotten_tunnels_kobold_key"})
         self.assertIs(access, unlocks.unlock_state(client, graph).access)
         for lock_id in ("incuna_western_gate_key", "incuna_tavern_barn"):
             gated = [(path, point) for path, node in graph.nodes.items()
@@ -16498,8 +16475,7 @@ class NavigationTests(unittest.TestCase):
                 self.assertTrue(node.walkable(*point, allow_locked=access))
                 self.assertFalse(node.walkable(
                     *point, allow_locked=access - {lock_id}))
-        # The talisman's title does not make it a key; the unopened ring
-        # stands for itself.
+        # The talisman's title does not make it a key.
         state = unlocks.unlock_state(client, graph)
         held = dict(state.keys)
         self.assertEqual([obj.name for obj in held["incuna_western_gate_key"]],
@@ -16516,12 +16492,35 @@ class NavigationTests(unittest.TestCase):
         self.assertIn("underground city skull key", aliases["underground_city_key3"])
         # A renamed artifact does not inherit its archetype's plural.
         self.assertNotIn("strange keys", aliases["incuna_western_gate_key"])
+        # Only KEY objects are keys: the key ring placed with slaying
+        # "locked" (world_3_85) is not one.
+        self.assertNotIn("key ring", {name for names in aliases.values()
+                                      for name in names})
+        # Only lock ids that gate a tile are kept.
+        self.assertLessEqual(set(aliases), set(unlocks.gate_counts(graph)))
+        # The generic "strange key" names several locks: it opens none.
+        ambiguous = unlocks.ambiguous_aliases(aliases)
+        self.assertGreater(len(ambiguous["strange key"]), 1)
+        self.assertNotIn("incuna western gate key", ambiguous)
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.place_item(Item(1, name="strange key", item_type=21), 7)
+        state = unlocks.unlock_state(client, graph)
+        self.assertEqual(state.access, frozenset())
+        self.assertEqual(state.ambiguous,
+                         (("strange key", ambiguous["strange key"]),))
+        self.assertEqual(state.summary()["ambiguous"],
+                         [{"name": "strange key",
+                           "locks": list(ambiguous["strange key"])}])
 
         archetypes = {
             "key2": {"attrs": {"name": "strange key", "name_pl": "strange keys",
-                               "slaying": "set_individual_value"}},
-            "gate_key": {"attrs": {"slaying": "gate"}},
-            "undead_bane": {"attrs": {"name": "sword", "slaying": "undead"}},
+                               "slaying": "set_individual_value", "type": "21"}},
+            "gate_key": {"attrs": {"slaying": "gate", "type": "21"}},
+            "ring": {"attrs": {"name": "key ring", "slaying": "gate",
+                               "type": "122"}},
+            "undead_bane": {"attrs": {"name": "sword", "slaying": "undead",
+                                      "type": "15"}},
         }
         artifacts = [
             {"id": "barn_key", "def_arch": "key2",
@@ -16533,8 +16532,8 @@ class NavigationTests(unittest.TestCase):
             unlocks.content_key_aliases(
                 {"gate", "barn", "name:barn key"}, archetypes, artifacts),
             # An archetype without a name is named by its identity; a race
-            # slaying is never a key; an unnamed artifact keeps the
-            # archetype's name and plural.
+            # slaying and a container are never keys; an unnamed artifact
+            # keeps the archetype's name and plural.
             {"gate": {"gate_key"},
              "barn": {"barn key", "strange key", "strange keys"}})
 
@@ -16621,6 +16620,12 @@ class NavigationTests(unittest.TestCase):
             ["/ship", "/far"])
         with self.assertRaises(ValueError):
             graph.route("/yard", "/far", access=frozenset(), source_xy=(0, 0))
+        # Standing on an unwalkable square (the closed gate) keeps every
+        # component as a possible start: the estimate, not a failure.
+        self.assertEqual(
+            [edge.destination for edge in graph.route(
+                "/yard", "/far", access=frozenset(), source_xy=(2, 0))],
+            ["/ship", "/far"])
         # The map-level graph and every gated view rebuild together.
         graph.nodes["/yard"].locks.clear()
         graph._world_search_snapshot = None

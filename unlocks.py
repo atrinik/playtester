@@ -1,17 +1,21 @@
 """Her unlock state: what her client knows she can pass.
 
 An :class:`UnlockState` is one immutable snapshot of the inputs that open
-gated tiles for her, built only from what an ordinary client sees:
+gated tiles for her, built only from what an ordinary client sees now:
 
-- the objects she carries, walked through containers as the server's
-  ``check_inv()`` does. A closed container's contents are not sent, so the
-  last contents seen while it was open are remembered (the key ring case)
-  and forgotten once the container leaves her inventory;
-- key aliases, which tie a lock id to the names of the objects that carry
-  that ``slaying``: map-placed keys (``WorldGraph.build``), plus archetypes
-  and artifacts (``*.art``) with a matching ``slaying``. Quest rewards
+- the objects she carries: her top-level inventory and the contents of
+  containers the client currently lists, walked as the server's
+  ``check_inv()`` does. A container never matches a lock itself, and a
+  closed one counts for nothing: what it holds is not sent, so a key in a
+  closed key ring counts only once she opens it (a false negative, never a
+  false positive);
+- key aliases, which tie a slaying lock id to the names of KEY objects
+  (type 21) with that ``slaying``: map-placed keys (``WorldGraph.build``),
+  plus key archetypes and artifacts (``*.art``). Quest rewards
   (``<object arch=...>`` in quest XML) name an archetype or artifact, so
-  they are covered by the same aliases;
+  they are covered by the same aliases. A name that is an alias of more
+  than one lock id (the generic "strange key") opens none of them: the
+  client cannot see which ``slaying`` it carries;
 - her quest journal, unknown until it has loaded.
 
 Its ``access`` is the access set that requirements.py evaluates and every
@@ -19,7 +23,7 @@ planner call receives, so `NavigateTask`, savebed walks and ``route()`` use
 one set. ``learned_tiles`` is the hook for learned tile access (LEARNING F8):
 it is always empty here, and nothing reads a learned record yet.
 
-See docs/ROUTING.md, section 4.3.
+See docs/ROUTING.md, section 4.3 and the P2 notes in section 5.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType
 
 from . import constants as c
@@ -35,64 +39,33 @@ from .requirements import NAME_LOCK_PREFIX, Consumes, Item, Requirement
 
 # Where a carried object was found.
 INVENTORY = "inventory"      # her own top-level inventory
-CONTAINER = "container"      # inside a container whose contents are visible
-REMEMBERED = "remembered"    # last seen inside a container now closed
+CONTAINER = "container"      # inside a container whose contents are listed
 
 _EMPTY: Mapping = MappingProxyType({})
 
 
 @dataclass(slots=True, frozen=True)
 class CarriedObject:
-    """One object she carries, as her client knows it."""
+    """One object she carries, as her client shows it now."""
     name: str
     where: str = INVENTORY
     container: str = ""
 
 
-@dataclass(slots=True)
-class ContainerMemory:
-    """The last seen contents of her own containers, by container tag.
+def carried_objects(state) -> tuple[CarriedObject, ...]:
+    """Every object her client shows her carrying, containers walked.
 
-    Lives for one game state (one connection); a reconnect starts empty
-    until she opens her containers again.
-    """
-    contents: dict[int, tuple[str, ...]] = field(default_factory=dict)
-
-
-# Container memory per game state. GameState has slots and no weak
-# references, so a few recent states are kept in a small bounded table.
-_MEMORIES: "OrderedDict[int, tuple[object, ContainerMemory]]" = OrderedDict()
-_MEMORY_LIMIT = 8
-
-
-def container_memory(state) -> ContainerMemory:
-    """The container memory of one game state."""
-    key = id(state)
-    entry = _MEMORIES.get(key)
-    if entry is None or entry[0] is not state:
-        entry = (state, ContainerMemory())
-        _MEMORIES[key] = entry
-        while len(_MEMORIES) > _MEMORY_LIMIT:
-            _MEMORIES.popitem(last=False)
-    _MEMORIES.move_to_end(key)
-    return entry[1]
-
-
-def carried_objects(state, memory: ContainerMemory | None = None
-                    ) -> tuple[CarriedObject, ...]:
-    """Every object she carries, walking containers like ``check_inv()``.
-
-    A container whose contents the client has seen stands for those
-    contents, as on the server. A closed one stands for what it held when
-    last open (``memory``); one never opened stands for itself, because
-    what it holds is unknown. A state without container bookkeeping gives
-    its top-level inventory.
+    The contents of a container the client lists are walked, as
+    ``check_inv()`` does. Containers themselves are left out: the server
+    never matches one with a key's slaying, and a closed one's contents are
+    unknown. A state without container bookkeeping gives its top level.
     """
     inventories = getattr(state, "inventories", None)
     player_tag = getattr(state, "player_tag", None)
     if not isinstance(inventories, dict) or player_tag not in inventories:
         return tuple(CarriedObject(item.name)
-                     for item in getattr(state, "inventory", ()))
+                     for item in getattr(state, "inventory", ())
+                     if getattr(item, "item_type", 0) != c.TYPE_CONTAINER)
     items = getattr(state, "items", {})
     carried: list[CarriedObject] = []
     pending = [(tag, INVENTORY, "") for tag in reversed(inventories[player_tag])]
@@ -105,41 +78,45 @@ def carried_objects(state, memory: ContainerMemory | None = None
         item = items[tag]
         contents = [child for child in inventories.get(tag, ())
                     if child in items]
-        is_open = bool(getattr(item, "flags", 0) & c.ITEM_CONTAINER_OPEN)
-        if contents or is_open:
-            # Visible contents are current, even an open container's
-            # empty ones.
-            if memory is not None:
-                memory.contents[tag] = tuple(items[child].name
-                                             for child in contents)
+        if contents:
             pending.extend((child, CONTAINER, item.name)
                            for child in reversed(contents))
-            if contents:
-                continue
-        elif memory is not None and memory.contents.get(tag):
-            carried.extend(CarriedObject(name, REMEMBERED, item.name)
-                           for name in memory.contents[tag])
-            continue
-        carried.append(CarriedObject(item.name, where, parent))
-    if memory is not None and getattr(state, "inventory_replay_complete", True):
-        # A container that left her inventory takes its memory with it.
-        for tag in [tag for tag in memory.contents if tag not in seen]:
-            del memory.contents[tag]
+        elif item.item_type != c.TYPE_CONTAINER:
+            carried.append(CarriedObject(item.name, where, parent))
     return tuple(carried)
 
 
+def ambiguous_aliases(aliases: Mapping[str, Iterable[str]]
+                      ) -> dict[str, tuple[str, ...]]:
+    """Key names that are aliases of more than one slaying lock id.
+
+    Name lock ids are exact server matches, so they never make a name
+    ambiguous.
+    """
+    locks: dict[str, set[str]] = defaultdict(set)
+    for lock_id, names in aliases.items():
+        if lock_id.startswith(NAME_LOCK_PREFIX):
+            continue
+        for name in names:
+            locks[name.casefold().strip()].add(lock_id)
+    return {name: tuple(sorted(ids)) for name, ids in locks.items()
+            if len(ids) > 1}
+
+
 def lock_matches(lock_id: str, aliases: Iterable[str],
-                 carried: Iterable[CarriedObject]) -> tuple[CarriedObject, ...]:
+                 carried: Iterable[CarriedObject],
+                 ambiguous: Iterable[str] = ()) -> tuple[CarriedObject, ...]:
     """The carried objects that open one lock id.
 
     A name lock mirrors the server's exact, case-sensitive comparison of
     the object's name. A slaying lock is not visible to the client, so it
-    goes through the key aliases, by case-folded name.
+    goes through the key aliases, by case-folded name; an ``ambiguous``
+    name opens nothing (fail closed).
     """
     if lock_id.startswith(NAME_LOCK_PREFIX):
         wanted = lock_id[len(NAME_LOCK_PREFIX):]
         return tuple(obj for obj in carried if obj.name == wanted)
-    names = {alias.casefold().strip() for alias in aliases}
+    names = {alias.casefold().strip() for alias in aliases} - set(ambiguous)
     return tuple(obj for obj in carried
                  if obj.name.casefold().strip() in names)
 
@@ -154,6 +131,9 @@ class UnlockState:
     access: frozenset[str] | bool = frozenset()
     # Lock id -> the carried objects that open it.
     keys: tuple[tuple[str, tuple[CarriedObject, ...]], ...] = ()
+    # Carried key names that alias several lock ids, with those ids: they
+    # open none of them (fail closed), and are listed for visibility.
+    ambiguous: tuple[tuple[str, tuple[str, ...]], ...] = ()
     # Her quest journal as (quest, part, status); see quest_part().
     quests: tuple[tuple[str, str, str], ...] = ()
     quests_loaded: bool = False
@@ -227,6 +207,8 @@ class UnlockState:
             "override": self.access is True,
             "inventory_known": self.inventory_known,
             "keys": rows,
+            "ambiguous": [{"name": name, "locks": list(locks)}
+                          for name, locks in self.ambiguous],
             "locks_known": len(gates or {}),
             "quests_loaded": self.quests_loaded,
             "quest_parts_done": sum(status in ("done", "completed")
@@ -252,23 +234,26 @@ def _snapshot(carried: tuple[CarriedObject, ...],
               aliases: Mapping[str, Iterable[str]],
               journal: tuple[tuple[str, str, str], ...], quests_loaded: bool,
               inventory_known: bool) -> UnlockState:
+    ambiguous = ambiguous_aliases(aliases)
     keys = []
     for lock_id in sorted(aliases):
-        matches = lock_matches(lock_id, aliases[lock_id], carried)
+        matches = lock_matches(lock_id, aliases[lock_id], carried, ambiguous)
         if matches:
             keys.append((lock_id, matches))
+    held = sorted({obj.name.casefold().strip() for obj in carried} &
+                  set(ambiguous))
     return UnlockState(
         access=frozenset(lock_id for lock_id, _ in keys), keys=tuple(keys),
+        ambiguous=tuple((name, ambiguous[name]) for name in held),
         quests=journal, quests_loaded=quests_loaded,
         inventory_known=inventory_known)
 
 
-def compute_unlock_state(state, aliases: Mapping[str, Iterable[str]], *,
-                         memory: ContainerMemory | None = None
+def compute_unlock_state(state, aliases: Mapping[str, Iterable[str]]
                          ) -> UnlockState:
     """Build her unlock state from a game state and the key aliases."""
     return _snapshot(
-        carried_objects(state, memory), aliases, _journal(state),
+        carried_objects(state), aliases, _journal(state),
         bool(getattr(state, "quests_loaded", False)),
         bool(getattr(state, "inventory_replay_complete", True)))
 
@@ -283,8 +268,7 @@ _STATE_LIMIT = 32
 def unlock_state(client, graph) -> UnlockState:
     """Her current unlock state, cached until one of its inputs changes."""
     state = client.state
-    memory = container_memory(state)
-    carried = carried_objects(state, memory)
+    carried = carried_objects(state)
     key = (id(graph), carried, _journal(state),
            bool(getattr(state, "quests_loaded", False)),
            bool(getattr(state, "inventory_replay_complete", True)))
@@ -313,11 +297,11 @@ def gate_counts(graph) -> dict[str, int]:
 def content_key_aliases(lock_ids: Iterable[str],
                         archetypes: Mapping[str, Mapping],
                         artifacts: Iterable[Mapping]) -> dict[str, set[str]]:
-    """Key names from archetypes and artifacts whose ``slaying`` is a lock.
+    """Key names from KEY archetypes and artifacts whose ``slaying`` is a lock.
 
-    Only slaying lock ids that gate a tile are kept, so an archetype's or
-    artifact's race ``slaying`` (a weapon of undead slaying) never becomes
-    a key. An artifact inherits ``name`` and ``slaying`` from its
+    Only KEY objects (type 21) count, as for the server's ``key_match()``,
+    and only slaying lock ids that gate a tile, so a weapon's race
+    ``slaying`` or a key ring's never becomes a key. An artifact inherits ``name`` and ``slaying`` from its
     ``def_arch`` when it sets none; a quest reward ``<object arch=...>``
     names one of these, so it needs no separate source. Names are
     case-folded, like map-placed key aliases; ``name_pl`` is kept too,
@@ -335,7 +319,8 @@ def content_key_aliases(lock_ids: Iterable[str],
 
     def add(attrs: Mapping, base: Mapping, default_name: str) -> None:
         slaying = scalar(attrs, "slaying") or scalar(base, "slaying")
-        if slaying not in wanted:
+        kind = scalar(attrs, "type") or scalar(base, "type")
+        if slaying not in wanted or kind != str(c.TYPE_KEY):
             return
         # A plural belongs to the name it was written with: an artifact
         # that renames its key does not inherit the archetype's plural.
