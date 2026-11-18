@@ -16632,6 +16632,33 @@ class NavigationTests(unittest.TestCase):
         graph._component_cache.clear()
         self.assertEqual(hops(access=frozenset()), ["/yard", "/ship", "/far"])
 
+    def test_component_cache_evicts_the_least_recently_used_access_set(self):
+        graph = WorldGraph()
+        node = MapNode("/m", width=3, height=1,
+                       terrain={(x, 0): 1 for x in range(3)})
+        graph.nodes["/m"] = node
+        sets = [frozenset({str(index)}) for index in range(5)]
+        for access in sets[:4]:
+            graph._component("/m", (0, 0), allow_locked=access)
+        # Using the oldest set again makes the second the least recent.
+        graph._component("/m", (0, 0), allow_locked=sets[0])
+        graph._component("/m", (0, 0), allow_locked=sets[4])
+        cached = {key[1] for key in graph._component_cache}
+        self.assertEqual(cached, {sets[0], sets[2], sets[3], sets[4]})
+        self.assertEqual(graph._component_access_order,
+                         [sets[2], sets[3], sets[0], sets[4]])
+        from .navigation import _clear_components
+        _clear_components(graph)
+        self.assertEqual((graph._component_cache, graph._component_access_order),
+                         ({}, []))
+
+    def test_name_locks_never_make_a_key_name_ambiguous(self):
+        aliases = {"name:blue stone giant key": {"blue stone giant key"},
+                   "giant_gate": {"blue stone giant key"},
+                   "a": {"strange key"}, "b": {"Strange Key"}}
+        self.assertEqual(unlocks.ambiguous_aliases(aliases),
+                         {"strange key": ("a", "b")})
+
     def test_savebed_walks_use_the_ship_with_the_key(self):
         from .navigation import savebed_walk
         graph = built_graph()

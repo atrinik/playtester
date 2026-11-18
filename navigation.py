@@ -291,6 +291,14 @@ def _coord(node: dict, parent: dict | None, name: str) -> int:
     return int(value or 0)
 
 
+def _clear_components(graph) -> None:
+    """Drop a graph's cached components, and their access-set order."""
+    graph._component_cache.clear()
+    order = getattr(graph, "_component_access_order", None)
+    if isinstance(order, list):
+        order.clear()
+
+
 def _checker_requirement(attrs: dict, base: dict
                          ) -> tuple[Requirement, bool, str] | None:
     """Compile one inventory checker (type 64) as the server evaluates it.
@@ -1248,13 +1256,18 @@ class WorldGraph:
         return [(state % node.width, state // node.width)
                 for state in result.path]
 
-    # Components are cached per access set; the cache keeps this many sets
-    # (her access set changes only when her keys do).
+    # Components are cached per access set; the cache keeps this many sets,
+    # least recently used first out (her access set changes only when her
+    # keys do).
     COMPONENT_ACCESS_SETS = 4
 
     def _note_component_access(self, access) -> None:
         order = self.__dict__.setdefault("_component_access_order", [])
+        if order and order[-1] == access:
+            return
         if access in order:
+            order.remove(access)
+            order.append(access)
             return
         order.append(access)
         if len(order) > self.COMPONENT_ACCESS_SETS:
@@ -2116,7 +2129,7 @@ class NavigateTask(BotTask):
             route = self.graph.route_points(*args, **kwargs)
         except ValueError:
             # Components are derived data; retry once with a fresh cache.
-            self.graph._component_cache.clear()
+            _clear_components(self.graph)
             try:
                 route = self.graph.route_points(*args, **kwargs)
             except ValueError as exc:
@@ -2162,7 +2175,7 @@ class NavigateTask(BotTask):
             # Components are derived acceleration data. A live exceptional
             # start square (closed door, runtime map mutation, occupied seam)
             # must never make a later route permanently unroutable.
-            self.graph._component_cache.clear()
+            _clear_components(self.graph)
             try:
                 route = self.graph.route_points(*args, **kwargs)
             except ValueError as preferred_exc:

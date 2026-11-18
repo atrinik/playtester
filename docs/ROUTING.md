@@ -1333,7 +1333,10 @@ savebed walks use the ship with the key; existing tests pass.
   name and plural. Quest rewards (`<object arch=...>`) name an archetype
   or artifact, so they need no separate parser. In the locked content this
   adds the two Incuna keys and the Underground City skull key. 21 of the
-  57 lock ids that gate a tile have no key item.
+  57 lock ids that gate a tile have no key item. The type-21 filter is narrower
+  than `check_inv()`, which matches an object of any type by `slaying`
+  when the checker's `sp` is set and `hp` is 0; in the locked content
+  every such slaying is carried by a KEY object, so nothing changes.
 - **Ambiguous names.** A name that is an alias of more than one lock id
   opens none of them, and the dashboard lists it as ambiguous. This is
   more conservative than before P2, when carrying any "strange key" (the
@@ -1346,6 +1349,12 @@ savebed walks use the ship with the key; existing tests pass.
   `rockforge_tavern`, `wizards_tower_archmage_treasury`) have no other key
   name, so planning never opens them. LEARNING F8's learned tiles are the
   way to open them from experience.
+  A later follow-up could disambiguate by provenance. Every map-placed
+  strange key has a known (map, x, y, slaying), and the Incuna key ring
+  holds a fixed authored set of slayings, so tracking where she picked
+  each one up would credit the six Incuna locks and open the Arvend
+  Blessed pocket (`world_3_84` 15,17). That needs pickup tracking that
+  survives reconnects, so P2 does not attempt it.
 - **One access set.** `NavigateTask._allow_locked`, the strict town-service
   check, #94's reachability verdicts, the farm circuit's savebed search and
   `route()` all read `unlock_state(client, graph).access`. The snapshot is
