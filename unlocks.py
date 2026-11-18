@@ -31,7 +31,7 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from . import constants as c
@@ -140,7 +140,8 @@ class UnlockState:
     inventory_known: bool = True
     # LEARNING F8 hook: (map path, x, y) -> "passed" or "rejected", from her
     # own trials. Always empty until F8 lands; tile_allowed() reads it.
-    learned_tiles: Mapping[tuple[str, int, int], str] = _EMPTY
+    learned_tiles: Mapping[tuple[str, int, int], str] = field(
+        default_factory=lambda: _EMPTY)
 
     def tile_allowed(self, path: str, point: tuple[int, int],
                      requirement: Requirement | None) -> bool:
