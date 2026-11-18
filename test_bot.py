@@ -21479,7 +21479,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=21", page)
+        self.assertIn(b"/app.js?v=22", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -23001,6 +23001,10 @@ def observation_content(directory: Path):
     for name, text in OBSERVATION_ARCH.items():
         (arch / name).write_text(text)
     (maps / "room").write_text(OBSERVATION_MAP)
+    # The words NPC scripts may say (the authored vocabulary).
+    (maps / "warden.py").write_text(
+        'say("Welcome, {}. The gate is shut.".format(activator.name))\n'
+        'say("The following items have been sent to you: #{} {} ({})")\n')
     (maps / "notes.txt").write_text("arch is not a map\nmsg\nNot authored.\nendmsg\n")
     return AuthoredContent.scan(Path(directory) / "content")
 
@@ -23109,11 +23113,12 @@ class ObservationTests(unittest.TestCase):
         raw = book_packet("old tale", "The old tale of the drowned king.\n"
                                        "He sleeps below the lake.\n")
         asyncio.run(client._handle_book(Cursor(raw), raw))
-        # An examine answer.
+        # An examine answer, ended by its blank line.
         asyncio.run(client.examine(72))
         self.say(client, "That is a sword +2")
         self.say(client, "It needs a level of 5 to use.")
         self.say(client, "Qua: 80 Con: 70.")
+        self.say(client, " ")
         # An unattributed fact line, three times: one row seen three times.
         for _ in range(3):
             self.say(client, "Something blocks your spellcasting.")
@@ -23209,27 +23214,113 @@ class ObservationTests(unittest.TestCase):
                        "unmatched-book", "renamed-item"):
             self.assertIn(f'reason="{reason}"}}', drops)
 
-    def test_without_the_index_books_are_dropped_and_bumps_resolve_by_square(self):
+    def test_without_the_index_only_fixed_server_phrases_are_kept(self):
         client = self.client(content=False)
         raw = book_packet("old tale", "The old tale of the drowned king.\n")
         asyncio.run(client._handle_book(Cursor(raw), raw))
-        # A bump she stays behind: the door; a step she completes: a mouth.
+        # Navy text after a bump or a step cannot be verified: not kept.
         asyncio.run(client.move(1))
         self.say(client, "This door is shut.", color="00ffff")
-        now = time.time()
-        client.observations.clock = lambda: now + 2
+        self.say(client, "Guard says: Halt, Bob!", color="00ffff")
+        self.at("/test/room", 5, 4, client)
+        self.say(client, "A voice whispers.", color="00ffff")
+        # Dialogue cannot be checked against authored words either.
+        raw = interface_packet("Warden Argoth", "Welcome, Sera. The gate is shut.")
+        asyncio.run(client._handle_interface(Cursor(raw), raw))
+        # The server's own phrase answering her one bump in the window is.
+        later = time.time() + 2
+        client.observations.clock = lambda: later
+        asyncio.run(client.move(1))
+        self.say(client, "You open the door with the brass key.")
+        self.assertEqual([row["source_key"] for row in self.rows(client)],
+                         ["door:/test/room:5,3"])
+        drops = client.metrics.registry.render()
+        self.assertIn('reason="book-unverified"}', drops)
+        self.assertIn('reason="unauthored-words"}', drops)
+
+    def test_lines_inside_a_timing_window_are_not_the_sources(self):
+        client = self.client()
+        lever = Item(70, location=0, item_type=93, name="big lever")
+        sign = Item(71, location=0, item_type=98, name="sign")
+        self.at("/test/room", 6, 6, client)
+        client.state.place_item(lever, 0)
+        client.state.place_item(sign, 0)
+        unrelated = [("ffffff", "Bob starved to death."),
+                     ("ffffff", "You hit the rat for 4 damage."),
+                     ("ffffff", "Mallory casts remove depletion on you."),
+                     ("ffffff", "The big lever is broken."),
+                     ("00ffff", "Guard says: Halt, Bob!"),
+                     ("00ffff", "\nTavern keeper says: hello"),
+                     ("00ffff", "You have been defeated in combat!"),
+                     ("00ffff", "Welcome to the hall.")]
+        # Before and after her own answer, no line in the window is the lever's.
+        asyncio.run(client.apply(70))
+        for color, text in unrelated:
+            self.say(client, text, color=color)
+        self.say(client, "You turn the big lever.")
+        for color, text in unrelated:
+            self.say(client, text, color=color)
+        # Nor the sign's, nor the bumped door's (whose square has a source).
+        asyncio.run(client.apply(71))
+        self.at("/test/room", 5, 5, client)
+        asyncio.run(client.move(1))
+        for color, text in unrelated:
+            self.say(client, text, color=color)
+        self.assertEqual([row["source_key"] for row in self.rows(client)],
+                         ["lever:/test/room:6,6"])
+        self.assertEqual(self.rows(client)[0]["seen"], 1)
+
+    def test_a_player_seen_earlier_out_of_view_is_still_filtered(self):
+        client = self.client()
+        client.state.map.tile(9, 9).objects[13] = MapObject(
+            13, 1, 0, c.MAP_FLAG_NAME, name="Quinlan", name_color="ffffff", target_id=9)
+        self.at("/test/room", 5, 5, client)
+        client.state.map.tile(9, 9).objects.clear()
+        self.assertIn("quinlan", client.observations.player_names)
+        raw = interface_packet("Warden Argoth", "Welcome, Quinlan. The gate is shut.")
+        asyncio.run(client._handle_interface(Cursor(raw), raw))
+        # Mail built from player data: words no script or map holds.
+        raw = interface_packet("Warden Argoth",
+                               "The following items have been sent to you: #1 sword (Bob)")
+        asyncio.run(client._handle_interface(Cursor(raw), raw))
+        self.assertEqual(self.rows(client), [])
+        drops = client.metrics.registry.render()
+        self.assertIn('reason="player-name"}', drops)
+        self.assertIn('reason="unauthored-words"}', drops)
+
+    def test_examines_keep_only_their_own_answer(self):
+        client = self.client()
+        for tag, name in ((72, "sword"), (73, "shield"), (74, "axe")):
+            client.state.place_item(Item(tag, item_type=c.TYPE_WEAPON, name=name),
+                                    client.state.player_tag)
+        # Soulbound to another player: dropped whole.
+        asyncio.run(client.examine(72))
+        self.say(client, "That is a sword")
+        self.say(client, "It is soulbound to Bob.")
+        self.say(client, " ")
+        # A broadcast inside the answer: dropped whole, the line not kept.
+        asyncio.run(client.examine(72))
+        self.say(client, "That is a sword")
+        self.say(client, "Mallory casts remove depletion on you.")
+        self.say(client, "Qua: 80 Con: 70.")
+        self.say(client, " ")
+        # No blank line in time: dropped.
+        asyncio.run(client.examine(74))
+        self.say(client, "That is an axe")
+        client.observations.clock = lambda: time.time() + 5
         client._observe(lambda recorder: recorder.flush(client.state))
         client.observations.clock = time.time
-        asyncio.run(client.move(3))
-        self.say(client, "A voice whispers.", color="00ffff")
-        self.at("/test/room", 6, 5, client)
-        rows = {row["source_key"]: row for row in self.rows(client)}
-        self.assertEqual(set(rows), {"door:/test/room:5,4", "mouth:/test/room:6,5"})
-        self.assertEqual(rows["door:/test/room:5,4"]["source_kind"], "door")
-        self.assertEqual(rows["mouth:/test/room:6,5"]["source_kind"], "magic_mouth")
-        self.assertEqual((rows["mouth:/test/room:6,5"]["x"], rows["mouth:/test/room:6,5"]["y"]),
-                         (5, 5))
-        self.assertIn('reason="book-unverified"}', client.metrics.registry.render())
+        self.assertEqual(self.rows(client), [])
+        # Two examines in flight are answered in the order she asked.
+        asyncio.run(client.examine(72))
+        asyncio.run(client.examine(73))
+        for name in ("sword", "shield"):
+            self.say(client, f"That is a {name}")
+            self.say(client, "It weighs 2.000 kg.")
+            self.say(client, " ")
+        rows = {row["source_key"]: row["text"] for row in self.rows(client)}
+        self.assertEqual(rows, {"examine:sword": "That is a sword\nIt weighs 2.000 kg.",
+                                "examine:shield": "That is a shield\nIt weighs 2.000 kg."})
 
     def test_a_full_table_evicts_the_oldest_unreferenced_rows(self):
         from . import memory as memory_module
@@ -23246,9 +23337,11 @@ class ObservationTests(unittest.TestCase):
                 patch.object(memory_module, "OBSERVATION_PRUNE_EVERY", 1):
             first = store.record_observation("Sera", row(0))
             with store._connect() as db:
-                # A later phase's fact still cites the oldest row.
+                # A later phase's fact still cites the oldest row; a locks
+                # table without the column is skipped, not an error.
                 db.execute("CREATE TABLE facts (id INTEGER PRIMARY KEY, observation_id INTEGER)")
                 db.execute("INSERT INTO facts (observation_id) VALUES (?)", (first,))
+                db.execute("CREATE TABLE locks (source_key TEXT)")
             for index in range(1, 6):
                 store.record_observation("Sera", row(index))
             # A repeat is no new row and evicts nothing.
@@ -23351,7 +23444,14 @@ class DashboardSecurityTests(unittest.IsolatedAsyncioTestCase):
             body = json.loads(payload)
             self.assertEqual(status, 200)
             self.assertEqual([row["source_key"] for row in body["observations"]], ["system:/m"])
-            self.assertEqual((body["counts"], body["authored_index"]), ({"system": 1}, False))
+            self.assertEqual((body["counts"], body["authored_index"], body["busy"]),
+                             ({"system": 1}, False, False))
+            # A locked database answers at once, empty and busy.
+            from .memory import BotMemory
+            with patch.object(BotMemory, "observations",
+                              side_effect=sqlite3.OperationalError("database is locked")):
+                status, payload = await self.request("GET", "/api/knowledge")
+            self.assertEqual((status, json.loads(payload)["busy"]), (200, True))
 
     request = WebTests.request
 

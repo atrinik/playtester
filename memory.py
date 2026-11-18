@@ -257,11 +257,12 @@ class BotMemory:
         excess = count - OBSERVATION_ROW_LIMIT
         if excess <= 0:
             return
-        tables = {name for (name,) in db.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        # Only references that exist: a table of a later phase, or one
+        # without the column, never fails the insert that pruned.
         referenced = " ".join(
             f"AND id NOT IN (SELECT {column} FROM {table} WHERE {column} IS NOT NULL)"
-            for table, column in OBSERVATION_REFERENCES if table in tables)
+            for table, column in OBSERVATION_REFERENCES
+            if column in {row[1] for row in db.execute(f"PRAGMA table_info({table})")})
         db.execute(
             f"""DELETE FROM observations WHERE id IN (
                     SELECT id FROM observations
@@ -269,8 +270,8 @@ class BotMemory:
                     ORDER BY last_at, id LIMIT ?)""",
             (*scope, excess))
 
-    def observations(self, character: str, *, limit: int = 100,
-                     source_kind: str = "") -> list[dict[str, Any]]:
+    def observations(self, character: str, *, limit: int = 100, source_kind: str = "",
+                     timeout: float = 10.0) -> list[dict[str, Any]]:
         """Her most recently seen observations, newest first."""
         query = """SELECT id, first_at, last_at, seen, map, x, y, source_kind,
                           source_key, source_name, attribution, authored, text
@@ -284,13 +285,14 @@ class BotMemory:
         params.append(max(1, min(int(limit), 1000)))
         columns = ("id", "first_at", "last_at", "seen", "map", "x", "y", "source_kind",
                    "source_key", "source_name", "attribution", "authored", "text")
-        with self._connect() as db:
+        with self._connect(timeout) as db:
             rows = db.execute(query, params).fetchall()
         return [dict(zip(columns, row)) for row in rows]
 
-    def observation_counts(self, character: str) -> dict[str, int]:
+    def observation_counts(self, character: str, *,
+                           timeout: float = 10.0) -> dict[str, int]:
         """Stored observations by source kind."""
-        with self._connect() as db:
+        with self._connect(timeout) as db:
             rows = db.execute(
                 """SELECT source_kind, count(*) FROM observations
                    WHERE server = ? AND account = ? AND character = ?

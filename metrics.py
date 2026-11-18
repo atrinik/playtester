@@ -319,7 +319,8 @@ class BotMetrics:
         self.observations_dropped = counter(
             "observations_dropped_total",
             "Readings the ingestion filter refused, by reason: chat, player link, "
-            "/who roster, another player's name, signed or unmatched book, renamed item.",
+            "/who roster, another player's name, signed or unmatched book, renamed item, "
+            "interrupted examine, dialogue with unauthored words.",
             "reason")
         self.observation_sources = LabelLimit(32)
         self.drop_reasons = LabelLimit(32)

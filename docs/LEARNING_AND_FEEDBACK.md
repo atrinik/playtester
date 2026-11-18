@@ -1462,17 +1462,40 @@ server:
   and the book message file (`arch/messages`). The server's other generated
   books (bestiary, artifact and spell path texts, `readable.c`) are not
   indexed, so they are dropped as unmatched, like player-edited books.
-  The index is scanned once when `web` or `autoplay` starts (about a
-  second); without it books are dropped (`book-unverified`) and a navy line
-  after a bump becomes the door's if she stayed and a magic mouth's if she
-  stepped onto the square.
+  The index is scanned once when `web` or `autoplay` starts (a second or
+  two); without it books are dropped (`book-unverified`), and so are
+  dialogue and all sign, door and magic-mouth text.
+- Attribution fails closed, narrower than 4.3.1: the timing window alone
+  never attributes a line, because the server sends unrelated lines in it
+  that name players without a link ("%s starved to death.", "%s says:
+  ..." from NPC talk and `Object.Say`, "%s casts ... on you", guard
+  shouts). Sign, door, magic-mouth and custom lever text must equal the
+  authored message of an object on or next to her square; timing only
+  labels such a match `timing`. Beyond that, only the fixed phrasings
+  ("You open the %s with the %s.", "The %s is opened for you.", "The %s
+  is locked.", "The %s won't budge.", "You turn the %s.", "Nothing is
+  written on it.", "You are unable to decipher the strange symbols.") are
+  kept, each consuming the one bump or ground apply of its kind in the
+  window; with two in the window nothing is kept.
+- Dialogue pages (exact by interface title) are kept only when every word
+  of the page and its title is a word of the authored content (maps, map
+  scripts, archetypes). Scripts build pages from player data, such as the
+  post-office clerk's senders and recipients, which no authored text
+  holds. Book titles pass the same check, since a player can retitle an
+  unsigned copy of an authored book.
+- "Characters she has seen" are chat senders, `/who` names and players in
+  view since the process started; they are kept only in memory, so the set
+  starts empty after a restart.
 - Until F2's parsers exist, the only unattributed fact lines are the
   no-magic refusals "Something blocks your spellcasting." and "Something
   blocks your spell." The variant naming her item ("...the magic of your
   %s") is not kept, because a player-renamed item could carry its name.
-- An examine is the consecutive white game lines from "That is ..." within
-  0.25 s of each other. An examine of a renamed item or a signed book is
-  dropped whole, because its first line already carries the custom name.
+- An examine is kept only when every line after "That is ..." is one of
+  the forms `types/player.c` `examine` sends, an item's story is authored
+  text, and its closing blank line arrives within 1.5 s. Any other line
+  inside it drops the whole answer, as do "You name it ...", "... soulbound
+  to NAME." and a signed book, because these name a player. Answers pair
+  with her examines oldest first.
 - Book packets answer only her own apply, so they need no timing window.
   The quest journal is not stored (`quests.parse_quest_book` reads it).
 - Dialogue pages store the interface text, not its links.

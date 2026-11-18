@@ -591,7 +591,8 @@ function renderKnowledge(k) {
   if (select.dataset.sig !== options) { select.innerHTML = options; select.value = chosen; select.dataset.sig = options; }
   const total = kinds.reduce((sum, x) => sum + counts[x], 0);
   $("#knowledge-summary").textContent = `${total.toLocaleString()} reading${total === 1 ? "" : "s"} kept` +
-    (k.authored_index ? "" : " · authored-text index unavailable: books are not kept");
+    (k.authored_index ? "" : " · authored-text index unavailable: books, dialogue and sign, door and magic-mouth text are not kept") +
+    (k.busy ? " · the database is busy; try again shortly" : "");
   const when = t => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   $("#knowledge").innerHTML = (k.observations || []).map(o => `<div class="reading">
     <div class="reading-head"><b>${esc(KIND_LABELS[o.source_kind] || o.source_kind)}</b><span>${esc(o.source_name || o.source_key)}</span><span class="flag">${esc(o.attribution)}</span>${o.seen > 1 ? `<span class="flag">×${esc(o.seen)}</span>` : ""}<time>${esc(when(o.last_at))}</time></div>

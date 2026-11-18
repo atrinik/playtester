@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ STATIC = Path(__file__).with_name("web_static")
 # 4.10.5): scripts, styles, images and requests only from the dashboard
 # itself; no inline script or style (the page sets styles through CSSOM),
 # no plugins, no framing and no <base> rewriting.
+# The longest the Knowledge tab waits for a locked database (seconds).
+KNOWLEDGE_READ_TIMEOUT = 0.25
 CONTENT_SECURITY_POLICY = ("default-src 'self'; script-src 'self'; object-src 'none'; "
                            "frame-ancestors 'none'; base-uri 'none'")
 
@@ -963,15 +966,21 @@ class WebControlServer:
             # they hold no chat and no other player's name.
             params = parse_qs(query)
             character = getattr(self.client, "_memory_character", "")
-            observations, counts = [], {}
+            observations, counts, busy = [], {}, False
             if character:
                 memory = self.client._memory_store()
-                observations = memory.observations(
-                    character, limit=int((params.get("limit") or ["100"])[0]),
-                    source_kind=(params.get("kind") or [""])[0])
-                counts = memory.observation_counts(character)
+                try:
+                    # A locked database must not hold up the event loop.
+                    observations = memory.observations(
+                        character, limit=int((params.get("limit") or ["100"])[0]),
+                        source_kind=(params.get("kind") or [""])[0],
+                        timeout=KNOWLEDGE_READ_TIMEOUT)
+                    counts = memory.observation_counts(
+                        character, timeout=KNOWLEDGE_READ_TIMEOUT)
+                except sqlite3.OperationalError:
+                    observations, counts, busy = [], {}, True
             await self._reply(writer, 200, _json_bytes({
-                "observations": observations, "counts": counts,
+                "observations": observations, "counts": counts, "busy": busy,
                 "authored_index": getattr(self.client, "authored_content", None) is not None}))
             return
         if method == "GET" and path.startswith("/api/face/"):

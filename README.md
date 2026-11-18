@@ -244,7 +244,7 @@ Counters:
 | `tasks_finished_total` | `task`, `status` | top-level tasks that completed, failed or were stopped from the dashboard (stopping counts as failed); a task replaced by another is not counted |
 | `state_seconds_total` | `state` | seconds `fighting`, `resting`, `travelling`, `shopping` (shops, temple, NPC dialogue), `busy`, `idle` or `disconnected` (not playing) |
 | `observations_total` | `source` | [observations](#observation-ledger) stored, by source kind; a repeat of a stored reading counts again |
-| `observations_dropped_total` | `reason` | readings the ingestion filter refused: `chat`, `player-link`, `who-list`, `player-name`, `signed-book`, `unmatched-book`, `book-unverified`, `renamed-item` |
+| `observations_dropped_total` | `reason` | readings the ingestion filter refused: `chat`, `player-link`, `who-list`, `player-name`, `signed-book`, `unmatched-book`, `book-unverified`, `renamed-item`, `examine-interrupted`, `unauthored-words` |
 
 The time in each state follows the latest recorded action that marks one. For
 example, a target or a kite step means fighting, and a step or route decision
@@ -265,20 +265,28 @@ runtime state database (`observations.py`, `memory.py`; the design is
   page naming another character she has seen (chat senders, `/who`, players
   in view) are never stored. Her own name becomes `{activator.name}`, as in
   authored dialogue. Other players' names are held only in memory, to
-  filter with.
-- **Attributed.** A door's, sign's or magic mouth's text is tied to its
-  object by her own bump, apply or step in the previous 1.5 seconds
-  (`timing`), or by an authored object on or next to her square whose
-  message equals the text (`content-match`; a broadcast she did not cause,
-  with another player in view, is not hers). Dialogue pages, authored books
-  and her examines carry their own identity (`exact`). An unattributed line
-  is stored, as `system:<map>`, only when it is a fact line (for now "Something
-  blocks your spellcasting."); others are not kept. The same text from the same
-  source raises the row's `seen` count.
+  filter with, so after a restart only players seen since then are known.
+- **Fail closed.** A line is kept only when it is certainly the source's own
+  answer. Sign, door and magic-mouth text must equal an authored message of
+  an object on or next to her square (`timing` when her own bump, apply or
+  step in the previous 1.5 seconds reached it, else `content-match`; a
+  broadcast she did not cause, with another player in view, is not hers).
+  Otherwise only fixed server phrasings are kept ("You open the door with
+  the key.", "You turn the lever.", "Nothing is written on it."), each the
+  answer to the one action of its kind in the window, which it consumes.
+  An examine is kept only when every line is one of the forms the server's
+  examine sends and its blank last line arrives; one soulbound to someone
+  is dropped. A dialogue page is kept only when every word in it is a word
+  of the authored content (maps, map scripts, archetypes), so pages built
+  from player data (mail senders, recipients) are dropped. Authored books
+  are kept by title (`exact`). An unattributed line is stored, as
+  `system:<map>`, only when it is a fact line (for now "Something blocks
+  your spellcasting."). The same text from the same source raises the
+  row's `seen` count.
 - **The authored-text index** is scanned from the locked content (maps,
-  archetypes, artifacts and the book message file, about a second) when the
-  `web` or `autoplay` command starts. Without it, books are not kept and
-  doors and magic mouths are attributed by timing alone.
+  map scripts, archetypes, artifacts and the book message file, a second or
+  two) when the `web` or `autoplay` command starts. Without it, books,
+  dialogue and sign, door and magic-mouth text are not kept.
 - **Bounded.** At most 50,000 rows a character, 4,000 characters of text a
   row; when full, the least recently seen rows that no later table refers to
   are evicted first. Writes wait at most 0.25 seconds for a locked database

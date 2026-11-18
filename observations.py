@@ -39,8 +39,6 @@ log = logging.getLogger(__name__)
 
 # Seconds after her own action in which a line is that action's answer.
 WINDOW = 1.5
-# Seconds between examine lines of one answer (one server tick sends them).
-EXAMINE_GAP = 0.25
 # Characters kept of any stored text.
 TEXT_LIMIT = 4000
 # Her own name in stored text: the form authored dialogue uses.
@@ -85,9 +83,44 @@ FACT_LINES = frozenset({
     "something blocks your spell.",
 })
 
+# Examine output after "That is ..." (types/player.c examine), as forms;
+# "You name it ...", "... soulbound to NAME." and "The object has a story:"
+# are handled apart, and a blank line ends the answer.
+_IT = r"(?:It|They)"
+_IS = r"(?:It is|They are)"
+EXAMINE_LINES = tuple(re.compile(pattern) for pattern in (
+    rf"^{_IS} (?:good|evil|neutral) aligned\.$",
+    r"^It needs a level of \d+(?: in [a-z ]+)? to use\.$",
+    r"^Qua: \d+ Con: (?:\d+|Indestructible)\.$",
+    r"^Something is written in it\.$",
+    r"^It seems to contain (?:no|tiny bits of|a small amount of|an average amount of|"
+    r"a moderate amount of|a fair amount of|a great amount of) knowledge you could "
+    r"learn from\.$",
+    r"^It contains a level \d+ [a-z]+ spell\.$",
+    r"^It requires a minimum level of \d+ in literacy to learn\.$",
+    r"^It can hold only [a-z ]+(?: and its weight limit is [\d.]+ kg)?\.$",
+    r"^Its weight limit is [\d.]+ kg\.$",
+    r"^It (?:increases|decreases) the weight of items inside by [\d.]+%\.$",
+    r"^It contains [\d.]+ kg(?:, (?:increased|decreased) to [\d.]+ kg)?\.$",
+    r"^It has \d+ charges left\.$",
+    r"^It has capacity of [\d.]+k?(?: and is [a-z ]+)?\.$",
+    rf"^{_IS} made of: [a-z ]*$",
+    rf"^{_IT} weighs? [\d.]+ kg(?: and is carrying [\d.]+ kg)?\.$",
+    rf"^{_IT} would become soulbound to you\.$",
+    rf"^{_IS} soulbound without an owner\.$",
+    rf"^{_IT} would cost (?:you [a-z0-9 ,]+|nothing)\.$",
+    r"^(?:It is a god-given item|They are god-given items)\.$",
+    rf"^(?:But )?(?:{_IS}|it is|they are) worth(?:less| [a-z0-9 ,]+)\.$",
+    r"^This shop will pay you [a-z0-9 ,]+\.$",
+))
+SOULBOUND_TO = re.compile(rf"^{_IS} soulbound to .+\.$")
+# Words, for the authored-vocabulary check of dialogue and book titles.
+WORD = re.compile(r"[^\W\d_]+")
+
 # observations_dropped_total reasons.
 DROP_REASONS = ("chat", "player-link", "who-list", "player-name", "signed-book",
-                "unmatched-book", "book-unverified", "renamed-item")
+                "unmatched-book", "book-unverified", "renamed-item",
+                "examine-interrupted", "unauthored-words")
 
 
 def normalize(text: str) -> str:
@@ -160,6 +193,9 @@ class AuthoredContent:
     texts: set[str] = field(default_factory=set)
     sources: dict[tuple[str, int, int], list[AuthoredSource]] = field(default_factory=dict)
     names: set[str] = field(default_factory=set)
+    # Every word of the authored content (maps, map scripts, archetypes),
+    # case folded: what an NPC page may consist of.
+    words: set[str] = field(default_factory=set)
 
     def at(self, map_path: str, x: int, y: int) -> list[AuthoredSource]:
         return self.sources.get((map_path, x, y), [])
@@ -178,10 +214,17 @@ class AuthoredContent:
             except OSError:
                 continue
             if not data.startswith(b"arch map\n"):
+                if path.suffix in (".py", ".xml", ".json", ".txt"):
+                    content._add_words(data.decode("utf-8", "replace"))
                 continue
             key = "/" + path.relative_to(map_root).as_posix()
-            content._scan_map(key, data.decode("utf-8", "replace"), defaults)
+            text = data.decode("utf-8", "replace")
+            content._add_words(text)
+            content._scan_map(key, text, defaults)
         return content
+
+    def _add_words(self, text: str) -> None:
+        self.words.update(WORD.findall(text.casefold()))
 
     def _add_text(self, lines: list[str]) -> str:
         msg = "\n".join(lines)
@@ -205,6 +248,7 @@ class AuthoredContent:
                 text = path.read_text(errors="replace")
             except OSError:
                 continue
+            self._add_words(text)
             if path.name == "messages":
                 # lib/messages: MSG ... ENDMSG (readable.c init_msgfile).
                 body: list[str] | None = None
@@ -388,15 +432,11 @@ class _Examine:
     x: int
     y: int
     lines: list[str] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class _Deferred:
-    at: float
-    text: str
-    color: str
-    msg_type: int
-    action: _Action
+    # The previous line was "The object has a story:"; this one must be
+    # authored text.
+    story_next: bool = False
+    # A line made the whole answer unsafe to keep.
+    rejected: str = ""
 
 
 class ObservationRecorder:
@@ -405,6 +445,11 @@ class ObservationRecorder:
     Each ``on_*`` method returns the observations to store (possibly none);
     ``dropped`` is called with a ``DROP_REASONS`` entry for each item the
     filter refused. ``content`` returns the authored-text index or None.
+
+    It fails closed: a line is kept only when it is certainly the source's
+    own answer: authored text (its hash is in the index), a fixed server
+    phrasing that answers the one action it consumes, an enumerated examine
+    line, or a dialogue page whose every word is authored vocabulary.
     """
 
     def __init__(self, content: Callable[[], AuthoredContent | None] = lambda: None,
@@ -415,11 +460,11 @@ class ObservationRecorder:
         self.clock = clock
         self._actions: deque[_Action] = deque(maxlen=16)
         self._examine: _Examine | None = None
-        self._deferred: list[_Deferred] = []
         self._last_square: tuple[str, int, int] | None = None
         self._square: tuple[str, int, int] | None = None
-        # Other characters she has seen (chat senders, /who): folded name to
-        # when last seen. Never stored; it only drops lines naming them.
+        # Other characters she has seen in this process (chat senders, /who,
+        # players in view): folded name to when last seen. Never stored, and
+        # empty again after a restart; it only drops lines naming them.
         self.player_names: dict[str, float] = {}
         self._patterns: dict[str, re.Pattern] = {}
 
@@ -428,8 +473,8 @@ class ObservationRecorder:
     def note_move(self, state: GameState, direction: int) -> None:
         dx, dy = c.DIRECTION_DELTAS.get(direction, (0, 0))
         m = state.map
-        self._note(_Action(self.clock(), "move", m.path, (m.world_x, m.world_y),
-                           (m.world_x + dx, m.world_y + dy)))
+        self._actions.append(_Action(self.clock(), "move", m.path, (m.world_x, m.world_y),
+                                     (m.world_x + dx, m.world_y + dy)))
 
     def note_apply(self, state: GameState, item: Item | None) -> None:
         """An apply: of an object under her (a lever, a sign) or one she carries."""
@@ -437,29 +482,33 @@ class ObservationRecorder:
             return
         m = state.map
         here = (m.world_x, m.world_y)
-        self._note(_Action(self.clock(), "apply", m.path, here, here,
-                           item.name, item.item_type, ground=item.location == 0))
+        self._actions.append(_Action(self.clock(), "apply", m.path, here, here,
+                                     item.name, item.item_type, ground=item.location == 0))
 
     def note_examine(self, state: GameState, item: Item | None) -> None:
         if item is None:
             return
         m = state.map
         here = (m.world_x, m.world_y)
-        self._note(_Action(self.clock(), "examine", m.path, here, here,
-                           item.name, item.item_type))
+        self._actions.append(_Action(self.clock(), "examine", m.path, here, here,
+                                     item.name, item.item_type))
 
     def note_position(self, state: GameState) -> list[Observation]:
         m = state.map
         square = (m.path, m.world_x, m.world_y)
         if square != self._square:
             self._last_square, self._square = self._square, square
+        self._remember_view(state)
         return self.flush(state)
-
-    def _note(self, action: _Action) -> None:
-        self._actions.append(action)
 
     def _recent(self, now: float) -> list[_Action]:
         return [a for a in self._actions if 0 <= now - a.at <= WINDOW]
+
+    def _consume(self, action: _Action) -> None:
+        try:
+            self._actions.remove(action)
+        except ValueError:
+            pass
 
     # Names.
 
@@ -486,10 +535,19 @@ class ObservationRecorder:
                 names.add(name)
         return names
 
+    def _remember_view(self, state: GameState) -> set[str]:
+        """Players in view now, remembered for as long as the process runs."""
+        names = self._players_in_view(state)
+        now = self.clock()
+        for name in names:
+            self._remember_player(name, now)
+        return names
+
     def _names_another(self, text: str, state: GameState) -> bool:
         folded = plain(text)
         own = plain(state.player_name)
-        for name in (*self.player_names, *self._players_in_view(state)):
+        self._remember_view(state)
+        for name in self.player_names:
             if name == own or name not in folded:
                 continue
             pattern = self._patterns.get(name)
@@ -506,6 +564,10 @@ class ObservationRecorder:
         own = normalize(state.player_name)
         if own:
             text = _name_pattern(own).sub(ACTIVATOR, text)
+            # Her name split by markup ("[b]Se[/b]ra") is not replaced: drop.
+            if _name_pattern(plain(own)).search(plain(text)):
+                self.dropped("player-name")
+                return None
         if self._names_another(text, state):
             self.dropped("player-name")
             return None
@@ -536,7 +598,7 @@ class ObservationRecorder:
             self.dropped("who-list")
             return out
         color = str(color).casefold()
-        consumed, finished = self._examine_line(state, msg_type, color, stripped, now)
+        consumed, finished = self._examine_line(state, msg_type, color, text, now)
         if finished is not None:
             out.append(finished)
         if consumed:
@@ -546,41 +608,68 @@ class ObservationRecorder:
             out.append(observation)
         return out
 
+    # Examine answers (types/player.c examine): "That is ...", lines of the
+    # forms below, and a blank line last. Any other line, or no blank line
+    # in time, drops the whole answer.
     def _examine_line(self, state: GameState, msg_type: int, color: str, text: str,
                       now: float) -> tuple[bool, Observation | None]:
         """Collect an examine answer: whether the line belongs to one, and
-        the previous answer when this line ended it."""
-        group = self._examine
-        finished = None
+        the finished answer when this line completed it."""
+        stripped = normalize(text)
         is_game = msg_type == c.CHAT_TYPE_GAME and color == WHITE
+        group = self._examine
+        if group is not None and is_game and stripped.startswith("That is "):
+            # The next answer began before this one's blank line.
+            self._abandon_examine()
+            group = None
         if group is not None:
-            if (is_game and now - group.last <= EXAMINE_GAP and
-                    not text.startswith("That is ") and text.casefold() not in FACT_LINES):
+            if not is_game:
+                self._abandon_examine()
+                return False, None
+            if not stripped:
+                return True, self._finish_examine(state)
+            if group.story_next:
+                group.story_next = False
+                content = self.content()
+                if content is None or text_hash(text) not in content.texts:
+                    group.rejected = group.rejected or "examine-interrupted"
                 group.lines.append(text)
-                group.last = now
-                return True, None
-            # Anything else ends the answer.
-            finished = self._finish_examine(state)
-        if not (is_game and text.startswith("That is ")):
-            return False, finished
-        action = next((a for a in reversed(self._recent(now)) if a.kind == "examine"), None)
+            elif stripped.startswith("You name it "):
+                group.rejected = "renamed-item"
+            elif SOULBOUND_TO.match(stripped):
+                group.rejected = "player-name"
+            elif stripped == "The object has a story:":
+                group.story_next = True
+                group.lines.append(stripped)
+            elif any(pattern.match(stripped) for pattern in EXAMINE_LINES):
+                group.lines.append(stripped)
+            else:
+                # Not examine output (a broadcast, a combat line): the
+                # answer can no longer be told apart from it.
+                self._abandon_examine()
+                return False, None
+            group.last = now
+            return True, None
+        if not (is_game and stripped.startswith("That is ")):
+            return False, None
+        # Answers come in the order she asked: the oldest unanswered examine.
+        action = next((a for a in self._recent(now) if a.kind == "examine"), None)
         if action is None:
-            return False, finished
-        self._actions.remove(action)
+            return False, None
+        self._consume(action)
         m = state.map
         self._examine = _Examine(now, now, action.item_name, m.path,
-                                 m.world_x, m.world_y, [text])
-        return True, finished
+                                 m.world_x, m.world_y, [stripped])
+        if "(signed; permanently finalized)" in stripped:
+            self._examine.rejected = "signed-book"
+        return True, None
 
     def _finish_examine(self, state: GameState) -> Observation | None:
         group, self._examine = self._examine, None
         if group is None:
             return None
-        if any(line.startswith("You name it ") for line in group.lines):
-            self.dropped("renamed-item")
-            return None
-        if "(signed; permanently finalized)" in group.lines[0]:
-            self.dropped("signed-book")
+        if group.rejected:
+            self.dropped(group.rejected)
             return None
         name = normalize(MARKUP.sub("", group.name))
         if not name or "corpse" in name.casefold():
@@ -595,125 +684,107 @@ class ObservationRecorder:
     def _attribute(self, state: GameState, msg_type: int, color: str, text: str,
                    now: float) -> Observation | None:
         m = state.map
-        here = (m.path, m.world_x, m.world_y)
         recent = self._recent(now)
         content = self.content()
-        digest = text_hash(text)
         stripped = normalize(text)
-        source: AuthoredSource | None = None
-        attribution = ""
-        # Content match on or next to her square (and the square she left).
+        # Authored text from a source on or next to her square (or the one
+        # she just left): the only way sign, door and magic mouth text is kept.
         if content is not None and m.path:
-            squares = {(m.world_x + dx, m.world_y + dy)
-                       for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
-            if self._last_square and self._last_square[0] == m.path:
-                squares.add(self._last_square[1:])
-            matches = {s.key: s for x, y in squares for s in content.at(m.path, x, y)
-                       if s.msg_hash == digest}
-            if len(matches) == 1:
-                source = next(iter(matches.values()))
-                own = any(a.map == m.path and (source.x, source.y) in (a.origin, a.target)
-                          for a in recent if a.kind in ("move", "apply"))
-                on_square = (source.x, source.y) == (m.world_x, m.world_y) or (
-                    self._last_square == (m.path, source.x, source.y))
-                if own:
-                    attribution = "timing"
-                elif on_square or not self._players_in_view(state):
-                    attribution = "content-match"
-                else:
-                    # A broadcast another player may have caused (sign.c
-                    # trigger_func): never a hint of hers.
-                    source = None
-        if source is not None:
-            return self._observation(state, now, source.map, source.x, source.y,
-                                     source.kind, source.key, source.name, attribution,
-                                     True, text, color, msg_type)
-        action = recent[-1] if recent else None
-        if action is not None and action.kind == "move" and action.map == m.path:
-            tx, ty = action.target
-            opened = DOOR_OPENED.match(stripped) or DOOR_OPENED_FOR_YOU.match(stripped)
-            if color == WHITE and opened:
-                return self._observation(state, now, m.path, tx, ty, "door",
-                                         f"door:{m.path}:{tx},{ty}", opened.group("name"),
-                                         "timing", False, text, color, msg_type)
-            # A refused bump leaves her where she was.
-            if color == NAVY and (m.world_x, m.world_y) == action.origin:
-                known = content.at(m.path, tx, ty) if content is not None else None
-                if known:
-                    # Her bump reached an authored door or sign whose text
-                    # differs from its authored message (a script set it).
-                    s = known[0]
-                    return self._observation(state, now, m.path, tx, ty, s.kind, s.key,
-                                             s.name, "timing", False, text, color, msg_type)
-                if content is None:
-                    # Without the index: a door if she stayed, a magic mouth
-                    # if she stepped on (decided once her square is known).
-                    self._deferred.append(_Deferred(now, text, color, msg_type, action))
-                    self._actions.remove(action)
-                    return None
-        if (action is not None and action.kind == "apply" and action.ground and
-                action.map == m.path):
-            x, y = action.target
-            if action.item_type == TYPE_HANDLE and color == WHITE:
-                named = next((p.match(stripped) for p in LEVER_PHRASES if p.match(stripped)), None)
-                return self._observation(state, now, m.path, x, y, "lever",
-                                         f"lever:{m.path}:{x},{y}",
-                                         named.group("name") if named else action.item_name,
-                                         "timing", False, text, color, msg_type)
-            if action.item_type == TYPE_SIGN and (
-                    color == NAVY or (color == WHITE and stripped.casefold() in SIGN_PHRASES)):
-                return self._observation(state, now, m.path, x, y, "sign",
-                                         f"sign:{m.path}:{x},{y}", action.item_name,
-                                         "timing", False, text, color, msg_type)
+            digest = text_hash(text)
+            if digest in content.texts:
+                squares = {(m.world_x + dx, m.world_y + dy)
+                           for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+                if self._last_square and self._last_square[0] == m.path:
+                    squares.add(self._last_square[1:])
+                matches = {s.key: s for x, y in squares for s in content.at(m.path, x, y)
+                           if s.msg_hash == digest}
+                if len(matches) == 1:
+                    source = next(iter(matches.values()))
+                    own = next((a for a in recent if a.kind in ("move", "apply") and
+                                a.map == m.path and
+                                (source.x, source.y) in (a.origin, a.target)), None)
+                    on_square = (source.x, source.y) == (m.world_x, m.world_y) or (
+                        self._last_square == (m.path, source.x, source.y))
+                    if own is not None:
+                        self._consume(own)
+                        attribution = "timing"
+                    elif on_square or not self._remember_view(state):
+                        attribution = "content-match"
+                    else:
+                        # A broadcast another player may have caused (sign.c
+                        # trigger_func): never a hint of hers.
+                        return None
+                    return self._observation(state, now, source.map, source.kind,
+                                             source.key, source.name, attribution, True,
+                                             text, color, msg_type)
+        # Fixed server phrasings, each the answer to one action it consumes.
+        # With two bumps or two applies in the window, which one the line
+        # answers is unknown: nothing is kept.
+        if color == WHITE:
+            kinds = [(a.kind, a.ground) for a in recent]
+            for action in recent:
+                if action.map != m.path or kinds.count((action.kind, action.ground)) != 1:
+                    continue
+                if action.kind == "move":
+                    opened = DOOR_OPENED.match(stripped) or DOOR_OPENED_FOR_YOU.match(stripped)
+                    if opened:
+                        self._consume(action)
+                        tx, ty = action.target
+                        return self._observation(state, now, m.path, "door",
+                                                 f"door:{m.path}:{tx},{ty}",
+                                                 opened.group("name"), "timing", False,
+                                                 text, color, msg_type)
+                elif action.kind == "apply" and action.ground:
+                    x, y = action.target
+                    named = next((p.match(stripped) for p in LEVER_PHRASES
+                                  if p.match(stripped)), None)
+                    if action.item_type == TYPE_HANDLE and named:
+                        self._consume(action)
+                        return self._observation(state, now, m.path, "lever",
+                                                 f"lever:{m.path}:{x},{y}",
+                                                 named.group("name"), "timing", False,
+                                                 text, color, msg_type)
+                    if action.item_type == TYPE_SIGN and stripped.casefold() in SIGN_PHRASES:
+                        self._consume(action)
+                        return self._observation(state, now, m.path, "sign",
+                                                 f"sign:{m.path}:{x},{y}", action.item_name,
+                                                 "timing", False, text, color, msg_type)
         if stripped.casefold() in FACT_LINES and m.path:
-            return self._observation(state, now, m.path, m.world_x, m.world_y, "system",
-                                     f"system:{m.path}", "", "none", False, text,
-                                     color, msg_type)
+            return self._observation(state, now, m.path, "system", f"system:{m.path}", "",
+                                     "none", False, text, color, msg_type)
         return None
 
-    def _observation(self, state: GameState, now: float, map_path: str, x: int, y: int,
-                     kind: str, key: str, name: str, attribution: str, authored: bool,
-                     text: str, color: str, msg_type: int | None,
-                     stood: tuple[int, int] | None = None) -> Observation | None:
-        """An observation of the source at (x, y); the row records where she
-        stood (``stood``, else her square now), the key names the source."""
+    def _observation(self, state: GameState, now: float, map_path: str, kind: str,
+                     key: str, name: str, attribution: str, authored: bool,
+                     text: str, color: str, msg_type: int | None) -> Observation | None:
+        """An observation of ``key``'s source; the row records where she stood."""
         cleaned = self._clean(text, state)
         if cleaned is None:
             return None
         m = state.map
-        sx, sy = stood if stood is not None else (m.world_x, m.world_y)
-        return Observation(now, map_path or m.path, sx, sy, kind, key,
+        return Observation(now, map_path or m.path, m.world_x, m.world_y, kind, key,
                            normalize(MARKUP.sub("", name)), attribution, authored,
                            cleaned, color, msg_type)
 
     def flush(self, state: GameState, now: float | None = None) -> list[Observation]:
-        """Finish answers whose time is up: an examine, a deferred bump."""
+        """Drop an examine answer whose blank last line never came."""
         now = self.clock() if now is None else now
-        out: list[Observation] = []
-        if self._examine is not None and now - self._examine.last > EXAMINE_GAP:
-            finished = self._finish_examine(state)
-            if finished is not None:
-                out.append(finished)
-        m = state.map
-        keep: list[_Deferred] = []
-        for item in self._deferred:
-            action = item.action
-            moved = m.path == action.map and (m.world_x, m.world_y) == action.target
-            if not moved and now - item.at <= WINDOW and m.path == action.map:
-                keep.append(item)
-                continue
-            if m.path != action.map:
-                continue
-            tx, ty = action.target
-            kind = "magic_mouth" if moved else "door"
-            key = f"{'mouth' if moved else 'door'}:{action.map}:{tx},{ty}"
-            observation = self._observation(state, item.at, action.map, tx, ty, kind,
-                                            key, "", "timing", False, item.text,
-                                            item.color, item.msg_type, stood=action.origin)
-            if observation is not None:
-                out.append(observation)
-        self._deferred = keep
-        return out
+        if self._examine is not None and now - self._examine.last > WINDOW:
+            self._abandon_examine()
+        return []
+
+    def _abandon_examine(self) -> None:
+        group, self._examine = self._examine, None
+        if group is not None:
+            self.dropped(group.rejected or "examine-interrupted")
+
+    def _authored_words(self, text: str) -> bool:
+        """Whether every word of ``text`` (her name aside) is authored."""
+        content = self.content()
+        if content is None:
+            return False
+        words = WORD.findall(MARKUP.sub(" ", text.replace(ACTIVATOR, " ")).casefold())
+        return all(word in content.words for word in words)
 
     def on_interface(self, state: GameState, interface: InterfaceState) -> list[Observation]:
         now = self.clock()
@@ -722,14 +793,19 @@ class ObservationRecorder:
         if not normalize(interface.text) or not title:
             return out
         m = state.map
-        if self._names_another(title, state):
-            self.dropped("player-name")
-            return out
         own = normalize(state.player_name)
         if own:
             title = _name_pattern(own).sub(ACTIVATOR, title)
         text = self._clean(interface.text, state)
-        if text is None:
+        if text is None or self._names_another(title, state):
+            if text is not None:
+                self.dropped("player-name")
+            return out
+        # Scripts build pages from player data (mail senders, recipients):
+        # a page is kept only when every word in it, and in its title, is a
+        # word of the authored content.
+        if not (self._authored_words(title) and self._authored_words(text)):
+            self.dropped("unauthored-words")
             return out
         out.append(Observation(now, m.path, m.world_x, m.world_y, "npc",
                                f"npc:{m.path}:{title}", title, "exact", False, text))
@@ -758,7 +834,8 @@ class ObservationRecorder:
         recent = [a for a in self._recent(now) if a.kind == "apply"]
         kind = "scroll" if recent and recent[-1].item_type == c.TYPE_SCROLL else "book"
         title = normalize(MARKUP.sub("", page.title))
-        if self._names_another(title, state):
+        # A player can retitle an unsigned copy of an authored book.
+        if self._names_another(title, state) or not self._authored_words(title):
             self.dropped("player-name")
             return out
         text = self._clean(page.body.strip("\n"), state)
