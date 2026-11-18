@@ -878,6 +878,98 @@ class ProtocolTests(unittest.TestCase):
             "task engine step failed 5 more times: RuntimeError: same bug",
             "task engine step failed"])
 
+    def test_pending_engine_error_repeats_are_flushed(self):
+        _, engine, _ = self.playing_engine()
+        with self.assertLogs(TaskEngine.__module__, "ERROR") as logs:
+            for _ in range(3):
+                engine._step_failed(RuntimeError("first bug"))
+            # A different error reports the first one's repeats first.
+            for _ in range(2):
+                engine._step_failed(KeyError("second bug"))
+            # So does a clean step.
+            engine._step_succeeded()
+            # And the same error afterwards is reported in full again.
+            engine._step_failed(KeyError("second bug"))
+        self.assertEqual([record.getMessage() for record in logs.records], [
+            "task engine step failed",
+            "task engine step failed 2 more times: RuntimeError: first bug",
+            "task engine step failed",
+            "task engine step failed 1 more times: KeyError: 'second bug'",
+            "task engine step failed"])
+        self.assertEqual((engine.step_error, engine.step_error_count),
+                         ("KeyError: 'second bug'", 1))
+
+    def test_a_failing_engine_step_is_shown_and_alerted_until_clean(self):
+        from .alerts import ENGINE_ERROR_CRITICAL_SECONDS, ENGINE_ERROR_STEPS
+        from .web_server import WebControlServer
+
+        async def scenario():
+            client, engine, _ = self.playing_engine()
+            engine.error_backoff_max = 0.001
+            server = WebControlServer(client, engine, WorldGraph())
+            failing = [True]
+
+            async def normalize():
+                if failing[0]:
+                    raise RuntimeError("bug in upkeep")
+                return False
+
+            engine._normalize_inventory_locks = normalize
+
+            def engine_alerts():
+                return [alert for alert in server.dashboard.alerts()
+                        if alert["id"] == "engine-error"]
+
+            with self.assertLogs(TaskEngine.__module__, "ERROR"):
+                runner = asyncio.create_task(engine.run())
+                await self.until(lambda: engine.step_error_count >= 1)
+                started = engine.step_error_since
+                self.assertLessEqual(abs(started - time.time()), 5)
+                snapshot = server.dashboard.snapshot()
+                self.assertEqual(snapshot["engine_error"]["error"],
+                                 "RuntimeError: bug in upkeep")
+                await self.until(
+                    lambda: engine.step_error_count > ENGINE_ERROR_STEPS)
+                self.assertEqual(engine.step_error_since, started)
+                self.assertEqual([alert["level"] for alert in engine_alerts()],
+                                 ["warn"])
+                # Ten minutes of it is critical.
+                engine.step_error_since = (time.time()
+                                           - ENGINE_ERROR_CRITICAL_SECONDS - 1)
+                alerts = engine_alerts()
+                self.assertEqual(alerts[0]["level"], "critical")
+                self.assertIn("bug in upkeep", alerts[0]["text"])
+                # A clean step clears both.
+                failing[0] = False
+                await self.until(lambda: engine.step_error_count == 0)
+            self.assertIsNone(server.dashboard.snapshot()["engine_error"])
+            self.assertEqual(engine_alerts(), [])
+            engine.running = False
+            await runner
+
+        asyncio.run(scenario())
+
+    def test_engine_error_alert_needs_more_than_a_few_failed_steps(self):
+        from .alerts import (ENGINE_ERROR_CRITICAL_SECONDS, ENGINE_ERROR_STEPS,
+                             ProgressWatch, active)
+
+        now = 10_000.0
+        state = GameState()
+        watch = ProgressWatch(now)
+
+        def levels(count, since):
+            return [alert["level"] for alert in active(
+                state, [], watch, autoplay_started_at=None, now=now,
+                engine_error={"error": "RuntimeError: x", "count": count,
+                              "since": since})
+                    if alert["id"] == "engine-error"]
+
+        self.assertEqual(levels(ENGINE_ERROR_STEPS, now - 3600), [])
+        self.assertEqual(levels(ENGINE_ERROR_STEPS + 1, now - 60), ["warn"])
+        self.assertEqual(levels(ENGINE_ERROR_STEPS + 1,
+                                now - ENGINE_ERROR_CRITICAL_SECONDS),
+                         ["critical"])
+
     def test_stop_during_an_idle_food_trip_tick_is_not_a_failed_trip(self):
         from .autoplay import IdleSurvival
 

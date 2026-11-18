@@ -7308,8 +7308,15 @@ class TaskEngine:
         # The last engine step error, its unreported repeats and when it
         # was last reported (``_report_step_error``).
         self._error_key: tuple | None = None
+        self._error_text = ""
         self._error_repeats = 0
         self._error_reported_at = 0.0
+        # Consecutive failed engine steps, the last one's error and when the
+        # run of failures began (wall clock): the dashboard's /api/state and
+        # its engine-error alert. A clean step clears them.
+        self.step_error = ""
+        self.step_error_count = 0
+        self.step_error_since = 0.0
 
     def set_task(self, task: BotTask | None) -> None:
         self.task = task
@@ -7486,18 +7493,40 @@ class TaskEngine:
                if frame is not None else None)
         now = time.monotonic()
         if key != self._error_key:
+            # Repeats of the previous error are reported before the new one.
+            self._flush_step_errors()
             self._error_key, self._error_repeats = key, 0
+            self._error_text = f"{type(exc).__name__}: {exc}"
             self._error_reported_at = now
             log.error("task engine step failed", exc_info=exc)
             return
         self._error_repeats += 1
         if now - self._error_reported_at >= self.error_report_seconds:
-            log.error("task engine step failed %d more times: %s: %s",
-                      self._error_repeats, type(exc).__name__, exc)
-            self._error_repeats, self._error_reported_at = 0, now
+            self._flush_step_errors()
+            self._error_reported_at = now
+
+    def _flush_step_errors(self) -> None:
+        """Log the unreported repeats of the last step error, if any."""
+        if self._error_repeats:
+            log.error("task engine step failed %d more times: %s",
+                      self._error_repeats, self._error_text)
+            self._error_repeats = 0
+
+    def _step_failed(self, exc: Exception) -> None:
+        self._report_step_error(exc)
+        if not self.step_error_count:
+            self.step_error_since = time.time()
+        self.step_error_count += 1
+        self.step_error = f"{type(exc).__name__}: {exc}"
+
+    def _step_succeeded(self) -> None:
+        self._flush_step_errors()
+        # A later failure, even the same one, is new again.
+        self._error_key = None
+        self.step_error, self.step_error_count = "", 0
+        self.step_error_since = 0.0
 
     async def run(self) -> None:
-        failures = 0
         while self.running:
             try:
                 await self._step()
@@ -7513,11 +7542,12 @@ class TaskEngine:
                 # ``_tick_task``; anything else here (upkeep, bookkeeping, a
                 # stale tick's cleanup) is not the task's, which is kept.
                 self.client.action_context = ""
-                self._report_step_error(exc)
-                failures += 1
+                self._step_failed(exc)
                 await asyncio.sleep(max(self.tick_rate, min(
                     self.error_backoff_max,
-                    self.error_backoff * 2 ** min(failures - 1, 16))))
+                    self.error_backoff * 2 ** min(
+                        self.step_error_count - 1, 16))))
                 continue
-            failures = 0
+            if self.step_error_count:
+                self._step_succeeded()
             await asyncio.sleep(self.tick_rate)

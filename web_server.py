@@ -512,6 +512,15 @@ class DashboardState:
             "y": game_map.world_y, "tiles": tiles,
         }
 
+    def engine_error(self) -> dict[str, Any] | None:
+        """The task engine's current run of failed steps, or None."""
+        count = int(getattr(self.engine, "step_error_count", 0) or 0)
+        if not count:
+            return None
+        return {"error": str(getattr(self.engine, "step_error", "")),
+                "count": count,
+                "since": float(getattr(self.engine, "step_error_since", 0.0))}
+
     def alerts(self) -> list[dict[str, str]]:
         """Alerts for the operator: deaths, starvation, stuck, disconnected."""
         watch = self.client.progress_watch
@@ -524,7 +533,8 @@ class DashboardState:
             self.client.state, self.client.decision_history, watch,
             autoplay_started_at=(float(getattr(task, "started_at", 0.0) or 0.0)
                                  if autoplay else None),
-            task_running=task is not None)
+            task_running=task is not None,
+            engine_error=self.engine_error())
         assist = self.operator_assist_status()
         if assist and assist["running"]:
             alerts.append({"id": "operator-assist-running", "level": "warn",
@@ -652,6 +662,7 @@ class DashboardState:
             },
             "operator_assist": assist,
             "task": task_data, "last_task": self.engine.last_task,
+            "engine_error": self.engine_error(),
             "map": self.map(), "inventory": inventory, "ground": ground,
             "skills": sorted(skills, key=lambda skill: (-skill["level"], skill["name"])),
             "farm_spots": self.analyzer_farm_spots(),
