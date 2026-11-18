@@ -738,6 +738,11 @@ class ObservationRecorder:
         if group.item_type == c.TYPE_BOOK:
             self.dropped("book-examine")
             return None
+        # Ground items come without a type (the look window sends no
+        # UPD_TYPE), so a book lying there cannot be told apart: fail closed.
+        if not group.item_type:
+            self.dropped("examine-unverified")
+            return None
         content = self.content()
         if content is None:
             self.dropped("examine-unverified")

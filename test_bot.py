@@ -23327,6 +23327,13 @@ class ObservationTests(unittest.TestCase):
         self.say(client, "That is warden argoth")
         self.say(client, "Something is written in it.")
         self.say(client, " ")
+        # The same book lying on the ground arrives untyped (the look window
+        # sends no UPD_TYPE): its examine cannot be verified and is dropped.
+        client.state.place_item(Item(83, name="warden argoth"), 0)
+        asyncio.run(client.examine(83))
+        self.say(client, "That is warden argoth")
+        self.say(client, "Something is written in it.")
+        self.say(client, " ")
         # Book lines that open like a door's answer, after a bump at the door.
         asyncio.run(client.move(1))
         self.say(client, "You open the door with the brass key and start reading.")
