@@ -509,8 +509,9 @@ class OperatorAssist:
         before = int(record.get("operator_gold_before", 0))
         if gold_stack(session.state.inventory)[0] >= before + gold:
             record["coin"] = "operator-inventory"
-        elif gold_stack(self.client.state.ground, ground=True)[0] >= (
-                int(record.get("ground_gold_before", 0)) + gold) and (
+        elif "ground_gold_before" in record and gold_stack(
+                self.client.state.ground, ground=True)[0] >= (
+                int(record["ground_gold_before"]) + gold) and (
                 record["coin"] == "operator-inventory"):
             record["coin"] = "ground"
         else:
@@ -617,6 +618,11 @@ class OperatorAssist:
                 # (commands_handle): nothing was created.
                 record["counts"] = False
             raise
+        # Gold already lying on her square is not the operator's coin: the
+        # stacks there now, before the coin can leave the operator.
+        ground_before = {item.tag: item.quantity for item in client.state.ground
+                         if gold_stack([item], ground=True)[0]}
+        record["ground_gold_before"] = sum(ground_before.values())
         record["coin"] = "operator-inventory"
 
         if not on_square():
@@ -630,9 +636,6 @@ class OperatorAssist:
             raise OperatorAssistAborted("drop", "cannot tell which gold stack is new")
         self._step(record, "drop", f"{gold} gold coin(s) at {square}")
         self._ensure_safe("drop")
-        # Gold already lying on her square is not the operator's coin.
-        ground_before = gold_stack(client.state.ground, ground=True)[0]
-        record["ground_gold_before"] = ground_before
         await session.move_item(0, grown[0].tag, gold)
         await self._wait("drop", lambda: gold_stack(ops.inventory)[0] <= before,
                          runner=runner)
@@ -647,9 +650,11 @@ class OperatorAssist:
         def coin_underfoot():
             if client.state.phase != "playing":
                 return None
-            total, coin = gold_stack(client.state.ground, ground=True)
-            return (coin if coin is not None and coin.quantity >= gold and
-                    total >= ground_before + gold else None)
+            # The stack the coin landed in: a new one, or one it merged into.
+            return next((item for item in client.state.ground
+                         if gold_stack([item], ground=True)[0] and
+                         item.quantity - ground_before.get(item.tag, 0) >= gold),
+                        None)
 
         await self._wait("pickup", lambda: coin_underfoot() is not None)
         await client.move_item(client.state.player_tag, coin_underfoot().tag, gold)

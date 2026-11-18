@@ -22378,6 +22378,16 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
                          ("drop", "operator-inventory", 1))
         self.assertNotIn((100, 800, 1), self.client.moves)
 
+    async def test_pickup_takes_the_dropped_coin_not_older_gold_underfoot(self):
+        state = self.client.state
+        state.items[800] = Item(800, location=0, name="gold coins", quantity=3)
+        state.inventories.setdefault(0, []).append(800)
+        record = await self.assist.run(1, "Sera")
+        self.assertEqual(record["outcome"], "completed", record)
+        self.assertEqual(record["ground_gold_before"], 3)
+        self.assertEqual(self.client.moves[-1], (100, 901, 1))
+        self.assertEqual(state.items[800].quantity, 3)
+
     def test_ground_gold_is_read_by_name_as_the_look_window_sends_no_type(self):
         from .operator_assist import gold_stack
 
