@@ -31,7 +31,7 @@ except ModuleNotFoundError:
 
 from . import constants as c
 from . import requirements as req
-from .equipment import gear_examine_pending
+from .equipment import abandon_gear_examine
 from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
 
@@ -7471,25 +7471,29 @@ class FarmCircuitTask(BotTask):
                                          farm: FarmTask) -> bool:
         """Hold the walk while a recall wand of unknown charge is examined.
 
-        True while an examine waits for its answer (FarmTask.check_recall_wand
-        gives up after 5 s), so she walks out only once every wand's charge
-        is known or its examine timed out. The farm examines on its own quiet
-        ticks, but only on the farm map: live, each life brought new tags for
-        her two empty wands (most likely her checkpoint relogs), the empty
-        marks were lost with the old tags, and she walked back out to fight
-        with no escape. An empty wand found here makes farming unsafe
-        (farming_unsafe_reason), and autoplay switches to its recovery phase.
-        Never while she is being hit.
+        True while a wand examine waits for its answer
+        (FarmTask.check_recall_wand gives it up after 5 s), so she walks out
+        only once every wand's charge is known or its examine timed out. A
+        gear examine still waiting is abandoned at once (its late answer is
+        consumed), so the hold is never longer than the wand's own. The farm
+        examines on its own quiet ticks, but only on the farm map: live, each
+        life brought new tags for her two empty wands (most likely her
+        checkpoint relogs), the empty marks were lost with the old tags, and
+        she walked back out to fight with no escape. An empty wand found here
+        makes farming unsafe (farming_unsafe_reason), and autoplay switches to
+        its recovery phase. Never while she is being hit.
         """
         if getattr(client, "examine", None) is None or _contact_this_life(client):
             return False
+        if farm._wand_examine is None and farm.next_recall_wand(client) is not None:
+            abandon_gear_examine(client)
         await farm.check_recall_wand(client)
         if farm._wand_examine is None:
             # That answer settled one wand: start the next, if any.
+            if farm.next_recall_wand(client) is not None:
+                abandon_gear_examine(client)
             await farm.check_recall_wand(client)
-        # A gear examine in flight holds the next wand back for its answer.
-        return farm._wand_examine is not None or (
-            gear_examine_pending(client) and farm.next_recall_wand(client) is not None)
+        return farm._wand_examine is not None
 
     async def _tick_running_service(self, client: AtrinikClient) -> bool:
         """Tick the maintenance trip under way, if any, and settle its end.

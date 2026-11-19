@@ -1684,14 +1684,23 @@ What was built:
   wears first; at least 2 seconds apart; it waits up to 5 seconds for the
   answer ("That is " and her item's shown name, followed only by its
   state flags and description) before the next. The recall wand and mana
-  crystal examines in turn wait for a gear examine's answer (the walk out
-  of a farm too, while a wand still needs examining), so only one examine
-  is ever in flight, which keeps F1's recorder, pairing answers with her
-  oldest unanswered examine, in step. An item is examined again when its
+  crystal examines in turn wait for a gear examine's answer, and the tick
+  that settles it sends no new gear examine, so a waiting crystal or wand
+  goes next. Only one examine is in flight, which keeps F1's recorder,
+  pairing answers with her oldest unanswered examine, in step. The one
+  exception: the walk out of a farm, which holds until her wands are
+  examined, abandons a waiting gear examine at once rather than wait for
+  it (no attempt is counted, and its late answer is consumed, never read
+  as a later item's); its answer then still comes first, in order. An item is examined again when its
   name changes (identification, a new "+N"), after a relog (new tags) or,
   with no answer, up to three times five minutes apart; a name that is not
   authored (most likely her own rename, which examine never shows) gets
-  one try. Lights are not examined. An untitled ring's, amulet's or
+  one try; the name is also tried without a title ("of Fire") or what
+  follows its "+N", since the authored-name index holds no artifact titles.
+  An item name longer than the protocol's 127 bytes is truncated in her
+  inventory (`socket/item.c:56-70`, `ITEM_NAME_SIZE`), so its examine
+  never matches and times out; an untitled ring's or amulet's stats past
+  the cut are lost. Lights are not examined. An untitled ring's, amulet's or
   trinket's description is in its name, which examine does not repeat, so
   it is read from the name.
 - **Shadow logging.** Every 30 seconds at most, on the same quiet tick, she

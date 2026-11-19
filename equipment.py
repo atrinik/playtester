@@ -42,7 +42,7 @@ except ModuleNotFoundError:
     from world_content_audit import load_archetypes
 
 from . import constants as c
-from .model import Item
+from .model import CHAT_MESSAGE_TYPES, PLAYER_NAME_LINK, Item
 from .observations import authored_item_name
 
 log = logging.getLogger(__name__)
@@ -645,6 +645,11 @@ class GearExaminer:
         self.shadow_signature: tuple = ()
         self.shadow_log: list[dict[str, Any]] = []
         self.policy: Any = None
+        # An abandoned examine whose answer may still come: (name, message
+        # position, sent at).
+        self.late: tuple[str, int, float] | None = None
+        # The message position of the last late answer consumed.
+        self.consumed_through = -1
         self.old_score: Callable[[Item], int] | None = None
 
     @staticmethod
@@ -670,17 +675,21 @@ class GearExaminer:
         tag, name, start, sent_at = self.pending
         item = client.state.items.get(tag)
         prefix = f"That is {name}"
-        for entry in client.state.messages_since(start):
-            if len(entry) < 4 or entry[1] != c.CHAT_TYPE_GAME:
+        position = max(start, client.state.message_offset)
+        # Every line, chat too, so each keeps its position; only server
+        # game lines without a player's name link can answer.
+        for offset, entry in enumerate(client.state.messages_since(start, chat=True)):
+            if (len(entry) < 4 or entry[1] != c.CHAT_TYPE_GAME or
+                    entry[1] in CHAT_MESSAGE_TYPES or PLAYER_NAME_LINK in str(entry[3])):
                 continue
-            # "That is " + her item's shown name (one of it: no count),
-            # its flags, then its description (types/player.c examine).
-            text = re.sub(r"^That is an? ", "That is ", str(entry[3]).strip())
+            text = str(entry[3]).strip()
+            if (position + offset <= self.consumed_through or
+                    self._late_answer(text, position + offset)):
+                continue
+            if not _answers(text, name):
+                continue
+            text = re.sub(r"^That is an? ", "That is ", text)
             rest = text[len(prefix):]
-            # After the name come only its state flags, "(...)" or a
-            # locked item's " *", and the description: never more name.
-            if not text.startswith(prefix) or rest and not rest.startswith((" (", " *")):
-                continue
             if item is not None:
                 # A ring's, amulet's or trinket's description is in its name.
                 shown = (name + rest if item.item_type in MAGIC_HIDDEN_TYPES else rest)
@@ -694,10 +703,10 @@ class GearExaminer:
         if self.clock() - sent_at <= self.ANSWER_TIMEOUT:
             return False
         if item is not None:
-            # A name that is not authored is most likely her own rename,
-            # which examine never shows: one try is enough.
+            # A name that is not authored, even without its title, is most
+            # likely her own rename, which examine never shows: one try.
             content = getattr(client, "authored_content", None)
-            renamed = content is not None and authored_item_name(content, name) is None
+            renamed = content is not None and looks_renamed(content, name)
             item.extra["gear_examine_attempts"] = (
                 self.MAX_ATTEMPTS if renamed else
                 int(item.extra.get("gear_examine_attempts", 0) or 0) + 1)
@@ -706,13 +715,43 @@ class GearExaminer:
         self.pending = None
         return True
 
+    def abandon(self, client: Any) -> None:
+        """Give up the pending examine at once, without counting an attempt,
+        so a recall wand examine need not wait for it. Its late answer is
+        consumed, never read as a later examine's."""
+        if self.pending is None or self.read_answer(client):
+            return
+        tag, name, start, sent_at = self.pending
+        self.late = (name, start, sent_at)
+        self.pending = None
+        log.info("gear examine of %s abandoned for a recall wand examine", name)
+
+    def _late_answer(self, text: str, position: int) -> bool:
+        """Whether a line is the abandoned examine's late answer (consumed)."""
+        if self.late is None:
+            return False
+        name, start, sent_at = self.late
+        if self.clock() - sent_at > self.ANSWER_TIMEOUT:
+            self.late = None
+            return False
+        if position >= start and _answers(text, name):
+            self.late = None
+            self.consumed_through = position
+            return True
+        return False
+
     async def tick(self, client: Any, policy: Any,
                    old_score: Callable[[Item], int]) -> bool:
         """Examine the next unexamined item, or settle the last one; True
         while an examine waits for its answer."""
         self.policy, self.old_score = policy, old_score
+        settling = self.pending is not None
         if not self.read_answer(client):
             return True
+        if settling:
+            # Yield this tick: a crystal or wand examine that waited for
+            # this answer goes next, not her next gear item.
+            return False
         now = self.clock()
         self.shadow(client)
         examine = getattr(client, "examine", None)
@@ -773,6 +812,36 @@ class GearExaminer:
             log.info("gear-shadow %s", detail)
             if recorder is not None:
                 recorder("gear-shadow", detail)
+
+
+def _answers(text: str, name: str) -> bool:
+    """Whether a line is the examine answer for an item of this shown name:
+    "That is " and the name (one of it: no count), then only its state
+    flags, "(...)" or a locked item's " *", and its description; never
+    more name (types/player.c examine, item.c object_get_name)."""
+    text = re.sub(r"^That is an? ", "That is ", text)
+    prefix = f"That is {name}"
+    rest = text[len(prefix):]
+    return text.startswith(prefix) and (not rest or rest.startswith((" (", " *")))
+
+
+def looks_renamed(content: Any, name: str) -> bool:
+    """Whether a shown name is not authored even without its title.
+
+    The authored-name index holds object and archetype names, not artifact
+    titles ("of Fire"), so the name is tried bare too: before " of ..." and
+    before a "+N" that a title follows.
+    """
+    forms = {name, re.sub(r"\s+of\s.*$", "", name),
+             re.sub(r"(\s[+-]\d+)\s.*$", r"\1", name)}
+    return all(authored_item_name(content, form) is None for form in forms if form)
+
+
+def abandon_gear_examine(client: Any) -> None:
+    """Give up her pending gear examine now (GearExaminer.abandon)."""
+    examiner = getattr(client, "gear_examiner", None)
+    if examiner is not None:
+        examiner.abandon(client)
 
 
 def gear_examine_pending(client: Any) -> bool:

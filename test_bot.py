@@ -21735,6 +21735,86 @@ class EquipmentTests(unittest.TestCase):
         self.assertTrue(asyncio.run(ManaCrystal.learn(client, crystal)))
         self.assertEqual(sent, [77, 78])
 
+    def test_the_walk_out_abandons_a_gear_examine_for_a_wand(self):
+        # The walk out holds for her wands' charges; a gear examine still
+        # waiting is given up at once, not waited for.
+        from types import SimpleNamespace
+        from .equipment import GearExaminer
+        from .navigation import FarmCircuitTask
+        client = self.section_two_client()
+        client.decision_history = []
+        now = [100.0]
+        examiner = client.gear_examiner = GearExaminer(clock=lambda: now[0])
+        examiner.pending = (15, "silk cape +2", client.state.message_count, now[0])
+        sent = []
+
+        async def examine(tag):
+            sent.append(tag)
+
+        client.examine = examine
+        client.state.place_item(Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                                     name="pine wand of word of recall (lvl 17)"), 1)
+        farm = FarmTask(zone="/test")
+        holding = asyncio.run(FarmCircuitTask._await_recall_wand_charges(
+            SimpleNamespace(), client, farm))
+        self.assertTrue(holding)
+        self.assertEqual(sent, [77])
+        self.assertIsNone(examiner.pending)
+        cape = client.state.items[15]
+        self.assertNotIn("gear_examine_attempts", cape.extra)
+        # The cape is asked again; the abandoned examine's late answer comes
+        # first and is consumed, never read as the new one's.
+        examiner.pending = (15, "silk cape +2", client.state.message_count, now[0])
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff", "That is silk cape +2 (ac+9)")
+        self.assertFalse(examiner.read_answer(client))
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                 "That is silk cape +2 (Protections: impact +3%)")
+        self.assertTrue(examiner.read_answer(client))
+        self.assertEqual(cape.extra["gear_examine"]["base"]["ac"], 0)
+        self.assertIsNone(examiner.late)
+
+    def test_a_crystal_examine_goes_next_once_a_gear_examine_settles(self):
+        from .equipment import GearExaminer
+        from .tasks import InventoryPolicy, ManaCrystal, carried_gear_score
+        client = self.section_two_client()
+        now = [100.0]
+        examiner = client.gear_examiner = GearExaminer(clock=lambda: now[0])
+        sent = []
+
+        async def examine(tag):
+            sent.append(tag)
+
+        client.examine = examine
+        policy = InventoryPolicy()
+        score = carried_gear_score(client, policy)
+        crystal = Item(78, item_type=c.TYPE_POWER_CRYSTAL, name="crystal")
+        client.state.place_item(crystal, 1)
+        asyncio.run(examiner.tick(client, policy, score))
+        self.assertEqual(sent, [11])
+        # A laggy answer: well past the spacing, still the crystal goes next.
+        now[0] += 4
+        self.assertTrue(asyncio.run(ManaCrystal.learn(client, crystal)))
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                 "That is silksteel chain mail +1 (ac+6)")
+        self.assertFalse(asyncio.run(examiner.tick(client, policy, score)))
+        self.assertEqual(sent, [11])
+        self.assertTrue(asyncio.run(ManaCrystal.learn(client, crystal)))
+        self.assertEqual(sent, [11, 78])
+        now[0] += 4
+        self.assertFalse(asyncio.run(examiner.tick(client, policy, score)))
+        self.assertEqual(sent, [11, 78])
+
+    def test_titled_items_are_not_taken_for_renamed_ones(self):
+        from .equipment import looks_renamed
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        content = observation_content(Path(directory.name))
+        for name in ("sword", "sword +2", "sword of Fire", "sword +2 of Fire",
+                     "black iron sword of the Dawn"):
+            with self.subTest(name=name):
+                self.assertFalse(looks_renamed(content, name))
+        self.assertTrue(looks_renamed(content, "Lucky Blade"))
+
 
 class BuildInfoTests(unittest.TestCase):
     COMMIT = "4a29be882631e570df3028c6e6ead2893b3d4723"
@@ -22221,7 +22301,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=25", page)
+        self.assertIn(b"/app.js?v=26", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

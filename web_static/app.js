@@ -737,7 +737,8 @@ function renderEquipment() {
     }
     return card;
   }));
-  if (!families.length) box.append(node("span", "muted", "No gear carried."));
+  if (e && e.error) box.append(node("span", "warn-text", e.error));
+  else if (!families.length) box.append(node("span", "muted", "No gear carried."));
   const log = [...((e && e.shadow) || [])].reverse();
   shadow.replaceChildren(...log.map(x => {
     const row = node("div", "act");
