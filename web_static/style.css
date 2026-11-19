@@ -186,3 +186,5 @@ details summary { cursor: pointer; color: var(--muted); margin-top: .6rem; font-
 .reading-head time { margin-left: auto; color: var(--muted); font-size: 11px; }
 .reading p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .reading small { color: var(--muted); overflow-wrap: anywhere; }
+/* Knowledge: facts read from her observations */
+.fact .fact-value { color: var(--text); font-weight: 500; overflow-wrap: anywhere; }

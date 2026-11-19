@@ -445,6 +445,11 @@ SPELL_BLOCK_ATTRIBUTION_SECONDS = 10.0
 # remembered as blocked, not just the square.
 MAP_NOMAGIC_MESSAGE = re.compile(
     r"^Powerful countermagic cancels all spellcasting here!", re.I)
+# A harmful spell cast where harm is forbidden (cast_spell, MAP_NOHARM or
+# the square's no-harm flag; the message does not say which). It blocks only
+# harmful spells, so it marks nothing: it is kept as a tile fact only.
+NO_HARM_MESSAGE = re.compile(
+    r"^Powerful countermagic cancels all harmful magic here!", re.I)
 # A Word of Recall that really started: cast_wor (server/spell_effect.c)
 # answers with this as it inserts the delayed recall force. Without it no
 # recall is coming. The server drops a fire without a word while the
@@ -491,6 +496,10 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
     when the cast is sent), so a step taken before the answer arrives does
     not mark the wrong square; without a recorded cast, to where she stands.
     The memory lives on the client, so every safety policy shares it.
+
+    Each refusal is also kept as a persistent tile fact
+    (``client.note_tile_fact``, facts.py), which decides here too only when
+    the owner sets ``persist_tile_facts`` (_tile_fact_blocks).
     """
     blocked = getattr(client, "spell_blocked_squares", None)
     if blocked is None:
@@ -510,13 +519,15 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
         mark = offset if mark is None else int(mark)
         cast = getattr(client, "spell_cast", None)
         fresh = time.time() - SPELL_BLOCK_ATTRIBUTION_SECONDS
+        note_tile_fact = getattr(client, "note_tile_fact", None)
         for position in range(max(mark, offset), count):
             entry = messages[position - offset]
             text = str(entry[-1]).strip()
             whole_map = bool(MAP_NOMAGIC_MESSAGE.match(text))
+            no_harm = bool(NO_HARM_MESSAGE.match(text))
             if not (float(entry[0]) >= fresh and
                     self_improvement.from_server(entry) and
-                    (whole_map or SPELL_BLOCKED_MESSAGE.match(text))):
+                    (whole_map or no_harm or SPELL_BLOCKED_MESSAGE.match(text))):
                 continue
             # Only a recent cast explains the answer; otherwise it is
             # some other use, on the square she stands on.
@@ -525,9 +536,16 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
                      SPELL_BLOCK_ATTRIBUTION_SECONDS else square)
             if not where[0]:
                 continue
+            if no_harm:
+                if note_tile_fact is not None:
+                    note_tile_fact(where, "no_harm", text)
+                continue
             if whole_map:
                 # Countermagic covers the whole map (MAP_NOMAGIC).
                 where = (where[0], -1, -1)
+            if note_tile_fact is not None:
+                # The same signal, kept as a persistent fact (facts.py).
+                note_tile_fact(where, "no_magic", text)
             if where not in blocked:
                 log.warning("spellcasting blocked at %s (%d,%d); "
                             "no more casts on this %s", *where,
@@ -545,7 +563,37 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
     for key, since in list(blocked.items()):
         if now - since >= SPELL_BLOCK_MEMORY_SECONDS:
             del blocked[key]
-    return square in blocked or (square[0], -1, -1) in blocked
+    if square in blocked or (square[0], -1, -1) in blocked:
+        return True
+    return _tile_fact_blocks(client, square)
+
+
+def _tile_fact_blocks(client: AtrinikClient, square: tuple[str, int, int]) -> bool:
+    """Whether a persistent no-magic tile fact covers her square, and the
+    owner's ``persist_tile_facts`` lets it decide (LEARNING_AND_FEEDBACK
+    4.11.1). Off, the fact only records, once a square in a process, that
+    she would not have cast here."""
+    facts = getattr(client, "tile_facts", None) or {}
+    where = next((key for key in (square, (square[0], -1, -1))
+                  if "no_magic" in facts.get(key, ())), None)
+    if where is None or not square[0]:
+        return False
+    enabled = bool(getattr(getattr(client, "config", None), "persist_tile_facts", False))
+    noted = getattr(client, "_tile_fact_decisions", None)
+    if noted is None:
+        noted = set()
+        try:
+            client._tile_fact_decisions = noted
+        except AttributeError:
+            pass
+    if where not in noted:
+        noted.add(where)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("tile-fact-no-magic" if enabled else "tile-fact-no-magic-shadow",
+                     f"{where[0]} (whole map)" if where[1:] == (-1, -1) else
+                     f"{where[0]} ({where[1]},{where[2]})")
+    return enabled
 
 
 class TaskStatus(str, Enum):

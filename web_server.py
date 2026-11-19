@@ -975,7 +975,9 @@ class WebControlServer:
             # they hold no chat and no other player's name.
             params = parse_qs(query)
             character = getattr(self.client, "_memory_character", "")
+            # Facts too (facts.py): ?fact_kind=KIND&fact_limit=N.
             observations, counts, busy = [], {}, False
+            facts, fact_counts = [], {}
             if character:
                 memory = self.client._memory_store()
                 try:
@@ -986,10 +988,20 @@ class WebControlServer:
                         timeout=KNOWLEDGE_READ_TIMEOUT)
                     counts = memory.observation_counts(
                         character, timeout=KNOWLEDGE_READ_TIMEOUT)
+                    facts = memory.facts(
+                        character, limit=int((params.get("fact_limit") or ["100"])[0]),
+                        kind=(params.get("fact_kind") or [""])[0],
+                        timeout=KNOWLEDGE_READ_TIMEOUT)
+                    fact_counts = memory.fact_counts(
+                        character, timeout=KNOWLEDGE_READ_TIMEOUT)
                 except sqlite3.OperationalError:
                     observations, counts, busy = [], {}, True
+                    facts, fact_counts = [], {}
             await self._reply(writer, 200, _json_bytes({
                 "observations": observations, "counts": counts, "busy": busy,
+                "facts": facts, "fact_counts": fact_counts,
+                "persist_tile_facts": bool(getattr(
+                    self.client.config, "persist_tile_facts", False)),
                 "authored_index": getattr(self.client, "authored_content", None) is not None}))
             return
         if method == "GET" and path.startswith("/api/face/"):

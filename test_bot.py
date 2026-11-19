@@ -21785,7 +21785,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=24", page)
+        self.assertIn(b"/app.js?v=25", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -23731,11 +23731,14 @@ class ObservationTests(unittest.TestCase):
         with patch.object(memory_module, "OBSERVATION_ROW_LIMIT", 3), \
                 patch.object(memory_module, "OBSERVATION_PRUNE_EVERY", 1):
             first = store.record_observation("Sera", row(0))
+            # A fact still cites the oldest row (F2's real facts table); a
+            # later phase's locks table without the column is skipped, not
+            # an error.
+            store.record_fact("Sera", {
+                "kind": "tile-property", "subject": "tile:/m:0,0", "value": "no_magic",
+                "confidence": 1.0, "status": "confirmed", "parser": "tile-property/1",
+                "observation_id": first, "at": 1000.0})
             with store._connect() as db:
-                # A later phase's fact still cites the oldest row; a locks
-                # table without the column is skipped, not an error.
-                db.execute("CREATE TABLE facts (id INTEGER PRIMARY KEY, observation_id INTEGER)")
-                db.execute("INSERT INTO facts (observation_id) VALUES (?)", (first,))
                 db.execute("CREATE TABLE locks (source_key TEXT)")
             for index in range(1, 6):
                 store.record_observation("Sera", row(index))
@@ -23786,6 +23789,322 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(mouth[0].msg_hash, text_hash(
             "The passage appears caved-in, but it might be possible to get through..."))
         self.assertIn(text_hash("*undecipherable text*"), content.texts)
+
+
+# Real texts from the content (docs/LEARNING_AND_FEEDBACK.md section 5), as
+# the observation ledger stores them, with the facts each must give. Books
+# are quoted only in the sentences that matter.
+SECTION_5_FACTS = (
+    # 5.1: default lock texts, and no_entry locks that say what they are.
+    ("door", "You need a special key to open this door.",
+     {("generic-lock", "special-key")}),
+    ("gate", "You need a special key to open this gate.",
+     {("generic-lock", "special-key")}),
+    ("door", "The prison cell is locked.", {("generic-lock", "locked")}),
+    ("door", "The Casino is currently closed.", {("unopenable", "closed")}),
+    ("door", "LandShare Industries is currently not open.", {("unopenable", "closed")}),
+    ("door", "The door appears to be blocked by something...", {("unopenable", "blocked")}),
+    ("door", "The entry way is locked.", {("generic-lock", "locked")}),
+    ("door", "The door is locked.", {("generic-lock", "locked")}),
+    ("door", "It seems like the door is not possible to open from this side...",
+     {("unopenable", "from-this-side")}),
+    # 5.2: a key that exists nowhere, with a typo: it names no key.
+    ("door", "You need a the key to open this door.", {("generic-lock", "unnamed-key")}),
+    # 5.3: the misleading colour, and the colour that agrees.
+    ("magic_mouth", "The yellow force field is preventing you from reaching the well bucket...",
+     {("lock-colour", "yellow")}),
+    ("magic_mouth", "The orange force field prevents you from reaching the door. "
+     "[i]Xuhrexal, the stone giant[/i] is engraved on the door.",
+     {("lock-colour", "orange"), ("key-holder", "Xuhrexal")}),
+    # 5.4: clear hints.
+    ("magic_mouth", "The blue force field prevents you from reaching the door. "
+     "[i]Ksha'sha, the troll[/i] is engraved on the door.",
+     {("lock-colour", "blue"), ("key-holder", "Ksha'sha")}),
+    ("gate", "You need Asteria Dungeon Key 1 to enter here.",
+     {("key-name", "Asteria Dungeon Key 1")}),
+    ("gate", "You need Asteria Dungeon Key 2 to pass.", {("key-name", "Asteria Dungeon Key 2")}),
+    ("gate", "You need Asteria Dungeon Key 3", {("key-name", "Asteria Dungeon Key 3")}),
+    ("npc", "*HIC* I see... I don't suppose you've come about the key. "
+     "Sorry, I can't give that to you...", {("npc-key", "key")}),
+    ("book", "[title]Intelligence Report - Operative A234ZX[/title] Topic: Asteria Defences "
+     "The defences of Asteria appear to be difficult to penetrate. We have discovered "
+     "that the guards will not open the gates except for those who know an, as yet, "
+     "unknown password. The guards will close the gate as soon as any substantial "
+     "threat is detected. The gate control system is protected by a series of locked "
+     "doors.",
+     {("password", ""), ("quest-gate", "gates"), ("quest-gate", "gate"),
+      ("quest-gate", "locked doors")}),
+    # 5.5: the Altar of Loki says nothing a parser could use; a locked big
+    # lever names nothing.
+    ("lever", "You appear to have company...", set()),
+    ("lever", "The big lever is locked.", {("generic-lock", "locked")}),
+    # 5.6: the note, and the blood stained letter.
+    ("book", "[title]Day 6:[/title] We found stairs leading to yet another level. Using "
+     "the knowledge we learned from the ancient library, we figured out that a ---ic "
+     "bul--- was needed. It must be cast northwest from a special location. We have "
+     "marked the spot with a fake torch, our hope is that the creatures that live down "
+     "here will not notice and leave the torch where we have placed it. [title]Day 7:"
+     "[/title] The bridge looks harmless; We are hoping the information about a death "
+     "trap is to just to scare people away. After breakfast, we will attempt to cross "
+     "the bridge. IT'S A TRAP!!!! If you are reading this; "
+     "!!! STAY OFF THE BRIDGE, IT IS A TRAP !!!!",
+     {("direction", "northwest"), ("trap-warning", "bridge")}),
+    ("book", "We failed to kill the giant king and his guards too. He is guarded by magic "
+     "doors. We will never find the keys.. Listen, I hear them coming...",
+     {("quest-gate", "magic doors")}),
+)
+
+
+class FactTests(unittest.TestCase):
+    """Phase F2: deterministic fact parsers and persistent tile facts."""
+
+    BED = ("/shattered_islands/world_7_79", 16, 3)
+    NAMES = frozenset({"xuhrexal", "ksha'sha", "warden argoth", "troll"})
+
+    setUp = ObservationTests.setUp
+    say = staticmethod(ObservationTests.say)
+    at = staticmethod(ObservationTests.at)
+
+    def client(self, *, persist=False, path="memory.sqlite3"):
+        from unittest.mock import AsyncMock
+        client = AtrinikClient(ClientConfig(
+            character="Sera", persist_tile_facts=persist,
+            runtime_state_path=str(Path(self.directory.name) / path)))
+        client.send = AsyncMock()
+        client.authored_content = self.content
+        client.state.player_name = "Sera"
+        client.state.player_tag = 1
+        client.load_character_memory("Sera")
+        client.state.phase = "playing"
+        client.state.stats.update({"hp": 40, "maxhp": 100, "sp": 50, "food": 500})
+        self.at(*self.BED, client)
+        return client
+
+    @staticmethod
+    def facts(client, **kwargs):
+        return client._memory_store().facts("Sera", limit=1000, **kwargs)
+
+    def test_every_section_5_text_gives_its_expected_facts(self):
+        from .facts import parse
+        for kind, text, expected in SECTION_5_FACTS:
+            with self.subTest(text=text[:60]):
+                found = parse({"source_kind": kind, "source_key": f"{kind}:/m:1,1",
+                               "text": text}, self.NAMES)
+                self.assertEqual({(fact.kind, fact.value) for fact in found}, expected)
+                for fact in found:
+                    self.assertEqual((fact.subject, fact.status), (f"{kind}:/m:1,1", "candidate"))
+                    self.assertTrue(fact.parser.startswith(f"{fact.kind}/"), fact.parser)
+                    self.assertLess(fact.confidence, 1.0)
+        # A known name is more certain than an unknown one.
+        known, = [f for f in parse({"source_kind": "magic_mouth", "source_key": "mouth:/m:1,1",
+                                    "text": SECTION_5_FACTS[11][1]}, self.NAMES)
+                  if f.kind == "key-holder"]
+        unknown, = [f for f in parse({"source_kind": "magic_mouth", "source_key": "mouth:/m:1,1",
+                                      "text": SECTION_5_FACTS[11][1]}) if f.kind == "key-holder"]
+        self.assertGreater(known.confidence, unknown.confidence)
+        self.assertEqual(known.detail, "Xuhrexal, the stone giant")
+
+    def test_parsers_read_only_what_they_are_for(self):
+        from .facts import parse
+        # Weakness and immunity name only a creature the content knows.
+        found = parse({"source_kind": "book", "source_key": "book:t:h",
+                       "text": "Trolls are very vulnerable to fire. The troll is immune to "
+                               "cold. It leaves its wearer very vulnerable to fire."},
+                      self.NAMES)
+        self.assertEqual({(f.kind, f.subject, f.value) for f in found},
+                         {("weakness", "troll", "fire"), ("immunity", "troll", "cold")})
+        self.assertEqual(parse({"source_kind": "book", "source_key": "book:t:h",
+                                "text": "The troll is immune to cold."}), [])
+        # System lines and examines give no text facts, whatever they say;
+        # lock parsers do not read books, and quest parsers do not read doors.
+        for kind in ("system", "examine"):
+            self.assertEqual(parse({"source_kind": kind, "source_key": f"{kind}:/m",
+                                    "text": "You need Asteria Dungeon Key 2 to pass."}), [])
+        self.assertEqual(parse({"source_kind": "book", "source_key": "book:t:h",
+                                "text": "You need Asteria Dungeon Key 2 to pass."}), [])
+        self.assertEqual({f.kind for f in parse({"source_kind": "door", "source_key": "door:/m:1,1",
+                                                 "text": "The gate is guarded by a key."})},
+                         set())
+        # A quoted password is its value.
+        said, = parse({"source_kind": "sign", "source_key": "sign:/m:1,1",
+                       "text": 'The password is "mellon".'})
+        self.assertEqual((said.kind, said.value), ("password", "mellon"))
+        # A journal part names places.
+        parts = parse({"source_kind": "journal", "source_key": "journal:q",
+                       "text": "King Rhun's domain is in the heart of Giant Mountains, and his "
+                               "outpost is at the very peak of the mountains."})
+        self.assertIn(("quest-part", "the very peak of the mountains"),
+                      {(f.kind, f.value) for f in parts})
+        self.assertIn(("quest-part", "Giant Mountains"), {(f.kind, f.value) for f in parts})
+
+    def test_tile_subjects_round_trip(self):
+        from .facts import parse_tile_subject, tile_property, tile_subject
+        self.assertEqual(tile_subject("/m/a", 3, 4), "tile:/m/a:3,4")
+        self.assertEqual(parse_tile_subject("tile:/m/a:3,4"), ("/m/a", 3, 4))
+        self.assertEqual(parse_tile_subject(tile_subject("/m/a", -1, -1)), ("/m/a", -1, -1))
+        for bad in ("door:/m:1,1", "tile:/m:x,y", "tile:/m", "map:"):
+            self.assertIsNone(parse_tile_subject(bad), bad)
+        self.assertEqual(tile_property("Something blocks your spellcasting."), ("no_magic", False))
+        self.assertEqual(tile_property("Something blocks the magic of your rod of healing."),
+                         ("no_magic", False))
+        self.assertEqual(tile_property("Powerful countermagic cancels all spellcasting here!"),
+                         ("no_magic", True))
+        self.assertEqual(tile_property("Powerful countermagic cancels all harmful magic here!"),
+                         ("no_harm", False))
+        self.assertIsNone(tile_property("Sera says: Something blocks your spellcasting."))
+
+    def cast_on_the_bed(self, client, times):
+        from .tasks import spell_blocked_here
+        spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+        spell.extra["cost"] = 3
+        client.state.place_item(spell, client.state.player_tag)
+        for _ in range(times):
+            asyncio.run(client.fire(0, 24))
+            self.say(client, "Something blocks your spellcasting.")
+            spell_blocked_here(client)
+        return spell
+
+    def test_the_section_2_stream_gives_one_no_magic_fact(self):
+        client = self.client()
+        self.cast_on_the_bed(client, 150)
+        fact, = self.facts(client)
+        self.assertEqual((fact["kind"], fact["subject"], fact["value"], fact["status"],
+                          fact["confidence"], fact["parser"], fact["detail"]),
+                         ("tile-property", "tile:/shattered_islands/world_7_79:16,3",
+                          "no_magic", "confirmed", 1.0, "tile-property/1",
+                          "Something blocks your spellcasting."))
+        # It cites the stored observation of the line.
+        system, = client._memory_store().observations("Sera", source_kind="system")
+        self.assertEqual((fact["observation_id"], system["seen"]), (system["id"], 150))
+        self.assertEqual((fact["map"], fact["source_name"]), (self.BED[0], ""))
+        self.assertEqual(client.tile_facts, {self.BED: {"no_magic"}})
+        metrics = client.metrics.registry.render()
+        self.assertIn('kind="tile-property",status="confirmed"} 1', metrics)
+
+    def test_with_the_flag_on_a_reconnect_a_day_later_casts_nothing_there(self):
+        from .tasks import spell_blocked_here
+        self.cast_on_the_bed(self.client(), 3)
+        day_later = time.time() + 24 * 3600
+        with patch("time.time", return_value=day_later):
+            # Off (the default): #97's one-hour mark alone decides, and that
+            # mark died with the old process. The fact records a shadow.
+            shadow = self.client()
+            spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+            spell.extra["cost"] = 3
+            shadow.state.place_item(spell, shadow.state.player_tag)
+            self.assertEqual(SafetyPolicy()._usable_heal(shadow).tag, 24)
+            self.assertEqual(
+                [r["detail"] for r in shadow.decision_history
+                 if r["action"] == "tile-fact-no-magic-shadow"],
+                [f"{self.BED[0]} (16,3)"])
+            # On: the remembered square stops every cast there.
+            client = self.client(persist=True)
+            client.state.place_item(spell, client.state.player_tag)
+            self.assertTrue(spell_blocked_here(client))
+            policy = SafetyPolicy()
+            self.assertIsNone(policy._usable_heal(client))
+            self.assertFalse(asyncio.run(policy._heal(client)))
+            client.send.assert_not_called()
+            # (The decision ledger is persisted: the shadow record came first.)
+            self.assertEqual([r["action"] for r in client.decision_history
+                              if r["action"].startswith("tile-fact")],
+                             ["tile-fact-no-magic-shadow", "tile-fact-no-magic"])
+            # The next square is not blocked, and a potion still heals here.
+            self.at(self.BED[0], 17, 3, client)
+            self.assertFalse(spell_blocked_here(client))
+            self.at(*self.BED, client)
+            potion = Item(27, item_type=c.TYPE_POTION, quality=100,
+                          name="potion of minor healing")
+            client.state.place_item(potion, client.state.player_tag)
+            self.assertEqual(policy._usable_heal(client).tag, 27)
+
+    def test_whole_map_countermagic_and_no_harm_are_tile_facts(self):
+        from .tasks import spell_blocked_here
+        client = self.client()
+        spell = self.cast_on_the_bed(client, 0)
+        self.at("/test/room", 5, 5, client)
+        asyncio.run(client.fire(0, spell.tag))
+        self.say(client, "Powerful countermagic cancels all harmful magic here!")
+        # No harm blocks only harmful spells: it marks nothing.
+        self.assertFalse(spell_blocked_here(client))
+        asyncio.run(client.fire(0, spell.tag))
+        self.say(client, "Powerful countermagic cancels all spellcasting here!")
+        self.assertTrue(spell_blocked_here(client))
+        found = {(f["subject"], f["value"]) for f in self.facts(client)}
+        self.assertEqual(found, {("tile:/test/room:5,5", "no_harm"),
+                                 ("map:/test/room", "no_magic")})
+        self.assertTrue(all(f["observation_id"] for f in self.facts(client)))
+        later = self.client(persist=True)
+        self.at("/test/room", 9, 9, later)
+        self.assertTrue(spell_blocked_here(later))
+
+    def test_stored_observations_give_facts_that_cite_them(self):
+        client = self.client()
+        self.at("/test/room", 5, 5, client)
+        # A bump north into the locked door, and the magic mouth underfoot.
+        asyncio.run(client.move(1))
+        self.say(client, "You need a special key to open this door.", color="00ffff")
+        self.at("/test/room", 3, 3, client)
+        self.say(client, "Beware the bridge!", color="00ffff")
+        rows = {row["source_key"]: row["id"]
+                for row in client._memory_store().observations("Sera")}
+        found = {(f["kind"], f["subject"], f["value"], f["observation_id"])
+                 for f in self.facts(client)}
+        self.assertEqual(found, {
+            ("generic-lock", "door:/test/room:5,4", "special-key", rows["door:/test/room:5,4"]),
+            ("trap-warning", "mouth:/test/room:3,3", "bridge", rows["mouth:/test/room:3,3"])})
+        # Chat quoting a door's hint is never an observation, so never a fact.
+        self.say(client, "[a=#charname]Mallory[/a] says: You need Asteria Dungeon Key 2 to pass.",
+                 msg_type=c.CHAT_TYPE_LOCAL)
+        self.say(client, "You need Asteria Dungeon Key 2 to pass.", color="00ffff")
+        self.assertEqual(len(self.facts(client)), 2)
+        # A repeat refreshes the fact, it adds none.
+        asyncio.run(client.move(1))
+        self.at("/test/room", 5, 5, client)
+        asyncio.run(client.move(1))
+        self.say(client, "You need a special key to open this door.", color="00ffff")
+        self.assertEqual(len(self.facts(client)), 2)
+
+    def test_facts_upsert_confirm_and_stay_bounded(self):
+        from . import memory as memory_module
+        from .memory import BotMemory
+        store = BotMemory(Path(self.directory.name) / "facts.sqlite3", server="s", account="a")
+
+        def fact(value, *, status="candidate", confidence=0.5, at=1000.0, observation=None):
+            return {"kind": "key-name", "subject": "door:/m:1,1", "value": value,
+                    "confidence": confidence, "status": status, "parser": "key-name/1",
+                    "detail": "d", "observation_id": observation, "at": at}
+
+        first, created = store.record_fact("Sera", fact("brass key", observation=7))
+        self.assertTrue(created)
+        again, created = store.record_fact(
+            "Sera", fact("brass key", status="confirmed", confidence=0.9, at=1001.0,
+                         observation=8))
+        self.assertEqual((again, created), (first, False))
+        store.record_fact("Sera", fact("brass key", confidence=0.2, at=1002.0))
+        row, = store.facts("Sera")
+        self.assertEqual((row["status"], row["confidence"], row["observation_id"],
+                          row["created_at"], row["updated_at"]),
+                         ("confirmed", 0.9, 7, 1000.0, 1002.0))
+        self.assertEqual(store.facts("Mallory"), [])
+        with patch.object(memory_module, "FACT_ROW_LIMIT", 3), \
+                patch.object(memory_module, "FACT_PRUNE_EVERY", 1):
+            for index in range(5):
+                store.record_fact("Sera", fact(f"key {index}", at=2000.0 + index))
+        values = sorted(row["value"] for row in store.facts("Sera"))
+        # Candidates go first, oldest first; the confirmed fact stays.
+        self.assertEqual(values, ["brass key", "key 3", "key 4"])
+        self.assertEqual(store.fact_counts("Sera"), {"key-name": 3})
+
+    def test_the_flag_comes_from_the_environment_or_the_command_line(self):
+        from .cli import parser
+        self.assertFalse(parser().parse_args(["observe"]).persist_tile_facts)
+        self.assertTrue(parser().parse_args(["--persist-tile-facts", "observe"]).persist_tile_facts)
+        with patch.dict(os.environ, {"ATRINIK_BOT_PERSIST_TILE_FACTS": "1"}):
+            self.assertTrue(parser().parse_args(["observe"]).persist_tile_facts)
+        with patch.dict(os.environ, {"ATRINIK_BOT_PERSIST_TILE_FACTS": "no"}):
+            self.assertFalse(parser().parse_args(["observe"]).persist_tile_facts)
+        self.assertFalse(ClientConfig().persist_tile_facts)
 
 
 class DashboardSecurityTests(unittest.IsolatedAsyncioTestCase):
@@ -23841,6 +24160,18 @@ class DashboardSecurityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row["source_key"] for row in body["observations"]], ["system:/m"])
             self.assertEqual((body["counts"], body["authored_index"], body["busy"]),
                              ({"system": 1}, False, False))
+            # And her facts, with the flag that decides whether they act.
+            self.client.state.map.world_x, self.client.state.map.world_y = 4, 2
+            self.client.note_tile_fact(("/m", 4, 2), "no_magic",
+                                       "Something blocks your spellcasting.")
+            status, payload = await self.request("GET", "/api/knowledge?fact_kind=tile-property")
+            body = json.loads(payload)
+            self.assertEqual([(f["subject"], f["value"], f["status"]) for f in body["facts"]],
+                             [("tile:/m:4,2", "no_magic", "confirmed")])
+            self.assertEqual((body["fact_counts"], body["persist_tile_facts"]),
+                             ({"tile-property": 1}, False))
+            self.assertEqual(body["facts"][0]["observation_id"],
+                             body["observations"][0]["id"] if body["observations"] else None)
             # A locked database answers at once, empty and busy.
             from .memory import BotMemory
             with patch.object(BotMemory, "observations",

@@ -324,6 +324,11 @@ class BotMetrics:
             "reason")
         self.observation_sources = LabelLimit(32)
         self.drop_reasons = LabelLimit(32)
+        # Facts extracted from them (facts.py): new facts by kind and status.
+        self.facts = counter(
+            "facts_total", "Facts first stored, by kind and status.", "kind", "status")
+        self.fact_kinds = LabelLimit(32)
+        self.fact_statuses = LabelLimit(8)
 
     def attach(self, engine: Any) -> None:
         """The task engine: task types, and idle time when no task runs."""
@@ -512,6 +517,10 @@ class BotMetrics:
     @_never_raises
     def observation_dropped(self, reason: str) -> None:
         self.observations_dropped.inc((*self.base(), self.drop_reasons(reason)))
+
+    @_never_raises
+    def fact(self, kind: str, status: str) -> None:
+        self.facts.inc((*self.base(), self.fact_kinds(kind), self.fact_statuses(status)))
 
     @_never_raises
     def death(self, cause: Any) -> None:

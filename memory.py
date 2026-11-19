@@ -32,6 +32,14 @@ OBSERVATION_SAVE_TIMEOUT = 0.25
 # exist (the facts and locks of later phases).
 OBSERVATION_REFERENCES = (("facts", "observation_id"),
                           ("locks", "hint_observation_id"))
+# Facts (4.2, phase F2): at most this many a character, the least recently
+# updated candidates evicted first, then confirmed ones.
+FACT_ROW_LIMIT = 20_000
+FACT_PRUNE_EVERY = 100
+FACT_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
+FACT_COLUMNS = ("id", "kind", "subject", "value", "confidence", "status",
+                "observation_id", "parser", "detail", "created_at", "updated_at",
+                "expires_at")
 
 
 class BotMemory:
@@ -108,8 +116,39 @@ class BotMemory:
             db.execute(
                 """CREATE INDEX IF NOT EXISTS observations_by_age
                    ON observations (server, account, character, last_at)""")
+            # Facts extracted from her observations (facts.py): candidates
+            # until an outcome confirms them. One row per (kind, subject,
+            # value); a repeat refreshes it.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS facts (
+                       id INTEGER PRIMARY KEY,
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       kind TEXT NOT NULL,
+                       subject TEXT NOT NULL,
+                       value TEXT NOT NULL,
+                       confidence REAL NOT NULL,
+                       status TEXT NOT NULL,
+                       observation_id INTEGER,
+                       parser TEXT NOT NULL,
+                       detail TEXT NOT NULL DEFAULT '',
+                       created_at REAL NOT NULL,
+                       updated_at REAL NOT NULL,
+                       expires_at REAL
+                   )""")
+            db.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS facts_dedup
+                   ON facts (server, account, character, kind, subject, value)""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS facts_by_age
+                   ON facts (server, account, character, updated_at)""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS facts_by_observation
+                   ON facts (observation_id)""")
         self._chat_appends = 0
         self._observation_inserts = 0
+        self._fact_inserts = 0
 
     @contextmanager
     def _connect(self, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
@@ -299,6 +338,119 @@ class BotMemory:
                    GROUP BY source_kind""",
                 (self.server, self.account, character.casefold())).fetchall()
         return {kind: int(count) for kind, count in rows}
+
+    def observation_id(self, character: str, source_key: str, digest: str, *,
+                       timeout: float = FACT_SAVE_TIMEOUT) -> int | None:
+        """The id of the observation of this text from this source, if kept."""
+        with self._connect(timeout) as db:
+            row = db.execute(
+                """SELECT id FROM observations
+                   WHERE server = ? AND account = ? AND character = ?
+                     AND source_key = ? AND text_hash = ?""",
+                (self.server, self.account, character.casefold(), source_key,
+                 digest)).fetchone()
+        return None if row is None else int(row[0])
+
+    def record_fact(self, character: str, row: dict[str, Any], *,
+                    timeout: float = FACT_SAVE_TIMEOUT) -> tuple[int, bool]:
+        """Store one fact (``Fact.row()``), or refresh the same (kind, subject,
+        value): the higher confidence wins, a candidate becomes confirmed but
+        never the reverse, and the first observation stays its source.
+        Returns the row id and whether the fact is new."""
+        folded = character.casefold()
+        at = float(row["at"])
+        key = (self.server, self.account, folded, str(row["kind"]),
+               str(row["subject"]), str(row["value"]))
+        with self._connect(timeout) as db:
+            existing = db.execute(
+                """SELECT id FROM facts WHERE server = ? AND account = ? AND character = ?
+                     AND kind = ? AND subject = ? AND value = ?""", key).fetchone()
+            db.execute(
+                """INSERT INTO facts
+                       (server, account, character, kind, subject, value, confidence,
+                        status, observation_id, parser, detail, created_at, updated_at,
+                        expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(server, account, character, kind, subject, value)
+                   DO UPDATE SET
+                       confidence = max(confidence, excluded.confidence),
+                       status = CASE WHEN excluded.status = 'confirmed'
+                                     THEN 'confirmed' ELSE status END,
+                       observation_id = coalesce(observation_id, excluded.observation_id),
+                       parser = excluded.parser,
+                       detail = CASE WHEN detail = '' THEN excluded.detail ELSE detail END,
+                       updated_at = max(updated_at, excluded.updated_at)""",
+                (*key, float(row["confidence"]), str(row["status"]),
+                 row.get("observation_id"), str(row["parser"]),
+                 str(row.get("detail") or ""), at, at, row.get("expires_at")))
+            (row_id,) = db.execute(
+                """SELECT id FROM facts WHERE server = ? AND account = ? AND character = ?
+                     AND kind = ? AND subject = ? AND value = ?""", key).fetchone()
+            if existing is None:
+                self._fact_inserts += 1
+                if self._fact_inserts % FACT_PRUNE_EVERY == 0:
+                    self._prune_facts(db, folded)
+        return int(row_id), existing is None
+
+    def _prune_facts(self, db: sqlite3.Connection, character: str) -> None:
+        """Evict the least recently updated facts over the cap, candidates first."""
+        scope = (self.server, self.account, character)
+        (count,) = db.execute(
+            """SELECT count(*) FROM facts
+               WHERE server = ? AND account = ? AND character = ?""", scope).fetchone()
+        excess = count - FACT_ROW_LIMIT
+        if excess > 0:
+            db.execute(
+                """DELETE FROM facts WHERE id IN (
+                       SELECT id FROM facts
+                       WHERE server = ? AND account = ? AND character = ?
+                       ORDER BY status = 'confirmed', updated_at, id LIMIT ?)""",
+                (*scope, excess))
+
+    def facts(self, character: str, *, limit: int = 100, kind: str = "",
+              status: str = "", timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her most recently updated facts, newest first, each with the map
+        and source name of the observation it came from."""
+        query = f"""SELECT {", ".join("f." + column for column in FACT_COLUMNS)},
+                           o.map, o.source_name
+                    FROM facts f LEFT JOIN observations o ON o.id = f.observation_id
+                    WHERE f.server = ? AND f.account = ? AND f.character = ?"""
+        params: list[Any] = [self.server, self.account, character.casefold()]
+        if kind:
+            query += " AND f.kind = ?"
+            params.append(kind)
+        if status:
+            query += " AND f.status = ?"
+            params.append(status)
+        query += " ORDER BY f.updated_at DESC, f.id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        columns = (*FACT_COLUMNS, "map", "source_name")
+        with self._connect(timeout) as db:
+            rows = db.execute(query, params).fetchall()
+        return [dict(zip(columns, row)) for row in rows]
+
+    def fact_counts(self, character: str, *, timeout: float = 10.0) -> dict[str, int]:
+        """Stored facts by kind."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT kind, count(*) FROM facts
+                   WHERE server = ? AND account = ? AND character = ?
+                   GROUP BY kind""",
+                (self.server, self.account, character.casefold())).fetchall()
+        return {kind: int(count) for kind, count in rows}
+
+    def tile_facts(self, character: str, *,
+                   timeout: float = 10.0) -> list[tuple[str, str]]:
+        """Her confirmed tile-property facts as (subject, value) pairs."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT subject, value FROM facts
+                   WHERE server = ? AND account = ? AND character = ?
+                     AND kind = 'tile-property' AND status = 'confirmed'
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (self.server, self.account, character.casefold(),
+                 FACT_ROW_LIMIT)).fetchall()
+        return [(str(subject), str(value)) for subject, value in rows]
 
     def import_legacy(self, state_path: Path, activity_path: Path) -> None:
         """Import the old unscoped JSON files once without modifying them."""

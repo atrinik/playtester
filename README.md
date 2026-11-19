@@ -244,6 +244,7 @@ Counters:
 | `tasks_finished_total` | `task`, `status` | top-level tasks that completed, failed or were stopped from the dashboard (stopping counts as failed); a task replaced by another is not counted |
 | `state_seconds_total` | `state` | seconds `fighting`, `resting`, `travelling`, `shopping` (shops, temple, NPC dialogue), `busy`, `idle` or `disconnected` (not playing) |
 | `observations_total` | `source` | [observations](#observation-ledger) stored, by source kind; a repeat of a stored reading counts again |
+| `facts_total` | `kind`, `status` | [facts](#facts) first stored, by kind (`tile-property`, `key-name`, ...) and status (`candidate`, `confirmed`) |
 | `observations_dropped_total` | `reason` | readings the ingestion filter refused: `chat`, `player-link`, `who-list`, `player-name`, `signed-book`, `unmatched-book`, `book-unverified`, `renamed-item`, `examine-interrupted`, `unauthored-item`, `examine-unverified`, `book-examine` |
 
 The time in each state follows the latest recorded action that marks one. For
@@ -282,8 +283,9 @@ runtime state database (`observations.py`, `memory.py`; the design is
   examine sends; one soulbound to someone is dropped. Dialogue pages are
   not kept (NPC scripts build them from player data; see the design's
   phase F13). An unattributed line is stored, as `system:<map>`, only when
-  it is a fact line (for now "Something blocks your spellcasting."). The
-  same text from the same source raises the row's `seen` count.
+  it is a fact line (the server's no-magic and no-harm refusals, such as
+  "Something blocks your spellcasting."). The same text from the same
+  source raises the row's `seen` count.
 - **The authored-text index** is scanned from the locked content (maps,
   archetypes, artifacts, materials and the book message file, about 1.3
   seconds) when the `web` or `autoplay` command starts. Without it only
@@ -293,9 +295,43 @@ runtime state database (`observations.py`, `memory.py`; the design is
   are evicted first. Writes wait at most 0.25 seconds for a locked database
   and otherwise drop the reading, never the game line.
 
-The dashboard's read-only **Knowledge** tab lists recent readings by source
-(`GET /api/knowledge?kind=SOURCE&limit=N`, newest first, up to 1000, under
-the same loopback and `Host` rules as `/api/state`).
+The dashboard's read-only **Knowledge** tab lists her facts and recent
+readings by kind and source (`GET
+/api/knowledge?kind=SOURCE&limit=N&fact_kind=KIND&fact_limit=N`, newest
+first, up to 1000 each, under the same loopback and `Host` rules as
+`/api/state`).
+
+### Facts
+
+Fixed parsers (`facts.py`, the design's 4.3.2, phase F2) read facts out of
+each stored observation into the `facts` table: key names a lock asks for,
+key holders engraved on a door, lock colours, NPCs that mention a key,
+passwords (an empty value when the text promises one and gives none),
+directions, trap warnings, creature weaknesses and immunities, quest-gate
+hints, quest-part places, doors that say they do not open, and lock texts
+that name nothing. They are regular expressions over the stored text and
+the authored names; no model, network or chat is involved, and nothing
+but a kept observation is read. Each fact cites its observation
+(`facts.observation_id`), which is then never evicted. Every parsed fact
+is a `candidate`: a hint, never an unlock. One row per kind, subject and
+value; a repeat refreshes it. At most 20,000 a character, the least
+recently updated candidates evicted first.
+
+**Tile facts.** When the server refuses her magic ("Something blocks your
+spellcasting.", "Powerful countermagic cancels all spellcasting here!"),
+the square of her cast (or the whole map) is kept as a confirmed
+`tile-property: no_magic` fact, besides the one-hour mark idle survival
+already sets; "Powerful countermagic cancels all harmful magic here!" is
+kept as `no_harm` and changes nothing. Whether a remembered no-magic square
+stops her casting after a restart is the owner's choice:
+
+- `--persist-tile-facts` (or `ATRINIK_BOT_PERSIST_TILE_FACTS=1`): she casts
+  no spell, scroll, rod or wand on a remembered square or map, as on a
+  square marked in this process (potions still work), and records a
+  `tile-fact-no-magic` decision once a square.
+- Off (the default): the facts are written and shown, the one-hour mark
+  alone decides, and a `tile-fact-no-magic-shadow` decision records once a
+  square where she would have held off.
 
 ## Operator assist
 

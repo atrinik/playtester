@@ -1,9 +1,10 @@
 # Learning from the world and playtester feedback
 
-Status: design proposal. Phase F1 (the observation ledger) is implemented;
-"F1 as built" in section 6 records where it differs from this text. Nothing
-else here is implemented, and nothing here changes behaviour until the
-phased pull requests at the end land.
+Status: design proposal. Phases F1 (the observation ledger) and F2 (fact
+parsers and tile facts) are implemented; "F1 as built" and "F2 as built" in
+section 6 record where they differ from this text. Nothing else here is
+implemented, and nothing here changes behaviour until the phased pull
+requests at the end land.
 
 The owner wants Sera to learn from what she reads and does in the world, and
 to turn what confuses her into feedback that improves the game. She chose
@@ -1532,6 +1533,56 @@ off (shadow: the fact is written and shown, #97 alone decides).
 *Accept:* every section 5 text gives its expected facts; the section 2
 message stream produces one `no_magic` fact; with the flag on, a reconnect
 a day later casts nothing on that square; no LLM dependency.
+
+*F2 as built* (`facts.py`, `memory.py`, `tasks.spell_blocked_here`, the
+Knowledge tab):
+
+- `facts` has the columns of 4.2 plus `detail`, the sentence a fact came
+  from (at most 300 characters of the stored observation's text, or the
+  fixed refusal), so the dashboard can show why without the whole book. A
+  unique index on (server, account, character, kind, subject, value) makes
+  a repeat an upsert: the higher confidence wins, `candidate` can become
+  `confirmed` but never the reverse, and the first observation stays the
+  source. `expires_at` is written empty; nothing expires yet.
+- Subjects are the observation's `source_key` for text facts, the folded
+  creature name for `weakness` and `immunity`, and `tile:/map:x,y` or, for
+  a whole map, `map:/map` for tile facts. `generic-lock` values are
+  `special-key` (the archetype defaults), `unnamed-key` (5.2's "a the
+  key") and `locked` ("The prison cell is locked.", "The big lever is
+  locked."); `unopenable` values are `from-this-side` (0.6), `closed` and
+  `blocked` (0.4, the 5.1 decoration doors). A `password` with no value is
+  stored with an empty value.
+- Parsers run on each observation as it is stored, including a repeat, so
+  rows F1 kept before this phase gain facts the next time she sees them;
+  there is no bulk backfill. They read only kept observations, so dialogue
+  (`npc-key`, F13) and the journal (`quest-part`, not stored) have no input
+  yet; both are tested on fixtures. Lock parsers read door, gate, lever,
+  sign and magic-mouth text; `quest-gate` reads books, scrolls, dialogue
+  and the journal; system lines and examines give no text facts.
+- `key-holder` reads only the engraved form (`[i]Name, the creature[/i] is
+  engraved ...`): free prose such as "each guard in Asteria possesses the
+  first of these keys" named places as holders. `weakness` and `immunity`
+  need a creature name the authored index knows (so "its wearer" is no
+  subject) and give nothing without the index; no authored text states one
+  today, since the bestiary books are generated and not indexed.
+- Tile facts come from `spell_blocked_here`'s attribution (the square of
+  the cast, as PR #97 decides it), not from the observation row: system
+  lines are deduplicated per map, so a second no-magic square on the same
+  map adds no observation. Each cites the stored observation of the same
+  line when there is one; the variant naming her item ("...the magic of
+  your %s") is not stored (F1), so its fact cites none and keeps no detail.
+  The countermagic lines join F1's fact lines. Classic has no no-prayer
+  refusal; "Powerful countermagic cancels all harmful magic here!" becomes
+  `no_harm` at the cast square (its message does not tell a no-harm map
+  from a no-harm square) and changes nothing.
+- The flag is `--persist-tile-facts` or `ATRINIK_BOT_PERSIST_TILE_FACTS=1`.
+  On, `spell_blocked_here` also answers true on a square or map with a
+  `no_magic` fact, which every caster that asks it obeys (healing and the
+  emergency recall); off, it records a `tile-fact-no-magic-shadow` decision
+  once a square a process. A fact is never refuted: a square whose content
+  changes stays remembered until the fact is removed.
+- Facts are capped at 20,000 a character, candidates first, least recently
+  updated first; `facts_total{kind,status}` counts new facts.
 
 **F3. `feat(inventory)`: effective item stats and an Equipment panel.** The
 "+N" model (4.8.1), examining carried gear once, `EffectiveStats`, the

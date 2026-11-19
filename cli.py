@@ -66,6 +66,13 @@ def parser() -> argparse.ArgumentParser:
         default=os.getenv("ATRINIK_RUNTIME_CONTENT", ""),
         help="collected Atrinik runtime content containing lib/bmaps",
     )
+    p.add_argument(
+        "--persist-tile-facts", action="store_true",
+        default=os.getenv("ATRINIK_BOT_PERSIST_TILE_FACTS", "").strip().casefold()
+        in ("1", "true", "yes", "on"),
+        help="let remembered no-magic squares stop her casting there after a "
+             "restart (default: off, the facts are only recorded and shown)",
+    )
     p.add_argument("--register", action="store_true")
     p.add_argument("--create-character", action="store_true")
     p.add_argument("--archetype", default="half_elf_male")
@@ -193,6 +200,7 @@ async def main_async(args: argparse.Namespace) -> None:
         chat_rules_path=args.chat_rules,
         runtime_state_path=args.runtime_state,
         runtime_content_path=args.runtime_content,
+        persist_tile_facts=args.persist_tile_facts,
         register=args.register, create_character=args.create_character,
         character_archetype=args.archetype,
     )

@@ -627,9 +627,9 @@ async function pollKnowledge() {
   if (knowledgeBusy) return;
   knowledgeBusy = true;
   try {
-    const kind = $("#knowledge-kind").value;
-    const r = await fetch(`/api/knowledge?limit=200${kind ? `&kind=${encodeURIComponent(kind)}` : ""}`, { cache: "no-store" });
-    if (r.ok) renderKnowledge(await r.json());
+    const kind = $("#knowledge-kind").value, factKind = $("#fact-kind").value;
+    const r = await fetch(`/api/knowledge?limit=200&fact_limit=200${kind ? `&kind=${encodeURIComponent(kind)}` : ""}${factKind ? `&fact_kind=${encodeURIComponent(factKind)}` : ""}`, { cache: "no-store" });
+    if (r.ok) { const k = await r.json(); renderFacts(k); renderKnowledge(k); }
   } finally { knowledgeBusy = false; }
 }
 function renderKnowledge(k) {
@@ -649,6 +649,39 @@ function renderKnowledge(k) {
   </div>`).join("") || '<span class="muted">Nothing read yet.</span>';
 }
 $("#knowledge-kind").onchange = pollKnowledge;
+
+// Facts her parsers read from those readings (facts.py), built as DOM nodes
+// with textContent only.
+const FACT_LABELS = { "tile-property": "Tile property", "key-name": "Key name", "key-holder": "Key holder", "lock-colour": "Lock colour", "npc-key": "NPC mentions a key", password: "Password", direction: "Direction", "trap-warning": "Trap warning", weakness: "Weakness", immunity: "Immunity", "quest-gate": "Quest gate", "quest-part": "Quest part", unopenable: "Unopenable", "generic-lock": "Generic lock text" };
+const node = (tag, className, text) => { const e = document.createElement(tag); if (className) e.className = className; if (text != null) e.textContent = String(text); return e; };
+function renderFacts(k) {
+  const counts = k.fact_counts || {}, select = $("#fact-kind"), chosen = select.value;
+  const kinds = Object.keys(counts).sort();
+  const sig = kinds.map(x => `${x}:${counts[x]}`).join(",");
+  if (select.dataset.sig !== sig) {
+    select.replaceChildren(node("option", "", "All kinds"), ...kinds.map(x => { const o = node("option", "", `${FACT_LABELS[x] || x} (${counts[x]})`); o.value = x; return o; }));
+    select.firstChild.value = "";
+    select.value = kinds.includes(chosen) ? chosen : "";
+    select.dataset.sig = sig;
+  }
+  const total = kinds.reduce((sum, x) => sum + counts[x], 0);
+  $("#facts-summary").textContent = `${total.toLocaleString()} fact${total === 1 ? "" : "s"} kept · no-magic tile facts ` +
+    (k.persist_tile_facts ? "stop her casting (persist_tile_facts on)" : "are recorded only (persist_tile_facts off)");
+  const when = t => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const rows = (k.facts || []).map(f => {
+    const row = node("div", "reading fact");
+    const head = node("div", "reading-head");
+    head.append(node("b", "", FACT_LABELS[f.kind] || f.kind), node("span", "fact-value", f.value === "" ? "(not given)" : f.value),
+      node("span", `flag ${f.status === "confirmed" ? "good" : ""}`.trim(), f.status), node("span", "flag", `${Math.round((f.confidence || 0) * 100)}%`));
+    const time = node("time", "", when(f.updated_at)); head.append(time);
+    row.append(head);
+    if (f.detail) row.append(node("p", "", clean(f.detail)));
+    row.append(node("small", "", [f.subject, f.source_name, f.parser].filter(Boolean).join(" · ")));
+    return row;
+  });
+  $("#facts").replaceChildren(...(rows.length ? rows : [node("span", "muted", "No facts yet.")]));
+}
+$("#fact-kind").onchange = pollKnowledge;
 
 // ---------- polling ----------
 let liveBusy = false, slowBusy = false;

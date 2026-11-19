@@ -25,7 +25,8 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameSta
 from .alerts import ProgressWatch
 from .memory import BotMemory
 from .metrics import BotMetrics
-from .observations import AuthoredContent, Observation, ObservationRecorder
+from . import facts as fact_parsers
+from .observations import AuthoredContent, Observation, ObservationRecorder, text_hash
 from . import post_mortem
 from .self_improvement import PLAYER_CHANNELS
 from .trends import Trends
@@ -172,6 +173,10 @@ class ClientConfig:
     runtime_state_path: str = ""
     chat_rules_path: str = ""
     runtime_content_path: str = ""
+    # docs/LEARNING_AND_FEEDBACK.md 4.11.1: whether her casting also reads
+    # the persistent no-magic tile facts. Off (the default) they are only
+    # written and shown, and spell_blocked_here's one-hour mark alone decides.
+    persist_tile_facts: bool = False
 
 
 # kill_player (server types/player.c) sends exactly one of these, as the whole
@@ -304,6 +309,14 @@ class AtrinikClient:
         self.authored_content: AuthoredContent | None = None
         self.observations = ObservationRecorder(
             lambda: self.authored_content, self._observation_dropped)
+        # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
+        # a whole map, loaded with her memory: the properties at each.
+        self.tile_facts: dict[tuple[str, int, int], set[str]] = {}
+        # Tile facts written in this process, so a repeat costs no write.
+        self._tile_facts_noted: set[tuple[tuple[str, int, int], str]] = set()
+        # Squares whose tile fact already recorded a decision in this process
+        # (tasks.spell_blocked_here).
+        self._tile_fact_decisions: set[tuple[str, int, int]] = set()
 
     def load_character_memory(self, character: str) -> None:
         # Switching characters on a long-lived client: the previous one's
@@ -338,6 +351,7 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        self._load_tile_facts(character)
         # The life boundary in this (possibly reloaded) ledger: the previous
         # report's mark, found by value, or, in a fresh process with no mark,
         # the restored ledger's last death.
@@ -561,6 +575,78 @@ class AtrinikClient:
             self._memory_store().save(
                 character, "state",
                 self._runtime_memory.get(character, {}))
+
+    def _load_tile_facts(self, character: str) -> None:
+        """Her confirmed tile facts, kept from earlier sessions."""
+        self.tile_facts = {}
+        self._tile_facts_noted.clear()
+        self._tile_fact_decisions.clear()
+        if not character:
+            return
+        try:
+            rows = self._memory_store().tile_facts(character)
+        except Exception as error:  # Never fails a login.
+            log.warning("tile facts not loaded: %s", error)
+            return
+        for subject, value in rows:
+            square = fact_parsers.parse_tile_subject(subject)
+            if square is not None:
+                self.tile_facts.setdefault(square, set()).add(value)
+
+    def note_tile_fact(self, square: tuple[str, int, int], value: str,
+                       text: str) -> None:
+        """Keep a fixed server refusal at ``square`` (x = y = -1: the whole
+        map) as a confirmed tile fact (facts.py); never fails play.
+
+        ``tasks.spell_blocked_here`` calls this for the square it marks. The
+        fact cites the stored observation of the same line, if any.
+        """
+        if not square[0]:
+            return
+        self.tile_facts.setdefault(square, set()).add(value)
+        character = getattr(self, "_memory_character", "")
+        if (not character or character != self.state.player_name or
+                (square, value) in self._tile_facts_noted):
+            return
+        fact = fact_parsers.tile_fact(*square, value, text)
+        try:
+            memory = self._memory_store()
+            observation = memory.observation_id(
+                character, f"system:{square[0]}", text_hash(text))
+            _, created = memory.record_fact(
+                character, fact.row(at=time.time(), observation_id=observation))
+        except sqlite3.Error as error:
+            log.warning("tile fact not kept: %s", error)
+            return
+        except Exception:
+            log.exception("tile fact not kept")
+            return
+        self._tile_facts_noted.add((square, value))
+        if created and self.metrics is not None:
+            self.metrics.fact(fact.kind, fact.status)
+
+    def _record_facts(self, character: str, observation: Observation,
+                      observation_id: int) -> None:
+        """The facts a stored observation states (facts.py), citing it."""
+        content = self.authored_content
+        try:
+            found = fact_parsers.parse(observation.row(),
+                                       content.names if content is not None else None)
+        except Exception:
+            log.exception("fact parsers failed")
+            return
+        for fact in found:
+            try:
+                _, created = self._memory_store().record_fact(
+                    character, fact.row(at=observation.at, observation_id=observation_id))
+            except sqlite3.Error as error:
+                log.warning("fact not kept: %s", error)
+                return
+            except Exception:
+                log.exception("fact not kept")
+                return
+            if created and self.metrics is not None:
+                self.metrics.fact(fact.kind, fact.status)
 
     def _memory_store(self) -> BotMemory:
         if self.memory is None:
@@ -1748,7 +1834,7 @@ class AtrinikClient:
             if not isinstance(observation, Observation):
                 continue
             try:
-                self._memory_store().record_observation(character, observation.row())
+                row_id = self._memory_store().record_observation(character, observation.row())
             except sqlite3.Error as error:
                 log.warning("observation not kept: %s", error)
                 continue
@@ -1757,6 +1843,8 @@ class AtrinikClient:
                 continue
             if self.metrics is not None:
                 self.metrics.observation(observation.source_kind)
+            # Facts only from what was kept: the stored row is their source.
+            self._record_facts(character, observation, row_id)
 
     def _observation_dropped(self, reason: str) -> None:
         if getattr(self, "metrics", None) is not None:
