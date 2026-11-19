@@ -25091,6 +25091,21 @@ class BlockClient:
     async def clear_actions(self):
         self.clears += 1
 
+    async def set_combat(self, enabled, force=False):
+        self.state.combat = enabled
+
+    async def clear_target(self):
+        self.state.target_id = 0
+
+    async def move(self, direction, run=False):
+        self.moves = getattr(self, "moves", []) + [direction]
+
+    async def fire(self, direction, tag):
+        pass
+
+    async def apply(self, tag):
+        pass
+
 
 class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -25484,6 +25499,56 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         tile.objects.clear()
         self.assertFalse(await self.rest(task, now, CARE_PLATEAU_SECONDS - 5))
         self.assertTrue(await self.rest(task, now, 5))
+
+    async def test_an_attacker_out_of_view_never_passes_for_a_plateau(self):
+        from .navigation import CARE_PLATEAU_SECONDS
+
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        rod = Item(50, name="rod of word of recall", item_type=c.TYPE_ROD, quality=60)
+        self.client.state.place_item(rod, 7)
+        self.client.recall_device_retry_at = {50: time.monotonic() + 3600}
+        self.client.state.stats.update(hp=200, maxhp=200)
+        trip = NavigateThenTask(self.graph, "/goal", _DoneErrand())
+        trip.navigation.essential = "cure"
+        clicks = []
+
+        async def click(_client, x, y):
+            clicks.append((x, y))
+            return True
+
+        trip.navigation._click_path = click
+        await trip.tick(self.client)
+        care = trip.navigation.care
+        self.assertEqual(care.missing, ("a ready recall",))
+        now = [100.0]
+        care.clock = lambda: now[0]
+        care.since, care.checked_at = now[0], 0.0
+        self.client.recall_device_retry_at = {}
+        # An attacker she cannot see (nothing within 8 tiles) hits her every
+        # 2 s for 1 % of her health, for 80 s: real ticks, with the trip's
+        # own defence and safety ahead of the care check.
+        defended = 0
+        for _ in range(40):
+            now[0] += 2
+            self.client.state.stats["hp"] -= 2
+            self.client.state.add_message(0, "ffffff", "Something hit you for 2 damage.")
+            checked = care.checked_at
+            await trip.tick(self.client)
+            defended += care.checked_at == checked
+            self.assertFalse(care.cleared, f"crossed at {self.client.state.stats['hp']} HP")
+        self.assertEqual(clicks, [])
+        # With no trail to back along, the defence does not hold the trip:
+        # the care check itself must see the falling health.
+        self.assertEqual(defended, 0)
+        # Once the attacks stop she still waits for a stable minute.
+        stopped = now[0]
+        while not care.cleared and now[0] - stopped < 2 * CARE_PLATEAU_SECONDS:
+            now[0] += 2
+            await trip.tick(self.client)
+        self.assertTrue(care.cleared)
+        self.assertGreaterEqual(now[0] - stopped, CARE_PLATEAU_SECONDS - 15)
+        self.assertIn("no longer rising", self.client.decision_history[-1]["detail"])
 
     def test_a_cache_retry_behind_the_walls_comes_before_crossing(self):
         self.block("/blocked")

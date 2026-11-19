@@ -1904,6 +1904,11 @@ CARE_STAGING_RETRY_SECONDS = 120.0
 # Resting at a safe place, HP or SP that has not risen for this long counts
 # as full: a disease or poison may keep it below the maximum.
 CARE_PLATEAU_SECONDS = 60.0
+# A plateau also ends when the vital falls more than this share of its
+# maximum below the plateau's peak: damage over time stays within it (the
+# worst in the content, pneumonic plague, takes 11 % a pulse and regenerates
+# back), steady damage from an attacker she cannot see does not.
+CARE_PLATEAU_BAND = 0.15
 # A gap this long between two care checks (a fight held the trip, which
 # skips them) forgets the plateau: what happened meanwhile is unknown.
 CARE_PLATEAU_GAP_SECONDS = 5.0
@@ -2441,15 +2446,18 @@ class NavigateTask(BotTask):
     @staticmethod
     def _vital_full(care: "CareCrossing", key: str, value: int, maximum: int,
                     now: float, resting: bool) -> bool:
-        """At its maximum, or, resting at a safe place, not risen above its
-        peak for CARE_PLATEAU_SECONDS: a disease or poison that keeps it
-        below the maximum must not hold her forever (the plateau counts as
-        full). Not resting (a hostile in view, on the walk home) starts it
-        afresh, and so does a gap between checks (_care_missing)."""
+        """At its maximum, or, resting at a safe place, stable for
+        CARE_PLATEAU_SECONDS: not risen above its peak, nor fallen more than
+        CARE_PLATEAU_BAND of the maximum below it. A disease or poison that
+        keeps it below the maximum must not hold her forever (the plateau
+        counts as full), and damage from an attacker she cannot see must
+        not pass for one. Not resting (a hostile in view, on the walk home)
+        starts it afresh, and so does a gap between checks (_care_missing)."""
         if maximum > 0 and value >= maximum:
             return True
         best = care.peaks.get(key)
-        if not resting or best is None or value > best[0]:
+        if (not resting or best is None or value > best[0] or
+                best[0] - value > CARE_PLATEAU_BAND * maximum):
             care.peaks[key] = (value, now)
             return False
         if now - best[1] >= CARE_PLATEAU_SECONDS:

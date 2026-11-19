@@ -1491,7 +1491,14 @@ is set. Notes against the text above:
   hostile in view at a check, or a gap of more than 5 s between care checks
   (a fight holds the trip in its defence, which skips them), starts the
   plateau afresh, so a fight's damage and the regeneration after it never
-  count as one. Damage over time does not. The wait
+  count as one. So does a fall of more than 15 % of the maximum below the
+  plateau's peak (`CARE_PLATEAU_BAND`). That is what catches an attacker
+  she cannot see: with no trail to back along, the defence's
+  unseen-attacker retreat does not hold the trip, so the care checks go on
+  while she is hit. Damage over time stays within the band (pneumonic
+  plague, the worst in the content, takes 11 % a pulse) and does not
+  restart the plateau; an attacker's damage below the band for a whole
+  minute would pass for one. The wait
   pauses no safety: whatever keeps her alive on a trip runs as it does on
   any other, such as healing, eating, the low-health retreat and defence
   (`NavigateThenTask`), the recovery phase's emergency recall, Stop and the
