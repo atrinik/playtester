@@ -1590,7 +1590,9 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   without `<close/>`) adds an `Unknown` atom, so no offered voyage starts
   or advances a quest, buys, sets an enemy or types text. `<check>` and
   `<ncheck>` also compile as `Unknown`, not as `Quest` atoms: no voyage
-  path in the content has one. Server dispatch the compiler does not
+  path in the content has one. No voyage charges a fare, and a fare could
+  only be taken by those elements, so there is no wallet check to make.
+  Server dispatch the compiler does not
   model is `Unknown` too: an interface with anything but `<dialog>`
   children (`<precond>`, `<code>`, a direct `<and>`), a `regex` dialogue
   (whose matchers run before the named dialogue), two dialogues with one
@@ -1611,8 +1613,7 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   when the server picks that interface's class, and dialogue-level code
   off the voyage's path only when that dialogue is called. Failing those
   closed would also close the Incuna Sam voyage, whose module defines a
-  `dialog_hello` for Lost Memories' `speak_sam` part. No voyage charges a fare, and a fare could
-  only be taken by those elements, so there is no wallet check to make.
+  `dialog_hello` for Lost Memories' `speak_sam` part.
 - **Interface state.** `state="completed"` on a quest's own interface is a
   `Quest(quest)` atom. Any other state, and a quest file's stateless
   interface (the server's fallback when no state matches), is `Unknown`.
