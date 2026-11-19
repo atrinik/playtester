@@ -8,7 +8,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +48,9 @@ FIGHT_COLUMNS = ("id", "started", "ended", "map", "x", "y", "cell", "feature",
                  "reach", "peak_attackers", "ranged_attackers", "ranged_covered",
                  "hostiles_in_view", "players_in_view", "kills", "damage_taken",
                  "seconds", "outcome")
+# Route events (docs/ROUTING.md 4.4, route_events.py): the longest a write
+# waits for a locked database (seconds).
+ROUTE_EVENT_SAVE_TIMEOUT = 0.25
 FACT_COLUMNS = ("id", "kind", "subject", "value", "confidence", "status",
                 "observation_id", "parser", "detail", "inputs", "created_at",
                 "updated_at", "expires_at")
@@ -215,6 +218,54 @@ class BotMemory:
                        until REAL NOT NULL,
                        note TEXT NOT NULL DEFAULT '',
                        PRIMARY KEY (server, account, character, subject)
+                   )""")
+            # Her route events (docs/ROUTING.md 4.4, route_events.py): rare
+            # danger and failure signals, one row each, capped per signal;
+            # successful traversals aggregated per subject (``timed`` counts
+            # the ones whose seconds are in the mean: a seeded count has
+            # none); requirement outcomes per edge.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS route_events (
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       at REAL NOT NULL,
+                       subject TEXT NOT NULL,
+                       signal TEXT NOT NULL,
+                       magnitude REAL NOT NULL,
+                       kit TEXT NOT NULL DEFAULT '',
+                       content TEXT NOT NULL DEFAULT ''
+                   )""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS route_events_by_signal
+                   ON route_events (server, account, character, signal, at)""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS route_events_by_age
+                   ON route_events (server, account, character, at)""")
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS route_traversals (
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       subject TEXT NOT NULL,
+                       count INTEGER NOT NULL,
+                       mean_seconds REAL NOT NULL,
+                       last_at REAL NOT NULL,
+                       timed INTEGER NOT NULL DEFAULT 0,
+                       PRIMARY KEY (server, account, character, subject)
+                   )""")
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS route_requirements (
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       edge TEXT NOT NULL,
+                       outcome TEXT NOT NULL,
+                       at REAL NOT NULL,
+                       until REAL NOT NULL,
+                       inputs TEXT NOT NULL,
+                       evidence TEXT NOT NULL DEFAULT '',
+                       PRIMARY KEY (server, account, character, edge)
                    )""")
         self._chat_appends = 0
         self._observation_inserts = 0
@@ -676,6 +727,179 @@ class BotMemory:
                    ORDER BY until, subject""", scope).fetchall()
         return [{"subject": subject, "created_at": created_at, "until": until,
                  "note": note} for subject, created_at, until, note in rows]
+
+    def _route_marker(self, character: str) -> str:
+        return f"route-events-migrated:{self.server}:{self.account}:{character.casefold()}"
+
+    def route_events_migrated(self, character: str, *, timeout: float = 10.0) -> bool:
+        """Whether her pre-P5 route history has been migrated."""
+        with self._connect(timeout) as db:
+            return db.execute("SELECT 1 FROM metadata WHERE key = ?",
+                              (self._route_marker(character),)).fetchone() is not None
+
+    def record_route_events(self, character: str, *, events: Iterable[dict[str, Any]] = (),
+                            traversals: Iterable[dict[str, Any]] = (),
+                            requirements: dict[str, dict[str, Any]] | None = None,
+                            migration: Any = None, now: float | None = None,
+                            timeout: float = ROUTE_EVENT_SAVE_TIMEOUT) -> bool:
+        """Write her route events, traversals and requirement outcomes in one
+        transaction, then hold every signal to its cap and drop aged rows.
+
+        ``migration`` (route_events.Migration) is written too, unless her
+        marker says it already was: history is migrated exactly once. Returns
+        whether this call migrated it. ``timeout`` bounds the wait for a
+        locked database."""
+        from .route_events import CAPS, EVENT_MAX_AGE, TRAVERSAL_MAX_IDLE
+
+        now = time.time() if now is None else float(now)
+        scope = (self.server, self.account, character.casefold())
+        migrated = False
+        with self._connect(timeout) as db:
+            rows = list(events)
+            seeds: list[dict[str, Any]] = []
+            if migration is not None:
+                marker = self._route_marker(character)
+                if db.execute("SELECT 1 FROM metadata WHERE key = ?",
+                              (marker,)).fetchone() is None:
+                    rows = [*migration.events, *rows]
+                    seeds = list(migration.traversals)
+                    db.execute("INSERT INTO metadata(key, value) VALUES (?, ?)",
+                               (marker, json.dumps({"at": now,
+                                                    "installed_at": migration.installed_at,
+                                                    "events": len(migration.events),
+                                                    "seeded": len(seeds)})))
+                    migrated = True
+            db.executemany(
+                """INSERT INTO route_events
+                       (server, account, character, at, subject, signal, magnitude,
+                        kit, content)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(*scope, float(row["at"]), str(row["subject"]), str(row["signal"]),
+                  float(row["magnitude"]), str(row.get("kit", "")),
+                  str(row.get("content", ""))) for row in rows
+                 if now - float(row["at"]) <= EVENT_MAX_AGE])
+            db.executemany(
+                """INSERT INTO route_traversals
+                       (server, account, character, subject, count, mean_seconds,
+                        last_at, timed)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(server, account, character, subject) DO UPDATE SET
+                       mean_seconds = CASE
+                           WHEN route_traversals.timed + excluded.timed > 0 THEN
+                               (route_traversals.mean_seconds * route_traversals.timed +
+                                excluded.mean_seconds * excluded.timed) /
+                               (route_traversals.timed + excluded.timed)
+                           ELSE 0 END,
+                       count = route_traversals.count + excluded.count,
+                       timed = route_traversals.timed + excluded.timed,
+                       last_at = max(route_traversals.last_at, excluded.last_at)""",
+                [(*scope, str(row["subject"]), int(row["count"]),
+                  float(row["mean_seconds"]), float(row["last_at"]), int(row["timed"]))
+                 for row in [*seeds, *traversals] if int(row["count"]) > 0])
+            db.executemany(
+                """INSERT OR REPLACE INTO route_requirements
+                       (server, account, character, edge, outcome, at, until, inputs,
+                        evidence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(*scope, edge, str(row["outcome"]), float(row["at"]), float(row["until"]),
+                  str(row.get("inputs", "")), str(row.get("evidence", "")))
+                 for edge, row in (requirements or {}).items()])
+            # Each signal its own cap, newest kept: a flood of one never
+            # evicts another's rows. Then the age limits.
+            for signal, cap in CAPS.items():
+                db.execute(
+                    """DELETE FROM route_events WHERE rowid IN (
+                           SELECT rowid FROM route_events
+                           WHERE server = ? AND account = ? AND character = ?
+                             AND signal = ?
+                           ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?)""",
+                    (*scope, signal, cap))
+            db.execute(
+                """DELETE FROM route_events
+                   WHERE server = ? AND account = ? AND character = ? AND at < ?""",
+                (*scope, now - EVENT_MAX_AGE))
+            db.execute(
+                """DELETE FROM route_traversals
+                   WHERE server = ? AND account = ? AND character = ? AND last_at < ?""",
+                (*scope, now - TRAVERSAL_MAX_IDLE))
+            db.execute(
+                """DELETE FROM route_requirements
+                   WHERE server = ? AND account = ? AND character = ? AND until <= ?""",
+                (*scope, now))
+        return migrated
+
+    def route_events(self, character: str, *, since: float = 0.0,
+                     timeout: float = 10.0) -> list[tuple[float, str, str, float]]:
+        """Her route events since ``since``: (at, subject, signal,
+        magnitude), oldest first."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT at, subject, signal, magnitude FROM route_events
+                   WHERE server = ? AND account = ? AND character = ? AND at >= ?
+                   ORDER BY at, rowid""",
+                (self.server, self.account, character.casefold(), float(since))).fetchall()
+        return [(float(at), str(subject), str(signal), float(magnitude))
+                for at, subject, signal, magnitude in rows]
+
+    def route_event_rows(self, character: str, *,
+                         timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Every column of her route events (for tests and audits)."""
+        with self._connect(timeout) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                """SELECT * FROM route_events
+                   WHERE server = ? AND account = ? AND character = ?
+                   ORDER BY at, rowid""",
+                (self.server, self.account, character.casefold())).fetchall()
+        return [dict(row) for row in rows]
+
+    def route_traversals(self, character: str, *,
+                         timeout: float = 10.0) -> dict[str, int]:
+        """Her traversal count per subject."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT subject, count FROM route_traversals
+                   WHERE server = ? AND account = ? AND character = ?""",
+                (self.server, self.account, character.casefold())).fetchall()
+        return {str(subject): int(count) for subject, count in rows}
+
+    def route_traversal_rows(self, character: str, *,
+                             timeout: float = 10.0) -> dict[str, dict[str, Any]]:
+        """Her traversal rows per subject: count, timed, mean seconds, last."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT subject, count, timed, mean_seconds, last_at FROM route_traversals
+                   WHERE server = ? AND account = ? AND character = ?""",
+                (self.server, self.account, character.casefold())).fetchall()
+        return {str(subject): {"count": int(count), "timed": int(timed),
+                               "mean_seconds": float(mean), "last_at": float(last)}
+                for subject, count, timed, mean, last in rows}
+
+    def route_requirements(self, character: str, *, now: float | None = None,
+                           inputs: dict[str, str] | None = None,
+                           timeout: float = 10.0) -> dict[str, dict[str, Any]]:
+        """Her requirement outcomes per edge. Expired rows, and rows of an
+        edge in ``inputs`` whose fingerprint no longer matches, are deleted
+        on the way. A row kept with no fingerprint depends on no item or
+        quest state and is kept until it expires."""
+        now = time.time() if now is None else now
+        scope = (self.server, self.account, character.casefold())
+        with self._connect(timeout) as db:
+            db.execute(
+                """DELETE FROM route_requirements
+                   WHERE server = ? AND account = ? AND character = ? AND until <= ?""",
+                (*scope, now))
+            for edge, fingerprint in (inputs or {}).items():
+                db.execute(
+                    """DELETE FROM route_requirements
+                       WHERE server = ? AND account = ? AND character = ? AND edge = ?
+                         AND inputs != '' AND inputs != ?""", (*scope, edge, fingerprint))
+            rows = db.execute(
+                """SELECT edge, outcome, at, until, inputs, evidence FROM route_requirements
+                   WHERE server = ? AND account = ? AND character = ?""", scope).fetchall()
+        return {str(edge): {"outcome": outcome, "at": at, "until": until,
+                            "inputs": fingerprint, "evidence": evidence}
+                for edge, outcome, at, until, fingerprint, evidence in rows}
 
     def import_legacy(self, state_path: Path, activity_path: Path) -> None:
         """Import the old unscoped JSON files once without modifying them."""

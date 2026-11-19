@@ -670,7 +670,30 @@ gives way to a food trip once she is hungry. A food trip, hungry or
 starving, waits only for a ready recall, since waiting to regenerate burns
 food. Each crossing is recorded (`essential-route-override`, plus
 `essential-care-food` or `essential-care-starving` for a food trip, which is
-also alerted) and listed under **Care crossings**. The proposed design for
+also alerted) and listed under **Care crossings**.
+
+On every trip she records what the way cost her, in the runtime state
+database (`route_events`, `route_traversals` and `route_requirements`, per
+character): deaths, emergency recalls and disengages, and the damage she
+took on each map she crossed, each against the map and, when it happened
+within 3 tiles of her planned path, its 8x8 cell; exits held by a pack and
+crossings that failed, against the exit or seam; and each exit, seam and map
+she crossed, with the time it took. Subjects use the same `map:`, `exit:`
+and `seam:` names as owner blocks, plus `cell:`. Deaths to other players and
+their hits are not recorded, nor is damage on a PvP map, and no row holds a
+player or creature name. A respawn is never taken for a crossing,
+and a recall only when it lands right beside the next map's arrival square.
+Writes are best effort: they wait at most a quarter second for a locked
+database, keep a failed write's rows in memory for the next attempt, and
+never hold up play. Each signal keeps its own cap (deaths 1,000, damage
+5,000), so a flood of one never evicts another, and rows older than 7 days
+are deleted. Her route deaths and learned hazards from before this were
+migrated once, and her decision ledger's map visits seed the crossing
+counts. The Tasks tab's **Learned routes** section lists the 25 subjects
+with the highest provisional cost (one death costs 30 minutes of travel,
+halving every 6 hours), their signals, the last event and when the cost
+falls below half. It is read-only, and the planner does not use it yet. The
+proposed design for
 alternative routes, unlocks such as keys, quests and NPC voyages, and costs
 learned from her own experience is in [docs/ROUTING.md](docs/ROUTING.md).
 

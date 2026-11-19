@@ -17,7 +17,7 @@ function applyStyles(root) {
 }
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts,engine_error";
-const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment,route_blocks";
+const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment,route_blocks,route_learned";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -767,6 +767,35 @@ function renderFacts(k) {
   $("#facts").replaceChildren(...(rows.length ? rows : [node("span", "muted", "No facts yet.")]));
 }
 $("#fact-kind").onchange = pollKnowledge;
+// ---------- learned route subjects (read-only; docs/ROUTING.md 4.4, 4.8) ----------
+// Built with node() and textContent only. The planner does not use them yet.
+const SIGNAL_LABELS = { death: ["death", "deaths"], recall: ["recall", "recalls"], damage: ["damage", "damage"], blocked: ["held exit", "held exits"], crossing_failed: ["failed crossing", "failed crossings"] };
+const signalCount = (k, n) => `${n} ${(SIGNAL_LABELS[k] || [k, k])[n === 1 ? 0 : 1]}`;
+const learnedCost = s => (s < 60 ? `${Math.round(s)} s` : blockSpan(s));
+let lastLearnedSig = "";
+function renderLearned() {
+  const l = slow.route_learned;
+  const sig = JSON.stringify(l ?? null);
+  if (sig === lastLearnedSig) return;
+  lastLearnedSig = sig;
+  const rows = [];
+  if (!l) rows.push(node("span", "muted", "Not available."));
+  else if (!l.character_loaded) rows.push(node("span", "muted", "Route events are kept per character: waiting for her to log in."));
+  else {
+    if (l.error) rows.push(node("span", "muted", l.error));
+    for (const s of l.subjects || []) {
+      const row = node("div", "quest");
+      row.append(node("strong", "", s.subject), node("span", s.signals.death ? "flag bad" : "flag warn", `${learnedCost(s.cost_seconds)} provisional`));
+      const signals = Object.entries(s.signals).map(([k, n]) => signalCount(k, n)).join(", ");
+      row.append(node("small", "", `${signals} · last: ${(SIGNAL_LABELS[s.last_signal] || [s.last_signal])[0]} ${blockWhen(s.last_at)} · half by ${blockWhen(s.half_at)}${s.traversals ? ` · crossed ${s.traversals}×` : ""}`));
+      rows.push(row);
+    }
+    if (!(l.subjects || []).length && !l.error) rows.push(node("span", "muted", "Nothing learned: no route has cost her anything yet."));
+    const totals = Object.entries(l.events || {}).filter(([, n]) => n).map(([k, n]) => signalCount(k, n)).join(", ");
+    rows.push(node("small", "muted", `${l.learned || 0} subjects with a cost · ${l.traversed || 0} crossed · events (7 d): ${totals || "none"}${l.pending ? ` · ${l.pending} not written yet` : ""}${l.migrated ? "" : " · history not migrated yet"}`));
+  }
+  $("#route-learned").replaceChildren(...rows);
+}
 // ---------- equipment (read-only) ----------
 // Effective item stats per gear family, built from DOM nodes and text only.
 // node() is shared with the Knowledge tab above.
@@ -897,7 +926,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderBlocks(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderBlocks(); renderLearned(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
     if ($("#tab-farming").classList.contains("active")) pollTerrain();
   } finally { slowBusy = false; }

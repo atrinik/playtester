@@ -32,6 +32,7 @@ except ModuleNotFoundError:
 from . import constants as c
 from . import requirements as req
 from . import route_blocks
+from . import route_events
 from . import unlocks
 from .equipment import abandon_gear_examine
 from .route_blocks import NO_WALLS, OwnerWalls
@@ -261,6 +262,8 @@ class MapNode:
     automatic_exits: set[tuple[int, int]] = field(default_factory=set)
     peaceful_identities: set[str] = field(default_factory=set)
     caster_identities: set[str] = field(default_factory=set)
+    # The map header's ``pvp 1``: players may attack each other here.
+    pvp: bool = False
 
     def lock_allowed(self, point: tuple[int, int], access=False) -> bool:
         """Check one gated tile against an access set (requirements.py)."""
@@ -556,6 +559,7 @@ class WorldGraph:
                 int(one(attrs, "enter_x", 0) or 0),
                 int(one(attrs, "enter_y", 0) or 0),
             )
+            self.nodes[key].pvp = str(one(attrs, "pvp", "0") or "0").strip() not in ("", "0")
             parsed_maps[key] = (path, parsed)
 
         auto_exits: dict[str, list[tuple[int, int, int, str, bool]]] = defaultdict(list)
@@ -3440,6 +3444,7 @@ class NavigateTask(BotTask):
                     abs(orthogonal - authored_orthogonal),
                     len(path), crossing))
         if not candidates:
+            route_events.note_edge(client, self, edge)
             self._exclude_edge(edge)
             self.route = []
             self._issued_goal = None
@@ -3458,6 +3463,7 @@ class NavigateTask(BotTask):
         self._issued_click = None
         self._last_progress = time.monotonic()
         await client.clear_actions()
+        route_events.note_edge(client, self, edge)
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder(
@@ -3475,6 +3481,8 @@ class NavigateTask(BotTask):
         if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
             return
         self._record_progress(client)
+        # Her route events: a crossing since the last tick, the edge ahead.
+        route_events.note_tick(client, self)
         if self.care is not None:
             # A crossing with no block left here or ahead is finished.
             self.care_holds_fire(client.state.map.path)
@@ -3573,6 +3581,16 @@ class NavigateTask(BotTask):
                 self._last_action = time.monotonic()
                 return
         if not await self._click_path(client, edge.x, edge.y):
+            route_events.note_edge(client, self, edge)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                detail = f"{edge.source} -> {edge.destination} at={edge.x},{edge.y}"
+                if isinstance(client, AtrinikClient):
+                    # A tick never waits SQLite's usual 10 s for it.
+                    recorder("navigation-click-failed", detail,
+                             save_timeout=route_events.WRITE_TIMEOUT)
+                else:
+                    recorder("navigation-click-failed", detail)
             self._exclude_edge(edge)
             try:
                 self.route = self._plan(client)
@@ -3661,8 +3679,10 @@ class NavigateThenTask(BotTask):
                 self._pack_exit_stall[0] != key):
             self._pack_exit_stall = (key, now)
             return False
-        if now - self._pack_exit_stall[1] < self.PACK_EXIT_BYPASS_SECONDS:
+        held = now - self._pack_exit_stall[1]
+        if held < self.PACK_EXIT_BYPASS_SECONDS:
             return False
+        route_events.note_edge(client, self.navigation, edge)
         self.navigation._exclude_edge(edge)
         self.navigation.route = []
         self.navigation._issued_goal = None
@@ -3675,7 +3695,8 @@ class NavigateThenTask(BotTask):
         if recorder is not None:
             recorder(
                 "navigation-pack-exit-bypass",
-                f"{edge.source} -> {edge.destination} at={edge.x},{edge.y}")
+                f"{edge.source} -> {edge.destination} at={edge.x},{edge.y} "
+                f"held={held:.0f}s")
         return True
 
     async def _abandon_stalled_transit_target(
@@ -4473,6 +4494,9 @@ class NavigateThenTask(BotTask):
         if client.state.phase != "playing":
             return
         self._record_trail(client)
+        # Her trip stays under way while a fight or a recovery hold keeps
+        # its navigation from ticking: what happens meanwhile is the route's.
+        route_events.note_hold(client, self.navigation)
         # Zone containment comes before defensive pursuit. Otherwise a farm
         # can chase one retreating monster across a connected-map seam, then
         # keep fighting there forever before the return route gets a tick.

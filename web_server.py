@@ -32,6 +32,7 @@ from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_far
                          ShopUpgradeSweepTask, WorldGraph)
 from . import route_blocks
 from . import terrain
+from . import route_events
 from .navigation_spots import navigation_spot_catalog
 from .unlocks import gate_counts, unlock_state
 from .operator_assist import (KEY_HEADER, MAX_GOLD_PER_RUN, OperatorAssist,
@@ -335,6 +336,22 @@ class DashboardState:
                 "max_seconds": route_blocks.MAX_BLOCK_SECONDS,
                 "character_loaded": bool(getattr(self.client, "_memory_character", "")),
                 "care_wait_seconds": CARE_WAIT_SECONDS}
+
+    def route_learned(self) -> dict[str, Any]:
+        """Her learned route subjects, read-only (docs/ROUTING.md 4.4, 4.8):
+        the highest provisional costs, their signals and when each falls
+        below half. The planner does not use them yet."""
+        recorder = route_events.recorder(self.client)
+        if recorder is None:
+            return {"character_loaded": False, "subjects": []}
+        try:
+            summary = recorder.learned(self.client)
+        except Exception as error:   # never let the panel break /api/state
+            log.warning("learned route subjects unavailable: %s", error)
+            return {"character_loaded": bool(recorder.character), "subjects": [],
+                    "error": "learned subjects unavailable"}
+        return {"subjects": [], **summary,
+                "weights": route_events.WEIGHTS, "half_lives": route_events.HALF_LIVES}
 
     def care_alerts(self) -> list[dict[str, str]]:
         """A care wait across an owner block past CARE_WAIT_SECONDS, and a
@@ -801,6 +818,8 @@ class DashboardState:
             # Built only for the polls that ask for it (the slow one).
             **({"equipment": self.equipment()}
                if include is None or "equipment" in include else {}),
+            **({"route_learned": self.route_learned()}
+               if include is None or "route_learned" in include else {}),
         }
 
     def equipment(self) -> dict[str, Any]:
