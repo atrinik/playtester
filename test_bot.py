@@ -25212,14 +25212,14 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.care.subjects, ("map:/blocked",))
         self.assertEqual(task.care.missing, ("full HP", "full SP", "a ready recall"))
         self.assertEqual(self.client.actions(), ["essential-care-wait"])
-        self.assertTrue(task.care_hold_fire)
+        self.assertTrue(task.care_holds_fire("/start"))
         self.client.state.stats.update(hp=100, sp=40)
         self.assertFalse(await self.walking(task))
         self.assertEqual(task.care.missing, ("a ready recall",))
         self.client.recall_device_retry_at = {}
         self.assertTrue(await self.walking(task))
         self.assertTrue(task.care.cleared)
-        self.assertTrue(task.care_hold_fire)
+        self.assertTrue(task.care_holds_fire("/start"))
         self.assertEqual(self.client.actions(), ["essential-care-wait", "essential-route-override"])
         self.assertIn("cure trip to /goal crosses map:/blocked (owner-block): full HP and SP",
                       self.client.decision_history[-1]["detail"])
@@ -25386,6 +25386,15 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.destination, "/goal")
         self.assertEqual(self.client.actions()[-1], "essential-care-yield")
 
+    async def rest(self, task, now, seconds, step=5.0):
+        """Tick the care wait every ``step`` seconds for ``seconds``; whether
+        she set off."""
+        for _ in range(int(seconds // step)):
+            now[0] += step
+            if await self.walking(task):
+                return True
+        return False
+
     async def test_hp_held_down_by_a_disease_counts_as_full_after_a_plateau(self):
         from .navigation import CARE_PLATEAU_SECONDS
 
@@ -25397,25 +25406,74 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.walking(task))
         task.care.clock = lambda: now[0]
         task.care.peaks.clear()
+        task.care.checked_at = 0.0
         self.assertFalse(await self.walking(task))
-        now[0] += CARE_PLATEAU_SECONDS - 1
         self.client.state.stats.update(hp=88)  # the disease, not a rise
-        self.assertFalse(await self.walking(task))
+        self.assertFalse(await self.rest(task, now, CARE_PLATEAU_SECONDS - 5))
         self.assertEqual(task.care.missing, ("full HP",))
-        now[0] += 1
-        self.assertTrue(await self.walking(task))
+        self.assertTrue(await self.rest(task, now, 5))
         self.assertIn("no longer rising", self.client.decision_history[-1]["detail"])
-        # A rise restarts the plateau, and it counts only while resting.
+        # A rise restarts the plateau.
         task = self.trip("cure")
         self.assertFalse(await self.walking(task))
         task.care.clock = lambda: now[0]
         task.care.peaks.clear()
+        task.care.checked_at = 0.0
         self.assertFalse(await self.walking(task))
-        now[0] += 30
+        self.assertFalse(await self.rest(task, now, 30))
         self.client.state.stats.update(hp=89)
+        # The rise is seen on the next check, which restarts the minute.
+        self.assertFalse(await self.rest(task, now, CARE_PLATEAU_SECONDS))
+        self.assertTrue(await self.rest(task, now, 5))
+
+    async def test_a_fight_during_the_wait_is_no_plateau(self):
+        from .navigation import CARE_PLATEAU_SECONDS
+
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=98)
+        now = [100.0]
+        task = self.trip("cure")
         self.assertFalse(await self.walking(task))
-        now[0] += CARE_PLATEAU_SECONDS - 1
+        task.care.clock = lambda: now[0]
+        task.care.peaks.clear()
+        task.care.checked_at = 0.0
         self.assertFalse(await self.walking(task))
+        # A cornered fight holds the trip (the defence skips the care check)
+        # for 50 s; she ends it at half health and regenerates.
+        self.client.state.add_message(0, "ffffff", "The rat hit you for 40 damage.")
+        now[0] += 61
+        self.client.state.stats.update(hp=73)
+        self.assertFalse(await self.walking(task))
+        self.assertIn("full HP", task.care.missing)
+        # Contact older than the place rule's 10 s still restarts it.
+        self.client.state.messages[-1] = (time.time() - 30,) + tuple(
+            self.client.state.messages[-1][1:])
+        task.care.peaks["hp"] = (73, now[0] - 120, time.time() - 120)
+        self.assertFalse(await self.walking(task))
+        # Only a new plateau, a minute without a rise, counts as full.
+        self.assertFalse(await self.rest(task, now, CARE_PLATEAU_SECONDS - 5))
+        self.assertTrue(await self.rest(task, now, 5))
+
+    async def test_a_block_never_relaxes_a_hazard_tier_but_soft_retries_come_first(self):
+        tunnel = "/shattered_islands/world_1_1_-1"
+        self.graph = blocks_graph(detour=False)
+        node = MapNode(tunnel, width=10, height=1)
+        node.terrain = {(x, 0): 1 for x in range(10)}
+        self.graph.nodes[tunnel] = node
+        self.graph.nodes["/start"].edges.append(MapEdge("/start", tunnel, 0, 0, 0, 0))
+        node.edges.append(MapEdge(tunnel, "/goal", 9, 0, 0, 0))
+        self.graph.named_spawns[tunnel] = [NamedSpawn(tunnel, 5, 0, "bat", ("bat",))]
+        self.graph.transit_max_aggro_pack = lambda path, radius=8: 3
+        self.assertEqual(self.maps(self.trip()._plan(self.client)), ["/blocked", "/goal"])
+        self.block("/blocked")
+        # The tunnels avoid the block without relaxing a hazard: taken
+        # before any route across the block, with no care.
+        for essential in ("", "cure"):
+            with self.subTest(essential=essential):
+                task = self.trip(essential)
+                self.assertEqual(self.maps(task._plan(self.client)), [tunnel, "/goal"])
+                self.assertIsNone(task.care)
 
     async def test_a_block_never_relaxes_a_hazard_tier(self):
         self.graph = blocks_graph(detour=False)
@@ -25454,17 +25512,35 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.block("/blocked")
         self.client.state.stats.update(hp=10)
         first = self.trip("cure")
+        await first.start(self.client)
         self.assertFalse(await self.walking(first))
+        first.care.since -= 700
+        self.assertFalse(await self.walking(first))
+        self.assertEqual(self.client.actions().count("essential-care-alert"), 1)
+        # A planning probe neither inherits nor records a wait.
+        probe = self.trip("cure")
+        probe._plan(self.client)
+        self.assertNotEqual(probe.care.since, first.care.since)
+        # Autoplay's handover rebuilds the trip: same start, no second alert.
         second = self.trip("cure")
+        second.status = TaskStatus.RUNNING
+        second.route = second._plan(self.client)
+        self.assertEqual((second.care.since, second.care.alerted), (first.care.since, True))
         self.assertFalse(await self.walking(second))
-        self.assertEqual(second.care.since, first.care.since)
+        self.assertEqual(self.client.actions().count("essential-care-alert"), 1)
+        # Another kind of trip across the same block waits on its own.
+        other = self.trip("depletion")
+        other.status = TaskStatus.RUNNING
+        other._plan(self.client)
+        self.assertFalse(other.care.alerted)
+        self.assertNotEqual(other.care.since, first.care.since)
         # Once a crossing clears, the next wait starts afresh.
         self.client.state.stats.update(hp=100)
         self.assertTrue(await self.walking(second))
         third = self.trip("cure")
-        self.client.state.stats.update(hp=10)
-        self.assertFalse(await self.walking(third))
-        self.assertGreater(third.care.since, first.care.since)
+        third.status = TaskStatus.RUNNING
+        third._plan(self.client)
+        self.assertNotEqual(third.care.since, first.care.since)
 
     async def test_a_hungry_food_trip_waits_only_for_a_ready_recall(self):
         self.graph = blocks_graph(detour=False)

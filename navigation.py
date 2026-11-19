@@ -1905,9 +1905,30 @@ CARE_STAGING_RETRY_SECONDS = 120.0
 # Resting at a safe place, HP or SP that has not risen for this long counts
 # as full: a disease or poison may keep it below the maximum.
 CARE_PLATEAU_SECONDS = 60.0
+# A gap this long between two care checks (a fight held the trip, which
+# skips them) forgets the plateau: what happened meanwhile is unknown.
+CARE_PLATEAU_GAP_SECONDS = 5.0
 # A new trip's owner-block wait for the same subjects keeps the start of one
 # left within this long (autoplay's handover rebuilds trips).
 CARE_WAIT_RESUME_SECONDS = 300.0
+
+
+# How far back the care rule looks for hostile contact (seconds).
+CARE_CONTACT_LOOKBACK_SECONDS = 3600.0
+
+
+def _last_hostile_contact_at(client: AtrinikClient) -> float:
+    """When combat text last showed an enemy acting on her (wall clock), as
+    recent_hostile_contact reads it; 0.0 if not within the lookback."""
+    cutoff = time.time() - CARE_CONTACT_LOOKBACK_SECONDS
+    for timestamp, _, _, raw in reversed(getattr(client.state, "messages", ())):
+        if timestamp < cutoff:
+            break
+        text = raw.casefold()
+        if (" hit you" in text or " misses you" in text or
+                text.startswith(("you block ", "you dodge ", "you parry "))):
+            return float(timestamp)
+    return 0.0
 
 
 class OwnerBlockRefusal(Exception):
@@ -1916,8 +1937,9 @@ class OwnerBlockRefusal(Exception):
     turns it into one)."""
 
 
-def _care_waits(client: AtrinikClient) -> dict[tuple[str, ...], tuple[float, float]]:
-    """Owner-block care waits by subjects: (start, last seen), per client."""
+def _care_waits(client: AtrinikClient) -> dict[tuple[str, ...], tuple[float, float, bool]]:
+    """Owner-block care waits by (trip kind, *subjects): (start, last seen,
+    alerted), per client."""
     waits = getattr(client, "_care_waits", None)
     if not isinstance(waits, dict):
         waits = {}
@@ -1944,12 +1966,15 @@ class CareCrossing:
     alerted: bool = False
     holding: bool = False
     missing: tuple[str, ...] = ()
-    # The subjects key of _care_waits, and whether this is a food trip.
+    # The (trip kind, *subjects) key of _care_waits, and whether this is a
+    # food trip.
     key: tuple[str, ...] = ()
     food: bool = False
-    # Per vital ("hp", "sp"): the highest value seen resting and since when.
+    # Per vital ("hp", "sp"): the highest value seen resting, since when
+    # (care clock) and its wall-clock time; and the last care check.
     peaks: dict = field(default_factory=dict)
     plateaued: bool = False
+    checked_at: float = 0.0
 
 
 def care_recall_ready(client: AtrinikClient, *, starving: bool = False) -> bool:
@@ -2220,39 +2245,49 @@ class NavigateTask(BotTask):
         hazards = getattr(client.state, "route_hazards", None) or {}
         return {path for path, until in hazards.items() if until > now}
 
-    def _route_points(self, *args, **kwargs) -> list[MapEdge]:
+    def _route_points(self, *args, unwalled_retry: bool = True,
+                      **kwargs) -> list[MapEdge]:
         """One tier's component route, behind this plan's owner walls.
 
         A block never relaxes a hazard tier: when the tier finds no route
-        behind the walls, the same tier is tried without them. If that
-        succeeds, the block is the only obstacle: an essential trip takes
-        that route and crosses with care (_plan), any other trip is refused
-        with OwnerBlockRefusal, which no tier catches. Only when the tier
-        fails without the walls too does its ValueError reach the tier,
-        which then relaxes as it always did.
+        behind the walls, the same tier is tried without them
+        (_unwalled_route), unless the caller still has soft retries that
+        relax no hazard (``unwalled_retry=False``) and tries without walls
+        itself after them. Only when the tier fails without the walls too
+        does its ValueError reach the tier, which then relaxes as it always
+        did.
         """
-        walls = self._walls
         try:
-            route = self.graph.route_points(*args, walls=walls, **kwargs)
+            route = self.graph.route_points(*args, walls=self._walls, **kwargs)
         except ValueError as blocked:
-            if not walls:
+            if not self._walls or not unwalled_retry:
                 raise
+            return self._unwalled_route(blocked, args, [kwargs])
+        self._crossed = ()
+        return route
+
+    def _unwalled_route(self, blocked: ValueError, args: tuple,
+                        tiers: list[dict]) -> list[MapEdge]:
+        """The first of ``tiers`` routed without the owner walls, or
+        ``blocked``. When one routes, the block is the only obstacle: an
+        essential trip takes it and crosses with care (_plan), any other
+        trip is refused with OwnerBlockRefusal, which no tier catches."""
+        walls = self._walls
+        for kwargs in tiers:
             try:
                 route = self.graph.route_points(*args, **kwargs)
             except ValueError:
-                raise blocked from None
+                continue
             crossed = walls.crossings(route, self.destination)
             if not crossed:
-                raise blocked from None
-            client = self._plan_client
-            if self._care_staging is not None or not self.is_essential(client):
+                continue
+            if self._care_staging is not None or not self.is_essential(self._plan_client):
                 raise OwnerBlockRefusal(
                     f"owner block: every route to {self.destination} crosses "
                     f"{', '.join(crossed)} ({blocked})") from None
             self._crossed = crossed
             return route
-        self._crossed = ()
-        return route
+        raise blocked
 
     def is_essential(self, client: AtrinikClient) -> bool:
         """Whether this trip is essential now (ROUTING 4.5): a cure, the
@@ -2305,32 +2340,32 @@ class NavigateTask(BotTask):
         overrides: after CARE_WAIT_SECONDS she goes anyway). A food trip
         waits only for the recall.
 
-        An owner-block wait for the same subjects that another trip left
-        within CARE_WAIT_RESUME_SECONDS (autoplay's handover rebuilds trips)
-        keeps its start, so its alert is not postponed (``client`` holds
-        that record)."""
+        An owner-block wait of a running trip for the same kind of trip and
+        the same subjects as one another trip left within
+        CARE_WAIT_RESUME_SECONDS (autoplay's handover rebuilds trips) keeps
+        its start and its alert, so the alert is neither postponed nor
+        repeated (``client`` holds that record). A planning probe (a trip
+        not started, such as the temple ranking's) neither reads nor writes
+        it."""
         care = self.care
         if care is None or care.finished:
-            since = clock()
-            key = tuple(sorted(subjects))
-            if mode == CARE_OWNER_BLOCK and client is not None:
+            since, alerted = clock(), False
+            key = (self.essential, *sorted(subjects))
+            if (mode == CARE_OWNER_BLOCK and client is not None and
+                    self.status == TaskStatus.RUNNING):
                 waits = _care_waits(client)
                 previous = waits.get(key)
                 if previous is not None and since - previous[1] <= CARE_WAIT_RESUME_SECONDS:
-                    since = previous[0]
-                waits[key] = (since, clock())
-            care = self.care = CareCrossing(mode, tuple(subjects), since, clock=clock, key=key)
+                    since, alerted = previous[0], previous[2]
+                waits[key] = (since, clock(), alerted)
+            care = self.care = CareCrossing(mode, tuple(subjects), since, clock=clock,
+                                            key=key, alerted=alerted)
         else:
             care.subjects = tuple(dict.fromkeys((*care.subjects, *subjects)))
             if mode == CARE_OWNER_BLOCK:
                 # An owner block never times out, whatever else asked.
                 care.mode = CARE_OWNER_BLOCK
         return care
-
-    @property
-    def care_hold_fire(self) -> bool:
-        """Hold fire in transit for a care crossing, waiting or crossing."""
-        return self.care is not None and not self.care.finished
 
     def _care_ahead(self, map_path: str) -> bool:
         """Whether a blocked subject of the care crossing is where she stands
@@ -2421,15 +2456,19 @@ class NavigateTask(BotTask):
 
     @staticmethod
     def _vital_full(care: "CareCrossing", key: str, value: int, maximum: int,
-                    now: float, resting: bool) -> bool:
-        """At its maximum, or, resting at a safe place, not risen for
-        CARE_PLATEAU_SECONDS: a disease or poison that keeps it below the
-        maximum must not hold her forever (the plateau counts as full)."""
+                    now: float, resting: bool, contact_at: float = 0.0) -> bool:
+        """At its maximum, or, resting at a safe place, not risen above its
+        peak for CARE_PLATEAU_SECONDS: a disease or poison that keeps it
+        below the maximum must not hold her forever (the plateau counts as
+        full). Hostile contact since the peak (``contact_at``, wall clock)
+        starts it afresh: a fight's damage is no plateau, and neither is
+        the regeneration after it."""
         if maximum > 0 and value >= maximum:
             return True
         best = care.peaks.get(key)
-        if not resting or best is None or value > best[0]:
-            care.peaks[key] = (value, now)
+        if (not resting or best is None or value > best[0] or
+                contact_at > best[2]):
+            care.peaks[key] = (value, now, time.time())
             return False
         if now - best[1] >= CARE_PLATEAU_SECONDS:
             care.plateaued = True
@@ -2449,9 +2488,13 @@ class NavigateTask(BotTask):
             hp, maxhp = int(stats.get("hp", 0) or 0), int(stats.get("maxhp", 0) or 0)
             sp, maxsp = int(stats.get("sp", 0) or 0), int(stats.get("maxsp", 0) or 0)
             resting = not place and self._care_staging is None
-            if maxhp <= 0 or not self._vital_full(care, "hp", hp, maxhp, now, resting):
+            if care.checked_at and now - care.checked_at > CARE_PLATEAU_GAP_SECONDS:
+                care.peaks.clear()
+            care.checked_at = now
+            contact = _last_hostile_contact_at(client)
+            if maxhp <= 0 or not self._vital_full(care, "hp", hp, maxhp, now, resting, contact):
                 missing.append("full HP")
-            if maxsp > 0 and not self._vital_full(care, "sp", sp, maxsp, now, resting):
+            if maxsp > 0 and not self._vital_full(care, "sp", sp, maxsp, now, resting, contact):
                 missing.append("full SP")
         if not care_recall_ready(client, starving=care.starving):
             missing.append("a ready recall")
@@ -2528,7 +2571,7 @@ class NavigateTask(BotTask):
             return False
         now = care.clock()
         if care.key in _care_waits(client):
-            _care_waits(client)[care.key] = (care.since, now)
+            _care_waits(client)[care.key] = (care.since, now, care.alerted)
         care.food = self.essential == "food"
         care.starving = care.food and starving_without_food(client)
         if (care.mode == CARE_OWNER_BLOCK and
@@ -2565,6 +2608,8 @@ class NavigateTask(BotTask):
         if (care.mode == CARE_OWNER_BLOCK and not care.alerted and
                 now - care.since >= CARE_WAIT_SECONDS):
             care.alerted = True
+            if care.key in _care_waits(client):
+                _care_waits(client)[care.key] = (care.since, now, True)
             self._record(client, "essential-care-alert",
                          f"{self.essential} trip to {self.destination} waited "
                          f"{now - care.since:.0f} s to cross {', '.join(care.subjects)}; "
@@ -2664,12 +2709,17 @@ class NavigateTask(BotTask):
             "avoided_maps": avoided,
         }
         try:
-            route = self._route_points(*args, **kwargs)
+            route = self._route_points(*args, unwalled_retry=False, **kwargs)
         except ValueError:
             # Components are derived data; retry once with a fresh cache.
             _clear_components(self.graph)
             try:
-                route = self._route_points(*args, **kwargs)
+                try:
+                    route = self._route_points(*args, unwalled_retry=False, **kwargs)
+                except ValueError as walled:
+                    if not self._walls:
+                        raise
+                    route = self._unwalled_route(walled, args, [kwargs])
             except ValueError as exc:
                 raise ValueError(
                     f"no route to {self.destination} avoiding every known "
@@ -2708,14 +2758,14 @@ class NavigateTask(BotTask):
                     "penalized_maps": kwargs["penalized_maps"] | (kwargs["avoided_maps"] - avoided)}
 
         try:
-            route = self._route_points(*args, **kwargs)
+            route = self._route_points(*args, unwalled_retry=False, **kwargs)
         except ValueError:
             # Components are derived acceleration data. A live exceptional
             # start square (closed door, runtime map mutation, occupied seam)
             # must never make a later route permanently unroutable.
             _clear_components(self.graph)
             try:
-                route = self._route_points(*args, **kwargs)
+                route = self._route_points(*args, unwalled_retry=False, **kwargs)
             except ValueError as preferred_exc:
                 # Tiled levels only joined the hazards to keep surface trips
                 # off dense tunnels. A trip that needs them (one inside the
@@ -2724,11 +2774,20 @@ class NavigateTask(BotTask):
                 tiled = {path for path in pack_hazards
                          if self.TILED_LEVEL_MAP.fullmatch(path)}
                 route = None
+                tunnels = relaxed(kwargs["avoided_maps"] - tiled)
                 if tiled:
                     # Only this retry lifts them; later tiers relax other
                     # hazards first and keep avoiding dense tunnels.
                     try:
-                        route = self._route_points(*args, **relaxed(kwargs["avoided_maps"] - tiled))
+                        route = self._route_points(*args, unwalled_retry=False, **tunnels)
+                    except ValueError:
+                        route = None
+                if route is None and self._walls:
+                    # Those retries relax no hazard: only after them is the
+                    # same tier tried without the owner's blocks.
+                    try:
+                        route = self._unwalled_route(
+                            preferred_exc, args, [kwargs] + ([tunnels] if tiled else []))
                     except ValueError:
                         route = None
                 if route is None and overlevel_hazards:

@@ -1449,8 +1449,10 @@ is set. Notes against the text above:
   strict and fallback alike, as `route_points(walls=...)`: a blocked map is
   never entered except as the destination, and a blocked exit or seam is
   never taken. A block never relaxes a hazard tier. When a tier finds no
-  route behind the walls, the same tier is tried without them; if that
-  succeeds, the block is the only obstacle. An essential trip then takes
+  route behind the walls, its retries that relax no hazard (a fresh
+  component cache, and the dense-tunnel retry of `_plan_avoiding`) run
+  behind the walls first; only then is the same tier tried without them.
+  If that succeeds, the block is the only obstacle. An essential trip then takes
   that route with care. Any other trip fails with
   `owner block: every route to ... crosses ...`, which no tier catches, so
   it is never sent through a relaxed hazard instead. Only a tier that fails
@@ -1480,9 +1482,12 @@ is set. Notes against the text above:
   walks to her savebed by a route that crosses no block
   (`essential-care-staging`), whatever else makes the place unsafe; with no
   such walk, or no savebed known, she waits where she stands. Resting at a
-  safe place, HP or SP that has not risen for 60 s counts as full
-  (`CARE_PLATEAU_SECONDS`), so a disease or poison that keeps it below the
-  maximum cannot hold her forever; the override then says so. The wait
+  safe place, HP or SP that has not risen above its peak for 60 s counts as
+  full (`CARE_PLATEAU_SECONDS`), so a disease or poison that keeps it below
+  the maximum cannot hold her forever; the override then says so. Hostile
+  contact since the peak, or a gap of more than 5 s between care checks
+  (a fight holds the trip and skips them), starts the plateau afresh, so a
+  fight's damage and the regeneration after it never count as one. The wait
   pauses no safety: whatever keeps her alive on a trip runs as it does on
   any other, such as healing, eating, the low-health retreat and defence
   (`NavigateThenTask`), the recovery phase's emergency recall, Stop and the
@@ -1502,10 +1507,12 @@ is set. Notes against the text above:
   walk home to wait, while she is hungry: it fails
   (`essential-care-yield`), and the food trip goes first; regenerating to
   full burns food (`player_do_some_living`), so waiting could otherwise
-  starve her. Autoplay's handover can rebuild a trip: a new owner-block
-  wait for the same blocked subjects, within 300 s of the last one's tick,
-  keeps its start (`CARE_WAIT_RESUME_SECONDS`), so the alert is not
-  postponed. A crossing that clears forgets it.
+  starve her. Autoplay's handover can rebuild a trip: a running trip's new
+  owner-block wait, for the same kind of trip and the same blocked
+  subjects, within 300 s of the last one's tick, keeps its start and its
+  alert (`CARE_WAIT_RESUME_SECONDS`), so the alert is neither postponed nor
+  repeated. A crossing that clears forgets it; planning probes, such as
+  the temple ranking's, neither read nor write it.
 - **Food trips.** A food trip, hungry or starving (owner decisions of
   2026-11-15 and 2026-11-18), needs only a ready recall, without the safe
   place or a walk home, and holds fire. While she is starving
