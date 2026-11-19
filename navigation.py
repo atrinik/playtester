@@ -3573,8 +3573,11 @@ class NavigateTask(BotTask):
         a new plan. A page that is not the authored one, a voyage that does
         not leave, or one that lands elsewhere is refused for her, so plans
         leave it out until her unlock state changes or a day passes. An NPC
-        that does not answer (it wandered, a fight) only excludes the edge
-        for a while, like a held exit.
+        that does not answer (it wandered, a fight), and a walk beside it
+        that finds no square or has not moved her for
+        VOYAGE_APPROACH_STALL_SECONDS (a gap of more than 5 s between ticks
+        starts that afresh), only exclude the edge for a while, like a held
+        exit.
         """
         offer = dialogue_edges.dialogue_offer(client, self.graph)
         voyage = offer.voyage(edge) if offer is not None else None

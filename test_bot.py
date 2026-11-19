@@ -28047,6 +28047,10 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
         # Another NPC's interface is not hers to use.
         self.assertEqual(self.compile(VOYAGE_XML.replace("<interface>",
                                                          '<interface npc="Sam">')), [])
+        # A named interface in a non-quest file runs only if its name is
+        # the file's stem: the server loads ferry.py for ferry.xml.
+        self.assertEqual(len(self.compile(VOYAGE_XML.replace(
+            "<interface>", '<interface npc="Ferry">'))), 1)
         savebed, = self.compile(VOYAGE_XML.replace("/isle 1 0", "/isle 1 0 savebed"))
         self.assertEqual(savebed.side_effects, frozenset({"savebed"}))
 
@@ -28070,7 +28074,9 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(unlocks.UnlockState(quests_loaded=True).met(voyage.requires))
 
     def test_dispatch_the_compiler_does_not_model_is_unknown(self):
-        other = ('<interface npc="Ferryman" state="x"><and><check region_map="x"/>'
+        # Another interface of the module the server runs for ferry.xml
+        # (its stem): unnamed, or named after the stem.
+        other = ('<interface state="x"><and><check region_map="x"/>'
                  '</and><dialog name="hello"><message>Hi.</message></dialog></interface>')
         for old, new, reason in (
                 ("<interface>", '<interface><precond>return True</precond>', "more than dialogues"),
@@ -28081,19 +28087,36 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
                  '<dialog name="sail">', "two dialogues with one name"),
                 ("<interfaces>", "<interfaces>" + other, "picks its dialogue by condition"),
                 ("<interfaces>", "<interfaces>" + other.replace("<and>", "<or>").replace(
-                    "</and>", "</or>"), "picks its dialogue by condition")):
+                    "</and>", "</or>"), "picks its dialogue by condition"),
+                ("<interfaces>", "<interfaces>" + other.replace(
+                    "<interface ", '<interface npc="Ferry" '), "picks its dialogue by condition"),
+                ("<interfaces>", "<interfaces>" + other.replace(
+                    '<and><check region_map="x"/></and>', "<code>Builder = None</code>"),
+                 "module code beyond method definitions"),
+                ("<interfaces>", '<interfaces><interface><dialog name="hello">'
+                 "<message>Hi.</message></dialog></interface>",
+                 "two interfaces compile to one dialogue class"),
+                ('<dialog name="sail">', '<dialog name="Sail"><message>Up.</message></dialog>'
+                 '<dialog name="sail">', "two dialogues with one name"),
+                ('destination="sail"', 'destination="Sail"', "cannot reach")):
             with self.subTest(reason=reason, new=new[:40]):
-                voyages = self.compile(VOYAGE_XML.replace(old, new))
+                text = VOYAGE_XML.replace(old, new)
+                if reason == "cannot reach":
+                    text = text.replace('<dialog name="sail">', '<dialog name="Sail">')
+                voyages = self.compile(text)
                 voyage = next(item for item in voyages if item.destination == "/isle")
                 reasons = [atom.reason for atom in voyage.requires.atoms
                            if isinstance(atom, req.Unknown)]
                 self.assertTrue(any(reason in text for text in reasons), reasons)
-        # A condition inside another interface's dialogue, or another NPC's
-        # interface, picks nothing for this one.
+        # A condition inside another interface's dialogue, another module's
+        # interface (one the server never runs for ferry.xml), or code that
+        # only defines its class's methods picks nothing for this one.
         for extra in (other.replace("<and><check region_map=\"x\"/></and>", "").replace(
                           "<message>Hi.</message>",
                           '<message>Hi.</message><and><check region_map="x"/></and>'),
-                      other.replace('npc="Ferryman"', 'npc="Sam"')):
+                      other.replace("<interface ", '<interface npc="Sam" '),
+                      other.replace('<and><check region_map="x"/></and>',
+                                    "<code>def dialog_hello(self):\n    pass</code>")):
             with self.subTest(extra=extra[:60]):
                 voyage, = [item for item in self.compile(VOYAGE_XML.replace(
                     "<interfaces>", "<interfaces>" + extra)) if item.destination == "/isle"]
@@ -28113,6 +28136,22 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
         fallback, = self.compile(text.replace("<interface>", '<interface npc="Ferryman">'),
                                  name="quest.xml", quests=quests)
         self.assertIn("default dialogue", next(iter(fallback.requires.atoms)).reason)
+        # The server runs one module per NPC name, normalised: "Ferryman."
+        # shares it, and its condition makes the voyage Unknown; so does a
+        # second interface compiling to the same class.
+        for extra in ('<interface npc="Ferryman."><and><check region_map="x"/></and>'
+                      '<dialog name="hello"><message>Hi.</message></dialog></interface>',
+                      '<interface npc="Ferryman" state="completed"><dialog name="hello">'
+                      "<message>Hi.</message></dialog></interface>"):
+            with self.subTest(extra=extra[:40]):
+                voyages = self.compile(text.replace(
+                    "<interface>", '<interface npc="Ferryman" state="completed">').replace(
+                    "<interfaces>", "<interfaces>" + extra), name="quest.xml", quests=quests)
+                voyage, = [item for item in voyages if item.pages]
+                self.assertTrue(any(isinstance(atom, req.Unknown)
+                                    for atom in voyage.requires.atoms), voyage.requires)
+        self.assertEqual(self.dialogue_edges.server_module(Path("quest.xml"), "Sam Goodberry."),
+                         "sam_goodberry")
 
     def test_quest_atoms_read_her_journal_and_fail_closed_before_it_loads(self):
         part = req.requires(req.Quest("Portal of Llwyfen", "A Strange Portal", "portal_found"))
@@ -28262,6 +28301,43 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("stalled", self.client.decision_history[-1]["detail"])
         self.assertEqual(task.status, TaskStatus.FAILED)
         self.assertIn(("/dock", "/isle", 5, 1), task._edge_exclusions)
+
+    async def test_a_gap_between_ticks_restarts_the_approach_timer(self):
+        task = NavigateTask(self.graph, "/isle")
+
+        async def stuck(client, x, y):
+            return True
+
+        task._click_path = stuck
+        now = [1000.0]
+        from . import navigation
+        with patch.object(navigation, "time",
+                          types.SimpleNamespace(monotonic=lambda: now[0], time=time.time)):
+            await task.tick(self.client)
+            for step in (4.5, 4.5, 6.0, 4.5, 4.5, 4.5, 4.5):
+                now[0] += step
+                await task.tick(self.client)
+            # 31.5 s on one square, but the 6 s gap restarted the timer.
+            self.assertNotIn("navigation-voyage-failed", self.client.actions())
+            now[0] += 4.5
+            await task.tick(self.client)
+        self.assertIn("navigation-voyage-failed", self.client.actions())
+
+    def test_route_death_reach_follows_the_offer(self):
+        from . import navigation
+        navigation._reach_cache.clear()
+        navigation._reach_search_after[0] = 0.0
+        self.addCleanup(navigation._reach_cache.clear)
+        component = self.graph._component("/dock", (1, 1), allow_locked=frozenset())
+        origin = ("/dock", (1, 1), min(component), None)
+        reach = lambda client: navigation._reachable_from(
+            client, self.graph, origin, frozenset(), frozenset(), True)
+        with patch.object(navigation, "ROUTE_DEATH_SEARCH_INTERVAL_SECONDS", 0.0):
+            self.assertEqual(reach(VoyageClient(enabled=False)), frozenset({"/dock"}))
+            self.assertEqual(reach(self.client), frozenset({"/dock", "/isle"}))
+            # Cached apart: the flag-off verdict is still the static one.
+            self.assertEqual(reach(VoyageClient(enabled=False)), frozenset({"/dock"}))
+        self.assertEqual(len(navigation._reach_cache), 2)
 
     def test_a_closed_quest_gate_sends_the_plan_the_long_way(self):
         graph = voyage_graph()

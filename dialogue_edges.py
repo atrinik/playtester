@@ -279,11 +279,46 @@ def _teleport(dialog: ET.Element, unknown: list[str]
     return posixpath.normpath(path), int(x), int(y), bool(savebed)
 
 
+def server_module(xml_path: Path, npc: str) -> str:
+    """The interface module the server runs for an NPC named ``npc``.
+
+    As plugin_python.c does: for a file ending in ``quest.xml``, the NPC's
+    name with spaces as ``_`` and only ASCII letters, digits and ``_`` kept,
+    lowercased; for any other file, the file's stem.
+    """
+    if not xml_path.name.endswith("quest.xml"):
+        return xml_path.stem
+    return "".join("_" if char == " " else char.lower() for char in npc
+                   if char in " _" or (char.isascii() and char.isalnum()))
+
+
+def compiled_module(xml_path: Path, interface: ET.Element) -> str:
+    """The module the interface compiler writes an interface into: its
+    ``npc_id`` verbatim, its normalised ``npc``, or the file's stem."""
+    if interface.get("npc_id"):
+        return interface.get("npc_id") or ""
+    if interface.get("npc"):
+        return re.sub(r"\W+", "", (interface.get("npc") or "").lower().replace(" ", "_"))
+    return xml_path.stem
+
+
+def _defines_only(code: str) -> bool:
+    """Whether interface-level ``<code>`` only defines methods of its own
+    class, so running the module rebinds nothing else."""
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return False
+    return all(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+               for node in tree.body)
+
+
 def compile_voyages(xml_path: Path, npc: str,
                     quests: Mapping[str, QuestInfo]) -> list[VoyageSpec]:
     """The voyages one NPC named ``npc`` offers through one interface file.
 
-    Interfaces for another NPC (``npc=``) are skipped. Each dialogue with a
+    Only the interfaces of the module the server runs for this NPC count
+    (server_module, compiled_module). Each dialogue with a
     teleport, reached from ``hello`` by response links, is one voyage; its
     pages are the dialogues on that path. The interface's ``state`` becomes
     a ``Quest`` atom when it is ``completed`` on the quest itself; any other
@@ -298,14 +333,27 @@ def compile_voyages(xml_path: Path, npc: str,
     in_quest_file = any(element.tag == "quest" for element in root.iter())
     voyages: list[VoyageSpec] = []
 
-    def hers(interface: ET.Element) -> bool:
-        named = interface.get("npc")
-        if interface.get("npc_id") or (
-                named and named.casefold() != npc.casefold()):
-            return False
-        return bool(named) or not in_quest_file
+    module = server_module(xml_path, npc)
+    mine = [interface for interface in root.iter("interface")
+            if compiled_module(xml_path, interface) == module]
 
-    mine = [interface for interface in root.iter("interface") if hers(interface)]
+    def class_uid(interface: ET.Element) -> str:
+        state = interface.get("state") or ""
+        parent = parents.get(interface)
+        if not state:
+            return ""
+        return f"_{state}" + (f"_{parent.get('uid', '')}"
+                              if parent is not None and parent.tag == "part" else "")
+
+    uids = [class_uid(interface) for interface in mine]
+    # Module-level effects the compiler does not model: interface-level
+    # <code> that does more than define its class's methods runs when the
+    # module loads and can rebind any class. Code inside a dialogue runs
+    # only when that dialogue is called, which a voyage never does off its
+    # own path (and on its path it is Unknown already).
+    module_code = any(
+        not _defines_only(child.text or "")
+        for interface in mine for child in interface if child.tag == "code")
     for interface in mine:
         base: list[req.Atom] = []
         # The server's dispatch (InterfaceBuilder.finish) tries regex
@@ -317,12 +365,17 @@ def compile_voyages(xml_path: Path, npc: str,
         # dispatch for this NPC in the file, are modelled.
         if any(child.tag != "dialog" for child in interface):
             base.append(req.Unknown("an interface with more than dialogues"))
-        names = [dialog.get("name") or "" for dialog in interface.findall("dialog")]
+        names = [(dialog.get("name") or "").casefold()
+                 for dialog in interface.findall("dialog")]
         if any(dialog.get("regex") is not None
                for dialog in interface.findall("dialog")):
             base.append(req.Unknown("a regex dialogue"))
         if len(names) != len(set(names)):
             base.append(req.Unknown("two dialogues with one name"))
+        if uids.count(class_uid(interface)) > 1:
+            base.append(req.Unknown("two interfaces compile to one dialogue class"))
+        if module_code:
+            base.append(req.Unknown("module code beyond method definitions"))
         if any(child.tag in ("and", "or")
                for other in mine if other is not interface for child in other):
             base.append(req.Unknown("another of the NPC's interfaces picks "
@@ -373,6 +426,10 @@ def compile_voyages(xml_path: Path, npc: str,
                 pages.append(page)
             if set(dialogs[name].attrib) - {"name"}:
                 unknown.append("a dialogue with a title, regex or inherit")
+            if any(step != step.lower() for step in path):
+                # The server looks a dialogue up by the lowercased link
+                # text, so a capitalised name is never reached.
+                unknown.append("a dialogue name the server cannot reach")
             if not pages:
                 # A teleport straight from hello: no page to check first.
                 unknown.append("the teleport runs on hello")

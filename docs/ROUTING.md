@@ -1596,8 +1596,22 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   (whose matchers run before the named dialogue), two dialogues with one
   name, or another interface for the same NPC in the file with a direct
   `<and>` or `<or>`, which compiles to the module's `preconds()` and can
-  pick another dialogue class. `<precond>` and `<code>` in another
-  interface belong to that interface's own class and do not count. No voyage charges a fare, and a fare could
+  pick another dialogue class. Two interfaces that compile to one dialogue
+  class, two dialogues whose names differ only in case, and a path through
+  a capitalised dialogue name (the server looks dialogues up by the
+  lowercased link text) are `Unknown` too. Interfaces count by the module
+  the server runs, as `plugin_python.c` picks it: for a `quest.xml`, the
+  NPC's name normalised (spaces to `_`, only ASCII letters, digits and `_`,
+  lowercased), so `npc="Sam Goodberry."` shares Sam's module; for any other
+  file, its stem, so a named interface there that is not the stem is never
+  run and compiles to nothing. Interface-level `<code>` in the module that
+  does more than define methods of its class runs when the module loads
+  and makes its voyages `Unknown`. A residual is accepted:
+  `<precond>` and method-defining `<code>` in another interface run only
+  when the server picks that interface's class, and dialogue-level code
+  off the voyage's path only when that dialogue is called. Failing those
+  closed would also close the Incuna Sam voyage, whose module defines a
+  `dialog_hello` for Lost Memories' `speak_sam` part. No voyage charges a fare, and a fare could
   only be taken by those elements, so there is no wallet check to make.
 - **Interface state.** `state="completed"` on a quest's own interface is a
   `Quest(quest)` atom. Any other state, and a quest file's stateless
