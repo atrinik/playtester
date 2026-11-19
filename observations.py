@@ -81,12 +81,16 @@ WHO_TOTAL = re.compile(r"^There (?:is|are) \d+ players? online\.$")
 NAME_LINK = re.compile(r"\[a=#charname\]([^\[]+)\[/a\]")
 MARKUP = re.compile(r"\[/?[a-z]+(?:=[^\]]*)?\]", re.I)
 
-# Server lines that are facts about her square even without a source
-# (spell_util.c, spell_effect.c: a no-magic square). Later parsers add
-# kinds; until then these are the only unattributed lines kept.
+# Server lines that are facts about her square or map even without a
+# source (spell_util.c, spell_effect.c: a no-magic square, a no-magic map,
+# a no-harm square or map). The tile facts that tasks.spell_blocked_here
+# derives from them cite these rows (facts.py); they are the only
+# unattributed lines kept.
 FACT_LINES = frozenset({
     "something blocks your spellcasting.",
     "something blocks your spell.",
+    "powerful countermagic cancels all spellcasting here!",
+    "powerful countermagic cancels all harmful magic here!",
 })
 
 # Examine output after "That is ..." (types/player.c examine), as forms;

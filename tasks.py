@@ -445,6 +445,11 @@ SPELL_BLOCK_ATTRIBUTION_SECONDS = 10.0
 # remembered as blocked, not just the square.
 MAP_NOMAGIC_MESSAGE = re.compile(
     r"^Powerful countermagic cancels all spellcasting here!", re.I)
+# A harmful spell cast where harm is forbidden (cast_spell, MAP_NOHARM or
+# the square's no-harm flag; the message does not say which). It blocks only
+# harmful spells, so it marks nothing: it is kept as a tile fact only.
+NO_HARM_MESSAGE = re.compile(
+    r"^Powerful countermagic cancels all harmful magic here!", re.I)
 # A Word of Recall that really started: cast_wor (server/spell_effect.c)
 # answers with this as it inserts the delayed recall force. Without it no
 # recall is coming. The server drops a fire without a word while the
@@ -491,6 +496,11 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
     when the cast is sent), so a step taken before the answer arrives does
     not mark the wrong square; without a recorded cast, to where she stands.
     The memory lives on the client, so every safety policy shares it.
+
+    Each refusal is also offered to ``client.note_tile_refusal``, which
+    keeps it as a persistent tile fact when it certainly belongs to her
+    cast (facts.py). Remembered facts never decide here: they only reorder
+    healing (``SafetyPolicy._known_heal``).
     """
     blocked = getattr(client, "spell_blocked_squares", None)
     if blocked is None:
@@ -510,19 +520,29 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
         mark = offset if mark is None else int(mark)
         cast = getattr(client, "spell_cast", None)
         fresh = time.time() - SPELL_BLOCK_ATTRIBUTION_SECONDS
+        note_tile_refusal = getattr(client, "note_tile_refusal", None)
         for position in range(max(mark, offset), count):
             entry = messages[position - offset]
             text = str(entry[-1]).strip()
             whole_map = bool(MAP_NOMAGIC_MESSAGE.match(text))
+            no_harm = bool(NO_HARM_MESSAGE.match(text))
             if not (float(entry[0]) >= fresh and
                     self_improvement.from_server(entry) and
-                    (whole_map or SPELL_BLOCKED_MESSAGE.match(text))):
+                    (whole_map or no_harm or SPELL_BLOCKED_MESSAGE.match(text))):
                 continue
             # Only a recent cast explains the answer; otherwise it is
             # some other use, on the square she stands on.
-            where = (cast[0] if cast is not None and cast[1] <= position and
-                     float(entry[0]) - float(cast[2]) <=
-                     SPELL_BLOCK_ATTRIBUTION_SECONDS else square)
+            attributed = (cast is not None and cast[1] <= position and
+                          float(entry[0]) - float(cast[2]) <=
+                          SPELL_BLOCK_ATTRIBUTION_SECONDS)
+            if note_tile_refusal is not None:
+                # The same signal, kept as a persistent fact when certain.
+                note_tile_refusal(position, "no_harm" if no_harm else "no_magic",
+                                  whole_map, text, attributed)
+            if no_harm:
+                # It blocks only harmful spells: it marks nothing here.
+                continue
+            where = cast[0] if attributed else square
             if not where[0]:
                 continue
             if whole_map:
@@ -630,10 +650,19 @@ class SafetyPolicy:
         (recall_waiting).
         """
         items = client.state.inventory
-        if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items) and (
-                recall_waiting(client) or spell_blocked_here(client)):
-            items = [item for item in items
+        if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items):
+            other = [item for item in items
                      if item.item_type not in MAGIC_BLOCKED_TYPES]
+            if recall_waiting(client) or spell_blocked_here(client):
+                items = other
+            else:
+                # A remembered no-magic square (persist_tile_facts) only puts
+                # another heal first; without one she casts, which tests it.
+                prefer = getattr(client, "tile_fact_prefers_other_heal", None)
+                if callable(prefer) and prefer(_square(client)) is True:
+                    found = self._find(other, self.healing_patterns)
+                    if found is not None:
+                        return found
         return self._find(items, self.healing_patterns)
 
     def _usable_heal(self, client: AtrinikClient) -> Item | None:

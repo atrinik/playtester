@@ -25,9 +25,10 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameSta
 from .alerts import ProgressWatch
 from .memory import BotMemory
 from .metrics import BotMetrics
-from .observations import AuthoredContent, Observation, ObservationRecorder
+from . import facts as fact_parsers
+from .observations import AuthoredContent, Observation, ObservationRecorder, text_hash
 from . import post_mortem
-from .self_improvement import PLAYER_CHANNELS
+from .self_improvement import PLAYER_CHANNELS, from_server
 from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
 from .transport import QuicStream
@@ -172,6 +173,10 @@ class ClientConfig:
     runtime_state_path: str = ""
     chat_rules_path: str = ""
     runtime_content_path: str = ""
+    # docs/LEARNING_AND_FEEDBACK.md 4.11.1: whether a persistent no-magic
+    # tile fact puts a non-magical heal first on its square. Off (the
+    # default) they are only written and shown.
+    persist_tile_facts: bool = False
 
 
 # kill_player (server types/player.c) sends exactly one of these, as the whole
@@ -179,6 +184,24 @@ class ClientConfig:
 # Matching the whole text keeps a player's chat that quotes one from passing
 # for a death.
 DEATH_NOTICES = ("you have been defeated in combat!", "you have died.")
+
+# Tile facts (facts.py): positions of recent refusal lines remembered, the
+# least time between writes of the same fact, and the wait after a failed
+# write.
+TILE_REFUSAL_SQUARES = 64
+TILE_FACT_REFRESH_SECONDS = 3600.0
+TILE_FACT_RETRY_SECONDS = 60.0
+
+
+def _locked_content_inputs() -> str:
+    """``content:<revision>`` of the locked content, or "" without the lock."""
+    try:
+        from .compatibility import load_lock
+        revision = load_lock()["inputs"]["content"]["revision"]
+        return f"content:{revision}" if isinstance(revision, str) and revision else ""
+    except Exception:
+        return ""
+
 
 def _after(records: list, mark: Any) -> list:
     """The records after ``mark``: found by identity, or by value in a
@@ -304,6 +327,31 @@ class AtrinikClient:
         self.authored_content: AuthoredContent | None = None
         self.observations = ObservationRecorder(
             lambda: self.authored_content, self._observation_dropped)
+        # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
+        # a whole map, loaded with her memory: each property and when it was
+        # last confirmed (wall time).
+        self.tile_facts: dict[tuple[str, int, int], dict[str, float]] = {}
+        # The content revision tile facts are recorded under; a fact from
+        # another revision is ignored.
+        self.content_inputs = _locked_content_inputs()
+        # When each tile fact was last written in this process: a repeat
+        # within TILE_FACT_REFRESH_SECONDS costs no write.
+        self._tile_facts_noted: dict[tuple[tuple[str, int, int], str], float] = {}
+        # After a failed write, no tile-fact write before this (monotonic).
+        self._tile_fact_retry_at = 0.0
+        # Decisions a tile fact already recorded in this process.
+        self._tile_fact_decisions: set[tuple[tuple[str, int, int], str]] = set()
+        # Where she stood when each recent tile refusal line arrived, by
+        # message position.
+        self._tile_refusal_squares: dict[int, tuple[str, int, int]] = {}
+        # When she last sent a step, and when a map update last moved her
+        # (monotonic): a cast between the two may be on either square.
+        self._step_sent_at = 0.0
+        self._position_at = 0.0
+        self._position: tuple[str, int, int] | None = None
+        # Whether the square recorded with the last cast (spell_cast) is
+        # uncertain that way.
+        self._spell_cast_uncertain = False
 
     def load_character_memory(self, character: str) -> None:
         # Switching characters on a long-lived client: the previous one's
@@ -338,6 +386,7 @@ class AtrinikClient:
         self.decision_history = [
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
+        self._load_tile_facts(character)
         # The life boundary in this (possibly reloaded) ledger: the previous
         # report's mark, found by value, or, in a fresh process with no mark,
         # the restored ledger's last death.
@@ -561,6 +610,146 @@ class AtrinikClient:
             self._memory_store().save(
                 character, "state",
                 self._runtime_memory.get(character, {}))
+
+    def _load_tile_facts(self, character: str) -> None:
+        """Her confirmed, unexpired tile facts of this content revision."""
+        self.tile_facts = {}
+        self._tile_facts_noted.clear()
+        self._tile_fact_decisions.clear()
+        if not character:
+            return
+        try:
+            rows = self._memory_store().tile_facts(
+                character, now=time.time(), inputs=self.content_inputs)
+        except Exception as error:  # Never fails a login.
+            log.warning("tile facts not loaded: %s", error)
+            return
+        for subject, value, at in rows:
+            square = fact_parsers.parse_tile_subject(subject)
+            if square is not None:
+                self.tile_facts.setdefault(square, {})[value] = at
+
+    def _note_tile_refusal_line(self, text: str) -> None:
+        """Where she stands as a tile refusal arrives (note_tile_refusal)."""
+        if (not from_server(self.state.messages[-1]) or
+                fact_parsers.tile_property(text) is None):
+            return
+        m = self.state.map
+        self._tile_refusal_squares[self.state.message_count - 1] = (
+            m.path, m.world_x, m.world_y)
+        while len(self._tile_refusal_squares) > TILE_REFUSAL_SQUARES:
+            del self._tile_refusal_squares[next(iter(self._tile_refusal_squares))]
+
+    def note_tile_refusal(self, position: int, value: str, whole_map: bool,
+                          text: str, attributed: bool) -> None:
+        """A tile refusal ``tasks.spell_blocked_here`` read at message
+        ``position``; ``attributed`` when her recent cast explains it.
+
+        Kept as a fact only when it certainly belongs to the cast: for a
+        whole map, she was on the cast's map when the line arrived; for a
+        square, she still stood on the square she cast from. Otherwise
+        (a potion drunk after an exit, say) nothing is kept.
+        """
+        cast = self.spell_cast
+        arrival = self._tile_refusal_squares.get(position)
+        if not attributed or cast is None or arrival is None or self._spell_cast_uncertain:
+            return
+        if whole_map:
+            if cast[0][0] != arrival[0]:
+                return
+            where = (arrival[0], -1, -1)
+        elif cast[0] != arrival:
+            return
+        else:
+            where = arrival
+        self.note_tile_fact(where, value, text)
+
+    def note_tile_fact(self, square: tuple[str, int, int], value: str,
+                       text: str) -> None:
+        """Keep a fixed server refusal at ``square`` (x = y = -1: the whole
+        map) as a confirmed tile fact (facts.py) for TILE_FACT_SECONDS under
+        this content revision; never fails or holds up play.
+
+        The fact cites the stored observation of the same line, if any. A
+        repeat is written at most once in TILE_FACT_REFRESH_SECONDS, and a
+        failed write waits TILE_FACT_RETRY_SECONDS before the next.
+        """
+        if not square[0]:
+            return
+        now = time.time()
+        self.tile_facts.setdefault(square, {})[value] = now
+        character = getattr(self, "_memory_character", "")
+        if not character or character != self.state.player_name:
+            return
+        written = self._tile_facts_noted.get((square, value))
+        if ((written is not None and now - written < TILE_FACT_REFRESH_SECONDS) or
+                time.monotonic() < self._tile_fact_retry_at):
+            return
+        fact = fact_parsers.tile_fact(*square, value, text)
+        try:
+            memory = self._memory_store()
+            observation = memory.observation_id(
+                character, f"system:{square[0]}", text_hash(text))
+            _, created = memory.record_fact(
+                character, fact.row(at=now, observation_id=observation,
+                                    inputs=self.content_inputs,
+                                    expires_at=now + fact_parsers.TILE_FACT_SECONDS))
+        except Exception as error:
+            log.warning("tile fact not kept: %s", error)
+            self._tile_fact_retry_at = time.monotonic() + TILE_FACT_RETRY_SECONDS
+            return
+        self._tile_facts_noted[(square, value)] = now
+        if created and self.metrics is not None:
+            self.metrics.fact(fact.kind, fact.status)
+
+    def _tile_decision(self, where: tuple[str, int, int], action: str, *,
+                       once: bool = True) -> None:
+        """Record a tile-fact decision; never fails or waits long."""
+        if once:
+            if (where, action) in self._tile_fact_decisions:
+                return
+            self._tile_fact_decisions.add((where, action))
+        try:
+            self.record_action(action, f"{where[0]} (whole map)" if where[1:] == (-1, -1)
+                               else f"{where[0]} ({where[1]},{where[2]})",
+                               save_timeout=fact_parsers.TILE_DECISION_SAVE_SECONDS)
+        except Exception as error:
+            log.warning("tile fact decision not recorded: %s", error)
+
+    def _remembered_no_magic(self, square: tuple[str, int, int]
+                             ) -> tuple[str, int, int] | None:
+        """The square or map whose unexpired no-magic fact covers ``square``."""
+        now = time.time()
+        for key in (square, (square[0], -1, -1)):
+            at = self.tile_facts.get(key, {}).get("no_magic")
+            if at is not None and now - at < fact_parsers.TILE_FACT_SECONDS:
+                return key
+        return None
+
+    def tile_fact_prefers_other_heal(self, square: tuple[str, int, int]) -> bool:
+        """Whether a remembered no-magic fact should put a non-magical heal
+        first on ``square`` (``SafetyPolicy._known_heal``). It only reorders:
+        with no other heal she still casts. Off (``persist_tile_facts``
+        unset), never; it records once that she would have preferred another
+        heal here."""
+        where = self._remembered_no_magic(square) if square[0] else None
+        if where is None:
+            return False
+        if not self.config.persist_tile_facts:
+            self._tile_decision(where, "tile-fact-no-magic-shadow")
+            return False
+        self._tile_decision(where, "tile-fact-no-magic")
+        return True
+
+    def _parse_facts(self, observation: Observation) -> list[fact_parsers.Fact]:
+        """The facts a kept observation states (facts.py); never fails play."""
+        content = self.authored_content
+        try:
+            return fact_parsers.parse(observation.row(),
+                                      content.names if content is not None else None)
+        except Exception:
+            log.exception("fact parsers failed")
+            return []
 
     def _memory_store(self) -> BotMemory:
         if self.memory is None:
@@ -935,8 +1124,12 @@ class AtrinikClient:
             "last_bank_deposit_at"] = self.state.last_bank_deposit_at
         self._persist_character_memory()
 
-    def record_action(self, action: str, detail: str = "") -> None:
-        """Keep a bounded, map-aware history of orders sent by automation."""
+    def record_action(self, action: str, detail: str = "", *,
+                      save_timeout: float | None = None) -> None:
+        """Keep a bounded, map-aware history of orders sent by automation.
+
+        With ``save_timeout``, saving the ledger waits at most that long and
+        a failed save is logged, not raised."""
         if self.metrics is not None:
             self.metrics.action(action, detail)
         m = self.state.map
@@ -978,7 +1171,13 @@ class AtrinikClient:
             # loaded yet. Saving the new process's short pre-login list under
             # that key would overwrite the existing SQLite decision ledger.
             character = self.state.player_name
-            if character:
+            if character and save_timeout is not None:
+                try:
+                    self._memory_store().save(character, "decisions",
+                                              self.decision_history, timeout=save_timeout)
+                except sqlite3.Error as error:
+                    log.warning("decision not saved: %s", error)
+            elif character:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
@@ -1492,6 +1691,7 @@ class AtrinikClient:
         msg_type, color = cur.u8(), cur.cstring()
         text = cur.cstring() if cur.remaining else ""
         self.state.add_message(msg_type, color, text)
+        self._note_tile_refusal_line(text)
         # Only what a review reads (time, type, text), bounded in size as well
         # as count: a report's own text length of each line, and no other
         # server field (a frame can be megabytes).
@@ -1747,8 +1947,13 @@ class AtrinikClient:
         for observation in observations:
             if not isinstance(observation, Observation):
                 continue
+            # Parsed before the write, so the facts share its transaction; a
+            # repeat the same parser set read stores none again.
+            found = self._parse_facts(observation)
             try:
-                self._memory_store().record_observation(character, observation.row())
+                _, stored = self._memory_store().record_observation_facts(
+                    character, observation.row(),
+                    [fact.row(at=observation.at) for fact in found], fact_parsers.VERSION)
             except sqlite3.Error as error:
                 log.warning("observation not kept: %s", error)
                 continue
@@ -1757,6 +1962,10 @@ class AtrinikClient:
                 continue
             if self.metrics is not None:
                 self.metrics.observation(observation.source_kind)
+                # Facts come only from what was kept: the row is their source.
+                for fact, (_, created) in zip(found, stored):
+                    if created:
+                        self.metrics.fact(fact.kind, fact.status)
 
     def _observation_dropped(self, reason: str) -> None:
         if getattr(self, "metrics", None) is not None:
@@ -2421,6 +2630,7 @@ class AtrinikClient:
             if marker:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
+        self._note_position(m)
         self._observe_map_change(old_path, m)
         self._observe(lambda recorder: recorder.note_position(self.state))
         # Movement arrives in map packets, between stats packets and polls.
@@ -2513,12 +2723,14 @@ class AtrinikClient:
             raise ValueError("direction must be 0..8")
         self.record_action("retreat" if run else "step",
                            f"direction={direction}")
+        self._step_sent_at = time.monotonic()
         self._observe(lambda recorder: recorder.note_move(self.state, direction))
         # Epoch zero keeps ordinary direct actions outside keyboard replacement.
         await self.send(Packet(c.S_MOVE).u8(direction).u8(int(run)).u32(0))
 
     async def move_to_view(self, x: int, y: int) -> None:
         self.record_action("pathfind", f"view={x},{y}")
+        self._step_sent_at = time.monotonic()
         await self.send(Packet(c.S_MOVE_PATH).u8(x).u8(y))
 
     async def clear_actions(self) -> None:
@@ -2550,6 +2762,13 @@ class AtrinikClient:
                            f"{'on' if enabled else 'off'}{' forced' if force else ''}")
         await self.send(Packet(c.S_COMBAT).u8(int(enabled)).u8(int(force)))
 
+    def _note_position(self, m: MapState) -> None:
+        """When a map update last moved her (``_spell_cast_uncertain``); map
+        packets also come when only monsters move, which is no move."""
+        position = (m.path, m.world_x, m.world_y)
+        if position != self._position:
+            self._position, self._position_at = position, time.monotonic()
+
     def _note_spell_cast(self, item: Item | None) -> None:
         """Remember where a spell, scroll, rod or wand was used, and after
         which message, so a "Something blocks your spellcasting." answer
@@ -2558,6 +2777,9 @@ class AtrinikClient:
             m = self.state.map
             self.spell_cast = ((m.path, m.world_x, m.world_y),
                                self.state.message_count, time.time())
+            # A step sent since a map update last moved her may land in the
+            # same server tick, before the cast: either square is possible.
+            self._spell_cast_uncertain = self._step_sent_at > self._position_at
 
     async def fire(self, direction: int, item_tag: int = 0) -> None:
         item = self.state.items.get(item_tag)

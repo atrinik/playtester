@@ -1,9 +1,10 @@
 # Learning from the world and playtester feedback
 
-Status: design proposal. Phase F1 (the observation ledger) is implemented;
-"F1 as built" in section 6 records where it differs from this text. Nothing
-else here is implemented, and nothing here changes behaviour until the
-phased pull requests at the end land.
+Status: design proposal. Phases F1 (the observation ledger) and F2 (fact
+parsers and tile facts) are implemented; "F1 as built" and "F2 as built" in
+section 6 record where they differ from this text. Nothing else here is
+implemented, and nothing here changes behaviour until the phased pull
+requests at the end land.
 
 The owner wants Sera to learn from what she reads and does in the world, and
 to turn what confuses her into feedback that improves the game. She chose
@@ -1532,6 +1533,99 @@ off (shadow: the fact is written and shown, #97 alone decides).
 *Accept:* every section 5 text gives its expected facts; the section 2
 message stream produces one `no_magic` fact; with the flag on, a reconnect
 a day later casts nothing on that square; no LLM dependency.
+
+*F2 as built* (`facts.py`, `memory.py`, `tasks.spell_blocked_here`, the
+Knowledge tab):
+
+- `facts` has the columns of 4.2 plus `detail`, the sentence a fact came
+  from (at most 300 characters of the stored observation's text, or the
+  fixed refusal), so the dashboard can show why without the whole book. A
+  unique index on (server, account, character, kind, subject, value) makes
+  a repeat an upsert: the higher confidence wins, `candidate` can become
+  `confirmed` but never the reverse, and the first observation stays the
+  source. Only tile facts get an `expires_at` (below).
+- Subjects are the observation's `source_key` for text facts, the folded
+  creature name for `weakness` and `immunity`, and `tile:/map:x,y` or, for
+  a whole map, `map:/map` for tile facts. `generic-lock` values are
+  `special-key` (the archetype defaults), `unnamed-key` (5.2's "a the
+  key") and `locked` ("The prison cell is locked.", "The big lever is
+  locked."); `unopenable` values are `from-this-side` (0.6), `closed` and
+  `blocked` (0.4, the 5.1 decoration doors). A `password` with no value is
+  stored with an empty value.
+- Parsers run on each observation as it is stored; a repeat stores facts
+  again only when an older parser set (or none) read it, so rows F1 kept before
+  this phase gain facts the next time she sees them;
+  there is no bulk backfill. They read only kept observations, so dialogue
+  (`npc-key`, F13) and the journal (`quest-part`, not stored) have no input
+  yet; both are tested on fixtures. Lock parsers read door, gate, lever,
+  sign and magic-mouth text; `quest-gate` reads books, scrolls, dialogue
+  and the journal; system lines and examines give no text facts.
+- `key-holder` reads only the engraved form (`[i]Name, the creature[/i] is
+  engraved ...`): free prose such as "each guard in Asteria possesses the
+  first of these keys" named places as holders. `weakness` and `immunity`
+  need a creature name the authored index knows (so "its wearer" is no
+  subject) and give nothing without the index; no authored text states one
+  today, since the bestiary books are generated and not indexed.
+- Tile facts come from `spell_blocked_here`'s attribution, not from the
+  observation row: system lines are deduplicated per map, so a second
+  no-magic square on the same map adds no observation. A refusal is kept
+  only when her recent cast explains it and it certainly belongs to that
+  cast: no step was sent after a map update last moved her before the
+  cast (a step and a cast in one server tick move her first; a map update
+  that does not change her square, sent when monsters move, does not
+  count), and for a square
+  she still stood on the square she cast from as the line arrived, for a
+  map she was still on the cast's map. Otherwise nothing is kept. (#97's
+  one-hour mark keeps its own attribution, unchanged: a heal cast just
+  before an exit, then a potion on a no-magic map, still marks the first
+  map for that hour, but never makes a fact.) A path walk (`S_MOVE_PATH`)
+  counts as one step: a cast later in the same walk, after a map update,
+  is taken as certain. Each fact cites the stored observation of the same
+  line when there is one; the variant naming her item ("...the magic of
+  your %s") is not stored (F1), so its fact cites none and keeps no
+  detail. The countermagic lines join F1's fact lines. Classic has no
+  no-prayer refusal; "Powerful countermagic cancels all harmful magic
+  here!" becomes `no_harm` at the cast square (its message does not tell
+  a no-harm map from a no-harm square) and changes nothing.
+- Tile facts expire 7 days after the last refusal confirmed them
+  (`expires_at`), and carry the locked content revision in a new `inputs`
+  column (`content:<revision>`); a fact from another revision is ignored
+  until a refusal confirms it again under the new one. A repeat refusal is
+  written at most once an hour; a failed write waits a minute.
+- **The flag only reorders healing.** This narrows the acceptance above:
+  `spell_blocked_here` answers exactly as before this phase, flag or not,
+  so a remembered fact never stops a cast by itself, and never the
+  emergency recall. With `--persist-tile-facts` (or
+  `ATRINIK_BOT_PERSIST_TILE_FACTS=1`), `SafetyPolicy._known_heal` puts a
+  non-magical heal (a potion) before a spell, scroll, rod or wand on a
+  remembered square or map. A reconnect a day later with a potion casts
+  nothing there; with no other heal she casts, at any health, because a
+  refused cast costs nothing (`cast_spell` refuses before spending mana)
+  and a stale fact must not leave her without healing. Off, healing is
+  unchanged and a `tile-fact-no-magic-shadow` decision records once a
+  square a process where she would have put another heal first.
+- **Nothing refutes a tile fact.** A cast the server drops without a word
+  (her action timer, `check_skill_to_fire`, an unready device) or refuses
+  for another reason first (a broken wand, a scroll she cannot read) looks
+  like one that worked, so silence proves nothing. A fact is refreshed
+  only by another no-magic refusal attributed to its square or map, and
+  otherwise lapses 7 days after the last one, or at once when the content
+  revision changes. With the flag on, a stale fact can therefore make her
+  drink potions instead of casting on that square for up to 7 days; the
+  flag is off by default.
+- Tile-fact decisions save the decision ledger with a 0.25 s timeout and
+  never raise.
+- An observation records the parser set that last read it
+  (`observations.facts_version`, added to F1's table where missing, a
+  column another process added at the same moment being no error). Facts
+  are parsed before the observation is written and stored with it in one
+  transaction, inside a savepoint: a fact that fails to store loses that
+  observation's facts (read again on its next sighting), never the
+  observation. Eviction runs after the facts are stored, so a new row is
+  cited before it could be evicted. A repeat the same parser set read
+  stores no facts again.
+- Facts are capped at 20,000 a character, candidates first, least recently
+  updated first; `facts_total{kind,status}` counts new facts.
 
 **F3. `feat(inventory)`: effective item stats and an Equipment panel.** The
 "+N" model (4.8.1), examining carried gear once, `EffectiveStats`, the

@@ -129,6 +129,10 @@
       </div>
 
       <div id="tab-knowledge" class="tab scroll">
+        <div class="row between"><h2>Facts</h2><select id="fact-kind"><option value="">All kinds</option></select></div>
+        <p id="facts-summary" class="muted small"></p>
+        <div id="facts" class="list"><span class="muted">Loading…</span></div>
+        <p class="muted small">Read by fixed parsers from the readings below and from the server's fixed refusals, never from chat or other players. A candidate is a hint until an outcome confirms it. Read-only.</p>
         <div class="row between"><h2>Recent readings</h2><select id="knowledge-kind"><option value="">All sources</option></select></div>
         <p id="knowledge-summary" class="muted small"></p>
         <div id="knowledge" class="list"><span class="muted">Loading…</span></div>
@@ -169,6 +173,6 @@
     </section>
   </main>
   <div id="toast" role="status"></div>
-  <script src="/app.js?v=24"></script>
+  <script src="/app.js?v=25"></script>
 </body>
 </html>
