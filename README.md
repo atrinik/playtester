@@ -600,7 +600,26 @@ only while she carries its key. The Tasks tab's **Unlocks** section shows the
 keys she carries, where, how many gated tiles each opens, and any ambiguous
 key names. A map where
 she recently died on the way somewhere is avoided for a while when another
-route exists. The proposed design for
+route exists.
+
+The owner can block a map, an exit or a tile seam from the Tasks tab's
+**Owner blocks** section, for 1 hour to 7 days; the list shows each block's
+expiry and removes it early. A block is a wall for transit on every trip; a
+blocked map stays usable as a destination. Blocks are stored per character
+in the runtime state database (`route_blocks`) and are written only through
+`POST /api/route-blocks`: loopback only, a loopback `Host`, no foreign
+`Origin`, and `application/json` only, which an HTML form cannot send
+cross-site. Only an essential trip (food while she is hungry or starving, a
+cure, the depletion service, a savebed move, a trip that funds one of them,
+and the recovery phase's recall shopping and walk home) crosses a block, and
+only when every route does. It waits at a safe place (her savebed, or a map
+without hostile spawns, with no hostile in view or contact) for full HP and
+SP and a ready recall when she owns one, then holds fire on the way. That
+wait has no limit and raises a dashboard alert after 10 minutes, and a
+non-food trip gives way to a food trip once she is hungry. A starving food
+trip waits only for a ready recall. Each crossing is recorded
+(`essential-route-override`, and `essential-care-starving` for a starving
+one, which is also alerted) and listed under **Care crossings**. The proposed design for
 alternative routes, unlocks such as keys, quests and NPC voyages, and costs
 learned from her own experience is in [docs/ROUTING.md](docs/ROUTING.md).
 

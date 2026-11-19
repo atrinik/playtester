@@ -5,6 +5,7 @@ import json
 import os
 import time
 import tempfile
+import types
 import shutil
 import sqlite3
 import unittest
@@ -22323,7 +22324,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=26", page)
+        self.assertIn(b"/app.js?v=27", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -25038,6 +25039,497 @@ class DashboardSecurityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((status, json.loads(payload)["busy"]), (200, True))
 
     request = WebTests.request
+
+
+# Owner route and map blocks, and the care crossing (docs/ROUTING.md 4.5,
+# 4.7, phase P3).
+def blocks_graph(*, detour: bool = True) -> WorldGraph:
+    """/start reaches /goal through /blocked in two exits, or through
+    /detour_1 and /detour_2 in three; /home is her savebed, beside /start."""
+    graph = WorldGraph()
+    for path in ("/start", "/blocked", "/detour_1", "/detour_2", "/goal", "/home"):
+        node = MapNode(path, width=10, height=1)
+        node.terrain = {(x, 0): 1 for x in range(10)}
+        graph.nodes[path] = node
+    graph.nodes["/start"].edges.append(MapEdge("/start", "/blocked", 9, 0, 0, 0))
+    graph.nodes["/blocked"].edges.append(MapEdge("/blocked", "/goal", 9, 0, 0, 0))
+    graph.nodes["/start"].edges.append(MapEdge("/start", "/home", 5, 0, 0, 0))
+    graph.nodes["/home"].edges.append(MapEdge("/home", "/start", 5, 0, 1, 0))
+    if detour:
+        graph.nodes["/start"].edges.append(MapEdge("/start", "/detour_1", 0, 0, 0, 0))
+        graph.nodes["/detour_1"].edges.append(
+            MapEdge("/detour_1", "/detour_2", 10, 0, kind="tile"))
+        graph.nodes["/detour_2"].edges.append(MapEdge("/detour_2", "/goal", 9, 0, 0, 0))
+    return graph
+
+
+class BlockClient:
+    """A playing Sera on /start with her own memory database."""
+
+    def __init__(self, memory_path: Path):
+        from .memory import BotMemory
+
+        self.memory = BotMemory(memory_path, server="game", account="acct")
+        self._memory_character = "Sera"
+        self.state = GameState(phase="playing", player_tag=7, player_name="Sera")
+        self.state.map.path, self.state.map.world_x, self.state.map.world_y = "/start", 1, 0
+        self.state.stats.update(hp=100, maxhp=100, sp=40, maxsp=40, food=900, level=10)
+        self.state.savebed_map, self.state.savebed_xy = "/home", (2, 0)
+        self.decision_history: list[dict] = []
+        self.clears = 0
+
+    def _memory_store(self):
+        return self.memory
+
+    def record_action(self, action, detail=""):
+        self.decision_history.append({"time": time.time(), "action": action,
+                                      "detail": detail, "map": self.state.map.path})
+
+    def actions(self) -> list[str]:
+        return [record["action"] for record in self.decision_history]
+
+    async def clear_actions(self):
+        self.clears += 1
+
+
+class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from . import route_blocks
+
+        self.route_blocks = route_blocks
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.client = BlockClient(Path(self.directory) / "memory.sqlite3")
+        self.graph = blocks_graph()
+
+    def block(self, subject, seconds=3600, **options):
+        return self.route_blocks.add_block(self.client, self.graph, subject, seconds,
+                                           **options)
+
+    def trip(self, essential="", *, destination="/goal") -> NavigateTask:
+        task = NavigateTask(self.graph, destination)
+        task.essential = essential
+        return task
+
+    def maps(self, route) -> list[str]:
+        return [edge.destination for edge in route]
+
+    async def walking(self, task):
+        """Tick once; whether she was sent a step."""
+        moves = []
+
+        async def click(_client, x, y):
+            moves.append((x, y))
+            return True
+
+        task._click_path = click
+        await task.tick(self.client)
+        return bool(moves)
+
+    def test_a_block_forces_the_alternative_route(self):
+        self.assertEqual(self.maps(self.trip()._plan(self.client)), ["/blocked", "/goal"])
+        for subject in ("/blocked", "map:/blocked", "exit:/start:9,0>/blocked",
+                        "exit:/blocked:9,0>/goal"):
+            with self.subTest(subject):
+                canonical = self.block(subject)["subject"]
+                self.assertEqual(self.maps(self.trip()._plan(self.client)),
+                                 ["/detour_1", "/detour_2", "/goal"])
+                self.assertTrue(self.route_blocks.remove_block(self.client, canonical))
+        # A seam block walls that seam off: no route is left at all here.
+        self.block("seam:/detour_1>/detour_2")
+        self.block("/blocked")
+        with self.assertRaisesRegex(ValueError, "owner block"):
+            self.trip()._plan(self.client)
+
+    def test_without_an_alternative_an_optional_trip_fails_with_the_block(self):
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        task = self.trip()
+        with self.assertRaisesRegex(
+                ValueError, r"owner block: every route to /goal crosses map:/blocked"):
+            task._plan(self.client)
+        self.assertIsNone(task.care)
+        # A blocked map stays usable as a destination.
+        self.route_blocks.remove_block(self.client, "/blocked")
+        self.block("/goal")
+        self.assertEqual(self.maps(self.trip(destination="/goal")._plan(self.client))[-1],
+                         "/goal")
+
+    def test_subjects_are_checked_against_the_content(self):
+        for subject, error in (("/nowhere", "not an authored map"),
+                               ("exit:/start:3,0>/blocked", "no exit"),
+                               ("seam:/start>/blocked", "no tile seam"),
+                               ("road", "must be a map path"), ("", "empty"),
+                               (7, "must be text")):
+            with self.subTest(subject):
+                with self.assertRaisesRegex(ValueError, error):
+                    self.block(subject)
+        for seconds in (3599, 7 * 86400 + 1, 3600.0, True, "3600"):
+            with self.subTest(seconds=seconds):
+                with self.assertRaises(ValueError):
+                    self.block("/blocked", seconds)
+        self.assertEqual(self.block("/blocked", 7 * 86400, note="  crocodiles\n here ")["note"],
+                         "crocodiles here")
+        self.assertEqual(self.route_blocks.active_subjects(self.client), {"map:/blocked"})
+
+    def test_a_block_expires_on_time_and_can_be_removed_early(self):
+        now = [1_800_000_000.0]
+        clock = types.SimpleNamespace(time=lambda: now[0], monotonic=time.monotonic)
+        with patch.object(self.route_blocks, "time", clock):
+            row = self.block("/blocked", 3600)
+            self.assertEqual(row["until"], now[0] + 3600)
+            self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/detour_1")
+            now[0] += 3599
+            self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/detour_1")
+            now[0] += 1
+            # At its expiry it stops counting, before any re-read...
+            self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/blocked")
+            self.assertEqual(self.route_blocks.active_blocks(self.client), [])
+            # ...and the row is deleted on the next read.
+            self.route_blocks.invalidate(self.client)
+            self.assertEqual(self.client.memory.route_blocks("Sera", now=0), [])
+            self.block("/blocked", 7 * 86400)
+            self.assertTrue(self.route_blocks.remove_block(self.client, "/blocked"))
+            self.assertFalse(self.route_blocks.remove_block(self.client, "/blocked"))
+            self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/blocked")
+
+    def test_blocks_belong_to_her_namespace(self):
+        self.block("/blocked")
+        other = BlockClient(Path(self.directory) / "memory.sqlite3")
+        other._memory_character = "Opal"
+        self.assertEqual(self.route_blocks.active_blocks(other), [])
+        self.assertEqual(self.maps(self.trip()._plan(other))[0], "/blocked")
+
+    async def test_an_essential_trip_crosses_only_at_full_hp_and_sp_with_a_ready_recall(self):
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        rod = Item(50, name="rod of word of recall", item_type=c.TYPE_ROD, quality=60)
+        self.client.state.place_item(rod, 7)
+        self.client.recall_device_retry_at = {50: time.monotonic() + 600}
+        self.client.state.stats.update(hp=60, sp=10)
+        task = self.trip("cure")
+        self.assertFalse(await self.walking(task))
+        self.assertEqual(task.care.mode, "owner-block")
+        self.assertEqual(task.care.subjects, ("map:/blocked",))
+        self.assertEqual(task.care.missing, ("full HP", "full SP", "a ready recall"))
+        self.assertEqual(self.client.actions(), ["essential-care-wait"])
+        self.assertTrue(task.care_hold_fire)
+        self.client.state.stats.update(hp=100, sp=40)
+        self.assertFalse(await self.walking(task))
+        self.assertEqual(task.care.missing, ("a ready recall",))
+        self.client.recall_device_retry_at = {}
+        self.assertTrue(await self.walking(task))
+        self.assertTrue(task.care.cleared)
+        self.assertTrue(task.care_hold_fire)
+        self.assertEqual(self.client.actions(), ["essential-care-wait", "essential-route-override"])
+        self.assertIn("cure trip to /goal crosses map:/blocked (owner-block): full HP and SP",
+                      self.client.decision_history[-1]["detail"])
+        # The dashboard shows the crossing and the block.
+        dashboard = DashboardState(self.client, types.SimpleNamespace(task=task, idle_survival=None),
+                                   self.graph, {})
+        blocks = dashboard.route_blocks()
+        self.assertEqual([row["subject"] for row in blocks["blocks"]], ["map:/blocked"])
+        self.assertEqual(blocks["decisions"][0]["action"], "essential-route-override")
+        self.assertTrue(blocks["care"][0]["cleared"])
+        # Mid-crossing replans keep going without a second wait.
+        task.route = []
+        self.client.state.stats.update(hp=50)
+        self.assertTrue(await self.walking(task))
+        # Once nothing blocked is left on her way, hold-fire ends.
+        self.client.state.map.path = "/blocked"
+        task.route = []
+        self.assertTrue(await self.walking(task))
+        self.assertFalse(task.care_hold_fire)
+
+    async def test_an_owner_block_wait_has_no_limit_and_alerts_after_600_s(self):
+        from .navigation import CARE_WAIT_SECONDS
+
+        self.assertEqual(CARE_WAIT_SECONDS, 600)
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=10)
+        now = [100.0]
+        task = self.trip("depletion")
+        self.assertFalse(await self.walking(task))
+        task.care.clock, task.care.since = (lambda: now[0]), now[0]
+        dashboard = DashboardState(self.client, types.SimpleNamespace(task=task, idle_survival=None),
+                                   self.graph, {})
+        now[0] += 599
+        self.assertFalse(await self.walking(task))
+        self.assertEqual(dashboard.care_alerts(), [])
+        now[0] += 1
+        self.assertFalse(await self.walking(task))
+        now[0] += 3600
+        self.assertFalse(await self.walking(task))
+        self.assertFalse(task.care.cleared)
+        self.assertEqual(self.client.actions(), ["essential-care-wait", "essential-care-alert"])
+        alert, = dashboard.care_alerts()
+        self.assertEqual((alert["id"], alert["level"]), ("essential-care-wait", "critical"))
+        self.assertIn("70 min to cross the owner block map:/blocked: needs full HP", alert["text"])
+
+    async def test_a_bounded_override_goes_after_600_s_and_records_the_timeout(self):
+        from .navigation import CARE_BOUNDED
+
+        self.client.state.stats.update(hp=10)
+        now = [100.0]
+        task = self.trip("funding")
+        await task.start(self.client)
+        task.require_care(CARE_BOUNDED, ("budget",), clock=lambda: now[0])
+        self.assertFalse(await self.walking(task))
+        now[0] += 600
+        self.assertTrue(await self.walking(task))
+        self.assertEqual(self.client.actions(),
+                         ["essential-care-wait", "essential-route-override",
+                          "essential-care-timeout"])
+        self.assertIn("without full HP", self.client.decision_history[-1]["detail"])
+
+    async def test_a_starving_food_trip_waits_only_for_a_ready_recall(self):
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=20, sp=0, food=0)
+        wand = Item(51, name="wand of word of recall", item_type=c.TYPE_WAND, quality=60)
+        self.client.state.place_item(wand, 7)
+        self.client.recall_device_retry_at = {51: time.monotonic() + 600}
+        task = self.trip("food")
+        self.assertTrue(task.is_essential(self.client))
+        self.assertFalse(await self.walking(task))
+        self.assertTrue(task.care.starving)
+        self.assertEqual(task.care.missing, ("a ready recall",))
+        self.client.recall_device_retry_at = {}
+        self.assertTrue(await self.walking(task))
+        self.assertEqual(self.client.actions(),
+                         ["essential-care-wait", "essential-route-override",
+                          "essential-care-starving"])
+        dashboard = DashboardState(self.client, types.SimpleNamespace(task=task, idle_survival=None),
+                                   self.graph, {})
+        alert, = dashboard.care_alerts()
+        self.assertEqual((alert["id"], alert["level"]), ("essential-care-starving", "critical"))
+        # A recall spell she has no SP for cannot be readied at food 0: it
+        # does not hold a starving trip back.
+        self.client.state.remove_item(51)
+        self.client.state.place_item(Item(52, name="word of recall", item_type=c.TYPE_SPELL,
+                                          extra={"cost": 20}), 7)
+        self.client.decision_history.clear()
+        self.assertTrue(await self.walking(self.trip("food")))
+        self.assertEqual(self.client.actions(),
+                         ["essential-route-override", "essential-care-starving"])
+        # Fed, a food trip is not essential and the block holds.
+        self.client.state.stats.update(food=900)
+        self.client.state.place_item(Item(53, name="bread", item_type=c.TYPE_FOOD,
+                                          quantity=5, quality=60), 7)
+        with self.assertRaisesRegex(ValueError, "owner block"):
+            self.trip("food")._plan(self.client)
+
+    async def test_she_waits_for_care_only_at_a_safe_place(self):
+        self.graph = blocks_graph(detour=False)
+        self.graph.named_spawns["/start"] = [NamedSpawn("/start", 8, 0, "rat", ("rat",))]
+        self.block("/blocked")
+        task = self.trip("savebed")
+        self.assertTrue(await self.walking(task))
+        # Full HP and SP, but /start has hostile spawns: she walks to her
+        # savebed first, by a route that crosses no block.
+        self.assertEqual((task.destination, task.destination_xy), ("/home", (2, 0)))
+        self.assertEqual(self.client.actions(), ["essential-care-staging"])
+        self.assertEqual(task.care.missing, ("a safe place (a map with hostile spawns)",))
+        self.client.state.map.path, self.client.state.map.world_x = "/home", 3
+        self.assertTrue(await self.walking(task))
+        self.assertEqual(task.destination, "/goal")
+        self.assertTrue(task.care.cleared)
+        # A hostile in view is no place to wait either, savebed or not.
+        task = self.trip("savebed")
+        self.client.state.map.tile(8, 8).objects[3] = MapObject(3, 1, 0, 0, name="kobold",
+                                                                  target_id=99)
+        self.assertFalse(await self.walking(task))
+        self.assertEqual(task.care.missing, ("a safe place (a hostile in view)",))
+
+    async def test_a_non_food_trip_yields_to_hunger_instead_of_waiting(self):
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=10, food=100)
+        task = self.trip("cure")
+        self.assertFalse(await self.walking(task))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("yielded to hunger", task.error)
+        self.assertEqual(self.client.actions(), ["essential-care-yield"])
+
+    async def test_a_removed_block_ends_the_wait(self):
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=10)
+        task = self.trip("cure")
+        self.assertFalse(await self.walking(task))
+        self.route_blocks.remove_block(self.client, "map:/blocked")
+        self.assertTrue(await self.walking(task))
+        self.assertIsNone(task.care)
+        self.assertEqual(self.client.actions(), ["essential-care-wait"])
+
+    async def test_stop_and_the_operator_hold_still_reach_a_waiting_trip(self):
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=10)
+        engine = TaskEngine(self.client)
+        trip = NavigateThenTask(self.graph, "/goal", _DoneErrand())
+        trip.navigation.essential = "cure"
+        engine.set_task(trip)
+        self.client.state.inventory_replay_complete = True
+        ticks = []
+        original = trip.tick
+
+        async def counted(client):
+            ticks.append(1)
+            await original(client)
+
+        trip.tick = counted
+        await engine._step()
+        self.assertEqual(len(ticks), 1)
+        self.assertIsNotNone(trip.navigation.care)
+        engine.operator_hold = "operator-assist"
+        await engine._step()
+        self.assertEqual(len(ticks), 1)
+        engine.operator_hold = ""
+        engine.set_task(None)
+        await engine._step()
+        self.assertEqual(len(ticks), 1)
+
+    def test_essential_trips_are_classified(self):
+        from .navigation import RecoveryTask, mark_essential, temple_food_trip
+        from .navigation import DialogueVendor
+
+        self.client.state.stats.update(level=20)
+        circuit = FarmCircuitTask(self.graph, [("/goal", "")])
+        self.assertEqual(circuit._new_depletion_service(self.client).navigation.essential,
+                         "depletion")
+        self.assertEqual(circuit._new_disease_cure().navigation.essential, "cure")
+        self.assertEqual(circuit._new_cure_funding(self.client).navigation.essential, "funding")
+        # Optional trips stay optional.
+        self.assertEqual(circuit._new_junk_sale(self.client).navigation.essential, "")
+        self.assertEqual(circuit._new_bank_deposit(self.client).navigation.essential, "")
+        self.graph.temple_priests.append(DialogueVendor("/goal", 3, 0, "Priest", ""))
+        self.assertEqual(temple_food_trip(self.graph, self.client).navigation.essential, "food")
+        key = mark_essential(MorgeeanShipKeyTask(self.graph), "recall")
+        self.assertEqual((key.essential, key.navigation.essential), ("recall", "recall"))
+        recovery = RecoveryTask(self.graph)
+        self.assertEqual(RecoveryTask.ESSENTIAL_ERRANDS["_recall_shopping"], "recall")
+        self.assertEqual(recovery._new_home_walk(("/home", (2, 0)), strict=True)
+                         .navigation.essential, "home")
+        # Food is essential only while she is hungry or starving.
+        self.assertFalse(self.trip("food").is_essential(self.client))
+        self.client.state.stats.update(food=100)
+        self.assertTrue(self.trip("food").is_essential(self.client))
+        self.assertFalse(self.trip("").is_essential(self.client))
+
+    async def test_a_temple_priest_behind_a_block_comes_last(self):
+        from .navigation import DialogueVendor, temple_food_trip
+
+        self.client.state.stats.update(food=100)
+        far = MapNode("/far", width=10, height=1)
+        far.terrain = {(x, 0): 1 for x in range(10)}
+        self.graph.nodes["/far"] = far
+        self.graph.nodes["/detour_2"].edges.append(MapEdge("/detour_2", "/far", 5, 0, 0, 0))
+        self.graph.temple_priests.append(DialogueVendor("/goal", 3, 0, "Near", ""))
+        self.graph.temple_priests.append(DialogueVendor("/far", 3, 0, "Far", ""))
+        self.assertEqual(temple_food_trip(self.graph, self.client).task.priest, "Near")
+        self.block("/blocked")
+        self.assertEqual(temple_food_trip(self.graph, self.client).task.priest, "Far")
+        # Every priest is behind a block: the nearest still feeds her, with care.
+        self.block("/detour_1")
+        trip = temple_food_trip(self.graph, self.client)
+        self.assertEqual((trip.task.priest, trip.navigation.essential), ("Near", "food"))
+        self.assertTrue(await self.walking(trip.navigation))
+        self.assertEqual(self.client.actions(), ["essential-route-override"])
+
+
+class OwnerBlockRouteTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = WebTests.asyncSetUp
+    asyncTearDown = WebTests.asyncTearDown
+    request = WebTests.request
+
+    def use_sera(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.client.config.character = "Sera"
+        self.client._memory_path = Path(directory) / "memory.sqlite3"
+        self.client.memory = None
+        self.client.state.player_name = "Sera"
+        self.client.load_character_memory("Sera")
+        self.client.state.map.path, self.client.state.map.world_x = "/start", 1
+        self.server.graph = self.server.dashboard.graph = blocks_graph()
+
+    async def post(self, data, **headers):
+        return await self.request("POST", "/api/route-blocks", data,
+                                  {"Content-Type": "application/json", **headers})
+
+    async def blocks(self):
+        status, payload = await self.request("GET", "/api/state?include=route_blocks")
+        self.assertEqual(status, 200, payload)
+        return json.loads(payload)["route_blocks"]
+
+    async def test_the_owner_adds_lists_and_removes_a_block(self):
+        self.use_sera()
+        status, payload = await self.post({"action": "add", "subject": "/blocked",
+                                           "seconds": 86400, "note": "crocodiles"})
+        self.assertEqual(status, 200, payload)
+        block, = (await self.blocks())["blocks"]
+        self.assertEqual((block["subject"], block["note"]), ("map:/blocked", "crocodiles"))
+        self.assertAlmostEqual(block["remaining_seconds"], 86400, delta=5)
+        self.assertEqual(self.client.decision_history[-1]["action"], "route-block")
+        # The planner sees it at once.
+        self.assertEqual(NavigateTask(self.server.graph, "/goal")._plan(self.client)[0]
+                         .destination, "/detour_1")
+        for data, expected in (({"action": "add", "subject": "/blocked", "seconds": 60}, 400),
+                               ({"action": "add", "subject": "/nowhere", "seconds": 3600}, 400),
+                               ({"action": "drop"}, 400),
+                               ({"action": "remove", "subject": "/goal"}, 404)):
+            with self.subTest(data):
+                status, payload = await self.post(data)
+                self.assertEqual(status, expected, payload)
+        status, payload = await self.post({"action": "remove", "subject": "map:/blocked"})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual((await self.blocks())["blocks"], [])
+
+    async def test_writes_are_refused_cross_origin_off_loopback_or_not_as_json(self):
+        self.use_sera()
+        data = {"action": "add", "subject": "/blocked", "seconds": 3600}
+        for headers, expected in (
+                ({"Origin": "https://evil.example"}, 403),
+                ({"Origin": "http://127.0.0.1:1"}, 403),
+                ({"Host": "dashboard.example"}, 400),
+                ({"Content-Type": "text/plain"}, 415),
+                ({"Content-Type": "application/x-www-form-urlencoded"}, 415)):
+            with self.subTest(headers):
+                status, payload = await self.post(data, **headers)
+                self.assertEqual(status, expected, payload)
+        self.assertEqual((await self.blocks())["blocks"], [])
+        # Same-origin succeeds.
+        status, payload = await self.post(data, Origin=f"http://127.0.0.1:{self.port}")
+        self.assertEqual(status, 200, payload)
+
+    async def test_no_block_is_kept_before_she_logs_in(self):
+        status, payload = await self.post({"action": "add", "subject": "/blocked",
+                                           "seconds": 3600})
+        self.assertEqual(status, 400, payload)
+        self.assertIn("no character", json.loads(payload)["error"])
+        self.assertFalse((await self.blocks())["character_loaded"])
+
+    async def test_stop_ends_a_trip_waiting_for_care(self):
+        self.use_sera()
+        await self.post({"action": "add", "subject": "/blocked", "seconds": 3600})
+        self.server.graph.nodes["/start"].edges[:] = [
+            edge for edge in self.server.graph.nodes["/start"].edges
+            if edge.destination != "/detour_1"]
+        trip = NavigateThenTask(self.server.graph, "/goal", _DoneErrand())
+        trip.navigation.essential = "cure"
+        self.client.state.phase = "playing"
+        self.client.state.map.path = "/start"
+        self.client.state.stats.update(hp=10, maxhp=100)
+        trip.navigation._plan(self.client)
+        self.assertIsNotNone(trip.navigation.care)
+        self.engine.set_task(trip)
+        self.assertEqual([care["trip"] for care in (await self.blocks())["care"]], ["cure"])
+        # (No game connection here: Stop's clear is not sent.)
+        self.client.state.phase = "disconnected"
+        status, payload = await self.request("POST", "/api/task", {"type": "stop"})
+        self.assertEqual(status, 200, payload)
+        self.assertIsNone(self.engine.task)
+        self.assertEqual((await self.blocks())["care"], [])
 
 
 if __name__ == "__main__":

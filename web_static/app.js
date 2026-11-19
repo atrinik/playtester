@@ -17,7 +17,7 @@ function applyStyles(root) {
 }
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts,engine_error";
-const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment";
+const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment,route_blocks";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -610,6 +610,89 @@ function renderUnlocks() {
   $("#unlocks").replaceChildren(...rows);
 }
 
+// ---------- owner blocks (docs/ROUTING.md 4.7) ----------
+// Built with DOM nodes and classes only, like the unlocks: no markup strings.
+function blockText(tag, text, cls) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  el.textContent = text;
+  return el;
+}
+function blockSpan(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s >= 86400) return `${Math.floor(s / 86400)} d ${Math.floor((s % 86400) / 3600)} h`;
+  if (s >= 3600) return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+  return `${Math.floor(s / 60)} min`;
+}
+const blockWhen = t => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+async function blockPost(button, label, data) {
+  const original = button.textContent;
+  button.disabled = true; button.textContent = "…";
+  try {
+    await post("/api/route-blocks", data);
+    toast(label);
+    lastBlockSig = "";
+    setTimeout(pollSlow, 250);
+    return true;
+  } catch (e) {
+    toast(`${label} failed: ${e.message}`, true);
+    return false;
+  } finally { button.disabled = false; button.textContent = original; }
+}
+let lastBlockSig = "";
+function renderBlocks() {
+  const b = slow.route_blocks;
+  const sig = JSON.stringify(b ?? null);
+  if (sig === lastBlockSig) return;
+  lastBlockSig = sig;
+  const rows = [];
+  if (!b) {
+    rows.push(blockText("span", "Not available.", "muted"));
+  } else {
+    if (!b.character_loaded) rows.push(blockText("span", "Blocks are kept per character: waiting for her to log in.", "muted"));
+    for (const block of b.blocks || []) {
+      const row = document.createElement("div");
+      row.className = "quest";
+      row.append(blockText("strong", block.subject));
+      const remove = blockText("button", "Remove", "small danger");
+      remove.onclick = () => blockPost(remove, `Removed the block on ${block.subject}`, { action: "remove", subject: block.subject });
+      row.append(remove);
+      row.append(blockText("small", `until ${blockWhen(block.until)} (${blockSpan(block.remaining_seconds)} left)${block.note ? ` · ${block.note}` : ""}`));
+      rows.push(row);
+    }
+    if (b.character_loaded && !(b.blocks || []).length) rows.push(blockText("span", "No blocks: every route is open to her.", "muted"));
+  }
+  $("#route-blocks").replaceChildren(...rows);
+  const care = [];
+  for (const c of (b && b.care) || []) {
+    const row = document.createElement("div");
+    row.className = "quest";
+    row.append(blockText("strong", `${c.trip || "trip"} to ${c.destination}`));
+    const state = c.cleared ? (c.starving ? "crossing starving" : "crossing") : c.staging ? "walking to her savebed" : "waiting";
+    row.append(blockText("span", state, c.cleared ? (c.starving ? "flag bad" : "flag warn") : c.alerted ? "flag bad" : "flag"));
+    row.append(blockText("small", `${c.subjects.join(", ")} · ${c.mode} · waited ${blockSpan(c.waiting_seconds)}${c.missing.length && !c.cleared ? ` · needs ${c.missing.join(", ")}` : ""}`));
+    care.push(row);
+  }
+  for (const d of (b && b.decisions) || []) {
+    const row = document.createElement("div");
+    row.className = "quest";
+    row.append(blockText("strong", d.action));
+    row.append(blockText("span", blockWhen(d.time), "flag"));
+    row.append(blockText("small", `${d.detail || ""}${d.map ? ` · ${d.map}` : ""}`));
+    care.push(row);
+  }
+  if (!care.length) care.push(blockText("span", "No care crossings recorded.", "muted"));
+  $("#route-care").replaceChildren(...care);
+}
+$("#block-here").onclick = () => { const path = (live.map || {}).path; if (!path) return toast("Her map is not known yet", true); $("#block-subject").value = path; };
+$("#block-add").onclick = e => {
+  const subject = $("#block-subject").value.trim();
+  if (!subject) return toast("Enter a map path, an exit or a seam", true);
+  const seconds = Number($("#block-duration").value);
+  blockPost(e.target, `Blocked ${subject} for ${blockSpan(seconds)}`, { action: "add", subject, seconds, note: $("#block-note").value.trim() })
+    .then(ok => { if (ok) { $("#block-subject").value = ""; $("#block-note").value = ""; } });
+};
+
 // ---------- tabs ----------
 $$(".tabs button").forEach(b => (b.onclick = () => {
   $$(".tabs button").forEach(x => x.classList.toggle("active", x === b));
@@ -768,7 +851,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderBlocks(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
   } finally { slowBusy = false; }
 }
