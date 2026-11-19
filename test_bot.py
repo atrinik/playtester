@@ -27987,7 +27987,12 @@ class VoyageClient:
         self.chosen: list[int] = []
 
     def record_action(self, action, detail=""):
-        self.decision_history.append({"action": action, "detail": detail})
+        record = {"action": action, "detail": detail,
+                  "x": self.state.map.world_x, "y": self.state.map.world_y}
+        self.decision_history.append(record)
+        recorder = getattr(self, "route_recorder", None)
+        if recorder is not None:
+            recorder.on_decision(self, record)
 
     def actions(self):
         return [record["action"] for record in self.decision_history]
@@ -28219,6 +28224,33 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
                          ["navigation-voyage", "navigation-voyage-arrived"])
         self.assertEqual(self.client.decision_history[0]["detail"],
                          "talk:/dock:Ferryman>/isle")
+
+    async def test_route_events_record_a_voyage_as_a_talk_crossing(self):
+        from .route_events import RouteRecorder
+        self.client.route_recorder = recorder = RouteRecorder()
+        recorder.flush = lambda *args, **kwargs: None
+        task = await self.walk(NavigateTask(self.graph, "/isle"))
+        self.assertEqual(task.status, TaskStatus.COMPLETE, task.error)
+        subject = "talk:/dock:Ferryman>/isle"
+        self.assertEqual(recorder.traversals[subject][0], 1)
+        self.assertEqual(recorder.traversals["map:/dock"][0], 1)
+        self.assertEqual(recorder.requirements[subject]["outcome"], "passed")
+        # An NPC that does not answer is a failed crossing of that edge.
+        from . import quest_tasks
+
+        async def silent(text, npc=""):
+            pass
+
+        self.client = VoyageClient()
+        self.client.route_recorder = recorder = RouteRecorder()
+        recorder.flush = lambda *args, **kwargs: None
+        self.client.talk = silent
+        clock = itertools_count(1000.0, 10.0)
+        with patch.object(quest_tasks, "time",
+                          types.SimpleNamespace(monotonic=lambda: next(clock))):
+            await self.walk(NavigateTask(self.graph, "/isle"), ticks=4)
+        self.assertEqual([(row["signal"], row["subject"]) for row in recorder.events],
+                         [("crossing_failed", subject)])
 
     async def test_a_page_that_differs_is_refused_and_never_clicked(self):
         self.client.page = dataclasses.replace(

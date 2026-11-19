@@ -1665,6 +1665,18 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   beside the NPC that has not moved her for 20 s or finds no square, only
   exclude the edge like a held exit (`navigation-voyage-failed`). Each voyage
   records `navigation-voyage` and `navigation-voyage-arrived`.
+- **Route events (P5).** P5's hooks fire around a voyage as around any
+  edge: `note_tick` at the top of every trip tick, so the voyage edge is
+  the one she walks toward. Arriving within 2 squares of its arrival
+  square records a traversal of its `talk:` subject (with the time from
+  boarding, the dialogue included) and of the map she left, and a
+  `passed` requirement for the `talk:` subject.
+  `navigation-voyage-failed` (no answer, a stalled walk beside the NPC)
+  is a `crossing_failed` event against the `talk:` subject, like a failed
+  click. A refusal is not written as a `rejected` requirement: 4.3 asks
+  for a server line as evidence, and a page that differs is not one. It
+  stays the in-memory refusal described above. The learned-cost model
+  does not read `talk:` subjects yet (P6).
 - **Owner blocks.** A voyage's subject is
   `talk:{source}:{npc}>{destination}`, as in 4.2, checked against the
   compiled voyages. Blocking it, or the arrival map, walls it like an exit:

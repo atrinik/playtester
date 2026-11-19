@@ -135,6 +135,9 @@ DECISION_SIGNALS = {
     "navigation-seam-excluded": CROSSING_FAILED,
     "navigation-seam-retry": CROSSING_FAILED,
     "navigation-click-failed": CROSSING_FAILED,
+    # A dialogue voyage (ROUTING P4) whose NPC did not answer or whose walk
+    # beside it stalled: against its talk: edge, like a failed click.
+    "navigation-voyage-failed": CROSSING_FAILED,
     "emergency-recall": RECALL,
     "emergency-disengage": RECALL,
 }

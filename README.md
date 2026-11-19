@@ -775,7 +775,8 @@ walking beside the NPC and following its authored pages exactly: a page
 that differs, a voyage that does not leave or lands elsewhere is refused
 for a day or until her keys or journal change, and is never clicked
 through. An owner block can name a voyage as
-`talk:SOURCE:NPC>DESTINATION`. The Tasks tab's **Voyages** section shows
+`talk:SOURCE:NPC>DESTINATION`, and her route events record each voyage
+she takes, or fails to start, under that name. The Tasks tab's **Voyages** section shows
 the flag, each voyage and why it is or is not offered, and the quest-gated
 exits. The design for alternative routes, unlocks such as keys, quests and
 NPC voyages, and costs learned from her own experience is in
