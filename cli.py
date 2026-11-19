@@ -151,10 +151,88 @@ def parser() -> argparse.ArgumentParser:
              "ATRINIK_BOT_OPERATOR_KEY_FILE, else operator-assist.key next to "
              "the runtime state, else /var/lib/atrinik-playtester); run as "
              "the bot's service user")
+    feedback = sub.add_parser(
+        "feedback",
+        help="her draft feedback queue, read from her memory database (no network)")
+    feedback_sub = feedback.add_subparsers(dest="feedback_command", required=True)
+    feedback_list = feedback_sub.add_parser("list", help="list feedback items")
+    feedback_list.add_argument("--kind", default="")
+    feedback_list.add_argument("--repo", default="")
+    feedback_list.add_argument("--status", default="")
+    feedback_list.add_argument("--limit", type=int, default=200)
+    feedback_list.add_argument("--json", action="store_true")
+    feedback_show = feedback_sub.add_parser(
+        "show", help="one item's title and the exact body that would be filed")
+    feedback_show.add_argument("item", help="its id, or its fingerprint (pt-...)")
+    feedback_show.add_argument("--json", action="store_true")
     deposit = sub.add_parser("deposit")
     deposit.add_argument("--container", required=True)
     deposit.add_argument("--item", action="append", required=True)
     return p
+
+
+def memory_path(runtime_state: str) -> Path:
+    """Her memory database, as ``AtrinikClient`` resolves ``--runtime-state``
+    (a legacy ``.json`` path keeps its database beside it)."""
+    requested = (Path(runtime_state) if runtime_state else
+                 Path(__file__).with_name("bot_memory.sqlite3"))
+    return (requested.with_suffix(".sqlite3")
+            if requested.suffix.casefold() == ".json" else requested)
+
+
+def feedback_command(args: argparse.Namespace) -> int:
+    """``feedback list|show``: read-only, local, no network (phase F5).
+
+    Reads the rows of the server, account and character given by
+    ``--host``, ``--port``, ``--account`` and ``--character``, as the bot
+    stores them; works whether or not the bot is running.
+    """
+    from .feedback import short_fingerprint
+    from .memory import BotMemory
+
+    path = memory_path(args.runtime_state)
+    if not args.character:
+        print("feedback: set --character (or ATRINIK_BOT_CHARACTER)")
+        return 2
+    if not path.is_file():
+        print(f"feedback: no memory database at {path}")
+        return 1
+    memory = BotMemory(path, server=f"{args.host.casefold()}:{args.port}",
+                       account=args.account)
+    if args.feedback_command == "list":
+        items = memory.feedback_items(args.character, kind=args.kind, repo=args.repo,
+                                      status=args.status, limit=args.limit)
+        for item in items:
+            item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
+            item.pop("body_md", None)
+            item.pop("evidence_json", None)
+        if args.json:
+            print(json.dumps(items, indent=2, sort_keys=True, ensure_ascii=False))
+            return 0
+        if not items:
+            print("No feedback items.")
+        for item in items:
+            print(f"{item['id']:>5}  {item['short_fingerprint']}  {item['status']:<8} "
+                  f"{item['kind']:<8} {item['repo']:<19} x{item['occurrences']:<4} "
+                  f"{item['title']}")
+        return 0
+    item = memory.feedback_item(args.character, args.item)
+    if item is None:
+        print(f"feedback: no single item matches {args.item!r}")
+        return 1
+    item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
+    if args.json:
+        item.pop("evidence_json", None)
+        print(json.dumps(item, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    print(f"#{item['id']} {item['short_fingerprint']} {item['status']} {item['kind']} "
+          f"-> {item['repo']} ({item['target']})")
+    print(f"Labels: {', '.join(json.loads(item['labels_json'] or '[]')) or 'none'}"
+          f"{'; type ' + item['issue_type'] if item['issue_type'] else ''}")
+    print(f"Title: {item['title']}")
+    print()
+    print(item["body_md"], end="")
+    return 0
 
 
 def autoplay_hold_reason(client) -> str:
@@ -205,6 +283,9 @@ async def main_async(args: argparse.Namespace) -> None:
         character_archetype=args.archetype,
     )
     client = AtrinikClient(config)
+    if args.operator_character:
+        # Never in a feedback draft (feedback.py, 4.10.4).
+        client.feedback_private_names.add(args.operator_character)
     engine = TaskEngine(client)
     client.chat_context_provider = engine.chat_context
     web_server = None
@@ -423,6 +504,9 @@ def operator_assist(args: argparse.Namespace) -> int:
 
 def main() -> None:
     args = parser().parse_args()
+    if args.task == "feedback":
+        # Local and read-only: needs no game inputs and no network.
+        raise SystemExit(feedback_command(args))
     if args.task == "operator-assist":
         # Needs no game inputs: it only talks to the running bot.
         raise SystemExit(operator_assist(args))

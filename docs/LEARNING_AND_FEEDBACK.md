@@ -1,9 +1,10 @@
 # Learning from the world and playtester feedback
 
 Status: design proposal. Phases F1 (the observation ledger), F2 (fact
-parsers and tile facts), F3 (effective item stats) and F10 (fights by
-terrain) are implemented; "F1 as built", "F2 as built", "F3 as built" and
-"F10 as built" in section 6 record where they differ from this text. Nothing else here is
+parsers and tile facts), F3 (effective item stats), F5 (the draft
+feedback queue) and F10 (fights by terrain) are implemented; "F1 as
+built", "F2 as built", "F3 as built", "F5 as built" and "F10 as built" in
+section 6 record where they differ from this text. Nothing else here is
 implemented, and nothing here changes behaviour until the phased pull
 requests at the end land.
 
@@ -1747,6 +1748,76 @@ first producers: "+N with no effect", the book experience formula and
 typos. No network at all.
 *Accept:* drafts are deduplicated across restarts; redaction and quoting
 tests pass (4.13); a test proves no socket is opened; nothing is filed.
+
+*F5 as built* (`feedback.py`, `feedback_producers.py`, `memory.py`, the
+Feedback tab, `atrinik-playtester feedback list|show`). Where the code
+differs from the text above:
+
+- **Storage.** `feedback_items` has the columns of 4.2 plus `subject` (for
+  filters and the CLI), `days` and `occurrence_keys_json`. `feedback_filings`
+  is not created yet; F6 adds it with the filer. Only `draft` rows are made.
+  The cap drops the drafts with the fewest occurrences, then the least
+  recently seen; other statuses are never dropped.
+- **Occurrences.** A finding carries an occurrence key; a key already
+  counted (the newest 200 are kept) adds nothing, so a restart, a repeated
+  sighting or the login sweep never inflates the count. Typos count once a
+  day a source, a low-Int book once a book, "+N" once a day. `days` grows
+  when an occurrence falls on a later UTC day than the last one. A draft's
+  title and body are rendered again from its merged evidence on every
+  occurrence (its `tried` lines, newest 10, and an aggregate's items, newest
+  50, accumulate); a rejected or filed item only gains occurrences.
+- **Evidence.** Prose in `evidence_json` is a list of parts: the
+  playtester's own fixed wording, or `{"code": ...}` for a name or value
+  from the game, always rendered as inline code; game text is only ever an
+  excerpt. Server formulas go in their own "What the server source says"
+  section, beside the "What the content says" of 4.10.3. "Where" names the
+  locked content and Classic server releases and this playtester's build:
+  her client cannot read the live server's build.
+- **Quoting.** Besides `<!--` and `-->` (removed until none is left, so
+  `<!<!---->--` cannot rebuild one), control characters and invisible
+  formatting characters (zero-width and bidirectional controls) are removed
+  from everything rendered. `fingerprints_outside_code` reads fingerprint
+  lines only outside fenced blocks, for F6's filer.
+- **Privacy.** Excerpt lines naming another character are dropped, against
+  the names she has seen in this process and every chat sender her memory
+  keeps for the account (so a restart does not forget them). Then the whole
+  title and body are checked against every private term: her account,
+  character name, the server's host, the password, the invite code, the
+  certificate pin, the party name, the operator character and those names.
+  A draft containing one is not stored, and only its fingerprint is logged.
+  Other players present are recorded only as a count of those in view.
+- **"+N with no effect"** reads her own carried items: an identified item
+  whose name shows "+N" counts when its effective stats come from her
+  examine (an artifact can give a cape the AC its archetype lacks) and
+  F3's note says the "+N" adds nothing; a light counts without an examine,
+  since it adds nothing at all. A shop's item counts only once it is in her
+  inventory (unpaid, after she picks it up). The family is the authored archetype name (or the
+  generic family), never the shown name, which a player could have set.
+  One aggregate draft, subject `presentation:plus-n-no-effect`, rather than
+  one per `item-family:`. It runs on the gear examiner's quiet tick, at
+  most every 30 seconds, and writes only when the set of qualifying items
+  changes in a process or a day passes.
+- **Book experience** is drafted when an authored book observation is
+  stored while her Int is 10 or lower. Whether the server still owed her
+  the book's experience (an unread copy) is not visible to the client; the
+  draft states the formula, her Int and Literacy, and the factor, and
+  quotes no book text.
+- **Typos** read only `authored` door, gate, lever, sign and magic-mouth
+  observations, one draft a source (`subject` is its `source_key`, such as
+  `door:/map:x,y`). The slips are a fixed list: a repeated small word ("the
+  the"), two articles ("a the") and about thirty common misspellings
+  ("recieve"). Slips are looked for only in the lines that may be quoted.
+  Each new observation is read as it is stored, and the newest 1,000 of each
+  kind once a login.
+- **Labels and types** are proposals until open question 3 is answered:
+  typos `bug`, `maps`; the book formula `bug`, `component: server`, type
+  `Bug`; "+N" `enhancement`, `component: server`.
+- **The Feedback tab** shows each draft's body as the plain Markdown text
+  that would be filed, in a `pre` built with `textContent`, not rendered;
+  there is no approval key and no POST route yet. The CLI reads the same
+  rows and needs `--character`; it never creates a database.
+- **Not built in F5:** the `feedback_items` gauge of 4.12, drafting from
+  shop items she has not picked up, and the other producers of 4.11.5.
 
 **F6. `feat(feedback)`: owner approval and GitHub filing.** The approval key,
 CLI `approve|reject|edit`, the separate filer unit and command, App key and

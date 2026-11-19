@@ -604,6 +604,11 @@ class ObservationRecorder:
     def _players_in_view(self, state: GameState) -> set[str]:
         return players_in_view(state, self.content())
 
+    def players_in_view(self, state: GameState) -> set[str]:
+        """Other players in view now (folded names); a feedback draft
+        records only how many (docs/LEARNING_AND_FEEDBACK.md 4.10.4)."""
+        return self._players_in_view(state)
+
     def _remember_view(self, state: GameState) -> set[str]:
         """Players in view now, remembered for as long as the process runs."""
         names = self._players_in_view(state)

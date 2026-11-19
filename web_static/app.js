@@ -702,6 +702,7 @@ $$(".tabs button").forEach(b => (b.onclick = () => {
   if (b.dataset.tab === "knowledge") pollKnowledge();
   if (b.dataset.tab === "equipment") renderEquipment();
   if (b.dataset.tab === "farming") pollTerrain();
+  if (b.dataset.tab === "feedback") pollFeedback();
 }));
 
 // ---------- knowledge (read-only) ----------
@@ -906,6 +907,58 @@ function renderTerrain(t) {
   $("#terrain-fights").replaceChildren(...fights);
 }
 
+// ---------- feedback drafts (read-only) ----------
+// Her draft queue (feedback.py), built from DOM nodes and text only: a body
+// is shown as the plain Markdown text that would be filed, never rendered.
+const FEEDBACK_KIND_LABELS = { bug: "Bug", hint: "Hint", balance: "Balance", qol: "Quality of life", clarity: "Clarity" };
+const feedbackOpen = new Set();
+let feedbackBusy = false, lastFeedbackSig = "";
+function fillSelect(select, first, values, label) {
+  const chosen = select.value, sig = values.join(",");
+  if (select.dataset.sig === sig) return;
+  select.replaceChildren(node("option", "", first), ...values.map(x => { const o = node("option", "", label(x)); o.value = x; return o; }));
+  select.firstChild.value = "";
+  select.value = values.includes(chosen) ? chosen : "";
+  select.dataset.sig = sig;
+}
+async function pollFeedback() {
+  if (feedbackBusy) return;
+  feedbackBusy = true;
+  try {
+    const kind = $("#feedback-kind").value, repo = $("#feedback-repo").value;
+    const r = await fetch(`/api/feedback?limit=200${kind ? `&kind=${encodeURIComponent(kind)}` : ""}${repo ? `&repo=${encodeURIComponent(repo)}` : ""}`, { cache: "no-store" });
+    if (r.ok) renderFeedback(await r.json());
+  } finally { feedbackBusy = false; }
+}
+function renderFeedback(f) {
+  const sig = JSON.stringify(f);
+  if (sig === lastFeedbackSig) return;
+  lastFeedbackSig = sig;
+  fillSelect($("#feedback-kind"), "All kinds", f.kinds || [], x => FEEDBACK_KIND_LABELS[x] || x);
+  fillSelect($("#feedback-repo"), "All repositories", f.repos || [], x => x);
+  const counts = f.counts || {}, drafts = Object.values(counts.draft || {}).reduce((a, b) => a + b, 0);
+  $("#feedback-summary").textContent = `${drafts} draft${drafts === 1 ? "" : "s"} · read-only: nothing is approved, filed or searched from here` +
+    (f.busy ? " · the database is busy; try again shortly" : "");
+  const day = t => new Date(t * 1000).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+  const rows = (f.items || []).map(x => {
+    const item = node("div", "feedback-item");
+    const head = node("div", "reading-head");
+    head.append(node("b", "", FEEDBACK_KIND_LABELS[x.kind] || x.kind), node("strong", "", x.title),
+      node("span", x.status === "draft" ? "flag" : "flag warn", x.status), node("span", "flag", `×${x.occurrences}`));
+    item.append(head);
+    item.append(node("small", "", [x.repo, x.short_fingerprint, `${x.days} day${x.days === 1 ? "" : "s"}`, `first ${day(x.first_seen)}`, `last ${day(x.last_seen)}`, (x.labels || []).join(", ")].filter(Boolean).join(" · ")));
+    const details = node("details");
+    details.open = feedbackOpen.has(x.id);
+    details.addEventListener("toggle", () => { if (details.open) feedbackOpen.add(x.id); else feedbackOpen.delete(x.id); });
+    details.append(node("summary", "", "Body as it would be filed"), node("pre", "feedback-body", x.body_md));
+    item.append(details);
+    return item;
+  });
+  $("#feedback").replaceChildren(...(rows.length ? rows : [node("span", "muted", "No drafts.")]));
+}
+$("#feedback-kind").onchange = pollFeedback;
+$("#feedback-repo").onchange = pollFeedback;
+
 // ---------- polling ----------
 let liveBusy = false, slowBusy = false;
 async function pollLive() {
@@ -929,6 +982,7 @@ async function pollSlow() {
     if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderBlocks(); renderLearned(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
     if ($("#tab-farming").classList.contains("active")) pollTerrain();
+    if ($("#tab-feedback").classList.contains("active")) pollFeedback();
   } finally { slowBusy = false; }
 }
 pollLive(); pollSlow();

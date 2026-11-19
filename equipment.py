@@ -739,6 +739,11 @@ class GearExaminer:
             return False
         now = self.clock()
         self.shadow(client)
+        # The "+N with no effect" feedback producer reads the same gear
+        # (AtrinikClient.note_equipment_feedback); it only writes a draft.
+        note_feedback = getattr(client, "note_equipment_feedback", None)
+        if callable(note_feedback):
+            note_feedback()
         examine = getattr(client, "examine", None)
         if (examine is None or now - self.last_sent < self.SPACING or
                 now < self.paused_until or

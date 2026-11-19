@@ -23,6 +23,7 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .equipment import equipment_report
+from .feedback import KINDS as FEEDBACK_KINDS, REPOS as FEEDBACK_REPOS, short_fingerprint
 from .face_images import FaceImages
 from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from .alerts import active as active_alerts
@@ -1143,6 +1144,37 @@ class WebControlServer:
             # ?limit=N (up to 200) and the decayed rates over all kept.
             # Counts only: no attacker's or other player's name is stored.
             await self._reply(writer, 200, _json_bytes(self._terrain(parse_qs(query))))
+            return
+        if method == "GET" and path == "/api/feedback":
+            # Her draft feedback queue (feedback.py), read-only:
+            # ?kind=KIND&repo=OWNER/NAME&status=STATUS&limit=N. Drafts hold
+            # only authored text and her own state; nothing is filed from
+            # here (approval and filing are phase F6).
+            params = parse_qs(query)
+            character = getattr(self.client, "_memory_character", "")
+            items, counts, busy = [], {}, False
+            if character:
+                memory = self.client._memory_store()
+                try:
+                    items = memory.feedback_items(
+                        character, kind=(params.get("kind") or [""])[0],
+                        repo=(params.get("repo") or [""])[0],
+                        status=(params.get("status") or [""])[0],
+                        limit=int((params.get("limit") or ["200"])[0]),
+                        timeout=KNOWLEDGE_READ_TIMEOUT)
+                    counts = memory.feedback_counts(character, timeout=KNOWLEDGE_READ_TIMEOUT)
+                except sqlite3.OperationalError:
+                    items, counts, busy = [], {}, True
+            for item in items:
+                item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
+                try:
+                    item["labels"] = json.loads(item.pop("labels_json") or "[]")
+                except ValueError:
+                    item["labels"] = []
+                item.pop("evidence_json", None)
+            await self._reply(writer, 200, _json_bytes({
+                "items": items, "counts": counts, "busy": busy, "read_only": True,
+                "kinds": list(FEEDBACK_KINDS), "repos": list(FEEDBACK_REPOS)}))
             return
         if method == "GET" and path.startswith("/api/face/"):
             image = self.face_images.png(path[len("/api/face/"):])

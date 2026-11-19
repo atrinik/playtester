@@ -8,7 +8,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +54,16 @@ ROUTE_EVENT_SAVE_TIMEOUT = 0.25
 FACT_COLUMNS = ("id", "kind", "subject", "value", "confidence", "status",
                 "observation_id", "parser", "detail", "inputs", "created_at",
                 "updated_at", "expires_at")
+# The feedback queue (4.10, phase F5, feedback.py): drafts are capped, the
+# lowest-occurrence, least recently seen drafts dropped first; other
+# statuses are kept. Each draft remembers its newest occurrence keys.
+FEEDBACK_DRAFT_LIMIT = 500
+FEEDBACK_OCCURRENCE_KEYS = 200
+FEEDBACK_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
+FEEDBACK_COLUMNS = ("id", "fingerprint", "repo", "kind", "subject", "target", "title",
+                    "body_md", "labels_json", "issue_type", "evidence_json", "status",
+                    "occurrences", "days", "first_seen", "last_seen", "decided_at",
+                    "decided_via", "issue_url", "error")
 
 
 def _add_column(db: sqlite3.Connection, table: str, definition: str) -> None:
@@ -267,6 +277,41 @@ class BotMemory:
                        evidence TEXT NOT NULL DEFAULT '',
                        PRIMARY KEY (server, account, character, edge)
                    )""")
+
+            # The draft feedback queue (feedback.py): one row a fingerprint.
+            # Only drafts exist before phase F6 adds approval and filing.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS feedback_items (
+                       id INTEGER PRIMARY KEY,
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       fingerprint TEXT NOT NULL,
+                       repo TEXT NOT NULL,
+                       kind TEXT NOT NULL,
+                       subject TEXT NOT NULL,
+                       target TEXT NOT NULL DEFAULT 'new-issue',
+                       title TEXT NOT NULL,
+                       body_md TEXT NOT NULL,
+                       labels_json TEXT NOT NULL DEFAULT '[]',
+                       issue_type TEXT NOT NULL DEFAULT '',
+                       evidence_json TEXT NOT NULL,
+                       status TEXT NOT NULL DEFAULT 'draft',
+                       occurrences INTEGER NOT NULL DEFAULT 1,
+                       days INTEGER NOT NULL DEFAULT 1,
+                       occurrence_keys_json TEXT NOT NULL DEFAULT '[]',
+                       first_seen REAL NOT NULL,
+                       last_seen REAL NOT NULL,
+                       remote_candidates_json TEXT,
+                       decided_at REAL,
+                       decided_via TEXT,
+                       issue_url TEXT,
+                       error TEXT,
+                       UNIQUE (server, account, character, fingerprint)
+                   )""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS feedback_by_status
+                   ON feedback_items (server, account, character, status, occurrences)""")
         self._chat_appends = 0
         self._observation_inserts = 0
         self._fact_inserts = 0
@@ -683,6 +728,163 @@ class BotMemory:
                    WHERE server = ? AND account = ? AND character = ?""",
                 (self.server, self.account, character.casefold())).fetchone()
         return int(count)
+    def record_feedback(self, character: str, *, fingerprint: str, repo: str, kind: str,
+                        subject: str, at: float, occurrence: str,
+                        build: Callable[..., dict[str, Any]],
+                        timeout: float = FEEDBACK_SAVE_TIMEOUT) -> tuple[int, bool]:
+        """Start a draft for ``fingerprint`` or count another occurrence of it,
+        in one transaction (feedback.note).
+
+        An ``occurrence`` key already counted (among the newest
+        ``FEEDBACK_OCCURRENCE_KEYS``) adds no occurrence; an empty key always
+        adds one. ``days`` grows when an occurrence falls on a later UTC day
+        than the last one. ``build(stored_evidence, occurrences, days,
+        first_seen, last_seen)`` returns the title, body, evidence, labels and
+        type; it is called for a new draft and for a draft, never for an
+        item past draft, which only gains occurrences. Whatever ``build``
+        raises leaves the row as it was. Returns the id and whether it is new.
+        """
+        folded = character.casefold()
+        scope = (self.server, self.account, folded)
+        with self._connect(timeout) as db:
+            row = db.execute(
+                """SELECT id, status, occurrences, days, occurrence_keys_json,
+                          first_seen, last_seen, evidence_json
+                   FROM feedback_items
+                   WHERE server = ? AND account = ? AND character = ? AND fingerprint = ?""",
+                (*scope, fingerprint)).fetchone()
+            if row is None:
+                fields = build(None, 1, 1, at, at)
+                cursor = db.execute(
+                    """INSERT INTO feedback_items
+                           (server, account, character, fingerprint, repo, kind, subject,
+                            title, body_md, labels_json, issue_type, evidence_json,
+                            occurrence_keys_json, first_seen, last_seen)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (*scope, fingerprint, repo, kind, subject, fields["title"],
+                     fields["body_md"], fields["labels_json"], fields["issue_type"],
+                     fields["evidence_json"], json.dumps([occurrence] if occurrence else []),
+                     at, at))
+                row_id = int(cursor.lastrowid)
+                self._prune_feedback(db, folded)
+                return row_id, True
+            row_id, status, occurrences, days, keys_json, first_seen, last_seen, stored = row
+            try:
+                keys = [str(key) for key in json.loads(keys_json)]
+            except (TypeError, ValueError):
+                keys = []
+            if not occurrence or occurrence not in keys:
+                occurrences += 1
+                if time.gmtime(at)[:3] > time.gmtime(last_seen)[:3]:
+                    days += 1
+                if occurrence:
+                    keys = (keys + [occurrence])[-FEEDBACK_OCCURRENCE_KEYS:]
+            first_seen, last_seen = min(first_seen, at), max(last_seen, at)
+            counts = (occurrences, days, json.dumps(keys), first_seen, last_seen)
+            if status != "draft":
+                db.execute(
+                    """UPDATE feedback_items SET occurrences = ?, days = ?,
+                           occurrence_keys_json = ?, first_seen = ?, last_seen = ?
+                       WHERE id = ?""", (*counts, row_id))
+                return int(row_id), False
+            try:
+                evidence = json.loads(stored)
+            except (TypeError, ValueError):
+                evidence = None
+            fields = build(evidence, occurrences, days, first_seen, last_seen)
+            db.execute(
+                """UPDATE feedback_items SET occurrences = ?, days = ?,
+                       occurrence_keys_json = ?, first_seen = ?, last_seen = ?,
+                       title = ?, body_md = ?, labels_json = ?, issue_type = ?,
+                       evidence_json = ?
+                   WHERE id = ?""",
+                (*counts, fields["title"], fields["body_md"], fields["labels_json"],
+                 fields["issue_type"], fields["evidence_json"], row_id))
+        return int(row_id), False
+
+    def _prune_feedback(self, db: sqlite3.Connection, character: str) -> None:
+        """Drop the drafts over the cap: fewest occurrences, then least
+        recently seen, first. Other statuses are never dropped."""
+        scope = (self.server, self.account, character)
+        (count,) = db.execute(
+            """SELECT count(*) FROM feedback_items
+               WHERE server = ? AND account = ? AND character = ? AND status = 'draft'""",
+            scope).fetchone()
+        excess = count - FEEDBACK_DRAFT_LIMIT
+        if excess > 0:
+            db.execute(
+                """DELETE FROM feedback_items WHERE id IN (
+                       SELECT id FROM feedback_items
+                       WHERE server = ? AND account = ? AND character = ?
+                         AND status = 'draft'
+                       ORDER BY occurrences, last_seen, id LIMIT ?)""",
+                (*scope, excess))
+
+    def feedback_items(self, character: str, *, kind: str = "", repo: str = "",
+                       status: str = "", limit: int = 200,
+                       timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her feedback items, most recently seen first."""
+        query = f"""SELECT {", ".join(FEEDBACK_COLUMNS)} FROM feedback_items
+                    WHERE server = ? AND account = ? AND character = ?"""
+        params: list[Any] = [self.server, self.account, character.casefold()]
+        for column, value in (("kind", kind), ("repo", repo), ("status", status)):
+            if value:
+                query += f" AND {column} = ?"
+                params.append(value)
+        query += " ORDER BY last_seen DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._connect(timeout) as db:
+            rows = db.execute(query, params).fetchall()
+        return [dict(zip(FEEDBACK_COLUMNS, row)) for row in rows]
+
+    def feedback_item(self, character: str, reference: str, *,
+                      timeout: float = 10.0) -> dict[str, Any] | None:
+        """One item by its id, or by its fingerprint (full, or ``pt-`` and
+        at least 12 hex digits); None when none or more than one match."""
+        reference = reference.strip().casefold()
+        scope = (self.server, self.account, character.casefold())
+        columns = ", ".join(FEEDBACK_COLUMNS)
+        with self._connect(timeout) as db:
+            if reference.isdigit():
+                rows = db.execute(
+                    f"""SELECT {columns} FROM feedback_items
+                        WHERE server = ? AND account = ? AND character = ? AND id = ?""",
+                    (*scope, int(reference))).fetchall()
+            else:
+                prefix = reference.removeprefix("pt-")
+                if len(prefix) < 12 or any(ch not in "0123456789abcdef" for ch in prefix):
+                    return None
+                rows = db.execute(
+                    f"""SELECT {columns} FROM feedback_items
+                        WHERE server = ? AND account = ? AND character = ?
+                          AND substr(fingerprint, 1, ?) = ? LIMIT 2""",
+                    (*scope, len(prefix), prefix)).fetchall()
+        return dict(zip(FEEDBACK_COLUMNS, rows[0])) if len(rows) == 1 else None
+
+    def feedback_counts(self, character: str, *,
+                        timeout: float = 10.0) -> dict[str, dict[str, int]]:
+        """Her feedback items by status, then kind."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT status, kind, count(*) FROM feedback_items
+                   WHERE server = ? AND account = ? AND character = ?
+                   GROUP BY status, kind""",
+                (self.server, self.account, character.casefold())).fetchall()
+        counts: dict[str, dict[str, int]] = {}
+        for status, kind, count in rows:
+            counts.setdefault(status, {})[kind] = int(count)
+        return counts
+
+    def chat_senders(self, *, limit: int = 5000, timeout: float = 10.0) -> list[str]:
+        """The distinct senders in this account's chat log (any of its
+        characters), most recent first: names drafts must never contain."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT sender FROM chat_log
+                   WHERE server = ? AND account = ?
+                   GROUP BY sender ORDER BY max(at) DESC LIMIT ?""",
+                (self.server, self.account, max(1, int(limit)))).fetchall()
+        return [str(sender) for (sender,) in rows if sender]
 
     def set_route_block(self, character: str, subject: str, *, created_at: float,
                         until: float, note: str = "", timeout: float = 10.0) -> None:
