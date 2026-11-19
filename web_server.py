@@ -29,6 +29,7 @@ from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_far
                          FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
 from .navigation_spots import navigation_spot_catalog
+from .unlocks import gate_counts, unlock_state
 from .operator_assist import (KEY_HEADER, MAX_GOLD_PER_RUN, OperatorAssist,
                               OperatorAssistRefused, key_matches)
 from .quest_tasks import EscapingDesertedIslandTask
@@ -273,6 +274,13 @@ class DashboardState:
                 "parts": parts,
             })
         return result
+
+    def unlocks(self) -> dict[str, Any]:
+        """Her unlock state, read-only: the keys she carries and where."""
+        gates = getattr(self, "_gate_counts", None)
+        if gates is None:
+            gates = self._gate_counts = gate_counts(self.graph)
+        return unlock_state(self.client, self.graph).summary(gates)
 
     def quest_journal(self) -> list[dict[str, Any]]:
         """Return only the live entries supplied by the server's Q journal."""
@@ -688,6 +696,7 @@ class DashboardState:
             "messages": messages, "interface": interface,
             "quests_loaded": state.quests_loaded, "quests": self.quests(),
             "quest_journal": self.quest_journal(),
+            "unlocks": self.unlocks(),
             "farming_analysis": self.farming_analysis(),
             "post_mortems": list(reversed(
                 getattr(self.client, "post_mortems", [])[-10:])),

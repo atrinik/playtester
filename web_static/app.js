@@ -17,7 +17,7 @@ function applyStyles(root) {
 }
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts,engine_error";
-const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
+const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -562,6 +562,54 @@ $("#run-nav").onclick = e => { const dest = $("#nav-map").value.trim(); if (!des
 $("#bank").onclick = e => task(e.target, "Depositing money", { type: "bank", banker: $("#banker").value, amount: $("#bank-amount").value });
 $("#sell-junk").onclick = e => task(e.target, "Selling junk", { type: "sell_junk", merchant: "shop-floor", patterns: $("#junk-patterns").value.split("\n").map(x => x.trim()).filter(Boolean) });
 
+// ---------- unlocks (read-only; docs/ROUTING.md 4.3) ----------
+// Built with DOM nodes and classes only: no markup strings, no inline styles.
+const UNLOCK_WHERE = { inventory: "carried", container: "in an open container" };
+function unlockRow(title, flag, note) {
+  const row = document.createElement("div");
+  row.className = "quest";
+  const name = document.createElement("strong");
+  name.textContent = title;
+  const tag = document.createElement("span");
+  tag.className = "flag";
+  tag.textContent = flag;
+  row.append(name, tag);
+  if (note) {
+    const small = document.createElement("small");
+    small.textContent = note;
+    row.append(small);
+  }
+  return row;
+}
+let lastUnlockSig = "";
+function renderUnlocks() {
+  const u = slow.unlocks;
+  const sig = JSON.stringify(u ?? null);
+  if (sig === lastUnlockSig) return;
+  lastUnlockSig = sig;
+  const rows = [];
+  if (!u) {
+    const none = document.createElement("span");
+    none.className = "muted";
+    none.textContent = "Not available.";
+    rows.push(none);
+  } else {
+    for (const key of u.keys || []) {
+      const items = (key.items || []).map(i => `${i.name} (${UNLOCK_WHERE[i.where] || i.where}${i.container ? `: ${i.container}` : ""})`).join(", ");
+      rows.push(unlockRow(key.lock, `${key.tiles} gated tile${key.tiles === 1 ? "" : "s"}`, items));
+    }
+    if (!(u.keys || []).length) rows.push(unlockRow("No keys", u.inventory_known ? "none carried" : "inventory loading", ""));
+    for (const a of u.ambiguous || []) rows.push(unlockRow(a.name, "ambiguous: opens nothing", `could be any of ${a.locks.join(", ")}`));
+    const notes = [`${(u.keys || []).length} of ${u.locks_known} lock ids open`, u.quests_loaded ? `${u.quest_parts_done} journal parts done` : "journal not loaded"];
+    if (u.override) notes.push("override: every gate open");
+    const summary = document.createElement("small");
+    summary.className = "muted";
+    summary.textContent = `${notes.join(" · ")} · state ${u.fingerprint}`;
+    rows.push(summary);
+  }
+  $("#unlocks").replaceChildren(...rows);
+}
+
 // ---------- tabs ----------
 $$(".tabs button").forEach(b => (b.onclick = () => {
   $$(".tabs button").forEach(x => x.classList.toggle("active", x === b));
@@ -622,7 +670,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderUnlocks(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
   } finally { slowBusy = false; }
 }

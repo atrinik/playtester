@@ -23,9 +23,10 @@ from .navigation import (BuySpellTask, FarmCircuitTask, FoodProfile,
                          MorgeeanShipKeyTask, NamedSpawn,
                          NavigateTask, NavigateThenTask, ServerGameClock,
                          ShopUpgradeSweepTask, WorldGraph, _checker_requirement,
-                         _coordinate_name, carried_items, content_attr,
+                         _coordinate_name, content_attr,
                          CONTENT_ROOT)
 from . import requirements as req
+from . import unlocks
 from .catalog_quest_tasks import (ApplyAtTask, ApplyGroundTask, ArrivedTask,
                                   CatalogQuestTask, DialogAtTask,
                                   AcquireContainerItemTask,
@@ -16320,7 +16321,7 @@ class NavigationTests(unittest.TestCase):
         # Unknown inventory keeps every gated tile closed.
         self.assertFalse(node.walkable(1, 0, allow_locked=False))
 
-    def test_carried_items_walk_opened_containers(self):
+    def test_carried_objects_walk_listed_containers_only(self):
         state = GameState(phase="playing", player_tag=7)
         state.place_item(Item(1, name="key ring", item_type=c.TYPE_CONTAINER), 7)
         state.place_item(Item(2, name="Morg'eean's Ship Key"), 1)
@@ -16328,13 +16329,25 @@ class NavigationTests(unittest.TestCase):
         state.place_item(Item(4, name="orange stone giant key"), 3)
         state.place_item(Item(5, name="sack", item_type=c.TYPE_CONTAINER), 7)
         state.place_item(Item(6, name="bread"), 7)
+        # A container never stands for itself: neither the listed key ring
+        # nor the sack whose contents are not listed counts.
         self.assertEqual(
-            sorted(item.name for item in carried_items(state)),
-            ["Morg'eean's Ship Key", "bread", "orange stone giant key",
-             "sack"])
+            sorted((obj.name, obj.where, obj.container)
+                   for obj in unlocks.carried_objects(state)),
+            [("Morg'eean's Ship Key", unlocks.CONTAINER, "key ring"),
+             ("bread", unlocks.INVENTORY, ""),
+             ("orange stone giant key", unlocks.CONTAINER, "pouch")])
+        # Closing the ring deletes its listed contents
+        # (esrv_close_container): its key no longer counts until reopened.
+        state.remove_item(2)
+        state.remove_item(3)
+        self.assertEqual([obj.name for obj in unlocks.carried_objects(state)],
+                         ["bread"])
         # A state without container bookkeeping falls back to the top level.
-        flat = type("State", (), {"inventory": [Item(8, name="torch")]})()
-        self.assertEqual([item.name for item in carried_items(flat)],
+        flat = type("State", (), {"inventory": [
+            Item(8, name="torch"),
+            Item(9, name="key ring", item_type=c.TYPE_CONTAINER)]})()
+        self.assertEqual([obj.name for obj in unlocks.carried_objects(flat)],
                          ["torch"])
 
     def test_key_in_a_key_ring_still_opens_its_lock(self):
@@ -16397,6 +16410,299 @@ class NavigationTests(unittest.TestCase):
             ("/shattered_islands/world_12_65", (5, 19)):
                 {"berri_lur_stench"},
         })
+
+    @staticmethod
+    def _sera_live_inventory() -> GameState:
+        """Sera's inventory as her client holds it (2026-11-14 /api/state).
+
+        Item names, types and flags as the server sends them: the quest
+        keys and the talisman at the top level, a key ring she has never
+        opened, equipment, food, coins, and the skill and force objects the
+        server sends in the same inventory.
+        """
+        state = GameState(phase="playing", player_tag=7)
+        state.player_name = "Sera"
+        carried = [
+            Item(101, name="Incuna Western Gate Key", item_type=21,
+                 quality=100, condition=100),
+            Item(102, name="Incuna Tavern Barn Key", item_type=21,
+                 quality=100, condition=100),
+            Item(103, name="Morg'eean's Ship Key", item_type=21,
+                 quality=100, condition=100),
+            Item(104, name="Forgotten Tunnels Kobold Key", item_type=21,
+                 quality=100, condition=100),
+            Item(105, name="Blue Crystal Talisman of Incuna",
+                 item_type=c.TYPE_AMULET, flags=c.ITEM_APPLIED | c.ITEM_MAGICAL),
+            Item(106, name="key ring", item_type=c.TYPE_CONTAINER),
+            Item(107, name="iron longsword", item_type=c.TYPE_WEAPON,
+                 flags=c.ITEM_APPLIED),
+            Item(108, name="leather armour", item_type=c.TYPE_ARMOUR,
+                 flags=c.ITEM_APPLIED),
+            Item(109, name="wholemeal breads", item_type=c.TYPE_FOOD,
+                 quantity=4),
+            Item(110, name="silver coins", item_type=c.TYPE_MONEY,
+                 quantity=37),
+            Item(111, name="scroll of word of recall", item_type=c.TYPE_SCROLL),
+            Item(112, name="one handed weapons", item_type=c.TYPE_SKILL),
+            Item(113, name="Food Force", item_type=c.TYPE_FORCE),
+        ]
+        for item in carried:
+            state.place_item(item, 7)
+        return state
+
+    def test_live_inventory_yields_the_incuna_gate_and_barn_locks(self):
+        graph = built_graph()
+        client = type("Client", (), {})()
+        client.state = self._sera_live_inventory()
+        access = NavigateTask(graph, "/shattered_islands/world_4_85")._allow_locked(
+            client)
+        # The two Incuna keys are Lost Memories rewards from
+        # incuna/artifacts.art; no map places them (ROUTING G7).
+        # Exactly these: the unopened key ring opens nothing (P1-1 of the
+        # review: it once opened the `locked` celestial gates).
+        self.assertEqual(
+            access,
+            {"incuna_western_gate_key", "incuna_tavern_barn",
+             "morgeean_ship_key", "forgotten_tunnels_kobold_key"})
+        self.assertIs(access, unlocks.unlock_state(client, graph).access)
+        for lock_id in ("incuna_western_gate_key", "incuna_tavern_barn"):
+            gated = [(path, point) for path, node in graph.nodes.items()
+                     for point, requirement in node.locks.items()
+                     if lock_id in requirement.lock_ids(req.Item)]
+            self.assertTrue(gated, lock_id)
+            for path, point in gated:
+                node = graph.nodes[path]
+                self.assertTrue(node.walkable(*point, allow_locked=access))
+                self.assertFalse(node.walkable(
+                    *point, allow_locked=access - {lock_id}))
+        # The talisman's title does not make it a key.
+        state = unlocks.unlock_state(client, graph)
+        held = dict(state.keys)
+        self.assertEqual([obj.name for obj in held["incuna_western_gate_key"]],
+                         ["Incuna Western Gate Key"])
+        self.assertTrue(all(obj.where == unlocks.INVENTORY
+                            for objs in held.values() for obj in objs))
+
+    def test_content_key_aliases_add_artifact_and_reward_keys(self):
+        graph = built_graph()
+        aliases = graph.access_item_names
+        self.assertIn("incuna western gate key", aliases["incuna_western_gate_key"])
+        self.assertIn("incuna tavern barn key", aliases["incuna_tavern_barn"])
+        # Two Lovers Doomed's reward, an artifact on the key_skull archetype.
+        self.assertIn("underground city skull key", aliases["underground_city_key3"])
+        # A renamed artifact does not inherit its archetype's plural.
+        self.assertNotIn("strange keys", aliases["incuna_western_gate_key"])
+        # Only KEY objects are keys: the key ring placed with slaying
+        # "locked" (world_3_85) is not one.
+        self.assertNotIn("key ring", {name for names in aliases.values()
+                                      for name in names})
+        # Only lock ids that gate a tile are kept.
+        self.assertLessEqual(set(aliases), set(unlocks.gate_counts(graph)))
+        # The generic "strange key" names several locks: it opens none.
+        ambiguous = unlocks.ambiguous_aliases(aliases)
+        self.assertGreater(len(ambiguous["strange key"]), 1)
+        self.assertNotIn("incuna western gate key", ambiguous)
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.place_item(Item(1, name="strange key", item_type=21), 7)
+        state = unlocks.unlock_state(client, graph)
+        self.assertEqual(state.access, frozenset())
+        self.assertEqual(state.ambiguous,
+                         (("strange key", ambiguous["strange key"]),))
+        self.assertEqual(state.summary()["ambiguous"],
+                         [{"name": "strange key",
+                           "locks": list(ambiguous["strange key"])}])
+
+        archetypes = {
+            "key2": {"attrs": {"name": "strange key", "name_pl": "strange keys",
+                               "slaying": "set_individual_value", "type": "21"}},
+            "gate_key": {"attrs": {"slaying": "gate", "type": "21"}},
+            "ring": {"attrs": {"name": "key ring", "slaying": "gate",
+                               "type": "122"}},
+            "undead_bane": {"attrs": {"name": "sword", "slaying": "undead",
+                                      "type": "15"}},
+        }
+        artifacts = [
+            {"id": "barn_key", "def_arch": "key2",
+             "attrs": {"name": "Barn Key", "slaying": "barn"}},
+            {"id": "plain", "def_arch": "key2", "attrs": {"slaying": "barn"}},
+            {"id": "holy", "def_arch": "undead_bane", "attrs": {}},
+        ]
+        self.assertEqual(
+            unlocks.content_key_aliases(
+                {"gate", "barn", "name:barn key"}, archetypes, artifacts),
+            # An archetype without a name is named by its identity; a race
+            # slaying and a container are never keys; an unnamed artifact
+            # keeps the archetype's name and plural.
+            {"gate": {"gate_key"},
+             "barn": {"barn key", "strange key", "strange keys"}})
+
+    def test_unlock_state_snapshot_contract(self):
+        state = unlocks.UnlockState(access=frozenset({"ship"}))
+        self.assertIsNone(state.quest_part("Lost Memories"))
+        loaded = unlocks.UnlockState(
+            access=frozenset({"ship"}), quests_loaded=True,
+            quests=(("Lost Memories", "", "completed"),
+                    ("Lost Memories", "The Priest", "done"),
+                    ("Two Lovers Doomed", "", "active"),
+                    ("Two Lovers Doomed", "Tortwald", "done")))
+        self.assertTrue(loaded.quest_part("Lost Memories"))
+        self.assertTrue(loaded.quest_part("Lost Memories", "The Priest"))
+        self.assertFalse(loaded.quest_part("Two Lovers Doomed"))
+        self.assertFalse(loaded.quest_part("Unknown"))
+        # The fingerprint follows the item and quest state, never names.
+        self.assertNotEqual(state.fingerprint, loaded.fingerprint)
+        self.assertEqual(state.fingerprint, unlocks.UnlockState(
+            access=frozenset({"ship"})).fingerprint)
+        self.assertRegex(state.fingerprint, r"^[0-9a-f]{16}$")
+        # Learned tiles (LEARNING F8) are an empty hook: a passed record
+        # never satisfies a consuming checker, a rejection closes a tile.
+        key = req.requires(req.Item("ship"))
+        spend = req.requires(req.Consumes("force"))
+        self.assertEqual(dict(state.learned_tiles), {})
+        self.assertTrue(state.tile_allowed("/m", (1, 1), key))
+        self.assertFalse(state.tile_allowed("/m", (1, 1), spend))
+        learned = unlocks.UnlockState(
+            access=frozenset(), learned_tiles={("/m", 1, 1): "passed",
+                                               ("/m", 2, 2): "rejected"})
+        self.assertTrue(learned.tile_allowed("/m", (1, 1), key))
+        self.assertFalse(learned.tile_allowed("/m", (1, 1), spend))
+        self.assertFalse(learned.tile_allowed("/m", (2, 2), req.NONE))
+        self.assertTrue(learned.tile_allowed("/m", (3, 3), None))
+
+    def test_unlock_state_is_cached_until_an_input_changes(self):
+        graph = WorldGraph()
+        graph.access_item_names["ship"] = {"ship key"}
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.place_item(Item(1, name="Ship Key"), 7)
+        first = unlocks.unlock_state(client, graph)
+        self.assertEqual(first.access, frozenset({"ship"}))
+        self.assertIs(unlocks.unlock_state(client, graph), first)
+        client.state.remove_item(1)
+        self.assertEqual(unlocks.unlock_state(client, graph).access, frozenset())
+        client.state.quests_loaded = True
+        self.assertTrue(unlocks.unlock_state(client, graph).quests_loaded)
+        summary = first.summary({"ship": 2, "gate": 1})
+        self.assertEqual(summary["keys"], [{
+            "lock": "ship", "tiles": 2,
+            "items": [{"name": "Ship Key", "where": unlocks.INVENTORY,
+                       "container": ""}]}])
+        self.assertEqual(summary["locks_known"], 2)
+        self.assertFalse(summary["override"])
+
+    def test_route_keeps_closed_gates_shut_under_an_access_set(self):
+        graph = WorldGraph()
+        for path, width in (("/start", 2), ("/yard", 5), ("/ship", 2),
+                            ("/far", 2)):
+            node = MapNode(path, width=width, height=1)
+            node.terrain = {(x, 0): 1 for x in range(width)}
+            graph.nodes[path] = node
+        # The yard's gangway at (4, 0) lies past a gate on (2, 0).
+        graph.nodes["/yard"].locks[(2, 0)] = req.requires(req.Item("ship"))
+        graph.nodes["/start"].edges.append(MapEdge("/start", "/yard", 1, 0, 0, 0))
+        graph.nodes["/yard"].edges.append(MapEdge("/yard", "/ship", 4, 0, 0, 0))
+        graph.nodes["/ship"].edges.append(MapEdge("/ship", "/far", 1, 0, 0, 0))
+        hops = lambda **kw: [edge.destination for edge in
+                             graph.route("/start", "/far", **kw)]
+        # Without an access set the map-level estimate ignores gates.
+        self.assertEqual(hops(), ["/yard", "/ship", "/far"])
+        self.assertEqual(hops(access=frozenset({"ship"})), ["/yard", "/ship", "/far"])
+        self.assertEqual(hops(access=True), ["/yard", "/ship", "/far"])
+        with self.assertRaises(ValueError):
+            graph.route("/start", "/far", access=frozenset())
+        with self.assertRaises(ValueError):
+            graph.route("/start", "/far", access=False)
+        # On a split source map, source_xy picks her side of the gate.
+        self.assertEqual(
+            [edge.destination for edge in graph.route(
+                "/yard", "/far", access=frozenset(), source_xy=(3, 0))],
+            ["/ship", "/far"])
+        with self.assertRaises(ValueError):
+            graph.route("/yard", "/far", access=frozenset(), source_xy=(0, 0))
+        # Standing on an unwalkable square (the closed gate) keeps every
+        # component as a possible start: the estimate, not a failure.
+        self.assertEqual(
+            [edge.destination for edge in graph.route(
+                "/yard", "/far", access=frozenset(), source_xy=(2, 0))],
+            ["/ship", "/far"])
+        # The map-level graph and every gated view rebuild together.
+        graph.nodes["/yard"].locks.clear()
+        graph._world_search_snapshot = None
+        graph._component_cache.clear()
+        self.assertEqual(hops(access=frozenset()), ["/yard", "/ship", "/far"])
+
+    def test_component_cache_evicts_the_least_recently_used_access_set(self):
+        graph = WorldGraph()
+        node = MapNode("/m", width=3, height=1,
+                       terrain={(x, 0): 1 for x in range(3)})
+        graph.nodes["/m"] = node
+        sets = [frozenset({str(index)}) for index in range(5)]
+        for access in sets[:4]:
+            graph._component("/m", (0, 0), allow_locked=access)
+        # Using the oldest set again makes the second the least recent.
+        graph._component("/m", (0, 0), allow_locked=sets[0])
+        graph._component("/m", (0, 0), allow_locked=sets[4])
+        cached = {key[1] for key in graph._component_cache}
+        self.assertEqual(cached, {sets[0], sets[2], sets[3], sets[4]})
+        self.assertEqual(graph._component_access_order,
+                         [sets[2], sets[3], sets[0], sets[4]])
+        from .navigation import _clear_components
+        _clear_components(graph)
+        self.assertEqual((graph._component_cache, graph._component_access_order),
+                         ({}, []))
+
+    def test_name_locks_never_make_a_key_name_ambiguous(self):
+        aliases = {"name:blue stone giant key": {"blue stone giant key"},
+                   "giant_gate": {"blue stone giant key"},
+                   "a": {"strange key"}, "b": {"Strange Key"}}
+        self.assertEqual(unlocks.ambiguous_aliases(aliases),
+                         {"strange key": ("a", "b")})
+
+    def test_savebed_walks_use_the_ship_with_the_key(self):
+        from .navigation import savebed_walk
+        graph = built_graph()
+        bed = "/shattered_islands/world_1_67_1"
+        yard = "/shattered_islands/world_6_51"
+        point = graph.savebeds[bed][0]
+        key = frozenset({"morgeean_ship_key"})
+        without = savebed_walk(graph, bed, point, [yard], access=frozenset())
+        with_key = savebed_walk(graph, bed, point, [yard], access=key)
+        self.assertIsNotNone(without)
+        self.assertLess(with_key * 3, without)
+        route = graph.route_points(bed, point, yard, [], allow_locked=key)
+        self.assertIn("/shattered_islands/ships/ship_2",
+                      [edge.destination for edge in route])
+        # The farm circuit's search takes her keys from her unlock state.
+        client = type("Client", (), {})()
+        client.state = self._sera_live_inventory()
+        client.state.stats["level"] = 10
+        circuit = FarmCircuitTask(graph, [(yard, "rat")])
+        self.assertIn("morgeean_ship_key", circuit._savebed_search(client).access)
+
+    def test_dashboard_shows_unlocks_read_only(self):
+        from .web_server import DashboardState
+        graph = built_graph()
+        client = type("Client", (), {})()
+        client.state = self._sera_live_inventory()
+        view = DashboardState(client, None, graph, {}).unlocks()
+        locks = {row["lock"]: row for row in view["keys"]}
+        self.assertLessEqual({"incuna_western_gate_key", "incuna_tavern_barn",
+                              "morgeean_ship_key"}, set(locks))
+        self.assertGreater(locks["morgeean_ship_key"]["tiles"], 0)
+        self.assertEqual(locks["incuna_tavern_barn"]["items"],
+                         [{"name": "Incuna Tavern Barn Key",
+                           "where": unlocks.INVENTORY, "container": ""}])
+        self.assertGreaterEqual(view["locks_known"], len(locks))
+        self.assertFalse(view["quests_loaded"])
+        static = Path(__file__).resolve().parent / "web_static"
+        self.assertIn('id="unlocks"', (static / "index.html").read_text())
+        script = (static / "app.js").read_text()
+        block = script[script.index("function renderUnlocks"):
+                       script.index("// ---------- tabs ----------")]
+        # Built from DOM nodes: no markup strings and no inline styles.
+        self.assertNotIn("innerHTML", block)
+        self.assertNotIn("style", block)
 
     def test_graph_compiles_authored_town_npcs_as_peaceful(self):
         graph = built_graph()
@@ -21479,7 +21785,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=23", page)
+        self.assertIn(b"/app.js?v=24", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
