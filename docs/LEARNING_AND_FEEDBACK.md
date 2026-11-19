@@ -1570,8 +1570,10 @@ Knowledge tab):
   observation row: system lines are deduplicated per map, so a second
   no-magic square on the same map adds no observation. A refusal is kept
   only when her recent cast explains it and it certainly belongs to that
-  cast: no step was sent after the last map update before the cast (a
-  step and a cast in one server tick move her first), and for a square
+  cast: no step was sent after a map update last moved her before the
+  cast (a step and a cast in one server tick move her first; a map update
+  that does not change her square, sent when monsters move, does not
+  count), and for a square
   she still stood on the square she cast from as the line arrived, for a
   map she was still on the cast's map. Otherwise nothing is kept. (#97's
   one-hour mark keeps its own attribution, unchanged: a heal cast just
@@ -1602,22 +1604,26 @@ Knowledge tab):
   and a stale fact must not leave her without healing. Off, healing is
   unchanged and a `tile-fact-no-magic-shadow` decision records once a
   square a process where she would have put another heal first.
-- **Refutation needs no probe schedule.** Whatever the flag, her next spell
-  fired (or scroll read) on a remembered square or map is the test: no
-  refusal line of any kind (facts.CAST_REFUSAL: no-magic, countermagic, no
-  mana, denied, no target, out of range, too much magic, device refusals)
-  within 10 s refutes the fact (status `refuted`); a no-magic refusal
-  refreshes it; any other refusal proves nothing; a cast with a step in
-  flight is not judged. Applying a rod, a wand or a spell only readies it,
-  so it is no test. A cast the server dropped silently (her action timer)
-  also refutes; the next refusal confirms the fact again.
+- **Nothing refutes a tile fact.** A cast the server drops without a word
+  (her action timer, `check_skill_to_fire`, an unready device) or refuses
+  for another reason first (a broken wand, a scroll she cannot read) looks
+  like one that worked, so silence proves nothing. A fact is refreshed
+  only by another no-magic refusal attributed to its square or map, and
+  otherwise lapses 7 days after the last one, or at once when the content
+  revision changes. With the flag on, a stale fact can therefore make her
+  drink potions instead of casting on that square for up to 7 days; the
+  flag is off by default.
 - Tile-fact decisions save the decision ledger with a 0.25 s timeout and
   never raise.
 - An observation records the parser set that last read it
   (`observations.facts_version`, added to F1's table where missing, a
   column another process added at the same moment being no error). Facts
   are parsed before the observation is written and stored with it in one
-  transaction; a repeat the same parser set read stores none again.
+  transaction, inside a savepoint: a fact that fails to store loses that
+  observation's facts (read again on its next sighting), never the
+  observation. Eviction runs after the facts are stored, so a new row is
+  cited before it could be evicted. A repeat the same parser set read
+  stores no facts again.
 - Facts are capped at 20,000 a character, candidates first, least recently
   updated first; `facts_total{kind,status}` counts new facts.
 

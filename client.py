@@ -342,22 +342,16 @@ class AtrinikClient:
         # Decisions a tile fact already recorded in this process.
         self._tile_fact_decisions: set[tuple[tuple[str, int, int], str]] = set()
         # Where she stood when each recent tile refusal line arrived, by
-        # message position, and when the last refusal of a cast (for any
-        # reason, facts.CAST_REFUSAL) arrived (wall time).
+        # message position.
         self._tile_refusal_squares: dict[int, tuple[str, int, int]] = {}
-        self._cast_refusal_at = 0.0
-        # When she last sent a step, and when a map update last placed her
+        # When she last sent a step, and when a map update last moved her
         # (monotonic): a cast between the two may be on either square.
         self._step_sent_at = 0.0
         self._position_at = 0.0
+        self._position: tuple[str, int, int] | None = None
         # Whether the square recorded with the last cast (spell_cast) is
         # uncertain that way.
         self._spell_cast_uncertain = False
-        # Her last cast of a spell (fired) or scroll (read): its square, its
-        # time (wall) and whether that square is uncertain; and the last one
-        # resolve_tile_casts judged.
-        self._tile_cast: tuple[tuple[str, int, int], float, bool] | None = None
-        self._tile_cast_judged: tuple[tuple[str, int, int], float, bool] | None = None
 
     def load_character_memory(self, character: str) -> None:
         # Switching characters on a long-lived client: the previous one's
@@ -636,14 +630,9 @@ class AtrinikClient:
                 self.tile_facts.setdefault(square, {})[value] = at
 
     def _note_tile_refusal_line(self, text: str) -> None:
-        """Where she stands as a tile refusal arrives (note_tile_refusal),
-        and when a server line last refused a cast (resolve_tile_casts)."""
-        if not from_server(self.state.messages[-1]):
-            return
-        stripped = " ".join(str(text).split())
-        if fact_parsers.CAST_REFUSAL.match(stripped):
-            self._cast_refusal_at = time.time()
-        if fact_parsers.tile_property(stripped) is None:
+        """Where she stands as a tile refusal arrives (note_tile_refusal)."""
+        if (not from_server(self.state.messages[-1]) or
+                fact_parsers.tile_property(text) is None):
             return
         m = self.state.map
         self._tile_refusal_squares[self.state.message_count - 1] = (
@@ -727,24 +716,22 @@ class AtrinikClient:
         except Exception as error:
             log.warning("tile fact decision not recorded: %s", error)
 
-    def _remembered_no_magic(self, square: tuple[str, int, int],
-                             before: float | None = None) -> tuple[str, int, int] | None:
-        """The square or map whose unexpired no-magic fact covers ``square``
-        (confirmed before ``before``, when given), or None."""
+    def _remembered_no_magic(self, square: tuple[str, int, int]
+                             ) -> tuple[str, int, int] | None:
+        """The square or map whose unexpired no-magic fact covers ``square``."""
         now = time.time()
         for key in (square, (square[0], -1, -1)):
             at = self.tile_facts.get(key, {}).get("no_magic")
-            if (at is not None and now - at < fact_parsers.TILE_FACT_SECONDS and
-                    (before is None or at < before)):
+            if at is not None and now - at < fact_parsers.TILE_FACT_SECONDS:
                 return key
         return None
 
     def tile_fact_prefers_other_heal(self, square: tuple[str, int, int]) -> bool:
         """Whether a remembered no-magic fact should put a non-magical heal
         first on ``square`` (``SafetyPolicy._known_heal``). It only reorders:
-        with no other heal she still casts, and that cast tests the fact
-        (resolve_tile_casts). Off (``persist_tile_facts`` unset), never; it
-        records once that she would have preferred another heal here."""
+        with no other heal she still casts. Off (``persist_tile_facts``
+        unset), never; it records once that she would have preferred another
+        heal here."""
         where = self._remembered_no_magic(square) if square[0] else None
         if where is None:
             return False
@@ -753,44 +740,6 @@ class AtrinikClient:
             return False
         self._tile_decision(where, "tile-fact-no-magic")
         return True
-
-    def resolve_tile_casts(self) -> None:
-        """Her last cast on a remembered no-magic square or map, once its
-        answer is due: no refusal of any kind refutes the fact. A no-magic
-        refusal has refreshed it (note_tile_refusal); any other refusal
-        (no mana, no target) proves nothing. A cast whose square is
-        uncertain (a step in flight) is not judged."""
-        cast = self._tile_cast
-        if cast is None or cast is self._tile_cast_judged:
-            return
-        square, at, uncertain = cast
-        if time.time() - at <= fact_parsers.TILE_CAST_ANSWER_SECONDS:
-            return
-        self._tile_cast_judged = cast
-        if uncertain or self._cast_refusal_at >= at:
-            return
-        where = self._remembered_no_magic(square, before=at)
-        if where is not None:
-            self._refute_tile_fact(where)
-
-    def _refute_tile_fact(self, where: tuple[str, int, int]) -> None:
-        """Her cast there drew no refusal: the square or map is not no-magic."""
-        self.tile_facts.get(where, {}).pop("no_magic", None)
-        self._tile_facts_noted.pop((where, "no_magic"), None)
-        self._tile_fact_decisions.discard((where, "tile-fact-no-magic"))
-        self._tile_decision(where, "tile-fact-refuted", once=False)
-        character = getattr(self, "_memory_character", "")
-        if not character or character != self.state.player_name:
-            return
-        try:
-            self._memory_store().refute_fact(
-                character, "tile-property", fact_parsers.tile_subject(*where), "no_magic",
-                at=time.time())
-        except Exception as error:
-            log.warning("tile fact not refuted: %s", error)
-            return
-        if self.metrics is not None:
-            self.metrics.fact("tile-property", "refuted")
 
     def _parse_facts(self, observation: Observation) -> list[fact_parsers.Fact]:
         """The facts a kept observation states (facts.py); never fails play."""
@@ -2681,7 +2630,7 @@ class AtrinikClient:
             if marker:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
-        self._position_at = time.monotonic()
+        self._note_position(m)
         self._observe_map_change(old_path, m)
         self._observe(lambda recorder: recorder.note_position(self.state))
         # Movement arrives in map packets, between stats packets and polls.
@@ -2813,6 +2762,13 @@ class AtrinikClient:
                            f"{'on' if enabled else 'off'}{' forced' if force else ''}")
         await self.send(Packet(c.S_COMBAT).u8(int(enabled)).u8(int(force)))
 
+    def _note_position(self, m: MapState) -> None:
+        """When a map update last moved her (``_spell_cast_uncertain``); map
+        packets also come when only monsters move, which is no move."""
+        position = (m.path, m.world_x, m.world_y)
+        if position != self._position:
+            self._position, self._position_at = position, time.monotonic()
+
     def _note_spell_cast(self, item: Item | None) -> None:
         """Remember where a spell, scroll, rod or wand was used, and after
         which message, so a "Something blocks your spellcasting." answer
@@ -2821,22 +2777,13 @@ class AtrinikClient:
             m = self.state.map
             self.spell_cast = ((m.path, m.world_x, m.world_y),
                                self.state.message_count, time.time())
-            # A step sent since the last map update may land in the same
-            # server tick, before the cast: either square is possible.
+            # A step sent since a map update last moved her may land in the
+            # same server tick, before the cast: either square is possible.
             self._spell_cast_uncertain = self._step_sent_at > self._position_at
-
-    def _note_tile_cast(self, item: Item | None) -> None:
-        """A cast that tests a remembered no-magic fact: a spell fired or a
-        scroll read (applying a rod, a wand or a spell only readies it)."""
-        if item is not None and self.spell_cast is not None:
-            self._tile_cast = (self.spell_cast[0], self.spell_cast[2],
-                               self._spell_cast_uncertain)
 
     async def fire(self, direction: int, item_tag: int = 0) -> None:
         item = self.state.items.get(item_tag)
         self._note_spell_cast(item)
-        if item is not None and item.item_type in MAGIC_CAST_TYPES:
-            self._note_tile_cast(item)
         if self.metrics is not None:
             self.metrics.fire(item)
         self.record_action("fire",
@@ -2847,8 +2794,6 @@ class AtrinikClient:
     async def apply(self, tag: int, apply_action: int = 0) -> None:
         item = self.state.items.get(tag)
         self._note_spell_cast(item)
-        if item is not None and item.item_type == c.TYPE_SCROLL:
-            self._note_tile_cast(item)
         if self.metrics is not None:
             self.metrics.apply(item)
         self.record_action("apply", item.name if item else str(tag or "below"))

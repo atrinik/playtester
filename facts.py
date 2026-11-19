@@ -45,20 +45,6 @@ VERSION = "facts/1"
 # Tile facts (4.11.1) lapse after a week unless a refusal refreshes them,
 # and count only under the content revision they were seen with.
 TILE_FACT_SECONDS = 7 * 24 * 3600.0
-# A cast of hers on a remembered no-magic square or map that draws no
-# refusal of any kind within this long refutes the fact.
-TILE_CAST_ANSWER_SECONDS = 10.0
-# What the server answers when it refuses a cast for any reason
-# (spell_util.c cast_spell and fire, spell_effect.c cast_wor, types/rod.c):
-# after such a line the cast proves nothing about the square.
-CAST_REFUSAL = re.compile(
-    r"^(?:Something blocks .+|Powerful countermagic cancels .+|"
-    r"It is denied for you to cast that spell|You don't have enough mana|"
-    r"You can't cast that spell on .+|Your target is out of range|"
-    r"There is too much magic in motion to cast that spell|"
-    r"You can't fire that at yourself|"
-    r"The .+ (?:whines for a while, but nothing happens|is impossible to handle for you))"
-    r"[.!]?$", re.I)
 # The longest a tile-fact decision waits to save the decision ledger.
 TILE_DECISION_SAVE_SECONDS = 0.25
 

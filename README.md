@@ -324,7 +324,8 @@ is kept as a confirmed `tile-property: no_magic` fact, besides the one-hour
 mark idle survival already sets; "Powerful countermagic cancels all
 harmful magic here!" is kept as `no_harm` and changes nothing. A fact is
 kept only when the refusal certainly belongs to the cast: no step was in
-flight when she cast, and for a square she still stands where she cast,
+flight when she cast (sent after a map update last moved her), and for a
+square she still stands where she cast,
 for a map she is still on the cast's map. Anything else (a potion drunk
 after an exit, a cast in the same tick as a step) is kept as nothing.
 Tile facts lapse after 7 days unless a refusal refreshes them, and count
@@ -342,11 +343,12 @@ the fact. Off (the default), healing is unchanged and a
 `tile-fact-no-magic-shadow` decision records once a square where she
 would have put another heal first.
 
-Whatever the flag, a spell she fires or a scroll she reads on a
-remembered square or map that draws no refusal of any kind within 10
-seconds refutes the fact (status `refuted`, `tile-fact-refuted`); a
-no-magic refusal refreshes it, and any other refusal (no mana, no
-target, denied) proves nothing.
+A fact is refreshed only by another no-magic refusal attributed to its
+square or map; nothing refutes it, since a cast the server drops without
+a word (her action timer, a device it refuses first) looks the same as
+one that worked. So with the flag on, a stale fact can make her drink a
+potion instead of casting on that square until it expires, at most 7 days
+after the last refusal (or at once, when the content revision changes).
 
 ## Operator assist
 

@@ -23365,7 +23365,7 @@ class ObservationTests(unittest.TestCase):
         client.state.map.path = path
         client.state.map.world_x, client.state.map.world_y = x, y
         # As a MAP2 update does.
-        client._position_at = time.monotonic()
+        client._note_position(client.state.map)
         client._observe(lambda recorder: recorder.note_position(client.state))
 
     @staticmethod
@@ -24012,7 +24012,6 @@ class FactTests(unittest.TestCase):
             plain.state.phase = "playing"
             plain.state.stats.update(ours.state.stats)
             plain.note_tile_refusal = None
-            plain.resolve_tile_casts = None
             plain.tile_fact_prefers_other_heal = None
             spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
             potion = Item(27, item_type=c.TYPE_POTION, name="potion of minor healing")
@@ -24200,47 +24199,6 @@ class FactTests(unittest.TestCase):
             self.assertEqual((fact["status"], fact["updated_at"]), ("confirmed", clock.now))
             self.assertGreater(fact["updated_at"], first)
 
-    def test_a_cast_there_with_no_refusal_refutes_the_fact(self):
-        from .tasks import spell_blocked_here
-        clock = self.Clock()
-        self.remembered_bed(clock)
-        clock.now += 2 * 3600
-        with patch("time.time", clock):
-            client = self.client(persist=True)
-            self.cast_on_the_bed(client, 0)
-            asyncio.run(SafetyPolicy()._heal(client))
-            # The answer is not due yet.
-            self.assertFalse(spell_blocked_here(client))
-            self.assertEqual(self.facts(client)[0]["status"], "confirmed")
-            clock.now += 11
-            self.assertFalse(spell_blocked_here(client))
-            fact, = self.facts(client)
-            self.assertEqual(fact["status"], "refuted")
-            self.assertEqual(client.tile_facts[self.BED], {})
-            self.assertEqual(self.client(persist=True).tile_facts, {})
-            self.assertIn("tile-fact-refuted", [r["action"] for r in client.decision_history])
-            # A later refusal confirms it again.
-            self.cast_on_the_bed(client, 1)
-            self.assertEqual(self.facts(client)[0]["status"], "confirmed")
-
-    def test_a_cast_refused_for_another_reason_proves_nothing(self):
-        from .tasks import spell_blocked_here
-        clock = self.Clock()
-        self.remembered_bed(clock)
-        first = self.facts(self.client())[0]
-        clock.now += 2 * 3600
-        with patch("time.time", clock):
-            client = self.client(persist=True)
-            self.cast_on_the_bed(client, 0)
-            for answer in ("You don't have enough mana.", "You can't cast that spell on rat!"):
-                asyncio.run(client.fire(0, 24))
-                self.say(client, answer)
-                clock.now += 11
-                self.assertFalse(spell_blocked_here(client))
-            fact, = self.facts(client)
-            self.assertEqual((fact["status"], fact["updated_at"]),
-                             ("confirmed", first["updated_at"]))
-
     def test_a_cast_with_a_step_in_flight_is_neither_kept_nor_judged(self):
         from .tasks import spell_blocked_here
         client = self.client()
@@ -24251,21 +24209,18 @@ class FactTests(unittest.TestCase):
         self.say(client, "Something blocks your spellcasting.")
         spell_blocked_here(client)
         self.assertEqual((self.facts(client), client.tile_facts), ([], {}))
-        # Once a map update has placed her, a cast is certain again.
+        # A map update that does not move her (a monster moved) proves
+        # nothing about the step.
+        client._note_position(client.state.map)
+        asyncio.run(client.fire(0, spell.tag))
+        self.say(client, "Something blocks your spellcasting.")
+        spell_blocked_here(client)
+        self.assertEqual(self.facts(client), [])
+        # Once a map update has moved her, a cast is certain again.
+        self.at(self.BED[0], 17, 3, client)
         self.at(*self.BED, client)
         self.cast_on_the_bed(client, 1)
         self.assertEqual(len(self.facts(client)), 1)
-        # And a remembered fact is not refuted by an uncertain cast.
-        clock = self.Clock()
-        with patch("time.time", clock):
-            clock.now += 2 * 3600
-            later = self.client(persist=True)
-            later.state.place_item(spell, later.state.player_tag)
-            asyncio.run(later.move(3))
-            asyncio.run(later.fire(0, spell.tag))
-            clock.now += 11
-            spell_blocked_here(later)
-            self.assertEqual(self.facts(later)[0]["status"], "confirmed")
 
     def test_tile_fact_writes_and_decisions_never_hold_up_play(self):
         from .memory import BotMemory
@@ -24312,6 +24267,23 @@ class FactTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
         separate.assert_not_called()
         self.assertEqual(len(self.facts(client)), 1)
+
+    def test_a_fact_that_fails_to_store_keeps_the_reading(self):
+        from .memory import BotMemory
+        client = self.client()
+        self.at("/test/room", 5, 5, client)
+        with patch.object(BotMemory, "_upsert_fact", side_effect=RuntimeError("fact bug")):
+            asyncio.run(client.move(1))
+            self.say(client, "You need a special key to open this door.", color="00ffff")
+        self.assertEqual(client.state.messages[-1][3], "You need a special key to open this door.")
+        door, = [row for row in client._memory_store().observations("Sera")
+                 if row["source_key"] == "door:/test/room:5,4"]
+        self.assertEqual(self.facts(client), [])
+        # Not marked as read: the next sighting stores its facts.
+        asyncio.run(client.move(1))
+        self.say(client, "You need a special key to open this door.", color="00ffff")
+        fact, = self.facts(client)
+        self.assertEqual(fact["observation_id"], door["id"])
 
     def test_an_f1_database_gains_the_new_columns(self):
         from .memory import BotMemory, _add_column

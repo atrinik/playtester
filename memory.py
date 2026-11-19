@@ -307,16 +307,27 @@ class BotMemory:
                      AND source_key = ? AND text_hash = ?""",
                 (self.server, self.account, folded, str(row["source_key"]),
                  str(row["text_hash"]))).fetchone()
+            stored: list[tuple[int, bool]] = []
+            if version and version != read_by:
+                # In a savepoint: a fact that fails to store loses only the
+                # facts (read again on the next sighting), never the reading.
+                db.execute("SAVEPOINT observation_facts")
+                try:
+                    stored = [self._upsert_fact(db, folded,
+                                                {**fact, "observation_id": row_id})
+                              for fact in facts]
+                    db.execute("UPDATE observations SET facts_version = ? WHERE id = ?",
+                               (version, row_id))
+                except Exception as error:
+                    db.execute("ROLLBACK TO observation_facts")
+                    log.warning("facts of observation %s not kept: %s", row_id, error)
+                    stored = []
+                db.execute("RELEASE observation_facts")
+            # Pruned last, so the new row's facts already cite it.
             if seen == 1:
                 self._observation_inserts += 1
                 if self._observation_inserts % OBSERVATION_PRUNE_EVERY == 0:
                     self._prune_observations(db, folded)
-            stored: list[tuple[int, bool]] = []
-            if version and version != read_by:
-                stored = [self._upsert_fact(db, folded, {**fact, "observation_id": row_id})
-                          for fact in facts]
-                db.execute("UPDATE observations SET facts_version = ? WHERE id = ?",
-                           (version, row_id))
         return int(row_id), stored
 
     def _prune_observations(self, db: sqlite3.Connection, character: str) -> None:
@@ -434,18 +445,6 @@ class BotMemory:
             if self._fact_inserts % FACT_PRUNE_EVERY == 0:
                 self._prune_facts(db, folded)
         return int(row_id), existing is None
-
-    def refute_fact(self, character: str, kind: str, subject: str, value: str, *,
-                    at: float, timeout: float = FACT_SAVE_TIMEOUT) -> bool:
-        """Mark a fact refuted (an outcome contradicted it); whether one was."""
-        with self._connect(timeout) as db:
-            cursor = db.execute(
-                """UPDATE facts SET status = 'refuted', updated_at = ?
-                   WHERE server = ? AND account = ? AND character = ?
-                     AND kind = ? AND subject = ? AND value = ?""",
-                (float(at), self.server, self.account, character.casefold(),
-                 kind, subject, value))
-        return cursor.rowcount > 0
 
     def _prune_facts(self, db: sqlite3.Connection, character: str) -> None:
         """Evict the least recently updated facts over the cap, candidates first."""

@@ -499,9 +499,8 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
 
     Each refusal is also offered to ``client.note_tile_refusal``, which
     keeps it as a persistent tile fact when it certainly belongs to her
-    cast (facts.py), and ``client.resolve_tile_casts`` judges her last cast
-    on a remembered square. Remembered facts never decide here: they only
-    reorder healing (``SafetyPolicy._known_heal``).
+    cast (facts.py). Remembered facts never decide here: they only reorder
+    healing (``SafetyPolicy._known_heal``).
     """
     blocked = getattr(client, "spell_blocked_squares", None)
     if blocked is None:
@@ -566,9 +565,6 @@ def spell_blocked_here(client: AtrinikClient) -> bool:
     for key, since in list(blocked.items()):
         if now - since >= SPELL_BLOCK_MEMORY_SECONDS:
             del blocked[key]
-    resolve = getattr(client, "resolve_tile_casts", None)
-    if callable(resolve):
-        resolve()
     return square in blocked or (square[0], -1, -1) in blocked
 
 
