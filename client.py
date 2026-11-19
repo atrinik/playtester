@@ -208,6 +208,10 @@ TILE_FACT_RETRY_SECONDS = 60.0
 # drafts are best effort and never stall a tick.
 FEEDBACK_READ_TIMEOUT = 0.25
 EQUIPMENT_FEEDBACK_SECONDS = 30.0
+# How often the running bot screens the feedback queue with her full
+# private terms (approved items, and items the owner edited), so the CLI
+# may approve them and the filer file them (phase F6).
+FEEDBACK_SCREEN_SECONDS = 60.0
 
 
 def _locked_content_inputs() -> str:
@@ -367,6 +371,10 @@ class AtrinikClient:
         self._feedback_common_warned: set[str] = set()
         # When the "+N with no effect" producer last ran (monotonic).
         self._equipment_feedback_at = float("-inf")
+        # Items needing the owner after filing (filed-unlabelled,
+        # needs-review, failed), counted by the queue screen for the
+        # dashboard's alerts; never read from the database on a live poll.
+        self.feedback_attention: dict[str, int] = {}
         # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
         # a whole map, loaded with her memory: each property and when it was
         # last confirmed (wall time).
@@ -2166,6 +2174,41 @@ class AtrinikClient:
             log.warning("feedback sweep skipped: %s", error)
             return
         self._note_feedback(findings, others=others)
+
+    def screen_feedback_queue(self) -> int:
+        """Screen the queue with her full private terms (feedback.screen):
+        every approved item, and every open item whose text changed since
+        its last screen (an owner's edit). A failing item is withheld; the
+        rest are marked screened, so the CLI may approve them and the filer
+        may file them (the filer also needs a screen after approval). Only
+        text unchanged since it was read here is marked. Returns how many
+        were screened clean; never raises."""
+        character = getattr(self, "_memory_character", "")
+        if not character:
+            return 0
+        try:
+            memory = self._memory_store()
+            items = memory.feedback_items_to_screen(character, timeout=FEEDBACK_READ_TIMEOUT)
+            versions = {int(item["id"]): item["updated_at"] for item in items}
+            newly = feedback.screen(items, self.feedback_private_terms())
+            if newly:
+                memory.withhold_feedback(character, newly, timeout=FEEDBACK_READ_TIMEOUT)
+            clean = [int(item["id"]) for item in items if not item["withheld"]]
+            memory.mark_feedback_screened(character, clean, versions=versions, refresh=True,
+                                          timeout=FEEDBACK_READ_TIMEOUT)
+            self.feedback_attention = memory.feedback_attention(
+                character, timeout=FEEDBACK_READ_TIMEOUT)
+        except Exception as error:
+            log.warning("feedback queue not screened: %s", error)
+            return 0
+        return len(clean)
+
+    async def screen_feedback_periodically(self,
+                                           interval: float = FEEDBACK_SCREEN_SECONDS) -> None:
+        """``screen_feedback_queue`` every ``interval`` seconds, for good."""
+        while True:
+            await asyncio.sleep(interval)
+            self.screen_feedback_queue()
 
     def note_equipment_feedback(self) -> None:
         """The "+N with no effect" producer, over her identified gear. Called

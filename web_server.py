@@ -688,6 +688,21 @@ class DashboardState:
             alerts = [alert for alert in alerts if alert["id"] != "stuck"]
         alerts[0:0] = [alert for alert in unsafe + care if alert["level"] == "critical"]
         alerts += [alert for alert in unsafe + care if alert["level"] != "critical"]
+        # Filed feedback that needs the owner, as last counted by the
+        # running bot's queue screen (no database read on a live poll).
+        attention = getattr(self.client, "feedback_attention", None) or {}
+        for status, level, text in (
+                ("filed-unlabelled", "warn", "filed without its labels or type: add them "
+                                             "on GitHub"),
+                ("needs-review", "info", "possibly a duplicate: decide with "
+                                         "`feedback approve --file-anyway` or "
+                                         "`feedback reject --duplicate`"),
+                ("failed", "warn", "failed to file: see `feedback show`")):
+            count = int(attention.get(status, 0) or 0)
+            if count:
+                alerts.append({"id": f"feedback-{status}", "level": level,
+                               "text": f"{count} feedback item{'s' if count != 1 else ''} "
+                                       f"{text}"})
         assist = self.operator_assist_status()
         if assist and assist["running"]:
             alerts.append({"id": "operator-assist-running", "level": "warn",
@@ -1183,10 +1198,12 @@ class WebControlServer:
             await self._reply(writer, 200, _json_bytes(self._terrain(parse_qs(query))))
             return
         if method == "GET" and path == "/api/feedback":
-            # Her draft feedback queue (feedback.py), read-only:
+            # Her feedback queue (feedback.py), read-only:
             # ?kind=KIND&repo=OWNER/NAME&status=STATUS&limit=N. Drafts hold
-            # only authored text and her own state; nothing is filed from
-            # here (approval and filing are phase F6).
+            # only authored text and her own state. Nothing is approved or
+            # filed from here: the owner decides with the CLI on CT130
+            # (owner decision, 2026-11-19) and only the separate filer
+            # talks to GitHub. There is no feedback write route.
             params = parse_qs(query)
             character = getattr(self.client, "_memory_character", "")
             items, counts, busy = [], {}, False
@@ -1216,6 +1233,7 @@ class WebControlServer:
                     # (the CLI) may show these (feedback.readable).
                     memory.mark_feedback_screened(
                         character, [item["id"] for item in items if not item["withheld"]],
+                        versions={item["id"]: item["updated_at"] for item in items},
                         timeout=KNOWLEDGE_READ_TIMEOUT)
                 except Exception as error:
                     log.warning("feedback screening failed: %s", error)
@@ -1227,6 +1245,14 @@ class WebControlServer:
                 except ValueError:
                     item["labels"] = []
                 item.pop("evidence_json", None)
+                try:
+                    candidates = json.loads(item.pop("remote_candidates_json") or "[]")
+                except ValueError:
+                    candidates = []
+                item["remote_candidates"] = (
+                    [str(entry.get("url", "")) for entry in candidates
+                     if isinstance(entry, dict)]
+                    if item["status"] == "needs-review" and not item["withheld"] else [])
             await self._reply(writer, 200, _json_bytes({
                 "items": items, "counts": counts, "busy": busy, "read_only": True,
                 "kinds": list(FEEDBACK_KINDS), "repos": list(FEEDBACK_REPOS)}))

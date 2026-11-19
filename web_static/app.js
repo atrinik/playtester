@@ -980,8 +980,10 @@ function renderTerrain(t) {
 }
 
 // ---------- feedback drafts (read-only) ----------
-// Her draft queue (feedback.py), built from DOM nodes and text only: a body
-// is shown as the plain Markdown text that would be filed, never rendered.
+// Her feedback queue (feedback.py), built from DOM nodes and text only: a
+// body is shown as the plain Markdown text that would be filed, never
+// rendered. Read-only by design: the owner approves, rejects and edits with
+// `atrinik-playtester feedback` on CT130, and only the separate filer files.
 const FEEDBACK_KIND_LABELS = { bug: "Bug", hint: "Hint", balance: "Balance", qol: "Quality of life", clarity: "Clarity" };
 const feedbackOpen = new Set();
 let feedbackBusy = false, lastFeedbackSig = "";
@@ -1009,7 +1011,7 @@ function renderFeedback(f) {
   fillSelect($("#feedback-kind"), "All kinds", f.kinds || [], x => FEEDBACK_KIND_LABELS[x] || x);
   fillSelect($("#feedback-repo"), "All repositories", f.repos || [], x => x);
   const counts = f.counts || {}, drafts = Object.values(counts.draft || {}).reduce((a, b) => a + b, 0);
-  $("#feedback-summary").textContent = `${drafts} draft${drafts === 1 ? "" : "s"} · read-only: nothing is approved, filed or searched from here` +
+  $("#feedback-summary").textContent = `${drafts} draft${drafts === 1 ? "" : "s"} · read-only: approve, reject and edit with "atrinik-playtester feedback" on CT130; the body below is the Markdown copy to file by hand` +
     (f.busy ? " · the database is busy; try again shortly" : "");
   const day = t => new Date(t * 1000).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
   const rows = (f.items || []).map(x => {
@@ -1019,6 +1021,9 @@ function renderFeedback(f) {
       node("span", x.status === "draft" && !x.withheld ? "flag" : "flag warn", x.withheld ? "withheld" : x.status), node("span", "flag", `×${x.occurrences}`));
     item.append(head);
     item.append(node("small", "", [x.repo, x.short_fingerprint, `${x.days} day${x.days === 1 ? "" : "s"}`, `first ${day(x.first_seen)}`, `last ${day(x.last_seen)}`, (x.labels || []).join(", ")].filter(Boolean).join(" · ")));
+    if (x.issue_url) item.append(node("small", "", `Issue: ${x.issue_url}`));
+    if ((x.remote_candidates || []).length) item.append(node("small", "", `Possible duplicates: ${x.remote_candidates.join(", ")}`));
+    if (x.error && !x.withheld) item.append(node("small", "", `Filer: ${x.error}`));
     const details = node("details");
     details.open = feedbackOpen.has(x.id);
     details.addEventListener("toggle", () => { if (details.open) feedbackOpen.add(x.id); else feedbackOpen.delete(x.id); });

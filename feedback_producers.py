@@ -155,7 +155,7 @@ def plus_n_no_effect(entries: Iterable[tuple[str, int, int, Any]], *,
             ],
             "state": state_parts(stats),
         },
-        labels=("enhancement", "component: server"),
+        labels=("enhancement", "component: server"), issue_type="Feature",
         occurrence=f"{','.join(families)}|{time.strftime('%Y-%m-%d', time.gmtime(at))}",
     )
 
@@ -291,6 +291,6 @@ def typo(row: dict[str, Any], *, names: Collection[str] = (), stats: dict[str, A
             "state": state_parts(stats or {}),
             "players_present": players_present,
         },
-        labels=("bug", "maps"),
+        labels=("bug", "maps"), issue_type="Bug",
         occurrence=time.strftime("%Y-%m-%d", time.gmtime(at)),
     )

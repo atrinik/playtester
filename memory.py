@@ -64,7 +64,13 @@ FEEDBACK_COLUMNS = ("id", "fingerprint", "repo", "kind", "subject", "target", "t
                     "body_md", "labels_json", "issue_type", "evidence_json", "status",
                     "occurrences", "days", "first_seen", "last_seen", "decided_at",
                     "decided_via", "issue_url", "error", "withheld", "updated_at",
-                    "screened_at")
+                    "screened_at", "remote_candidates_json", "edited", "file_anyway")
+# The filer's append-only audit (4.10.6, phase F6, feedback_filer.py): one row
+# a request it made to GitHub. Never a key, a JWT or a token.
+FEEDBACK_FILING_COLUMNS = ("id", "item_id", "at", "request", "repo", "http_status",
+                           "issue_url", "error", "retry_at")
+# The statuses the owner decides from (cli.py ``feedback approve|reject|edit``).
+FEEDBACK_OPEN_STATUSES = ("draft", "approved", "needs-review", "failed", "snoozed")
 # Distinct UTC dates kept per item for its day count.
 FEEDBACK_DATES = 1000
 
@@ -371,6 +377,28 @@ class BotMemory:
             db.execute(
                 """CREATE INDEX IF NOT EXISTS feedback_by_status
                    ON feedback_items (server, account, character, status, occurrences)""")
+            # Phase F6: an item whose text the owner edited is not rendered
+            # again (it only gains occurrences), and one she chose to file
+            # despite duplicate candidates skips the remote check.
+            _add_column(db, "feedback_items", "edited INTEGER NOT NULL DEFAULT 0")
+            _add_column(db, "feedback_items", "file_anyway INTEGER NOT NULL DEFAULT 0")
+            # The filer's audit (feedback_filer.py): append-only, one row a
+            # GitHub request; ``retry_at`` is when GitHub said to come back.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS feedback_filings (
+                       id INTEGER PRIMARY KEY,
+                       item_id INTEGER,
+                       at REAL NOT NULL,
+                       request TEXT NOT NULL,
+                       repo TEXT NOT NULL,
+                       http_status INTEGER,
+                       issue_url TEXT,
+                       error TEXT,
+                       retry_at REAL
+                   )""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS feedback_filings_by_age
+                   ON feedback_filings (at)""")
         self._chat_appends = 0
         self._observation_inserts = 0
         self._fact_inserts = 0
@@ -388,6 +416,22 @@ class BotMemory:
         memory.read_only = True
         memory._chat_appends = memory._observation_inserts = memory._fact_inserts = 0
         return memory
+
+    @classmethod
+    def open_existing(cls, path: Path, *, server: str, account: str) -> "BotMemory":
+        """A store that writes an existing database without creating or
+        migrating anything (the feedback CLI's approve, reject and edit):
+        the running bot owns the schema."""
+        memory = cls.open_read_only(path, server=server, account=account)
+        memory.read_only = False
+        return memory
+
+    def has_columns(self, table: str, columns: Iterable[str], *,
+                    timeout: float = 10.0) -> bool:
+        """Whether ``table`` exists with every one of ``columns``."""
+        with self._connect(timeout) as db:
+            present = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        return bool(present) and set(columns) <= present
 
     def has_table(self, name: str, *, timeout: float = 10.0) -> bool:
         with self._connect(timeout) as db:
@@ -841,7 +885,7 @@ class BotMemory:
         with self._connect(timeout) as db:
             row = db.execute(
                 """SELECT id, status, occurrences, occurrence_keys_json, dates_json,
-                          first_seen, last_seen, evidence_json
+                          first_seen, last_seen, evidence_json, edited
                    FROM feedback_items
                    WHERE server = ? AND account = ? AND character = ? AND fingerprint = ?""",
                 (*scope, fingerprint)).fetchone()
@@ -860,7 +904,8 @@ class BotMemory:
                      fields["evidence_json"], json.dumps([occurrence] if occurrence else []),
                      json.dumps([day]), at, at, written, written))
                 return int(cursor.lastrowid), True
-            row_id, status, occurrences, keys_json, dates_json, first_seen, last_seen, stored = row
+            (row_id, status, occurrences, keys_json, dates_json, first_seen, last_seen,
+             stored, edited) = row
 
             def decoded(value: str) -> list[str]:
                 try:
@@ -878,7 +923,8 @@ class BotMemory:
             first_seen, last_seen = min(first_seen, at), max(last_seen, at)
             counts = (occurrences, len(ordered), json.dumps(keys), json.dumps(ordered),
                       first_seen, last_seen)
-            if status != "draft":
+            if status != "draft" or edited:
+                # Past draft, or text the owner edited: counts only.
                 db.execute(
                     """UPDATE feedback_items SET occurrences = ?, days = ?,
                            occurrence_keys_json = ?, dates_json = ?, first_seen = ?,
@@ -936,20 +982,28 @@ class BotMemory:
 
     def mark_feedback_screened(self, character: str, ids: Iterable[int], *,
                                at: float | None = None,
+                               versions: dict[int, float] | None = None,
+                               refresh: bool = False,
                                timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
         """Record that the running bot screened these items with its full
-        private terms (only those whose text changed since the last screen)."""
+        private terms (only those whose text changed since the last screen,
+        or every one with ``refresh``). ``versions`` maps an id to the
+        ``updated_at`` of the text that was screened: an item edited since
+        (by the CLI) is not marked, so its new text waits for a screen."""
         ids = [int(item) for item in ids]
         if not ids:
             return
         at = time.time() if at is None else at
+        scope = (self.server, self.account, character.casefold())
         with self._connect(timeout) as db:
-            db.executemany(
-                """UPDATE feedback_items SET screened_at = ?
-                   WHERE server = ? AND account = ? AND character = ? AND id = ?
-                     AND screened_at < updated_at""",
-                [(at, self.server, self.account, character.casefold(), item)
-                 for item in ids])
+            for item in ids:
+                version = None if versions is None else versions.get(item)
+                db.execute(
+                    """UPDATE feedback_items SET screened_at = ?
+                       WHERE server = ? AND account = ? AND character = ? AND id = ?
+                         AND (? OR screened_at < updated_at)
+                         AND (? IS NULL OR updated_at = ?)""",
+                    (at, *scope, item, int(refresh), version, version))
 
     def withhold_feedback_fingerprint(self, character: str, fingerprint: str, *,
                                       timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
@@ -1014,6 +1068,89 @@ class BotMemory:
         for status, kind, count in rows:
             counts.setdefault(status, {})[kind] = int(count)
         return counts
+
+    def feedback_items_to_screen(self, character: str, *, limit: int = 200,
+                                 timeout: float = FEEDBACK_SAVE_TIMEOUT
+                                 ) -> list[dict[str, Any]]:
+        """The items the running bot screens on its poll: every approved
+        item (the filer needs a screen after approval), and every other open
+        item whose text changed since its last screen (an edit)."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                f"""SELECT {", ".join(FEEDBACK_COLUMNS)} FROM feedback_items
+                    WHERE server = ? AND account = ? AND character = ? AND withheld = 0
+                      AND (status = 'approved' OR
+                           (status IN ({", ".join("?" * len(FEEDBACK_OPEN_STATUSES))})
+                            AND screened_at < updated_at))
+                    ORDER BY updated_at LIMIT ?""",
+                (self.server, self.account, character.casefold(), *FEEDBACK_OPEN_STATUSES,
+                 max(1, int(limit)))).fetchall()
+        return [dict(zip(FEEDBACK_COLUMNS, row)) for row in rows]
+
+    def update_feedback(self, character: str, item_id: int, *, expect_status: Iterable[str],
+                        fields: dict[str, Any], updated_at: float | None = None,
+                        require_screened: bool = False,
+                        timeout: float = 10.0) -> bool:
+        """Change one item in one statement, only while it is still in one of
+        ``expect_status`` (and, with ``updated_at``, its text unchanged since
+        it was read; with ``require_screened``, not withheld and screened by
+        the running bot since that change). Returns whether it changed: a
+        concurrent change (the bot, another command) leaves it alone."""
+        allowed = {"status", "title", "body_md", "labels_json", "issue_type", "repo",
+                   "target", "decided_at", "decided_via", "issue_url", "error",
+                   "remote_candidates_json", "updated_at", "edited", "file_anyway",
+                   "withheld"}
+        if not fields or set(fields) - allowed:
+            raise ValueError(f"cannot set {sorted(set(fields) - allowed)}")
+        statuses = list(expect_status)
+        query = (f"UPDATE feedback_items SET {', '.join(f'{key} = ?' for key in fields)} "
+                 "WHERE server = ? AND account = ? AND character = ? AND id = ? "
+                 f"AND status IN ({', '.join('?' * len(statuses))})")
+        params: list[Any] = [*fields.values(), self.server, self.account,
+                             character.casefold(), int(item_id), *statuses]
+        if updated_at is not None:
+            query += " AND updated_at = ?"
+            params.append(updated_at)
+        if require_screened:
+            query += " AND withheld = 0 AND screened_at >= updated_at AND updated_at > 0"
+        with self._connect(timeout) as db:
+            return db.execute(query, params).rowcount == 1
+
+    def feedback_attention(self, character: str, *,
+                           timeout: float = FEEDBACK_SAVE_TIMEOUT) -> dict[str, int]:
+        """How many items need the owner: filed without their labels or
+        type, waiting on a duplicate review, or failed."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT status, count(*) FROM feedback_items
+                   WHERE server = ? AND account = ? AND character = ?
+                     AND status IN ('filed-unlabelled', 'needs-review', 'failed')
+                   GROUP BY status""",
+                (self.server, self.account, character.casefold())).fetchall()
+        return {status: int(count) for status, count in rows}
+
+    def record_feedback_filing(self, row: dict[str, Any], *,
+                               timeout: float = 10.0) -> None:
+        """Append one row to the filer's audit (``feedback_filings``)."""
+        columns = [column for column in FEEDBACK_FILING_COLUMNS[1:] if column in row]
+        with self._connect(timeout) as db:
+            db.execute(
+                f"""INSERT INTO feedback_filings ({", ".join(columns)})
+                    VALUES ({", ".join("?" * len(columns))})""",
+                [row[column] for column in columns])
+
+    def feedback_filings(self, *, since: float = 0.0, item_id: int | None = None,
+                         timeout: float = 10.0) -> list[dict[str, Any]]:
+        """The filer's audit rows since ``since``, oldest first."""
+        query = (f"SELECT {', '.join(FEEDBACK_FILING_COLUMNS)} FROM feedback_filings "
+                 "WHERE at >= ?")
+        params: list[Any] = [since]
+        if item_id is not None:
+            query += " AND item_id = ?"
+            params.append(int(item_id))
+        with self._connect(timeout) as db:
+            rows = db.execute(query + " ORDER BY at, id", params).fetchall()
+        return [dict(zip(FEEDBACK_FILING_COLUMNS, row)) for row in rows]
 
     def chat_senders(self, *, limit: int = 5000, timeout: float = 10.0) -> list[str]:
         """The distinct senders in this account's chat log (any of its

@@ -24,6 +24,13 @@
   as operator-assisted so later progress is never counted as earned. Do not
   widen it (more gold, other items, other commands, automatic triggers)
   without a new owner decision.
+- Feedback (docs/LEARNING_AND_FEEDBACK.md 4.10): the owner approves,
+  rejects and edits items only with the `atrinik-playtester feedback` CLI
+  on CT130 (owner decision, 2026-11-19); the dashboard has no feedback
+  write route. Only `feedback_filer.py`, run as `feedback file` in its own
+  systemd unit, reads the GitHub App key or holds a JWT or token; no game
+  module imports it, and none of them is ever printed, logged or stored.
+  The filer never creates labels.
 - Source modules remain at repository root and CMake assembles the installable
   `atrinik_bot` package with its native extension under `build/`.
 - Keep `dependencies.lock.json`, the atomic compatibility cache installer,

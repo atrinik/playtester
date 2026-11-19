@@ -8,8 +8,11 @@ evidence with one template.
 
 Nothing here leaves the machine. This module opens no socket and imports
 no network library: drafts are rows in her memory database, shown on the
-dashboard's Feedback tab and by ``atrinik-playtester feedback list|show``.
-Approval and filing are phase F6.
+dashboard's read-only Feedback tab and by ``atrinik-playtester feedback
+list|show``. The owner approves, rejects and edits them with
+``atrinik-playtester feedback approve|reject|edit`` (cli.py), and only the
+separate filer (``feedback file``, feedback_filer.py, phase F6) talks to
+GitHub, for approved items only.
 
 Privacy (4.10.4): drafts carry only authored text and her own state.
 
@@ -50,6 +53,19 @@ EXCERPT_CHARS = 1500
 # items of an aggregate draft.
 TRIED_LIMIT = 10
 ITEMS_LIMIT = 50
+
+# The organization's issue types (owner decision, 2026-11-19), and the
+# type an item without one is filed with, by kind.
+ISSUE_TYPES = ("Bug", "Feature", "Task")
+DEFAULT_ISSUE_TYPES = {"bug": "Bug", "hint": "Task", "balance": "Task", "qol": "Feature",
+                       "clarity": "Task"}
+# Every issue the filer opens also carries this label, which the owner
+# creates by hand in each repository (the filer never creates labels).
+FILED_LABEL = "playtester"
+LABEL_LIMIT = 10
+LABEL_CHARS = 50
+TITLE_CHARS = 256
+BODY_CHARS = 60_000
 
 FINGERPRINT_PREFIX = "Playtester fingerprint: "
 FOOTER = "Filed by the Atrinik playtester after owner review."
@@ -426,3 +442,101 @@ def readable(item: dict[str, Any]) -> bool:
     return (not item.get("withheld") and
             float(item.get("screened_at") or 0) >= float(item.get("updated_at") or 0) and
             float(item.get("updated_at") or 0) > 0)
+
+
+def issue_type(item: dict[str, Any]) -> str:
+    """The issue type an item is filed with: its own, else its kind's."""
+    chosen = str(item.get("issue_type") or "")
+    return chosen if chosen in ISSUE_TYPES else DEFAULT_ISSUE_TYPES.get(
+        str(item.get("kind") or ""), "Task")
+
+
+def labels(item: dict[str, Any]) -> list[str]:
+    """An item's labels as stored (invalid JSON is none)."""
+    try:
+        value = json.loads(item.get("labels_json") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [str(label) for label in value] if isinstance(value, list) else []
+
+
+def clean_title(title: str) -> str:
+    """A title the owner typed: one line, inert, at most ``TITLE_CHARS``."""
+    title = " ".join(inert(title).split())
+    if not title:
+        raise ValueError("the title is empty")
+    if len(title) > TITLE_CHARS:
+        raise ValueError(f"the title is longer than {TITLE_CHARS} characters")
+    return title
+
+
+def clean_labels(values: Iterable[str]) -> list[str]:
+    """Labels the owner typed: trimmed, distinct, at most ``LABEL_LIMIT``."""
+    out: list[str] = []
+    for value in values:
+        label = " ".join(inert(value).split())
+        if not label:
+            continue
+        if len(label) > LABEL_CHARS or "," in label:
+            raise ValueError(f"invalid label {label!r}")
+        if label.casefold() not in {known.casefold() for known in out}:
+            out.append(label)
+    if len(out) > LABEL_LIMIT:
+        raise ValueError(f"more than {LABEL_LIMIT} labels")
+    return out
+
+
+def clean_body(body: str, digest: str) -> str:
+    """A body the owner wrote: made inert, and ending with this item's
+    fingerprint footer outside any code block (added when missing). A body
+    that shows another fingerprint outside code is refused: the filer reads
+    those for deduplication."""
+    text = "\n".join(inert(line).rstrip() for line in str(body).splitlines()).strip("\n")
+    short = short_fingerprint(digest)
+    found = fingerprints_outside_code(text)
+    if any(value != short for value in found):
+        raise ValueError("the body shows another item's fingerprint")
+    if short not in found:
+        text = f"{text}\n\n---\n{FINGERPRINT_PREFIX}{short}\n{FOOTER}"
+    if not fingerprints_outside_code(text + "\n"):
+        # The appended footer landed inside an unclosed fence.
+        raise ValueError("the body leaves a code block open")
+    if len(text) > BODY_CHARS:
+        raise ValueError(f"the body is longer than {BODY_CHARS} characters")
+    return text + "\n"
+
+
+def rerender(item: dict[str, Any]) -> str:
+    """An item's body rendered again from its stored evidence and counts."""
+    evidence = json.loads(item.get("evidence_json") or "{}")
+    return render(evidence if isinstance(evidence, dict) else {},
+                  digest=str(item["fingerprint"]), occurrences=int(item["occurrences"]),
+                  days=int(item.get("days") or 1), first_seen=float(item["first_seen"]),
+                  last_seen=float(item["last_seen"]))
+
+
+def markdown_copy(item: dict[str, Any]) -> str:
+    """What the owner files by hand without the App key (the dry run): where
+    it goes, its labels, type and title, then the exact Markdown body."""
+    target = str(item.get("target") or "new-issue")
+    if target.startswith("comment:"):
+        head = [f"Comment on: {target.removeprefix('comment:')}"]
+    else:
+        head = [f"Repository: {item['repo']} (a new issue)",
+                f"Labels: {', '.join([*labels(item), FILED_LABEL])}",
+                f"Type: {issue_type(item)}",
+                f"Title: {item['title']}"]
+    return "\n".join(head) + "\n\n" + str(item["body_md"])
+
+
+def search_terms(subject: str) -> list[str]:
+    """What the filer looks for in existing issue titles besides the
+    fingerprint (4.10.2): a subject's map path (``door:/map:x,y`` gives
+    ``/map``), or else its name (``formula:book_exp_mod`` gives
+    ``book_exp_mod``). Quotes are removed; very short terms are dropped."""
+    _, _, rest = str(subject).partition(":")
+    if rest.startswith("/"):
+        path, _, coordinates = rest.rpartition(":")
+        rest = path if path and re.fullmatch(r"-?\d+,-?\d+", coordinates) else rest
+    term = " ".join(rest.replace('"', " ").split())
+    return [term] if len(term) >= 4 else []
