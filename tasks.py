@@ -26,6 +26,7 @@ from .targeting import select_target, target_set_aside
 from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      format_money, map_object_visual_name,
                      update_bank_balance)
+from .equipment import gear_examine_pending, gear_examiner
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
 
@@ -344,6 +345,17 @@ def healing_outpaced(client: AtrinikClient, seconds: float = 8.0) -> bool:
         [entry for entry in messages if float(entry[0]) > first],
         first, now + 1.0).values())
     return damage >= sum(amount for _, amount in heals[1:])
+
+
+def carried_gear_score(client: AtrinikClient, policy: "InventoryPolicy"
+                       ) -> Callable[[Item], int]:
+    """The score the equip loop (maintain_inventory) ranks carried gear by:
+    the name-based gear_score plus its archetype's base score."""
+    def score(item: Item) -> int:
+        prototype = BuyShopUpgradeTask._prototype(client, item)
+        return policy.gear_score(item) + (prototype.base_score
+                                          if prototype is not None else 0)
+    return score
 
 
 def wand_charges(client: AtrinikClient) -> dict[int, int]:
@@ -1303,6 +1315,9 @@ class ManaCrystal:
             return False
         if now < float(item.extra.get("crystal_examine_retry_at", 0.0)):
             return False
+        if gear_examine_pending(client):
+            # One examine in flight at a time: hers answers first.
+            return True
         item.extra["crystal_examine"] = (client.state.message_count, now)
         await client.examine(item.tag)
         return True
@@ -3517,12 +3532,7 @@ class FarmTask(BotTask):
                     for tag in client.state.equipment.values()
                     if tag in client.state.items]
         equipped_by_tag = {item.tag: item for item in equipped}
-
-        def score_item(item: Item) -> int:
-            score = self.inventory_policy.gear_score(item)
-            prototype = BuyShopUpgradeTask._prototype(client, item)
-            return score + (prototype.base_score
-                            if prototype is not None else 0)
+        score_item = carried_gear_score(client, self.inventory_policy)
 
         for candidate in sorted(
                 client.state.inventory,
@@ -4954,19 +4964,24 @@ class FarmTask(BotTask):
                     recorder("recall-wand-charges", f"tag={tag} charges={charges}")
             return
         examine = getattr(client, "examine", None)
+        wand = self.next_recall_wand(client)
+        # One examine in flight at a time: a gear examine answers first.
+        if wand is None or examine is None or gear_examine_pending(client):
+            return
+        self._wand_examined.add(wand.tag)
+        self._wand_examine = (wand.tag, time.time())
+        await examine(wand.tag)
+
+    def next_recall_wand(self, client: AtrinikClient) -> Item | None:
+        """The next recall wand of unknown charge to examine, if any."""
         policy = InventoryPolicy()
-        wand = next((
+        return next((
             item for item in client.state.inventory
             if item.item_type == c.TYPE_WAND and
             re.search(r"\bword of recall\b", item.name, re.I) and
             policy.identified(item) and
             item.tag not in wand_charges(client) and
             item.tag not in self._wand_examined), None)
-        if wand is None or examine is None:
-            return
-        self._wand_examined.add(wand.tag)
-        self._wand_examine = (wand.tag, time.time())
-        await examine(wand.tag)
 
     def remember_safe_position(self, client: AtrinikClient) -> None:
         """Retain a short breadcrumb trail from before hostile contact."""
@@ -5344,6 +5359,12 @@ class FarmTask(BotTask):
         if not hostile_contact and not initial_threats:
             self.remember_safe_position(client)
             await self.check_recall_wand(client)
+            if self._wand_examine is None:
+                # Examine carried gear for its effective stats, one item at
+                # a time behind any wand examine (equipment.GearExaminer).
+                await gear_examiner(client).tick(
+                    client, self.inventory_policy,
+                    carried_gear_score(client, self.inventory_policy))
         # A hit never commits her to a set-aside pull or to a packmate within
         # its reach: combat text cannot say which one attacked, and fighting
         # the packmate drags the set-aside monster in too. Within two tiles

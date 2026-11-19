@@ -17,7 +17,7 @@ function applyStyles(root) {
 }
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts,engine_error";
-const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks";
+const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -617,6 +617,7 @@ $$(".tabs button").forEach(b => (b.onclick = () => {
   if (b.dataset.tab === "chat") { unreadChat = 0; renderChat(); const m = $("#messages"); m.scrollTop = m.scrollHeight; }
   if (b.dataset.tab === "activity") renderActivity();
   if (b.dataset.tab === "knowledge") pollKnowledge();
+  if (b.dataset.tab === "equipment") renderEquipment();
 }));
 
 // ---------- knowledge (read-only) ----------
@@ -682,6 +683,70 @@ function renderFacts(k) {
   $("#facts").replaceChildren(...(rows.length ? rows : [node("span", "muted", "No facts yet.")]));
 }
 $("#fact-kind").onchange = pollKnowledge;
+// ---------- equipment (read-only) ----------
+// Effective item stats per gear family, built from DOM nodes and text only.
+// node() is shared with the Knowledge tab above.
+const signed = v => (v > 0 ? `+${v}` : `${v}`);
+function gearPiece(title, r) {
+  const piece = node("div", "gear-piece");
+  const head = node("div", "gear-piece-head");
+  head.append(node("span", "muted", title), node("strong", null, r.name));
+  if (r.source === "archetype") head.append(node("span", "flag", "not examined"));
+  else if (r.source === "unknown") head.append(node("span", "flag warn", "unknown"));
+  head.append(node("span", "gear-scores", `current ${r.old_score} · effective ${r.new_score ?? "—"}`));
+  piece.append(head);
+  if ((r.stats || []).length) {
+    const stats = node("ul", "gear-stats");
+    for (const [label, value] of r.stats) stats.append(node("li", null, `${label} ${value}`));
+    piece.append(stats);
+  } else if (r.source !== "unknown") piece.append(node("span", "muted", "Adds no stats when worn."));
+  if ((r.notes || []).length) {
+    const notes = node("ul", "gear-notes");
+    for (const note of r.notes) notes.append(node("li", null, note));
+    piece.append(notes);
+  }
+  return piece;
+}
+let lastEquipSig = "";
+function renderEquipment() {
+  const e = slow.equipment, sig = JSON.stringify(e || null);
+  if (sig === lastEquipSig) return;
+  lastEquipSig = sig;
+  const box = $("#equipment"), shadow = $("#equipment-shadow");
+  const families = (e && e.families) || [];
+  $("#equipment-summary").textContent = e ? `${e.examined} examined this session` : "";
+  box.replaceChildren(...families.map(f => {
+    const card = node("div", f.diverges ? "gear-family diverges" : "gear-family");
+    const head = node("div", "gear-head");
+    head.append(node("b", null, f.label));
+    if (f.diverges) head.append(node("span", "flag warn", "scores disagree"));
+    card.append(head);
+    for (const w of f.worn) card.append(gearPiece("Worn", w));
+    if (!f.worn.length) card.append(node("span", "muted", "Nothing worn."));
+    if (f.candidate) {
+      card.append(gearPiece("Best carried", f.candidate));
+      if (f.deltas.length) {
+        const deltas = node("ul", "gear-deltas");
+        for (const [label, value] of f.deltas) deltas.append(node("li", value > 0 ? "delta up" : "delta down", `${label} ${signed(value)}`));
+        card.append(deltas);
+      }
+    }
+    if (f.diverges) {
+      const choice = c => (c ? `put on ${c.name}` : "keep what she wears");
+      card.append(node("div", "gear-shadow", `Current scoring would ${choice(f.old_choice)}; effective stats would ${choice(f.new_choice)}.`));
+    }
+    return card;
+  }));
+  if (e && e.error) box.append(node("span", "warn-text", e.error));
+  else if (!families.length) box.append(node("span", "muted", "No gear carried."));
+  const log = [...((e && e.shadow) || [])].reverse();
+  shadow.replaceChildren(...log.map(x => {
+    const row = node("div", "act");
+    row.append(node("time", null, new Date(x.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })), node("b", null, "gear-shadow"), node("span", null, x.detail));
+    return row;
+  }));
+  if (!log.length) shadow.append(node("span", "muted", "No comparison logged yet."));
+}
 
 // ---------- polling ----------
 let liveBusy = false, slowBusy = false;
@@ -703,7 +768,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderUnlocks(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
   } finally { slowBusy = false; }
 }

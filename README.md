@@ -350,6 +350,44 @@ one that worked. So with the flag on, a stale fact can make her drink a
 potion instead of casting on that square until it expires, at most 7 days
 after the last refusal (or at once, when the content revision changes).
 
+## Equipment
+
+She works out what each piece of gear really adds when worn
+(`equipment.py`; the design is
+[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md) 4.8, phase
+F3). This changes no choice yet: the name-based `gear_score` still decides
+what she wears and buys.
+
+- **The "+N" rules follow the Classic server.** "+N" adds N to each of AC,
+  block and absorb the item has a base value for and, unless it is a
+  launcher, to WC and damage likewise; a base of zero gets nothing, so a
+  `silk cape +2` (capes have no AC) adds no AC. A launcher's "+N" goes to
+  each arrow it fires, and its protections do not count. A light adds
+  nothing. Protections, attacks and a weapon's damage scale with condition.
+- **Examining carried gear.** On a quiet farm tick (no threat in view, the
+  recall-wand rule) she examines each identified gear item she carries
+  once a session, what she wears first: one at a time, at least 2 seconds
+  apart, waiting up to 5 seconds for each. Recall-wand and mana-crystal
+  examines wait for its answer and it for theirs, so normally only one
+  examine is in flight. The walk out of a farm, waiting for her wands'
+  charges, abandons a waiting gear examine instead; the gear examiner then
+  pauses for 7 seconds, so its late answer, read by nothing, comes before
+  her next gear examine is asked. The observation ledger may then pair that late
+  answer with the wand's examine; the row still carries the item's name
+  from its own line, and the wand's answer may go unrecorded. Examine shows the base stats
+  without the "+N"; until an item is examined its archetype's base stats
+  are used.
+- **Shadow logging.** At most every 30 seconds she compares, per gear
+  family, what the current score and the effective-stats score would put
+  on. Each change in where they disagree is a `gear-shadow` decision with
+  both items and both scores, for the owner's review before phase F4
+  switches the scoring.
+
+The dashboard's read-only **Equipment** tab lists each gear family she
+carries: what she wears and the best candidate, with both scores, the
+effective stats, per-stat differences and notes such as "+2 on a cape adds
+no AC", and the recent shadow log.
+
 ## Operator assist
 
 The owner can have an operator character hand the played character gold.

@@ -188,3 +188,19 @@ details summary { cursor: pointer; color: var(--muted); margin-top: .6rem; font-
 .reading small { color: var(--muted); overflow-wrap: anywhere; }
 /* Knowledge: facts read from her observations */
 .fact .fact-value { color: var(--text); font-weight: 500; overflow-wrap: anywhere; }
+/* Equipment: effective item stats and the shadow comparison */
+.gear-family { background: #121719; border-radius: 6px; padding: .45rem .55rem; display: grid; gap: .35rem; font-size: 12px; }
+.gear-family.diverges { outline: 1px solid var(--gold); }
+.gear-head { display: flex; gap: .4rem; align-items: baseline; }
+.gear-head b { color: var(--gold); font-weight: 500; }
+.gear-piece { display: grid; gap: .15rem; border-top: 1px solid var(--line); padding-top: .3rem; }
+.gear-piece-head { display: flex; flex-wrap: wrap; gap: .4rem; align-items: baseline; }
+.gear-piece-head strong { overflow-wrap: anywhere; }
+.gear-scores { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.gear-stats, .gear-deltas { display: flex; flex-wrap: wrap; gap: .2rem .7rem; margin: 0; padding: 0; list-style: none; }
+.gear-notes { margin: 0; padding-left: 1rem; color: var(--muted); }
+.delta.up { color: var(--green); } .delta.down { color: var(--red); }
+.gear-shadow { color: var(--gold); }
+/* Eight tabs: let them size to their labels and wrap on narrow screens. */
+.tabs { flex-wrap: wrap; }
+.tabs button { flex: 1 1 auto; padding: .55rem .4rem; white-space: nowrap; }
