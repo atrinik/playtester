@@ -151,10 +151,143 @@ def parser() -> argparse.ArgumentParser:
              "ATRINIK_BOT_OPERATOR_KEY_FILE, else operator-assist.key next to "
              "the runtime state, else /var/lib/atrinik-playtester); run as "
              "the bot's service user")
+    feedback = sub.add_parser(
+        "feedback",
+        help="her draft feedback queue, read from her memory database (no network)")
+    feedback_sub = feedback.add_subparsers(dest="feedback_command", required=True)
+    feedback_list = feedback_sub.add_parser("list", help="list feedback items")
+    feedback_list.add_argument("--kind", default="")
+    feedback_list.add_argument("--repo", default="")
+    feedback_list.add_argument("--status", default="")
+    feedback_list.add_argument("--limit", type=int, default=200)
+    feedback_list.add_argument("--json", action="store_true")
+    feedback_show = feedback_sub.add_parser(
+        "show", help="one item's title and the exact body that would be filed")
+    feedback_show.add_argument("item", help="its id, or its fingerprint (pt-...)")
+    feedback_show.add_argument("--json", action="store_true")
     deposit = sub.add_parser("deposit")
     deposit.add_argument("--container", required=True)
     deposit.add_argument("--item", action="append", required=True)
     return p
+
+
+def memory_path(runtime_state: str) -> Path:
+    """Her memory database, as ``AtrinikClient`` resolves ``--runtime-state``
+    (a legacy ``.json`` path keeps its database beside it)."""
+    requested = (Path(runtime_state) if runtime_state else
+                 Path(__file__).with_name("bot_memory.sqlite3"))
+    return (requested.with_suffix(".sqlite3")
+            if requested.suffix.casefold() == ".json" else requested)
+
+
+def feedback_command(args: argparse.Namespace) -> int:
+    """``feedback list|show``: read-only, local, no network (phase F5).
+
+    Reads the rows of the server, account and character given by
+    ``--host``, ``--port``, ``--account`` and ``--character``, as the bot
+    stores them; works whether or not the bot is running.
+    """
+    import sqlite3
+    import sys
+
+    from .feedback import common_terms, readable, screen, short_fingerprint
+    from .memory import BotMemory
+
+    NOT_SCREENED = "(not yet screened by the running bot)"
+
+    path = memory_path(args.runtime_state)
+    if not args.character:
+        print("feedback: set --character (or ATRINIK_BOT_CHARACTER)")
+        return 2
+    if not path.is_file():
+        print(f"feedback: no memory database at {path}")
+        return 1
+    # Read-only: nothing is created, migrated or changed.
+    memory = BotMemory.open_read_only(path, server=f"{args.host.casefold()}:{args.port}",
+                                      account=args.account)
+    try:
+        if not memory.has_table("feedback_items"):
+            print(f"feedback: {path} has no feedback queue yet (no bot of this "
+                  "version has opened it)")
+            return 1
+        senders = (memory.chat_senders() if memory.has_table("chat_log") else [])
+    except sqlite3.Error as error:
+        print(f"feedback: cannot read {path}: {error}")
+        return 1
+    # Every item is checked against the private terms this command knows
+    # (the bot's own screening also uses names seen in its process).
+    code = ""
+    if args.access_code_file:
+        from .access_codes import read_access_code
+        try:
+            code = read_access_code(args.access_code_file)
+        except Exception as error:
+            print(f"feedback: cannot read the access code file: {error}")
+            return 1
+    private = [args.account, args.password, args.host, args.character,
+               args.certificate_sha256, args.party_name, args.operator_character,
+               code, *senders]
+    for term in common_terms(private):
+        print(f"feedback: warning: the private term {term!r} is a common word; "
+              "items containing it are withheld", file=sys.stderr)
+
+    def gate(items: list[dict]) -> None:
+        """Text only for items the running bot screened with its full terms
+        since they last changed (feedback.readable), and that pass this
+        command's own screen; the rest show metadata only."""
+        unscreened = [item for item in items if not readable(item)]
+        screen(items, private)
+        for item in unscreened:
+            if not item["withheld"]:
+                item.update(title=NOT_SCREENED, body_md="", subject="", labels_json="[]",
+                            issue_type="", error="", screened=False)
+        for item in items:
+            item.setdefault("screened", not item["withheld"])
+            item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
+            item.pop("evidence_json", None)
+
+    try:
+        if args.feedback_command == "list":
+            items = memory.feedback_items(args.character, kind=args.kind, repo=args.repo,
+                                          status=args.status, limit=args.limit)
+        else:
+            item = memory.feedback_item(args.character, args.item)
+            items = [] if item is None else [item]
+    except sqlite3.Error as error:
+        print(f"feedback: cannot read the queue in {path} (a database from another "
+              f"version?): {error}")
+        return 1
+    gate(items)
+    if args.feedback_command == "list":
+        for item in items:
+            item.pop("body_md", None)
+        if args.json:
+            print(json.dumps(items, indent=2, sort_keys=True, ensure_ascii=False))
+            return 0
+        if not items:
+            print("No feedback items.")
+        for item in items:
+            print(f"{item['id']:>5}  {item['short_fingerprint']}  "
+                  f"{'withheld' if item['withheld'] else item['status']:<8} "
+                  f"{item['kind']:<8} {item['repo']:<19} x{item['occurrences']:<4} "
+                  f"{item['title']}")
+        return 0
+    if not items:
+        print(f"feedback: no single item matches {args.item!r}")
+        return 1
+    item, = items
+    if args.json:
+        print(json.dumps(item, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    print(f"#{item['id']} {item['short_fingerprint']} "
+          f"{'withheld' if item['withheld'] else item['status']} {item['kind']} "
+          f"-> {item['repo']} ({item['target']})")
+    print(f"Labels: {', '.join(json.loads(item['labels_json'] or '[]')) or 'none'}"
+          f"{'; type ' + item['issue_type'] if item['issue_type'] else ''}")
+    print(f"Title: {item['title']}")
+    print()
+    print(item["body_md"], end="")
+    return 0
 
 
 def autoplay_hold_reason(client) -> str:
@@ -205,6 +338,9 @@ async def main_async(args: argparse.Namespace) -> None:
         character_archetype=args.archetype,
     )
     client = AtrinikClient(config)
+    if args.operator_character:
+        # Never in a feedback draft (feedback.py, 4.10.4).
+        client.feedback_private_names.add(args.operator_character)
     engine = TaskEngine(client)
     client.chat_context_provider = engine.chat_context
     web_server = None
@@ -423,6 +559,9 @@ def operator_assist(args: argparse.Namespace) -> int:
 
 def main() -> None:
     args = parser().parse_args()
+    if args.task == "feedback":
+        # Local and read-only: needs no game inputs and no network.
+        raise SystemExit(feedback_command(args))
     if args.task == "operator-assist":
         # Needs no game inputs: it only talks to the running bot.
         raise SystemExit(operator_assist(args))

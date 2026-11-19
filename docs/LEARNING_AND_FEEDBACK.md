@@ -1,9 +1,10 @@
 # Learning from the world and playtester feedback
 
 Status: design proposal. Phases F1 (the observation ledger), F2 (fact
-parsers and tile facts), F3 (effective item stats) and F10 (fights by
-terrain) are implemented; "F1 as built", "F2 as built", "F3 as built" and
-"F10 as built" in section 6 record where they differ from this text. Nothing else here is
+parsers and tile facts), F3 (effective item stats), F5 (the draft
+feedback queue) and F10 (fights by terrain) are implemented; "F1 as
+built", "F2 as built", "F3 as built", "F5 as built" and "F10 as built" in
+section 6 record where they differ from this text. Nothing else here is
 implemented, and nothing here changes behaviour until the phased pull
 requests at the end land.
 
@@ -1747,6 +1748,114 @@ first producers: "+N with no effect", the book experience formula and
 typos. No network at all.
 *Accept:* drafts are deduplicated across restarts; redaction and quoting
 tests pass (4.13); a test proves no socket is opened; nothing is filed.
+
+*F5 as built* (`feedback.py`, `feedback_producers.py`, `memory.py`, the
+Feedback tab, `atrinik-playtester feedback list|show`). Where the code
+differs from the text above:
+
+- **Storage.** `feedback_items` has the columns of 4.2 plus `subject` (for
+  filters and the CLI), `days`, `occurrence_keys_json`, `dates_json`,
+  `withheld`, `updated_at` (when its text last changed) and `screened_at`
+  (when the running bot last screened it). `feedback_filings` is not created yet; F6 adds it with the
+  filer. Only `draft` rows are made. At the cap of 500 drafts a new draft
+  always gets in: before it is inserted, the draft with the fewest
+  occurrences, then the least recently seen, is evicted (never the new one);
+  other statuses are never evicted.
+- **Occurrences.** A finding carries an occurrence key; a key already
+  counted (the newest 200 are kept) adds nothing, so a restart, a repeated
+  sighting or the login sweep never inflates the count. Typos count once a
+  day a source, a low-Int book once a book, "+N" once a day. `days` is the
+  number of distinct UTC dates of counted occurrences, whatever order they
+  arrive in. Drafts carry dates, never times of day. A draft's
+  title and body are rendered again from its merged evidence on every
+  occurrence (its `tried` lines, newest 10, and an aggregate's items, newest
+  50, accumulate); a rejected or filed item only gains occurrences.
+- **Evidence.** Prose in `evidence_json` is a list of parts: the
+  playtester's own fixed wording, or `{"code": ...}` for a name or value
+  from the game, always rendered as inline code; game text is only ever an
+  excerpt. Server formulas go in their own "What the server source says"
+  section, beside the "What the content says" of 4.10.3. "Where" names the
+  locked content and Classic server releases (read from the lock as JSON)
+  and this playtester's build: her client cannot read the live server's
+  build. A map is named only when its path is an authored one (starting
+  with "/", and not a player's unique map under `/players/`); otherwise the
+  draft names none, and a typo on such a map is not drafted. No rendered
+  paragraph starts with a code span (the renderer refuses one).
+- **Quoting.** Besides `<!--` and `-->` (removed until none is left, so
+  `<!<!---->--` cannot rebuild one), C0 and C1 control characters and
+  invisible formatting characters (zero-width, bidirectional and Arabic
+  letter marks, the Mongolian vowel separator, tag characters) are removed
+  from everything rendered. `fingerprints_outside_code` reads fingerprint
+  lines only outside fenced blocks, for F6's filer; as in CommonMark, a
+  backtick "fence" whose info string holds a backtick opens none.
+- **Privacy.** Excerpt lines naming another character are dropped, against
+  the names she has seen in this process and every chat sender her memory
+  keeps for the account (so a restart does not forget them). Then the whole
+  title and body are checked against every private term: her account,
+  character name, the server's host, the password, the invite code, the
+  certificate pin, the configured and the joined party names, the operator
+  character (added wherever the dashboard server is built) and those names.
+  Names are compared after NFKC folding, with game markup and invisible
+  characters removed. A draft containing one is not stored, and only its
+  fingerprint is logged; an existing item of that fingerprint is marked
+  `withheld`, and the finding is tried again on its next sighting. A term
+  that is a common word ("the", "door") is warned about once, since it
+  withholds nearly every draft. Player names are never persisted for this:
+  the set is what the process saw plus the chat log. The chat
+  senders are read once a login and extended by each new sender. Other
+  players present are recorded only as a count of those in view.
+- **Screening on read.** A name can be learned after a draft was stored, and
+  items past draft are never re-rendered, so every reader checks every
+  field it shows or files (title, body, subject, labels, type and, for F6,
+  the filing error) against the current private terms (`feedback.screen`):
+  the dashboard on each request (it flags failures `withheld` in her
+  memory), the CLI with the terms it knows, and F6's filer. A withheld item
+  is shown with a placeholder title and no text, and is never to be filed.
+  **Withholding is sticky:** the term set can shrink (names seen in a
+  process are forgotten at a restart, the party changes, the chat senders
+  read are the newest 5,000), so no later render or read releases it; only
+  an explicit owner action, in F6, may.
+- **Readers without her full terms.** A render by the running bot (which
+  passes its full terms) and each dashboard read set `screened_at`. The CLI,
+  and any other reader without the bot's full term set, shows an item's
+  text only when it is not withheld and `screened_at >= updated_at`;
+  otherwise it prints metadata and "(not yet screened by the running
+  bot)".
+- **"+N with no effect"** reads her own carried items: an identified item
+  whose name shows "+N" counts when its effective stats come from her
+  examine (an artifact can give a cape the AC its archetype lacks) and
+  F3's note says the "+N" adds nothing; a light counts without an examine,
+  since it adds nothing at all. A shop's item counts only once it is in her
+  inventory (unpaid, after she picks it up). The family is the authored archetype name (or the
+  generic family), never the shown name, which a player could have set.
+  One aggregate draft, subject `presentation:plus-n-no-effect`, rather than
+  one per `item-family:`. It runs on the gear examiner's quiet tick, at
+  most every 30 seconds, and writes only when the set of qualifying items
+  changes in a process or a day passes.
+- **Book experience** is drafted when an authored book observation is
+  stored while her Int is 10 or lower. Whether the server still owed her
+  the book's experience (an unread copy) is not visible to the client; the
+  draft states the formula, her Int and Literacy, and the factor, and
+  quotes no book text.
+- **Typos** read only `authored` door, gate, lever, sign and magic-mouth
+  observations, one draft a source (`subject` is its `source_key`, such as
+  `door:/map:x,y`). The slips are a fixed list: a repeated small word ("the
+  the"), two articles ("a the") and about thirty common misspellings
+  ("recieve"). Slips are looked for only in the lines that may be quoted.
+  Each new observation is read as it is stored, and the newest 1,000 of each
+  kind once a login.
+- **Labels and types** are proposals until open question 3 is answered:
+  typos `bug`, `maps`; the book formula `bug`, `component: server`, type
+  `Bug`; "+N" `enhancement`, `component: server`.
+- **The Feedback tab** shows each draft's body as the plain Markdown text
+  that would be filed, in a `pre` built with `textContent`, not rendered;
+  there is no approval key and no POST route yet. The CLI needs
+  `--character` and opens the database read-only (`mode=ro`): it creates,
+  migrates and changes nothing, and says so when the queue's table is
+  missing or of another version. It cannot flag items withheld; it hides
+  them in its output.
+- **Not built in F5:** the `feedback_items` gauge of 4.12, drafting from
+  shop items she has not picked up, and the other producers of 4.11.5.
 
 **F6. `feat(feedback)`: owner approval and GitHub filing.** The approval key,
 CLI `approve|reject|edit`, the separate filer unit and command, App key and

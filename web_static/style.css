@@ -204,3 +204,8 @@ details summary { cursor: pointer; color: var(--muted); margin-top: .6rem; font-
 /* Eight tabs: let them size to their labels and wrap on narrow screens. */
 .tabs { flex-wrap: wrap; }
 .tabs button { flex: 1 1 auto; padding: .55rem .4rem; white-space: nowrap; }
+.feedback-item { background: #121719; border-radius: 6px; padding: .45rem .55rem; display: grid; gap: .25rem; font-size: 12px; }
+.feedback-item .reading-head strong { overflow-wrap: anywhere; }
+.feedback-item small { color: var(--muted); overflow-wrap: anywhere; }
+.feedback-item summary { cursor: pointer; color: var(--muted); }
+.feedback-body { margin: .3rem 0 0; padding: .4rem; background: var(--panel2); border-radius: 4px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; max-height: 24rem; overflow: auto; }

@@ -26,6 +26,8 @@ from .alerts import ProgressWatch
 from .memory import BotMemory
 from .metrics import BotMetrics
 from . import facts as fact_parsers
+from . import feedback
+from . import feedback_producers
 from .observations import AuthoredContent, Observation, ObservationRecorder, text_hash
 from . import post_mortem
 from .terrain import FightRecorder
@@ -193,6 +195,10 @@ DEATH_NOTICES = ("you have been defeated in combat!", "you have died.")
 TILE_REFUSAL_SQUARES = 64
 TILE_FACT_REFRESH_SECONDS = 3600.0
 TILE_FACT_RETRY_SECONDS = 60.0
+# The longest a feedback producer waits for a locked database (seconds):
+# drafts are best effort and never stall a tick.
+FEEDBACK_READ_TIMEOUT = 0.25
+EQUIPMENT_FEEDBACK_SECONDS = 30.0
 
 
 def _locked_content_inputs() -> str:
@@ -338,6 +344,18 @@ class AtrinikClient:
         # Her route events (route_events.py, docs/ROUTING.md 4.4): what
         # crossing the world costs her, written best effort.
         self.route_recorder = route_events.RouteRecorder()
+        # The feedback queue (feedback.py): (fingerprint, occurrence, detail)
+        # already noted in this process, so a repeat costs no write, and
+        # other names drafts must never contain (the operator character).
+        self._feedback_noted: set[tuple[str, str, str]] = set()
+        self.feedback_private_names: set[str] = set()
+        # Chat senders her memory keeps, read once a login and extended by
+        # each new sender (_log_chat); None until first needed.
+        self._feedback_senders: set[str] | None = None
+        # Private terms already warned about as common words.
+        self._feedback_common_warned: set[str] = set()
+        # When the "+N with no effect" producer last ran (monotonic).
+        self._equipment_feedback_at = float("-inf")
         # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
         # a whole map, loaded with her memory: each property and when it was
         # last confirmed (wall time).
@@ -399,6 +417,8 @@ class AtrinikClient:
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
         self._load_tile_facts(character)
+        self._feedback_senders = None
+        self._feedback_sweep(character)
         # The life boundary in this (possibly reloaded) ledger: the previous
         # report's mark, found by value, or, in a fresh process with no mark,
         # the restored ledger's last death.
@@ -1993,6 +2013,7 @@ class AtrinikClient:
             except Exception:
                 log.exception("observation not kept")
                 continue
+            self._feedback_from_observation(observation.row())
             if self.metrics is not None:
                 self.metrics.observation(observation.source_kind)
                 # Facts come only from what was kept: the row is their source.
@@ -2020,6 +2041,159 @@ class AtrinikClient:
             self.metrics.fight_position(str(row.get("feature")), str(row.get("outcome")))
         return True
 
+    # The feedback queue (feedback.py, feedback_producers.py): drafts only;
+    # nothing here sends anything anywhere.
+
+    def _feedback_other_names(self) -> list[str]:
+        """Other characters she has seen: in this process, and every chat
+        sender her memory keeps."""
+        names = list(getattr(self.observations, "player_names", {}))
+        if self._feedback_senders is None:
+            # A failure propagates: without the chat senders no draft is made.
+            self._feedback_senders = set(
+                self._memory_store().chat_senders(timeout=FEEDBACK_READ_TIMEOUT))
+        names.extend(self._feedback_senders)
+        return names
+
+    def feedback_private_terms(self) -> list[str]:
+        """Every term no draft may show (feedback.screen, the dashboard)."""
+        return self._feedback_private(self._feedback_other_names())
+
+    def _feedback_private(self, others: list[str]) -> list[str]:
+        """Every term no draft may contain (4.10.4). A term that is a common
+        word is warned about once: it withholds nearly every draft."""
+        terms = self._feedback_private_terms(others)
+        for term in feedback.common_terms(terms):
+            if term not in self._feedback_common_warned:
+                self._feedback_common_warned.add(term)
+                log.warning("a private term is the common word %r: feedback drafts "
+                            "containing it are withheld", term)
+        return terms
+
+    def _feedback_private_terms(self, others: list[str]) -> list[str]:
+        config = self.config
+        return [config.account, config.password, config.access_code, config.host,
+                config.certificate_sha256, config.character, config.party_name,
+                self.state.player_name, self.state.party_name,
+                *self.feedback_private_names, *others]
+
+    def _note_feedback(self, findings: list[feedback.Finding], detail: str = "",
+                       others: list[str] | None = None) -> None:
+        """Store findings as drafts; never fails play. A finding already noted
+        in this process with the same occurrence and detail costs nothing."""
+        character = getattr(self, "_memory_character", "")
+        if not character or character != self.state.player_name:
+            return
+        for finding in findings:
+            key = (finding.fingerprint, finding.occurrence, detail)
+            if key in self._feedback_noted:
+                continue
+            try:
+                names = self._feedback_other_names() if others is None else others
+                stored = feedback.note(self._memory_store(), character, finding,
+                                       private=self._feedback_private(names))
+            except Exception as error:
+                log.warning("feedback draft not kept: %s", error)
+                continue
+            if stored is None:
+                # Withheld for a private term: tried again on its next sighting.
+                continue
+            self._feedback_noted.add(key)
+            if len(self._feedback_noted) > 10_000:
+                self._feedback_noted.clear()
+
+    def _players_present(self) -> int:
+        try:
+            return len(self.observations.players_in_view(self.state))
+        except Exception:
+            return 0
+
+    def _feedback_from_observation(self, row: dict[str, Any]) -> None:
+        """Producers that read one stored observation: typos in authored
+        lock and sign text, and a book read at low Int."""
+        findings: list[feedback.Finding] = []
+        try:
+            if row.get("source_kind") == "book":
+                book = feedback_producers.book_experience(
+                    row, stats=self.state.stats, literacy=self._skill_level("literacy"),
+                    players_present=self._players_present())
+                if book is not None:
+                    findings.append(book)
+            elif (row.get("source_kind") in feedback_producers.TYPO_SOURCES and
+                  feedback_producers.find_typos(str(row.get("text") or ""))):
+                others = self._feedback_other_names()
+                found = feedback_producers.typo(
+                    row, names=others, stats=self.state.stats,
+                    players_present=self._players_present())
+                if found is not None:
+                    self._note_feedback([found], others=others)
+                return
+        except sqlite3.Error as error:
+            log.warning("feedback producers skipped: %s", error)
+            return
+        except Exception:
+            log.exception("feedback producers failed")
+            return
+        self._note_feedback(findings)
+
+    def _feedback_sweep(self, character: str) -> None:
+        """Typos in the lock and sign texts her memory already keeps (each
+        kind's newest 1000), once a login."""
+        try:
+            memory = self._memory_store()
+            rows = [row for kind in feedback_producers.TYPO_SOURCES
+                    for row in memory.observations(character, limit=1000, source_kind=kind,
+                                                   timeout=FEEDBACK_READ_TIMEOUT)
+                    if feedback_producers.find_typos(str(row.get("text") or ""))]
+            if not rows:
+                return
+            others = self._feedback_other_names()
+            findings = [found for row in rows
+                        if (found := feedback_producers.typo(row, names=others)) is not None]
+        except Exception as error:
+            log.warning("feedback sweep skipped: %s", error)
+            return
+        self._note_feedback(findings, others=others)
+
+    def note_equipment_feedback(self) -> None:
+        """The "+N with no effect" producer, over her identified gear. Called
+        on the gear examiner's quiet tick; writes only when the set of items
+        that qualify changes in this process (or a new day starts), and runs
+        at most every EQUIPMENT_FEEDBACK_SECONDS."""
+        now = time.monotonic()
+        if now - self._equipment_feedback_at < EQUIPMENT_FEEDBACK_SECONDS:
+            return
+        self._equipment_feedback_at = now
+        try:
+            from .equipment import (FAMILY_NAMES, GEAR_LABELS, item_base,
+                                    item_effective_stats, magic_from_name)
+            entries = []
+            for item in self.state.inventory:
+                if item.item_type not in GEAR_LABELS:
+                    continue
+                magic = magic_from_name(item.name, item.item_type)
+                if not magic:
+                    continue
+                known = item_base(self, item)
+                family = (known[0] if known is not None and known[0] else
+                          FAMILY_NAMES.get(item.item_type, ""))
+                entries.append((family, item.item_type, magic,
+                                item_effective_stats(self, item)))
+            found = feedback_producers.plus_n_no_effect(
+                entries, stats=self.state.stats, at=time.time())
+        except Exception:
+            log.exception("equipment feedback producer failed")
+            return
+        if found is not None:
+            detail = ",".join(sorted(item["key"] for item in found.evidence["items"]))
+            self._note_feedback([found], detail)
+
+    def _skill_level(self, skill_name: str) -> int | None:
+        return next((int(skill.extra.get("level", 0) or 0)
+                     for skill in self.state.inventory
+                     if skill.item_type == c.TYPE_SKILL and
+                     skill.name.casefold() == skill_name), None)
+
     def _observation_dropped(self, reason: str) -> None:
         if getattr(self, "metrics", None) is not None:
             self.metrics.observation_dropped(reason)
@@ -2029,6 +2203,9 @@ class AtrinikClient:
         """Keep a chat line in the durable chat log; never fail the bot."""
         if self.metrics is not None:
             self.metrics.chat(msg_type, direction)
+        if self._feedback_senders is not None and sender:
+            # Kept as the chat log keeps it, so drafts never name the sender.
+            self._feedback_senders.add(sender[:64])
         character = self.state.player_name or self.config.character
         if not character:
             return

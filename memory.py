@@ -8,7 +8,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +54,19 @@ ROUTE_EVENT_SAVE_TIMEOUT = 0.25
 FACT_COLUMNS = ("id", "kind", "subject", "value", "confidence", "status",
                 "observation_id", "parser", "detail", "inputs", "created_at",
                 "updated_at", "expires_at")
+# The feedback queue (4.10, phase F5, feedback.py): drafts are capped, the
+# lowest-occurrence, least recently seen drafts dropped first; other
+# statuses are kept. Each draft remembers its newest occurrence keys.
+FEEDBACK_DRAFT_LIMIT = 500
+FEEDBACK_OCCURRENCE_KEYS = 200
+FEEDBACK_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
+FEEDBACK_COLUMNS = ("id", "fingerprint", "repo", "kind", "subject", "target", "title",
+                    "body_md", "labels_json", "issue_type", "evidence_json", "status",
+                    "occurrences", "days", "first_seen", "last_seen", "decided_at",
+                    "decided_via", "issue_url", "error", "withheld", "updated_at",
+                    "screened_at")
+# Distinct UTC dates kept per item for its day count.
+FEEDBACK_DATES = 1000
 
 
 def _add_column(db: sqlite3.Connection, table: str, definition: str) -> None:
@@ -267,14 +280,75 @@ class BotMemory:
                        evidence TEXT NOT NULL DEFAULT '',
                        PRIMARY KEY (server, account, character, edge)
                    )""")
+
+            # The draft feedback queue (feedback.py): one row a fingerprint.
+            # Only drafts exist before phase F6 adds approval and filing.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS feedback_items (
+                       id INTEGER PRIMARY KEY,
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       fingerprint TEXT NOT NULL,
+                       repo TEXT NOT NULL,
+                       kind TEXT NOT NULL,
+                       subject TEXT NOT NULL,
+                       target TEXT NOT NULL DEFAULT 'new-issue',
+                       title TEXT NOT NULL,
+                       body_md TEXT NOT NULL,
+                       labels_json TEXT NOT NULL DEFAULT '[]',
+                       issue_type TEXT NOT NULL DEFAULT '',
+                       evidence_json TEXT NOT NULL,
+                       status TEXT NOT NULL DEFAULT 'draft',
+                       occurrences INTEGER NOT NULL DEFAULT 1,
+                       days INTEGER NOT NULL DEFAULT 1,
+                       occurrence_keys_json TEXT NOT NULL DEFAULT '[]',
+                       dates_json TEXT NOT NULL DEFAULT '[]',
+                       withheld INTEGER NOT NULL DEFAULT 0,
+                       updated_at REAL NOT NULL DEFAULT 0,
+                       screened_at REAL NOT NULL DEFAULT 0,
+                       first_seen REAL NOT NULL,
+                       last_seen REAL NOT NULL,
+                       remote_candidates_json TEXT,
+                       decided_at REAL,
+                       decided_via TEXT,
+                       issue_url TEXT,
+                       error TEXT,
+                       UNIQUE (server, account, character, fingerprint)
+                   )""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS feedback_by_status
+                   ON feedback_items (server, account, character, status, occurrences)""")
         self._chat_appends = 0
         self._observation_inserts = 0
         self._fact_inserts = 0
         self._fight_inserts = 0
 
+    @classmethod
+    def open_read_only(cls, path: Path, *, server: str, account: str) -> "BotMemory":
+        """A store that only reads an existing database: opened with
+        ``mode=ro``, creating nothing and migrating nothing (the feedback
+        CLI). A write through it fails."""
+        memory = cls.__new__(cls)
+        memory.path = Path(path)
+        memory.server = server.casefold().strip()
+        memory.account = account.casefold().strip()
+        memory.read_only = True
+        memory._chat_appends = memory._observation_inserts = memory._fact_inserts = 0
+        return memory
+
+    def has_table(self, name: str, *, timeout: float = 10.0) -> bool:
+        with self._connect(timeout) as db:
+            return db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                              (name,)).fetchone() is not None
+
     @contextmanager
     def _connect(self, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=timeout)
+        if getattr(self, "read_only", False):
+            db = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=ro", timeout=timeout,
+                                 uri=True)
+        else:
+            db = sqlite3.connect(self.path, timeout=timeout)
         try:
             yield db
         except Exception:
@@ -683,6 +757,222 @@ class BotMemory:
                    WHERE server = ? AND account = ? AND character = ?""",
                 (self.server, self.account, character.casefold())).fetchone()
         return int(count)
+    def record_feedback(self, character: str, *, fingerprint: str, repo: str, kind: str,
+                        subject: str, at: float, occurrence: str,
+                        build: Callable[..., dict[str, Any]],
+                        timeout: float = FEEDBACK_SAVE_TIMEOUT) -> tuple[int, bool]:
+        """Start a draft for ``fingerprint`` or count another occurrence of it,
+        in one transaction (feedback.note).
+
+        An ``occurrence`` key already counted (among the newest
+        ``FEEDBACK_OCCURRENCE_KEYS``) adds no occurrence; an empty key always
+        adds one. ``days`` is the number of distinct UTC dates of counted
+        occurrences, whatever order they arrive in. ``build(stored_evidence,
+        occurrences, days, first_seen, last_seen)`` returns the title, body,
+        evidence, labels and type; it is called for a new draft and for a
+        draft, never for an item past draft, which only gains occurrences.
+        ``build`` checks the text against the running bot's full private
+        terms, so a stored render is also screened (``updated_at`` and
+        ``screened_at`` both set to the time of the write). A withheld item
+        stays withheld: only an explicit owner action (phase F6) may release
+        it. Whatever ``build`` raises
+        leaves the row as it was. A new draft in a full queue first evicts
+        the weakest draft (``_make_room``). Returns the id and whether it is
+        new.
+        """
+        folded = character.casefold()
+        scope = (self.server, self.account, folded)
+        day = time.strftime("%Y-%m-%d", time.gmtime(at))
+        # When the text was written (and screened), on the wall clock: the
+        # occurrence time ``at`` may be earlier.
+        written = time.time()
+        with self._connect(timeout) as db:
+            row = db.execute(
+                """SELECT id, status, occurrences, occurrence_keys_json, dates_json,
+                          first_seen, last_seen, evidence_json
+                   FROM feedback_items
+                   WHERE server = ? AND account = ? AND character = ? AND fingerprint = ?""",
+                (*scope, fingerprint)).fetchone()
+            if row is None:
+                fields = build(None, 1, 1, at, at)
+                self._make_room(db, folded)
+                cursor = db.execute(
+                    """INSERT INTO feedback_items
+                           (server, account, character, fingerprint, repo, kind, subject,
+                            title, body_md, labels_json, issue_type, evidence_json,
+                            occurrence_keys_json, dates_json, first_seen, last_seen,
+                            updated_at, screened_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (*scope, fingerprint, repo, kind, subject, fields["title"],
+                     fields["body_md"], fields["labels_json"], fields["issue_type"],
+                     fields["evidence_json"], json.dumps([occurrence] if occurrence else []),
+                     json.dumps([day]), at, at, written, written))
+                return int(cursor.lastrowid), True
+            row_id, status, occurrences, keys_json, dates_json, first_seen, last_seen, stored = row
+
+            def decoded(value: str) -> list[str]:
+                try:
+                    return [str(entry) for entry in json.loads(value)]
+                except (TypeError, ValueError):
+                    return []
+
+            keys, dates = decoded(keys_json), set(decoded(dates_json))
+            if not occurrence or occurrence not in keys:
+                occurrences += 1
+                dates.add(day)
+                if occurrence:
+                    keys = (keys + [occurrence])[-FEEDBACK_OCCURRENCE_KEYS:]
+            ordered = sorted(dates)[-FEEDBACK_DATES:]
+            first_seen, last_seen = min(first_seen, at), max(last_seen, at)
+            counts = (occurrences, len(ordered), json.dumps(keys), json.dumps(ordered),
+                      first_seen, last_seen)
+            if status != "draft":
+                db.execute(
+                    """UPDATE feedback_items SET occurrences = ?, days = ?,
+                           occurrence_keys_json = ?, dates_json = ?, first_seen = ?,
+                           last_seen = ?
+                       WHERE id = ?""", (*counts, row_id))
+                return int(row_id), False
+            try:
+                evidence = json.loads(stored)
+            except (TypeError, ValueError):
+                evidence = None
+            fields = build(evidence, occurrences, len(ordered), first_seen, last_seen)
+            db.execute(
+                """UPDATE feedback_items SET occurrences = ?, days = ?,
+                       occurrence_keys_json = ?, dates_json = ?, first_seen = ?,
+                       last_seen = ?, title = ?, body_md = ?, labels_json = ?,
+                       issue_type = ?, evidence_json = ?, updated_at = ?,
+                       screened_at = ?
+                   WHERE id = ?""",
+                (*counts, fields["title"], fields["body_md"], fields["labels_json"],
+                 fields["issue_type"], fields["evidence_json"], written, written, row_id))
+        return int(row_id), False
+
+    def _make_room(self, db: sqlite3.Connection, character: str) -> None:
+        """Before a new draft: while the queue holds ``FEEDBACK_DRAFT_LIMIT``
+        drafts, evict the weakest (fewest occurrences, then least recently
+        seen), so a new draft always gets in and is never itself the one
+        dropped. Other statuses are never evicted."""
+        scope = (self.server, self.account, character)
+        (count,) = db.execute(
+            """SELECT count(*) FROM feedback_items
+               WHERE server = ? AND account = ? AND character = ? AND status = 'draft'""",
+            scope).fetchone()
+        excess = count - FEEDBACK_DRAFT_LIMIT + 1
+        if excess > 0:
+            db.execute(
+                """DELETE FROM feedback_items WHERE id IN (
+                       SELECT id FROM feedback_items
+                       WHERE server = ? AND account = ? AND character = ?
+                         AND status = 'draft'
+                       ORDER BY occurrences, last_seen, id LIMIT ?)""",
+                (*scope, excess))
+
+    def withhold_feedback(self, character: str, ids: Iterable[int], *,
+                          timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
+        """Mark items withheld: their stored title or body names a private
+        term. They are shown and filed only once a clean render replaces it."""
+        ids = [int(item) for item in ids]
+        if not ids:
+            return
+        with self._connect(timeout) as db:
+            db.executemany(
+                """UPDATE feedback_items SET withheld = 1
+                   WHERE server = ? AND account = ? AND character = ? AND id = ?""",
+                [(self.server, self.account, character.casefold(), item) for item in ids])
+
+    def mark_feedback_screened(self, character: str, ids: Iterable[int], *,
+                               at: float | None = None,
+                               timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
+        """Record that the running bot screened these items with its full
+        private terms (only those whose text changed since the last screen)."""
+        ids = [int(item) for item in ids]
+        if not ids:
+            return
+        at = time.time() if at is None else at
+        with self._connect(timeout) as db:
+            db.executemany(
+                """UPDATE feedback_items SET screened_at = ?
+                   WHERE server = ? AND account = ? AND character = ? AND id = ?
+                     AND screened_at < updated_at""",
+                [(at, self.server, self.account, character.casefold(), item)
+                 for item in ids])
+
+    def withhold_feedback_fingerprint(self, character: str, fingerprint: str, *,
+                                      timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
+        """Mark the item of ``fingerprint`` withheld, if there is one."""
+        with self._connect(timeout) as db:
+            db.execute(
+                """UPDATE feedback_items SET withheld = 1
+                   WHERE server = ? AND account = ? AND character = ? AND fingerprint = ?""",
+                (self.server, self.account, character.casefold(), fingerprint))
+
+    def feedback_items(self, character: str, *, kind: str = "", repo: str = "",
+                       status: str = "", limit: int = 200,
+                       timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her feedback items, most recently seen first."""
+        query = f"""SELECT {", ".join(FEEDBACK_COLUMNS)} FROM feedback_items
+                    WHERE server = ? AND account = ? AND character = ?"""
+        params: list[Any] = [self.server, self.account, character.casefold()]
+        for column, value in (("kind", kind), ("repo", repo), ("status", status)):
+            if value:
+                query += f" AND {column} = ?"
+                params.append(value)
+        query += " ORDER BY last_seen DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._connect(timeout) as db:
+            rows = db.execute(query, params).fetchall()
+        return [dict(zip(FEEDBACK_COLUMNS, row)) for row in rows]
+
+    def feedback_item(self, character: str, reference: str, *,
+                      timeout: float = 10.0) -> dict[str, Any] | None:
+        """One item by its id, or by its fingerprint (full, or ``pt-`` and
+        at least 12 hex digits); None when none or more than one match."""
+        reference = reference.strip().casefold()
+        scope = (self.server, self.account, character.casefold())
+        columns = ", ".join(FEEDBACK_COLUMNS)
+        with self._connect(timeout) as db:
+            if reference.isdigit():
+                rows = db.execute(
+                    f"""SELECT {columns} FROM feedback_items
+                        WHERE server = ? AND account = ? AND character = ? AND id = ?""",
+                    (*scope, int(reference))).fetchall()
+            else:
+                prefix = reference.removeprefix("pt-")
+                if len(prefix) < 12 or any(ch not in "0123456789abcdef" for ch in prefix):
+                    return None
+                rows = db.execute(
+                    f"""SELECT {columns} FROM feedback_items
+                        WHERE server = ? AND account = ? AND character = ?
+                          AND substr(fingerprint, 1, ?) = ? LIMIT 2""",
+                    (*scope, len(prefix), prefix)).fetchall()
+        return dict(zip(FEEDBACK_COLUMNS, rows[0])) if len(rows) == 1 else None
+
+    def feedback_counts(self, character: str, *,
+                        timeout: float = 10.0) -> dict[str, dict[str, int]]:
+        """Her feedback items by status, then kind."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT status, kind, count(*) FROM feedback_items
+                   WHERE server = ? AND account = ? AND character = ?
+                   GROUP BY status, kind""",
+                (self.server, self.account, character.casefold())).fetchall()
+        counts: dict[str, dict[str, int]] = {}
+        for status, kind, count in rows:
+            counts.setdefault(status, {})[kind] = int(count)
+        return counts
+
+    def chat_senders(self, *, limit: int = 5000, timeout: float = 10.0) -> list[str]:
+        """The distinct senders in this account's chat log (any of its
+        characters), most recent first: names drafts must never contain."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT sender FROM chat_log
+                   WHERE server = ? AND account = ?
+                   GROUP BY sender ORDER BY max(at) DESC LIMIT ?""",
+                (self.server, self.account, max(1, int(limit)))).fetchall()
+        return [str(sender) for (sender,) in rows if sender]
 
     def set_route_block(self, character: str, subject: str, *, created_at: float,
                         until: float, note: str = "", timeout: float = 10.0) -> None:

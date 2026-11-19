@@ -23,6 +23,8 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .equipment import equipment_report
+from .feedback import (KINDS as FEEDBACK_KINDS, REPOS as FEEDBACK_REPOS,
+                       screen as screen_feedback, short_fingerprint)
 from .face_images import FaceImages
 from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from .alerts import active as active_alerts
@@ -954,6 +956,11 @@ class WebControlServer:
         self.operator_assist = operator_assist or OperatorAssist(
             client, engine, operator_character)
         self.dashboard.operator_assist = self.operator_assist
+        # The operator character never appears in a feedback draft.
+        private = getattr(client, "feedback_private_names", None)
+        operator = getattr(self.operator_assist, "operator_character", "") or operator_character
+        if isinstance(private, set) and operator:
+            private.add(operator)
         # The owner-only key /api/operator-assist requires; empty refuses all.
         self.operator_key = operator_key
         self._key_refusals_logged_at = 0.0
@@ -1143,6 +1150,55 @@ class WebControlServer:
             # ?limit=N (up to 200) and the decayed rates over all kept.
             # Counts only: no attacker's or other player's name is stored.
             await self._reply(writer, 200, _json_bytes(self._terrain(parse_qs(query))))
+            return
+        if method == "GET" and path == "/api/feedback":
+            # Her draft feedback queue (feedback.py), read-only:
+            # ?kind=KIND&repo=OWNER/NAME&status=STATUS&limit=N. Drafts hold
+            # only authored text and her own state; nothing is filed from
+            # here (approval and filing are phase F6).
+            params = parse_qs(query)
+            character = getattr(self.client, "_memory_character", "")
+            items, counts, busy = [], {}, False
+            if character:
+                memory = self.client._memory_store()
+                try:
+                    items = memory.feedback_items(
+                        character, kind=(params.get("kind") or [""])[0],
+                        repo=(params.get("repo") or [""])[0],
+                        status=(params.get("status") or [""])[0],
+                        limit=int((params.get("limit") or ["200"])[0]),
+                        timeout=KNOWLEDGE_READ_TIMEOUT)
+                    counts = memory.feedback_counts(character, timeout=KNOWLEDGE_READ_TIMEOUT)
+                except sqlite3.OperationalError:
+                    items, counts, busy = [], {}, True
+            if items:
+                # Checked against the current private terms on every read:
+                # an item naming one is withheld (blanked here, flagged in
+                # her memory) until a clean render replaces it.
+                try:
+                    newly = screen_feedback(items, self.client.feedback_private_terms())
+                    memory = self.client._memory_store()
+                    if newly:
+                        memory.withhold_feedback(
+                            character, newly, timeout=KNOWLEDGE_READ_TIMEOUT)
+                    # Screened with her full terms: a reader without them
+                    # (the CLI) may show these (feedback.readable).
+                    memory.mark_feedback_screened(
+                        character, [item["id"] for item in items if not item["withheld"]],
+                        timeout=KNOWLEDGE_READ_TIMEOUT)
+                except Exception as error:
+                    log.warning("feedback screening failed: %s", error)
+                    items, busy = [], True
+            for item in items:
+                item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
+                try:
+                    item["labels"] = json.loads(item.pop("labels_json") or "[]")
+                except ValueError:
+                    item["labels"] = []
+                item.pop("evidence_json", None)
+            await self._reply(writer, 200, _json_bytes({
+                "items": items, "counts": counts, "busy": busy, "read_only": True,
+                "kinds": list(FEEDBACK_KINDS), "repos": list(FEEDBACK_REPOS)}))
             return
         if method == "GET" and path.startswith("/api/face/"):
             image = self.face_images.png(path[len("/api/face/"):])

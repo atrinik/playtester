@@ -435,6 +435,71 @@ ranged monsters in view: fights, damage a second and deaths, each day's
 fights weighted with a 7-day half-life (`GET /api/terrain?limit=N`, up to
 200, under the same loopback and `Host` rules as `/api/state`).
 
+## Feedback drafts
+
+She collects what confuses her as deduplicated drafts in a local queue
+(`feedback.py`, `feedback_producers.py`; the design is
+[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md) 4.10, phase
+F5). Nothing leaves the machine: no draft is filed, no GitHub request of
+any kind is made, and the queue's code opens no socket. Approval and filing
+are a later phase, and only an item the owner approves will ever be filed.
+
+- **Producers.** "+N with no effect": an examined item of hers whose name
+  shows "+N" on a type and base that gain nothing from it (a `silk cape +2`),
+  one aggregate draft for `atrinik/classic` listing the archetype families
+  she met. Book experience at low Int: an authored book she read at Int 10
+  or lower, where the server's `book_exp_mod` is negative, one draft for
+  `atrinik/classic`. Typos (a small list of common slips such as "a the",
+  "the the" and "recieve") in authored door, gate, lever, sign and
+  magic-mouth text, one draft a source for `atrinik/content`. They read
+  only her stored observations, her own stats and skills and her own gear,
+  never chat; the typo producer also reads the stored lock and sign texts
+  once a login.
+- **Deduplication.** Each draft has a fingerprint, the sha256 of its kind,
+  repository, subject and claim, shown as `pt-` and 12 hex digits. The same
+  fingerprint never makes a second draft, across restarts too; a new
+  occurrence raises its count, and a draft's body is rendered again from its
+  evidence each time; its day count is the number of distinct dates. At
+  most 500 drafts a character: a new draft evicts the one with the fewest
+  occurrences, then the least recently seen. Drafts carry dates, never times
+  of day, and name a map only by its authored path, never a player's own
+  map.
+- **Privacy.** A draft holds only authored text and her own state. Game
+  text appears only in a fenced code block longer than any backtick run in
+  it, with HTML comment markers and invisible characters removed, so a
+  `@name`, `#123`, link or copied fingerprint line in it does nothing;
+  names are inline code. An excerpt line naming another character she has
+  seen (in view, in `/who`, or any chat sender her memory keeps) is
+  dropped. A draft whose title or body would contain her account,
+  character or the server's address, the password, the invite code, her
+  party, the operator character or another character's name is not stored
+  at all. Every reader checks stored items again against the names known
+  now: one that names a private term is withheld, shown with no text, and
+  stays withheld (only an owner action in a later phase may release it).
+
+The dashboard's read-only **Feedback** tab lists the drafts, filtered by
+kind and repository, with the exact body that would be filed (`GET
+/api/feedback?kind=KIND&repo=OWNER/NAME&status=STATUS&limit=N`). On CT130:
+
+```sh
+# With the service's ATRINIK_BOT_ACCOUNT, ATRINIK_BOT_CHARACTER and
+# ATRINIK_BOT_RUNTIME_STATE, and its --host and --port:
+atrinik-playtester --host HOST --port 1728 feedback list
+atrinik-playtester --host HOST --port 1728 feedback show pt-4f1c2a9b0d3e
+```
+
+`--host`, `--port`, `--account` and `--character` select her rows as the
+bot stores them; `list` takes `--kind`, `--repo` and `--status`, and
+`list --json` and `show --json` print JSON. The command opens the database
+read-only, whether or not the bot is running, and needs no network and no
+game inputs. It knows fewer names than the running bot (none it saw in
+play), so it shows an item's text only once the running bot has screened
+it since it last changed; otherwise it prints "(not yet screened by the
+running bot)" and the metadata. Run it as the bot's service user: SQLite
+may create the database's `-wal` and `-shm` files even for a read-only
+reader when the bot is stopped, and files created by another user can then
+stop the bot from opening its database.
+
 ## Operator assist
 
 The owner can have an operator character hand the played character gold.

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Atrinik Observer</title>
-  <link rel="stylesheet" href="/style.css?v=16">
+  <link rel="stylesheet" href="/style.css?v=17">
 </head>
 <body>
   <header class="topbar">
@@ -81,6 +81,7 @@
         <button data-tab="farming">Farming</button>
         <button data-tab="knowledge">Knowledge</button>
         <button data-tab="equipment">Equipment</button>
+        <button data-tab="feedback">Feedback</button>
         <button data-tab="tasks">Tasks</button>
       </nav>
 
@@ -152,6 +153,13 @@
         <p class="muted small">What each piece really adds when worn: its examined base stats with the server's rules for “+N” (only AC, WC, damage, block and absorb the item already has gain it; a launcher's goes to its arrows) and its condition. The current name-based score still chooses her gear; this panel and the shadow log only show where the two would differ. Read-only.</p>
       </div>
 
+      <div id="tab-feedback" class="tab scroll">
+        <div class="row between"><h2>Feedback drafts</h2><div class="row"><select id="feedback-kind"><option value="">All kinds</option></select><select id="feedback-repo"><option value="">All repositories</option></select></div></div>
+        <p id="feedback-summary" class="muted small"></p>
+        <div id="feedback" class="list"><span class="muted">Loading…</span></div>
+        <p class="muted small">What she found confusing or broken, deduplicated, with the exact body that would be filed. Drafts hold only authored text and her own state: never chat, other players' names, her account or the server's address. Nothing is filed or searched from here; approval and filing come later, and only with the owner's approval. Read-only.</p>
+      </div>
+
       <div id="tab-tasks" class="tab scroll">
         <p class="muted small">Starting any of these replaces autoplay until it finishes; use <b>Start autoplay</b> to return to the campaign.</p>
         <section class="form">
@@ -200,6 +208,6 @@
     </section>
   </main>
   <div id="toast" role="status"></div>
-  <script src="/app.js?v=31"></script>
+  <script src="/app.js?v=32"></script>
 </body>
 </html>

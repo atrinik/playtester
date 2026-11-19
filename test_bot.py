@@ -22324,7 +22324,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=31", page)
+        self.assertIn(b"/app.js?v=32", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -24977,7 +24977,8 @@ class DashboardSecurityTests(unittest.IsolatedAsyncioTestCase):
                          "default-src 'self'; script-src 'self'; object-src 'none'; "
                          "frame-ancestors 'none'; base-uri 'none'")
         for path in ("/", "/app.js", "/style.css", "/api/state?include=phase",
-                     "/api/knowledge", "/api/terrain", "/metrics", "/missing"):
+                     "/api/knowledge", "/api/terrain", "/api/feedback", "/metrics",
+                     "/missing"):
             head, _ = await self.raw_get(path)
             self.assertIn(f"Content-Security-Policy: {CONTENT_SECURITY_POLICY}\r\n", head, path)
 
@@ -27064,6 +27065,847 @@ class RouteLearnedRouteTests(unittest.IsolatedAsyncioTestCase):
         status, _ = await self.request("POST", "/api/route-learned", {},
                                        {"Content-Type": "application/json"})
         self.assertNotEqual(status, 200)
+
+
+
+# The draft feedback queue (docs/LEARNING_AND_FEEDBACK.md 4.10, phase F5).
+_NETWORK_AUDIT = {"armed": False, "events": []}
+
+
+def _network_audit(event, args):
+    """Network use while armed: an internet socket, a connection, a name
+    lookup or a URL opened. (asyncio's own wake-up socketpair is AF_UNIX.)"""
+    if not _NETWORK_AUDIT["armed"]:
+        return
+    import socket
+    if event == "socket.__new__":
+        if len(args) > 1 and args[1] in (socket.AF_INET, socket.AF_INET6):
+            _NETWORK_AUDIT["events"].append(event)
+    elif event.split(".")[0] in ("socket", "urllib", "http", "ssl", "smtplib",
+                                 "ftplib", "webbrowser"):
+        _NETWORK_AUDIT["events"].append(event)
+
+
+import sys as _sys  # noqa: E402
+_sys.addaudithook(_network_audit)
+
+FEEDBACK_MAP = """arch map
+name Hall
+width 10
+height 10
+end
+arch locked_door
+slaying hall_key
+msg
+You need a the key to open this door.
+endmsg
+x 5
+y 4
+end
+arch sign
+msg
+Mallory recieved the crown here.
+Ask the warden about the the vault.
+endmsg
+x 7
+y 7
+end
+arch book
+name founding notes
+msg
+The hall was built in a single winter.
+endmsg
+x 2
+y 2
+end
+"""
+
+
+def feedback_content(directory: Path):
+    from .observations import AuthoredContent
+    arch = Path(directory) / "content" / "arch"
+    maps = Path(directory) / "content" / "maps" / "test"
+    arch.mkdir(parents=True)
+    maps.mkdir(parents=True)
+    for name, text in OBSERVATION_ARCH.items():
+        (arch / name).write_text(text)
+    (maps / "hall").write_text(FEEDBACK_MAP)
+    return AuthoredContent.scan(Path(directory) / "content")
+
+
+class FeedbackQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "memory.sqlite3"
+
+    def memory(self):
+        from .memory import BotMemory
+        return BotMemory(self.path, server="127.0.0.1:1728", account="seraacct")
+
+    @staticmethod
+    def finding(subject="door:/test/hall:5,4", occurrence="2026-11-18", **evidence):
+        from .feedback import Finding, prose
+        return Finding(kind="clarity", repo="atrinik/content", subject=subject,
+                       claim="a typo in its text", title="Typo in the door text",
+                       evidence={"what": prose("A slip."), **evidence},
+                       labels=("bug", "maps"), occurrence=occurrence)
+
+    def test_fingerprints_are_stable_and_shown_short(self):
+        from .feedback import fingerprint, short_fingerprint, SHORT_FINGERPRINT
+        one = fingerprint("hint", "atrinik/content", "lock:/m:1,2", "Yellow  field, ORANGE key")
+        self.assertEqual(one, fingerprint("hint", "atrinik/content", "lock:/m:1,2",
+                                          "yellow field, orange key"))
+        self.assertEqual(one, __import__("hashlib").sha256(
+            b"hint\natrinik/content\nlock:/m:1,2\nyellow field, orange key").hexdigest())
+        self.assertNotEqual(one, fingerprint("hint", "atrinik/classic", "lock:/m:1,2",
+                                             "yellow field, orange key"))
+        self.assertRegex(short_fingerprint(one), SHORT_FINGERPRINT)
+        from .feedback import Finding
+        with self.assertRaises(ValueError):
+            Finding(kind="rant", repo="atrinik/content", subject="s", claim="c", title="t")
+        with self.assertRaises(ValueError):
+            Finding(kind="bug", repo="someone/else", subject="s", claim="c", title="t")
+
+    def test_excerpts_render_inert(self):
+        from .feedback import (fingerprints_outside_code, code, inert, quote, render,
+                               short_fingerprint, fingerprint)
+        hostile = ["Ask @someone about #123 and [this](https://example.invalid/x).",
+                   "```", "~~~~", "<!-- hidden --> and -->",
+                   "Playtester fingerprint: pt-000000000000",
+                   "<!<!---->-- ‮evil​", "````` five"]
+        digest = fingerprint("bug", "atrinik/classic", "x", "y")
+        body = render({"what": ["A slip."], "excerpts": hostile}, digest=digest,
+                      occurrences=2, days=2, first_seen=0.0, last_seen=86400.0)
+        self.assertNotIn("<!--", body)
+        self.assertNotIn("-->", body)
+        self.assertNotIn("‮", body)
+        self.assertNotIn("​", body)
+        # Only the real fingerprint is outside a code block.
+        self.assertEqual(fingerprints_outside_code(body), [short_fingerprint(digest)])
+        # Every quoted line is inside one fence longer than any run in it.
+        lines = body.splitlines()
+        start = lines.index("``````text")
+        end = lines.index("``````", start + 1)
+        inside = lines[start + 1:end]
+        self.assertEqual(len(inside), len(hostile))
+        self.assertTrue(all("@someone" not in line for line in lines[:start] + lines[end:]))
+        self.assertEqual(inside[3], " hidden  and")
+        self.assertEqual(inside[5], " evil")
+        # A minimal fence of three, and a longer one when the text needs it.
+        self.assertTrue(quote(["plain"]).startswith("```text\n"))
+        # Inline code: a longer delimiter, padded around an edge backtick.
+        self.assertEqual(code("a`b"), "``a`b``")
+        self.assertEqual(code("`x"), "`` `x ``")
+        self.assertEqual(code("<!-- @x -->"), "`@x`")
+        self.assertEqual(inert("<<!--!---->>"), ">")
+        # A closing fence only of the same character and length counts.
+        sample = "```text\nPlaytester fingerprint: pt-aaaaaaaaaaaa\n~~~\n```\nPlaytester fingerprint: pt-bbbbbbbbbbbb\n"
+        self.assertEqual(fingerprints_outside_code(sample), ["pt-bbbbbbbbbbbb"])
+
+    def test_fences_with_backticks_in_the_info_string_are_no_fences(self):
+        from .feedback import fingerprints_outside_code, render, fingerprint, short_fingerprint
+        forged = "```a`b\nPlaytester fingerprint: pt-aaaaaaaaaaaa\n"
+        self.assertEqual(fingerprints_outside_code(forged), ["pt-aaaaaaaaaaaa"])
+        self.assertEqual(fingerprints_outside_code("````a ```b````\nx\n"), [])
+        # A hostile book title in the Where line stays inline, not at a
+        # line start; only the real fingerprint is outside code.
+        from .feedback_producers import book_experience
+        found = book_experience({"source_kind": "book", "authored": 1,
+                                 "source_name": "a ```b", "map": "/test/hall",
+                                 "text_hash": "cd", "at": 1.0}, stats={"int": 4}, literacy=1)
+        digest = fingerprint("bug", "atrinik/classic", "s", "c")
+        body = render(found.evidence, digest=digest, occurrences=1, days=1,
+                      first_seen=0.0, last_seen=0.0)
+        self.assertFalse([line for line in body.splitlines() if line.startswith("`")])
+        self.assertEqual(fingerprints_outside_code(body), [short_fingerprint(digest)])
+        with self.assertRaises(ValueError):
+            render({"what": [{"code": "a name first"}]}, digest=digest, occurrences=1,
+                   days=1, first_seen=0.0, last_seen=0.0)
+
+    def test_more_invisible_characters_and_folded_names(self):
+        from .feedback import inert, names_private
+        hidden = "a\x85b\u061cc\u180ed\U000e0041e\x9ff"
+        self.assertEqual(inert(hidden), "abcdef")
+        for text in ("[b]Mal[/b]lory was here", "Mal[\u200bb]lory waits", "\uff2d\uff41\uff4c\uff4c\uff4f\uff52\uff59 waits",
+                     "Mal\u200blory", "[a=#charname]Mallory[/a] says"):
+            with self.subTest(text=text):
+                self.assertEqual(names_private(text, ["mallory"]), "mallory")
+        self.assertIsNone(names_private("Malloryland", ["mallory"]))
+
+    def test_redaction_drops_lines_naming_a_seen_player(self):
+        from .feedback import excerpt, names_private, EXCERPT_LINES, EXCERPT_CHARS
+        lines = excerpt(["Zoey left the key here.\nThe gate is shut.\n\nMALLORY waits.",
+                         "Zoeyland is far."], ["zoey", "Mallory"])
+        self.assertEqual(lines, ["The gate is shut.", "Zoeyland is far."])
+        self.assertEqual(len(excerpt(["line"] * 30, [])), EXCERPT_LINES)
+        long = excerpt(["x" * 1000, "y" * 1000], [])
+        self.assertEqual(sum(map(len, long)), EXCERPT_CHARS)
+        self.assertTrue(long[-1].endswith("…"))
+        self.assertEqual(names_private("Hello, Sera!", ["sera"]), "sera")
+        self.assertIsNone(names_private("Serafina", ["sera"]))
+
+    def test_a_draft_naming_a_private_term_is_never_stored(self):
+        from .feedback import note, prose, name
+        memory = self.memory()
+        private = ["seraacct", "hunter2", "127.0.0.1", "INVITE-CODE", "Sera", "Mallory"]
+        for evidence in ({"tried": [prose("asked ", name("Mallory"))]},
+                         {"what": prose("Logged in as SeraAcct.")},
+                         {"where": prose("Server ", name("127.0.0.1"))},
+                         {"notes": [prose("Sera saw it.")]},
+                         {"excerpts": ["the code is invite-code"]}):
+            with self.subTest(evidence=evidence):
+                self.assertIsNone(note(memory, "Sera", self.finding(**evidence),
+                                       private=private))
+        self.assertEqual(memory.feedback_items("Sera"), [])
+        self.assertIsNotNone(note(memory, "Sera", self.finding(), private=private))
+
+    def test_drafts_are_deduplicated_across_restarts(self):
+        from .feedback import note, short_fingerprint
+        day = 1_795_000_000.0
+        first, created = note(self.memory(), "Sera", self.finding(occurrence="a"), at=day)
+        self.assertTrue(created)
+        # A restart: a new store on the same file; the same occurrence key
+        # adds nothing, a new one adds an occurrence, a later day a day.
+        again = self.memory()
+        self.assertEqual(note(again, "Sera", self.finding(occurrence="a"), at=day + 60),
+                         (first, False))
+        note(again, "Sera", self.finding(occurrence="b"), at=day + 120)
+        note(self.memory(), "Sera", self.finding(occurrence="c"), at=day + 86400)
+        item, = self.memory().feedback_items("Sera")
+        self.assertEqual((item["id"], item["occurrences"], item["days"], item["status"],
+                          item["first_seen"], item["last_seen"]),
+                         (first, 3, 2, "draft", day, day + 86400))
+        self.assertIn("3 times on 2 days", item["body_md"])
+        self.assertIn(f"Playtester fingerprint: {short_fingerprint(item['fingerprint'])}",
+                      item["body_md"])
+        # Another character, account or server has its own queue.
+        from .memory import BotMemory
+        self.assertEqual(BotMemory(self.path, server="127.0.0.1:1728",
+                                   account="other").feedback_items("Sera"), [])
+        self.assertEqual(self.memory().feedback_items("Mallory"), [])
+        # A rejected item stays rejected and keeps its body; it only counts.
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE feedback_items SET status = 'rejected'")
+        note(self.memory(), "Sera", self.finding(occurrence="d", notes=[["new"]]),
+             at=day + 2 * 86400)
+        rejected, = self.memory().feedback_items("Sera")
+        self.assertEqual((rejected["status"], rejected["occurrences"], rejected["days"],
+                          rejected["body_md"]), ("rejected", 4, 3, item["body_md"]))
+        self.assertEqual(self.memory().feedback_item("Sera", str(first))["id"], first)
+        self.assertEqual(self.memory().feedback_item(
+            "Sera", short_fingerprint(item["fingerprint"]))["id"], first)
+        self.assertIsNone(self.memory().feedback_item("Sera", "pt-12"))
+        self.assertIsNone(self.memory().feedback_item("Sera", "999"))
+        self.assertEqual(self.memory().feedback_counts("Sera"), {"rejected": {"clarity": 1}})
+
+    def test_aggregate_items_and_tries_merge(self):
+        from .feedback import note, prose, name
+        memory = self.memory()
+        note(memory, "Sera", self.finding(
+            items=[{"key": "cape", "text": prose(name("cape"), " +2")}],
+            tried=[prose("first")]), at=1.0)
+        note(memory, "Sera", self.finding(
+            occurrence="x", items=[{"key": "torch", "text": prose(name("torch"), " +1")},
+                                   {"key": "cape", "text": prose(name("cape"), " +3")}],
+            tried=[prose("second")]), at=2.0)
+        body = memory.feedback_items("Sera")[0]["body_md"]
+        self.assertIn("- `torch` +1\n- `cape` +3", body)
+        self.assertIn("- first\n- second", body)
+
+    def test_stored_items_are_screened_on_every_read(self):
+        from .feedback import note, screen, WITHHELD_TITLE
+        memory = self.memory()
+        draft_id, _ = note(memory, "Sera", self.finding(excerpts=["Ask Kiri at the gate."]),
+                           at=1.0)
+        filed_id, _ = note(memory, "Sera", self.finding("filed:x",
+                                                        excerpts=["Kiri was here."]), at=1.0)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE feedback_items SET status = 'filed' WHERE id = ?", (filed_id,))
+        # Kiri is learned later: both the draft and the filed item fail now.
+        items = memory.feedback_items("Sera")
+        self.assertEqual(sorted(screen(items, ["kiri"])), sorted([draft_id, filed_id]))
+        self.assertTrue(all(item["withheld"] and item["title"] == WITHHELD_TITLE and
+                            item["body_md"] == "" for item in items))
+        memory.withhold_feedback("Sera", [draft_id, filed_id])
+        # Withheld stays withheld, even without the term, until a clean render.
+        items = memory.feedback_items("Sera")
+        self.assertEqual(screen(items, []), [])
+        self.assertTrue(all(item["withheld"] for item in items))
+        # A new occurrence still naming her is not stored and stays withheld.
+        self.assertIsNone(note(memory, "Sera", self.finding(
+            occurrence="later", excerpts=["Ask Kiri at the gate."]), private=["kiri"], at=2.0))
+        # Withholding is sticky: a "clean" render (the term set may simply
+        # have shrunk after a restart) releases nothing; only an explicit
+        # owner action (phase F6) may.
+        note(memory, "Sera", self.finding(occurrence="clean", excerpts=["The gate."]),
+             private=["kiri"], at=3.0)
+        kept = {item["id"]: item for item in memory.feedback_items("Sera")}
+        self.assertEqual((kept[draft_id]["withheld"], kept[filed_id]["withheld"]), (1, 1))
+        screen(list(kept.values()), [])
+        self.assertEqual(kept[draft_id]["body_md"], "")
+        # A draft that was clean when stored but now names a term is withheld
+        # by note() too, through its fingerprint.
+        fresh, _ = note(memory, "Sera", self.finding("fresh:y", excerpts=["Mira waits."]))
+        self.assertIsNone(note(memory, "Sera", self.finding("fresh:y", occurrence="z",
+                                                            excerpts=["Mira waits."]),
+                               private=["mira"]))
+        self.assertEqual(memory.feedback_item("Sera", str(fresh))["withheld"], 1)
+
+    def test_every_shown_field_is_screened(self):
+        from .feedback import screen
+        items = [{"id": 1, "title": "t", "body_md": "b", "subject": "s", "labels_json": "[]",
+                  "issue_type": "", "error": "403 for Kiri"},
+                 {"id": 2, "title": "t", "body_md": "b", "subject": "door:/m:1,1",
+                  "labels_json": '["Kiri"]', "issue_type": "", "error": None},
+                 {"id": 3, "title": "t", "body_md": "b", "subject": "door:/m:1,1",
+                  "labels_json": '["bug"]', "issue_type": "Bug", "error": None}]
+        self.assertEqual(screen(items, ["kiri"]), [1, 2])
+        self.assertEqual([(item["withheld"], item["error"], item["subject"]) for item in items],
+                         [(True, "", ""), (True, "", ""), (False, None, "door:/m:1,1")])
+
+    def test_screening_times_tell_the_cli_what_it_may_show(self):
+        from .feedback import note, readable
+        memory = self.memory()
+        draft_id, _ = note(memory, "Sera", self.finding())
+        item = memory.feedback_item("Sera", str(draft_id))
+        # A render by the running bot (with its full terms) is screened.
+        self.assertGreater(item["updated_at"], 0)
+        self.assertEqual(item["screened_at"], item["updated_at"])
+        self.assertTrue(readable(item))
+        # A text written by anything else (F6's edit, say) is not, until the
+        # running bot screens it again.
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE feedback_items SET updated_at = updated_at + 10")
+        item = memory.feedback_item("Sera", str(draft_id))
+        self.assertFalse(readable(item))
+        memory.mark_feedback_screened("Sera", [draft_id], at=item["updated_at"] + 1)
+        self.assertTrue(readable(memory.feedback_item("Sera", str(draft_id))))
+        self.assertFalse(readable({**item, "withheld": 1, "screened_at": 1e12}))
+
+    def test_common_words_as_private_terms_are_flagged(self):
+        from .feedback import common_terms
+        self.assertEqual(common_terms(["The", "seraacct", "Door", "Kiri"]), ["door", "the"])
+
+    def test_days_count_distinct_dates_in_any_order(self):
+        from .feedback import note
+        day = 86400.0
+        memory = self.memory()
+        note(memory, "Sera", self.finding(occurrence="a"), at=1_795_000_000.0 + 2 * day)
+        note(memory, "Sera", self.finding(occurrence="b"), at=1_795_000_000.0)
+        note(memory, "Sera", self.finding(occurrence="c"), at=1_795_000_000.0 + 2 * day + 60)
+        note(memory, "Sera", self.finding(occurrence="d"), at=1_795_000_000.0 + 60)
+        item, = memory.feedback_items("Sera")
+        self.assertEqual((item["occurrences"], item["days"]), (4, 2))
+
+    def test_drafts_are_capped_fewest_occurrences_first(self):
+        from . import memory as memory_module
+        from .feedback import note
+        memory = self.memory()
+        with patch.object(memory_module, "FEEDBACK_DRAFT_LIMIT", 3):
+            note(memory, "Sera", self.finding("keep:often", occurrence="1"), at=1.0)
+            note(memory, "Sera", self.finding("keep:often", occurrence="2"), at=2.0)
+            note(memory, "Sera", self.finding("old:once"), at=3.0)
+            with sqlite3.connect(self.path) as db:
+                db.execute("UPDATE feedback_items SET status = 'filed' "
+                           "WHERE subject = 'old:once'")
+            for index in range(4):
+                note(memory, "Sera", self.finding(f"new:{index}"), at=10.0 + index)
+        subjects = {item["subject"]: item["status"] for item in memory.feedback_items("Sera")}
+        self.assertEqual(subjects, {"keep:often": "draft", "old:once": "filed",
+                                    "new:2": "draft", "new:3": "draft"})
+        # The queue was full when new:3 came: it got in, the weakest left.
+        with patch.object(memory_module, "FEEDBACK_DRAFT_LIMIT", 3):
+            _, created = note(memory, "Sera", self.finding("new:4"), at=20.0)
+        self.assertTrue(created)
+        self.assertIn("new:4", {item["subject"] for item in memory.feedback_items("Sera")})
+        self.assertEqual(sum(item["status"] == "draft"
+                             for item in memory.feedback_items("Sera")), 3)
+
+
+class FeedbackProducerTests(unittest.TestCase):
+    def test_typos_from_the_small_list(self):
+        from .feedback_producers import find_typos
+        self.assertEqual(find_typos("You need a the key to open this door."),
+                         [("a the", "two articles")])
+        self.assertEqual(find_typos("[b]Ask[/b] about the the vault. It is recieved."),
+                         [("the the", "a repeated word"),
+                          ("recieved", "probably “received”")])
+        for clean in ("You need a special key to open this door.",
+                      "The prison cell is locked.", "That that is so.",
+                      "Beware the bridge!"):
+            self.assertEqual(find_typos(clean), [], clean)
+
+    def test_the_typo_producer_reads_only_authored_lock_and_sign_text(self):
+        from .feedback_producers import typo
+        row = {"source_kind": "door", "authored": 1, "source_key": "door:/test/hall:5,4",
+               "text": "You need a the key to open this door.", "at": 1_795_000_000.0,
+               "map": "/test/hall"}
+        found = typo(row, stats={"level": 7, "hp": 30, "maxhp": 40})
+        self.assertEqual((found.kind, found.repo, found.subject, found.labels),
+                         ("clarity", "atrinik/content", "door:/test/hall:5,4", ("bug", "maps")))
+        self.assertEqual(found.title, "Typo in the door text at /test/hall (5,4)")
+        self.assertEqual(found.evidence["excerpts"], ["You need a the key to open this door."])
+        self.assertIsNone(typo({**row, "authored": 0}))
+        self.assertIsNone(typo({**row, "source_kind": "system"}))
+        self.assertIsNone(typo({**row, "source_kind": "examine"}))
+        self.assertIsNone(typo({**row, "source_key": "door:nowhere"}))
+        # A line naming a player she has seen is dropped; with nothing left
+        # there is no draft.
+        self.assertIsNone(typo({**row, "text": "Mallory: you need a the key."},
+                               names=["mallory"]))
+
+    def test_drafts_name_only_public_maps_and_days(self):
+        from .feedback_producers import book_experience, public_map, typo
+        self.assertEqual(public_map("/shattered_islands/world_4_58"),
+                         "/shattered_islands/world_4_58")
+        for private in ("/players/sera/apartment", "/players", "relative/map", "", None):
+            self.assertIsNone(public_map(private), private)
+        row = {"source_kind": "book", "authored": 1, "source_name": "founding notes",
+               "map": "/players/sera/apartment", "text_hash": "ab", "at": 1_795_000_000.0}
+        found = book_experience(row, stats={"int": 3}, literacy=1)
+        flat = json.dumps(found.evidence)
+        self.assertNotIn("/players", flat)
+        self.assertNotRegex(flat, r"\d\d:\d\d")
+        self.assertIsNone(typo({"source_kind": "sign", "authored": 1,
+                                "source_key": "sign:/players/sera/apartment:1,1",
+                                "text": "You need a the key."}))
+
+    def test_the_book_producer_needs_int_ten_or_lower(self):
+        from .feedback_producers import book_experience
+        row = {"source_kind": "book", "authored": 1, "source_name": "founding notes",
+               "map": "/test/hall", "text_hash": "ab" * 32, "at": 1_795_000_000.0}
+        found = book_experience(row, stats={"int": 10, "level": 7}, literacy=3)
+        self.assertEqual((found.kind, found.repo, found.subject, found.issue_type),
+                         ("bug", "atrinik/classic", "formula:book_exp_mod", "Bug"))
+        self.assertEqual(found.occurrence, "book:" + "ab" * 32)
+        self.assertEqual(found.evidence["notes"][0][1], {"code": "-1.10"})
+        self.assertIsNotNone(book_experience(row, stats={"int": 0}, literacy=None))
+        self.assertIsNone(book_experience(row, stats={"int": 11}, literacy=3))
+        self.assertIsNone(book_experience(row, stats={}, literacy=3))
+        self.assertIsNone(book_experience({**row, "source_kind": "scroll"},
+                                          stats={"int": 3}, literacy=3))
+        self.assertIsNone(book_experience({**row, "authored": 0}, stats={"int": 3},
+                                          literacy=3))
+
+    def test_plus_n_with_no_effect_lists_examined_families(self):
+        from .equipment import archetype_for, base_from_json, effective_stats, parse_description
+        from .feedback_producers import plus_n_no_effect, PLUS_N_SUBJECT
+
+        def entry(face, item_type, magic, examined):
+            family, base = archetype_for(face, item_type)
+            if examined:
+                base = parse_description("x") or type(base)()
+            return (family, item_type, magic,
+                    effective_stats(item_type, base, magic, 100, family))
+
+        self.assertIsNone(base_from_json(None))
+        entries = [
+            entry("cape.101", c.TYPE_CLOAK, 2, True),             # counts
+            entry("combat_boots.101", c.TYPE_BOOTS, 2, True),     # base AC: no
+            entry("sandals.101", c.TYPE_BOOTS, 1, False),         # not examined: no
+            entry("torch_unlit.101", c.TYPE_LIGHT_APPLY, 1, False),  # a light: counts
+            entry("cape.101", c.TYPE_CLOAK, 0, True),             # no "+N": no
+        ]
+        # An examined combat boots item really has its AC.
+        family, base = archetype_for("combat_boots.101", c.TYPE_BOOTS)
+        entries[1] = (family, c.TYPE_BOOTS, 2, effective_stats(
+            c.TYPE_BOOTS, dataclasses.replace(base, source="examine"), 2, 100, family))
+        found = plus_n_no_effect(entries, stats={"level": 60}, at=1_795_000_000.0)
+        cape = archetype_for("cape.101", c.TYPE_CLOAK)[0]
+        torch = archetype_for("torch_unlit.101", c.TYPE_LIGHT_APPLY)[0]
+        self.assertEqual([item["key"] for item in found.evidence["items"]],
+                         [f"{cape}|+2", f"{torch}|+1"])
+        self.assertEqual((found.kind, found.repo, found.subject),
+                         ("clarity", "atrinik/classic", PLUS_N_SUBJECT))
+        self.assertIsNone(plus_n_no_effect(entries[1:3], stats={}, at=0.0))
+
+
+class FeedbackClientTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.content = feedback_content(Path(self.directory.name))
+
+    def client(self):
+        from unittest.mock import AsyncMock
+        client = AtrinikClient(ClientConfig(
+            account="seraacct", password="hunter2", character="Sera",
+            runtime_state_path=str(Path(self.directory.name) / "memory.sqlite3")))
+        client.send = AsyncMock()
+        client.authored_content = self.content
+        client.state.player_name = "Sera"
+        client.state.player_tag = 1
+        client.state.stats.update({"level": 7, "hp": 30, "maxhp": 40, "int": 9})
+        client.load_character_memory("Sera")
+        client.state.phase = "playing"
+        ObservationTests.at("/test/hall", 5, 5, client)
+        return client
+
+    def drafts(self, client):
+        return client._memory_store().feedback_items("Sera")
+
+    def test_typos_and_low_int_books_become_drafts_once(self):
+        client = self.client()
+        # An earlier process's chat log names a player: the recorder has
+        # not seen her in this process, so the sign below is stored, but a
+        # line naming her is never quoted in a draft.
+        client._memory_store().append_chat("Sera", c.CHAT_TYPE_CHAT, "in", "Mallory",
+                                           "You need a the key to open this door.")
+        asyncio.run(client.move(1))
+        ObservationTests.say(client, "You need a the key to open this door.", color="00ffff")
+        # Chat quoting the same text makes nothing.
+        ObservationTests.say(client, "[a=#charname]Zoey[/a] says: Ask the warden "
+                             "about the the vault.", msg_type=c.CHAT_TYPE_CHAT)
+        ObservationTests.at("/test/hall", 7, 7, client)
+        sign = Item(80, location=0, item_type=98, name="sign")
+        client.state.place_item(sign, 0)
+        asyncio.run(client.apply(80))
+        ObservationTests.say(client, "Mallory recieved the crown here.\n"
+                             "Ask the warden about the the vault.", color="00ffff")
+        book = Item(81, item_type=c.TYPE_BOOK, name="founding notes")
+        client.state.place_item(book, client.state.player_tag)
+        asyncio.run(client.apply(81))
+        raw = book_packet("founding notes", "The hall was built in a single winter.\n")
+        asyncio.run(client._handle_book(Cursor(raw), raw))
+        drafts = {item["subject"]: item for item in self.drafts(client)}
+        self.assertEqual(set(drafts), {"door:/test/hall:5,4", "sign:/test/hall:7,7",
+                                       "formula:book_exp_mod"})
+        sign_body = drafts["sign:/test/hall:7,7"]["body_md"]
+        self.assertIn("Ask the warden about the the vault.", sign_body)
+        # The line naming Mallory (a chat sender) is dropped, not masked.
+        self.assertNotIn("Mallory", sign_body)
+        self.assertNotIn("crown", sign_body)
+        self.assertNotIn("recieved", sign_body)
+        self.assertIn("`the the` (a repeated word)", sign_body)
+        for item in drafts.values():
+            text = (item["title"] + item["body_md"]).casefold()
+            for private in ("seraacct", "hunter2", "127.0.0.1", "sera", "mallory", "zoey"):
+                self.assertNotRegex(text, rf"(?<!\w){private}(?!\w)")
+        self.assertIn("Int 9", drafts["formula:book_exp_mod"]["body_md"])
+        # A restart: the same texts again the same day add no draft and no
+        # occurrence; the sweep at login reads the stored rows the same way.
+        again = self.client()
+        asyncio.run(again.move(1))
+        ObservationTests.say(again, "You need a the key to open this door.", color="00ffff")
+        self.assertEqual(sorted((item["subject"], item["occurrences"])
+                                for item in self.drafts(again)),
+                         [("door:/test/hall:5,4", 1), ("formula:book_exp_mod", 1),
+                          ("sign:/test/hall:7,7", 1)])
+
+    def test_her_carried_cape_plus_two_becomes_one_draft(self):
+        client = self.client()
+        from .equipment import BaseStats, base_to_json
+        faces = {5: "cape.101", 6: "combat_boots.101"}
+        client.faces = faces
+        cape = Item(15, item_type=c.TYPE_CLOAK, name="silk cape +2", face=5,
+                    quality=80, condition=100)
+        cape.extra["gear_examine"] = {"name": "silk cape +2",
+                                      "base": base_to_json(BaseStats()), "at": 0}
+        boots = Item(17, item_type=c.TYPE_BOOTS, name="combat boots +2", face=6,
+                     quality=80, condition=100)
+        boots.extra["gear_examine"] = {"name": "combat boots +2",
+                                       "base": base_to_json(BaseStats(ac=1)), "at": 0}
+        client.state.place_item(cape, 1)
+        client.state.place_item(boots, 1)
+        client.note_equipment_feedback()
+        # Rate limited, and unchanged gear writes nothing.
+        client.note_equipment_feedback()
+        client._equipment_feedback_at = float("-inf")
+        client.note_equipment_feedback()
+        item, = self.drafts(client)
+        self.assertEqual((item["kind"], item["repo"], item["occurrences"]),
+                         ("clarity", "atrinik/classic", 1))
+        self.assertIn("shown as +2", item["body_md"])
+        self.assertNotIn("silk", item["body_md"])
+        self.assertNotIn("combat boots", item["body_md"])
+
+    def test_nothing_opens_a_socket(self):
+        import io
+        import contextlib as context
+        from .cli import feedback_command, parser
+        from .equipment import BaseStats, base_to_json
+        from .web_server import WebControlServer
+
+        class Writer:
+            def __init__(self):
+                self.data = b""
+
+            def write(self, data):
+                self.data += data
+
+            async def drain(self):
+                pass
+
+        _NETWORK_AUDIT["events"].clear()
+        _NETWORK_AUDIT["armed"] = True
+        try:
+            client = self.client()
+            # A typo, a book at Int 9 and her cape: all three producers.
+            asyncio.run(client.move(1))
+            ObservationTests.say(client, "You need a the key to open this door.",
+                                 color="00ffff")
+            client.state.place_item(Item(81, item_type=c.TYPE_BOOK, name="founding notes"),
+                                    client.state.player_tag)
+            asyncio.run(client.apply(81))
+            raw = book_packet("founding notes", "The hall was built in a single winter.\n")
+            asyncio.run(client._handle_book(Cursor(raw), raw))
+            client.faces = {5: "cape.101"}
+            cape = Item(15, item_type=c.TYPE_CLOAK, name="silk cape +2", face=5,
+                        quality=80, condition=100)
+            cape.extra["gear_examine"] = {"name": "silk cape +2",
+                                          "base": base_to_json(BaseStats()), "at": 0}
+            client.state.place_item(cape, 1)
+            client.note_equipment_feedback()
+            # The login sweep of a new process.
+            again = self.client()
+            self.assertEqual(len(self.drafts(again)), 3)
+            item = next(row for row in self.drafts(again) if row["kind"] == "clarity"
+                        and row["subject"].startswith("door:"))
+            # The dashboard route, called without its listener.
+            server = WebControlServer(again, TaskEngine(again), WorldGraph(), "127.0.0.1", 0)
+            writer = Writer()
+            asyncio.run(server._route(writer, "GET", "/api/feedback", b"", ""))
+            base = ["--runtime-state", str(Path(self.directory.name) / "memory.sqlite3"),
+                    "--host", "127.0.0.1", "--account", "seraacct", "--character", "Sera",
+                    "feedback"]
+            out = io.StringIO()
+            with context.redirect_stdout(out):
+                self.assertEqual(feedback_command(parser().parse_args(base + ["list"])), 0)
+                self.assertEqual(feedback_command(parser().parse_args(
+                    base + ["show", str(item["id"])])), 0)
+                self.assertEqual(feedback_command(parser().parse_args(
+                    base + ["list", "--json"])), 0)
+        finally:
+            _NETWORK_AUDIT["armed"] = False
+        self.assertEqual(_NETWORK_AUDIT["events"], [])
+        self.assertIn(b"200 OK", writer.data)
+        self.assertEqual(len(json.loads(writer.data.split(b"\r\n\r\n", 1)[1])["items"]), 3)
+        text = out.getvalue()
+        self.assertIn("Typo in the door text at /test/hall (5,4)", text)
+        self.assertIn(item["body_md"], text)
+        # The audit hook does see a socket.
+        import socket
+        _NETWORK_AUDIT["armed"] = True
+        try:
+            socket.socket().close()
+        finally:
+            _NETWORK_AUDIT["armed"] = False
+        self.assertIn("socket.__new__", _NETWORK_AUDIT["events"])
+        # The queue's modules, and every package module they import, import
+        # no network library.
+        import ast
+        seen, todo = set(), ["feedback", "feedback_producers", "memory"]
+        while todo:
+            module = todo.pop()
+            if module in seen:
+                continue
+            seen.add(module)
+            tree = ast.parse(Path(__file__).with_name(f"{module}.py").read_text())
+            names = {alias.name.split(".")[0] for node in ast.walk(tree)
+                     if isinstance(node, ast.Import) for alias in node.names}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    if node.level:
+                        todo.extend([node.module] if node.module else
+                                    [alias.name for alias in node.names])
+                    else:
+                        names.add((node.module or "").split(".")[0])
+            self.assertFalse(names & {"socket", "urllib", "http", "ssl", "asyncio",
+                                      "requests", "aioquic", "smtplib"}, module)
+        self.assertLessEqual({"feedback", "feedback_producers", "memory", "observations",
+                              "build_info"}, seen)
+
+    def test_a_withheld_finding_is_tried_again(self):
+        from . import feedback
+        client = self.client()
+        calls = []
+        with patch.object(feedback, "note", side_effect=lambda *a, **k: calls.append(1)):
+            for _ in range(2):
+                asyncio.run(client.move(1))
+                ObservationTests.say(client, "You need a the key to open this door.",
+                                     color="00ffff")
+        self.assertEqual(len(calls), 2)
+
+    def test_chat_senders_are_read_once_a_login(self):
+        from .memory import BotMemory
+        client = self.client()
+        calls = []
+        original = BotMemory.chat_senders
+
+        def counted(memory, **kwargs):
+            calls.append(1)
+            return original(memory, **kwargs)
+
+        with patch.object(BotMemory, "chat_senders", counted):
+            client._feedback_other_names()
+            client._feedback_other_names()
+            client._log_chat(c.CHAT_TYPE_CHAT, "in", "Nadia", "hello")
+            self.assertIn("Nadia", client._feedback_other_names())
+            self.assertEqual(len(calls), 1)
+            client.load_character_memory("Sera")
+            client._feedback_other_names()
+            self.assertEqual(len(calls), 2)
+
+    def test_a_common_word_as_a_private_term_is_warned_about_once(self):
+        client = self.client()
+        client.state.party_name = "The"
+        with self.assertLogs("atrinik_bot.client", "WARNING") as logs:
+            client.feedback_private_terms()
+            client.feedback_private_terms()
+        self.assertEqual(sum("common word 'the'" in line for line in logs.output), 1)
+
+    def test_her_party_and_the_operator_are_private(self):
+        from .web_server import WebControlServer
+        client = self.client()
+        client.state.party_name = "Moonriders"
+        WebControlServer(client, TaskEngine(client), WorldGraph(), "127.0.0.1", 0,
+                         operator_character="Opal")
+        terms = client.feedback_private_terms()
+        self.assertIn("Moonriders", terms)
+        self.assertIn("Opal", terms)
+
+    def test_cli_reads_without_writing_and_screens(self):
+        import hashlib
+        import io
+        import contextlib as context
+        from .cli import feedback_command, parser
+        from .feedback import note
+        client = self.client()
+        memory = client._memory_store()
+        note(memory, "Sera", FeedbackQueueTests.finding(excerpts=["Ask Kiri."]))
+        memory.append_chat("Sera", c.CHAT_TYPE_CHAT, "in", "Kiri", "hi")
+        path = Path(self.directory.name) / "memory.sqlite3"
+        with sqlite3.connect(path) as db:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        base = ["--runtime-state", str(path), "--host", "127.0.0.1", "--account", "seraacct",
+                "--character", "Sera", "feedback"]
+        out = io.StringIO()
+        with context.redirect_stdout(out):
+            self.assertEqual(feedback_command(parser().parse_args(base + ["list"])), 0)
+            self.assertEqual(feedback_command(parser().parse_args(base + ["show", "1"])), 0)
+        self.assertIn("withheld", out.getvalue())
+        self.assertNotIn("Kiri", out.getvalue())
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+        self.assertEqual(memory.feedback_item("Sera", "1")["withheld"], 0)
+        # A database without the queue: a clear message, and nothing created.
+        other = Path(self.directory.name) / "old.sqlite3"
+        with sqlite3.connect(other) as db:
+            db.execute("CREATE TABLE memory (x)")
+        out = io.StringIO()
+        with context.redirect_stdout(out):
+            self.assertEqual(feedback_command(parser().parse_args(
+                ["--runtime-state", str(other), "--character", "Sera", "feedback", "list"])), 1)
+        self.assertIn("no feedback queue", out.getvalue())
+        with sqlite3.connect(other) as db:
+            self.assertEqual([row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")], ["memory"])
+        # An item the running bot has not screened since it changed: metadata
+        # only.
+        second, _ = note(memory, "Sera", FeedbackQueueTests.finding(
+            "sign:/m:2,2", excerpts=["The gate is shut."]))
+        with sqlite3.connect(path) as db:
+            db.execute("UPDATE feedback_items SET updated_at = updated_at + 10 WHERE id = ?",
+                       (second,))
+        out = io.StringIO()
+        with context.redirect_stdout(out):
+            self.assertEqual(feedback_command(parser().parse_args(
+                base + ["show", str(second)])), 0)
+            self.assertEqual(feedback_command(parser().parse_args(
+                base + ["list", "--json"])), 0)
+        self.assertIn("(not yet screened by the running bot)", out.getvalue())
+        self.assertNotIn("The gate is shut.", out.getvalue())
+        self.assertNotIn("sign:/m:2,2", out.getvalue())
+        # A queue table of another version: a clear message, no traceback.
+        old_queue = Path(self.directory.name) / "older.sqlite3"
+        with sqlite3.connect(old_queue) as db:
+            db.execute("CREATE TABLE feedback_items (id INTEGER, server TEXT)")
+        out = io.StringIO()
+        with context.redirect_stdout(out):
+            self.assertEqual(feedback_command(parser().parse_args(
+                ["--runtime-state", str(old_queue), "--character", "Sera", "feedback",
+                 "list"])), 1)
+        self.assertIn("cannot read the queue", out.getvalue())
+
+    def test_cli_needs_a_character_and_an_existing_database(self):
+        import io
+        import contextlib as context
+        from .cli import feedback_command, memory_path, parser
+        self.assertEqual(memory_path("/x/state.json"), Path("/x/state.sqlite3"))
+        self.assertEqual(memory_path("/x/memory.sqlite3"), Path("/x/memory.sqlite3"))
+        out = io.StringIO()
+        with context.redirect_stdout(out), patch.dict(os.environ, {"ATRINIK_BOT_CHARACTER": ""}):
+            self.assertEqual(feedback_command(parser().parse_args(
+                ["--runtime-state", str(Path(self.directory.name) / "none.sqlite3"),
+                 "feedback", "list"])), 2)
+            self.assertEqual(feedback_command(parser().parse_args(
+                ["--runtime-state", str(Path(self.directory.name) / "none.sqlite3"),
+                 "--character", "Sera", "feedback", "show", "1"])), 1)
+        self.assertFalse((Path(self.directory.name) / "none.sqlite3").exists())
+
+
+class FeedbackRouteTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = WebTests.asyncSetUp
+    asyncTearDown = WebTests.asyncTearDown
+    request = WebTests.request
+
+    async def test_the_feedback_route_is_read_only(self):
+        from .feedback import note
+        with tempfile.TemporaryDirectory() as directory:
+            self.client.config.character = "Sera"
+            self.client._memory_path = Path(directory) / "memory.sqlite3"
+            self.client.memory = None
+            status, payload = await self.request("GET", "/api/feedback")
+            self.assertEqual((status, json.loads(payload)["items"]), (200, []))
+            self.client.state.player_name = "Sera"
+            self.client.load_character_memory("Sera")
+            note(self.client._memory_store(), "Sera", FeedbackQueueTests.finding())
+            status, payload = await self.request("GET", "/api/feedback?kind=clarity")
+            body = json.loads(payload)
+            item, = body["items"]
+            self.assertEqual((status, body["read_only"], item["labels"], item["status"]),
+                             (200, True, ["bug", "maps"], "draft"))
+            self.assertRegex(item["short_fingerprint"], r"^pt-[0-9a-f]{12}$")
+            self.assertNotIn("evidence_json", item)
+            self.assertEqual(body["counts"], {"draft": {"clarity": 1}})
+            status, payload = await self.request("GET", "/api/feedback?repo=atrinik/classic")
+            self.assertEqual(json.loads(payload)["items"], [])
+            # A name learned after the draft was stored withholds it on read.
+            note(self.client._memory_store(), "Sera",
+                 FeedbackQueueTests.finding("sign:/m:1,1", excerpts=["Kiri waits."]))
+            self.client.observations.player_names["kiri"] = 1.0
+            status, payload = await self.request("GET", "/api/feedback")
+            rows = {row["id"]: row for row in json.loads(payload)["items"]}
+            hidden, = [row for row in rows.values() if row["withheld"]]
+            self.assertEqual((hidden["body_md"], hidden["subject"]), ("", ""))
+            self.assertFalse(rows[item["id"]]["withheld"])
+            self.assertNotIn(b"Kiri", payload)
+            stored = self.client._memory_store().feedback_item("Sera", str(hidden["id"]))
+            self.assertEqual((stored["withheld"], stored["subject"]), (1, "sign:/m:1,1"))
+            # The clean item is screened for readers without her terms.
+            from .feedback import readable
+            self.assertTrue(readable(self.client._memory_store().feedback_item(
+                "Sera", str(item["id"]))))
+            # There is no write route in this phase.
+            status, _ = await self.request("POST", f"/api/feedback/{item['id']}",
+                                           {"action": "approve"})
+            self.assertEqual(status, 404)
+            from .memory import BotMemory
+            with patch.object(BotMemory, "feedback_items",
+                              side_effect=sqlite3.OperationalError("database is locked")):
+                status, payload = await self.request("GET", "/api/feedback")
+            self.assertEqual((status, json.loads(payload)["busy"]), (200, True))
+
+    def test_the_tab_builds_drafts_from_text_nodes(self):
+        from .web_server import STATIC
+        html = (STATIC / "index.html").read_text()
+        script = (STATIC / "app.js").read_text()
+        self.assertIn('data-tab="feedback"', html)
+        start = script.index("// ---------- feedback drafts")
+        section = script[start:script.index("// ---------- polling", start)]
+        self.assertNotIn("innerHTML", section)
+        self.assertIn('node("pre", "feedback-body", body)', section)
 
 
 if __name__ == "__main__":
