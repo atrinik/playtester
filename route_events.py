@@ -38,9 +38,10 @@ map-level traversal counts (the cold start of 4.4). Only history from
 before this process first loaded her counts: everything since comes from
 the live recorder, so no death is counted twice.
 
-The planner does not read any of this yet (P6). The weights and half-lives
-below are 4.4's proposed defaults, kept in one place for it; the dashboard
-uses them for a provisional learned cost.
+The learned cost model (route_costs.py, P6) reads these rows. The weights
+and half-lives below are 4.4's proposed defaults, kept in one place for it;
+the Learned routes summary uses them for a provisional cost, without the kit
+rule or recovery, which route_costs.py applies.
 """
 
 from __future__ import annotations
@@ -73,6 +74,11 @@ WEIGHTS = {DEATH: 1800.0, RECALL: 900.0, DAMAGE: 300.0, BLOCKED: 1.0,
 HALF_LIVES = {DEATH: 6 * 3600.0, RECALL: 6 * 3600.0, DAMAGE: 6 * 3600.0,
               BLOCKED: 1800.0, CROSSING_FAILED: 1800.0}
 TRAVERSAL_HALF_LIFE = 24 * 3600.0
+# A safe pass (a crossing with no damage or recall on the way) multiplies
+# the subject's earlier rows of these signals by this (4.4). Deaths never
+# recover: they decay with time only, so 4.5's death-rate bounds hold.
+RECOVERY_FACTOR = 0.7
+RECOVERING_SIGNALS = (RECALL, DAMAGE, BLOCKED)
 # A contribution below this many seconds is dropped.
 MIN_CONTRIBUTION = 1.0
 # Event rows older than this are deleted; traversal rows idle this long too.
@@ -117,6 +123,10 @@ MAX_CELL_SQUARES = 8
 # whose time is at most this much before its learn time.
 ROUTE_HAZARD_SECONDS = 6 * 3600.0
 MIGRATION_MATCH_SECONDS = 600.0
+# Shadow planning rows (route_shadow.py, P6) kept per character, and for
+# how long.
+SHADOW_ROW_CAP = 10000
+SHADOW_MAX_AGE = 7 * 24 * 3600.0
 # What the dashboard lists, and how often its summary is re-read (seconds).
 LEARNED_LIMIT = 25
 LEARNED_REFRESH_SECONDS = 30.0
@@ -309,6 +319,8 @@ class RouteRecorder:
         # subject -> [count, timed count, timed seconds, last at]
         self.traversals: dict[str, list[float]] = {}
         self.requirements: dict[str, dict[str, Any]] = {}
+        # Safe passes not yet written: (subject, since), RECOVERY_FACTOR each.
+        self.recoveries: list[tuple[str, float]] = []
         self.transit: _Transit | None = None
         self._death: tuple[dict, _Snapshot | None] | None = None
         self._next_flush = float("-inf")
@@ -334,10 +346,12 @@ class RouteRecorder:
         self.installed_at = self.clock()
         self.migrated = False
         self.events, self.traversals, self.requirements = [], {}, {}
+        self.recoveries = []
         self.transit, self._death, self._learned = None, None, None
 
     def _pending(self) -> int:
-        return len(self.events) + len(self.traversals) + len(self.requirements)
+        return (len(self.events) + len(self.traversals) + len(self.requirements) +
+                len(self.recoveries))
 
     # The trip under way.
 
@@ -480,6 +494,12 @@ class RouteRecorder:
         self.requirements[subject] = {"outcome": PASSED, "at": wall,
                                       "until": wall + PASSED_SECONDS,
                                       "inputs": "", "evidence": ""}
+        if transit.timed and transit.damage <= 0 and transit.recalled_at == float("-inf"):
+            # A safe pass: her earlier recall, damage and blocked rows on
+            # the edge and the map recover (4.4); this visit's never do.
+            for safe in (subject, map_subject(transit.map)):
+                self.recoveries.append((safe, transit.arrived_wall))
+            del self.recoveries[:-PENDING_LIMIT]
         if transit.damage > 0:
             self._damage(client, transit)
 
@@ -645,7 +665,7 @@ class RouteRecorder:
             store().record_route_events(
                 self.character, events=self.events, traversals=traversals,
                 requirements=self.requirements, migration=migration,
-                now=self.clock(), timeout=timeout)
+                now=self.clock(), recoveries=list(self.recoveries), timeout=timeout)
         except (sqlite3.Error, OSError, ValueError) as error:
             self._retry_at = now + RETRY_SECONDS
             if not self._warned:
@@ -656,6 +676,7 @@ class RouteRecorder:
         self.migrated = True
         self._warned = False
         self.events, self.traversals, self.requirements = [], {}, {}
+        self.recoveries = []
         self._learned = None
         return True
 

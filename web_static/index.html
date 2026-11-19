@@ -197,8 +197,13 @@
         </section>
         <section class="form">
           <h2>Learned routes</h2>
-          <p class="muted small">Maps, cells, exits and seams her own trips taught her to fear: deaths, recalls, damage, held exits and failed crossings on the way, with a provisional cost in travel time (one death is 30 minutes) that halves every 6 hours (30 minutes for held exits and failed crossings). Deaths to other players are not counted. Read-only: the planner does not use them yet.</p>
+          <p class="muted small">Maps, cells, exits and seams her own trips taught her to fear: deaths, recalls, damage, held exits and failed crossings on the way, with a provisional cost in travel time (one death is 30 minutes) that halves every 6 hours (30 minutes for held exits and failed crossings). Deaths to other players are not counted. Read-only. Her learned route costs build on them: in the shadow below, and in her live plans only with learned_route_costs on.</p>
           <div id="route-learned" class="list"><span class="muted">Loading…</span></div>
+        </section>
+        <section class="form">
+          <h2>Shadow routes</h2>
+          <p class="muted small">With learned route costs off, she still plans each trip, and scores the farm spots, the way the flag would: travel time plus content and learned danger, a one-death budget for errands, and care for essential trips. This lists how often that agreed with her real plan and the last differences, for the owner's report before any flip. Read-only.</p>
+          <div id="route-shadow" class="list"><span class="muted">Loading…</span></div>
         </section>
         <section class="form">
           <h2>Bank</h2>
@@ -213,6 +218,6 @@
     </section>
   </main>
   <div id="toast" role="status"></div>
-  <script src="/app.js?v=33"></script>
+  <script src="/app.js?v=34"></script>
 </body>
 </html>

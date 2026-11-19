@@ -339,6 +339,20 @@ class BotMetrics:
         self.route_events = counter(
             "route_events_total", "Route events recorded in transit, by signal.", "signal")
         self.route_signals = LabelLimit(8)
+        # Plans with learned costs (route_costs.py, route_shadow.py), by
+        # result and trip kind: code-defined sets.
+        self.route_plans = counter(
+            "route_plans_total",
+            "Learned-cost plans, by result (shadow_* for shadow comparisons) and trip kind.",
+            "result", "trip")
+        self.route_results = LabelLimit(16)
+        self.route_trips = LabelLimit(16)
+        self.route_plan_cost = gauge(
+            "route_plan_cost_seconds",
+            "The latest learned-cost plan's travel time, danger, learned danger and budget.",
+            "part")
+        self.route_learned_subjects = gauge(
+            "route_learned_subjects", "Subjects with a non-zero learned route cost.")
 
     def attach(self, engine: Any) -> None:
         """The task engine: task types, and idle time when no task runs."""
@@ -540,6 +554,11 @@ class BotMetrics:
         self.route_events.inc((*self.base(), self.route_signals(signal)))
 
     @_never_raises
+    def route_plan(self, result: str, trip: str) -> None:
+        self.route_plans.inc((*self.base(), self.route_results(result),
+                              self.route_trips(trip or "other")))
+
+    @_never_raises
     def death(self, cause: Any) -> None:
         self.deaths.inc((*self.base(), self.causes(cause or "unclassified")))
 
@@ -557,6 +576,7 @@ class BotMetrics:
                        self.depletion, self.predicted_xp, self.task_info, self.phase_info,
                        self.operator_assisted, self.operator_assist_copper,
                        self.operator_assist_last, self.operator_assist_running,
+                       self.route_plan_cost, self.route_learned_subjects,
                        *self.vitals.values(), *self.regen.values()):
             # Gauges describe now: an earlier character's or task's are gone.
             family.samples.clear()
@@ -592,6 +612,17 @@ class BotMetrics:
             if operator_assist.get("last_assisted_at") is not None:
                 self.operator_assist_last.set(
                     base, float(operator_assist["last_assisted_at"]))
+        shadow = getattr(client, "route_shadow", None)
+        for part, seconds in (getattr(shadow, "last_cost", None) or {}).items():
+            self.route_plan_cost.set((*base, clean_label(part)), float(seconds))
+        model = getattr(client, "_route_cost_model", None)
+        if model is not None and callable(getattr(model, "view", None)):
+            try:
+                from .route_costs import current_kit
+                self.route_learned_subjects.set(
+                    base, model.view(time.time(), current_kit(client)).subjects())
+            except Exception:
+                log.exception("learned route subjects unavailable")
         task = getattr(self.engine, "task", None)
         if task is not None:
             self.task_info.set((*base, self.tasks(type(task).__name__)), 1)

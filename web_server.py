@@ -34,7 +34,7 @@ from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_far
                          ShopUpgradeSweepTask, WorldGraph)
 from . import route_blocks
 from . import terrain
-from . import route_events
+from . import route_events, route_shadow
 from .navigation_spots import navigation_spot_catalog
 from .dialogue_edges import dialogue_summary
 from .unlocks import gate_counts, unlock_state
@@ -343,7 +343,8 @@ class DashboardState:
     def route_learned(self) -> dict[str, Any]:
         """Her learned route subjects, read-only (docs/ROUTING.md 4.4, 4.8):
         the highest provisional costs, their signals and when each falls
-        below half. The planner does not use them yet."""
+        below half. The learned cost model (route_costs.py) reads the same
+        rows with the kit rule and recovery."""
         recorder = route_events.recorder(self.client)
         if recorder is None:
             return {"character_loaded": False, "subjects": []}
@@ -355,6 +356,20 @@ class DashboardState:
                     "error": "learned subjects unavailable"}
         return {"subjects": [], **summary,
                 "weights": route_events.WEIGHTS, "half_lives": route_events.HALF_LIVES}
+
+    def route_shadow(self) -> dict[str, Any]:
+        """Shadow planning with learned costs, read-only (docs/ROUTING.md
+        4.8, P6): the flag, comparisons per trip kind, the last
+        differences and the last farm comparison."""
+        value = route_shadow.shadow(self.client)
+        if value is None:
+            return {"enabled": False, "counts": {}, "recent": []}
+        try:
+            return value.summary(self.client)
+        except Exception as error:   # never let the panel break /api/state
+            log.warning("route shadow panel unavailable: %s", error)
+            return {"enabled": False, "counts": {}, "recent": [],
+                    "error": "shadow planning unavailable"}
 
     def care_alerts(self) -> list[dict[str, str]]:
         """A care wait across an owner block past CARE_WAIT_SECONDS, and a
@@ -825,6 +840,8 @@ class DashboardState:
                if include is None or "route_learned" in include else {}),
             **({"dialogue_edges": self.dialogue_edges()}
                if include is None or "dialogue_edges" in include else {}),
+            **({"route_shadow": self.route_shadow()}
+               if include is None or "route_shadow" in include else {}),
         }
 
     def dialogue_edges(self) -> dict[str, Any]:

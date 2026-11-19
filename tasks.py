@@ -7678,6 +7678,10 @@ class TaskEngine:
             # empty map that login just reset either.
             return
         await self._tick_task(task)
+        # Shadow planning (route_shadow.py): a bounded slice of the learned
+        # plans' searches, after the task's own tick. Never raises.
+        from . import route_shadow
+        route_shadow.step(self.client)
 
     def _report_step_error(self, exc: Exception) -> None:
         """Log an engine step error: a new one in full, a repeat counted."""

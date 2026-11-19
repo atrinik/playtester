@@ -249,6 +249,10 @@ class BotMemory:
                        kit TEXT NOT NULL DEFAULT '',
                        content TEXT NOT NULL DEFAULT ''
                    )""")
+            # P6 (route_costs.py): a safe pass multiplies a subject's
+            # recall, damage and blocked rows from before it by
+            # route_events.RECOVERY_FACTOR; deaths always keep 1.
+            _add_column(db, "route_events", "recovery REAL NOT NULL DEFAULT 1.0")
             db.execute(
                 """CREATE INDEX IF NOT EXISTS route_events_by_signal
                    ON route_events (server, account, character, signal, at)""")
@@ -280,6 +284,24 @@ class BotMemory:
                        evidence TEXT NOT NULL DEFAULT '',
                        PRIMARY KEY (server, account, character, edge)
                    )""")
+
+            # Shadow planning (route_shadow.py, docs/ROUTING.md P6): one row
+            # per comparison of a live plan or farm choice with the learned
+            # one, for the owner's divergence report.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS route_shadow (
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       at REAL NOT NULL,
+                       kind TEXT NOT NULL,
+                       trip TEXT NOT NULL,
+                       result TEXT NOT NULL,
+                       detail TEXT NOT NULL DEFAULT '{}'
+                   )""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS route_shadow_by_age
+                   ON route_shadow (server, account, character, at)""")
 
             # The draft feedback queue (feedback.py): one row a fingerprint.
             # Only drafts exist before phase F6 adds approval and filing.
@@ -1031,15 +1053,20 @@ class BotMemory:
                             traversals: Iterable[dict[str, Any]] = (),
                             requirements: dict[str, dict[str, Any]] | None = None,
                             migration: Any = None, now: float | None = None,
+                            recoveries: Iterable[tuple[str, float]] = (),
                             timeout: float = ROUTE_EVENT_SAVE_TIMEOUT) -> bool:
         """Write her route events, traversals and requirement outcomes in one
         transaction, then hold every signal to its cap and drop aged rows.
 
         ``migration`` (route_events.Migration) is written too, unless her
         marker says it already was: history is migrated exactly once. Returns
-        whether this call migrated it. ``timeout`` bounds the wait for a
-        locked database."""
-        from .route_events import CAPS, EVENT_MAX_AGE, TRAVERSAL_MAX_IDLE
+        whether this call migrated it. ``recoveries`` are safe passes
+        (subject, since): each multiplies that subject's recall, damage and
+        blocked rows from before ``since`` by RECOVERY_FACTOR (ROUTING 4.4;
+        deaths never recover). ``timeout`` bounds the wait for a locked
+        database."""
+        from .route_events import (CAPS, EVENT_MAX_AGE, RECOVERING_SIGNALS,
+                                   RECOVERY_FACTOR, TRAVERSAL_MAX_IDLE)
 
         now = time.time() if now is None else float(now)
         scope = (self.server, self.account, character.casefold())
@@ -1086,6 +1113,13 @@ class BotMemory:
                 [(*scope, str(row["subject"]), int(row["count"]),
                   float(row["mean_seconds"]), float(row["last_at"]), int(row["timed"]))
                  for row in [*seeds, *traversals] if int(row["count"]) > 0])
+            marks = ",".join("?" * len(RECOVERING_SIGNALS))
+            db.executemany(
+                f"""UPDATE route_events SET recovery = recovery * ?
+                    WHERE server = ? AND account = ? AND character = ?
+                      AND subject = ? AND at < ? AND signal IN ({marks})""",
+                [(RECOVERY_FACTOR, *scope, str(subject), float(since), *RECOVERING_SIGNALS)
+                 for subject, since in recoveries])
             db.executemany(
                 """INSERT OR REPLACE INTO route_requirements
                        (server, account, character, edge, outcome, at, until, inputs,
@@ -1130,6 +1164,70 @@ class BotMemory:
                 (self.server, self.account, character.casefold(), float(since))).fetchall()
         return [(float(at), str(subject), str(signal), float(magnitude))
                 for at, subject, signal, magnitude in rows]
+
+    def route_cost_rows(self, character: str, *, since: float = 0.0,
+                        timeout: float = 10.0) -> list[tuple[float, str, str, float, str, float]]:
+        """Her route events since ``since`` for the learned cost
+        (route_costs.py): (at, subject, signal, magnitude, kit, recovery),
+        oldest first."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT at, subject, signal, magnitude, kit, recovery FROM route_events
+                   WHERE server = ? AND account = ? AND character = ? AND at >= ?
+                   ORDER BY at, rowid""",
+                (self.server, self.account, character.casefold(), float(since))).fetchall()
+        return [(float(at), str(subject), str(signal), float(magnitude), str(kit or ""),
+                 float(recovery if recovery is not None else 1.0))
+                for at, subject, signal, magnitude, kit, recovery in rows]
+
+    def record_route_shadow(self, character: str, entries: Iterable[dict[str, Any]], *,
+                            now: float | None = None,
+                            timeout: float = ROUTE_EVENT_SAVE_TIMEOUT) -> None:
+        """Write shadow comparisons (route_shadow.py), then keep her newest
+        SHADOW_ROW_CAP rows from the last SHADOW_MAX_AGE."""
+        from .route_events import SHADOW_MAX_AGE, SHADOW_ROW_CAP
+
+        now = time.time() if now is None else float(now)
+        scope = (self.server, self.account, character.casefold())
+        with self._connect(timeout) as db:
+            db.executemany(
+                """INSERT INTO route_shadow
+                       (server, account, character, at, kind, trip, result, detail)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(*scope, float(entry["at"]), str(entry["kind"]), str(entry["trip"]),
+                  str(entry["result"]),
+                  json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)[:8000])
+                 for entry in entries])
+            db.execute(
+                """DELETE FROM route_shadow WHERE rowid IN (
+                       SELECT rowid FROM route_shadow
+                       WHERE server = ? AND account = ? AND character = ?
+                       ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?)""",
+                (*scope, SHADOW_ROW_CAP))
+            db.execute(
+                """DELETE FROM route_shadow
+                   WHERE server = ? AND account = ? AND character = ? AND at < ?""",
+                (*scope, now - SHADOW_MAX_AGE))
+
+    def route_shadow_rows(self, character: str, *, since: float = 0.0,
+                          timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her shadow comparisons since ``since``, oldest first."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT at, kind, trip, result, detail FROM route_shadow
+                   WHERE server = ? AND account = ? AND character = ? AND at >= ?
+                   ORDER BY at, rowid""",
+                (self.server, self.account, character.casefold(), float(since))).fetchall()
+        result = []
+        for at, kind, trip, outcome, detail in rows:
+            try:
+                decoded = json.loads(detail)
+            except (TypeError, ValueError):
+                decoded = {}
+            result.append({"at": float(at), "kind": str(kind), "trip": str(trip),
+                           "result": str(outcome),
+                           "detail": decoded if isinstance(decoded, dict) else {}})
+        return result
 
     def route_event_rows(self, character: str, *,
                          timeout: float = 10.0) -> list[dict[str, Any]]:

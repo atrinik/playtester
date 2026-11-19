@@ -22324,7 +22324,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=33", page)
+        self.assertIn(b"/app.js?v=34", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -28634,6 +28634,693 @@ class DialogueEdgeContentTests(unittest.TestCase):
                         except ValueError as error:
                             results.append(str(error))
                     self.assertEqual(results[0], results[1])
+
+
+def learned_rows(*rows, now=None):
+    """route_costs.RouteCostModel rows from (age seconds, subject, signal,
+    magnitude[, kit[, recovery]])."""
+    now = time.time() if now is None else now
+    result = []
+    for age, subject, signal, magnitude, *rest in rows:
+        kit = rest[0] if rest else ""
+        recovery = rest[1] if len(rest) > 1 else 1.0
+        result.append((now - age, subject, signal, magnitude, kit, recovery))
+    return result
+
+
+class LearnedClient(BlockClient):
+    """A BlockClient with the learned_route_costs flag, a route recorder
+    and a fixed learned model."""
+
+    def __init__(self, memory_path: Path, *, enabled=False):
+        super().__init__(memory_path)
+        from . import route_costs, route_events, route_shadow
+        self.config = types.SimpleNamespace(learned_route_costs=enabled)
+        self.route_recorder = route_events.RouteRecorder()
+        self.route_recorder.character = "Sera"
+        self.route_shadow = route_shadow.RouteShadow()
+        self.route_model = route_costs.RouteCostModel()
+
+    def record_action(self, action, detail="", *, save_timeout=None):
+        super().record_action(action, detail)
+
+
+class LearnedCostModelTests(unittest.TestCase):
+    """docs/ROUTING.md 4.4 and P6: the cost model, with an injected clock."""
+
+    def setUp(self):
+        from . import route_costs
+        self.route_costs = route_costs
+        self.now = 1_800_000_000.0
+
+    def view(self, *rows, kit=None):
+        model = self.route_costs.RouteCostModel(rows=learned_rows(*rows, now=self.now))
+        return model.view(self.now, kit)
+
+    def test_each_signal_weighs_and_halves_as_4_4_says(self):
+        hour = 3600.0
+        view = self.view((0, "map:/a", "death", 1.0), (6 * hour, "map:/b", "death", 1.0),
+                         (12 * hour, "map:/c", "death", 1.0), (0, "map:/d", "recall", 1.0),
+                         (0, "map:/e", "damage", 0.5), (1800, "exit:/f:1,1>/g", "blocked", 60.0),
+                         (1800, "seam:/f>/h", "crossing_failed", 1.0),
+                         # Under a second: dropped.
+                         (30 * hour, "map:/i", "blocked", 1.0))
+        self.assertEqual({path: round(value) for path, value in view.maps.items()},
+                         {"/a": 1800, "/b": 900, "/c": 450, "/d": 900, "/e": 150})
+        self.assertEqual({subject: round(value) for subject, value in view.edges.items()},
+                         {"exit:/f:1,1>/g": 30, "seam:/f>/h": 60})
+
+    def test_the_kit_rule_is_94s_predicate(self):
+        from .farm_analyzer import CombatProfile
+        then = json.dumps({"max_health": 200, "armour_class": 10, "protections": {},
+                           "character_level": 30})
+        rows = [(0, "map:/a", "death", 1.0, then)]
+        stronger = {"max_health": 300, "armour_class": 10, "protections": {},
+                    "character_level": 30}
+        mixed = {**stronger, "armour_class": 5}
+        weaker = {**stronger, "max_health": 150}
+        self.assertEqual(self.view(*rows, kit=stronger).maps, {})
+        self.assertEqual(round(self.view(*rows, kit=mixed).maps["/a"]), 1800)
+        self.assertEqual(round(self.view(*rows, kit=weaker).maps["/a"]), 1800)
+        self.assertEqual(round(self.view(*rows).maps["/a"]), 1800)
+        self.assertEqual(round(self.view((0, "map:/a", "death", 1.0, ""), kit=stronger)
+                               .maps["/a"]), 1800)
+        # The same predicate as CombatProfile.no_survivability_gain.
+        base = dict(skill="", skill_level=1, attack=1, damage=1, weapon_class=1,
+                    weapon_speed=1.0, speed=1.0, max_aggro_pack=1)
+        for now in (stronger, mixed, weaker):
+            profile = CombatProfile(**base, character_level=now["character_level"],
+                                    max_health=now["max_health"],
+                                    armour_class=now["armour_class"], protections=())
+            earlier = CombatProfile(**base, character_level=30, max_health=200,
+                                    armour_class=10, protections=())
+            self.assertEqual(profile.no_survivability_gain(earlier),
+                             self.route_costs.kit_counts(then, now))
+
+    def test_recovery_never_reduces_deaths(self):
+        view = self.view((0, "map:/a", "death", 1.0, "", 0.49),
+                         (0, "map:/a", "damage", 1.0, "", 0.49))
+        self.assertEqual(round(view.maps["/a"]), 1800 + 147)
+
+    def test_one_death_counts_once_on_a_route(self):
+        graph = blocks_graph()
+        # P5 records a death on the map, the edge she walked toward and the
+        # cell: the route pays 1800 s once.
+        view = self.view((0, "map:/blocked", "death", 1.0),
+                         (0, "exit:/blocked:9,0>/goal", "death", 1.0),
+                         (0, "cell:/blocked:0,0", "death", 1.0),
+                         (0, "exit:/blocked:9,0>/goal", "crossing_failed", 1.0))
+        context = self.route_costs.CostContext(graph, view, {})
+        route = graph.route_points("/start", (1, 0), "/goal", [])
+        cost = context.evaluate(route, (1, 0), lambda edge: (edge.destination_x,
+                                                              edge.destination_y))
+        self.assertEqual(round(cost.learned), 1800 + 120)
+        self.assertEqual(cost.worst[0], ("map:/blocked", 1800.0))
+
+    def test_a_measured_crossing_time_replaces_the_prior(self):
+        graph = blocks_graph()
+        model = self.route_costs.RouteCostModel(traversals={
+            "exit:/start:9,0>/blocked": {"count": 3, "timed": 3, "mean_seconds": 40.0,
+                                         "last_at": self.now},
+            "exit:/blocked:9,0>/goal": {"count": 3, "timed": 3, "mean_seconds": 40.0,
+                                        "last_at": self.now - 24 * 3600.0},
+            "map:/start": {"count": 3, "timed": 3, "mean_seconds": 999.0,
+                           "last_at": self.now}})
+        context = self.route_costs.CostContext(graph, model.view(self.now), {}, pace=0.5)
+        start, blocked = graph.nodes["/start"].edges[0], graph.nodes["/blocked"].edges[0]
+        self.assertAlmostEqual(context.edge_time(start, (1, 0)), 40.0)
+        # A day old: half the measurement, half the prior (9 tiles, 2 s).
+        self.assertAlmostEqual(context.edge_time(blocked, (0, 0)), 20.0 + 0.5 * 6.5)
+
+    def test_content_priors_grade_todays_tiers(self):
+        graph = blocks_graph()
+        graph.map_monster_levels = {"/blocked": {"orc": 20, "rat": 1},
+                                    "/detour_1": {"lost soul": 5}}
+        def spawn(x):
+            return NamedSpawn("/detour_2", x, 0, "orc", ("orc",), level=20)
+        graph.named_spawns = {"/detour_2": [spawn(1), spawn(2), spawn(3), spawn(4)]}
+        priors = self.route_costs.content_priors(graph, 10, lethal={"/goal"})
+        # Level 10: margin 3, so an orc at 20 is 7 over: 900 + 7 x 60.
+        self.assertEqual(priors["/blocked"], 900 + 7 * 60)
+        self.assertEqual(priors["/detour_1"], 900)
+        # A pack of four on any map, not only world_* (G4).
+        self.assertEqual(priors["/detour_2"], 600)
+        self.assertEqual(priors["/goal"], 3600)
+        self.assertNotIn("/detour_1", self.route_costs.content_priors(graph, 20))
+
+
+class FarmScoreTests(unittest.TestCase):
+    """docs/ROUTING.md 4.5 and 4.10: the farm score."""
+
+    def setUp(self):
+        from . import route_costs
+        self.route_costs = route_costs
+
+    def spot(self, key, rate, danger, *, position=0, rank=None, chokepoints=None):
+        rank = int(key[1:]) if rank is None else rank
+        return self.route_costs.FarmCandidate(key, key, "xp", position, rank, rate,
+                                              danger, chokepoints or {})
+
+    def pick(self, *spots):
+        choice = self.route_costs.farm_score(list(spots)).choice
+        return choice.key if choice else None
+
+    @staticmethod
+    def deaths(*ages_hours):
+        return sum(1800 * 0.5 ** (age / 6) for age in ages_hours)
+
+    def test_no_division_by_zero_and_negative_rates_clamped(self):
+        self.assertEqual(self.route_costs.spot_rate({"xp_hour": -5}, "xp"), 0.0)
+        self.assertEqual(self.route_costs.spot_rate({"score": "x"}, "balanced"), 0.0)
+        self.assertEqual(self.route_costs.spot_rate({"safety_score": 0.7}, "safety"), 0.7)
+        # r_top <= 0: the least dangerous wins, in ranking order on ties.
+        self.assertEqual(self.pick(self.spot("s0", 0.0, 500), self.spot("s1", 0.0, 100),
+                                   self.spot("s2", 0.0, 100)), "s1")
+
+    def test_a_danger_free_tie_keeps_the_higher_ranked_spot(self):
+        self.assertEqual(self.pick(self.spot("s1", 1.0, 0), self.spot("s0", 1.0, 0)), "s0")
+
+    def test_the_two_rankings_are_never_mixed(self):
+        # The effective objective's spots are scored on their own while one
+        # is usable, whatever the other ranking's rates.
+        first = self.spot("s0", 1.0, 2000, position=0)
+        other = self.spot("s1", 1e9, 0, position=1)
+        self.assertEqual(self.pick(first, other), "s0")
+        first.danger = 3000
+        self.assertEqual(self.pick(first, other), "s1")
+
+    def test_a_spot_whose_danger_is_not_known_is_not_usable_yet(self):
+        self.assertEqual(self.pick(self.spot("s0", 1.0, None), self.spot("s1", 0.1, 0)), "s1")
+        self.assertIsNone(self.pick(self.spot("s0", 1.0, None)))
+
+    def test_one_fresh_death_moves_her_to_a_spot_within_half_the_top_rate(self):
+        self.assertEqual(self.pick(self.spot("s0", 1.0, 1800), self.spot("s1", 0.51, 0)), "s1")
+        self.assertEqual(self.pick(self.spot("s0", 1.0, 1800), self.spot("s1", 0.49, 0)), "s0")
+
+    def test_a_lone_spot_is_farmed_under_the_cap_and_not_at_it(self):
+        self.assertEqual(self.pick(self.spot("s0", 1.0, 2999)), "s0")
+        score = self.route_costs.farm_score([self.spot("s0", 1.0, 3000)])
+        self.assertIsNone(score.choice)
+        self.assertIn("at its cap", score.paused["s0"])
+
+    def test_two_deaths_3_h_apart_pause_a_spot_and_4_h_apart_do_not(self):
+        self.assertIsNone(self.pick(self.spot("s0", 1.0, self.deaths(0, 3))))
+        self.assertEqual(self.pick(self.spot("s0", 1.0, self.deaths(0, 4))), "s0")
+
+    def test_chokepoint_danger_has_its_own_cap(self):
+        # Behind a chokepoint at 4000 s: under its cap, not counted toward
+        # the per-spot one.
+        behind = self.spot("s0", 1.0, 4000 + 100, chokepoints={"/gate": 4000})
+        self.assertEqual(self.pick(behind), "s0")
+        behind.danger, behind.chokepoints = 4500 + 100, {"/gate": 4500}
+        self.assertIsNone(self.pick(behind))
+        self.assertEqual(self.pick(behind, self.spot("s1", 0.1, 0)), "s1")
+
+    def test_care_from_one_fresh_death(self):
+        self.assertTrue(self.route_costs.farm_score([self.spot("s0", 1.0, 1800)]).care)
+        self.assertFalse(self.route_costs.farm_score([self.spot("s0", 1.0, 1799)]).care)
+
+
+class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
+    """docs/ROUTING.md 4.5, P6/P7: the learned-cost planner, in the shadow
+    and with the owner's learned_route_costs flag on."""
+
+    def setUp(self):
+        from . import route_blocks, route_costs, route_shadow
+        self.route_blocks, self.route_costs, self.route_shadow = (
+            route_blocks, route_costs, route_shadow)
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.client = LearnedClient(Path(self.directory) / "memory.sqlite3")
+        self.graph = blocks_graph()
+        self.enterContext(patch.object(route_costs, "learned_model",
+                                       lambda client, **_: client.route_model))
+
+    def learn(self, *rows):
+        self.client.route_model = self.route_costs.RouteCostModel(
+            rows=learned_rows(*rows), version=len(rows) + 1)
+
+    def deaths_on_blocked(self, count=2):
+        # Two deaths a minute apart: about 3600 s, over one death's budget
+        # (a single death is under it a moment later: it decays).
+        self.learn(*[(60 * index, "map:/blocked", "death", 1.0) for index in range(count)])
+
+    def trip(self, essential="", *, destination="/goal", strict=False, trip="") -> NavigateTask:
+        task = NavigateTask(self.graph, destination)
+        task.essential, task.strict_safety, task.trip = essential, strict, trip
+        return task
+
+    def maps(self, route) -> list[str]:
+        return [edge.destination for edge in route or ()]
+
+    def shadow_plan(self, task):
+        from .navigation import learned_route
+        task._walls = self.route_blocks.owner_walls(self.client)
+        return self.route_costs.drain(learned_route(task._trip_snapshot(self.client)))
+
+    def test_the_cheapest_route_wins_and_a_repeated_failure_flips_it(self):
+        self.assertEqual(self.maps(self.shadow_plan(self.trip()).route), ["/blocked", "/goal"])
+        self.deaths_on_blocked(1)
+        plan = self.shadow_plan(self.trip())
+        self.assertEqual(self.maps(plan.route), ["/detour_1", "/detour_2", "/goal"])
+        self.assertEqual((plan.outcome, plan.cost.learned), ("planned", 0.0))
+
+    def test_content_priors_steer_but_never_decline(self):
+        self.graph = blocks_graph(detour=False)
+        self.graph.map_monster_levels = {"/blocked": {"dragon": 90}}
+        plan = self.shadow_plan(self.trip())
+        self.assertEqual(plan.outcome, "planned")
+        self.assertGreaterEqual(plan.cost.prior, 1800)
+
+    def test_the_budget_declines_an_errand_and_an_essential_trip_overrides_it(self):
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        plan = self.shadow_plan(self.trip())
+        self.assertEqual((plan.outcome, plan.route, plan.budget), ("declined", None, 1800.0))
+        self.assertIn("route declined", plan.reason)
+        self.assertRegex(plan.reason, r"map:/blocked 3\d{3} s")
+        plan = self.shadow_plan(self.trip("cure"))
+        self.assertEqual((plan.outcome, plan.care), ("override", "bounded"))
+        self.assertEqual(self.maps(plan.route), ["/blocked", "/goal"])
+        # A farm trip has no budget: farm selection weighs its danger.
+        plan = self.shadow_plan(self.trip(trip="farm"))
+        self.assertEqual((plan.outcome, plan.budget), ("planned", None))
+        # Under one death: planned.
+        self.learn((7 * 3600, "map:/blocked", "death", 1.0))
+        self.assertEqual(self.shadow_plan(self.trip()).outcome, "planned")
+
+    def test_a_strict_trip_avoids_learned_danger_and_only_an_essential_one_overrides(self):
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        self.assertEqual(self.shadow_plan(self.trip(strict=True)).outcome, "no_route")
+        plan = self.shadow_plan(self.trip("funding", strict=True))
+        self.assertEqual((plan.outcome, plan.care, plan.strict_relaxed),
+                         ("override", "bounded", True))
+        # Half a death no longer counts as a hazard for the strict set.
+        self.learn((6 * 3600 + 60, "map:/blocked", "death", 1.0))
+        self.assertEqual(self.shadow_plan(self.trip(strict=True)).outcome, "planned")
+
+    def test_the_strict_avoid_set_is_todays_with_learned_danger(self):
+        self.graph.map_monster_levels = {"/detour_2": {"dragon": 90}}
+        self.client.state.route_hazards = {"/blocked": time.time() + 3600}
+        self.learn((2 * 3600, "map:/blocked", "death", 1.0))
+        task = self.trip(strict=True)
+        live = set()
+
+        def capture(*args, avoided_maps=None, **kwargs):
+            live.update(avoided_maps)
+            raise ValueError("captured")
+
+        with patch.object(self.graph, "route_points", capture):
+            with self.assertRaises(ValueError):
+                task._plan(self.client)
+        task._walls = self.route_blocks.owner_walls(self.client)
+        self.assertEqual(set(task._trip_snapshot(self.client).strict_avoided), live)
+        self.assertEqual(live, {"/blocked", "/detour_2"} |
+                         set(NavigateTask.KNOWN_LETHAL_TRANSIT))
+
+    def test_owner_blocks_stay_walls_for_other_trips(self):
+        self.route_blocks.add_block(self.client, self.graph, "/blocked", 3600)
+        self.assertEqual(self.maps(self.shadow_plan(self.trip()).route)[0], "/detour_1")
+        self.graph = blocks_graph(detour=False)
+        plan = self.shadow_plan(self.trip())
+        self.assertEqual(plan.outcome, "blocked")
+        plan = self.shadow_plan(self.trip("cure"))
+        self.assertEqual((plan.outcome, plan.crossed), ("planned", ("map:/blocked",)))
+
+    def test_with_the_flag_on_an_optional_trip_is_declined_and_retried_later(self):
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        task = self.trip()
+        with self.assertRaisesRegex(ValueError, "route declined"):
+            task._plan(self.client)
+        self.assertIn("route-declined", self.client.actions())
+        self.assertIsNone(task.care)
+
+    async def test_with_the_flag_on_an_essential_trip_crosses_with_bounded_care(self):
+        from .navigation import CARE_WAIT_SECONDS
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        self.client.state.stats.update(hp=10)
+        task = self.trip("cure")
+        task.status = TaskStatus.RUNNING
+        self.assertEqual(self.maps(task._plan(self.client)), ["/blocked", "/goal"])
+        self.assertEqual((task.care.mode, task.care.subjects), ("bounded", ("map:/blocked",)))
+        self.assertIn("route-budget-override", self.client.actions())
+        self.assertTrue(await task._care_hold(self.client))
+        # After the bounded wait she goes anyway.
+        task.care.since -= CARE_WAIT_SECONDS + 1
+        self.assertFalse(await task._care_hold(self.client))
+        self.assertIn("essential-care-timeout", self.client.actions())
+        self.assertIn("essential-route-override", self.client.actions())
+        # Once under way, a replan does not wait again.
+        task._plan(self.client)
+        self.assertTrue(task.care.cleared)
+
+    def test_with_the_flag_on_a_strict_essential_trip_overrides_with_care(self):
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        with self.assertRaisesRegex(ValueError, "avoiding every known hazard"):
+            self.trip(strict=True)._plan(self.client)
+        task = self.trip("funding", strict=True)
+        self.assertEqual(self.maps(task._plan(self.client)), ["/blocked", "/goal"])
+        self.assertEqual(task.care.mode, "bounded")
+        self.assertIn("route-strict-override", self.client.actions())
+
+    def test_with_the_flag_on_a_repeated_failure_switches_to_the_alternative(self):
+        self.client.config.learned_route_costs = True
+        self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/blocked")
+        self.deaths_on_blocked()
+        self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/detour_1")
+
+
+class RouteShadowTests(unittest.TestCase):
+    """docs/ROUTING.md P6: shadow planning beside today's plans."""
+
+    def setUp(self):
+        from . import route_blocks, route_costs, route_shadow
+        self.route_blocks, self.route_costs, self.route_shadow = (
+            route_blocks, route_costs, route_shadow)
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.client = LearnedClient(Path(self.directory) / "memory.sqlite3")
+        self.graph = blocks_graph()
+        self.enterContext(patch.object(route_costs, "learned_model",
+                                       lambda client, **_: client.route_model))
+
+    def learn(self, *rows):
+        self.client.route_model = self.route_costs.RouteCostModel(
+            rows=learned_rows(*rows), version=len(rows) + 1)
+
+    def plan(self, destination="/goal", **options):
+        task = NavigateTask(self.graph, destination)
+        for name, value in options.items():
+            setattr(task, name, value)
+        task.status = TaskStatus.RUNNING
+        try:
+            return task, [edge.destination for edge in task._plan(self.client)]
+        except ValueError as error:
+            return task, str(error)
+
+    def rows(self):
+        self.client.route_shadow.flush(self.client, force=True)
+        return self.client.memory.route_shadow_rows("Sera")
+
+    def test_the_live_plan_is_todays_and_the_shadow_logs_where_it_differs(self):
+        self.learn((60, "map:/blocked", "death", 1.0))
+        _, live = self.plan()
+        shadow, self.client.route_shadow = self.client.route_shadow, None
+        _, without = self.plan()
+        self.client.route_shadow = shadow
+        self.assertEqual(live, without)
+        self.assertEqual(live, ["/blocked", "/goal"])
+        self.assertEqual(self.client.actions(), [])
+        shadow.run(self.client)
+        record, = [r for r in self.client.decision_history
+                   if r["action"] == "route-shadow-diverge"]
+        self.assertIn("errand trip /start -> /goal: diverged", record["detail"])
+        self.assertRegex(record["detail"], r"-179\d s learned danger")
+        row, = self.rows()
+        self.assertEqual((row["kind"], row["trip"], row["result"]), ("trip", "errand", "diverged"))
+        detail = row["detail"]
+        self.assertEqual(detail["live"]["maps"], ["/blocked", "/goal"])
+        self.assertEqual(detail["shadow"]["maps"], ["/detour_1", "/detour_2", "/goal"])
+        self.assertEqual(detail["live"]["worst"][0][0], "map:/blocked")
+        self.assertEqual(detail["first_difference"]["index"], 0)
+        summary = shadow.summary(self.client)
+        self.assertEqual(summary["counts"], {"trip": {"errand": {"diverged": 1}}})
+        self.assertEqual(summary["recent"][0]["result"], "diverged")
+        self.assertFalse(summary["enabled"])
+
+    def test_a_decline_and_an_override_are_logged(self):
+        self.graph = blocks_graph(detour=False)
+        self.learn((60, "map:/blocked", "death", 1.0), (0, "map:/blocked", "death", 1.0))
+        self.plan()
+        self.client.route_shadow.run(self.client)
+        record = self.client.decision_history[-1]
+        self.assertEqual(record["action"], "route-shadow-decline")
+        self.assertIn("declined", record["detail"])
+        self.assertIn("budget of 1800 s", record["detail"])
+        self.client.route_shadow._next_trip = float("-inf")
+        self.plan(essential="cure")
+        self.client.route_shadow.run(self.client)
+        record = self.client.decision_history[-1]
+        self.assertEqual(record["action"], "route-shadow-decline")
+        self.assertIn("cure trip /start -> /goal: override", record["detail"])
+        self.assertIn("care bounded", record["detail"])
+        self.assertEqual([row["result"] for row in self.rows()], ["declined", "override"])
+
+    def test_an_agreement_is_counted_and_kept_without_a_decision(self):
+        self.graph = blocks_graph(detour=False)
+        self.plan()
+        self.client.route_shadow.run(self.client)
+        self.assertEqual(self.client.actions(), [])
+        self.assertEqual([row["result"] for row in self.rows()], ["agreed"])
+
+    def test_shadow_work_is_throttled_and_spread_over_steps(self):
+        shadow = self.client.route_shadow
+        self.learn((60, "map:/blocked", "death", 1.0))
+        self.plan()
+        self.assertIn("trip", shadow.jobs)
+        # One in flight: another request is skipped.
+        self.plan(destination="/detour_2")
+        self.assertEqual(shadow.skipped, 1)
+        # Each next() costs a second on this clock: a 0.5 s step advances
+        # the search once, so it takes several steps.
+        ticks = [0.0]
+
+        def monotonic():
+            ticks[0] += 1.0
+            return ticks[0]
+
+        shadow.monotonic = monotonic
+        steps = 0
+        while "trip" in shadow.jobs:
+            shadow.step(self.client, budget=0.5)
+            steps += 1
+        self.assertGreater(steps, 3)
+        # The same trip again is not compared again for a while.
+        shadow.monotonic = time.monotonic
+        shadow._next_trip = float("-inf")
+        self.plan()
+        self.assertNotIn("trip", shadow.jobs)
+        self.assertEqual(shadow.skipped, 2)
+
+    def test_shadow_failures_never_reach_the_tick(self):
+        shadow = self.client.route_shadow
+
+        def broken():
+            yield
+            raise RuntimeError("boom")
+
+        shadow.jobs["trip"] = self.route_shadow._Job("trip", broken(), None, time.time())
+        with self.assertLogs("atrinik_bot.route_shadow", "ERROR"):
+            self.route_shadow.step(self.client, budget=1.0)
+        self.assertEqual((shadow.jobs, shadow.dropped), ({}, 1))
+        with patch.object(self.route_shadow.RouteShadow, "step", side_effect=RuntimeError("boom")), \
+                self.assertLogs("atrinik_bot.route_shadow", "ERROR"):
+            self.route_shadow.step(self.client)
+        with patch.object(NavigateTask, "_trip_snapshot", side_effect=RuntimeError("x")), \
+                self.assertLogs("atrinik_bot.route_shadow", "ERROR"):
+            self.assertEqual(self.plan()[1], ["/blocked", "/goal"])
+
+    def test_with_the_flag_on_nothing_runs_in_the_shadow(self):
+        self.client.config.learned_route_costs = True
+        self.plan()
+        self.assertEqual(self.client.route_shadow.jobs, {})
+
+    def test_a_planning_probe_and_the_walk_home_are_not_compared(self):
+        task = NavigateTask(self.graph, "/goal")
+        task._plan(self.client)
+        self.assertEqual(self.client.route_shadow.jobs, {})
+
+    def test_the_report_summarises_per_trip_kind(self):
+        from .cli import parser, route_shadow_command
+        self.learn((60, "map:/blocked", "death", 1.0))
+        self.plan()
+        self.client.route_shadow.run(self.client)
+        self.client.route_shadow._next_trip = float("-inf")
+        self.graph = blocks_graph(detour=False)
+        self.plan(trip="farm")
+        self.client.route_shadow.run(self.client)
+        rows = self.rows()
+        report = self.route_shadow.summarise_rows(rows)
+        self.assertEqual(report["counts"], {"trip": {"errand": {"diverged": 1},
+                                                     "farm": {"agreed": 1}}})
+        self.assertEqual(report["subjects"][0], ("map:/blocked", 1))
+        args = parser().parse_args([
+            "--runtime-state", str(self.client.memory.path), "--host", "game",
+            "--port", "1", "--account", "acct", "--character", "Sera", "route-shadow"])
+        args.host, args.port = "game", None
+        import contextlib
+        import io
+        out = io.StringIO()
+        with patch.object(self.client.memory, "server", "game"), \
+                contextlib.redirect_stdout(out):
+            with patch("atrinik_bot.memory.BotMemory.open_read_only",
+                       return_value=self.client.memory):
+                self.assertEqual(route_shadow_command(args), 0)
+        text = out.getvalue()
+        self.assertIn("2 comparisons in the last 24 h", text)
+        self.assertIn("errand", text)
+        self.assertIn("diverged 1", text)
+        self.assertIn("map:/blocked", text)
+
+    def test_metrics_count_shadow_results(self):
+        from .metrics import BotMetrics
+        client = AtrinikClient(ClientConfig())
+        metrics = BotMetrics(client)
+        metrics.route_plan("shadow_diverged", "errand")
+        client.route_shadow.last_cost = {"time": 12.0, "danger": 1800.0,
+                                         "learned": 1800.0, "budget": 1800.0}
+        text = metrics.render()
+        self.assertIn('route_plans_total{', text)
+        self.assertIn('result="shadow_diverged"', text)
+        self.assertIn('trip="errand"', text)
+        self.assertIn('route_plan_cost_seconds{', text)
+        self.assertIn('part="learned"', text)
+
+
+class RouteShadowContentTests(RouteDeathReachIsolation, unittest.TestCase):
+    """docs/ROUTING.md 4.10, P6 accept: the incident replay and identical
+    live plans on the locked content."""
+
+    BED = "/shattered_islands/world_1_67_1"
+    UC = "/shattered_islands/strakewood_island/underground_city/underground_city_"
+    TREES = "/shattered_islands/world_14_79"
+
+    def setUp(self):
+        super().setUp()
+        from . import route_costs
+        self.route_costs = route_costs
+        self.graph = built_graph()
+
+    def sera(self, rankings=None):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 34, "exp": 1000, "hp": 300, "maxhp": 300})
+        point = self.graph.savebeds[self.BED][0]
+        client.state.savebed_map, client.state.savebed_xy = self.BED, point
+        client.state.map.path = self.BED
+        client.state.map.world_x, client.state.map.world_y = point
+        client.farm_analyzer = StubAnalyzer(rankings or {})
+        return client
+
+    def learn(self, client, *rows):
+        client._route_cost_model = self.route_costs.RouteCostModel(
+            rows=learned_rows(*rows), version=len(rows) + 1)
+        client._route_cost_model_state = ("", time.monotonic(), 0)
+
+    def test_the_incident_replay_leaves_the_underground_city_after_one_death(self):
+        from .navigation import analyzer_farm_choice
+        # The 2026-11-14 incident (section 2): the Underground City circuit
+        # at 0_4 ranked first, a Burnt Forest circuit at 80 % of its rate
+        # (the live rates were not recorded; 4.5 uses the condition).
+        circuit = {**analyzer_spot("UC circuit", [self.UC + "0_4"], ["orc L30"]),
+                   "xp_hour": 7.0e6}
+        forest = {**analyzer_spot("Burnt forest", [self.TREES], ["evil treant L13"]),
+                  "xp_hour": 5.6e6}
+        client = self.sera({"xp": [circuit, forest]})
+        shadow = client.route_shadow
+        # 20:34:13: the Old Outpost death (resources), not on either route.
+        self.learn(client, (900, "map:/shattered_islands/old_outpost/old_outpost_0101",
+                            "death", 1.0))
+        self.assertEqual(analyzer_farm_choice(client, self.graph)[2]["name"], "UC circuit")
+        shadow.run(client)
+        self.assertEqual((shadow.last_farm["result"], shadow.last_farm["shadow"]["name"]),
+                         ("agreed", "UC circuit"))
+        # 20:38:44: the first underground_city_0_0 death.
+        self.learn(client, (900, "map:/shattered_islands/old_outpost/old_outpost_0101",
+                            "death", 1.0), (0, f"map:{self.UC}0_0", "death", 1.0))
+        shadow._farm = (None, float("-inf"))
+        live = analyzer_farm_choice(client, self.graph)
+        # The live choice stays #94's (no kit failure recorded here).
+        self.assertEqual(live[2]["name"], "UC circuit")
+        shadow.run(client)
+        farm = shadow.last_farm
+        self.assertEqual((farm["result"], farm["shadow"]["name"]), ("diverged", "Burnt forest"))
+        self.assertEqual(round(farm["live"]["danger"]), 1800)
+        self.assertEqual(farm["shadow"]["danger"], 0)
+        self.assertTrue(any(record["action"] == "route-shadow-diverge" and
+                            "farm: diverged" in record["detail"]
+                            for record in client.decision_history))
+        # A second death within 3.5 h pauses the circuit outright.
+        self.learn(client, (3 * 3600, f"map:{self.UC}0_0", "death", 1.0),
+                   (0, f"map:{self.UC}0_0", "death", 1.0))
+        shadow._farm = (None, float("-inf"))
+        analyzer_farm_choice(client, self.graph)
+        shadow.run(client)
+        self.assertIn("at its cap", shadow.last_farm["paused"][
+            "xp:" + circuit["path"]])
+
+    def test_with_the_flag_off_live_plans_and_farm_choices_are_unchanged(self):
+        from . import route_shadow
+        from .navigation import analyzer_farm_choice
+        bed = self.graph.savebeds[self.BED][0]
+        trips = (
+            ((self.BED, *bed), self.UC + "0_4", {"allow_ranged_hazard_fallback": True}),
+            ((self.BED, *bed), "/shattered_islands/world_6_51", {}),
+            ((self.BED, *bed), self.TREES, {}),
+            ((self.BED, *bed), "/shattered_islands/world_0_51", {"strict_safety": True}),
+            ((self.BED, *bed), self.UC + "0_4", {"strict_safety": True}),
+            (("/shattered_islands/world_0_70", 10, 10), "/shattered_islands/world_3_69",
+             {"strict_safety": True}),
+        )
+        for (path, x, y), destination, options in trips:
+            with self.subTest(destination=destination, **options):
+                results = []
+                for shadowed in (True, False):
+                    client = self.sera()
+                    client.state.map.path, client.state.map.world_x, \
+                        client.state.map.world_y = path, x, y
+                    self.learn(client, (0, f"map:{self.UC}0_0", "death", 1.0))
+                    if not shadowed:
+                        client.route_shadow = None
+                    task = NavigateTask(self.graph, destination)
+                    task.status = TaskStatus.RUNNING
+                    for name, value in options.items():
+                        setattr(task, name, value)
+                    try:
+                        results.append(task._plan(client))
+                    except ValueError as error:
+                        results.append(str(error))
+                    if shadowed:
+                        self.assertIn("trip", client.route_shadow.jobs)
+                        client.route_shadow.run(client)
+                        self.assertEqual(client.route_shadow.jobs, {})
+                self.assertEqual(results[0], results[1])
+        circuit = analyzer_spot("UC", [self.UC + "0_4"], ["orc L30"])
+        forest = analyzer_spot("Forest", [self.TREES], ["evil treant L13"])
+        choices = []
+        for shadowed in (True, False):
+            client = self.sera({"xp": [circuit, forest]})
+            self.learn(client, (0, f"map:{self.UC}0_0", "death", 1.0))
+            if not shadowed:
+                client.route_shadow = None
+            choices.append(analyzer_farm_choice(client, self.graph))
+            if shadowed:
+                route_shadow.shadow(client).run(client)
+        self.assertEqual(choices[0], choices[1])
+
+    def test_strict_shadow_plans_route_where_todays_strict_plans_do(self):
+        from .navigation import learned_route
+        bed = self.graph.savebeds[self.BED][0]
+        for destination in ("/shattered_islands/world_0_51", "/shattered_islands/world_6_51",
+                            self.UC + "0_4", "/shattered_islands/world_0_70"):
+            with self.subTest(destination):
+                client = self.sera()
+                task = NavigateTask(self.graph, destination)
+                task.strict_safety = True
+                try:
+                    live = task._plan(client)
+                except ValueError:
+                    live = None
+                plan = self.route_costs.drain(learned_route(task._trip_snapshot(client)))
+                self.assertEqual(plan.route is not None, live is not None)
+                if live is not None:
+                    avoided = task._trip_snapshot(client).strict_avoided
+                    self.assertFalse({edge.destination for edge in plan.route[:-1]} & avoided)
 
 
 if __name__ == "__main__":

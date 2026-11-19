@@ -1804,6 +1804,110 @@ metrics.
 *Accept:* the incident replay's shadow farm choice leaves the Underground
 City spot after one death; strict trips are identical; the benchmark gate
 in 4.5 passes.
+*Landed:* `route_costs.py` holds the cost model, the priors, the plan
+types and the farm score; `navigation.learned_route` and
+`navigation.farm_shadow` plan with them; `route_shadow.py` runs them beside
+the live plans. Notes against the text above:
+- **Flag.** `ClientConfig.learned_route_costs` (`--learned-route-costs`,
+  `ATRINIK_BOT_LEARNED_ROUTE_COSTS=1`), off by default. With it on, live
+  plans use `learned_route`, budgets and the essential override, so P7 is
+  the flip and its tests. Spot selection is never live here: P8 adds its
+  own flag. With it off, `NavigateTask._plan` is unchanged and only hands
+  its result to the shadow: a test plans content trips and the farm choice
+  with and without the shadow running to completion, and a one-off
+  comparison with main's code on 84 content trips (savebed to savebed,
+  strict and fallback mixed) matched exactly.
+- **Search.** `route_points` takes an `edge_cost` callback and becomes a
+  generator (`route_points_iter`, `_expand_component_states`) that yields
+  after each state; without a callback the result is today's. Costs are
+  tenths of a second, at least one.
+- **Travel time.** The prior is the Chebyshev distance from her first
+  arrival on the source map to the departure, at 1 / speed seconds a tile
+  (0.5 s unknown, clamped 0.1 to 2), plus 2 s a transition and 20 s a
+  voyage. That is a lower bound on the walk, not `_segment_steps`: the
+  exits' `local_path` is already run by the expansion, and a second one per
+  edge would double it. An edge's measured mean (P5's timed traversals,
+  the seconds on its source map before crossing it) replaces the prior
+  with weight 0.5^(age / 24 h).
+- **One death counts once.** P5 writes a death on the map, the edge and a
+  cell. A visit to map M left by edge E costs M's learned danger plus E's
+  own failures (blocked, crossing_failed); edge and cell deaths are not
+  added again, so 4.5's arithmetic holds. Cells wait for P9. `talk:`
+  subjects are costed like any edge: their failures and measured times.
+- **Priors.** Over-level spawns 900 s plus 60 s a level beyond the margin
+  (at most 1800 s); ranged or caster residents 900 s below level 18; an
+  aggro pack of three or more on any map 300 s a member from the third (at
+  most 1800 s, so `underground_city_0_0`'s pack of 8 is 1800 s, G4);
+  `KNOWN_LETHAL_TRANSIT` 3600 s; at most 3600 s a map. λ is 2 for the
+  safety objective, while depleted, without a ready recall, and on
+  optional trips (every trip but a farm or essential one), else 1.
+- **Kit and recovery.** `farm_analyzer.survivability_unchanged` is #94's
+  predicate on the four fields a row keeps, and
+  `CombatProfile.no_survivability_gain` now calls it. A safe pass is a
+  timed crossing with no damage or recall on that visit; it multiplies the
+  map's and the edge's earlier recall, damage and blocked rows by 0.7, in
+  a new `recovery` column of `route_events`. Deaths keep 1; cells never
+  recover.
+- **Budgets.** A budget compares learned danger only: content priors never
+  decline a trip. Farm and strict trips have none; every other trip
+  (errands and quest steps, which report as `errand`) has 1800 s. Because
+  danger decays from the moment of the death, a sole route with one death
+  is at the budget only at once and under it seconds later: an errand is
+  declined by two recent deaths (within about 6 h), not by one. Declined
+  live trips record `route-declined` and fail, to be retried.
+- **Strict.** The avoid set is today's with learned danger of 900 s or more
+  in place of `route_hazards` (a test compares the sets); within it the
+  search is weighted. An essential strict trip with no strict route takes
+  the cheapest unrestricted route (`route-strict-override`); a budget
+  override records `route-budget-override`. Both cross with
+  `CARE_BOUNDED` care, so `essential-care-timeout` follows a 600 s wait.
+  Owner blocks keep P3's rules inside `learned_route`.
+- **Shadow.** A live plan of a running trip (never a planning probe or the
+  walk home to wait for care) takes a snapshot of its inputs; the search
+  is advanced by the task engine after each step for at most 20 ms, at
+  least one state expansion. At most one trip and one farm comparison are
+  in flight, a trip every 15 s at most and the same trip (kind, map,
+  destination, live route) every 10 minutes; the farm score every 5
+  minutes unless its inputs change, and never within 30 s. A comparison
+  still running after 3 minutes is dropped. Every hook catches its own
+  errors. A whole-world search takes about 0.4 s, so a comparison
+  completes over roughly 20 to 40 engine steps.
+- **Logs.** `route-shadow-diverge` (another route, a route where the live
+  plan has none, another spot) and `route-shadow-decline` (declined, no
+  route, blocked, an essential override, farming paused), each at most
+  once an hour for the same trip and result. Every comparison, agreements
+  included, is a row in the new `route_shadow` table (7 days, 10,000 rows)
+  with both routes' maps, time, prior, learned danger, worst subjects, the
+  first difference and what the shadow saves by part. The `route-shadow`
+  command summarises it per trip kind, read-only, for the divergence
+  report; the Tasks tab's **Shadow routes** section shows the counts, the
+  last farm comparison and the last 20 differences.
+- **Farm score.** It scores the usable spots of `analyzer_farm_choice`
+  without #94's block (quarantine and kit hazard as live, the top 25 of
+  each ranking), from one weighted search from her savebed; chokepoints
+  are found on that search's states for the 12 most dangerous learned maps,
+  so it runs no extra whole-world search and never touches #94's shared
+  reach cache or its rate limit. While she is depleted at the temple
+  threshold it does not run. The care rule's wait is P8's; the shadow
+  reports `care` from D ≥ 1800.
+- **Incident replay.** On the locked content, from the `world_1_67_1` bed,
+  with the Underground City circuit first and a Burnt Forest circuit at
+  80 % of its rate: the Old Outpost death leaves the shadow on the
+  Underground City; the first `underground_city_0_0` death moves it to the
+  Burnt Forest (D 1800 against 0) while the live choice stays; a second
+  death within 3.5 h pauses the circuit at its cap.
+- **Metrics.** `route_plans_total{result,trip}` (shadow comparisons as
+  `shadow_*`), `route_plan_cost_seconds{part}` (time, danger, learned,
+  budget of the latest plan) and `route_learned_subjects`.
+- **Benchmark gate.** `benchmark_pathfinding.py --world` times today's
+  `route_points` and the weighted one, warm, on six content trips
+  (incident, ship with and without the key, Burnt Forest, Brynknot to
+  Strakewood; the Incuna trip has no route without Lost Memories). On
+  2026-11-19: median ratio 0.989 (gate 1.5), from 0.91 to 1.15 per trip,
+  about 390 to 460 ms a plan warm and 650 to 1140 ms cold.
+- **Unchanged.** The Learned routes summary keeps its provisional cost;
+  savebed ranking by route cost and the map-level estimates are P8's and
+  later.
 
 **P7. `feat(navigation)`: plan with learned costs.** Turn the flag on: live
 plans use learned costs, errand budgets apply, and essential overrides take

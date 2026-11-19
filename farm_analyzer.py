@@ -154,6 +154,36 @@ def risky_approach(spot: dict) -> bool:
             score < APPROACH_SAFETY_FLOOR)
 
 
+def survivability_unchanged(now: dict, earlier: dict) -> bool:
+    """CombatProfile.no_survivability_gain on the four fields it compares
+    (maximum health, armour class, protections, character level), as plain
+    descriptions. A route event keeps only these (route_events.KIT_FIELDS),
+    so the learned route cost (route_costs.py) applies the same predicate.
+    A missing field counts as 0."""
+    def number(data: dict, key: str) -> float:
+        try:
+            return float(data.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def protections(data: dict) -> float:
+        try:
+            return float(sum(int(value) for value in dict(data.get("protections") or {}).values()))
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+    changes = (
+        (number(now, "max_health") - number(earlier, "max_health"),
+         0.10 * max(number(earlier, "max_health"), 1)),
+        (number(now, "armour_class") - number(earlier, "armour_class"), 2),
+        (protections(now) - protections(earlier), 5),
+        (number(now, "character_level") - number(earlier, "character_level"), 2),
+    )
+    gain = any(change > tolerance for change, tolerance in changes)
+    loss = any(-change > tolerance for change, tolerance in changes)
+    return not gain or loss
+
+
 @dataclass(frozen=True)
 class CombatProfile:
     """The live melee profile the analyzer simulates."""
@@ -266,17 +296,13 @@ class CombatProfile:
         10%" test then stopped counting the deaths she had at full
         strength, so the weaker character walked back into the same fights.
         """
-        changes = (
-            (self.max_health - earlier.max_health,
-             0.10 * max(earlier.max_health, 1)),
-            (self.armour_class - earlier.armour_class, 2),
-            (sum(dict(self.protections).values()) -
-             sum(dict(earlier.protections).values()), 5),
-            (self.character_level - earlier.character_level, 2),
-        )
-        gain = any(change > tolerance for change, tolerance in changes)
-        loss = any(-change > tolerance for change, tolerance in changes)
-        return not gain or loss
+        return survivability_unchanged(
+            {"max_health": self.max_health, "armour_class": self.armour_class,
+             "protections": dict(self.protections),
+             "character_level": self.character_level},
+            {"max_health": earlier.max_health, "armour_class": earlier.armour_class,
+             "protections": dict(earlier.protections),
+             "character_level": earlier.character_level})
 
     @classmethod
     def from_description(cls, data: dict) -> "CombatProfile | None":

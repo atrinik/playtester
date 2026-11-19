@@ -757,7 +757,36 @@ migrated once, and her decision ledger's map visits seed the crossing
 counts. The Tasks tab's **Learned routes** section lists the 25 subjects
 with the highest provisional cost (one death costs 30 minutes of travel,
 halving every 6 hours), their signals, the last event and when the cost
-falls below half. It is read-only, and the planner does not use it yet.
+falls below half. It is read-only.
+
+Those events become learned route costs (`route_costs.py`), in seconds:
+each crossing's travel time (her measured crossing times once she has
+them) plus the danger of the map it enters, one death counting 30 minutes
+and halving every 6 hours, a recall 15 minutes and a full health bar of
+damage 5. A death stops counting once her survivability (health, armour,
+protections, level) has genuinely improved since, and each safe crossing
+cuts a map's or exit's recall, damage and held-exit cost by 30 %, never its
+deaths. Today's hazard tiers become graded content costs that steer the
+route but never stop a trip. Behind the owner's `learned_route_costs` flag
+(`--learned-route-costs` or `ATRINIK_BOT_LEARNED_ROUTE_COSTS=1`), off by
+default, a trip takes the cheapest route by those costs; an errand whose
+cheapest route carries one expected death or more of learned danger is
+declined and retried later, while an essential trip goes anyway with the
+owner-block care rules, waiting at most 10 minutes
+(`route-budget-override`, `route-strict-override`, then
+`essential-care-timeout`). With the flag off, plans and farm choices are
+exactly as before, and the learned plans run in the shadow: at most
+20 ms a task-engine step, at most one trip every 15 seconds and the farm score
+every 5 minutes. Where they differ she records `route-shadow-diverge` or
+`route-shadow-decline`, keeps every comparison for 7 days in the runtime
+state database (`route_shadow`), and the Tasks tab's **Shadow routes**
+section lists the counts per trip kind and the last 20 differences. The
+`route-shadow` command (`--hours`, `--json`) prints the same report from
+her memory database, read-only, for the owner's divergence report before
+any flip. The farm score in the shadow is the analyzer's rate over an hour
+minus the learned danger on the spot's route and maps; one fresh death on
+the way moves her to any spot rated within half of the top one, and a spot
+pauses at 3000 s (4500 s behind a chokepoint).
 
 NPC voyages and quest-gated exits wait behind the owner's `dialogue_edges`
 flag (`--dialogue-edges` or `ATRINIK_BOT_DIALOGUE_EDGES=1`), off by default:
