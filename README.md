@@ -245,6 +245,7 @@ Counters:
 | `state_seconds_total` | `state` | seconds `fighting`, `resting`, `travelling`, `shopping` (shops, temple, NPC dialogue), `busy`, `idle` or `disconnected` (not playing) |
 | `observations_total` | `source` | [observations](#observation-ledger) stored, by source kind; a repeat of a stored reading counts again |
 | `facts_total` | `kind`, `status` | [facts](#facts) first stored, by kind (`tile-property`, `key-name`, ...) and status (`candidate`, `confirmed`) |
+| `fight_positions_total` | `feature`, `outcome` | [fights recorded by terrain](#fights-by-terrain): `corridor`, `doorway`, `room`, `open` or `unknown`, and `won`, `retreated`, `recalled` or `died` |
 | `observations_dropped_total` | `reason` | readings the ingestion filter refused: `chat`, `player-link`, `who-list`, `player-name`, `signed-book`, `unmatched-book`, `book-unverified`, `renamed-item`, `examine-interrupted`, `unauthored-item`, `examine-unverified`, `book-examine` |
 
 The time in each state follows the latest recorded action that marks one. For
@@ -387,6 +388,52 @@ The dashboard's read-only **Equipment** tab lists each gear family she
 carries: what she wears and the best candidate, with both scores, the
 effective stats, per-stat differences and notes such as "+2 on a cape adds
 no AC", and the recent shadow log.
+
+## Fights by terrain
+
+She records where she stood in each fight (`terrain.py`, `memory.py`; the
+design is [docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md)
+4.7, phase F10). Recording changes nothing she does.
+
+- **A fight** starts at the first combat line of hers in a while (a hit or
+  miss on her, a block, dodge or parry, her own hit or kill) and ends 10
+  seconds after the last one, when she leaves the map (crossing a tile
+  seam to the next map keeps it), or 2 seconds after her death (hits until
+  then still count, as in the failure review); a fight longer than 15
+  minutes is cut there. It ends `died` on her death, `recalled` after her
+  emergency recall, `won` when she killed something, and `retreated`
+  otherwise. Damage over time from her own poisoning or disease ("poison
+  hit you for ...", or a symptom under its disease's name, "flu hit you
+  for ...", from the authored diseases in the locked content) names no
+  attacker and starts no fight.
+- **The square** is read when the fight starts, and again where she stands
+  when a second attacker hits her within 8 seconds. Its `reach` is how
+  many of her 8 neighbours a walking monster could stand on, from the
+  authored walkability she plans with (a door counts; the server lets a
+  monster hit a diagonal neighbour past a wall corner; off the map counts
+  only toward a tiled neighbour). Its feature is
+  `corridor` (reach 2, opposite each other), `doorway` (a door on or next
+  to her, or a one-wide gap into a room), `open` (reach 7 or 8 and at least
+  20 standable squares within 2), `room` (anything else), or `unknown` off
+  the world graph.
+- **Counts only.** Peak attackers (the most distinct attackers within 8
+  seconds, counted exactly as the failure review counts packs), ranged
+  monsters in view and how many a wall or door covers (on the cells an
+  aimed bullet crosses, as `bullet_ray_clear` tests them), creatures and players in view, kills, damage taken and
+  seconds. No attacker's or player's name is stored.
+- **Bounded.** The recorder reads only new server lines each engine step
+  and looks at the creatures in view only during a fight; a fight keeps at
+  most 2,000 hits. A row waits at most 0.25 seconds for a locked database
+  and is otherwise dropped; at most 20,000 rows a character, oldest
+  evicted first. An error in the recorder forgets the fight and never
+  reaches the game loop; it is logged once, then counted every 10 minutes
+  until a step works again.
+
+The read-only **Terrain** panel on the dashboard's Farming tab lists her
+recent fights and the rates learned per feature, peak attackers and
+ranged monsters in view: fights, damage a second and deaths, each day's
+fights weighted with a 7-day half-life (`GET /api/terrain?limit=N`, up to
+200, under the same loopback and `Host` rules as `/api/state`).
 
 ## Operator assist
 

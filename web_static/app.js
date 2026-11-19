@@ -701,6 +701,7 @@ $$(".tabs button").forEach(b => (b.onclick = () => {
   if (b.dataset.tab === "activity") renderActivity();
   if (b.dataset.tab === "knowledge") pollKnowledge();
   if (b.dataset.tab === "equipment") renderEquipment();
+  if (b.dataset.tab === "farming") pollTerrain();
 }));
 
 // ---------- knowledge (read-only) ----------
@@ -831,6 +832,51 @@ function renderEquipment() {
   if (!log.length) shadow.append(node("span", "muted", "No comparison logged yet."));
 }
 
+// ---------- terrain (read-only; docs/LEARNING_AND_FEEDBACK.md 4.7) ----------
+// Her fights by terrain, built from DOM nodes and text only with node().
+const FEATURE_LABELS = { corridor: "Corridor", doorway: "Doorway", room: "Room", open: "Open ground", unknown: "Unknown" };
+const OUTCOME_FLAGS = { won: "flag good", retreated: "flag warn", recalled: "flag warn", died: "flag bad" };
+let terrainBusy = false, lastTerrainSig = "";
+async function pollTerrain() {
+  if (terrainBusy) return;
+  terrainBusy = true;
+  try {
+    const r = await fetch("/api/terrain?limit=20", { cache: "no-store" });
+    if (r.ok) renderTerrain(await r.json());
+  } finally { terrainBusy = false; }
+}
+function renderTerrain(t) {
+  const sig = JSON.stringify(t);
+  if (sig === lastTerrainSig) return;
+  lastTerrainSig = sig;
+  $("#terrain-summary").textContent = `${(t.total || 0).toLocaleString()} fight${t.total === 1 ? "" : "s"} kept` +
+    (t.terrain_known ? "" : " · world graph unavailable: features unknown") +
+    (t.busy ? " · the database is busy; try again shortly" : "");
+  const rates = (t.rates || []).map(r => {
+    const row = node("div", "quest");
+    row.append(node("strong", "", `${FEATURE_LABELS[r.feature] || r.feature} · ${r.attackers === 3 ? "3+" : r.attackers} at once${r.ranged ? " · ranged in view" : ""}`),
+      node("span", r.death_rate > 0 ? "flag bad" : "flag", `${Math.round((r.death_rate || 0) * 100)}% deaths`),
+      node("small", "", `${r.fights} fight${r.fights === 1 ? "" : "s"} · ${r.damage_per_second == null ? "no time" : `${r.damage_per_second} damage/s`}`));
+    return row;
+  });
+  $("#terrain-rates").replaceChildren(...(rates.length ? rates : [node("span", "muted", "No fights recorded yet.")]));
+  const when = s => new Date(s * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const fights = (t.fights || []).map(f => {
+    const row = node("div", "reading");
+    const head = node("div", "reading-head");
+    head.append(node("b", "", FEATURE_LABELS[f.feature] || f.feature), node("span", "", `reach ${f.reach ?? "?"}`),
+      node("span", OUTCOME_FLAGS[f.outcome] || "flag", f.outcome), node("time", "", when(f.ended)));
+    row.append(head);
+    const parts = [`${f.peak_attackers} at once`, `${f.damage_taken} damage in ${Math.round(f.seconds)} s`];
+    if (f.ranged_attackers) parts.push(`${f.ranged_attackers} ranged in view, ${f.ranged_covered} covered`);
+    if (f.kills) parts.push(`${f.kills} killed`);
+    if (f.players_in_view) parts.push(`${f.players_in_view} player${f.players_in_view === 1 ? "" : "s"} in view`);
+    row.append(node("p", "", parts.join(" · ")), node("small", "", `${f.map} (${f.x}, ${f.y})`));
+    return row;
+  });
+  $("#terrain-fights").replaceChildren(...fights);
+}
+
 // ---------- polling ----------
 let liveBusy = false, slowBusy = false;
 async function pollLive() {
@@ -853,6 +899,7 @@ async function pollSlow() {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
     if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderBlocks(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
+    if ($("#tab-farming").classList.contains("active")) pollTerrain();
   } finally { slowBusy = false; }
 }
 pollLive(); pollSlow();

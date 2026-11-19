@@ -27,6 +27,8 @@ from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      format_money, map_object_visual_name,
                      update_bank_balance)
 from .equipment import gear_examine_pending, gear_examiner
+from . import terrain
+from .observations import is_player, plain
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
 
@@ -319,6 +321,29 @@ def ray_cells(dx: int, dy: int, reach: int) -> tuple[tuple[int, int], ...]:
                 fy = 0 if hy > 0 else q
                 y += sy
     return tuple(cells)
+
+
+def ray_split(dx: int, dy: int, reach: int
+              ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """A ray at offset (dx, dy)'s cells (ray_cells, out to reach) before the
+    target cell, and those after it. Off the exact line, the cells no
+    farther than the target (Chebyshev) come before it."""
+    cells = list(ray_cells(dx, dy, reach))
+    if (dx, dy) in cells:
+        index = cells.index((dx, dy))
+        return cells[:index], cells[index + 1:]
+    span = max(abs(dx), abs(dy))
+    return ([cell for cell in cells
+             if max(abs(cell[0]), abs(cell[1])) <= span],
+            [cell for cell in cells
+             if max(abs(cell[0]), abs(cell[1])) > span])
+
+
+def cover_cells(dx: int, dy: int) -> list[tuple[int, int]]:
+    """The cells an aimed bullet at offset (dx, dy) crosses before it,
+    exactly as FarmTask.bullet_ray_clear tests them (its BULLET_RANGE, or
+    farther for a farther target): what gives cover (terrain.covered)."""
+    return ray_split(dx, dy, max(FarmTask.BULLET_RANGE, abs(dx), abs(dy)))[0]
 
 
 def healing_outpaced(client: AtrinikClient, seconds: float = 8.0) -> bool:
@@ -2065,16 +2090,7 @@ class FarmTask(BotTask):
                    origin: tuple[int, int]
                    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
         """The ray's cells before the target cell, and those after it."""
-        dx, dy = x - origin[0], y - origin[1]
-        cells = list(ray_cells(dx, dy, self.BULLET_RANGE))
-        if (dx, dy) in cells:
-            index = cells.index((dx, dy))
-            return cells[:index], cells[index + 1:]
-        span = max(abs(dx), abs(dy))
-        return ([cell for cell in cells
-                 if max(abs(cell[0]), abs(cell[1])) <= span],
-                [cell for cell in cells
-                 if max(abs(cell[0]), abs(cell[1])) > span])
+        return ray_split(x - origin[0], y - origin[1], self.BULLET_RANGE)
 
     def bullet_ray_clear(self, client: AtrinikClient, x: int, y: int,
                          target_id: int, *,
@@ -7340,6 +7356,124 @@ class BindSavebedTask(BotTask):
         self.applied_at = now
 
 
+# Objects in her inventory that hit her as themselves (server poisoning,
+# force, disease and symptom types): no attacker of a fight.
+OWN_FORCE_TYPES = frozenset({c.TYPE_POISONING, c.TYPE_FORCE, c.TYPE_DISEASE,
+                             c.TYPE_SYMPTOM})
+# A failing fight recorder logs its traceback once, then a count at most
+# this often (seconds).
+FIGHT_ERROR_REPORT_SECONDS = 600.0
+
+
+@lru_cache(maxsize=1)
+def disease_names() -> frozenset[str]:
+    """The folded names (and plurals) of the authored diseases (type 158) in
+    the locked content. The server names each symptom after its disease
+    (disease.c), so a symptom's damage reads "flu hit you ...". Diseases and
+    symptoms are system objects the client is never sent, so only the
+    content names them. Loaded once; without content, none."""
+    try:
+        records = load_archetypes()
+    except Exception as error:
+        log.warning("disease names unavailable: %s", error)
+        return frozenset()
+    names: set[str] = set()
+    for arch, record in records.items():
+        attrs = record.get("attrs", {})
+        if str(attrs.get("type", "")).strip() != str(c.TYPE_DISEASE):
+            continue
+        for name in (attrs.get("name") or arch, attrs.get("name_pl")):
+            if name and plain(str(name)):
+                names.add(plain(str(name)))
+    return frozenset(names)
+
+
+def fight_view(client: AtrinikClient, recorder: terrain.FightRecorder
+               ) -> terrain.FightView | None:
+    """What this step shows the fight recorder: her square, the new server
+    lines and, during a fight, the creatures and players in view (players
+    only counted). None while she is not playing."""
+    state = client.state
+    m = state.map
+    if state.phase != "playing" or not m.path or not state.player_name:
+        recorder.position = None
+        return None
+    count = state.message_count
+    if recorder.position is None or recorder.position > count:
+        # From now on: the history before this step is no fight of ours.
+        recorder.position = count
+    messages = state.messages_since(recorder.position)
+    recorder.position = count
+    graph = getattr(client, "world_graph", None)
+    node = getattr(graph, "nodes", {}).get(m.path) if graph is not None else None
+    def scan() -> tuple[list[terrain.Hostile], int]:
+        content = getattr(client, "authored_content", None)
+        own = plain(state.player_name)
+        casters = getattr(node, "caster_identities", ()) or ()
+        cx, cy = m.width // 2, m.height // 2
+        hostiles: list[terrain.Hostile] = []
+        players = 0
+        for x, y, obj in m.targets():
+            if is_player(obj, own, content):
+                players += 1
+                continue
+            if obj.is_friend or plain(obj.name) == own:
+                continue
+            semantic = map_object_semantic(client, obj).casefold()
+            ranged = (any(marker in semantic for marker in RANGED_RESIDENT_MARKERS) or
+                      any(_same_semantic_identity(identity, semantic) for identity in casters))
+            hostiles.append(terrain.Hostile(m.world_x + x - cx, m.world_y + y - cy, ranged))
+        return hostiles, players
+
+    # Damage over time names its force as the hitter: an authored disease
+    # (its symptoms carry its name) or a force she carries.
+    ignored = disease_names() | frozenset(
+        plain(item.name) for item in state.inventory
+        if item.item_type in OWN_FORCE_TYPES and item.name) if messages else frozenset()
+    return terrain.FightView(
+        now=time.time(), character=state.player_name, map=m.path,
+        x=m.world_x, y=m.world_y, node=node, messages=messages, scan=scan,
+        ignored=ignored)
+
+
+def observe_fight(client: AtrinikClient) -> int:
+    """Feed one engine step to her fight recorder (terrain.py) and keep the
+    fights that ended; returns how many were kept. Recording changes nothing
+    she does and never raises into play."""
+    recorder = getattr(client, "fight_recorder", None)
+    if recorder is None:
+        return 0
+    try:
+        if recorder.ray is None:
+            recorder.ray = cover_cells
+        view = fight_view(client, recorder)
+        if view is None:
+            return 0
+        kept = sum(bool(client.store_fight(row)) for row in recorder.observe(view))
+    except Exception:
+        # A broken recorder must not keep failing: forget its fight. A
+        # repeated failure is logged once in full, then counted.
+        now = time.monotonic()
+        failures = getattr(recorder, "failures", 0) + 1
+        reported = getattr(recorder, "failure_reported_at", None)
+        if reported is None:
+            log.exception("fight recorder failed")
+            recorder.failure_reported_at, failures = now, 0
+        elif now - reported >= FIGHT_ERROR_REPORT_SECONDS:
+            log.error("fight recorder failed %d more times", failures)
+            recorder.failure_reported_at, failures = now, 0
+        recorder.failures = failures
+        with contextlib.suppress(Exception):
+            recorder.reset()
+        return 0
+    if getattr(recorder, "failure_reported_at", None) is not None:
+        # Recovered: report what was not, and log the next failure in full.
+        if recorder.failures:
+            log.error("fight recorder failed %d more times", recorder.failures)
+        recorder.failure_reported_at, recorder.failures = None, 0
+    return kept
+
+
 class TaskEngine:
     # The pause after an unexpected error in an engine step (seconds): it
     # doubles with each consecutive failed step up to the maximum, and a
@@ -7592,6 +7726,8 @@ class TaskEngine:
 
     async def run(self) -> None:
         while self.running:
+            # Her fight records (terrain.py): read-only, never raises.
+            observe_fight(self.client)
             try:
                 await self._step()
             except ConnectionError as exc:

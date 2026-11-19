@@ -28,6 +28,7 @@ from .metrics import BotMetrics
 from . import facts as fact_parsers
 from .observations import AuthoredContent, Observation, ObservationRecorder, text_hash
 from . import post_mortem
+from .terrain import FightRecorder
 from .self_improvement import PLAYER_CHANNELS, from_server
 from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
@@ -327,6 +328,12 @@ class AtrinikClient:
         self.authored_content: AuthoredContent | None = None
         self.observations = ObservationRecorder(
             lambda: self.authored_content, self._observation_dropped)
+        # Her fights by terrain (terrain.py), fed by the task engine's steps
+        # (tasks.observe_fight) and her death and recall decisions.
+        self.fight_recorder = FightRecorder()
+        # The authored world graph the CLI built (web and autoplay), for
+        # the terrain of her fights; without it a fight's feature is unknown.
+        self.world_graph = None
         # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
         # a whole map, loaded with her memory: each property and when it was
         # last confirmed (wall time).
@@ -1140,6 +1147,9 @@ class AtrinikClient:
         }
         self.action_history.append(record)
         del self.action_history[:-500]
+        fights = getattr(self, "fight_recorder", None)
+        if fights is not None:
+            fights.note(action, record["time"])
         noisy = {
             "step", "clear", "target", "combat", "fire", "pathfind",
             "apply", "move item", "approach-step", "melee-dodge",
@@ -1966,6 +1976,26 @@ class AtrinikClient:
                 for fact, (_, created) in zip(found, stored):
                     if created:
                         self.metrics.fact(fact.kind, fact.status)
+
+    def store_fight(self, row: dict[str, Any]) -> bool:
+        """Keep one fight row (terrain.py) for the character it belongs to,
+        if her memory is open; never fails or stalls play (a locked database
+        waits at most memory.FIGHT_SAVE_TIMEOUT and drops the row)."""
+        character = getattr(self, "_memory_character", "")
+        if not character or character != row.get("character") or \
+                character != self.state.player_name:
+            return False
+        try:
+            self._memory_store().record_fight(character, row)
+        except sqlite3.Error as error:
+            log.warning("fight not kept: %s", error)
+            return False
+        except Exception:
+            log.exception("fight not kept")
+            return False
+        if self.metrics is not None:
+            self.metrics.fight_position(str(row.get("feature")), str(row.get("outcome")))
+        return True
 
     def _observation_dropped(self, reason: str) -> None:
         if getattr(self, "metrics", None) is not None:
