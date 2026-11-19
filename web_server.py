@@ -36,6 +36,7 @@ from . import route_blocks
 from . import terrain
 from . import route_events
 from .navigation_spots import navigation_spot_catalog
+from .dialogue_edges import dialogue_summary
 from .unlocks import gate_counts, unlock_state
 from .operator_assist import (KEY_HEADER, MAX_GOLD_PER_RUN, OperatorAssist,
                               OperatorAssistRefused, key_matches)
@@ -822,7 +823,20 @@ class DashboardState:
                if include is None or "equipment" in include else {}),
             **({"route_learned": self.route_learned()}
                if include is None or "route_learned" in include else {}),
+            **({"dialogue_edges": self.dialogue_edges()}
+               if include is None or "dialogue_edges" in include else {}),
         }
+
+    def dialogue_edges(self) -> dict[str, Any]:
+        """The dialogue_edges flag, each compiled voyage and whether it is
+        offered and why, and the quest-gated exits (read-only;
+        docs/ROUTING.md P4)."""
+        try:
+            return dialogue_summary(self.client, self.graph)
+        except Exception as error:   # never let the panel break /api/state
+            log.warning("voyage panel unavailable: %s", error)
+            return {"enabled": False, "voyages": [], "gated_exits": [],
+                    "error": f"voyages unavailable: {error}"}
 
     def equipment(self) -> dict[str, Any]:
         """The Equipment panel: effective stats per gear family and where

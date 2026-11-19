@@ -181,6 +181,10 @@ class ClientConfig:
     # tile fact puts a non-magical heal first on its square. Off (the
     # default) they are only written and shown.
     persist_tile_facts: bool = False
+    # docs/ROUTING.md P4: plan with NPC dialogue voyages and quest-gated
+    # exits (dialogue_edges.py). Off (the default) plans exactly as before;
+    # the owner turns it on after one supervised voyage.
+    dialogue_edges: bool = False
 
 
 # kill_player (server types/player.c) sends exactly one of these, as the whole

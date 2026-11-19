@@ -11,7 +11,9 @@ Subjects follow the edge identities of ROUTING 4.2:
 
 - ``map:{path}`` - the whole map, for transit;
 - ``exit:{source}:{x},{y}>{destination}`` - one exit, in that direction;
-- ``seam:{source}>{destination}`` - a tile seam, in that direction.
+- ``seam:{source}>{destination}`` - a tile seam, in that direction;
+- ``talk:{source}:{npc}>{destination}`` - an NPC's dialogue voyage
+  (dialogue_edges.py, P4), in that direction.
 
 Rows live in memory's ``route_blocks`` table, in her (server, account,
 character) namespace. The planner reads them through a small per-client
@@ -46,9 +48,10 @@ RETRY_SECONDS = 5.0
 READ_TIMEOUT = 0.25
 WRITE_TIMEOUT = 0.25
 
-MAP, EXIT, SEAM = "map", "exit", "seam"
+MAP, EXIT, SEAM, TALK = "map", "exit", "seam", "talk"
 _EXIT = re.compile(r"exit:(?P<source>/[^>]*):(?P<x>-?\d+),(?P<y>-?\d+)>(?P<destination>/.+)")
 _SEAM = re.compile(r"seam:(?P<source>/[^>]*)>(?P<destination>/.+)")
+_TALK = re.compile(r"talk:(?P<source>/[^:>]*):(?P<npc>[^>]+)>(?P<destination>/.+)")
 
 
 def map_subject(path: str) -> str:
@@ -56,9 +59,13 @@ def map_subject(path: str) -> str:
 
 
 def edge_subject(edge: Any) -> str:
-    """The subject of a planned edge: its seam for a tile edge, else its exit."""
-    if getattr(edge, "kind", "exit") == "tile":
+    """The subject of a planned edge: its seam for a tile edge, its voyage
+    for a dialogue edge (whose label is the NPC's name), else its exit."""
+    kind = getattr(edge, "kind", "exit")
+    if kind == "tile":
         return f"{SEAM}:{edge.source}>{edge.destination}"
+    if kind == "dialogue":
+        return f"{TALK}:{edge.source}:{edge.label}>{edge.destination}"
     return f"{EXIT}:{edge.source}:{edge.x},{edge.y}>{edge.destination}"
 
 
@@ -97,8 +104,18 @@ def normalize_subject(graph: Any, text: Any) -> str:
                 for edge in node.edges):
             raise ValueError(f"no tile seam from {source} to {destination}")
         return f"{SEAM}:{source}>{destination}"
+    match = _TALK.fullmatch(subject)
+    if match is not None:
+        source, npc, destination = (match["source"], match["npc"],
+                                    match["destination"])
+        if not any(voyage.edge.source == source and voyage.npc == npc and
+                   voyage.edge.destination == destination
+                   for voyage in getattr(graph, "voyages", ())):
+            raise ValueError(f"no voyage from {source} with {npc} to {destination}")
+        return f"{TALK}:{source}:{npc}>{destination}"
     raise ValueError("the subject must be a map path, map:PATH, "
-                     "exit:SOURCE:X,Y>DESTINATION or seam:SOURCE>DESTINATION")
+                     "exit:SOURCE:X,Y>DESTINATION, seam:SOURCE>DESTINATION or "
+                     "talk:SOURCE:NPC>DESTINATION")
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,18 +125,24 @@ class OwnerWalls:
     maps: frozenset[str] = frozenset()
     exits: frozenset[tuple[str, str, int, int]] = frozenset()
     seams: frozenset[tuple[str, str]] = frozenset()
+    # Dialogue voyages: (source, npc, destination).
+    talks: frozenset[tuple[str, str, str]] = frozenset()
 
     def __bool__(self) -> bool:
-        return bool(self.maps or self.exits or self.seams)
+        return bool(self.maps or self.exits or self.seams or self.talks)
+
+    def _edge_blocked(self, edge: Any) -> bool:
+        if edge.kind == "tile":
+            return (edge.source, edge.destination) in self.seams
+        if edge.kind == "dialogue":
+            return (edge.source, edge.label, edge.destination) in self.talks
+        return (edge.source, edge.destination, edge.x, edge.y) in self.exits
 
     def blocks(self, edge: Any, destination: str | None) -> bool:
         """Whether taking ``edge`` crosses a block. Entering a blocked map
         that is the trip's ``destination`` does not: a block is a transit
         wall, and the map stays usable as a destination."""
-        if edge.kind == "tile":
-            if (edge.source, edge.destination) in self.seams:
-                return True
-        elif (edge.source, edge.destination, edge.x, edge.y) in self.exits:
+        if self._edge_blocked(edge):
             return True
         return edge.destination in self.maps and edge.destination != destination
 
@@ -129,10 +152,7 @@ class OwnerWalls:
         for edge in route:
             if not self.blocks(edge, destination):
                 continue
-            if edge.kind == "tile" and (edge.source, edge.destination) in self.seams:
-                subject = edge_subject(edge)
-            elif edge.kind != "tile" and (
-                    edge.source, edge.destination, edge.x, edge.y) in self.exits:
+            if self._edge_blocked(edge):
                 subject = edge_subject(edge)
             else:
                 subject = map_subject(edge.destination)
@@ -146,7 +166,7 @@ NO_WALLS = OwnerWalls()
 
 def walls_for(subjects: Iterable[str]) -> OwnerWalls:
     """The walls of these (canonical) subjects."""
-    maps, exits, seams = set(), set(), set()
+    maps, exits, seams, talks = set(), set(), set(), set()
     for subject in subjects:
         if subject.startswith(f"{MAP}:"):
             maps.add(subject[len(MAP) + 1:])
@@ -155,7 +175,10 @@ def walls_for(subjects: Iterable[str]) -> OwnerWalls:
                        int(match["x"]), int(match["y"])))
         elif (match := _SEAM.fullmatch(subject)) is not None:
             seams.add((match["source"], match["destination"]))
-    return OwnerWalls(frozenset(maps), frozenset(exits), frozenset(seams))
+        elif (match := _TALK.fullmatch(subject)) is not None:
+            talks.add((match["source"], match["npc"], match["destination"]))
+    return OwnerWalls(frozenset(maps), frozenset(exits), frozenset(seams),
+                      frozenset(talks))
 
 
 class _Cache:

@@ -30,6 +30,7 @@ except ModuleNotFoundError:
                                      parse_blocks)
 
 from . import constants as c
+from . import dialogue_edges
 from . import requirements as req
 from . import route_blocks
 from . import route_events
@@ -497,6 +498,11 @@ class WorldGraph:
         ] | None = None
         # route() under an access set, per set (_gated_route_snapshot).
         self._gated_route_snapshots: dict = {}
+        # Dialogue voyages and quest-gated exits (dialogue_edges.py, P4).
+        # Kept out of node.edges: only a plan with a DialogueOffer (the
+        # owner's dialogue_edges flag) uses them.
+        self.voyages: list[dialogue_edges.Voyage] = []
+        self.gated_exits: dict[tuple[str, int, int], Requirement] = {}
 
     def build(self) -> "WorldGraph":
         archetypes = load_archetypes()
@@ -566,6 +572,10 @@ class WorldGraph:
         apartment_entrances: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
         apartment_returns: dict[str, list[tuple[str, int, int, str, bool]]] = defaultdict(list)
         consumed_locks: dict[tuple[str, int, int], set[str]] = defaultdict(set)
+        # NPCs with an interface (map, x, y, name, resource), and exits
+        # whose script is a recognised quest gate (dialogue_edges.py).
+        npc_interfaces: list[tuple[str, int, int, str, str]] = []
+        quest_gates: dict[tuple[str, int, int], tuple[str, str]] = {}
         for source, (path, parsed) in parsed_maps.items():
             node = self.nodes[source]
             header_attrs = parsed["header"]["attrs"]
@@ -680,6 +690,12 @@ class WorldGraph:
                         script = str(one(
                             event["attrs"], "race",
                             event_base.get("race")) or "")
+                        if (script.startswith("/interfaces/") and
+                                script.endswith(".xml") and
+                                str(one(event["attrs"], "sub_type",
+                                        event_base.get("sub_type"))) == "6"):
+                            npc_interfaces.append((
+                                source, x, y, str(name or obj["arch"]), script))
                         if script.startswith("/interfaces/temples/"):
                             priest = DialogueVendor(
                                 source, x, y, str(name or obj["arch"]),
@@ -907,6 +923,9 @@ class WorldGraph:
                         if not script_path.is_file():
                             continue
                         source_code = script_path.read_text(errors="replace")
+                        gate = dialogue_edges.quest_gate(source_code)
+                        if gate is not None:
+                            quest_gates[(source, x, y)] = gate
                         suffix_match = re.search(
                             r"me\.slaying\s*\+\s*[\"']([^\"']+)[\"']",
                             source_code,
@@ -1031,6 +1050,11 @@ class WorldGraph:
         for lock_id in [lock_id for lock_id in self.access_item_names
                         if lock_id not in gated]:
             del self.access_item_names[lock_id]
+        dialogue_edges.compile_graph(
+            self, npc_interfaces, quest_gates,
+            lambda source, destination, x, y, dx, dy, npc: MapEdge(
+                source, destination, x, y, dx, dy, dialogue_edges.DIALOGUE,
+                npc))
         return self
 
     @staticmethod
@@ -1404,6 +1428,15 @@ class WorldGraph:
             transitions = self._tile_transitions(
                 edge, start, allow_locked=allow_locked)
             return transitions[0] if transitions else None
+        if edge.kind == dialogue_edges.DIALOGUE:
+            # A voyage departs from beside the NPC and arrives where its
+            # teleport puts her.
+            arrival = edge.destination_x, edge.destination_y
+            if not (self.dialogue_approaches(
+                    edge, start, allow_locked=allow_locked) and
+                    destination.walkable(*arrival, allow_locked=allow_locked)):
+                return None
+            return edge, arrival
         path = self.local_path(
             edge.source, start, (edge.x, edge.y),
             allow_locked=allow_locked)
@@ -1449,13 +1482,34 @@ class WorldGraph:
             return None
         return adjusted, arrival
 
+    def dialogue_approaches(self, edge: MapEdge, start: tuple[int, int], *,
+                            allow_locked=False) -> list[tuple[int, int]]:
+        """The squares beside a voyage's NPC that she can walk to from
+        ``start``, nearest first: where she talks to it from."""
+        node = self.nodes.get(edge.source)
+        if node is None:
+            return []
+        component = self._component(edge.source, start,
+                                     allow_locked=allow_locked)
+        squares = [
+            (edge.x + dx, edge.y + dy)
+            for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dx or dy]
+        squares = [
+            point for point in squares
+            if point in component and point not in node.automatic_exits and
+            point not in node.occupied]
+        return sorted(squares, key=lambda point: (
+            max(abs(point[0] - start[0]), abs(point[1] - start[1])), point))
+
     def _component_states(self, source: str, source_xy: tuple[int, int],
                           destination: str | None, *,
                           allow_locked=False,
                           excluded: set[tuple[str, str]] | None = None,
                           avoided_maps: set[str] | None = None,
                           penalized_maps: set[str] | None = None,
-                          walls: OwnerWalls | None = None):
+                          walls: OwnerWalls | None = None,
+                          offer: dialogue_edges.DialogueOffer | None = None,
+                          stop_maps: set[str] | None = None):
         """Every walkable component reachable from ``source_xy``, and how.
 
         Breadth-first over exact walkable components across maps: the
@@ -1465,7 +1519,10 @@ class WorldGraph:
         ``destination``; apartments are entered only as the destination.
         ``walls`` are the owner's blocks (route_blocks): a blocked exit or
         seam is never taken, a blocked map never entered except as the
-        ``destination``.
+        ``destination``. ``offer`` (dialogue_edges.py, the owner's
+        ``dialogue_edges`` flag) adds its voyages and closes the quest-gated
+        exits it names; without one the graph is the static one.
+        ``stop_maps`` ends the search once it reaches one of them.
         """
         start_component = self._component(
             source, source_xy, allow_locked=allow_locked)
@@ -1486,8 +1543,14 @@ class WorldGraph:
             map_path, _ = state
             position = positions[cursor]
             node = self.nodes.get(map_path)
+            if stop_maps and map_path in stop_maps:
+                break
             if node is not None:
-                for edge in node.edges:
+                edges = node.edges if offer is None else (
+                    *node.edges, *offer.from_map(map_path))
+                for edge in edges:
+                    if offer is not None and offer.closes(edge):
+                        continue
                     if excluded and (
                             (edge.source, edge.destination) in excluded or
                             (edge.source, edge.destination, edge.x, edge.y)
@@ -1537,12 +1600,16 @@ class WorldGraph:
 
     def reachable_maps(self, source: str, source_xy: tuple[int, int], *,
                        allow_locked=False,
-                       avoided_maps: set[str] | None = None) -> frozenset[str]:
+                       avoided_maps: set[str] | None = None,
+                       offer: dialogue_edges.DialogueOffer | None = None,
+                       stop_maps: set[str] | None = None) -> frozenset[str]:
         """Maps she can walk to from ``source_xy`` without entering
-        ``avoided_maps``: one whole-world expansion, as route_points does."""
+        ``avoided_maps``: one whole-world expansion, as route_points does,
+        with ``offer``'s voyages, ended early once one of ``stop_maps`` is
+        reached."""
         states = self._component_states(
             source, source_xy, None, allow_locked=allow_locked,
-            avoided_maps=avoided_maps)[0]
+            avoided_maps=avoided_maps, offer=offer, stop_maps=stop_maps)[0]
         return frozenset(map_path for map_path, _ in states)
 
     def route_points(self, source: str, source_xy: tuple[int, int],
@@ -1553,18 +1620,21 @@ class WorldGraph:
                      avoided_maps: set[str] | None = None,
                      penalized_maps: set[str] | None = None,
                      walls: OwnerWalls | None = None,
+                     offer: dialogue_edges.DialogueOffer | None = None,
                      ) -> list[MapEdge]:
         """Route end-to-end between exact walkable components across maps.
 
         Entering a ``penalized_maps`` map costs more than any route without
         one, so the route crosses as few of them as it can and, among those,
         is the shortest. ``walls`` (the owner's blocks) are never crossed.
+        ``offer`` adds dialogue voyages and closes quest-gated exits
+        (dialogue_edges.py); None plans on the static graph.
         """
         states, positions, offsets, targets, edge_metadata, edge_costs, \
             route_edges = self._component_states(
                 source, source_xy, destination, allow_locked=allow_locked,
                 excluded=excluded, avoided_maps=avoided_maps,
-                penalized_maps=penalized_maps, walls=walls)
+                penalized_maps=penalized_maps, walls=walls, offer=offer)
         goals = [
             index for index, ((map_path, _), position)
             in enumerate(zip(states, positions))
@@ -2059,7 +2129,7 @@ class NavigateTask(BotTask):
         whole tile seam: EDGE_EXCLUSION_SECONDS, doubled on each repeat of
         the same key, up to EDGE_EXCLUSION_MAX_SECONDS."""
         key = ((edge.source, edge.destination, edge.x, edge.y)
-               if edge.kind == "exit" else (edge.source, edge.destination))
+               if edge.kind != "tile" else (edge.source, edge.destination))
         strikes = self._edge_exclusion_strikes.get(key, 0)
         self._edge_exclusion_strikes[key] = strikes + 1
         seconds = min(self.EDGE_EXCLUSION_MAX_SECONDS,
@@ -2122,6 +2192,15 @@ class NavigateTask(BotTask):
         # The owner walls of the plan under way (_plan), its client, and the
         # blocks its route crosses (_route_points).
         self._walls: OwnerWalls = NO_WALLS
+        # The plan's dialogue voyages and closed quest gates, or None with
+        # the owner's dialogue_edges flag off (dialogue_edges.py).
+        self._offer: dialogue_edges.DialogueOffer | None = None
+        # The voyage under way: its edge, the voyage and its dialogue task.
+        self._voyage: tuple[MapEdge, dialogue_edges.Voyage, BotTask] | None = None
+        # The walk beside a voyage's NPC: ((edge, map, square), since when
+        # she has stood on that square, the last tick), for
+        # VOYAGE_APPROACH_STALL_SECONDS.
+        self._voyage_approach: tuple[tuple, float, float] | None = None
         self._plan_client: AtrinikClient | None = None
         self._crossed: tuple[str, ...] = ()
         # A care crossing (require_care), and while she walks to her
@@ -2248,7 +2327,8 @@ class NavigateTask(BotTask):
         did.
         """
         try:
-            route = self.graph.route_points(*args, walls=self._walls, **kwargs)
+            route = self.graph.route_points(
+                *args, walls=self._walls, offer=self._offer, **kwargs)
         except ValueError as blocked:
             if not self._walls or not unwalled_retry:
                 raise
@@ -2265,7 +2345,7 @@ class NavigateTask(BotTask):
         walls = self._walls
         for kwargs in tiers:
             try:
-                route = self.graph.route_points(*args, **kwargs)
+                route = self.graph.route_points(*args, offer=self._offer, **kwargs)
             except ValueError:
                 continue
             crossed = walls.crossings(route, self.destination)
@@ -2300,6 +2380,7 @@ class NavigateTask(BotTask):
         place for that care never crosses one.
         """
         self._walls = route_blocks.owner_walls(client)
+        self._offer = dialogue_edges.dialogue_offer(client, self.graph)
         self._plan_client, self._crossed = client, ()
         try:
             route = self._plan_tiers(client, origin=origin)
@@ -3471,6 +3552,104 @@ class NavigateTask(BotTask):
                 f"{failed} rejected; trying {crossing}")
         return True
 
+    # A voyage whose last link was chosen must leave within this long.
+    VOYAGE_LEAVE_SECONDS = 8.0
+    # The walk to a square beside a voyage's NPC gives up after this long
+    # without a step, and excludes the edge for a while, as an NPC that
+    # does not answer does.
+    VOYAGE_APPROACH_STALL_SECONDS = 20.0
+
+    def _replan(self, client: AtrinikClient) -> None:
+        try:
+            self.route = self._plan(client)
+        except ValueError as exc:
+            self.fail(str(exc))
+
+    async def _take_voyage(self, client: AtrinikClient, edge: MapEdge) -> None:
+        """Take one dialogue voyage (dialogue_edges.py): walk beside the
+        NPC, then follow its authored pages exactly (VoyageDialogTask).
+
+        A voyage no longer offered (her journal, a refusal) is dropped for
+        a new plan. A page that is not the authored one, a voyage that does
+        not leave, or one that lands elsewhere is refused for her, so plans
+        leave it out until her unlock state changes or a day passes. An NPC
+        that does not answer (it wandered, a fight), and a walk beside it
+        that finds no square or has not moved her for
+        VOYAGE_APPROACH_STALL_SECONDS (a gap of more than 5 s between ticks
+        starts that afresh), only exclude the edge for a while, like a held
+        exit.
+        """
+        offer = dialogue_edges.dialogue_offer(client, self.graph)
+        voyage = offer.voyage(edge) if offer is not None else None
+        if self._voyage is not None and (
+                self._voyage[0] != edge or self._voyage[1] is not voyage):
+            self._voyage = None
+        if voyage is None:
+            self._replan(client)
+            return
+        if self._voyage is None:
+            m = client.state.map
+            here = m.world_x, m.world_y
+            if max(abs(here[0] - edge.x), abs(here[1] - edge.y)) > 1:
+                approaches = self.graph.dialogue_approaches(
+                    edge, here, allow_locked=self._allow_locked(client))
+                now = time.monotonic()
+                key = (edge, client.state.map.path, here)
+                # A gap between ticks (a fight held the trip) starts afresh.
+                if (self._voyage_approach is None or
+                        self._voyage_approach[0] != key or
+                        now - self._voyage_approach[2] > 5.0):
+                    self._voyage_approach = (key, now, now)
+                self._voyage_approach = (key, self._voyage_approach[1], now)
+                stalled = (now - self._voyage_approach[1] >
+                           self.VOYAGE_APPROACH_STALL_SECONDS)
+                if stalled or not approaches or not await self._click_path(
+                        client, *approaches[0]):
+                    self._exclude_edge(edge)
+                    self._record(client, "navigation-voyage-failed",
+                                 f"{voyage.subject}: " + (
+                                     "the walk to the NPC stalled" if stalled
+                                     else "no walk to the NPC"))
+                    self._voyage_approach = None
+                    self._replan(client)
+                return
+            self._voyage_approach = None
+            from .quest_tasks import VoyageDialogTask
+            await client.clear_actions()
+            self._issued_goal = self._issued_click = None
+            self._voyage = (edge, voyage, VoyageDialogTask(
+                voyage.npc, voyage.pages, edge.destination,
+                leave_seconds=self.VOYAGE_LEAVE_SECONDS))
+            self._record(client, "navigation-voyage", voyage.subject)
+        task = self._voyage[2]
+        await task.tick(client)
+        self._last_progress = time.monotonic()
+        if task.status != TaskStatus.FAILED:
+            return
+        self._voyage = None
+        if task.refused:
+            dialogue_edges.refuse(client, self.graph, voyage, task.error)
+            self._record(client, "navigation-voyage-refused",
+                         f"{voyage.subject}: {task.error}")
+        else:
+            self._exclude_edge(edge)
+            self._record(client, "navigation-voyage-failed",
+                         f"{voyage.subject}: {task.error}")
+        self._replan(client)
+
+    def _voyage_landed_elsewhere(self, client: AtrinikClient) -> None:
+        """She left the voyage's map but not for its destination. Once its
+        last link was chosen, that is the voyage's doing: refuse it. Before
+        then (a death, a recall) nothing is learned."""
+        edge, voyage, task = self._voyage
+        self._voyage = None
+        if not getattr(task, "left_at", 0.0):
+            return
+        reason = f"landed on {client.state.map.path}, not {edge.destination}"
+        dialogue_edges.refuse(client, self.graph, voyage, reason)
+        self._record(client, "navigation-voyage-refused",
+                     f"{voyage.subject}: {reason}")
+
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             try:
@@ -3542,10 +3721,16 @@ class NavigateTask(BotTask):
         if (self.route and
                 self.route[0].source != client.state.map.path and
                 self.route[0].destination == client.state.map.path):
-            self.route.pop(0)
+            arrived = self.route.pop(0)
             self._issued_goal = None
             self._issued_click = None
+            if arrived.kind == dialogue_edges.DIALOGUE:
+                self._voyage = None
+                self._record(client, "navigation-voyage-arrived",
+                             route_blocks.edge_subject(arrived))
         if not self.route or self.route[0].source != client.state.map.path:
+            if self._voyage is not None:
+                self._voyage_landed_elsewhere(client)
             try:
                 self.route = self._plan(client)
             except ValueError as exc:
@@ -3556,6 +3741,9 @@ class NavigateTask(BotTask):
             if self.care is not None and await self._care_hold(client):
                 return
         edge = self.route[0]
+        if edge.kind == dialogue_edges.DIALOGUE:
+            await self._take_voyage(client, edge)
+            return
         if await self._retry_stalled_tile_crossing(client, edge):
             return
         if await self._bump_boundary_door(client, edge):
@@ -5217,7 +5405,11 @@ def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
     (route_death_overdue) is searched despite contact.
     """
     path, xy, component, _ = origin
-    key = (id(graph), path, component, avoided, access)
+    # With the dialogue_edges flag on, reach follows the planner: offered
+    # voyages count, closed quest gates do not.
+    offer = dialogue_edges.dialogue_offer(client, graph)
+    key = (id(graph), path, component, avoided, access,
+           None if offer is None else (offer.edges, offer.closed_exits))
     if key in _reach_cache:
         return _reach_cache[key]
     if (not search or (not overdue and _contact_this_life(client)) or
@@ -5227,7 +5419,7 @@ def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
         _reach_cache.clear()
     try:
         reach = graph.reachable_maps(path, xy, allow_locked=access,
-                                     avoided_maps=set(avoided))
+                                     avoided_maps=set(avoided), offer=offer)
     except ValueError:
         reach = frozenset()
     _reach_cache[key] = reach

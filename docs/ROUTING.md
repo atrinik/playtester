@@ -1555,6 +1555,137 @@ when Lost Memories is completed and not otherwise; the lake portal is
 offered only with `portal_found`; the three `savebed` voyages are never in
 a plan; with the flag off, routes are unchanged.
 `LostMemoriesArrivalTask` stays in this PR.
+*Landed:* `dialogue_edges.py` compiles the voyages and the quest gate, and
+holds the flag's offer; `NavigateTask` takes a voyage with
+`VoyageDialogTask`, a `DialogTask` that follows authored pages only.
+`LostMemoriesArrivalTask` is unchanged. Notes against the text above:
+- **Flag.** `ClientConfig.dialogue_edges` (`--dialogue-edges`,
+  `ATRINIK_BOT_DIALOGUE_EDGES=1`), off by default. With it off the planner
+  receives no offer, and plans are main's: a test plans the same trips on
+  the graph and on a copy stripped of every P4 compilation, and a one-off
+  comparison with main's code on 84 content trips matched exactly (16,814
+  static edges either way).
+- **Edge model.** `MapEdge` gains no fields. A voyage is a separate
+  `Voyage` record (NPC, interface, pages, requirement, side effects) whose
+  planner edge has `kind="dialogue"`, departs from the NPC's authored
+  square and is labelled with the NPC's name. Voyages stay out of
+  `node.edges`. `NavigateTask` passes the offer, tier by tier, walled or
+  not, and so does #94's reachability (`_reachable_from`, cached per
+  offer), so its verdicts follow the planner. The map-level estimates do
+  not: `route()` and with it `routes_into_component`, the savebed search
+  and shortlist, `town_safely_reachable` and the quest catalog's direct
+  `route_points` call still plan on the static graph and treat the lake
+  portal as an ordinary exit. With the flag on, an estimate can therefore
+  miss a voyage (a savebed or town ranked unreachable that a trip could
+  reach) or count the closed portal; the trip itself then plans with the
+  offer and fails or detours as any plan does. This is a known gap, left
+  while the flag stays off until a supervised voyage.
+- **Voyages.** Seven compile, as 1.4 says: four ordinary and three with
+  `savebed`, which are never offered. A voyage is the path from `hello` to
+  a dialogue with `<action teleport>` through `<response destination>`
+  links. Every dialogue on the path may hold only plain messages and
+  links, and the last only messages, `<close/>` and the teleport; anything
+  else (objects, quest actions, `enemy`, checks, code, inheritance, a
+  formatted message, a response with another action or NPC, a teleport
+  without `<close/>`) adds an `Unknown` atom, so no offered voyage starts
+  or advances a quest, buys, sets an enemy or types text. `<check>` and
+  `<ncheck>` also compile as `Unknown`, not as `Quest` atoms: no voyage
+  path in the content has one. No voyage charges a fare, and a fare could
+  only be taken by those elements, so there is no wallet check to make.
+  Server dispatch the compiler does not
+  model is `Unknown` too: an interface with anything but `<dialog>`
+  children (`<precond>`, `<code>`, a direct `<and>`), a `regex` dialogue
+  (whose matchers run before the named dialogue), two dialogues with one
+  name, or another interface for the same NPC in the file with a direct
+  `<and>` or `<or>`, which compiles to the module's `preconds()` and can
+  pick another dialogue class. Two interfaces that compile to one dialogue
+  class, two dialogues whose names differ only in case, and a path through
+  a capitalised dialogue name (the server looks dialogues up by the
+  lowercased link text) are `Unknown` too. Interfaces count by the module
+  the server runs, as `plugin_python.c` picks it: for a `quest.xml`, the
+  NPC's name normalised (spaces to `_`, only ASCII letters, digits and `_`,
+  lowercased), so `npc="Sam Goodberry."` shares Sam's module; for any other
+  file, its stem, so a named interface there that is not the stem is never
+  run and compiles to nothing. Interface-level `<code>` in the module that
+  does more than define methods of its class runs when the module loads
+  and makes its voyages `Unknown`. A residual is accepted:
+  `<precond>` and method-defining `<code>` in another interface run only
+  when the server picks that interface's class, and dialogue-level code
+  off the voyage's path only when that dialogue is called. Failing those
+  closed would also close the Incuna Sam voyage, whose module defines a
+  `dialog_hello` for Lost Memories' `speak_sam` part.
+- **Interface state.** `state="completed"` on a quest's own interface is a
+  `Quest(quest)` atom. Any other state, and a quest file's stateless
+  interface (the server's fallback when no state matches), is `Unknown`.
+  The Incuna Sam's `completed` voyage and The Journey's `savebed` one
+  share one NPC square and arrival, so one planner edge. The offer maps
+  each offered edge to exactly one voyage, whose pages are followed; two
+  offered voyages on one edge would offer neither.
+- **Quest atoms** carry the journal's names (`Quest(quest, part, uid)`),
+  mapped from uids through each `quest.xml`: the journal the server sends
+  shows names only, never uids. Part names are unique within each quest in
+  the locked content, so a name names one part. `UnlockState.met` reads them
+  against her journal; an unloaded journal meets none. The server lists a
+  completed quest by its title only, so a part also counts as done once
+  its quest is completed, unless some dialogue of that quest can fail the
+  part. An access set alone never meets a `Quest` atom, so tile locks are
+  unaffected.
+- **Quest-gated exit.** Recognised only: `qm = QuestManager(activator,
+  uid)` and one `if not qm.completed("part"):` whose body calls
+  `SetReturnValue(1)`, with no other `SetReturnValue` or `TeleportTo` in
+  the script. In the locked content only `lake_portal.py` matches, so the
+  lake portal from `underground_city_0_1` (22,12) is offered only with
+  Portal of Llwyfen's "A Strange Portal" done. Passing it shatters the
+  amulet of Llwyfen, which has no other use; that is not modelled. The
+  Nyhelobo suffix (1.1) is unchanged. LEARNING 4.5's `quest-gate` facts
+  are not read: F8 offers them.
+- **No stranding.** A voyage is offered only when, from its arrival, a
+  component route over the static graph and the other offered voyages
+  reaches the map she boarded on or her savebed map. Dropping one voyage
+  can strand another, so the check repeats until nothing changes. It
+  ignores hazards and owner blocks. Without Lost Memories completed no way
+  back from Incuna is known, so, unless her savebed is there, no voyage at
+  all is offered. The offer is cached per access set, journal, savebed and
+  refusals. For the locked content a recomputation takes 0.03 s to 0.15 s
+  with Lost Memories completed, and up to about 1 s without it, when every
+  voyage is dropped in turn.
+- **Taking a voyage.** She walks to a square beside the NPC's authored
+  square (the server finds an NPC by name within 3 squares), stops, says
+  `hello` and checks every page against the authored one, only a page that
+  arrived after what she last saw (the interface open before `hello` is
+  never taken for the answer): its text (with
+  `{activator.name}`-style fields as wildcards), every link in order, no
+  text box and no objects. Only then is the authored link chosen. After the
+  last link she must reach the arrival map within 8 s. A page that
+  differs, a voyage that does not leave and one that lands elsewhere are
+  refused (`navigation-voyage-refused`): plans leave the voyage out until
+  her unlock state's fingerprint changes, and at most a day. P4 keeps
+  refusals in memory; P5's `route_requirements` can persist them. An NPC
+  that does not answer within 3 s (it wandered, or a fight), and a walk
+  beside the NPC that has not moved her for 20 s or finds no square, only
+  exclude the edge like a held exit (`navigation-voyage-failed`). Each voyage
+  records `navigation-voyage` and `navigation-voyage-arrived`.
+- **Route events (P5).** P5's hooks fire around a voyage as around any
+  edge: `note_tick` at the top of every trip tick, so the voyage edge is
+  the one she walks toward. Arriving within 2 squares of its arrival
+  square records a traversal of its `talk:` subject (with the time from
+  boarding, the dialogue included) and of the map she left, and a
+  `passed` requirement for the `talk:` subject.
+  `navigation-voyage-failed` (no answer, a stalled walk beside the NPC)
+  is a `crossing_failed` event against the `talk:` subject, like a failed
+  click. A refusal is not written as a `rejected` requirement: 4.3 asks
+  for a server line as evidence, and a page that differs is not one. It
+  stays the in-memory refusal described above. The learned-cost model
+  does not read `talk:` subjects yet (P6).
+- **Owner blocks.** A voyage's subject is
+  `talk:{source}:{npc}>{destination}`, as in 4.2, checked against the
+  compiled voyages. Blocking it, or the arrival map, walls it like an exit:
+  an essential trip crosses it only with care.
+- **Dashboard.** `/api/state` has a `dialogue_edges` field (slow poll): the
+  flag, each compiled voyage with its requirement, side effects and status
+  (offered, flag off, requirement not met, journal not loaded, refused, no
+  known route back, never: moves her savebed), and each quest-gated exit,
+  open or closed. The Tasks tab shows it read-only under **Voyages**.
 
 **P5. `feat(memory)`: record route events.** The `route_events`,
 `route_traversals` and `route_requirements` tables, the recorders from 4.4,

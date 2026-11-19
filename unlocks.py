@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from . import constants as c
-from .requirements import NAME_LOCK_PREFIX, Consumes, Item, Requirement
+from .requirements import NAME_LOCK_PREFIX, Consumes, Item, Quest, Requirement
 
 # Where a carried object was found.
 INVENTORY = "inventory"      # her own top-level inventory
@@ -165,14 +165,42 @@ class UnlockState:
         """Whether a journal part (or, with no part, the quest) is done.
 
         None before the journal has loaded: unknown, not false. Journal
-        names are what the client shows; P4's ``Quest`` atoms map them to
-        part uids through the quest catalog.
+        names are what the client shows (the server sends no uids); P4's
+        ``Quest`` atoms carry those names, mapped from part uids when the
+        content is compiled. Part names are unique within each quest in the
+        locked content.
         """
         if not self.quests_loaded:
             return None
         return any(name == quest and title == part and
                    status in ("done", "completed")
                    for name, title, status in self.quests)
+
+    def quest_done(self, atom: Quest) -> bool | None:
+        """Whether one ``Quest`` atom holds: None before the journal loads.
+
+        Her journal lists a completed quest by its title only, so a part
+        also counts as done once its quest is, unless the quest can fail
+        that part (``done_with_quest`` false).
+        """
+        done = self.quest_part(atom.quest, atom.part)
+        if done is None or done or not atom.part:
+            return done
+        return atom.done_with_quest and bool(self.quest_part(atom.quest))
+
+    def met(self, requirement: Requirement | None) -> bool:
+        """Whether a requirement holds for her now (ROUTING 4.2, P4).
+
+        Item atoms read the access set, ``Quest`` atoms her journal. An
+        unloaded journal, like an ``Unknown`` atom, is not met (fail
+        closed).
+        """
+        if requirement is None:
+            return True
+        quests = [atom for atom in requirement.atoms if isinstance(atom, Quest)]
+        rest = Requirement(requirement.atoms - frozenset(quests))
+        return rest.met(self.access) and all(
+            self.quest_done(atom) is True for atom in quests)
 
     @property
     def fingerprint(self) -> str:

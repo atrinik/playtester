@@ -56,12 +56,30 @@ class Consumes:
 
 
 @dataclass(slots=True, frozen=True)
+class Quest:
+    """A journal quest, or one of its parts, is completed (ROUTING 4.2).
+
+    ``quest`` and ``part`` are the names her journal shows (``part`` empty
+    for the whole quest); ``uid`` is the part's authored uid, for display.
+    The journal lists a completed quest by its title only, so a part also
+    counts as done once its quest is completed, unless the quest can fail
+    that part (``done_with_quest`` false). Evaluated only against her
+    journal (``unlocks.UnlockState.met``); an access set alone never
+    satisfies one.
+    """
+    quest: str
+    part: str = ""
+    uid: str = ""
+    done_with_quest: bool = True
+
+
+@dataclass(slots=True, frozen=True)
 class Unknown:
     """Cannot be evaluated offline; never satisfied (fail closed)."""
     reason: str
 
 
-Atom = Item | NotItem | Consumes | Unknown
+Atom = Item | NotItem | Consumes | Quest | Unknown
 
 
 @dataclass(slots=True, frozen=True)
@@ -94,6 +112,7 @@ class Requirement:
                 if atom.lock_id in access:
                     return False
             else:
+                # Quest and Unknown atoms: an access set cannot tell.
                 return False
         return True
 
