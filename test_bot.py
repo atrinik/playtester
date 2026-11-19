@@ -26603,7 +26603,7 @@ class RouteEventTests(unittest.TestCase):
         self.assertEqual(sorted(self.events()), [
             ("damage", "cell:/hall:0,1", 0.3), ("damage", "map:/hall", 0.5)])
 
-    def test_a_recall_in_transit_counts_once_and_ends_the_trip_there(self):
+    def test_recalls_in_transit_count_once_a_minute(self):
         task = self.trip()
         self.into_hall(task)
         self.at(self.client, "/hall", 2, 4)
@@ -26611,10 +26611,64 @@ class RouteEventTests(unittest.TestCase):
         self.client.record_action("emergency-recall", "via scroll")
         self.assertEqual(sorted(self.events()), [
             ("recall", "cell:/hall:0,0", 1.0), ("recall", "map:/hall", 1.0)])
-        # Gone by recall: nothing more on this map is the trip's.
         self.tick(task, self.route_events.RECALL_REPEAT_SECONDS)
         self.client.record_action("emergency-recall", "via rod")
-        self.assertEqual(len(self.events()), 2)
+        self.assertEqual(len(self.events()), 4)
+
+    def test_a_death_while_a_recall_builds_is_still_recorded(self):
+        task = self.trip()
+        self.into_hall(task)
+        self.client.record_action("emergency-recall", "via scroll")
+        self.tick(task, 2.0)
+        self.die(3, 10)
+        self.assertIn(("death", "map:/hall", 1.0), self.events())
+        self.assertIn(("death", "exit:/hall:1,28>/goal", 1.0), self.events())
+
+    def test_a_recall_landing_on_the_next_map_is_no_crossing(self):
+        task = self.trip()
+        self.into_hall(task)
+        self.client.record_action("emergency-recall", "via scroll")
+        self.tick(task, 2.0)
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task)
+        traversals, passed = self.crossings()
+        self.assertNotIn("exit:/hall:1,28>/goal", traversals)
+        self.assertNotIn("exit:/hall:1,28>/goal", passed)
+
+    def test_a_disengage_then_a_real_crossing_records_the_crossing(self):
+        task = self.trip()
+        self.into_hall(task)
+        self.client.record_action("emergency-disengage", "sp=1 next-heal=9")
+        self.tick(task, 20.0)
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task)
+        traversals, passed = self.crossings()
+        self.assertIn("exit:/hall:1,28>/goal", traversals)
+        self.assertIn("exit:/hall:1,28>/goal", passed)
+        self.assertIn(("recall", "map:/hall", 1.0), self.events())
+
+    def test_the_first_square_on_a_new_map_judges_the_crossing(self):
+        from . import route_events
+
+        task = self.trip()
+        self.into_hall(task)
+        # She lands on the exit's arrival square; a hold (looting, a fight)
+        # sees it, then she walks 4 tiles before the navigation ticks.
+        self.at(self.client, "/goal", 5, 5)
+        self.clock[0] += 9
+        route_events.note_hold(self.client, task)
+        self.at(self.client, "/goal", 9, 5)
+        self.tick(task, 3.0)
+        traversals, passed = self.crossings()
+        self.assertIn("exit:/hall:1,28>/goal", passed)
+        rows = self.client._memory_store().route_traversal_rows("Sera")
+        self.assertAlmostEqual(rows["map:/hall"]["mean_seconds"], 9.0)
+        self.assertEqual(self.client.route_recorder.transit.arrival, (5, 5))
+
+    def test_the_content_marks_its_pvp_map(self):
+        graph = built_graph()
+        self.assertTrue(graph.nodes["/shattered_islands/world_10_68"].pvp)
+        self.assertFalse(graph.nodes["/shattered_islands/world_1_50"].pvp)
 
     def test_a_held_exit_is_blocked_for_its_seconds(self):
         task = self.trip()

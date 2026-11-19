@@ -1578,12 +1578,17 @@ three tables. The planner is unchanged. Notes against the text above:
   the edge it walks toward (the first edge of its route leaving her map).
   A trip counts while its task is running and ticked within 120 s, on the
   map it last saw. `NavigateThenTask` keeps it fresh on each of its own
-  ticks, so a fight or a recovery hold that stops the navigation does not
-  end it. Once she stands on the destination map with no edge
+  ticks, so a fight, looting or a recovery hold that stops the navigation
+  does not end it, and those ticks keep the first square she is seen on
+  after a map change, which judges the crossing even when she has walked
+  on before the navigation ticks again. Once she stands on the destination map with no edge
   left, the trip has arrived: a death or recall there is the destination's
-  (the farm's own review), not the route's. A recall or death ends the
-  trip's attribution on that map: nothing more there counts, and wherever
-  she lands is no crossing.
+  (the farm's own review), not the route's. A death ends the trip's
+  attribution on that map: nothing more there counts, and her respawn is
+  no crossing. An `emergency-recall` does not: it is confirmed when it
+  starts, so she can still be hit or die before it lands, and all of that
+  still counts. It only makes her next map change the recall's landing,
+  not a crossing. A disengage does not leave the map and changes nothing.
 - **Signals.** Each comes from a recorded decision while a trip is under
   way, except damage and traversals, which the trip's ticks and her
   messages give:
@@ -1594,14 +1599,14 @@ three tables. The planner is unchanged. Notes against the text above:
     have been defeated in combat!"), or a post-mortem attacker she has seen
     as a player in this process (`ObservationRecorder.player_names`, or in
     view, and not an authored creature name), records nothing.
-  - `recall`: `emergency-recall` or `emergency-disengage`, once a map visit
-    (a disengage repeats while she flees), against the map and the cell
-    near the path.
+  - `recall`: `emergency-recall` or `emergency-disengage`, at most once a
+    minute (a disengage repeats while she flees), against the map and the
+    cell near the path.
   - `damage`: "... hit you for N" lines from the server while she is on a
     transit map, minus hits from players, summed per cell where she stood
     and written when she leaves the map across her edge: HP lost over
     maximum HP (at most 10) against the map, and against each cell near the
-    path. Hits on a map where she then died or recalled are left to that
+    path. Hits on a map she then leaves by death or recall are left to that
     death or recall, and hits on the destination map are not transit.
     On a map whose header says `pvp 1` no damage counts: an unseen player
     or their spell can hit her under any name there.

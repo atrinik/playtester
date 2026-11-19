@@ -261,13 +261,20 @@ class _Transit:
     recalled_at: float = float("-inf")
     path_key: tuple | None = None
     path: list = field(default_factory=list)
-    # A recall or death on this map: nothing more is attributed to the trip
-    # here, and leaving it is no crossing.
+    # A death on this map: nothing more is attributed to the trip here, and
+    # her respawn is no crossing.
     lost: bool = False
+    # An emergency recall on this map: everything here still counts, but the
+    # next map change is the recall landing, not a crossing.
+    recalling: bool = False
+    # The first square seen on a map she has not been ticked on yet
+    # (path, square, wall time), sampled on every NavigateThenTask tick.
+    landing: tuple | None = None
 
     def enter(self, path: str, arrival: tuple[int, int], wall: float) -> None:
         self.map, self.arrival, self.arrived_wall = path, arrival, wall
-        self.lost = False
+        self.lost = self.recalling = False
+        self.landing = None
         self.timed = True
         self.edge = None
         self.damage = 0.0
@@ -356,9 +363,15 @@ class RouteRecorder:
         if transit is None or transit.task is not task:
             transit = self.transit = _Transit(task, path, square, wall, False, now)
         elif path != transit.map:
+            # Where she first stood on this map, if a hold saw it before
+            # this tick: she may have walked on since.
+            landing = transit.landing
+            if landing is not None and landing[0] == path:
+                square, wall = landing[1], landing[2]
             edge = transit.edge
-            if (edge is not None and not transit.lost and edge.source == transit.map and
-                    edge.destination == path and now - transit.ticked <= TRANSIT_STALE_SECONDS
+            if (edge is not None and not (transit.lost or transit.recalling) and
+                    edge.source == transit.map and edge.destination == path and
+                    now - transit.ticked <= TRANSIT_STALE_SECONDS
                     and arrived_by(getattr(task, "graph", None), edge, square)):
                 self._traversal(client, transit, edge, wall)
             transit.enter(path, square, wall)
@@ -368,14 +381,20 @@ class RouteRecorder:
             (edge for edge in route[:2] if edge.source == path), None)
         self.flush(client)
 
-    def hold(self, task: Any) -> None:
-        """``task``'s trip is held (a fight, a rest), not abandoned."""
+    def hold(self, client: Any, task: Any) -> None:
+        """``task``'s trip is held (a fight, a rest, looting), not abandoned;
+        the first square she is seen on after a map change is kept."""
         transit = self.transit
-        if transit is not None and transit.task is task:
-            transit.ticked = self.monotonic()
+        if transit is None or transit.task is not task:
+            return
+        transit.ticked = self.monotonic()
+        m = client.state.map
+        if m.path != transit.map and (transit.landing is None or
+                                      transit.landing[0] != m.path):
+            transit.landing = (m.path, (m.world_x, m.world_y), self.clock())
 
     def _lose(self, transit: _Transit) -> None:
-        """A recall or death: the trip is no longer where it was walking."""
+        """A death: the trip is no longer where it was walking."""
         transit.lost = True
         transit.edge = None
         transit.damage, transit.damage_cells = 0.0, {}
@@ -513,6 +532,10 @@ class RouteRecorder:
         if transit is None:
             return
         if signal == RECALL:
+            if action == "emergency-recall":
+                # The recall lands her elsewhere, maybe on the next map: that
+                # is no crossing. Until it lands, she is still on the way.
+                transit.recalling = True
             now = self.clock()
             if now - transit.recalled_at < RECALL_REPEAT_SECONDS:
                 return
@@ -522,9 +545,6 @@ class RouteRecorder:
             square = (int(record.get("x", 0) or 0), int(record.get("y", 0) or 0))
             if self._near_path(client, transit, [square]):
                 self._event(client, RECALL, cell_subject(transit.map, *square), 1.0)
-            # Gone by recall: the hits on this map are the recall's, and
-            # where she lands is no crossing.
-            self._lose(transit)
         elif transit.edge is not None:
             if signal == BLOCKED:
                 held = _HELD.search(str(record.get("detail", "")))
@@ -821,7 +841,7 @@ def note_tick(client: Any, task: Any) -> None:
 def note_hold(client: Any, task: Any) -> None:
     """A NavigateThenTask tick: its trip is still under way, even while a
     fight or a recovery hold keeps ``task`` from ticking."""
-    _guard("hold", lambda value: value.hold(task), client)
+    _guard("hold", lambda value: value.hold(client, task), client)
 
 
 def note_edge(client: Any, task: Any, edge: Any) -> None:
