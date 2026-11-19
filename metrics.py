@@ -335,6 +335,10 @@ class BotMetrics:
             "feature", "outcome")
         self.fight_features = LabelLimit(8)
         self.fight_outcomes = LabelLimit(8)
+        # Her route events (route_events.py), by signal: a code-defined set.
+        self.route_events = counter(
+            "route_events_total", "Route events recorded in transit, by signal.", "signal")
+        self.route_signals = LabelLimit(8)
 
     def attach(self, engine: Any) -> None:
         """The task engine: task types, and idle time when no task runs."""
@@ -532,6 +536,8 @@ class BotMetrics:
     def fight_position(self, feature: str, outcome: str) -> None:
         self.fight_positions.inc((*self.base(), self.fight_features(feature),
                                   self.fight_outcomes(outcome)))
+    def route_event(self, signal: str) -> None:
+        self.route_events.inc((*self.base(), self.route_signals(signal)))
 
     @_never_raises
     def death(self, cause: Any) -> None:

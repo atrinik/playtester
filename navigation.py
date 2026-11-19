@@ -32,6 +32,7 @@ except ModuleNotFoundError:
 from . import constants as c
 from . import requirements as req
 from . import route_blocks
+from . import route_events
 from . import unlocks
 from .equipment import abandon_gear_examine
 from .route_blocks import NO_WALLS, OwnerWalls
@@ -3440,6 +3441,7 @@ class NavigateTask(BotTask):
                     abs(orthogonal - authored_orthogonal),
                     len(path), crossing))
         if not candidates:
+            route_events.note_edge(client, self, edge)
             self._exclude_edge(edge)
             self.route = []
             self._issued_goal = None
@@ -3458,6 +3460,7 @@ class NavigateTask(BotTask):
         self._issued_click = None
         self._last_progress = time.monotonic()
         await client.clear_actions()
+        route_events.note_edge(client, self, edge)
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder(
@@ -3475,6 +3478,8 @@ class NavigateTask(BotTask):
         if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
             return
         self._record_progress(client)
+        # Her route events: a crossing since the last tick, the edge ahead.
+        route_events.note_tick(client, self)
         if self.care is not None:
             # A crossing with no block left here or ahead is finished.
             self.care_holds_fire(client.state.map.path)
@@ -3573,6 +3578,11 @@ class NavigateTask(BotTask):
                 self._last_action = time.monotonic()
                 return
         if not await self._click_path(client, edge.x, edge.y):
+            route_events.note_edge(client, self, edge)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("navigation-click-failed",
+                         f"{edge.source} -> {edge.destination} at={edge.x},{edge.y}")
             self._exclude_edge(edge)
             try:
                 self.route = self._plan(client)
@@ -3661,8 +3671,10 @@ class NavigateThenTask(BotTask):
                 self._pack_exit_stall[0] != key):
             self._pack_exit_stall = (key, now)
             return False
-        if now - self._pack_exit_stall[1] < self.PACK_EXIT_BYPASS_SECONDS:
+        held = now - self._pack_exit_stall[1]
+        if held < self.PACK_EXIT_BYPASS_SECONDS:
             return False
+        route_events.note_edge(client, self.navigation, edge)
         self.navigation._exclude_edge(edge)
         self.navigation.route = []
         self.navigation._issued_goal = None
@@ -3675,7 +3687,8 @@ class NavigateThenTask(BotTask):
         if recorder is not None:
             recorder(
                 "navigation-pack-exit-bypass",
-                f"{edge.source} -> {edge.destination} at={edge.x},{edge.y}")
+                f"{edge.source} -> {edge.destination} at={edge.x},{edge.y} "
+                f"held={held:.0f}s")
         return True
 
     async def _abandon_stalled_transit_target(

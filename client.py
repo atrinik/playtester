@@ -29,6 +29,7 @@ from . import facts as fact_parsers
 from .observations import AuthoredContent, Observation, ObservationRecorder, text_hash
 from . import post_mortem
 from .terrain import FightRecorder
+from . import route_events
 from .self_improvement import PLAYER_CHANNELS, from_server
 from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
@@ -334,6 +335,9 @@ class AtrinikClient:
         # The authored world graph the CLI built (web and autoplay), for
         # the terrain of her fights; without it a fight's feature is unknown.
         self.world_graph = None
+        # Her route events (route_events.py, docs/ROUTING.md 4.4): what
+        # crossing the world costs her, written best effort.
+        self.route_recorder = route_events.RouteRecorder()
         # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
         # a whole map, loaded with her memory: each property and when it was
         # last confirmed (wall time).
@@ -382,6 +386,7 @@ class AtrinikClient:
                     del self._live_post_mortems[next(iter(self._live_post_mortems))]
             self.post_mortems = []
         self._memory_character = character
+        self._route_events("load", lambda recorder: recorder.load(self, character))
         memory = self._memory_store()
         memory.import_legacy(
             self._legacy_runtime_state_path,
@@ -757,6 +762,17 @@ class AtrinikClient:
         except Exception:
             log.exception("fact parsers failed")
             return []
+
+    def _route_events(self, name: str, call: Callable[[route_events.RouteRecorder], Any]
+                      ) -> None:
+        """Run one route event hook; it never fails or holds up play."""
+        recorder = getattr(self, "route_recorder", None)
+        if recorder is None:
+            return
+        try:
+            call(recorder)
+        except Exception:
+            log.exception("route events: %s failed", name)
 
     def _memory_store(self) -> BotMemory:
         if self.memory is None:
@@ -1150,6 +1166,7 @@ class AtrinikClient:
         fights = getattr(self, "fight_recorder", None)
         if fights is not None:
             fights.note(action, record["time"])
+        self._route_events("decision", lambda recorder: recorder.on_decision(self, record))
         noisy = {
             "step", "clear", "target", "combat", "fire", "pathfind",
             "apply", "move item", "approach-step", "melee-dodge",
@@ -1234,6 +1251,10 @@ class AtrinikClient:
             recorded=time.time()))
         if self.metrics is not None and self.post_mortems[-1] is not None:
             self.metrics.death(self.post_mortems[-1].get("cause"))
+        # A death in transit: written at once, waiting at most the
+        # post-mortem's own limit for a locked database.
+        report = self.post_mortems[-1]
+        self._route_events("death", lambda recorder: recorder.on_post_mortem(self, report))
         self._post_mortem_booked = time.time()
         # The next life starts here: its messages afresh, its vitals from the
         # latest sample (the state it starts in), its records after these.
@@ -1713,6 +1734,8 @@ class AtrinikClient:
             self.review_messages.popleft()
         self._observe(lambda recorder: recorder.on_message(
             self.state, msg_type, color, text))
+        self._route_events("message", lambda recorder: recorder.on_message(
+            self, msg_type, text))
         # A player can type "your balance is ..." in chat; only game and NPC
         # messages are the bank's (the banker itself answers in a dialogue).
         if (msg_type not in c.PLAYER_CHAT_TYPES and

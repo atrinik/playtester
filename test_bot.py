@@ -22324,7 +22324,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=29", page)
+        self.assertIn(b"/app.js?v=31", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -26427,6 +26427,456 @@ class TerrainRouteTests(unittest.IsolatedAsyncioTestCase):
         for element in ("terrain-summary", "terrain-rates", "terrain-fights"):
             self.assertIn(f'id="{element}"', html)
         self.assertIn('if (b.dataset.tab === "farming") pollTerrain();', script)
+
+
+def transit_graph() -> WorldGraph:
+    """/start (exit at 2,2) to /hall (arrive 1,1), whose exit at 1,28 leads
+    to /goal: in /hall the planned path runs down the west side."""
+    graph = WorldGraph()
+    for path in ("/start", "/hall", "/goal"):
+        node = MapNode(path, width=30, height=30)
+        node.terrain = {(x, y): 1 for x in range(30) for y in range(30)}
+        graph.nodes[path] = node
+    graph.nodes["/start"].edges.append(MapEdge("/start", "/hall", 2, 2, 1, 1))
+    graph.nodes["/hall"].edges.append(MapEdge("/hall", "/goal", 1, 28, 5, 5))
+    return graph
+
+
+class RouteEventTests(unittest.TestCase):
+    """docs/ROUTING.md P5: each signal from a recorded decision sequence."""
+
+    def setUp(self):
+        from . import route_events
+        from .route_events import RouteRecorder
+
+        self.route_events = route_events
+        self.directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.clock = [time.time()]
+        self.mono = [1000.0]
+        self.graph = transit_graph()
+        self.client = self.sera()
+
+    def sera(self, *, installed=None):
+        from .route_events import RouteRecorder
+
+        client = AtrinikClient(ClientConfig(
+            character="Sera", runtime_state_path=str(Path(self.directory) / "state.json")))
+        client.route_recorder = RouteRecorder(clock=lambda: self.clock[0],
+                                              monotonic=lambda: self.mono[0])
+        client.state.player_name = "Sera"
+        client.state.phase = "playing"
+        client.state.stats.update(hp=100, maxhp=100)
+        client.load_character_memory("Sera")
+        self.at(client, "/start", 1, 1)
+        return client
+
+    @staticmethod
+    def at(client, path, x, y):
+        m = client.state.map
+        m.path, m.world_x, m.world_y = path, x, y
+
+    def trip(self, client=None):
+        client = client or self.client
+        self.at(client, "/start", 1, 1)
+        task = NavigateTask(self.graph, "/goal")
+        task.status = TaskStatus.RUNNING
+        task.route = [self.graph.nodes["/start"].edges[0], self.graph.nodes["/hall"].edges[0]]
+        self.route_events.note_tick(client, task)
+        return task
+
+    def tick(self, task, seconds=1.0, client=None):
+        self.clock[0] += seconds
+        self.mono[0] += seconds
+        self.route_events.note_tick(client or self.client, task)
+
+    def into_hall(self, task, seconds=12.0):
+        self.at(self.client, "/hall", 1, 1)
+        self.tick(task, seconds)
+        task.route.pop(0)
+
+    def events(self, client=None):
+        client = client or self.client
+        client.route_recorder.flush(client, force=True)
+        return [(row["signal"], row["subject"], round(row["magnitude"], 3))
+                for row in client._memory_store().route_event_rows("Sera")]
+
+    def die(self, x, y, text="You have died.", client=None):
+        client = client or self.client
+        client.state.map.world_x, client.state.map.world_y = x, y
+        # As the death notice's handler does: the previous death first.
+        previous = client._latest_ledger_death()
+        client.record_action("death", text)
+        client._record_post_mortem(None, previous)
+
+    def test_a_traversal_counts_the_edge_and_the_map_with_their_time(self):
+        task = self.trip()
+        self.into_hall(task, 12.0)
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task, 30.0)
+        self.events()
+        rows = self.client._memory_store().route_traversal_rows("Sera")
+        self.assertEqual(rows["exit:/start:2,2>/hall"]["count"], 1)
+        # The first map's arrival was not seen: counted, not timed.
+        self.assertEqual(rows["map:/start"]["timed"], 0)
+        self.assertEqual(rows["exit:/hall:1,28>/goal"]["timed"], 1)
+        self.assertAlmostEqual(rows["map:/hall"]["mean_seconds"], 30.0)
+        passed = self.client._memory_store().route_requirements("Sera", now=self.clock[0])
+        self.assertEqual(passed["exit:/hall:1,28>/goal"]["outcome"], "passed")
+        # Another crossing updates the same row in place, a running mean.
+        task = self.trip()
+        self.into_hall(task, 5.0)
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task, 10.0)
+        self.events()
+        rows = self.client._memory_store().route_traversal_rows("Sera")
+        self.assertEqual(rows["map:/hall"]["count"], 2)
+        self.assertAlmostEqual(rows["map:/hall"]["mean_seconds"], 20.0)
+        # Arrived: nothing after it is transit.
+        self.client.record_action("emergency-recall", "via scroll")
+        self.assertEqual(self.events(), [])
+
+    def test_a_death_counts_the_map_and_edge_and_the_cell_only_near_the_path(self):
+        task = self.trip()
+        self.into_hall(task)
+        self.die(3, 10)
+        self.assertEqual(sorted(self.events()), [
+            ("death", "cell:/hall:0,1", 1.0), ("death", "exit:/hall:1,28>/goal", 1.0),
+            ("death", "map:/hall", 1.0)])
+        self.assertEqual(self.client.decision_history[-1]["action"], "death")
+        # Off the path (flight or pursuit): the map and edge only.
+        task = self.trip()
+        self.into_hall(task)
+        self.die(20, 3)
+        self.assertEqual(sum(1 for signal, subject, _ in self.events()
+                             if subject.startswith("cell:")), 1)
+        self.assertEqual(sum(1 for signal, subject, _ in self.events()
+                             if subject == "map:/hall"), 2)
+        kit = self.client._memory_store().route_event_rows("Sera")[0]["kit"]
+        self.assertEqual(kit, "")
+
+    def test_a_death_outside_a_trip_or_on_arrival_records_nothing(self):
+        self.die(1, 1)
+        task = self.trip()
+        task.status = TaskStatus.COMPLETE
+        self.die(1, 1)
+        task = self.trip()
+        self.into_hall(task)
+        self.mono[0] += self.route_events.TRANSIT_STALE_SECONDS + 1
+        self.die(3, 10)
+        self.assertEqual(self.events(), [])
+
+    def test_deaths_to_players_and_their_hits_leave_no_row_and_no_name(self):
+        self.client.observations.player_names["zoey"] = time.time()
+        task = self.trip()
+        self.into_hall(task)
+        now = time.time()
+        for _ in range(3):
+            self.client.route_recorder.on_message(self.client, 0, "Zoey hit you for 40")
+            self.client.review_messages.append((now, 0, "Zoey hit you for 40"))
+        self.die(3, 10)
+        self.assertEqual(self.client.post_mortems[-1]["attackers"], {"Zoey": 3})
+        task = self.trip()
+        self.into_hall(task)
+        self.die(3, 10, "You have been defeated in combat!")
+        task = self.trip()
+        self.into_hall(task)
+        self.client.route_recorder.on_message(self.client, 0, "Zoey hit you for 40")
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task)
+        self.assertEqual([row for row in self.events() if row[0] != "traversal"], [])
+        with sqlite3.connect(self.client._memory_store().path) as db:
+            for table in ("route_events", "route_traversals", "route_requirements"):
+                for row in db.execute(f"SELECT * FROM {table}"):
+                    self.assertNotIn("zoey", json.dumps(row).casefold())
+
+    def test_damage_on_a_crossed_map_counts_as_a_share_of_her_health(self):
+        task = self.trip()
+        self.into_hall(task)
+        self.at(self.client, "/hall", 2, 12)
+        self.client.route_recorder.on_message(self.client, 0, "The orc hit you for 30 (-5)")
+        self.at(self.client, "/hall", 25, 25)
+        self.client.route_recorder.on_message(self.client, 0, "The orc hit you for 20")
+        # Chat that quotes a hit is not one.
+        self.client.route_recorder.on_message(self.client, 4, "The orc hit you for 90")
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task)
+        self.assertEqual(sorted(self.events()), [
+            ("damage", "cell:/hall:0,1", 0.3), ("damage", "map:/hall", 0.5)])
+
+    def test_recalls_in_transit_count_once_a_minute(self):
+        task = self.trip()
+        self.into_hall(task)
+        self.at(self.client, "/hall", 2, 4)
+        self.client.record_action("emergency-disengage", "sp=1 next-heal=9")
+        self.client.record_action("emergency-recall", "via scroll")
+        self.assertEqual(sorted(self.events()), [
+            ("recall", "cell:/hall:0,0", 1.0), ("recall", "map:/hall", 1.0)])
+        self.tick(task, self.route_events.RECALL_REPEAT_SECONDS)
+        self.client.record_action("emergency-recall", "via rod")
+        self.assertEqual(len(self.events()), 4)
+
+    def test_a_held_exit_is_blocked_for_its_seconds(self):
+        task = self.trip()
+        self.into_hall(task)
+        self.client.record_action("navigation-pack-exit-bypass",
+                                  "/hall -> /goal at=1,28 held=17s")
+        self.assertEqual(self.events(), [("blocked", "exit:/hall:1,28>/goal", 17.0)])
+
+    def test_failed_crossings_count_against_the_edge(self):
+        task = self.trip()
+        for action in ("navigation-seam-excluded", "navigation-seam-retry",
+                       "navigation-click-failed"):
+            self.client.record_action(action, "x")
+        self.assertEqual(self.events(), [("crossing_failed", "exit:/start:2,2>/hall", 1.0)] * 3)
+
+    def test_a_real_trip_records_its_crossings(self):
+        from .route_events import RouteRecorder
+
+        client = BlockClient(Path(self.directory) / "blocks.sqlite3")
+        client.route_recorder = RouteRecorder(clock=lambda: self.clock[0],
+                                              monotonic=lambda: self.mono[0])
+        client.route_recorder.load(client, "Sera")
+        task = NavigateTask(blocks_graph(), "/goal")
+
+        async def click(_client, x, y):
+            return True
+
+        task._click_path = click
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.route_recorder.transit.edge.destination, "/blocked")
+        client.state.map.path, client.state.map.world_x = "/blocked", 0
+        self.clock[0] += 8
+        asyncio.run(task.tick(client))
+        client.route_recorder.flush(client, force=True)
+        rows = client.memory.route_traversal_rows("Sera")
+        self.assertEqual(set(rows), {"exit:/start:9,0>/blocked", "map:/start"})
+
+    def test_navigation_records_a_click_path_failure(self):
+        from . import route_events
+
+        client = BlockClient(Path(self.directory) / "blocks.sqlite3")
+        task = NavigateTask(blocks_graph(), "/goal")
+
+        async def no_path(_client, x, y):
+            return False
+
+        task._click_path = no_path
+        asyncio.run(task.tick(client))
+        self.assertIn("navigation-click-failed", client.actions())
+        # A pack-held exit says how long it held her.
+        trip = NavigateThenTask(blocks_graph(), "/goal", BotTask("errand"))
+        trip.navigation.route = trip.navigation._plan(client)
+        trip._pack_exit_stall = ((("/start", "/blocked", 9, 0)), time.monotonic() - 20)
+        self.assertTrue(asyncio.run(trip._bypass_pack_blocked_exit(client)))
+        detail = client.decision_history[-1]["detail"]
+        self.assertRegex(detail, r"held=(19|2\d)s$")
+        self.assertIsNotNone(route_events._HELD.search(detail))
+
+    def test_caps_hold_under_a_flood_of_blocked_rows_without_evicting_deaths(self):
+        store = self.client._memory_store()
+        now = self.clock[0]
+        deaths = [{"at": now - 3600 + index, "subject": "map:/hall", "signal": "death",
+                   "magnitude": 1.0} for index in range(5)]
+        store.record_route_events("Sera", events=deaths, now=now)
+        for batch in range(6):
+            store.record_route_events("Sera", events=[
+                {"at": now - 600 + batch * 500 + index, "subject": "seam:/a>/b",
+                 "signal": "blocked", "magnitude": 15.0} for index in range(500)], now=now)
+        rows = store.route_event_rows("Sera")
+        self.assertEqual(sum(row["signal"] == "blocked" for row in rows),
+                         self.route_events.CAPS["blocked"])
+        self.assertEqual(sum(row["signal"] == "death" for row in rows), 5)
+        # The newest blocked rows are the ones kept, and old rows age out.
+        self.assertEqual(min(row["at"] for row in rows if row["signal"] == "blocked"),
+                         now - 600 + 1000)
+        store.record_route_events("Sera", now=now + self.route_events.EVENT_MAX_AGE + 4000)
+        self.assertEqual(store.route_event_rows("Sera"), [])
+
+    def test_a_locked_database_delays_a_death_at_most_the_post_mortem_timeout(self):
+        from . import client as client_module
+
+        self.assertLessEqual(self.route_events.DEATH_WRITE_TIMEOUT,
+                             client_module.POST_MORTEM_SAVE_TIMEOUT)
+        self.assertLessEqual(self.route_events.WRITE_TIMEOUT, 0.25)
+        task = self.trip()
+        self.into_hall(task)
+        self.client.route_recorder.flush(self.client, force=True)
+        holder = sqlite3.connect(self.client._memory_store().path)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            # Only the route events' write: the post-mortem's own save is
+            # timed by its own test.
+            recorder = self.client.route_recorder
+            self.client.state.map.world_x, self.client.state.map.world_y = 3, 10
+            recorder.on_decision(self.client, {"action": "death", "detail": "You have died."})
+            started = time.monotonic()
+            recorder.on_post_mortem(self.client, {"time": self.clock[0], "map": "/hall",
+                                                  "x": 3, "y": 10, "attackers": {}})
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, client_module.POST_MORTEM_SAVE_TIMEOUT + 0.5)
+            self.assertEqual(len(recorder.events), 3)
+            # Ticks meanwhile neither wait again nor raise.
+            started = time.monotonic()
+            for _ in range(20):
+                self.tick(task, 0.1)
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            holder.rollback()
+            holder.close()
+        self.assertEqual(len([row for row in self.events() if row[0] == "death"]), 3)
+
+    def test_a_failing_store_never_raises_into_the_tick(self):
+        task = self.trip()
+
+        class Broken:
+            def record_route_events(self, *args, **kwargs):
+                raise RuntimeError("disk on fire")
+
+        self.client._memory_store = lambda: Broken()
+        self.into_hall(task)
+        with self.assertLogs("atrinik_bot.route_events", "ERROR"):
+            self.tick(task, 10.0)
+        # The client's own hooks are guarded the same way.
+        with patch.object(self.client.route_recorder, "on_decision",
+                          side_effect=RuntimeError("bug")), \
+                self.assertLogs("atrinik_bot.client", "ERROR"):
+            self.client._route_events("decision", lambda recorder: recorder.on_decision(
+                self.client, {"action": "emergency-recall"}))
+
+    def kit_failure(self, at, path, **extra):
+        return {"time": at, "kind": "death", "cause": "route", "map": path,
+                "map_damage": 120, "kit": {"max_health": 300, "armour_class": 20,
+                                           "protections": {}, "character_level": 34,
+                                           "skill": "slash weapons", "attack": "slash"},
+                **extra}
+
+    def test_history_is_migrated_once_and_a_death_in_both_ledgers_once(self):
+        start = self.clock[0]
+        death = self.kit_failure(start - 7200, "/hall")
+        self.client.state.farm_adaptations = {
+            "spot-a": {"kit_failures": [death, self.kit_failure(start - 9000, "/start",
+                                                                  map_damage=0)]},
+            # The same death, recorded for a second spot sharing the map.
+            "spot-b": {"kit_failures": [dict(death)]}}
+        self.client.state.route_hazards = {
+            # Learned 2 minutes after the review: the same death.
+            "/hall": start - 7200 + 120 + 6 * 3600,
+            # No kit failure explains it: one synthetic death.
+            "/other": start - 3600 + 6 * 3600}
+        self.client.decision_history = [
+            {"time": start - 50, "action": "a", "map": "/start"},
+            {"time": start - 40, "action": "b", "map": "/start"},
+            {"time": start - 30, "action": "c", "map": "/hall"},
+            {"time": start - 20, "action": "d", "map": "/start"},
+            {"time": start + 20, "action": "e", "map": "/goal"}]
+        self.assertEqual(sorted(self.events()), [
+            ("death", "map:/hall", 1.0), ("death", "map:/other", 1.0)])
+        rows = self.client._memory_store().route_event_rows("Sera")
+        self.assertEqual({row["subject"]: row["at"] for row in rows},
+                         {"map:/hall": start - 7200, "map:/other": start - 3600})
+        self.assertEqual(json.loads(rows[0]["kit"]), {
+            "armour_class": 20, "character_level": 34, "max_health": 300, "protections": {}})
+        # Cold start: map visits before her first load, untimed.
+        seeded = self.client._memory_store().route_traversal_rows("Sera")
+        self.assertEqual({subject: (row["count"], row["timed"]) for subject, row in seeded.items()},
+                         {"map:/start": (2, 0), "map:/hall": (1, 0)})
+        # Never again, in this process or the next.
+        self.client.route_recorder.migrated = False
+        self.assertEqual(len(self.events()), 2)
+        self.assertEqual(len(self.events(self.sera())), 2)
+
+    def test_a_new_route_death_while_94_is_live_is_recorded_once(self):
+        self.events()   # migrated, with nothing to migrate
+        task = self.trip()
+        self.into_hall(task)
+        self.die(3, 10)
+        when = self.client.post_mortems[-1]["time"]
+        # #94 then keeps it in kit_failures, and navigation learns the hazard.
+        self.client.state.farm_adaptations = {
+            "spot": {"kit_failures": [self.kit_failure(when, "/hall")]}}
+        self.client.remember_route_hazard("/hall", when + 60 + 6 * 3600)
+        self.assertEqual(len([row for row in self.events() if row[1] == "map:/hall"]), 1)
+        # A restart (her state reloaded) migrates nothing more.
+        self.clock[0] += 3600
+        later = self.sera()
+        later.state.farm_adaptations = self.client.state.farm_adaptations
+        self.assertEqual(len([row for row in self.events(later) if row[1] == "map:/hall"]), 1)
+
+    def test_a_death_recorded_live_before_a_failed_migration_is_not_migrated_too(self):
+        from .route_events import build_migration
+
+        installed = self.clock[0]
+        live = self.kit_failure(installed + 30, "/hall")
+        migration = build_migration({"spot": {"kit_failures": [live]}},
+                                    {"/hall": installed + 90 + 6 * 3600}, [],
+                                    before=installed)
+        self.assertEqual(migration.events, [])
+
+    def test_requirement_outcomes_expire_and_follow_their_inputs(self):
+        recorder, store = self.client.route_recorder, self.client._memory_store()
+        recorder.note_requirement(self.client, "exit:/a:1,1>/b", "rejected")
+        self.assertEqual(recorder.requirements, {})   # no message evidence
+        recorder.note_requirement(self.client, "exit:/a:1,1>/b", "rejected",
+                                  inputs="q1", evidence="The portal bounces you away.")
+        recorder.note_requirement(self.client, "exit:/c:1,1>/d", "passed", inputs="k1")
+        self.events()
+        now = self.clock[0]
+        self.assertEqual(set(store.route_requirements("Sera", now=now)),
+                         {"exit:/a:1,1>/b", "exit:/c:1,1>/d"})
+        self.assertEqual(set(store.route_requirements("Sera", now=now,
+                                                      inputs={"exit:/c:1,1>/d": "k2"})),
+                         {"exit:/a:1,1>/b"})
+        self.assertEqual(store.route_requirements(
+            "Sera", now=now + self.route_events.REJECTED_SECONDS), {})
+
+    def test_the_learned_summary_ranks_subjects_and_says_when_they_halve(self):
+        from .route_events import learned_summary
+
+        now = 10_000_000.0
+        rows = [(now, "map:/hall", "death", 1.0), (now - 600, "map:/hall", "blocked", 30.0),
+                (now - 60, "seam:/a>/b", "crossing_failed", 1.0),
+                (now - 86400 * 3, "map:/old", "blocked", 2.0)]
+        summary = learned_summary(rows, {"map:/hall": 4}, now=now)
+        hall, seam = summary["subjects"]
+        self.assertEqual(hall["subject"], "map:/hall")
+        self.assertEqual(hall["signals"], {"death": 1, "blocked": 1})
+        self.assertEqual(hall["traversals"], 4)
+        self.assertAlmostEqual(hall["cost_seconds"], 1800 + 30 * 0.5 ** (600 / 1800), delta=1)
+        # About one death half-life, a little less for the blocked share.
+        self.assertAlmostEqual(hall["half_at"] - now, 6 * 3600, delta=600)
+        self.assertEqual(seam["kind"], "seam")
+        self.assertEqual(summary["learned"], 2)
+        self.assertEqual(summary["events"]["blocked"], 2)
+
+
+class RouteLearnedRouteTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = WebTests.asyncSetUp
+    asyncTearDown = WebTests.asyncTearDown
+    request = WebTests.request
+
+    async def test_the_dashboard_lists_learned_subjects_read_only(self):
+        status, payload = await self.request("GET", "/api/state?include=route_learned")
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(json.loads(payload)["route_learned"]["character_loaded"])
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.client.config.character = "Sera"
+        self.client._memory_path = Path(directory) / "memory.sqlite3"
+        self.client.memory = None
+        self.client.state.player_name = "Sera"
+        self.client.load_character_memory("Sera")
+        now = time.time()
+        self.client._memory_store().record_route_events("Sera", events=[
+            {"at": now - 60, "subject": "map:/hall", "signal": "death", "magnitude": 1.0}],
+            now=now)
+        status, payload = await self.request("GET", "/api/state?include=route_learned")
+        learned = json.loads(payload)["route_learned"]
+        self.assertTrue(learned["character_loaded"])
+        self.assertEqual([s["subject"] for s in learned["subjects"]], ["map:/hall"])
+        self.assertEqual(learned["weights"]["death"], 1800.0)
+        # Read-only: no route writes it.
+        status, _ = await self.request("POST", "/api/route-learned", {},
+                                       {"Content-Type": "application/json"})
+        self.assertNotEqual(status, 200)
 
 
 if __name__ == "__main__":
