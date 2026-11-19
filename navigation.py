@@ -31,6 +31,7 @@ except ModuleNotFoundError:
 
 from . import constants as c
 from . import requirements as req
+from . import unlocks
 from .equipment import abandon_gear_examine
 from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
