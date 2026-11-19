@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Atrinik Observer</title>
-  <link rel="stylesheet" href="/style.css?v=15">
+  <link rel="stylesheet" href="/style.css?v=16">
 </head>
 <body>
   <header class="topbar">
@@ -80,6 +80,7 @@
         <button data-tab="quests">Quests</button>
         <button data-tab="farming">Farming</button>
         <button data-tab="knowledge">Knowledge</button>
+        <button data-tab="equipment">Equipment</button>
         <button data-tab="tasks">Tasks</button>
       </nav>
 
@@ -137,6 +138,14 @@
         <p id="knowledge-summary" class="muted small"></p>
         <div id="knowledge" class="list"><span class="muted">Loading…</span></div>
         <p class="muted small">Only what she read herself and what matches authored content exactly: signs, doors, levers, magic mouths, authored books and examined authored items. Chat, dialogue, other players' names, signed or unknown books and renamed or player-titled items are never kept. Read-only.</p>
+      </div>
+
+      <div id="tab-equipment" class="tab scroll">
+        <div class="row between"><h2>Equipment</h2><span id="equipment-summary" class="muted small"></span></div>
+        <div id="equipment" class="list"><span class="muted">Loading…</span></div>
+        <h3>Shadow comparison</h3>
+        <div id="equipment-shadow" class="list"><span class="muted">No comparison logged yet.</span></div>
+        <p class="muted small">What each piece really adds when worn: its examined base stats with the server's rules for “+N” (only AC, WC, damage, block and absorb the item already has gain it; a launcher's goes to its arrows) and its condition. The current name-based score still chooses her gear; this panel and the shadow log only show where the two would differ. Read-only.</p>
       </div>
 
       <div id="tab-tasks" class="tab scroll">

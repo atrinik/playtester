@@ -21324,6 +21324,283 @@ class SelfImprovementTests(unittest.TestCase):
                                  "offence": 3, "healing": 1})
 
 
+class EquipmentTests(unittest.TestCase):
+    """Effective item stats (docs/LEARNING_AND_FEEDBACK.md 4.8, phase F3)."""
+
+    @staticmethod
+    def archetype(face, item_type):
+        from .equipment import archetype_for
+        known = archetype_for(face, item_type)
+        assert known is not None, face
+        return known
+
+    def effective(self, face, item_type, magic=0, condition=100):
+        from .equipment import effective_stats
+        family, base = self.archetype(face, item_type)
+        return effective_stats(item_type, base, magic, condition, family)
+
+    def test_plus_n_follows_the_server_for_each_archetype_family(self):
+        # (face, type, magic) -> AC, WC, damage, block, absorb, arrow WC and
+        # damage, from the locked content's archetypes and living.c.
+        table = [
+            # No base AC: "+N" adds nothing in combat.
+            ("cape.101", c.TYPE_CLOAK, 2, (0, 0, 0, 0, 0, 0, 0)),
+            ("robe_grey.101", c.TYPE_CLOAK, 1, (0, 0, 0, 0, 0, 0, 0)),
+            ("girdle.101", c.TYPE_GIRDLE, 1, (0, 0, 0, 0, 0, 0, 0)),
+            ("sandals.101", c.TYPE_BOOTS, 1, (0, 0, 0, 0, 0, 0, 0)),
+            ("low_boots.101", c.TYPE_BOOTS, 1, (0, 0, 0, 0, 0, 0, 0)),
+            ("hat_feather.101", c.TYPE_HELMET, 1, (0, 0, 0, 0, 0, 0, 0)),
+            ("pants_blue.101", c.TYPE_PANTS, 1, (0, 0, 0, 0, 0, 0, 0)),
+            ("gloves.101", c.TYPE_GLOVES, 1, (0, 0, 0, 0, 0, 0, 0)),
+            ("torch_unlit.101", c.TYPE_LIGHT_APPLY, 1, (0, 0, 0, 0, 0, 0, 0)),
+            # A base AC: "+N" adds AC.
+            ("cloak_leather.101", c.TYPE_CLOAK, 2, (3, 0, 0, 0, 0, 0, 0)),
+            ("chainpants.101", c.TYPE_PANTS, 1, (2, 0, 0, 0, 0, 0, 0)),
+            ("belt.101", c.TYPE_GIRDLE, 1, (2, 0, 0, 0, 0, 0, 0)),
+            ("combat_boots.101", c.TYPE_BOOTS, 2, (3, 0, 0, 0, 0, 0, 0)),
+            # A shield with AC, WC, block and absorb gains each (4.8.1).
+            ("ball_and_chain.101", c.TYPE_SHIELD, 2, (4, 3, 0, 4, 7, 0, 0)),
+            # A weapon: WC and damage, and its base block and absorb too.
+            ("falchion.101", c.TYPE_WEAPON, 2, (0, 7, 8, 7, 9, 0, 0)),
+            # A launcher's goes to its arrows, never to her WC or damage.
+            ("bow_short.101", c.TYPE_BOW, 2, (0, 0, 0, 0, 0, 6, 2)),
+            # An arrow adds nothing worn; its magic counts when fired.
+            ("arrow.101", c.TYPE_ARROW, 3, (0, 0, 0, 0, 0, None, None)),
+        ]
+        for face, item_type, magic, expected in table:
+            with self.subTest(face=face):
+                stats = self.effective(face, item_type, magic)
+                got = (stats.ac, stats.wc, stats.dam, stats.block, stats.absorb,
+                       stats.missile_wc, stats.missile_dam)
+                if expected[5] is None:
+                    _, base = self.archetype(face, item_type)
+                    expected = expected[:5] + (base.wc + magic, base.dam + magic)
+                self.assertEqual(got, expected)
+        # A light adds nothing at all, not even its archetype's values.
+        torch = self.effective("torch_unlit.101", c.TYPE_LIGHT_APPLY, 1)
+        self.assertEqual((torch.maxhp, torch.protections), (0, ()))
+        self.assertEqual(torch.notes, ("+1 on a torch adds nothing: a light gives no "
+                                       "stats when worn",))
+        self.assertIn("+1 on sandals adds no AC: they have no base AC, WC, damage, "
+                      "block or absorb", self.effective("sandals.101", c.TYPE_BOOTS, 1).notes)
+        # A launcher's protections do not count (living.c, non-ranged only).
+        from .equipment import BaseStats, effective_stats
+        bow = effective_stats(c.TYPE_BOW, BaseStats(wc=4, protections=(("fire", 10),)), 1)
+        self.assertEqual(bow.protections, ())
+        self.assertIn("a launcher's protections do not count", bow.notes)
+
+    def test_condition_scales_protections_attacks_and_weapon_damage(self):
+        sword = self.effective("falchion.101", c.TYPE_WEAPON, 0, condition=50)
+        self.assertEqual((sword.dam, sword.wc, sword.attacks), (3.0, 5, (("slash", 50.0),)))
+        boots = self.effective("combat_boots.101", c.TYPE_BOOTS, 0, condition=50)
+        self.assertEqual(dict(boots.protections)["impact"], 5.0)
+        self.assertEqual(boots.ac, 1)
+        self.assertIn("condition 50% scales its protections", boots.notes)
+        # 255 is "not sent": full condition.
+        self.assertEqual(self.effective("combat_boots.101", c.TYPE_BOOTS, 0, 255).condition, 100)
+
+    def test_examine_text_gives_the_base_without_the_magic(self):
+        from .equipment import effective_stats, magic_from_name, parse_description
+        line = ("forged silksteel ball and chain +2 (magical) (wc+1) (ac+2) (block+2) "
+                "(absorb+5%) (Protections: impact +5%, slash +10%)")
+        base = parse_description(line)
+        self.assertEqual((base.ac, base.wc, base.block, base.absorb, base.source),
+                         (2, 1, 2, 5, "examine"))
+        self.assertEqual(base.protections, (("impact", 5), ("slash", 10)))
+        shield = effective_stats(c.TYPE_SHIELD, base, magic_from_name(line, c.TYPE_SHIELD))
+        self.assertEqual((shield.ac, shield.wc, shield.block, shield.absorb), (4, 3, 4, 7))
+        self.assertIn("+2 adds AC +2, WC +2, block +2, absorb +2%", shield.notes)
+        self.assertIsNone(parse_description("silk cape +2 (worn)"))
+        weapon = parse_description("sword (wc+2) (dam+5) (1.50 sec) (Str+1) (mana reg.+0.8) "
+                                   "(hp+10) (mana+4) (Attacks: slash +100%) (see invisible)")
+        self.assertEqual((weapon.delay, weapon.stats, weapon.regen_sp, weapon.maxhp,
+                          weapon.maxsp, weapon.attacks, weapon.specials),
+                         (1.5, (("Str", 1),), 2, 10, 4, (("slash", 100),), ("see invisible",)))
+        for name, item_type, magic in (
+                ("silk cape +2", c.TYPE_CLOAK, 2),
+                ("shear steel falchion +2", c.TYPE_WEAPON, 2),
+                ("rusty sword -1", c.TYPE_WEAPON, -1),
+                ("gargoyle leather combat boots of acid protection", c.TYPE_BOOTS, 0),
+                ("boots (Protections: acid +15%)", c.TYPE_BOOTS, 0),
+                # Rings never show it: the "+3" is a protection.
+                ("ring (Protections: fire +3%)", c.TYPE_RING, 0)):
+            with self.subTest(name=name):
+                self.assertEqual(magic_from_name(name, item_type), magic)
+
+    def section_two_client(self):
+        """Her kit on 2026-11-15 (section 2): the unworn pieces and what she wore."""
+        state = GameState(player_tag=1)
+        state.stats["level"] = 60
+        faces = {1: "ring_mail.101", 2: "chainmail.101", 3: "falchion.101",
+                 4: "cloak_leather.101", 5: "cape.101", 6: "combat_boots.101"}
+        index = {name: number for number, name in faces.items()}
+        kit = [
+            (10, "black iron ring mail +2", c.TYPE_ARMOUR, "ring_mail.101", False),
+            (11, "silksteel chain mail +1", c.TYPE_ARMOUR, "chainmail.101", True),
+            (13, "shear steel falchion +2", c.TYPE_WEAPON, "falchion.101", True),
+            (14, "chimera leather cloak", c.TYPE_CLOAK, "cloak_leather.101", False),
+            (15, "silk cape +2", c.TYPE_CLOAK, "cape.101", True),
+            (16, "gargoyle leather combat boots of acid protection", c.TYPE_BOOTS,
+             "combat_boots.101", False),
+            (17, "manticore leather combat boots +2", c.TYPE_BOOTS, "combat_boots.101", True),
+        ]
+        for tag, name, item_type, face, worn in kit:
+            item = Item(tag, item_type=item_type, name=name, face=index.get(face, 0),
+                        quality=80, condition=100,
+                        flags=c.ITEM_APPLIED if worn else 0)
+            state.place_item(item, 1)
+        state.equipment = {c.EQUIP_ARMOUR: 11, c.EQUIP_WEAPON: 13,
+                           c.EQUIP_CLOAK: 15, c.EQUIP_BOOTS: 17}
+
+        class Client:
+            pass
+
+        client = Client()
+        client.state, client.faces = state, faces
+        client.recorded = []
+        client.record_action = lambda action, detail="": client.recorded.append((action, detail))
+        return client
+
+    def test_her_live_inventory_shows_the_capes_plus_two_as_no_ac(self):
+        from .equipment import equipment_report
+        from .tasks import InventoryPolicy, carried_gear_score
+        client = self.section_two_client()
+        policy = InventoryPolicy()
+        report = equipment_report(client, policy, carried_gear_score(client, policy))
+        cloak = next(f for f in report["families"] if f["type"] == c.TYPE_CLOAK)
+        cape, = cloak["worn"]
+        self.assertEqual(cape["name"], "silk cape +2")
+        self.assertNotIn("AC", dict(cape["stats"]))
+        self.assertIn("+2 on a cape adds no AC: it has no base AC, WC, damage, "
+                      "block or absorb", cape["notes"])
+        # The old score gives the "+2" 16 points; the new one gives it nothing.
+        plain = Item(0, item_type=c.TYPE_CLOAK, name="silk cape", quality=80, condition=100)
+        self.assertEqual(policy.gear_score(client.state.items[15]) - policy.gear_score(plain), 16)
+        # The leather cloak (base AC 1) is the better piece: both scores agree.
+        self.assertEqual(cloak["candidate"]["name"], "chimera leather cloak")
+        self.assertEqual(dict(cloak["deltas"])["AC"], 1)
+        self.assertEqual(dict(cloak["deltas"])["Impact %"], 5)
+        # The boots' "+2" does add AC: combat boots have a base AC of 1.
+        boots = next(f for f in report["families"] if f["type"] == c.TYPE_BOOTS)
+        self.assertIn(("AC", "3"), boots["worn"][0]["stats"])
+        self.assertEqual(report["examined"], 0)
+        self.assertTrue(all(row["source"] == "archetype" for family in report["families"]
+                            for row in family["worn"]))
+        # The report is plain JSON for the dashboard.
+        json.dumps(report)
+
+    def test_shadow_logs_where_the_two_scores_disagree(self):
+        from .equipment import GearExaminer
+        from .tasks import InventoryPolicy, carried_gear_score
+        client = self.section_two_client()
+        policy = InventoryPolicy()
+        examiner = GearExaminer(clock=lambda: 100.0)
+        examiner.policy, examiner.old_score = policy, carried_gear_score(client, policy)
+        examiner.shadow(client, force=True)
+        # Body armour: the name-based score values the chain mail's quality
+        # and the ring mail's "+2" alike and keeps what she wears; effective
+        # stats count the ring mail's better impact protection.
+        self.assertEqual(client.recorded, [("gear-shadow", (
+            "body armour: current scoring keeps silksteel chain mail +1 (old 463, new 740); "
+            "effective stats puts on black iron ring mail +2 (old 456, new 780)"))])
+        # Logged once per change, not on every call.
+        count = len(client.recorded)
+        examiner.shadow(client, force=True)
+        self.assertEqual(len(client.recorded), count)
+        self.assertEqual(len(examiner.shadow_log), count)
+
+    def test_the_examiner_asks_one_item_at_a_time_and_reads_its_answer(self):
+        from .equipment import GearExaminer, item_effective_stats
+        from .tasks import InventoryPolicy, carried_gear_score
+        client = self.section_two_client()
+        now = [100.0]
+        examiner = GearExaminer(clock=lambda: now[0])
+        sent = []
+
+        async def examine(tag):
+            sent.append(tag)
+
+        client.examine = examine
+        policy = InventoryPolicy()
+        score = carried_gear_score(client, policy)
+
+        def tick():
+            return asyncio.run(examiner.tick(client, policy, score))
+
+        self.assertTrue(tick())
+        self.assertEqual(sent, [11])          # what she wears first
+        now[0] += 1
+        self.assertTrue(tick())               # waits for the answer
+        self.assertEqual(sent, [11])
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                 "That is silksteel chain mail +1 (worn) (speed cap 0.88) "
+                                 "(ac+6) (Protections: slash +20%)")
+        self.assertFalse(tick())              # settled; spacing holds the next
+        stats = item_effective_stats(client, client.state.items[11])
+        self.assertEqual((stats.source, stats.ac, stats.speed_cap), ("examine", 7, 0.88))
+        now[0] += 2
+        # A mana crystal examine in flight holds hers back.
+        crystal = Item(30, item_type=c.TYPE_POWER_CRYSTAL, name="crystal",
+                       extra={"crystal_examine": (0, now[0])})
+        client.state.place_item(crystal, 1)
+        self.assertFalse(tick())
+        self.assertEqual(sent, [11])
+        crystal.extra.pop("crystal_examine")
+        self.assertTrue(tick())
+        self.assertEqual(sent, [11, 13])
+        # No answer: given up after the timeout, retried later.
+        now[0] += GearExaminer.ANSWER_TIMEOUT + 1
+        tick()
+        weapon = client.state.items[13]
+        self.assertEqual(weapon.extra["gear_examine_attempts"], 1)
+        self.assertNotIn(13, sent[2:])
+        # Another item's answer is not taken for this one.
+        examiner.pending = (15, "silk cape +2", client.state.message_count, now[0])
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff", "That is silk cape +20 (ac+5)")
+        self.assertFalse(examiner.read_answer(client))
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                 "That is silk cape +2 (worn) (Protections: impact +3%)")
+        self.assertTrue(examiner.read_answer(client))
+        cape = item_effective_stats(client, client.state.items[15])
+        self.assertEqual((cape.source, cape.ac), ("examine", 0))
+        json.dumps(client.state.items[15].extra)
+        # Once read, an item is not examined again until its name changes.
+        self.assertFalse(GearExaminer.wanted(client.state.items[15], policy))
+        client.state.items[15].name = "silk cape +3"
+        self.assertTrue(GearExaminer.wanted(client.state.items[15], policy))
+
+    def test_the_examiner_and_the_observation_ledger_pair_the_same_answer(self):
+        from .equipment import gear_examiner, item_effective_stats
+        from .tasks import InventoryPolicy, carried_gear_score
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        from unittest.mock import AsyncMock
+        client = AtrinikClient(ClientConfig(
+            character="Sera",
+            runtime_state_path=str(Path(directory.name) / "memory.sqlite3")))
+        client.send = AsyncMock()
+        client.authored_content = observation_content(Path(directory.name))
+        client.state.player_name, client.state.player_tag = "Sera", 1
+        client.load_character_memory("Sera")
+        client.state.phase = "playing"
+        client.state.map.path = "/test/room"
+        client.state.place_item(Item(72, item_type=c.TYPE_WEAPON, name="sword +2",
+                                     quality=80, condition=100), 1)
+        policy = InventoryPolicy()
+        examiner = gear_examiner(client)
+        self.assertIs(gear_examiner(client), examiner)
+        asyncio.run(examiner.tick(client, policy, carried_gear_score(client, policy)))
+        client.send.assert_awaited_once()
+        for line in ("That is sword +2 (wc+3) (dam+4) (2.00 sec)", "Qua: 80 Con: 100.", " "):
+            data = drawinfo(c.CHAT_TYPE_GAME, "ffffff", line)
+            asyncio.run(client._handle_drawinfo(Cursor(data), data))
+        self.assertTrue(examiner.read_answer(client))
+        stats = item_effective_stats(client, client.state.items[72])
+        self.assertEqual((stats.wc, stats.dam, stats.delay), (5, 6.0, 2.0))
+        rows = client._memory_store().observations("Sera", limit=10)
+        self.assertEqual([row["source_key"] for row in rows], ["examine:sword"])
+
+
 class BuildInfoTests(unittest.TestCase):
     COMMIT = "4a29be882631e570df3028c6e6ead2893b3d4723"
 

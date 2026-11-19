@@ -22,6 +22,7 @@ from .build_info import build_info
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_approach
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
+from .equipment import equipment_report
 from .face_images import FaceImages
 from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from .alerts import active as active_alerts
@@ -36,7 +37,8 @@ from .quest_tasks import EscapingDesertedIslandTask
 from .quests import QuestDefinition, QuestObjective, flatten_parts, load_catalog
 from .tasks import (BankTask, BotTask, BuyShopUpgradeTask, DepositItemsTask,
                     FarmTask, InventoryPolicy, JunkPolicy, RetrieveItemsTask,
-                    SellItemsTask, SellJunkTask, TaskEngine, TaskStatus)
+                    SellItemsTask, SellJunkTask, TaskEngine, TaskStatus,
+                    carried_gear_score)
 
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).with_name("web_static")
@@ -701,7 +703,17 @@ class DashboardState:
             "post_mortems": list(reversed(
                 getattr(self.client, "post_mortems", [])[-10:])),
             "alerts": self.alerts(),
+            "equipment": self.equipment(),
         }
+
+    def equipment(self) -> dict[str, Any]:
+        """The Equipment panel: effective stats per gear family and where
+        they would choose differently from the current score (read-only)."""
+        examiner = getattr(self.client, "gear_examiner", None)
+        # The policy her farm last examined with (caster or melee scoring).
+        policy = getattr(examiner, "policy", None) or InventoryPolicy()
+        return equipment_report(self.client, policy,
+                                carried_gear_score(self.client, policy))
 
     def prometheus(self) -> str:
         """The Prometheus exposition: activity counters and live gauges."""

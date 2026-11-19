@@ -1,7 +1,8 @@
 # Learning from the world and playtester feedback
 
-Status: design proposal. Phases F1 (the observation ledger) and F2 (fact
-parsers and tile facts) are implemented; "F1 as built" and "F2 as built" in
+Status: design proposal. Phases F1 (the observation ledger), F2 (fact
+parsers and tile facts) and F3 (effective item stats) are implemented;
+"F1 as built", "F2 as built" and "F3 as built" in
 section 6 record where they differ from this text. Nothing else here is
 implemented, and nothing here changes behaviour until the phased pull
 requests at the end land.
@@ -1632,6 +1633,75 @@ Knowledge tab):
 panel, and shadow logging of old and new gear scores. No scoring change.
 *Accept:* table tests for each archetype family in 4.8.1; the live
 inventory in section 2 shows the cape's "+2" as no AC.
+
+*F3 as built* (`equipment.py`, the Equipment tab). The "+N" rules were
+checked again against the Classic server (`server/src` at `f2273c85f`) and
+the locked content (v1.14.0). Where the server says more than 4.8.1, the
+code follows the server:
+
+- **A light adds nothing at all**, not only nothing from its "+N": the
+  light slot is skipped when her stats are summed (`living.c:1007-1009`),
+  so its archetype values (a torch's `maxhp`) count for nothing. So is the
+  ammunition slot: an arrow's "+N" counts only when it is fired.
+- **A launcher's protections, attacks and speed do not count**, and it
+  adds no hit points, mana or regeneration: those are summed for
+  non-ranged items only (`living.c:578-624`, `living.c:628-635`). Its base
+  AC, block and absorb, and their "+N", do count; its stats (Str and so on)
+  count too.
+- **A weapon's base block and absorb gain its "+N" too**: the 4.8.1 rows
+  for AC, block and absorb apply to every worn item, and many weapons have
+  them (the falchion has block 5 and absorb 7).
+- **The examine text's speed cap already includes the "+N"**: the treasure
+  code stores the raised cap on the item (`treasure.c:846-847`), so only an
+  unexamined armour's archetype cap would need the 4.8.1 factor; the panel
+  shows the cap from examine and from the archetype as is.
+- **Not modelled:** a shield gives nothing while a two-handed weapon or
+  launcher is wielded (`living.c:997-1005`); the panel values the shield
+  on its own. The protections of several items combine with diminishing
+  returns (`living.c:596-606`); the panel shows each item's own value,
+  scaled by its condition. A "(speed+N)" item's speed is not counted.
+
+What was built:
+
+- `EffectiveStats`, from the base stats of her examine (else the archetype
+  her item's face and type name, when all archetypes sharing that face have
+  the same base) and the "+N" in her item's name: AC, WC, damage, block and
+  absorb, each arrow's WC and damage for launchers and arrows, protections
+  and attacks scaled by condition (a wielded weapon's damage too), stats,
+  hit points, mana and regeneration, delay, speed cap and special flags,
+  with notes such as "+2 on a cape adds no AC: it has no base AC, WC,
+  damage, block or absorb". The examine reader is a new, general parser
+  (`parse_description`); the shop's `_apply_examine_metadata` is unchanged
+  until F4.
+- **Examining carried gear once** (`GearExaminer`): on a quiet farm tick
+  (no threat in view or contact, the recall-wand rule), only after any
+  recall-wand examine has its answer and while no mana-crystal examine
+  waits, one identified, worn or carried gear item at a time, what she
+  wears first; at least 2 seconds apart; it waits up to 5 seconds for the
+  answer ("That is " and her item's shown name) before the next. One
+  examine in flight at a time keeps F1's recorder, which pairs answers with
+  her oldest unanswered examine, in step. An item is examined again when
+  its name changes (identification, a new "+N"), after a relog (new tags)
+  or, with no answer, up to three times five minutes apart. Lights are not
+  examined.
+- **Shadow logging.** Every 30 seconds at most, on the same quiet tick, she
+  compares, per gear family, what the current score (`gear_score` plus the
+  archetype's base score, as the equip loop ranks) and the effective-stats
+  score would put on, with the equip loop's margin of 15. Each change in
+  where they disagree is a `gear-shadow` decision (in the decision ledger
+  and the Activity tab) naming both items and both scores; "no
+  divergence" when they agree again. The effective score uses the shop
+  examine score's weights on the effective values (protections at 8 a
+  percent) and the caster weights when she scores as a caster; F4 settles
+  the weights, including recent damage taken, after the owner reviews the
+  log.
+- **The Equipment tab** lists each gear family she carries: what she wears
+  and the best identified, uncursed candidate she could wear, each with
+  both scores, its effective stats and notes, the per-stat deltas, and
+  where the scores disagree, with the recent shadow log. It is built from
+  DOM nodes and text only, under the dashboard's CSP.
+- No choice changes: `gear_score`, the equip loop and the shop buyer are as
+  before.
 
 **F4. `feat(inventory)`: score gear by effective stats.** Switch
 `gear_score` to the model behind `effective_gear_scoring`, after the owner
