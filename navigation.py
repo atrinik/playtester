@@ -2197,6 +2197,10 @@ class NavigateTask(BotTask):
         self._offer: dialogue_edges.DialogueOffer | None = None
         # The voyage under way: its edge, the voyage and its dialogue task.
         self._voyage: tuple[MapEdge, dialogue_edges.Voyage, BotTask] | None = None
+        # The walk beside a voyage's NPC: ((edge, map, square), since when
+        # she has stood on that square, the last tick), for
+        # VOYAGE_APPROACH_STALL_SECONDS.
+        self._voyage_approach: tuple[tuple, float, float] | None = None
         self._plan_client: AtrinikClient | None = None
         self._crossed: tuple[str, ...] = ()
         # A care crossing (require_care), and while she walks to her
@@ -3550,6 +3554,10 @@ class NavigateTask(BotTask):
 
     # A voyage whose last link was chosen must leave within this long.
     VOYAGE_LEAVE_SECONDS = 8.0
+    # The walk to a square beside a voyage's NPC gives up after this long
+    # without a step, and excludes the edge for a while, as an NPC that
+    # does not answer does.
+    VOYAGE_APPROACH_STALL_SECONDS = 20.0
 
     def _replan(self, client: AtrinikClient) -> None:
         try:
@@ -3582,11 +3590,27 @@ class NavigateTask(BotTask):
             if max(abs(here[0] - edge.x), abs(here[1] - edge.y)) > 1:
                 approaches = self.graph.dialogue_approaches(
                     edge, here, allow_locked=self._allow_locked(client))
-                if not approaches or not await self._click_path(
+                now = time.monotonic()
+                key = (edge, client.state.map.path, here)
+                # A gap between ticks (a fight held the trip) starts afresh.
+                if (self._voyage_approach is None or
+                        self._voyage_approach[0] != key or
+                        now - self._voyage_approach[2] > 5.0):
+                    self._voyage_approach = (key, now, now)
+                self._voyage_approach = (key, self._voyage_approach[1], now)
+                stalled = (now - self._voyage_approach[1] >
+                           self.VOYAGE_APPROACH_STALL_SECONDS)
+                if stalled or not approaches or not await self._click_path(
                         client, *approaches[0]):
                     self._exclude_edge(edge)
+                    self._record(client, "navigation-voyage-failed",
+                                 f"{voyage.subject}: " + (
+                                     "the walk to the NPC stalled" if stalled
+                                     else "no walk to the NPC"))
+                    self._voyage_approach = None
                     self._replan(client)
                 return
+            self._voyage_approach = None
             from .quest_tasks import VoyageDialogTask
             await client.clear_actions()
             self._issued_goal = self._issued_click = None
@@ -5378,7 +5402,11 @@ def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
     (route_death_overdue) is searched despite contact.
     """
     path, xy, component, _ = origin
-    key = (id(graph), path, component, avoided, access)
+    # With the dialogue_edges flag on, reach follows the planner: offered
+    # voyages count, closed quest gates do not.
+    offer = dialogue_edges.dialogue_offer(client, graph)
+    key = (id(graph), path, component, avoided, access,
+           None if offer is None else (offer.edges, offer.closed_exits))
     if key in _reach_cache:
         return _reach_cache[key]
     if (not search or (not overdue and _contact_this_life(client)) or
@@ -5388,7 +5416,7 @@ def _reachable_from(client: AtrinikClient, graph: "WorldGraph", origin,
         _reach_cache.clear()
     try:
         reach = graph.reachable_maps(path, xy, allow_locked=access,
-                                     avoided_maps=set(avoided))
+                                     avoided_maps=set(avoided), offer=offer)
     except ValueError:
         reach = frozenset()
     _reach_cache[key] = reach

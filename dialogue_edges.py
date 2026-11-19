@@ -297,14 +297,36 @@ def compile_voyages(xml_path: Path, npc: str,
     quest_uid = xml_path.parent.name
     in_quest_file = any(element.tag == "quest" for element in root.iter())
     voyages: list[VoyageSpec] = []
-    for interface in root.iter("interface"):
+
+    def hers(interface: ET.Element) -> bool:
         named = interface.get("npc")
         if interface.get("npc_id") or (
                 named and named.casefold() != npc.casefold()):
-            continue
-        if not named and in_quest_file:
-            continue
+            return False
+        return bool(named) or not in_quest_file
+
+    mine = [interface for interface in root.iter("interface") if hers(interface)]
+    for interface in mine:
         base: list[req.Atom] = []
+        # The server's dispatch (InterfaceBuilder.finish) tries regex
+        # matchers before the named dialogue, and an <and>/<or> directly in
+        # any of her interfaces compiles to the module's preconds(), which
+        # can pick another dialogue class. <precond> and <code> belong to
+        # their own interface's class, so they count only in this one (as
+        # non-dialogue children). Only plain named dialogues, with no such
+        # dispatch for this NPC in the file, are modelled.
+        if any(child.tag != "dialog" for child in interface):
+            base.append(req.Unknown("an interface with more than dialogues"))
+        names = [dialog.get("name") or "" for dialog in interface.findall("dialog")]
+        if any(dialog.get("regex") is not None
+               for dialog in interface.findall("dialog")):
+            base.append(req.Unknown("a regex dialogue"))
+        if len(names) != len(set(names)):
+            base.append(req.Unknown("two dialogues with one name"))
+        if any(child.tag in ("and", "or")
+               for other in mine if other is not interface for child in other):
+            base.append(req.Unknown("another of the NPC's interfaces picks "
+                                    "its dialogue by condition"))
         state = interface.get("state") or ""
         parent = parents.get(interface)
         if interface.get("inherit"):

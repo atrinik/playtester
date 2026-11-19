@@ -134,7 +134,10 @@ class VoyageDialogTask(DialogTask):
         self.refused = False
         # When the last link was chosen (0.0 before).
         self.left_at = 0.0
-        self._last_page: tuple | None = None
+        # The interface object last seen (the one open before hello, then
+        # each page answered): only a newer object is a page to check, so
+        # a stale page is never taken for the NPC's answer.
+        self._seen: object | None = None
 
     def _refuse(self, reason: str) -> None:
         self.refused = True
@@ -157,17 +160,14 @@ class VoyageDialogTask(DialogTask):
             self.fail(f"left {self._start_map} before the voyage")
             return
         if not self._sent_hello:
+            self._seen = client.state.interface
             await client.talk("hello", self.npc)
             self._sent_hello = True
             self._last_action = now
             return
         interface = client.state.interface
-        if interface is None or interface.title.casefold() != self.npc.casefold():
-            if now - self._last_action > self.answer_seconds:
-                self.fail(f"{self.npc} did not answer")
-            return
-        page = (interface.text, tuple(interface.links))
-        if page == self._last_page:
+        if (interface is None or interface is self._seen or
+                interface.title.casefold() != self.npc.casefold()):
             if now - self._last_action > self.answer_seconds:
                 self.fail(f"{self.npc} did not answer")
             return
@@ -175,7 +175,7 @@ class VoyageDialogTask(DialogTask):
         if index is None or not 0 <= index < len(interface.links):
             self._refuse(f"{self.npc}'s page {self._followed + 1} is not the authored one")
             return
-        self._last_page = page
+        self._seen = interface
         await client.choose_interface_link(index)
         self._followed += 1
         self._last_action = now

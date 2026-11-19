@@ -165,8 +165,10 @@ class UnlockState:
         """Whether a journal part (or, with no part, the quest) is done.
 
         None before the journal has loaded: unknown, not false. Journal
-        names are what the client shows; P4's ``Quest`` atoms carry those
-        names, mapped from part uids when the content is compiled.
+        names are what the client shows (the server sends no uids); P4's
+        ``Quest`` atoms carry those names, mapped from part uids when the
+        content is compiled. Part names are unique within each quest in the
+        locked content.
         """
         if not self.quests_loaded:
             return None

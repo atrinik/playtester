@@ -1569,11 +1569,17 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   `Voyage` record (NPC, interface, pages, requirement, side effects) whose
   planner edge has `kind="dialogue"`, departs from the NPC's authored
   square and is labelled with the NPC's name. Voyages stay out of
-  `node.edges`, so every caller that does not pass an offer (`route()`,
-  the savebed search and shortlist, `town_safely_reachable`, #94's
-  reachability, the quest catalog's direct `route_points` call) still plans
-  on the static graph, and still treats the lake portal as an ordinary
-  exit. Only `NavigateTask` passes the offer, tier by tier, walled or not.
+  `node.edges`. `NavigateTask` passes the offer, tier by tier, walled or
+  not, and so does #94's reachability (`_reachable_from`, cached per
+  offer), so its verdicts follow the planner. The map-level estimates do
+  not: `route()` and with it `routes_into_component`, the savebed search
+  and shortlist, `town_safely_reachable` and the quest catalog's direct
+  `route_points` call still plan on the static graph and treat the lake
+  portal as an ordinary exit. With the flag on, an estimate can therefore
+  miss a voyage (a savebed or town ranked unreachable that a trip could
+  reach) or count the closed portal; the trip itself then plans with the
+  offer and fails or detours as any plan does. This is a known gap, left
+  while the flag stays off until a supervised voyage.
 - **Voyages.** Seven compile, as 1.4 says: four ordinary and three with
   `savebed`, which are never offered. A voyage is the path from `hello` to
   a dialogue with `<action teleport>` through `<response destination>`
@@ -1584,7 +1590,14 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   without `<close/>`) adds an `Unknown` atom, so no offered voyage starts
   or advances a quest, buys, sets an enemy or types text. `<check>` and
   `<ncheck>` also compile as `Unknown`, not as `Quest` atoms: no voyage
-  path in the content has one. No voyage charges a fare, and a fare could
+  path in the content has one. Server dispatch the compiler does not
+  model is `Unknown` too: an interface with anything but `<dialog>`
+  children (`<precond>`, `<code>`, a direct `<and>`), a `regex` dialogue
+  (whose matchers run before the named dialogue), two dialogues with one
+  name, or another interface for the same NPC in the file with a direct
+  `<and>` or `<or>`, which compiles to the module's `preconds()` and can
+  pick another dialogue class. `<precond>` and `<code>` in another
+  interface belong to that interface's own class and do not count. No voyage charges a fare, and a fare could
   only be taken by those elements, so there is no wallet check to make.
 - **Interface state.** `state="completed"` on a quest's own interface is a
   `Quest(quest)` atom. Any other state, and a quest file's stateless
@@ -1594,7 +1607,9 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   each offered edge to exactly one voyage, whose pages are followed; two
   offered voyages on one edge would offer neither.
 - **Quest atoms** carry the journal's names (`Quest(quest, part, uid)`),
-  mapped from uids through each `quest.xml`. `UnlockState.met` reads them
+  mapped from uids through each `quest.xml`: the journal the server sends
+  shows names only, never uids. Part names are unique within each quest in
+  the locked content, so a name names one part. `UnlockState.met` reads them
   against her journal; an unloaded journal meets none. The server lists a
   completed quest by its title only, so a part also counts as done once
   its quest is completed, unless some dialogue of that quest can fail the
@@ -1621,7 +1636,9 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   voyage is dropped in turn.
 - **Taking a voyage.** She walks to a square beside the NPC's authored
   square (the server finds an NPC by name within 3 squares), stops, says
-  `hello` and checks every page against the authored one: its text (with
+  `hello` and checks every page against the authored one, only a page that
+  arrived after what she last saw (the interface open before `hello` is
+  never taken for the answer): its text (with
   `{activator.name}`-style fields as wildcards), every link in order, no
   text box and no objects. Only then is the authored link chosen. After the
   last link she must reach the arrival map within 8 s. A page that
@@ -1629,8 +1646,9 @@ holds the flag's offer; `NavigateTask` takes a voyage with
   refused (`navigation-voyage-refused`): plans leave the voyage out until
   her unlock state's fingerprint changes, and at most a day. P4 keeps
   refusals in memory; P5's `route_requirements` can persist them. An NPC
-  that does not answer within 3 s (it wandered, or a fight) only excludes
-  the edge like a held exit (`navigation-voyage-failed`). Each voyage
+  that does not answer within 3 s (it wandered, or a fight), and a walk
+  beside the NPC that has not moved her for 20 s or finds no square, only
+  exclude the edge like a held exit (`navigation-voyage-failed`). Each voyage
   records `navigation-voyage` and `navigation-voyage-arrived`.
 - **Owner blocks.** A voyage's subject is
   `talk:{source}:{npc}>{destination}`, as in 4.2, checked against the

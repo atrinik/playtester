@@ -28069,6 +28069,36 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any(reason in text for text in reasons), reasons)
                 self.assertFalse(unlocks.UnlockState(quests_loaded=True).met(voyage.requires))
 
+    def test_dispatch_the_compiler_does_not_model_is_unknown(self):
+        other = ('<interface npc="Ferryman" state="x"><and><check region_map="x"/>'
+                 '</and><dialog name="hello"><message>Hi.</message></dialog></interface>')
+        for old, new, reason in (
+                ("<interface>", '<interface><precond>return True</precond>', "more than dialogues"),
+                ("<interface>", '<interface><code>pass</code>', "more than dialogues"),
+                ('<dialog name="sail">', '<dialog name="x" regex="sa.*"><message>R.</message></dialog>'
+                 '<dialog name="sail">', "regex dialogue"),
+                ('<dialog name="sail">', '<dialog name="hello"><message>Again.</message></dialog>'
+                 '<dialog name="sail">', "two dialogues with one name"),
+                ("<interfaces>", "<interfaces>" + other, "picks its dialogue by condition"),
+                ("<interfaces>", "<interfaces>" + other.replace("<and>", "<or>").replace(
+                    "</and>", "</or>"), "picks its dialogue by condition")):
+            with self.subTest(reason=reason, new=new[:40]):
+                voyages = self.compile(VOYAGE_XML.replace(old, new))
+                voyage = next(item for item in voyages if item.destination == "/isle")
+                reasons = [atom.reason for atom in voyage.requires.atoms
+                           if isinstance(atom, req.Unknown)]
+                self.assertTrue(any(reason in text for text in reasons), reasons)
+        # A condition inside another interface's dialogue, or another NPC's
+        # interface, picks nothing for this one.
+        for extra in (other.replace("<and><check region_map=\"x\"/></and>", "").replace(
+                          "<message>Hi.</message>",
+                          '<message>Hi.</message><and><check region_map="x"/></and>'),
+                      other.replace('npc="Ferryman"', 'npc="Sam"')):
+            with self.subTest(extra=extra[:60]):
+                voyage, = [item for item in self.compile(VOYAGE_XML.replace(
+                    "<interfaces>", "<interfaces>" + extra)) if item.destination == "/isle"]
+                self.assertEqual(voyage.requires, req.NONE)
+
     def test_a_quest_interface_state_becomes_a_quest_atom(self):
         quests = {"ferry": self.dialogue_edges.QuestInfo(
             "The Ferry", {"paid": "Pay The Ferryman"}, frozenset())}
@@ -28166,6 +28196,88 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
         self.client.state.quests = {"Anything": QuestProgress("Anything", "completed")}
         self.assertEqual(self.dialogue_edges.dialogue_offer(self.client, self.graph).edges,
                          (self.graph.voyages[0].edge,))
+
+    async def test_a_stale_page_is_never_taken_for_the_answer(self):
+        # The page left open before hello (here one without links, and one
+        # that even looks like the authored page) is not the answer.
+        answer = self.client.page
+        for stale in (InterfaceState(title="Ferryman", text="Fair winds."),
+                      dataclasses.replace(answer)):
+            with self.subTest(stale.text):
+                self.client = VoyageClient()
+                self.client.state.interface = stale
+                pending = []
+
+                async def talk(text, npc="", client=self.client):
+                    client.talks.append((text, npc))
+                    pending.append(answer)
+
+                self.client.talk = talk
+                task = NavigateTask(self.graph, "/isle")
+                await self.walk(task, ticks=3)
+                self.assertEqual((self.client.chosen, task.status),
+                                 ([], TaskStatus.RUNNING), task.error)
+                self.client.state.interface = dataclasses.replace(pending[0])
+                await self.walk(task)
+                self.assertEqual(task.status, TaskStatus.COMPLETE, task.error)
+                self.assertEqual(self.client.chosen, [0])
+
+    async def test_a_voyage_that_lands_elsewhere_is_refused(self):
+        self.graph.nodes["/elsewhere"] = MapNode("/elsewhere", width=3, height=1,
+                                                 terrain={(x, 0): 1 for x in range(3)})
+        original = self.client.choose_interface_link
+
+        async def astray(index):
+            await original(index)
+            self.client.state.map.path = "/elsewhere"
+
+        self.client.choose_interface_link = astray
+        task = await self.walk(NavigateTask(self.graph, "/isle"))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        refused = [record["detail"] for record in self.client.decision_history
+                   if record["action"] == "navigation-voyage-refused"]
+        self.assertEqual(refused, ["talk:/dock:Ferryman>/isle: landed on /elsewhere, "
+                                   "not /isle"])
+        self.assertEqual(self.dialogue_edges.dialogue_offer(self.client, self.graph).edges, ())
+
+    async def test_a_stalled_walk_to_the_npc_excludes_the_edge(self):
+        task = NavigateTask(self.graph, "/isle")
+
+        async def stuck(client, x, y):
+            return True
+
+        task._click_path = stuck
+        now = [1000.0]
+        clock = types.SimpleNamespace(monotonic=lambda: now[0], time=time.time)
+        from . import navigation
+        with patch.object(navigation, "time", clock):
+            await task.tick(self.client)
+            for _ in range(4):
+                now[0] += 4.5
+                await task.tick(self.client)
+            self.assertNotIn("navigation-voyage-failed", self.client.actions())
+            now[0] += 4.5
+            await task.tick(self.client)
+        self.assertIn("navigation-voyage-failed", self.client.actions())
+        self.assertIn("stalled", self.client.decision_history[-1]["detail"])
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn(("/dock", "/isle", 5, 1), task._edge_exclusions)
+
+    def test_a_closed_quest_gate_sends_the_plan_the_long_way(self):
+        graph = voyage_graph()
+        graph.voyages = []
+        # The gated portal is the first of two ways onto /isle.
+        graph.nodes["/dock"].edges += [MapEdge("/dock", "/isle", 2, 1, 0, 0),
+                                       MapEdge("/dock", "/isle", 9, 2, 5, 0)]
+        graph.gated_exits = {("/dock", 2, 1): req.requires(req.Quest(
+            "Portal of Llwyfen", "A Strange Portal", "portal_found"))}
+        edges = lambda client: [(edge.x, edge.y) for edge in
+                                NavigateTask(graph, "/isle")._plan(client)]
+        self.assertEqual(edges(VoyageClient(enabled=False)), [(2, 1)])
+        self.assertEqual(edges(self.client), [(9, 2)])
+        self.client.state.quests = {"Portal of Llwyfen": QuestProgress(
+            "Portal of Llwyfen", "active", [QuestPartProgress("A Strange Portal", "", "done")])}
+        self.assertEqual(edges(self.client), [(2, 1)])
 
     async def test_a_voyage_that_does_not_leave_is_refused(self):
         self.client.sails = False
@@ -28395,6 +28507,11 @@ class DialogueEdgeContentTests(unittest.TestCase):
             ((self.LAKE, 23, 13), "/shattered_islands/strakewood_island/"
                                   "underground_city/underground_city_0_4"),
             ((self.BRYNKNOT, 10, 10), self.INCUNA),
+            ((self.INCUNA, 4, 12), self.BRYNKNOT),
+            (("/shattered_islands/world_6_51", 10, 10), "/shattered_islands/world_3_69"),
+            (("/shattered_islands/world_2_69", 5, 5), "/shattered_islands/"
+                                                     "strakewood_island/underground_city/"
+                                                     "underground_city_0_4"),
         )
         stripped = WorldGraph()
         stripped.__dict__.update({**self.graph.__dict__, "voyages": [], "gated_exits": {}})
