@@ -352,6 +352,8 @@ class AtrinikClient:
         # Chat senders her memory keeps, read once a login and extended by
         # each new sender (_log_chat); None until first needed.
         self._feedback_senders: set[str] | None = None
+        # Private terms already warned about as common words.
+        self._feedback_common_warned: set[str] = set()
         # When the "+N with no effect" producer last ran (monotonic).
         self._equipment_feedback_at = float("-inf")
         # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
@@ -2058,7 +2060,17 @@ class AtrinikClient:
         return self._feedback_private(self._feedback_other_names())
 
     def _feedback_private(self, others: list[str]) -> list[str]:
-        """Every term no draft may contain (4.10.4)."""
+        """Every term no draft may contain (4.10.4). A term that is a common
+        word is warned about once: it withholds nearly every draft."""
+        terms = self._feedback_private_terms(others)
+        for term in feedback.common_terms(terms):
+            if term not in self._feedback_common_warned:
+                self._feedback_common_warned.add(term)
+                log.warning("a private term is the common word %r: feedback drafts "
+                            "containing it are withheld", term)
+        return terms
+
+    def _feedback_private_terms(self, others: list[str]) -> list[str]:
         config = self.config
         return [config.account, config.password, config.access_code, config.host,
                 config.certificate_sha256, config.character, config.party_name,

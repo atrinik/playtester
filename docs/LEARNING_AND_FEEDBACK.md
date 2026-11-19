@@ -1754,8 +1754,9 @@ Feedback tab, `atrinik-playtester feedback list|show`). Where the code
 differs from the text above:
 
 - **Storage.** `feedback_items` has the columns of 4.2 plus `subject` (for
-  filters and the CLI), `days`, `occurrence_keys_json`, `dates_json` and
-  `withheld`. `feedback_filings` is not created yet; F6 adds it with the
+  filters and the CLI), `days`, `occurrence_keys_json`, `dates_json`,
+  `withheld`, `updated_at` (when its text last changed) and `screened_at`
+  (when the running bot last screened it). `feedback_filings` is not created yet; F6 adds it with the
   filer. Only `draft` rows are made. At the cap of 500 drafts a new draft
   always gets in: before it is inserted, the draft with the fewest
   occurrences, then the least recently seen, is evicted (never the new one);
@@ -1797,16 +1798,29 @@ differs from the text above:
   Names are compared after NFKC folding, with game markup and invisible
   characters removed. A draft containing one is not stored, and only its
   fingerprint is logged; an existing item of that fingerprint is marked
-  `withheld`, and the finding is tried again on its next sighting. The chat
+  `withheld`, and the finding is tried again on its next sighting. A term
+  that is a common word ("the", "door") is warned about once, since it
+  withholds nearly every draft. Player names are never persisted for this:
+  the set is what the process saw plus the chat log. The chat
   senders are read once a login and extended by each new sender. Other
   players present are recorded only as a count of those in view.
 - **Screening on read.** A name can be learned after a draft was stored, and
-  items past draft are never re-rendered, so every reader checks stored
-  titles and bodies against the current private terms (`feedback.screen`):
-  the dashboard on each request (and flags failures `withheld` in her
+  items past draft are never re-rendered, so every reader checks every
+  field it shows or files (title, body, subject, labels, type and, for F6,
+  the filing error) against the current private terms (`feedback.screen`):
+  the dashboard on each request (it flags failures `withheld` in her
   memory), the CLI with the terms it knows, and F6's filer. A withheld item
-  is shown with a placeholder title and no body, and is never to be filed,
-  until a clean render of the same draft replaces its text.
+  is shown with a placeholder title and no text, and is never to be filed.
+  **Withholding is sticky:** the term set can shrink (names seen in a
+  process are forgotten at a restart, the party changes, the chat senders
+  read are the newest 5,000), so no later render or read releases it; only
+  an explicit owner action, in F6, may.
+- **Readers without her full terms.** A render by the running bot (which
+  passes its full terms) and each dashboard read set `screened_at`. The CLI,
+  and any other reader without the bot's full term set, shows an item's
+  text only when it is not withheld and `screened_at >= updated_at`;
+  otherwise it prints metadata and "(not yet screened by the running
+  bot)".
 - **"+N with no effect"** reads her own carried items: an identified item
   whose name shows "+N" counts when its effective stats come from her
   examine (an artifact can give a cape the AC its archetype lacks) and
@@ -1838,7 +1852,8 @@ differs from the text above:
   there is no approval key and no POST route yet. The CLI needs
   `--character` and opens the database read-only (`mode=ro`): it creates,
   migrates and changes nothing, and says so when the queue's table is
-  missing. It cannot flag items withheld; it hides them in its output.
+  missing or of another version. It cannot flag items withheld; it hides
+  them in its output.
 - **Not built in F5:** the `feedback_items` gauge of 4.12, drafting from
   shop items she has not picked up, and the other producers of 4.11.5.
 

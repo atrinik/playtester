@@ -138,8 +138,11 @@ def names_private(text: str, terms: Collection[str]) -> str | None:
     """The first private term ``text`` contains as a word, or None; both
     are compared folded (``fold``), so "[b]Zo[/b]" or a full-width or
     zero-width-split name still matches."""
-    folded = fold(inert(text))
-    folded_joined = fold(_MARKUP.sub("", unicodedata.normalize("NFKC", str(text))))
+    clean = inert(unicodedata.normalize("NFKC", str(text)))
+    folded = fold(clean)
+    # Markup removed with nothing in its place, after invisible characters
+    # are gone: "Zo[\u200bb]e" and "[b]Mal[/b]lory" join up again.
+    folded_joined = fold(_MARKUP.sub("", clean))
     for candidate in (folded, folded_joined):
         for term in terms:
             if term in candidate and _term_pattern(term).search(candidate):
@@ -333,7 +336,9 @@ def note(memory: Any, character: str, finding: Finding, *, at: float | None = No
     Returns the row id and whether the draft is new, or None when the draft
     would contain a private term (nothing is stored). A draft's title and
     body are rendered again on each occurrence while it is a draft; a
-    rejected or filed item only gains occurrences.
+    rejected or filed item only gains occurrences. ``private`` must be the
+    running bot's full set of private terms: a stored render counts as
+    screened (``screened_at``).
     """
     at = time.time() if at is None else at
     digest = finding.fingerprint
@@ -345,7 +350,8 @@ def note(memory: Any, character: str, finding: Finding, *, at: float | None = No
         body = render(evidence, digest=digest, occurrences=occurrences, days=days,
                       first_seen=first_seen, last_seen=last_seen)
         title = " ".join(inert(finding.title).split())
-        hit = names_private(title + "\n" + body, terms)
+        hit = names_private("\n".join((title, body, finding.subject, *finding.labels,
+                                        finding.issue_type)), terms)
         if hit is not None:
             raise PrivateText("a private term")
         return {"title": title, "body_md": body,
@@ -361,8 +367,8 @@ def note(memory: Any, character: str, finding: Finding, *, at: float | None = No
             build=build, timeout=timeout)
     except PrivateText:
         # Never logged with the term or the text: only that it happened. A
-        # stored draft that would now name one is withheld until a clean
-        # render replaces it.
+        # stored item that would now name one is withheld for good (only an
+        # explicit owner action, phase F6, may release it).
         log.warning("feedback draft %s not kept: it named a private term",
                     short_fingerprint(digest))
         try:
@@ -373,23 +379,50 @@ def note(memory: Any, character: str, finding: Finding, *, at: float | None = No
 
 
 WITHHELD_TITLE = "(withheld: it names a private term)"
+# Every field of a stored item a reader may show or file; all are screened.
+SCREENED_FIELDS = ("title", "body_md", "subject", "labels_json", "issue_type", "error")
+# Common words: a private term among these (an account named "the") would
+# withhold nearly every draft, so it is warned about.
+COMMON_WORDS = frozenset((
+    "a", "an", "the", "and", "or", "of", "to", "in", "on", "at", "it", "is", "be", "by",
+    "for", "with", "from", "as", "you", "she", "her", "he", "his", "they", "this", "that",
+    "door", "gate", "key", "book", "sign", "lever", "map", "level", "server", "content",
+    "classic", "playtester", "what", "where", "time", "times", "day", "days", "first",
+    "last", "read", "item", "items", "text"))
+
+
+def common_terms(private: Collection[str]) -> list[str]:
+    """The private terms that are common words (see ``COMMON_WORDS``)."""
+    return [term for term in private_terms(private) if term in COMMON_WORDS]
 
 
 def screen(items: Iterable[dict[str, Any]], private: Collection[str]) -> list[int]:
-    """Check stored items against the current private terms before anyone
-    sees or files them (the dashboard, the CLI and the filer all call it):
-    a term learned after an item was rendered, or one in an item past
-    draft, is caught here. A failing or already withheld item is marked
-    ``withheld`` and its title and body are blanked in place. Returns the
-    ids that newly failed, for ``BotMemory.withhold_feedback``."""
+    """Check stored items against the private terms before anyone sees or
+    files them (the dashboard, the CLI and the filer all call it): a term
+    learned after an item was rendered, or one in an item past draft, is
+    caught here. Every shown field (``SCREENED_FIELDS``) is checked. A
+    failing or already withheld item is marked ``withheld`` and those
+    fields are blanked in place; withholding is never undone here. Returns
+    the ids that newly failed, for ``BotMemory.withhold_feedback``."""
     terms = private_terms(private)
     newly: list[int] = []
     for item in items:
-        failed = names_private(f"{item.get('title', '')}\n{item.get('body_md', '')}", terms)
+        text = "\n".join(str(item.get(key) or "") for key in SCREENED_FIELDS)
+        failed = names_private(text, terms)
         if failed is not None and not item.get("withheld"):
             newly.append(int(item["id"]))
         if failed is not None or item.get("withheld"):
-            item.update(withheld=True, title=WITHHELD_TITLE, body_md="")
+            item.update(withheld=True, title=WITHHELD_TITLE, body_md="", subject="",
+                        labels_json="[]", issue_type="", error="")
         else:
             item["withheld"] = False
     return newly
+
+
+def readable(item: dict[str, Any]) -> bool:
+    """Whether a reader without the running bot's full private terms (the
+    CLI) may show an item's text: not withheld, and screened by the bot
+    since its text last changed."""
+    return (not item.get("withheld") and
+            float(item.get("screened_at") or 0) >= float(item.get("updated_at") or 0) and
+            float(item.get("updated_at") or 0) > 0)

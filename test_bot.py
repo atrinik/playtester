@@ -27227,7 +27227,7 @@ class FeedbackQueueTests(unittest.TestCase):
         from .feedback import inert, names_private
         hidden = "a\x85b\u061cc\u180ed\U000e0041e\x9ff"
         self.assertEqual(inert(hidden), "abcdef")
-        for text in ("[b]Mal[/b]lory was here", "\uff2d\uff41\uff4c\uff4c\uff4f\uff52\uff59 waits",
+        for text in ("[b]Mal[/b]lory was here", "Mal[\u200bb]lory waits", "\uff2d\uff41\uff4c\uff4c\uff4f\uff52\uff59 waits",
                      "Mal\u200blory", "[a=#charname]Mallory[/a] says"):
             with self.subTest(text=text):
                 self.assertEqual(names_private(text, ["mallory"]), "mallory")
@@ -27335,13 +27335,15 @@ class FeedbackQueueTests(unittest.TestCase):
         # A new occurrence still naming her is not stored and stays withheld.
         self.assertIsNone(note(memory, "Sera", self.finding(
             occurrence="later", excerpts=["Ask Kiri at the gate."]), private=["kiri"], at=2.0))
-        # A clean render (the evidence no longer quotes her) releases it.
-        note(memory, "Sera", self.finding(occurrence="clean", excerpts=["The gate."]), at=3.0)
-        released = {item["id"]: item for item in memory.feedback_items("Sera")}
-        self.assertEqual((released[draft_id]["withheld"], released[filed_id]["withheld"]),
-                         (0, 1))
-        screen(list(released.values()), ["kiri"])
-        self.assertIn("The gate.", released[draft_id]["body_md"])
+        # Withholding is sticky: a "clean" render (the term set may simply
+        # have shrunk after a restart) releases nothing; only an explicit
+        # owner action (phase F6) may.
+        note(memory, "Sera", self.finding(occurrence="clean", excerpts=["The gate."]),
+             private=["kiri"], at=3.0)
+        kept = {item["id"]: item for item in memory.feedback_items("Sera")}
+        self.assertEqual((kept[draft_id]["withheld"], kept[filed_id]["withheld"]), (1, 1))
+        screen(list(kept.values()), [])
+        self.assertEqual(kept[draft_id]["body_md"], "")
         # A draft that was clean when stored but now names a term is withheld
         # by note() too, through its fingerprint.
         fresh, _ = note(memory, "Sera", self.finding("fresh:y", excerpts=["Mira waits."]))
@@ -27349,6 +27351,41 @@ class FeedbackQueueTests(unittest.TestCase):
                                                             excerpts=["Mira waits."]),
                                private=["mira"]))
         self.assertEqual(memory.feedback_item("Sera", str(fresh))["withheld"], 1)
+
+    def test_every_shown_field_is_screened(self):
+        from .feedback import screen
+        items = [{"id": 1, "title": "t", "body_md": "b", "subject": "s", "labels_json": "[]",
+                  "issue_type": "", "error": "403 for Kiri"},
+                 {"id": 2, "title": "t", "body_md": "b", "subject": "door:/m:1,1",
+                  "labels_json": '["Kiri"]', "issue_type": "", "error": None},
+                 {"id": 3, "title": "t", "body_md": "b", "subject": "door:/m:1,1",
+                  "labels_json": '["bug"]', "issue_type": "Bug", "error": None}]
+        self.assertEqual(screen(items, ["kiri"]), [1, 2])
+        self.assertEqual([(item["withheld"], item["error"], item["subject"]) for item in items],
+                         [(True, "", ""), (True, "", ""), (False, None, "door:/m:1,1")])
+
+    def test_screening_times_tell_the_cli_what_it_may_show(self):
+        from .feedback import note, readable
+        memory = self.memory()
+        draft_id, _ = note(memory, "Sera", self.finding())
+        item = memory.feedback_item("Sera", str(draft_id))
+        # A render by the running bot (with its full terms) is screened.
+        self.assertGreater(item["updated_at"], 0)
+        self.assertEqual(item["screened_at"], item["updated_at"])
+        self.assertTrue(readable(item))
+        # A text written by anything else (F6's edit, say) is not, until the
+        # running bot screens it again.
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE feedback_items SET updated_at = updated_at + 10")
+        item = memory.feedback_item("Sera", str(draft_id))
+        self.assertFalse(readable(item))
+        memory.mark_feedback_screened("Sera", [draft_id], at=item["updated_at"] + 1)
+        self.assertTrue(readable(memory.feedback_item("Sera", str(draft_id))))
+        self.assertFalse(readable({**item, "withheld": 1, "screened_at": 1e12}))
+
+    def test_common_words_as_private_terms_are_flagged(self):
+        from .feedback import common_terms
+        self.assertEqual(common_terms(["The", "seraacct", "Door", "Kiri"]), ["door", "the"])
 
     def test_days_count_distinct_dates_in_any_order(self):
         from .feedback import note
@@ -27710,6 +27747,14 @@ class FeedbackClientTests(unittest.TestCase):
             client._feedback_other_names()
             self.assertEqual(len(calls), 2)
 
+    def test_a_common_word_as_a_private_term_is_warned_about_once(self):
+        client = self.client()
+        client.state.party_name = "The"
+        with self.assertLogs("atrinik_bot.client", "WARNING") as logs:
+            client.feedback_private_terms()
+            client.feedback_private_terms()
+        self.assertEqual(sum("common word 'the'" in line for line in logs.output), 1)
+
     def test_her_party_and_the_operator_are_private(self):
         from .web_server import WebControlServer
         client = self.client()
@@ -27756,6 +27801,32 @@ class FeedbackClientTests(unittest.TestCase):
         with sqlite3.connect(other) as db:
             self.assertEqual([row[0] for row in db.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")], ["memory"])
+        # An item the running bot has not screened since it changed: metadata
+        # only.
+        second, _ = note(memory, "Sera", FeedbackQueueTests.finding(
+            "sign:/m:2,2", excerpts=["The gate is shut."]))
+        with sqlite3.connect(path) as db:
+            db.execute("UPDATE feedback_items SET updated_at = updated_at + 10 WHERE id = ?",
+                       (second,))
+        out = io.StringIO()
+        with context.redirect_stdout(out):
+            self.assertEqual(feedback_command(parser().parse_args(
+                base + ["show", str(second)])), 0)
+            self.assertEqual(feedback_command(parser().parse_args(
+                base + ["list", "--json"])), 0)
+        self.assertIn("(not yet screened by the running bot)", out.getvalue())
+        self.assertNotIn("The gate is shut.", out.getvalue())
+        self.assertNotIn("sign:/m:2,2", out.getvalue())
+        # A queue table of another version: a clear message, no traceback.
+        old_queue = Path(self.directory.name) / "older.sqlite3"
+        with sqlite3.connect(old_queue) as db:
+            db.execute("CREATE TABLE feedback_items (id INTEGER, server TEXT)")
+        out = io.StringIO()
+        with context.redirect_stdout(out):
+            self.assertEqual(feedback_command(parser().parse_args(
+                ["--runtime-state", str(old_queue), "--character", "Sera", "feedback",
+                 "list"])), 1)
+        self.assertIn("cannot read the queue", out.getvalue())
 
     def test_cli_needs_a_character_and_an_existing_database(self):
         import io
@@ -27805,13 +27876,17 @@ class FeedbackRouteTests(unittest.IsolatedAsyncioTestCase):
                  FeedbackQueueTests.finding("sign:/m:1,1", excerpts=["Kiri waits."]))
             self.client.observations.player_names["kiri"] = 1.0
             status, payload = await self.request("GET", "/api/feedback")
-            rows = {row["subject"]: row for row in json.loads(payload)["items"]}
-            self.assertEqual((rows["sign:/m:1,1"]["withheld"], rows["sign:/m:1,1"]["body_md"]),
-                             (True, ""))
-            self.assertFalse(rows[item["subject"]]["withheld"])
+            rows = {row["id"]: row for row in json.loads(payload)["items"]}
+            hidden, = [row for row in rows.values() if row["withheld"]]
+            self.assertEqual((hidden["body_md"], hidden["subject"]), ("", ""))
+            self.assertFalse(rows[item["id"]]["withheld"])
             self.assertNotIn(b"Kiri", payload)
-            self.assertEqual(self.client._memory_store().feedback_item(
-                "Sera", str(rows["sign:/m:1,1"]["id"]))["withheld"], 1)
+            stored = self.client._memory_store().feedback_item("Sera", str(hidden["id"]))
+            self.assertEqual((stored["withheld"], stored["subject"]), (1, "sign:/m:1,1"))
+            # The clean item is screened for readers without her terms.
+            from .feedback import readable
+            self.assertTrue(readable(self.client._memory_store().feedback_item(
+                "Sera", str(item["id"]))))
             # There is no write route in this phase.
             status, _ = await self.request("POST", f"/api/feedback/{item['id']}",
                                            {"action": "approve"})

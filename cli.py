@@ -188,9 +188,12 @@ def feedback_command(args: argparse.Namespace) -> int:
     stores them; works whether or not the bot is running.
     """
     import sqlite3
+    import sys
 
-    from .feedback import screen, short_fingerprint
+    from .feedback import common_terms, readable, screen, short_fingerprint
     from .memory import BotMemory
+
+    NOT_SCREENED = "(not yet screened by the running bot)"
 
     path = memory_path(args.runtime_state)
     if not args.character:
@@ -224,15 +227,40 @@ def feedback_command(args: argparse.Namespace) -> int:
     private = [args.account, args.password, args.host, args.character,
                args.certificate_sha256, args.party_name, args.operator_character,
                code, *senders]
+    for term in common_terms(private):
+        print(f"feedback: warning: the private term {term!r} is a common word; "
+              "items containing it are withheld", file=sys.stderr)
 
-    if args.feedback_command == "list":
-        items = memory.feedback_items(args.character, kind=args.kind, repo=args.repo,
-                                      status=args.status, limit=args.limit)
+    def gate(items: list[dict]) -> None:
+        """Text only for items the running bot screened with its full terms
+        since they last changed (feedback.readable), and that pass this
+        command's own screen; the rest show metadata only."""
+        unscreened = [item for item in items if not readable(item)]
         screen(items, private)
+        for item in unscreened:
+            if not item["withheld"]:
+                item.update(title=NOT_SCREENED, body_md="", subject="", labels_json="[]",
+                            issue_type="", error="", screened=False)
         for item in items:
+            item.setdefault("screened", not item["withheld"])
             item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
-            item.pop("body_md", None)
             item.pop("evidence_json", None)
+
+    try:
+        if args.feedback_command == "list":
+            items = memory.feedback_items(args.character, kind=args.kind, repo=args.repo,
+                                          status=args.status, limit=args.limit)
+        else:
+            item = memory.feedback_item(args.character, args.item)
+            items = [] if item is None else [item]
+    except sqlite3.Error as error:
+        print(f"feedback: cannot read the queue in {path} (a database from another "
+              f"version?): {error}")
+        return 1
+    gate(items)
+    if args.feedback_command == "list":
+        for item in items:
+            item.pop("body_md", None)
         if args.json:
             print(json.dumps(items, indent=2, sort_keys=True, ensure_ascii=False))
             return 0
@@ -244,17 +272,15 @@ def feedback_command(args: argparse.Namespace) -> int:
                   f"{item['kind']:<8} {item['repo']:<19} x{item['occurrences']:<4} "
                   f"{item['title']}")
         return 0
-    item = memory.feedback_item(args.character, args.item)
-    if item is None:
+    if not items:
         print(f"feedback: no single item matches {args.item!r}")
         return 1
-    screen([item], private)
-    item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
+    item, = items
     if args.json:
-        item.pop("evidence_json", None)
         print(json.dumps(item, indent=2, sort_keys=True, ensure_ascii=False))
         return 0
-    print(f"#{item['id']} {item['short_fingerprint']} {item['status']} {item['kind']} "
+    print(f"#{item['id']} {item['short_fingerprint']} "
+          f"{'withheld' if item['withheld'] else item['status']} {item['kind']} "
           f"-> {item['repo']} ({item['target']})")
     print(f"Labels: {', '.join(json.loads(item['labels_json'] or '[]')) or 'none'}"
           f"{'; type ' + item['issue_type'] if item['issue_type'] else ''}")

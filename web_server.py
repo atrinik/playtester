@@ -1177,9 +1177,15 @@ class WebControlServer:
                 # her memory) until a clean render replaces it.
                 try:
                     newly = screen_feedback(items, self.client.feedback_private_terms())
+                    memory = self.client._memory_store()
                     if newly:
-                        self.client._memory_store().withhold_feedback(
+                        memory.withhold_feedback(
                             character, newly, timeout=KNOWLEDGE_READ_TIMEOUT)
+                    # Screened with her full terms: a reader without them
+                    # (the CLI) may show these (feedback.readable).
+                    memory.mark_feedback_screened(
+                        character, [item["id"] for item in items if not item["withheld"]],
+                        timeout=KNOWLEDGE_READ_TIMEOUT)
                 except Exception as error:
                     log.warning("feedback screening failed: %s", error)
                     items, busy = [], True

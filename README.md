@@ -474,8 +474,8 @@ are a later phase, and only an item the owner approves will ever be filed.
   character or the server's address, the password, the invite code, her
   party, the operator character or another character's name is not stored
   at all. Every reader checks stored items again against the names known
-  now: one that names a private term is shown as withheld, with no body,
-  until it is rendered again without it.
+  now: one that names a private term is withheld, shown with no text, and
+  stays withheld (only an owner action in a later phase may release it).
 
 The dashboard's read-only **Feedback** tab lists the drafts, filtered by
 kind and repository, with the exact body that would be filed (`GET
@@ -492,7 +492,13 @@ atrinik-playtester --host HOST --port 1728 feedback show pt-4f1c2a9b0d3e
 bot stores them; `list` takes `--kind`, `--repo` and `--status`, and
 `list --json` and `show --json` print JSON. The command opens the database
 read-only, whether or not the bot is running, and needs no network and no
-game inputs.
+game inputs. It knows fewer names than the running bot (none it saw in
+play), so it shows an item's text only once the running bot has screened
+it since it last changed; otherwise it prints "(not yet screened by the
+running bot)" and the metadata. Run it as the bot's service user: SQLite
+may create the database's `-wal` and `-shm` files even for a read-only
+reader when the bot is stopped, and files created by another user can then
+stop the bot from opening its database.
 
 ## Operator assist
 

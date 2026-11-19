@@ -63,7 +63,8 @@ FEEDBACK_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
 FEEDBACK_COLUMNS = ("id", "fingerprint", "repo", "kind", "subject", "target", "title",
                     "body_md", "labels_json", "issue_type", "evidence_json", "status",
                     "occurrences", "days", "first_seen", "last_seen", "decided_at",
-                    "decided_via", "issue_url", "error", "withheld")
+                    "decided_via", "issue_url", "error", "withheld", "updated_at",
+                    "screened_at")
 # Distinct UTC dates kept per item for its day count.
 FEEDBACK_DATES = 1000
 
@@ -304,6 +305,8 @@ class BotMemory:
                        occurrence_keys_json TEXT NOT NULL DEFAULT '[]',
                        dates_json TEXT NOT NULL DEFAULT '[]',
                        withheld INTEGER NOT NULL DEFAULT 0,
+                       updated_at REAL NOT NULL DEFAULT 0,
+                       screened_at REAL NOT NULL DEFAULT 0,
                        first_seen REAL NOT NULL,
                        last_seen REAL NOT NULL,
                        remote_candidates_json TEXT,
@@ -767,8 +770,12 @@ class BotMemory:
         occurrences, whatever order they arrive in. ``build(stored_evidence,
         occurrences, days, first_seen, last_seen)`` returns the title, body,
         evidence, labels and type; it is called for a new draft and for a
-        draft, never for an item past draft, which only gains occurrences. A
-        draft built cleanly is no longer withheld. Whatever ``build`` raises
+        draft, never for an item past draft, which only gains occurrences.
+        ``build`` checks the text against the running bot's full private
+        terms, so a stored render is also screened (``updated_at`` and
+        ``screened_at`` both set to the time of the write). A withheld item
+        stays withheld: only an explicit owner action (phase F6) may release
+        it. Whatever ``build`` raises
         leaves the row as it was. A new draft in a full queue first evicts
         the weakest draft (``_make_room``). Returns the id and whether it is
         new.
@@ -776,6 +783,9 @@ class BotMemory:
         folded = character.casefold()
         scope = (self.server, self.account, folded)
         day = time.strftime("%Y-%m-%d", time.gmtime(at))
+        # When the text was written (and screened), on the wall clock: the
+        # occurrence time ``at`` may be earlier.
+        written = time.time()
         with self._connect(timeout) as db:
             row = db.execute(
                 """SELECT id, status, occurrences, occurrence_keys_json, dates_json,
@@ -790,12 +800,13 @@ class BotMemory:
                     """INSERT INTO feedback_items
                            (server, account, character, fingerprint, repo, kind, subject,
                             title, body_md, labels_json, issue_type, evidence_json,
-                            occurrence_keys_json, dates_json, first_seen, last_seen)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            occurrence_keys_json, dates_json, first_seen, last_seen,
+                            updated_at, screened_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (*scope, fingerprint, repo, kind, subject, fields["title"],
                      fields["body_md"], fields["labels_json"], fields["issue_type"],
                      fields["evidence_json"], json.dumps([occurrence] if occurrence else []),
-                     json.dumps([day]), at, at))
+                     json.dumps([day]), at, at, written, written))
                 return int(cursor.lastrowid), True
             row_id, status, occurrences, keys_json, dates_json, first_seen, last_seen, stored = row
 
@@ -831,10 +842,11 @@ class BotMemory:
                 """UPDATE feedback_items SET occurrences = ?, days = ?,
                        occurrence_keys_json = ?, dates_json = ?, first_seen = ?,
                        last_seen = ?, title = ?, body_md = ?, labels_json = ?,
-                       issue_type = ?, evidence_json = ?, withheld = 0
+                       issue_type = ?, evidence_json = ?, updated_at = ?,
+                       screened_at = ?
                    WHERE id = ?""",
                 (*counts, fields["title"], fields["body_md"], fields["labels_json"],
-                 fields["issue_type"], fields["evidence_json"], row_id))
+                 fields["issue_type"], fields["evidence_json"], written, written, row_id))
         return int(row_id), False
 
     def _make_room(self, db: sqlite3.Connection, character: str) -> None:
@@ -869,6 +881,23 @@ class BotMemory:
                 """UPDATE feedback_items SET withheld = 1
                    WHERE server = ? AND account = ? AND character = ? AND id = ?""",
                 [(self.server, self.account, character.casefold(), item) for item in ids])
+
+    def mark_feedback_screened(self, character: str, ids: Iterable[int], *,
+                               at: float | None = None,
+                               timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
+        """Record that the running bot screened these items with its full
+        private terms (only those whose text changed since the last screen)."""
+        ids = [int(item) for item in ids]
+        if not ids:
+            return
+        at = time.time() if at is None else at
+        with self._connect(timeout) as db:
+            db.executemany(
+                """UPDATE feedback_items SET screened_at = ?
+                   WHERE server = ? AND account = ? AND character = ? AND id = ?
+                     AND screened_at < updated_at""",
+                [(at, self.server, self.account, character.casefold(), item)
+                 for item in ids])
 
     def withhold_feedback_fingerprint(self, character: str, fingerprint: str, *,
                                       timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
