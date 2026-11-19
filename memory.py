@@ -42,6 +42,15 @@ FACT_COLUMNS = ("id", "kind", "subject", "value", "confidence", "status",
                 "updated_at", "expires_at")
 
 
+def _add_column(db: sqlite3.Connection, table: str, definition: str) -> None:
+    """Add a column unless it exists (race-free: the duplicate is ignored)."""
+    try:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+    except sqlite3.OperationalError as error:
+        if "duplicate column name" not in str(error):
+            raise
+
+
 class BotMemory:
     """Small SQLite key/value store for durable autonomous decisions."""
 
@@ -147,14 +156,12 @@ class BotMemory:
             db.execute(
                 """CREATE INDEX IF NOT EXISTS facts_by_observation
                    ON facts (observation_id)""")
-            if "inputs" not in {row[1] for row in db.execute("PRAGMA table_info(facts)")}:
-                db.execute("ALTER TABLE facts ADD COLUMN inputs TEXT NOT NULL DEFAULT ''")
-            # The parser set that last read each observation (facts.VERSION):
-            # a repeat is read again only after the parsers change. Added to
-            # F1's table where it predates the column.
-            if "facts_version" not in {
-                    row[1] for row in db.execute("PRAGMA table_info(observations)")}:
-                db.execute("ALTER TABLE observations ADD COLUMN facts_version TEXT")
+            # Columns added after a table first shipped. Another process may
+            # add one at the same moment: an existing column is no error.
+            # facts_version is the parser set that last read an observation
+            # (facts.VERSION): a repeat is read again only after it changes.
+            _add_column(db, "facts", "inputs TEXT NOT NULL DEFAULT ''")
+            _add_column(db, "observations", "facts_version TEXT")
         self._chat_appends = 0
         self._observation_inserts = 0
         self._fact_inserts = 0
@@ -265,13 +272,16 @@ class BotMemory:
         """Store one observation (``Observation.row()``), or raise its seen
         count when the same text came from the same source before; returns
         the row id. ``timeout`` bounds the wait for a locked database."""
-        return self.record_observation_parsed(character, row, timeout=timeout)[0]
+        return self.record_observation_facts(character, row, timeout=timeout)[0]
 
-    def record_observation_parsed(self, character: str, row: dict[str, Any], *,
-                                  timeout: float = OBSERVATION_SAVE_TIMEOUT
-                                  ) -> tuple[int, str | None]:
-        """``record_observation``, also returning the parser set that last
-        read the row (None when none has)."""
+    def record_observation_facts(self, character: str, row: dict[str, Any],
+                                 facts: list[dict[str, Any]] = (), version: str = "", *,
+                                 timeout: float = OBSERVATION_SAVE_TIMEOUT
+                                 ) -> tuple[int, list[tuple[int, bool]]]:
+        """``record_observation`` and, in the same transaction, the facts
+        (``Fact.row()``) parser set ``version`` read from it, citing it.
+        A row that parser set already read stores no facts again. Returns
+        the row id and each stored fact's id and whether it is new."""
         folded = character.casefold()
         at = float(row["at"])
         with self._connect(timeout) as db:
@@ -291,7 +301,7 @@ class BotMemory:
                  int(bool(row.get("authored"))), str(row["text_hash"]),
                  str(row["text"])[:OBSERVATION_TEXT_LIMIT],
                  row.get("color") or "", row.get("msg_type")))
-            row_id, seen, version = db.execute(
+            row_id, seen, read_by = db.execute(
                 """SELECT id, seen, facts_version FROM observations
                    WHERE server = ? AND account = ? AND character = ?
                      AND source_key = ? AND text_hash = ?""",
@@ -301,7 +311,13 @@ class BotMemory:
                 self._observation_inserts += 1
                 if self._observation_inserts % OBSERVATION_PRUNE_EVERY == 0:
                     self._prune_observations(db, folded)
-        return int(row_id), version
+            stored: list[tuple[int, bool]] = []
+            if version and version != read_by:
+                stored = [self._upsert_fact(db, folded, {**fact, "observation_id": row_id})
+                          for fact in facts]
+                db.execute("UPDATE observations SET facts_version = ? WHERE id = ?",
+                           (version, row_id))
+        return int(row_id), stored
 
     def _prune_observations(self, db: sqlite3.Connection, character: str) -> None:
         """Evict the least recently seen unreferenced rows over the cap."""
@@ -377,18 +393,6 @@ class BotMemory:
         folded = character.casefold()
         with self._connect(timeout) as db:
             return self._upsert_fact(db, folded, row)
-
-    def record_facts(self, character: str, observation_id: int,
-                     rows: list[dict[str, Any]], version: str, *,
-                     timeout: float = FACT_SAVE_TIMEOUT) -> list[tuple[int, bool]]:
-        """Store the facts one observation gave, and that parser set
-        ``version`` read it, in one transaction."""
-        folded = character.casefold()
-        with self._connect(timeout) as db:
-            out = [self._upsert_fact(db, folded, row) for row in rows]
-            db.execute("UPDATE observations SET facts_version = ? WHERE id = ?",
-                       (version, int(observation_id)))
-        return out
 
     def _upsert_fact(self, db: sqlite3.Connection, folded: str,
                      row: dict[str, Any]) -> tuple[int, bool]:

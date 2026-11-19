@@ -1552,8 +1552,8 @@ Knowledge tab):
   locked."); `unopenable` values are `from-this-side` (0.6), `closed` and
   `blocked` (0.4, the 5.1 decoration doors). A `password` with no value is
   stored with an empty value.
-- Parsers run on each observation as it is stored; a repeat is read again
-  only when an older parser set (or none) read it, so rows F1 kept before
+- Parsers run on each observation as it is stored; a repeat stores facts
+  again only when an older parser set (or none) read it, so rows F1 kept before
   this phase gain facts the next time she sees them;
   there is no bulk backfill. They read only kept observations, so dialogue
   (`npc-key`, F13) and the journal (`quest-part`, not stored) have no input
@@ -1570,40 +1570,54 @@ Knowledge tab):
   observation row: system lines are deduplicated per map, so a second
   no-magic square on the same map adds no observation. A refusal is kept
   only when her recent cast explains it and it certainly belongs to that
-  cast: a square fact only when she still stood on the square she cast
-  from as the line arrived, a map fact only when she was still on the
-  cast's map. Otherwise nothing is kept. (#97's one-hour mark keeps its own
-  attribution, unchanged: a heal cast just before an exit, then a potion
-  on a no-magic map, still marks the first map for that hour, but never
-  makes a fact.) Each fact cites the stored observation of the same line
-  when there is one; the variant naming her item ("...the magic of your
-  %s") is not stored (F1), so its fact cites none and keeps no detail. The
-  countermagic lines join F1's fact lines. Classic has no no-prayer
-  refusal; "Powerful countermagic cancels all harmful magic here!" becomes
-  `no_harm` at the cast square (its message does not tell a no-harm map
-  from a no-harm square) and changes nothing.
+  cast: no step was sent after the last map update before the cast (a
+  step and a cast in one server tick move her first), and for a square
+  she still stood on the square she cast from as the line arrived, for a
+  map she was still on the cast's map. Otherwise nothing is kept. (#97's
+  one-hour mark keeps its own attribution, unchanged: a heal cast just
+  before an exit, then a potion on a no-magic map, still marks the first
+  map for that hour, but never makes a fact.) A path walk (`S_MOVE_PATH`)
+  counts as one step: a cast later in the same walk, after a map update,
+  is taken as certain. Each fact cites the stored observation of the same
+  line when there is one; the variant naming her item ("...the magic of
+  your %s") is not stored (F1), so its fact cites none and keeps no
+  detail. The countermagic lines join F1's fact lines. Classic has no
+  no-prayer refusal; "Powerful countermagic cancels all harmful magic
+  here!" becomes `no_harm` at the cast square (its message does not tell
+  a no-harm map from a no-harm square) and changes nothing.
 - Tile facts expire 7 days after the last refusal confirmed them
   (`expires_at`), and carry the locked content revision in a new `inputs`
   column (`content:<revision>`); a fact from another revision is ignored
   until a refusal confirms it again under the new one. A repeat refusal is
   written at most once an hour; a failed write waits a minute.
-- The flag is `--persist-tile-facts` or `ATRINIK_BOT_PERSIST_TILE_FACTS=1`.
-  On, `spell_blocked_here` also answers true on a square or map with a
-  live `no_magic` fact, for healing only: the emergency recall calls it
-  with `persisted=False`, so only this process's own refusals stop a
-  recall. Six hours after a fact was last confirmed or tried, and while
-  her health is at least half, one ordinary cast is let through (a 60 s
-  window); no tile refusal within 10 s of it refutes the fact (status
-  `refuted`, dropped from memory), a refusal refreshes it. A cast the
-  server silently dropped also refutes it; the next refusal confirms it
-  again. Off, it records a `tile-fact-no-magic-shadow` decision once a
-  square a process, and `spell_blocked_here` answers exactly as before
-  this phase. Tile-fact decisions save the decision ledger with a 0.25 s
-  timeout and never raise.
+- **The flag only reorders healing.** This narrows the acceptance above:
+  `spell_blocked_here` answers exactly as before this phase, flag or not,
+  so a remembered fact never stops a cast by itself, and never the
+  emergency recall. With `--persist-tile-facts` (or
+  `ATRINIK_BOT_PERSIST_TILE_FACTS=1`), `SafetyPolicy._known_heal` puts a
+  non-magical heal (a potion) before a spell, scroll, rod or wand on a
+  remembered square or map. A reconnect a day later with a potion casts
+  nothing there; with no other heal she casts, at any health, because a
+  refused cast costs nothing (`cast_spell` refuses before spending mana)
+  and a stale fact must not leave her without healing. Off, healing is
+  unchanged and a `tile-fact-no-magic-shadow` decision records once a
+  square a process where she would have put another heal first.
+- **Refutation needs no probe schedule.** Whatever the flag, her next spell
+  fired (or scroll read) on a remembered square or map is the test: no
+  refusal line of any kind (facts.CAST_REFUSAL: no-magic, countermagic, no
+  mana, denied, no target, out of range, too much magic, device refusals)
+  within 10 s refutes the fact (status `refuted`); a no-magic refusal
+  refreshes it; any other refusal proves nothing; a cast with a step in
+  flight is not judged. Applying a rod, a wand or a spell only readies it,
+  so it is no test. A cast the server dropped silently (her action timer)
+  also refutes; the next refusal confirms the fact again.
+- Tile-fact decisions save the decision ledger with a 0.25 s timeout and
+  never raise.
 - An observation records the parser set that last read it
-  (`observations.facts_version`, added to F1's table where missing); a
-  repeat is parsed again only after `facts.VERSION` changes, and an
-  observation's facts are written in one transaction.
+  (`observations.facts_version`, added to F1's table where missing, a
+  column another process added at the same moment being no error). Facts
+  are parsed before the observation is written and stored with it in one
+  transaction; a repeat the same parser set read stores none again.
 - Facts are capped at 20,000 a character, candidates first, least recently
   updated first; `facts_total{kind,status}` counts new facts.
 

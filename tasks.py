@@ -488,7 +488,7 @@ def _square(client: AtrinikClient) -> tuple[str, int, int]:
             int(getattr(m, "world_y", 0) or 0))
 
 
-def spell_blocked_here(client: AtrinikClient, *, persisted: bool = True) -> bool:
+def spell_blocked_here(client: AtrinikClient) -> bool:
     """Whether the server has refused her spells on the square she stands on.
 
     The server checks the caster's own square. A refusal is attributed to
@@ -499,10 +499,9 @@ def spell_blocked_here(client: AtrinikClient, *, persisted: bool = True) -> bool
 
     Each refusal is also offered to ``client.note_tile_refusal``, which
     keeps it as a persistent tile fact when it certainly belongs to her
-    cast (facts.py). With ``persisted`` (the default; healing), a remembered
-    fact decides here too, through ``client.tile_fact_blocks``, and only when
-    the owner sets ``persist_tile_facts``. The emergency recall passes
-    ``persisted=False``: only this process's own refusals ever stop it.
+    cast (facts.py), and ``client.resolve_tile_casts`` judges her last cast
+    on a remembered square. Remembered facts never decide here: they only
+    reorder healing (``SafetyPolicy._known_heal``).
     """
     blocked = getattr(client, "spell_blocked_squares", None)
     if blocked is None:
@@ -567,10 +566,10 @@ def spell_blocked_here(client: AtrinikClient, *, persisted: bool = True) -> bool
     for key, since in list(blocked.items()):
         if now - since >= SPELL_BLOCK_MEMORY_SECONDS:
             del blocked[key]
-    if square in blocked or (square[0], -1, -1) in blocked:
-        return True
-    decide = getattr(client, "tile_fact_blocks", None) if persisted else None
-    return bool(decide(square)) if decide is not None and square[0] else False
+    resolve = getattr(client, "resolve_tile_casts", None)
+    if callable(resolve):
+        resolve()
+    return square in blocked or (square[0], -1, -1) in blocked
 
 
 class TaskStatus(str, Enum):
@@ -655,10 +654,19 @@ class SafetyPolicy:
         (recall_waiting).
         """
         items = client.state.inventory
-        if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items) and (
-                recall_waiting(client) or spell_blocked_here(client)):
-            items = [item for item in items
+        if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items):
+            other = [item for item in items
                      if item.item_type not in MAGIC_BLOCKED_TYPES]
+            if recall_waiting(client) or spell_blocked_here(client):
+                items = other
+            else:
+                # A remembered no-magic square (persist_tile_facts) only puts
+                # another heal first; without one she casts, which tests it.
+                prefer = getattr(client, "tile_fact_prefers_other_heal", None)
+                if callable(prefer) and prefer(_square(client)) is True:
+                    found = self._find(other, self.healing_patterns)
+                    if found is not None:
+                        return found
         return self._find(items, self.healing_patterns)
 
     def _usable_heal(self, client: AtrinikClient) -> Item | None:
@@ -4792,9 +4800,7 @@ class FarmTask(BotTask):
             return False
         candidates = self.emergency_recall_candidates(client)
         # Every recall source is magic: none works where magic is blocked.
-        # A remembered tile fact never stops a recall: only this process's
-        # own refusals do.
-        if not candidates or spell_blocked_here(client, persisted=False):
+        if not candidates or spell_blocked_here(client):
             return False
         source = candidates[0]
         self._emergency_recall_source = source.tag

@@ -23365,6 +23365,7 @@ class ObservationTests(unittest.TestCase):
         client.state.map.path = path
         client.state.map.world_x, client.state.map.world_y = x, y
         # As a MAP2 update does.
+        client._position_at = time.monotonic()
         client._observe(lambda recorder: recorder.note_position(client.state))
 
     @staticmethod
@@ -23766,7 +23767,7 @@ class ObservationTests(unittest.TestCase):
         self.assertIn("death", [entry["action"] for entry in client.action_history])
         # A locked database drops the reading, not the line.
         del client.observations.on_message
-        with patch.object(type(client._memory_store()), "record_observation_parsed",
+        with patch.object(type(client._memory_store()), "record_observation_facts",
                           side_effect=sqlite3.OperationalError("database is locked")):
             self.say(client, "Something blocks your spellcasting.")
         self.assertEqual(client.state.messages[-1][3], "Something blocks your spellcasting.")
@@ -23984,43 +23985,6 @@ class FactTests(unittest.TestCase):
         metrics = client.metrics.registry.render()
         self.assertIn('kind="tile-property",status="confirmed"} 1', metrics)
 
-    def test_with_the_flag_on_a_reconnect_a_day_later_casts_nothing_there(self):
-        from .tasks import spell_blocked_here
-        self.cast_on_the_bed(self.client(), 3)
-        day_later = time.time() + 24 * 3600
-        with patch("time.time", return_value=day_later):
-            # Off (the default): #97's one-hour mark alone decides, and that
-            # mark died with the old process. The fact records a shadow.
-            shadow = self.client()
-            spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
-            spell.extra["cost"] = 3
-            shadow.state.place_item(spell, shadow.state.player_tag)
-            self.assertEqual(SafetyPolicy()._usable_heal(shadow).tag, 24)
-            self.assertEqual(
-                [r["detail"] for r in shadow.decision_history
-                 if r["action"] == "tile-fact-no-magic-shadow"],
-                [f"{self.BED[0]} (16,3)"])
-            # On: the remembered square stops every cast there.
-            client = self.client(persist=True)
-            client.state.place_item(spell, client.state.player_tag)
-            self.assertTrue(spell_blocked_here(client))
-            policy = SafetyPolicy()
-            self.assertIsNone(policy._usable_heal(client))
-            self.assertFalse(asyncio.run(policy._heal(client)))
-            client.send.assert_not_called()
-            # (The decision ledger is persisted: the shadow record came first.)
-            self.assertEqual([r["action"] for r in client.decision_history
-                              if r["action"].startswith("tile-fact")],
-                             ["tile-fact-no-magic-shadow", "tile-fact-no-magic"])
-            # The next square is not blocked, and a potion still heals here.
-            self.at(self.BED[0], 17, 3, client)
-            self.assertFalse(spell_blocked_here(client))
-            self.at(*self.BED, client)
-            potion = Item(27, item_type=c.TYPE_POTION, quality=100,
-                          name="potion of minor healing")
-            client.state.place_item(potion, client.state.player_tag)
-            self.assertEqual(policy._usable_heal(client).tag, 27)
-
     class Clock:
         """A wall clock the test moves (time.time everywhere)."""
 
@@ -24048,7 +24012,8 @@ class FactTests(unittest.TestCase):
             plain.state.phase = "playing"
             plain.state.stats.update(ours.state.stats)
             plain.note_tile_refusal = None
-            plain.tile_fact_blocks = None
+            plain.resolve_tile_casts = None
+            plain.tile_fact_prefers_other_heal = None
             spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
             potion = Item(27, item_type=c.TYPE_POTION, name="potion of minor healing")
             for client in (ours, plain):
@@ -24077,10 +24042,12 @@ class FactTests(unittest.TestCase):
                     elif step[0] == "say":
                         self.say(client, step[1])
                     else:
-                        results[id(client)].append(spell_blocked_here(client))
+                        heal = SafetyPolicy()._usable_heal(client)
+                        results[id(client)].append(
+                            (spell_blocked_here(client), heal and heal.tag))
             self.assertEqual(results[id(ours)], results[id(plain)])
-            self.assertIn(True, results[id(ours)])
-            self.assertIn(False, results[id(ours)])
+            self.assertEqual({blocked for blocked, _ in results[id(ours)]}, {True, False})
+            self.assertEqual({heal for _, heal in results[id(ours)]}, {24, 27})
 
     def test_a_remembered_fact_never_stops_an_emergency_recall(self):
         from .tasks import spell_blocked_here
@@ -24093,8 +24060,8 @@ class FactTests(unittest.TestCase):
             recall.extra["cost"] = 5
             client.state.place_item(recall, client.state.player_tag)
             client.state.stats.update(hp=10, maxhp=100)
-            self.assertTrue(spell_blocked_here(client))
-            self.assertFalse(spell_blocked_here(client, persisted=False))
+            # Facts never block here: only this process's own refusals do.
+            self.assertFalse(spell_blocked_here(client))
             fired = []
 
             async def fire(direction, tag=0):
@@ -24166,78 +24133,153 @@ class FactTests(unittest.TestCase):
         from .client import _locked_content_inputs
         self.assertRegex(_locked_content_inputs(), r"^content:[0-9a-f]{40}$")
 
-    def test_a_remembered_square_is_probed_and_refuted_without_a_refusal(self):
+    def test_with_the_flag_on_a_remembered_square_puts_another_heal_first(self):
         from .tasks import spell_blocked_here
-        clock = self.Clock()
-        self.remembered_bed(clock)
-        clock.now += 7 * 3600
-        with patch("time.time", clock):
+        self.cast_on_the_bed(self.client(), 3)
+        spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+        spell.extra["cost"] = 3
+        potion = Item(27, item_type=c.TYPE_POTION, quality=100, name="potion of minor healing")
+        with patch("time.time", return_value=time.time() + 24 * 3600):
+            # Off (the default): healing is as before, and the fact records
+            # once that she would have put the potion first.
+            shadow = self.client()
+            for item in (spell, potion):
+                shadow.state.place_item(item, shadow.state.player_tag)
+            self.assertEqual(SafetyPolicy()._usable_heal(shadow).tag, 24)
+            SafetyPolicy()._usable_heal(shadow)
+            self.assertEqual(
+                [r["detail"] for r in shadow.decision_history
+                 if r["action"] == "tile-fact-no-magic-shadow"],
+                [f"{self.BED[0]} (16,3)"])
+            # On: a reconnect a day later heals with the potion, and casts
+            # nothing on that square.
             client = self.client(persist=True)
-            spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
-            spell.extra["cost"] = 3
-            client.state.place_item(spell, client.state.player_tag)
-            # Badly hurt: no probe.
-            self.assertTrue(spell_blocked_here(client))
-            client.state.stats.update(hp=60, maxhp=100)
-            # One ordinary cast is allowed, and only one.
-            self.assertFalse(spell_blocked_here(client))
-            self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 24)
-            asyncio.run(client.fire(0, 24))
-            self.assertTrue(spell_blocked_here(client))
-            clock.now += 11
-            # No refusal came: the fact is refuted.
-            self.assertFalse(spell_blocked_here(client))
-            self.assertEqual(client.tile_facts[self.BED], {})
-            fact, = self.facts(client)
-            self.assertEqual(fact["status"], "refuted")
-            self.assertEqual(self.client(persist=True).tile_facts, {})
-            actions = [r["action"] for r in client.decision_history
-                       if r["action"].startswith("tile-fact")]
-            self.assertEqual(actions[-3:], ["tile-fact-no-magic", "tile-fact-probe",
-                                            "tile-fact-refuted"])
-            # A later refusal confirms it again.
-            self.cast_on_the_bed(client, 1)
-            self.assertEqual(self.facts(client)[0]["status"], "confirmed")
+            for item in (spell, potion):
+                client.state.place_item(item, client.state.player_tag)
+            fired = []
 
-    def test_a_probe_refused_refreshes_the_fact_and_waits_again(self):
+            async def fire(direction, tag=0):
+                fired.append(tag)
+
+            client.fire = fire
+            policy = SafetyPolicy()
+            self.assertFalse(spell_blocked_here(client))
+            self.assertTrue(asyncio.run(policy._heal(client)))
+            self.assertEqual(fired, [])
+            self.assertEqual(policy._usable_heal(client).tag, 27)
+            # (The decision ledger is persisted: the shadow record came first.)
+            self.assertEqual([r["action"] for r in client.decision_history
+                              if r["action"].startswith("tile-fact")],
+                             ["tile-fact-no-magic-shadow", "tile-fact-no-magic"])
+            # Elsewhere the spell comes first again.
+            self.at(self.BED[0], 17, 3, client)
+            self.assertEqual(policy._usable_heal(client).tag, 24)
+
+    def test_with_no_other_heal_she_casts_there_at_any_health(self):
         from .tasks import spell_blocked_here
         clock = self.Clock()
         self.remembered_bed(clock)
         first = self.facts(self.client())[0]["updated_at"]
-        clock.now += 7 * 3600
+        clock.now += 24 * 3600
         with patch("time.time", clock):
             client = self.client(persist=True)
-            client.state.stats.update(hp=60, maxhp=100)
-            self.assertFalse(spell_blocked_here(client))
-            self.cast_on_the_bed(client, 1)
+            client.state.stats.update(hp=40, maxhp=100)
+            spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+            spell.extra["cost"] = 3
+            client.state.place_item(spell, client.state.player_tag)
+            policy = SafetyPolicy()
+            # No potion: the heal is attempted; the attempt tests the fact.
+            self.assertEqual(policy._usable_heal(client).tag, 24)
+            self.assertTrue(asyncio.run(policy._heal(client)))
+            self.say(client, "Something blocks your spellcasting.")
+            # Refused: #97's live mark stops the next cast, and the fact is
+            # refreshed.
             self.assertTrue(spell_blocked_here(client))
+            self.assertIsNone(policy._usable_heal(client))
             fact, = self.facts(client)
             self.assertEqual((fact["status"], fact["updated_at"]), ("confirmed", clock.now))
             self.assertGreater(fact["updated_at"], first)
-            # Past the live mark's hour (it runs on the monotonic clock), the
-            # probe resolves as refused; a restart within six hours of the
-            # refusal blocks without another probe.
-            clock.now += 3601
-            client.spell_blocked_squares.clear()
-            self.assertTrue(spell_blocked_here(client))
-            self.assertIn("tile-fact-probe-refused",
-                          [r["action"] for r in client.decision_history])
-            later = self.client(persist=True)
-            later.state.stats.update(hp=60, maxhp=100)
-            self.assertTrue(spell_blocked_here(later))
 
-    def test_tile_fact_writes_and_decisions_never_hold_up_play(self):
-        from .memory import BotMemory
+    def test_a_cast_there_with_no_refusal_refutes_the_fact(self):
         from .tasks import spell_blocked_here
         clock = self.Clock()
         self.remembered_bed(clock)
         clock.now += 2 * 3600
         with patch("time.time", clock):
+            client = self.client(persist=True)
+            self.cast_on_the_bed(client, 0)
+            asyncio.run(SafetyPolicy()._heal(client))
+            # The answer is not due yet.
+            self.assertFalse(spell_blocked_here(client))
+            self.assertEqual(self.facts(client)[0]["status"], "confirmed")
+            clock.now += 11
+            self.assertFalse(spell_blocked_here(client))
+            fact, = self.facts(client)
+            self.assertEqual(fact["status"], "refuted")
+            self.assertEqual(client.tile_facts[self.BED], {})
+            self.assertEqual(self.client(persist=True).tile_facts, {})
+            self.assertIn("tile-fact-refuted", [r["action"] for r in client.decision_history])
+            # A later refusal confirms it again.
+            self.cast_on_the_bed(client, 1)
+            self.assertEqual(self.facts(client)[0]["status"], "confirmed")
+
+    def test_a_cast_refused_for_another_reason_proves_nothing(self):
+        from .tasks import spell_blocked_here
+        clock = self.Clock()
+        self.remembered_bed(clock)
+        first = self.facts(self.client())[0]
+        clock.now += 2 * 3600
+        with patch("time.time", clock):
+            client = self.client(persist=True)
+            self.cast_on_the_bed(client, 0)
+            for answer in ("You don't have enough mana.", "You can't cast that spell on rat!"):
+                asyncio.run(client.fire(0, 24))
+                self.say(client, answer)
+                clock.now += 11
+                self.assertFalse(spell_blocked_here(client))
+            fact, = self.facts(client)
+            self.assertEqual((fact["status"], fact["updated_at"]),
+                             ("confirmed", first["updated_at"]))
+
+    def test_a_cast_with_a_step_in_flight_is_neither_kept_nor_judged(self):
+        from .tasks import spell_blocked_here
+        client = self.client()
+        spell = self.cast_on_the_bed(client, 0)
+        # A step sent, then a cast before the map update that places her.
+        asyncio.run(client.move(3))
+        asyncio.run(client.fire(0, spell.tag))
+        self.say(client, "Something blocks your spellcasting.")
+        spell_blocked_here(client)
+        self.assertEqual((self.facts(client), client.tile_facts), ([], {}))
+        # Once a map update has placed her, a cast is certain again.
+        self.at(*self.BED, client)
+        self.cast_on_the_bed(client, 1)
+        self.assertEqual(len(self.facts(client)), 1)
+        # And a remembered fact is not refuted by an uncertain cast.
+        clock = self.Clock()
+        with patch("time.time", clock):
+            clock.now += 2 * 3600
+            later = self.client(persist=True)
+            later.state.place_item(spell, later.state.player_tag)
+            asyncio.run(later.move(3))
+            asyncio.run(later.fire(0, spell.tag))
+            clock.now += 11
+            spell_blocked_here(later)
+            self.assertEqual(self.facts(later)[0]["status"], "confirmed")
+
+    def test_tile_fact_writes_and_decisions_never_hold_up_play(self):
+        from .memory import BotMemory
+        clock = self.Clock()
+        self.remembered_bed(clock)
+        clock.now += 2 * 3600
+        with patch("time.time", clock):
             client = self.client()
+            spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+            client.state.place_item(spell, client.state.player_tag)
             locked = sqlite3.OperationalError("database is locked")
             # The shadow decision's save fails: no error, and no long wait.
             with patch.object(BotMemory, "save", side_effect=locked) as save:
-                self.assertFalse(spell_blocked_here(client))
+                self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 24)
             self.assertEqual(save.call_args.kwargs["timeout"], 0.25)
             # A failed write is not retried on every refusal.
             other = self.client(path="other.sqlite3")
@@ -24245,29 +24287,83 @@ class FactTests(unittest.TestCase):
                 self.cast_on_the_bed(other, 5)
             self.assertEqual(record.call_count, 1)
 
-    def test_a_repeat_is_not_parsed_again(self):
-        from . import facts as facts_module
+    def test_a_repeat_stores_its_facts_once_in_its_own_transaction(self):
+        from .memory import BotMemory
         client = self.client()
         self.at("/test/room", 5, 5, client)
+        upsert = BotMemory._upsert_fact
         calls = []
-        parse = facts_module.parse
 
-        def counting(*args, **kwargs):
-            calls.append(args[0]["source_key"])
-            return parse(*args, **kwargs)
+        def counting(store, db, folded, row):
+            calls.append(row["observation_id"])
+            return upsert(store, db, folded, row)
 
-        with patch.object(facts_module, "parse", counting):
+        with patch.object(BotMemory, "_upsert_fact", counting), \
+                patch.object(BotMemory, "record_fact") as separate:
             for _ in range(3):
                 asyncio.run(client.move(1))
                 self.say(client, "You need a special key to open this door.", color="00ffff")
-            self.assertEqual(calls, ["door:/test/room:5,4"])
+            self.assertEqual(len(calls), 1)
             # A row an older parser set read (or F1 stored) is read again.
             with client._memory_store()._connect() as db:
                 db.execute("UPDATE observations SET facts_version = NULL")
             asyncio.run(client.move(1))
             self.say(client, "You need a special key to open this door.", color="00ffff")
             self.assertEqual(len(calls), 2)
+        separate.assert_not_called()
         self.assertEqual(len(self.facts(client)), 1)
+
+    def test_an_f1_database_gains_the_new_columns(self):
+        from .memory import BotMemory, _add_column
+        path = Path(self.directory.name) / "f1.sqlite3"
+        with sqlite3.connect(path) as db:
+            # F1's observations table, and the facts table of F2's first
+            # draft, before facts_version and inputs.
+            db.execute(
+                """CREATE TABLE observations (
+                       id INTEGER PRIMARY KEY, server TEXT NOT NULL,
+                       account TEXT NOT NULL, character TEXT NOT NULL,
+                       first_at REAL NOT NULL, last_at REAL NOT NULL,
+                       seen INTEGER NOT NULL DEFAULT 1, map TEXT, x INTEGER, y INTEGER,
+                       source_kind TEXT NOT NULL, source_key TEXT NOT NULL,
+                       source_name TEXT, attribution TEXT NOT NULL,
+                       authored INTEGER NOT NULL, text_hash TEXT NOT NULL,
+                       text TEXT NOT NULL, color TEXT, msg_type INTEGER)""")
+            db.execute(
+                """INSERT INTO observations (server, account, character, first_at,
+                       last_at, source_kind, source_key, attribution, authored,
+                       text_hash, text)
+                   VALUES ('s', 'a', 'sera', 1, 1, 'door', 'door:/m:1,1', 'timing', 1,
+                           'h', 'You need Asteria Dungeon Key 2 to pass.')""")
+            db.execute(
+                """CREATE TABLE facts (
+                       id INTEGER PRIMARY KEY, server TEXT NOT NULL,
+                       account TEXT NOT NULL, character TEXT NOT NULL,
+                       kind TEXT NOT NULL, subject TEXT NOT NULL, value TEXT NOT NULL,
+                       confidence REAL NOT NULL, status TEXT NOT NULL,
+                       observation_id INTEGER, parser TEXT NOT NULL,
+                       detail TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+                       updated_at REAL NOT NULL, expires_at REAL)""")
+        store = BotMemory(path, server="s", account="a")
+        # Two processes opening it at once: the second finds the columns.
+        BotMemory(path, server="s", account="a")
+        with store._connect() as db:
+            self.assertIn("facts_version",
+                          {row[1] for row in db.execute("PRAGMA table_info(observations)")})
+            self.assertIn("inputs", {row[1] for row in db.execute("PRAGMA table_info(facts)")})
+            # A racing process's column is no error; another failure is.
+            _add_column(db, "facts", "inputs TEXT NOT NULL DEFAULT ''")
+            with self.assertRaises(sqlite3.OperationalError):
+                _add_column(db, "missing_table", "x TEXT")
+        row_id, stored = store.record_observation_facts(
+            "Sera", {"at": 2.0, "source_kind": "door", "source_key": "door:/m:1,1",
+                     "attribution": "timing", "authored": 1, "text_hash": "h",
+                     "text": "You need Asteria Dungeon Key 2 to pass."},
+            [{"kind": "key-name", "subject": "door:/m:1,1", "value": "Asteria Dungeon Key 2",
+              "confidence": 0.6, "status": "candidate", "parser": "key-name/1", "at": 2.0}],
+            "facts/1")
+        self.assertEqual((row_id, [created for _, created in stored]), (1, [True]))
+        self.assertEqual(store.facts("Sera")[0]["observation_id"], 1)
 
     def test_whole_map_countermagic_and_no_harm_are_tile_facts(self):
         from .tasks import spell_blocked_here
@@ -24287,7 +24383,8 @@ class FactTests(unittest.TestCase):
         self.assertTrue(all(f["observation_id"] for f in self.facts(client)))
         later = self.client(persist=True)
         self.at("/test/room", 9, 9, later)
-        self.assertTrue(spell_blocked_here(later))
+        self.assertFalse(spell_blocked_here(later))
+        self.assertTrue(later.tile_fact_prefers_other_heal(("/test/room", 9, 9)))
 
     def test_stored_observations_give_facts_that_cite_them(self):
         client = self.client()

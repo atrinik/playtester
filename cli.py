@@ -70,8 +70,8 @@ def parser() -> argparse.ArgumentParser:
         "--persist-tile-facts", action="store_true",
         default=os.getenv("ATRINIK_BOT_PERSIST_TILE_FACTS", "").strip().casefold()
         in ("1", "true", "yes", "on"),
-        help="let remembered no-magic squares stop her casting there after a "
-             "restart (default: off, the facts are only recorded and shown)",
+        help="on remembered no-magic squares, heal with a potion before a spell "
+             "(default: off, the facts are only recorded and shown)",
     )
     p.add_argument("--register", action="store_true")
     p.add_argument("--create-character", action="store_true")

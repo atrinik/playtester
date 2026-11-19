@@ -14,8 +14,9 @@ Facts come only from two places, so no other player's text reaches them:
 - the fixed server refusals that ``tasks.spell_blocked_here`` attributes to
   the square of her cast (``tile_property``).
 
-Nothing here changes what she does. ``tasks.spell_blocked_here`` reads tile
-facts only when the owner sets ``persist_tile_facts``.
+Nothing here changes what she does. Only ``SafetyPolicy._known_heal`` reads
+tile facts, and only when the owner sets ``persist_tile_facts``: they put a
+non-magical heal first on a remembered no-magic square.
 """
 
 from __future__ import annotations
@@ -44,14 +45,20 @@ VERSION = "facts/1"
 # Tile facts (4.11.1) lapse after a week unless a refusal refreshes them,
 # and count only under the content revision they were seen with.
 TILE_FACT_SECONDS = 7 * 24 * 3600.0
-# With persist_tile_facts on, a remembered square or map is tried again
-# with one ordinary cast this long after it was last confirmed or tried
-# (and only when she is not hurt badly, TILE_PROBE_MIN_HEALTH); no refusal
-# within the attribution window refutes the fact, a refusal refreshes it.
-TILE_PROBE_SECONDS = 6 * 3600.0
-TILE_PROBE_WINDOW_SECONDS = 60.0
-TILE_PROBE_MIN_HEALTH = 0.5
-TILE_PROBE_ANSWER_SECONDS = 10.0
+# A cast of hers on a remembered no-magic square or map that draws no
+# refusal of any kind within this long refutes the fact.
+TILE_CAST_ANSWER_SECONDS = 10.0
+# What the server answers when it refuses a cast for any reason
+# (spell_util.c cast_spell and fire, spell_effect.c cast_wor, types/rod.c):
+# after such a line the cast proves nothing about the square.
+CAST_REFUSAL = re.compile(
+    r"^(?:Something blocks .+|Powerful countermagic cancels .+|"
+    r"It is denied for you to cast that spell|You don't have enough mana|"
+    r"You can't cast that spell on .+|Your target is out of range|"
+    r"There is too much magic in motion to cast that spell|"
+    r"You can't fire that at yourself|"
+    r"The .+ (?:whines for a while, but nothing happens|is impossible to handle for you))"
+    r"[.!]?$", re.I)
 # The longest a tile-fact decision waits to save the decision ledger.
 TILE_DECISION_SAVE_SECONDS = 0.25
 

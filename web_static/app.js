@@ -666,7 +666,7 @@ function renderFacts(k) {
   }
   const total = kinds.reduce((sum, x) => sum + counts[x], 0);
   $("#facts-summary").textContent = `${total.toLocaleString()} fact${total === 1 ? "" : "s"} kept · no-magic tile facts ` +
-    (k.persist_tile_facts ? "stop her casting (persist_tile_facts on)" : "are recorded only (persist_tile_facts off)");
+    (k.persist_tile_facts ? "put a potion before a spell there (persist_tile_facts on)" : "are recorded only (persist_tile_facts off)");
   const when = t => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   const rows = (k.facts || []).map(f => {
     const row = node("div", "reading fact");

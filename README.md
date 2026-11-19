@@ -323,28 +323,30 @@ answer to her own recent cast, the square of the cast (or the whole map)
 is kept as a confirmed `tile-property: no_magic` fact, besides the one-hour
 mark idle survival already sets; "Powerful countermagic cancels all
 harmful magic here!" is kept as `no_harm` and changes nothing. A fact is
-kept only when the refusal certainly belongs to the cast: for a square,
-she still stands where she cast; for a map, she is still on the cast's
-map. A refusal after a step or an exit (a potion drunk on the next map,
-say) is kept as nothing. Tile facts lapse after 7 days unless a refusal
-refreshes them, and count only under the content revision they were seen
-with (the locked `atrinik/content` revision, in the fact's `inputs`).
+kept only when the refusal certainly belongs to the cast: no step was in
+flight when she cast, and for a square she still stands where she cast,
+for a map she is still on the cast's map. Anything else (a potion drunk
+after an exit, a cast in the same tick as a step) is kept as nothing.
+Tile facts lapse after 7 days unless a refusal refreshes them, and count
+only under the content revision they were seen with (the locked
+`atrinik/content` revision, in the fact's `inputs`).
 
-Whether a remembered no-magic square stops her casting after a restart is
-the owner's choice:
+A remembered fact never blocks anything by itself; idle survival's
+one-hour mark still alone stops casts, the emergency recall included.
+With `--persist-tile-facts` (or `ATRINIK_BOT_PERSIST_TILE_FACTS=1`), a
+remembered no-magic square or map only reorders healing: a potion or
+other non-magical heal comes before a spell, scroll, rod or wand there
+(`tile-fact-no-magic`, once a square). With no other heal she casts
+anyway, at any health: a refused cast costs nothing, and that cast tests
+the fact. Off (the default), healing is unchanged and a
+`tile-fact-no-magic-shadow` decision records once a square where she
+would have put another heal first.
 
-- `--persist-tile-facts` (or `ATRINIK_BOT_PERSIST_TILE_FACTS=1`): she heals
-  with no spell, scroll, rod or wand on a remembered square or map (potions
-  still work) and records a `tile-fact-no-magic` decision once a square.
-  Six hours after the fact was last confirmed or tried, and only while her
-  health is at least half, she may try one ordinary cast there
-  (`tile-fact-probe`): no refusal within 10 seconds refutes the fact
-  (`tile-fact-refuted`, status `refuted`), a refusal refreshes it
-  (`tile-fact-probe-refused`). The emergency recall never consults a
-  remembered fact: only a refusal in this process stops it.
-- Off (the default): the facts are written and shown, the one-hour mark
-  alone decides, and a `tile-fact-no-magic-shadow` decision records once a
-  square where she would have held off.
+Whatever the flag, a spell she fires or a scroll she reads on a
+remembered square or map that draws no refusal of any kind within 10
+seconds refutes the fact (status `refuted`, `tile-fact-refuted`); a
+no-magic refusal refreshes it, and any other refusal (no mana, no
+target, denied) proves nothing.
 
 ## Operator assist
 
