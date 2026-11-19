@@ -27,8 +27,10 @@ from .face_images import FaceImages
 from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from .alerts import active as active_alerts
 from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_farm_objective,
+                         CARE_OWNER_BLOCK, CARE_WAIT_SECONDS,
                          FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
+from . import route_blocks
 from .navigation_spots import navigation_spot_catalog
 from .unlocks import gate_counts, unlock_state
 from .operator_assist import (KEY_HEADER, MAX_GOLD_PER_RUN, OperatorAssist,
@@ -284,6 +286,91 @@ class DashboardState:
             gates = self._gate_counts = gate_counts(self.graph)
         return unlock_state(self.client, self.graph).summary(gates)
 
+    # Decisions the Blocks section lists: each care crossing and its outcome.
+    CARE_ACTIONS = ("essential-route-override", "essential-care-starving",
+                    "essential-care-food",
+                    "essential-care-timeout", "essential-care-alert",
+                    "essential-care-wait", "essential-care-staging",
+                    "essential-care-yield")
+    # A food trip's crossing (hungry or starving) stays alerted this long
+    # (seconds).
+    STARVING_CROSSING_ALERT_SECONDS = 3600.0
+
+    def care_crossings(self) -> list[dict[str, Any]]:
+        """Every care crossing under way: her task tree and idle survival."""
+        roots = [self.engine.task, getattr(getattr(self.engine, "idle_survival", None),
+                                           "child", None)]
+        found, seen = [], set()
+        pending = [(root, 0) for root in roots]
+        while pending:
+            current, depth = pending.pop()
+            if not isinstance(current, BotTask) or id(current) in seen or depth > 10:
+                continue
+            seen.add(id(current))
+            if isinstance(current, NavigateTask):
+                status = current.care_status()
+                if status is not None and current.status in (TaskStatus.READY,
+                                                             TaskStatus.RUNNING):
+                    found.append(status)
+            for value in vars(current).values():
+                if isinstance(value, BotTask):
+                    pending.append((value, depth + 1))
+        return found
+
+    def route_blocks(self) -> dict[str, Any]:
+        """The owner's blocks, the care crossings under way and the recent
+        crossing decisions (docs/ROUTING.md 4.7, 4.8)."""
+        now = time.time()
+        blocks = [{**row, "remaining_seconds": round(row["until"] - now)}
+                  for row in route_blocks.active_blocks(self.client, now=now)]
+        decisions = [record for record in self.client.decision_history[-2000:]
+                     if isinstance(record, dict) and
+                     record.get("action") in self.CARE_ACTIONS]
+        return {"blocks": blocks, "care": self.care_crossings(),
+                "decisions": [{key: record.get(key) for key in
+                               ("time", "action", "detail", "map", "task")}
+                              for record in reversed(decisions[-25:])],
+                "min_seconds": route_blocks.MIN_BLOCK_SECONDS,
+                "max_seconds": route_blocks.MAX_BLOCK_SECONDS,
+                "character_loaded": bool(getattr(self.client, "_memory_character", "")),
+                "care_wait_seconds": CARE_WAIT_SECONDS}
+
+    def care_alerts(self) -> list[dict[str, str]]:
+        """A care wait across an owner block past CARE_WAIT_SECONDS, and a
+        food trip's crossing, hungry or starving (owner-approved; ROUTING 4.5)."""
+        alerts = []
+        for care in self.care_crossings():
+            subjects = ", ".join(care["subjects"])
+            if (care["mode"] == CARE_OWNER_BLOCK and not care["cleared"] and
+                    care["waiting_seconds"] >= CARE_WAIT_SECONDS):
+                alerts.append({
+                    "id": "essential-care-wait", "level": "critical",
+                    "text": (f"Essential {care['trip']} trip waiting "
+                             f"{int(care['waiting_seconds'] // 60)} min to cross the "
+                             f"owner block {subjects}: needs "
+                             f"{', '.join(care['missing']) or 'nothing more'}")})
+            if care["cleared"] and care.get("food"):
+                alerts.append({
+                    "id": ("essential-care-starving" if care["starving"]
+                           else "essential-care-food"), "level": "critical",
+                    "text": (f"{'Starving' if care['starving'] else 'Hungry'}: food trip "
+                             f"crossing the owner block {subjects} with only a ready "
+                             "recall and hold-fire")})
+        food_ids = ("essential-care-starving", "essential-care-food")
+        if not any(alert["id"] in food_ids for alert in alerts):
+            cutoff = time.time() - self.STARVING_CROSSING_ALERT_SECONDS
+            latest = next((record for record in reversed(self.client.decision_history)
+                           if isinstance(record, dict) and
+                           record.get("action") in food_ids and
+                           float(record.get("time", 0.0) or 0.0) >= cutoff), None)
+            if latest is not None:
+                alerts.append({
+                    "id": latest["action"], "level": "warn",
+                    "text": ("A food trip crossed an owner block in the last hour "
+                             "with only a recall and hold-fire: "
+                             f"{latest.get('detail', '')}")})
+        return alerts
+
     def quest_journal(self) -> list[dict[str, Any]]:
         """Return only the live entries supplied by the server's Q journal."""
         return [{
@@ -448,6 +535,8 @@ class DashboardState:
                     "progress_age_seconds": (round(progress_age, 1)
                                              if progress_age is not None else
                                              None),
+                    "essential": current.essential,
+                    "care": current.care_status(),
                 }
             if isinstance(current, FarmTask):
                 engaged = (current._engaged_target[0]
@@ -557,8 +646,12 @@ class DashboardState:
                                  if autoplay else None),
             task_running=task is not None, waiting_explained=waiting,
             engine_error=self.engine_error())
-        alerts[0:0] = [alert for alert in unsafe if alert["level"] == "critical"]
-        alerts += [alert for alert in unsafe if alert["level"] != "critical"]
+        care = self.care_alerts()
+        if any(alert["id"] == "essential-care-wait" for alert in care):
+            # The care alert explains the wait; no stuck alert besides it.
+            alerts = [alert for alert in alerts if alert["id"] != "stuck"]
+        alerts[0:0] = [alert for alert in unsafe + care if alert["level"] == "critical"]
+        alerts += [alert for alert in unsafe + care if alert["level"] != "critical"]
         assist = self.operator_assist_status()
         if assist and assist["running"]:
             alerts.append({"id": "operator-assist-running", "level": "warn",
@@ -699,6 +792,7 @@ class DashboardState:
             "quests_loaded": state.quests_loaded, "quests": self.quests(),
             "quest_journal": self.quest_journal(),
             "unlocks": self.unlocks(),
+            "route_blocks": self.route_blocks(),
             "farming_analysis": self.farming_analysis(),
             "post_mortems": list(reversed(
                 getattr(self.client, "post_mortems", [])[-10:])),
@@ -900,7 +994,8 @@ class WebControlServer:
         labels = {200: "OK", 201: "Created", 204: "No Content",
                   400: "Bad Request", 403: "Forbidden", 404: "Not Found",
                   405: "Method Not Allowed", 415: "Unsupported Media Type",
-                  409: "Conflict", 413: "Content Too Large", 500: "Internal Server Error"}
+                  409: "Conflict", 413: "Content Too Large", 500: "Internal Server Error",
+                  503: "Service Unavailable"}
         header = (f"HTTP/1.1 {status} {labels.get(status, 'Error')}\r\n"
                   f"Content-Type: {content_type}\r\nContent-Length: {len(body)}\r\n"
                   f"Cache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\n"
@@ -1067,6 +1162,22 @@ class WebControlServer:
                 "ok": record["outcome"] == "completed",
                 "outcome": record["outcome"], "record": record}))
             return
+        if method == "POST" and path == "/api/route-blocks":
+            # The owner's blocks (docs/ROUTING.md 4.7): behind the loopback
+            # listener, the Host check and the Origin check every POST gets,
+            # and, as for the operator assist, only as JSON, which an HTML
+            # form cannot send cross-site.
+            content_type = (headers or {}).get("content-type", "").split(";")[0].strip()
+            if content_type.casefold() != "application/json":
+                await self._reply(writer, 415, _json_bytes({
+                    "ok": False, "error": "send application/json"}))
+                return
+            data = json.loads(body or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("expected a JSON object")
+            status, result = self._route_block_write(data)
+            await self._reply(writer, status, _json_bytes(result))
+            return
         if method == "POST" and path in ("/api/task", "/api/action"):
             data = json.loads(body or b"{}")
             result = (await self._set_task(data) if path == "/api/task"
@@ -1081,6 +1192,31 @@ class WebControlServer:
             await self._reply(writer, 200, (STATIC / filename).read_bytes(), content_type)
             return
         await self._reply(writer, 404, _json_bytes({"error": "not found"}))
+
+    def _route_block_write(self, data: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Add or remove one owner block; (HTTP status, reply)."""
+        kind = data.get("action")
+        try:
+            if kind == "add":
+                row = route_blocks.add_block(
+                    self.client, self.graph, data.get("subject"),
+                    data.get("seconds"), data.get("note", ""))
+                self.client.record_action(
+                    "route-block", f"{row['subject']} until {int(row['until'])}"
+                    + (f": {row['note']}" if row["note"] else ""))
+                return 200, {"ok": True, "block": row}
+            if kind == "remove":
+                subject = data.get("subject")
+                if not route_blocks.remove_block(self.client, subject):
+                    return 404, {"ok": False, "error": "no such block"}
+                self.client.record_action("route-unblock", str(subject).strip())
+                return 200, {"ok": True}
+        except sqlite3.Error as exc:
+            log.warning("route block write failed: %s", exc)
+            return 503, {"ok": False, "error": "her memory database is busy; try again"}
+        except ValueError as exc:
+            return 400, {"ok": False, "error": str(exc)}
+        return 400, {"ok": False, "error": "action must be add or remove"}
 
     KEY_REFUSAL_LOG_SECONDS = 60.0
 

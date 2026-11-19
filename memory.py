@@ -162,6 +162,20 @@ class BotMemory:
             # (facts.VERSION): a repeat is read again only after it changes.
             _add_column(db, "facts", "inputs TEXT NOT NULL DEFAULT ''")
             _add_column(db, "observations", "facts_version TEXT")
+            # The owner's route and map blocks (docs/ROUTING.md 4.7): each a
+            # transit wall until ``until`` (wall clock), set and removed only
+            # from the loopback dashboard (route_blocks.py).
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS route_blocks (
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       subject TEXT NOT NULL,
+                       created_at REAL NOT NULL,
+                       until REAL NOT NULL,
+                       note TEXT NOT NULL DEFAULT '',
+                       PRIMARY KEY (server, account, character, subject)
+                   )""")
         self._chat_appends = 0
         self._observation_inserts = 0
         self._fact_inserts = 0
@@ -507,6 +521,50 @@ class BotMemory:
                 (self.server, self.account, character.casefold(), float(now),
                  inputs, FACT_ROW_LIMIT)).fetchall()
         return [(str(subject), str(value), float(at)) for subject, value, at in rows]
+
+    def set_route_block(self, character: str, subject: str, *, created_at: float,
+                        until: float, note: str = "", timeout: float = 10.0) -> None:
+        """Store one owner block (a new one, or a new expiry for the same
+        subject); ``timeout`` bounds the wait for a locked database."""
+        with self._connect(timeout) as db:
+            db.execute(
+                """INSERT INTO route_blocks
+                       (server, account, character, subject, created_at, until, note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(server, account, character, subject) DO UPDATE SET
+                       created_at = excluded.created_at,
+                       until = excluded.until,
+                       note = excluded.note""",
+                (self.server, self.account, character.casefold(), subject,
+                 float(created_at), float(until), note))
+
+    def remove_route_block(self, character: str, subject: str, *,
+                           timeout: float = 10.0) -> bool:
+        """Delete one owner block; whether there was one."""
+        with self._connect(timeout) as db:
+            cursor = db.execute(
+                """DELETE FROM route_blocks
+                   WHERE server = ? AND account = ? AND character = ? AND subject = ?""",
+                (self.server, self.account, character.casefold(), subject))
+        return cursor.rowcount > 0
+
+    def route_blocks(self, character: str, *, now: float | None = None,
+                     timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her active owner blocks, soonest expiry first. Expired rows are
+        deleted on the way: a block lasts exactly until ``until``."""
+        now = time.time() if now is None else now
+        scope = (self.server, self.account, character.casefold())
+        with self._connect(timeout) as db:
+            db.execute(
+                """DELETE FROM route_blocks
+                   WHERE server = ? AND account = ? AND character = ? AND until <= ?""",
+                (*scope, now))
+            rows = db.execute(
+                """SELECT subject, created_at, until, note FROM route_blocks
+                   WHERE server = ? AND account = ? AND character = ?
+                   ORDER BY until, subject""", scope).fetchall()
+        return [{"subject": subject, "created_at": created_at, "until": until,
+                 "note": note} for subject, created_at, until, note in rows]
 
     def import_legacy(self, state_path: Path, activity_path: Path) -> None:
         """Import the old unscoped JSON files once without modifying them."""
