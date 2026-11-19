@@ -26624,16 +26624,50 @@ class RouteEventTests(unittest.TestCase):
         self.assertIn(("death", "map:/hall", 1.0), self.events())
         self.assertIn(("death", "exit:/hall:1,28>/goal", 1.0), self.events())
 
-    def test_a_recall_landing_on_the_next_map_is_no_crossing(self):
+    def test_a_recall_landing_far_from_the_arrival_square_is_no_crossing(self):
         task = self.trip()
         self.into_hall(task)
         self.client.record_action("emergency-recall", "via scroll")
         self.tick(task, 2.0)
-        self.at(self.client, "/goal", 5, 5)
+        self.at(self.client, "/goal", 20, 20)
         self.tick(task)
         traversals, passed = self.crossings()
         self.assertNotIn("exit:/hall:1,28>/goal", traversals)
         self.assertNotIn("exit:/hall:1,28>/goal", passed)
+
+    def test_a_fizzled_recall_then_a_real_exit_records_the_crossing(self):
+        task = self.trip()
+        self.into_hall(task)
+        self.client.record_action("emergency-recall", "via scroll")
+        self.tick(task, 30.0)   # it fizzled: still on /hall
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task)
+        traversals, passed = self.crossings()
+        self.assertIn("exit:/hall:1,28>/goal", traversals)
+        self.assertIn("exit:/hall:1,28>/goal", passed)
+
+    def test_a_chase_back_and_forth_forgets_its_old_landing(self):
+        from . import route_events
+
+        task = self.trip()
+        self.into_hall(task)
+        # Chased onto /goal far from the arrival square, then back.
+        self.at(self.client, "/goal", 20, 20)
+        route_events.note_hold(self.client, task)
+        self.at(self.client, "/hall", 1, 27)
+        self.clock[0] += 5
+        route_events.note_hold(self.client, task)
+        # Later the real crossing, seen first by a hold.
+        self.clock[0] += 10
+        self.at(self.client, "/goal", 5, 5)
+        route_events.note_hold(self.client, task)
+        landed = self.clock[0]
+        self.at(self.client, "/goal", 9, 5)
+        self.tick(task, 3.0)
+        traversals, passed = self.crossings()
+        self.assertIn("exit:/hall:1,28>/goal", passed)
+        self.assertEqual(self.client.route_recorder.transit.arrival, (5, 5))
+        self.assertEqual(self.client.route_recorder.transit.arrived_wall, landed)
 
     def test_a_disengage_then_a_real_crossing_records_the_crossing(self):
         task = self.trip()
@@ -26701,14 +26735,14 @@ class RouteEventTests(unittest.TestCase):
                 self.at(self.client, "/hall", 3, 10)
                 if how == "recall":
                     self.client.record_action("emergency-recall", "via scroll")
-                    # Ticks before the teleport lands keep the trip lost.
                     self.tick(task)
                 elif how in ("death", "pvp"):
                     self.die(3, 10, "You have died." if how == "death"
                              else "You have been defeated in combat!")
-                # She lands on the edge's own arrival square, or (elsewhere)
-                # walks in far from it.
-                self.at(self.client, "/goal", *((5, 5) if how != "elsewhere" else (20, 20)))
+                # A death's respawn lands on the edge's own arrival square; a
+                # recall lands (and a walk-in comes) far from it.
+                self.at(self.client, "/goal",
+                        *((5, 5) if how in ("death", "pvp") else (20, 20)))
                 self.tick(task)
                 traversals, passed = self.crossings()
                 self.assertNotIn("exit:/hall:1,28>/goal", traversals)

@@ -264,16 +264,14 @@ class _Transit:
     # A death on this map: nothing more is attributed to the trip here, and
     # her respawn is no crossing.
     lost: bool = False
-    # An emergency recall on this map: everything here still counts, but the
-    # next map change is the recall landing, not a crossing.
-    recalling: bool = False
     # The first square seen on a map she has not been ticked on yet
-    # (path, square, wall time), sampled on every NavigateThenTask tick.
+    # (path, square, wall time), sampled on every NavigateThenTask tick and
+    # forgotten once she is seen back on this map.
     landing: tuple | None = None
 
     def enter(self, path: str, arrival: tuple[int, int], wall: float) -> None:
         self.map, self.arrival, self.arrived_wall = path, arrival, wall
-        self.lost = self.recalling = False
+        self.lost = False
         self.landing = None
         self.timed = True
         self.edge = None
@@ -362,14 +360,18 @@ class RouteRecorder:
         transit = self.transit
         if transit is None or transit.task is not task:
             transit = self.transit = _Transit(task, path, square, wall, False, now)
-        elif path != transit.map:
+        elif path == transit.map:
+            # Back where the trip was (a chase across a seam and back): an
+            # earlier landing elsewhere is no longer this crossing's.
+            transit.landing = None
+        else:
             # Where she first stood on this map, if a hold saw it before
             # this tick: she may have walked on since.
             landing = transit.landing
             if landing is not None and landing[0] == path:
                 square, wall = landing[1], landing[2]
             edge = transit.edge
-            if (edge is not None and not (transit.lost or transit.recalling) and
+            if (edge is not None and not transit.lost and
                     edge.source == transit.map and edge.destination == path and
                     now - transit.ticked <= TRANSIT_STALE_SECONDS
                     and arrived_by(getattr(task, "graph", None), edge, square)):
@@ -389,8 +391,9 @@ class RouteRecorder:
             return
         transit.ticked = self.monotonic()
         m = client.state.map
-        if m.path != transit.map and (transit.landing is None or
-                                      transit.landing[0] != m.path):
+        if m.path == transit.map:
+            transit.landing = None
+        elif transit.landing is None or transit.landing[0] != m.path:
             transit.landing = (m.path, (m.world_x, m.world_y), self.clock())
 
     def _lose(self, transit: _Transit) -> None:
@@ -532,10 +535,6 @@ class RouteRecorder:
         if transit is None:
             return
         if signal == RECALL:
-            if action == "emergency-recall":
-                # The recall lands her elsewhere, maybe on the next map: that
-                # is no crossing. Until it lands, she is still on the way.
-                transit.recalling = True
             now = self.clock()
             if now - transit.recalled_at < RECALL_REPEAT_SECONDS:
                 return

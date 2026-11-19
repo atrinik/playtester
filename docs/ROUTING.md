@@ -1581,14 +1581,18 @@ three tables. The planner is unchanged. Notes against the text above:
   ticks, so a fight, looting or a recovery hold that stops the navigation
   does not end it, and those ticks keep the first square she is seen on
   after a map change, which judges the crossing even when she has walked
-  on before the navigation ticks again. Once she stands on the destination map with no edge
+  on before the navigation ticks again. Seen back on the trip's map (a
+  chase across a seam and back), she forgets it. Once she stands on the destination map with no edge
   left, the trip has arrived: a death or recall there is the destination's
   (the farm's own review), not the route's. A death ends the trip's
   attribution on that map: nothing more there counts, and her respawn is
-  no crossing. An `emergency-recall` does not: it is confirmed when it
-  starts, so she can still be hit or die before it lands, and all of that
-  still counts. It only makes her next map change the recall's landing,
-  not a crossing. A disengage does not leave the map and changes nothing.
+  no crossing. A recall or disengage does not end it: a recall is
+  confirmed when it starts, so she can still be hit or die before it
+  lands (or it fizzles), and all of that still counts. Its landing is told
+  from a crossing by the arrival check below alone; the residual is a
+  recall landing within 2 tiles of the arrival square of the edge she was
+  walking toward, which counts as a crossing. Hits on a map she leaves
+  without a crossing are dropped.
 - **Signals.** Each comes from a recorded decision while a trip is under
   way, except damage and traversals, which the trip's ticks and her
   messages give:

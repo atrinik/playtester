@@ -681,8 +681,8 @@ crossings that failed, against the exit or seam; and each exit, seam and map
 she crossed, with the time it took. Subjects use the same `map:`, `exit:`
 and `seam:` names as owner blocks, plus `cell:`. Deaths to other players and
 their hits are not recorded, nor is damage on a PvP map, and no row holds a
-player or creature name. A recall or a respawn is never taken for a
-crossing.
+player or creature name. A respawn is never taken for a crossing,
+and a recall only when it lands right beside the next map's arrival square.
 Writes are best effort: they wait at most a quarter second for a locked
 database, keep a failed write's rows in memory for the next attempt, and
 never hold up play. Each signal keeps its own cap (deaths 1,000, damage
