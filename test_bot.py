@@ -26603,7 +26603,7 @@ class RouteEventTests(unittest.TestCase):
         self.assertEqual(sorted(self.events()), [
             ("damage", "cell:/hall:0,1", 0.3), ("damage", "map:/hall", 0.5)])
 
-    def test_recalls_in_transit_count_once_a_minute(self):
+    def test_a_recall_in_transit_counts_once_and_ends_the_trip_there(self):
         task = self.trip()
         self.into_hall(task)
         self.at(self.client, "/hall", 2, 4)
@@ -26611,9 +26611,10 @@ class RouteEventTests(unittest.TestCase):
         self.client.record_action("emergency-recall", "via scroll")
         self.assertEqual(sorted(self.events()), [
             ("recall", "cell:/hall:0,0", 1.0), ("recall", "map:/hall", 1.0)])
+        # Gone by recall: nothing more on this map is the trip's.
         self.tick(task, self.route_events.RECALL_REPEAT_SECONDS)
         self.client.record_action("emergency-recall", "via rod")
-        self.assertEqual(len(self.events()), 4)
+        self.assertEqual(len(self.events()), 2)
 
     def test_a_held_exit_is_blocked_for_its_seconds(self):
         task = self.trip()
@@ -26628,6 +26629,99 @@ class RouteEventTests(unittest.TestCase):
                        "navigation-click-failed"):
             self.client.record_action(action, "x")
         self.assertEqual(self.events(), [("crossing_failed", "exit:/start:2,2>/hall", 1.0)] * 3)
+
+    def crossings(self, client=None):
+        client = client or self.client
+        self.events(client)
+        store = client._memory_store()
+        return (set(store.route_traversal_rows("Sera")),
+                set(store.route_requirements("Sera", now=self.clock[0])))
+
+    def test_a_recall_or_respawn_onto_the_next_map_is_no_crossing(self):
+        for how in ("recall", "death", "pvp", "elsewhere"):
+            with self.subTest(how):
+                self.clock[0] += 3600
+                self.client = self.sera()
+                task = self.trip()
+                self.into_hall(task)
+                self.at(self.client, "/hall", 3, 10)
+                if how == "recall":
+                    self.client.record_action("emergency-recall", "via scroll")
+                    # Ticks before the teleport lands keep the trip lost.
+                    self.tick(task)
+                elif how in ("death", "pvp"):
+                    self.die(3, 10, "You have died." if how == "death"
+                             else "You have been defeated in combat!")
+                # She lands on the edge's own arrival square, or (elsewhere)
+                # walks in far from it.
+                self.at(self.client, "/goal", *((5, 5) if how != "elsewhere" else (20, 20)))
+                self.tick(task)
+                traversals, passed = self.crossings()
+                self.assertNotIn("exit:/hall:1,28>/goal", traversals)
+                self.assertNotIn("map:/hall", traversals)
+                self.assertNotIn("exit:/hall:1,28>/goal", passed)
+                self.assertIn("exit:/start:2,2>/hall", passed)
+
+    def test_seam_crossings_need_the_far_border(self):
+        from .route_events import arrived_by
+
+        graph = blocks_graph()
+        seam = graph.nodes["/detour_1"].edges[0]
+        self.assertTrue(arrived_by(graph, seam, (0, 0)))
+        self.assertFalse(arrived_by(graph, seam, (8, 0)))
+        exit_edge = MapEdge("/start", "/goal", 1, 0, -1, -1)
+        graph.nodes["/goal"].enter_x = 7
+        self.assertTrue(arrived_by(graph, exit_edge, (7, 0)))
+        self.assertFalse(arrived_by(graph, exit_edge, (1, 0)))
+
+    def test_a_held_trip_stays_under_way(self):
+        from . import route_events
+
+        task = self.trip()
+        self.into_hall(task)
+        for _ in range(5):
+            self.mono[0] += 60
+            route_events.note_hold(self.client, task)
+        self.client.record_action("emergency-recall", "via scroll")
+        self.assertIn(("recall", "map:/hall", 1.0), self.events())
+
+    def test_no_damage_counts_where_players_may_fight(self):
+        self.graph.nodes["/hall"].pvp = True
+        task = self.trip()
+        self.into_hall(task)
+        self.client.route_recorder.on_message(self.client, 0, "Something hit you for 50")
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task)
+        self.assertEqual(self.events(), [])
+
+    def test_metrics_count_each_occurrence_once(self):
+        counted = []
+        self.client.metrics = types.SimpleNamespace(
+            route_event=counted.append, action=lambda *a: None, death=lambda *a: None,
+            fact=lambda *a: None)
+        task = self.trip()
+        self.into_hall(task)
+        self.die(3, 10)
+        self.assertEqual(len(self.events()), 3)
+        self.assertEqual(counted, ["death"])
+
+    def test_a_click_path_failure_never_waits_long_on_the_ledger(self):
+        from unittest.mock import MagicMock
+
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        client.state.phase, client.state.player_name = "playing", "Sera"
+        client.state.map.path, client.state.map.world_x = "/start", 1
+        client.record_action = MagicMock()
+        task = NavigateTask(blocks_graph(), "/goal")
+
+        async def no_path(_client, x, y):
+            return False
+
+        task._click_path = no_path
+        asyncio.run(task.tick(client))
+        call = next(call for call in client.record_action.call_args_list
+                    if call.args[0] == "navigation-click-failed")
+        self.assertEqual(call.kwargs, {"save_timeout": 0.25})
 
     def test_a_real_trip_records_its_crossings(self):
         from .route_events import RouteRecorder
@@ -26826,8 +26920,13 @@ class RouteEventTests(unittest.TestCase):
         self.assertEqual(set(store.route_requirements("Sera", now=now,
                                                       inputs={"exit:/c:1,1>/d": "k2"})),
                          {"exit:/a:1,1>/b"})
-        self.assertEqual(store.route_requirements(
-            "Sera", now=now + self.route_events.REJECTED_SECONDS), {})
+        # A live pass depends on no inputs: a fingerprint never deletes it.
+        recorder.note_requirement(self.client, "exit:/e:1,1>/f", "passed")
+        self.events()
+        self.assertIn("exit:/e:1,1>/f", store.route_requirements(
+            "Sera", now=now, inputs={"exit:/e:1,1>/f": "k3"}))
+        self.assertEqual(set(store.route_requirements(
+            "Sera", now=now + self.route_events.REJECTED_SECONDS)), {"exit:/e:1,1>/f"})
 
     def test_the_learned_summary_ranks_subjects_and_says_when_they_halve(self):
         from .route_events import learned_summary

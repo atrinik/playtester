@@ -99,8 +99,12 @@ RETRY_SECONDS = 5.0
 # deaths last.
 PENDING_LIMIT = 500
 # A trip whose task has not ticked for this long is not under way (an
-# abandoned task object, a reconnect).
+# abandoned task object, a reconnect). NavigateThenTask keeps its trip
+# fresh while a fight or a recovery hold stops its navigation (note_hold).
 TRANSIT_STALE_SECONDS = 120.0
+# A crossing counts only when she arrives within this many tiles of the
+# edge's arrival square (an exit) or of the border it crosses to (a seam).
+ARRIVAL_TILES = 2
 # One recall a map within this long: a disengage repeats while she flees.
 RECALL_REPEAT_SECONDS = 60.0
 # A damage magnitude is HP lost over maximum HP, at most this.
@@ -155,6 +159,39 @@ def departure(graph: Any, edge: Any) -> tuple[int, int]:
     if node is None:
         return edge.x, edge.y
     return (max(0, min(node.width - 1, edge.x)), max(0, min(node.height - 1, edge.y)))
+
+
+def arrived_by(graph: Any, edge: Any, square: tuple[int, int]) -> bool:
+    """Whether arriving at ``square`` on ``edge``'s destination map is that
+    edge's crossing, not a recall, a respawn or another way in."""
+    nodes = getattr(graph, "nodes", {})
+    destination = nodes.get(edge.destination)
+    x, y = square
+    if getattr(edge, "kind", "exit") != "tile":
+        ax, ay = edge.destination_x, edge.destination_y
+        if destination is not None:
+            ax = ax if ax >= 0 else destination.enter_x
+            ay = ay if ay >= 0 else destination.enter_y
+        return max(abs(x - ax), abs(y - ay)) <= ARRIVAL_TILES
+    source = nodes.get(edge.source)
+    if source is None or destination is None:
+        return False
+    sides = []
+    if edge.x < 0:
+        sides.append(x >= destination.width - 1 - ARRIVAL_TILES)
+    elif edge.x >= source.width:
+        sides.append(x <= ARRIVAL_TILES)
+    if edge.y < 0:
+        sides.append(y >= destination.height - 1 - ARRIVAL_TILES)
+    elif edge.y >= source.height:
+        sides.append(y <= ARRIVAL_TILES)
+    return bool(sides) and all(sides)
+
+
+def pvp_map(graph: Any, path: str) -> bool:
+    """Whether players may attack each other on ``path`` (its header)."""
+    node = getattr(graph, "nodes", {}).get(path)
+    return bool(getattr(node, "pvp", False))
 
 
 def near(square: tuple[int, int], path: Iterable[tuple[int, int]]) -> bool:
@@ -224,9 +261,13 @@ class _Transit:
     recalled_at: float = float("-inf")
     path_key: tuple | None = None
     path: list = field(default_factory=list)
+    # A recall or death on this map: nothing more is attributed to the trip
+    # here, and leaving it is no crossing.
+    lost: bool = False
 
     def enter(self, path: str, arrival: tuple[int, int], wall: float) -> None:
         self.map, self.arrival, self.arrived_wall = path, arrival, wall
+        self.lost = False
         self.timed = True
         self.edge = None
         self.damage = 0.0
@@ -300,7 +341,7 @@ class RouteRecorder:
         status = getattr(getattr(transit.task, "status", None), "value", None)
         if status != "running" or self.monotonic() - transit.ticked > TRANSIT_STALE_SECONDS:
             return None
-        if client.state.map.path != transit.map:
+        if client.state.map.path != transit.map or transit.lost:
             return None
         # Arrived: on the destination map with no edge left to walk.
         if transit.edge is None and transit.map == getattr(transit.task, "destination", None):
@@ -316,14 +357,28 @@ class RouteRecorder:
             transit = self.transit = _Transit(task, path, square, wall, False, now)
         elif path != transit.map:
             edge = transit.edge
-            if (edge is not None and edge.source == transit.map and
-                    edge.destination == path and now - transit.ticked <= TRANSIT_STALE_SECONDS):
+            if (edge is not None and not transit.lost and edge.source == transit.map and
+                    edge.destination == path and now - transit.ticked <= TRANSIT_STALE_SECONDS
+                    and arrived_by(getattr(task, "graph", None), edge, square)):
                 self._traversal(client, transit, edge, wall)
             transit.enter(path, square, wall)
         transit.ticked = now
         route = getattr(task, "route", None) or ()
-        transit.edge = next((edge for edge in route[:2] if edge.source == path), None)
+        transit.edge = None if transit.lost else next(
+            (edge for edge in route[:2] if edge.source == path), None)
         self.flush(client)
+
+    def hold(self, task: Any) -> None:
+        """``task``'s trip is held (a fight, a rest), not abandoned."""
+        transit = self.transit
+        if transit is not None and transit.task is task:
+            transit.ticked = self.monotonic()
+
+    def _lose(self, transit: _Transit) -> None:
+        """A recall or death: the trip is no longer where it was walking."""
+        transit.lost = True
+        transit.edge = None
+        transit.damage, transit.damage_cells = 0.0, {}
 
     def note_edge(self, task: Any, edge: Any) -> None:
         """The edge ``task`` walks toward now (before a decision about it)."""
@@ -374,14 +429,18 @@ class RouteRecorder:
                "kit": kit_text(client) if signal in (DEATH, RECALL, DAMAGE) else "",
                "content": str(getattr(client, "content_inputs", "") or "")[:200]}
         self.events.append(row)
-        metrics = getattr(client, "metrics", None)
-        if metrics is not None and callable(getattr(metrics, "route_event", None)):
-            metrics.route_event(signal)
         if len(self.events) > PENDING_LIMIT:
             # The oldest go first, deaths last.
             index = next((i for i, row in enumerate(self.events) if row["signal"] != DEATH), 0)
             del self.events[index]
             self.dropped += 1
+
+    @staticmethod
+    def _count(client: Any, signal: str) -> None:
+        """One occurrence of ``signal`` (however many subject rows it has)."""
+        metrics = getattr(client, "metrics", None)
+        if metrics is not None and callable(getattr(metrics, "route_event", None)):
+            metrics.route_event(signal)
 
     def _traversal(self, client: Any, transit: _Transit, edge: Any, wall: float) -> None:
         seconds = wall - transit.arrived_wall if transit.timed else None
@@ -403,6 +462,7 @@ class RouteRecorder:
         maxhp = float(client.state.stats.get("maxhp", 0) or 0)
         if maxhp <= 0:
             return
+        self._count(client, DAMAGE)
         self._event(client, DAMAGE, map_subject(transit.map),
                     min(MAX_DAMAGE_MAGNITUDE, transit.damage / maxhp))
         for subject, (amount, squares) in transit.damage_cells.items():
@@ -420,6 +480,10 @@ class RouteRecorder:
             return
         match = _HIT.match(text.strip())
         if match is None or player_attacker(client, match["who"].strip()):
+            return
+        # Where players may fight, an unseen one or their spell can hit her
+        # under any name: no damage counts there.
+        if pvp_map(getattr(transit.task, "graph", None), transit.map):
             return
         amount = int(match["amount"])
         if amount <= 0:
@@ -453,18 +517,21 @@ class RouteRecorder:
             if now - transit.recalled_at < RECALL_REPEAT_SECONDS:
                 return
             transit.recalled_at = now
+            self._count(client, RECALL)
             self._event(client, RECALL, map_subject(transit.map), 1.0)
             square = (int(record.get("x", 0) or 0), int(record.get("y", 0) or 0))
             if self._near_path(client, transit, [square]):
                 self._event(client, RECALL, cell_subject(transit.map, *square), 1.0)
-            # Gone by recall: the hits on this map are the recall's.
-            transit.damage, transit.damage_cells = 0.0, {}
+            # Gone by recall: the hits on this map are the recall's, and
+            # where she lands is no crossing.
+            self._lose(transit)
         elif transit.edge is not None:
             if signal == BLOCKED:
                 held = _HELD.search(str(record.get("detail", "")))
                 magnitude = float(held["seconds"]) if held else 1.0
             else:
                 magnitude = 1.0
+            self._count(client, signal)
             self._event(client, signal, edge_subject(transit.edge), magnitude)
         self.flush(client)
 
@@ -474,6 +541,8 @@ class RouteRecorder:
         transit = self.active(client)
         if str(record.get("detail", "")).strip().casefold() == PVP_DEFEAT:
             self._death = (record, None)
+            if transit is not None:
+                self._lose(transit)
             return
         snapshot = None
         if transit is not None:
@@ -483,7 +552,8 @@ class RouteRecorder:
                 log.exception("planned path for route events failed")
                 path = []
             snapshot = _Snapshot(transit.map, transit.arrival, transit.edge, list(path))
-            transit.damage, transit.damage_cells = 0.0, {}
+            # Her respawn is no crossing.
+            self._lose(transit)
         self._death = (record, snapshot)
 
     def on_post_mortem(self, client: Any, report: dict | None) -> None:
@@ -501,6 +571,7 @@ class RouteRecorder:
         if path != snapshot.map:
             return
         at = float(report.get("time") or self.clock())
+        self._count(client, DEATH)
         self._event(client, DEATH, map_subject(path), 1.0, at=at)
         if snapshot.edge is not None:
             self._event(client, DEATH, edge_subject(snapshot.edge), 1.0, at=at)
@@ -745,6 +816,12 @@ def _guard(name: str, call: Callable[[RouteRecorder], Any], client: Any) -> None
 def note_tick(client: Any, task: Any) -> None:
     """A NavigateTask tick (every tick of a trip under way)."""
     _guard("tick", lambda value: value.tick(client, task), client)
+
+
+def note_hold(client: Any, task: Any) -> None:
+    """A NavigateThenTask tick: its trip is still under way, even while a
+    fight or a recovery hold keeps ``task`` from ticking."""
+    _guard("hold", lambda value: value.hold(task), client)
 
 
 def note_edge(client: Any, task: Any, edge: Any) -> None:

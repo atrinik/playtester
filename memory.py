@@ -880,7 +880,8 @@ class BotMemory:
                            timeout: float = 10.0) -> dict[str, dict[str, Any]]:
         """Her requirement outcomes per edge. Expired rows, and rows of an
         edge in ``inputs`` whose fingerprint no longer matches, are deleted
-        on the way."""
+        on the way. A row kept with no fingerprint depends on no item or
+        quest state and is kept until it expires."""
         now = time.time() if now is None else now
         scope = (self.server, self.account, character.casefold())
         with self._connect(timeout) as db:
@@ -892,7 +893,7 @@ class BotMemory:
                 db.execute(
                     """DELETE FROM route_requirements
                        WHERE server = ? AND account = ? AND character = ? AND edge = ?
-                         AND inputs != ?""", (*scope, edge, fingerprint))
+                         AND inputs != '' AND inputs != ?""", (*scope, edge, fingerprint))
             rows = db.execute(
                 """SELECT edge, outcome, at, until, inputs, evidence FROM route_requirements
                    WHERE server = ? AND account = ? AND character = ?""", scope).fetchall()

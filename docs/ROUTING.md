@@ -1577,9 +1577,13 @@ three tables. The planner is unchanged. Notes against the text above:
 - **The trip under way.** `NavigateTask.tick` tells the recorder its map and
   the edge it walks toward (the first edge of its route leaving her map).
   A trip counts while its task is running and ticked within 120 s, on the
-  map it last saw. Once she stands on the destination map with no edge
+  map it last saw. `NavigateThenTask` keeps it fresh on each of its own
+  ticks, so a fight or a recovery hold that stops the navigation does not
+  end it. Once she stands on the destination map with no edge
   left, the trip has arrived: a death or recall there is the destination's
-  (the farm's own review), not the route's.
+  (the farm's own review), not the route's. A recall or death ends the
+  trip's attribution on that map: nothing more there counts, and wherever
+  she lands is no crossing.
 - **Signals.** Each comes from a recorded decision while a trip is under
   way, except damage and traversals, which the trip's ticks and her
   messages give:
@@ -1590,24 +1594,28 @@ three tables. The planner is unchanged. Notes against the text above:
     have been defeated in combat!"), or a post-mortem attacker she has seen
     as a player in this process (`ObservationRecorder.player_names`, or in
     view, and not an authored creature name), records nothing.
-  - `recall`: `emergency-recall` or `emergency-disengage`, once a map a
-    minute (a disengage repeats while she flees), against the map and the
-    cell near the path.
+  - `recall`: `emergency-recall` or `emergency-disengage`, once a map visit
+    (a disengage repeats while she flees), against the map and the cell
+    near the path.
   - `damage`: "... hit you for N" lines from the server while she is on a
     transit map, minus hits from players, summed per cell where she stood
     and written when she leaves the map across her edge: HP lost over
     maximum HP (at most 10) against the map, and against each cell near the
     path. Hits on a map where she then died or recalled are left to that
     death or recall, and hits on the destination map are not transit.
+    On a map whose header says `pvp 1` no damage counts: an unseen player
+    or their spell can hit her under any name there.
   - `blocked`: `navigation-pack-exit-bypass` only, with the seconds the pack
     held the exit (the decision now says `held=Ns`). The other
     `_exclude_edge` callers are crossing failures.
   - `crossing_failed`: `navigation-seam-excluded`, `navigation-seam-retry`
     (a rejected departure) and the new `navigation-click-failed` decision,
-    recorded where the click path finds no way to the edge.
-  - `traversal`: arriving on the map her edge leads to. The edge and the
-    map she crossed each get a count and, when her arrival on that map was
-    seen, its seconds.
+    recorded where the click path finds no way to the edge (its ledger
+    save waits at most 0.25 s).
+  - `traversal`: arriving on the map her edge leads to, within 2 tiles of
+    the exit's arrival square or of the border a seam crosses to. The edge
+    and the map she crossed each get a count and, when her arrival on that
+    map was seen, its seconds.
 - **Traversals** have one more column than 4.4's sketch, `timed`, the
   number of crossings in `mean_seconds`, so seeded and untimed counts never
   pull the mean toward zero.
@@ -1616,7 +1624,8 @@ three tables. The planner is unchanged. Notes against the text above:
   `rejected` outcome needs the refusing server line as evidence, and lasts
   24 h; matching a line to an edge's authored text waits for P4's and P10's
   edges, so nothing records one yet. Reads delete expired rows and the rows
-  of edges whose `inputs` fingerprint changed.
+  of edges whose non-empty `inputs` fingerprint changed; a row without one
+  depends on no item or quest state and lasts until it expires.
 - **Kit.** A danger row keeps only the survivability that #94's predicate
   compares (maximum health, armour class, protections, character level),
   from her current farm profile, or nothing when none is known. No names.
@@ -1641,7 +1650,8 @@ three tables. The planner is unchanged. Notes against the text above:
   provisional cost (4.4's weights and half-lives, without the kit rule or
   traversal recovery, which are P6's), their signals, the last event and
   when the cost falls below half, re-read at most every 30 s. Metrics:
-  `route_events_total{signal}`; the plan and learned-subject metrics of 4.8
+  `route_events_total{signal}`, once per occurrence (a death with a map,
+  an edge and a cell row counts one); the plan and learned-subject metrics of 4.8
   come with P6.
 
 **P6. `feat(navigation)`: a cost model, budgets and shadow planning.** Travel

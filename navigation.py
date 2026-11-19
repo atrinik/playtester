@@ -262,6 +262,8 @@ class MapNode:
     automatic_exits: set[tuple[int, int]] = field(default_factory=set)
     peaceful_identities: set[str] = field(default_factory=set)
     caster_identities: set[str] = field(default_factory=set)
+    # The map header's ``pvp 1``: players may attack each other here.
+    pvp: bool = False
 
     def lock_allowed(self, point: tuple[int, int], access=False) -> bool:
         """Check one gated tile against an access set (requirements.py)."""
@@ -557,6 +559,7 @@ class WorldGraph:
                 int(one(attrs, "enter_x", 0) or 0),
                 int(one(attrs, "enter_y", 0) or 0),
             )
+            self.nodes[key].pvp = str(one(attrs, "pvp", "0") or "0").strip() not in ("", "0")
             parsed_maps[key] = (path, parsed)
 
         auto_exits: dict[str, list[tuple[int, int, int, str, bool]]] = defaultdict(list)
@@ -3581,8 +3584,13 @@ class NavigateTask(BotTask):
             route_events.note_edge(client, self, edge)
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
-                recorder("navigation-click-failed",
-                         f"{edge.source} -> {edge.destination} at={edge.x},{edge.y}")
+                detail = f"{edge.source} -> {edge.destination} at={edge.x},{edge.y}"
+                if isinstance(client, AtrinikClient):
+                    # A tick never waits SQLite's usual 10 s for it.
+                    recorder("navigation-click-failed", detail,
+                             save_timeout=route_events.WRITE_TIMEOUT)
+                else:
+                    recorder("navigation-click-failed", detail)
             self._exclude_edge(edge)
             try:
                 self.route = self._plan(client)
@@ -4486,6 +4494,9 @@ class NavigateThenTask(BotTask):
         if client.state.phase != "playing":
             return
         self._record_trail(client)
+        # Her trip stays under way while a fight or a recovery hold keeps
+        # its navigation from ticking: what happens meanwhile is the route's.
+        route_events.note_hold(client, self.navigation)
         # Zone containment comes before defensive pursuit. Otherwise a farm
         # can chase one retreating monster across a connected-map seam, then
         # keep fighting there forever before the return route gets a tick.
