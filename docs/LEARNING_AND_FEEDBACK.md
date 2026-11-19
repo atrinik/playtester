@@ -1754,15 +1754,18 @@ Feedback tab, `atrinik-playtester feedback list|show`). Where the code
 differs from the text above:
 
 - **Storage.** `feedback_items` has the columns of 4.2 plus `subject` (for
-  filters and the CLI), `days` and `occurrence_keys_json`. `feedback_filings`
-  is not created yet; F6 adds it with the filer. Only `draft` rows are made.
-  The cap drops the drafts with the fewest occurrences, then the least
-  recently seen; other statuses are never dropped.
+  filters and the CLI), `days`, `occurrence_keys_json`, `dates_json` and
+  `withheld`. `feedback_filings` is not created yet; F6 adds it with the
+  filer. Only `draft` rows are made. At the cap of 500 drafts a new draft
+  always gets in: before it is inserted, the draft with the fewest
+  occurrences, then the least recently seen, is evicted (never the new one);
+  other statuses are never evicted.
 - **Occurrences.** A finding carries an occurrence key; a key already
   counted (the newest 200 are kept) adds nothing, so a restart, a repeated
   sighting or the login sweep never inflates the count. Typos count once a
-  day a source, a low-Int book once a book, "+N" once a day. `days` grows
-  when an occurrence falls on a later UTC day than the last one. A draft's
+  day a source, a low-Int book once a book, "+N" once a day. `days` is the
+  number of distinct UTC dates of counted occurrences, whatever order they
+  arrive in. Drafts carry dates, never times of day. A draft's
   title and body are rendered again from its merged evidence on every
   occurrence (its `tried` lines, newest 10, and an aggregate's items, newest
   50, accumulate); a rejected or filed item only gains occurrences.
@@ -1771,21 +1774,39 @@ differs from the text above:
   from the game, always rendered as inline code; game text is only ever an
   excerpt. Server formulas go in their own "What the server source says"
   section, beside the "What the content says" of 4.10.3. "Where" names the
-  locked content and Classic server releases and this playtester's build:
-  her client cannot read the live server's build.
+  locked content and Classic server releases (read from the lock as JSON)
+  and this playtester's build: her client cannot read the live server's
+  build. A map is named only when its path is an authored one (starting
+  with "/", and not a player's unique map under `/players/`); otherwise the
+  draft names none, and a typo on such a map is not drafted. No rendered
+  paragraph starts with a code span (the renderer refuses one).
 - **Quoting.** Besides `<!--` and `-->` (removed until none is left, so
-  `<!<!---->--` cannot rebuild one), control characters and invisible
-  formatting characters (zero-width and bidirectional controls) are removed
+  `<!<!---->--` cannot rebuild one), C0 and C1 control characters and
+  invisible formatting characters (zero-width, bidirectional and Arabic
+  letter marks, the Mongolian vowel separator, tag characters) are removed
   from everything rendered. `fingerprints_outside_code` reads fingerprint
-  lines only outside fenced blocks, for F6's filer.
+  lines only outside fenced blocks, for F6's filer; as in CommonMark, a
+  backtick "fence" whose info string holds a backtick opens none.
 - **Privacy.** Excerpt lines naming another character are dropped, against
   the names she has seen in this process and every chat sender her memory
   keeps for the account (so a restart does not forget them). Then the whole
   title and body are checked against every private term: her account,
   character name, the server's host, the password, the invite code, the
-  certificate pin, the party name, the operator character and those names.
-  A draft containing one is not stored, and only its fingerprint is logged.
-  Other players present are recorded only as a count of those in view.
+  certificate pin, the configured and the joined party names, the operator
+  character (added wherever the dashboard server is built) and those names.
+  Names are compared after NFKC folding, with game markup and invisible
+  characters removed. A draft containing one is not stored, and only its
+  fingerprint is logged; an existing item of that fingerprint is marked
+  `withheld`, and the finding is tried again on its next sighting. The chat
+  senders are read once a login and extended by each new sender. Other
+  players present are recorded only as a count of those in view.
+- **Screening on read.** A name can be learned after a draft was stored, and
+  items past draft are never re-rendered, so every reader checks stored
+  titles and bodies against the current private terms (`feedback.screen`):
+  the dashboard on each request (and flags failures `withheld` in her
+  memory), the CLI with the terms it knows, and F6's filer. A withheld item
+  is shown with a placeholder title and no body, and is never to be filed,
+  until a clean render of the same draft replaces its text.
 - **"+N with no effect"** reads her own carried items: an identified item
   whose name shows "+N" counts when its effective stats come from her
   examine (an artifact can give a cape the AC its archetype lacks) and
@@ -1814,8 +1835,10 @@ differs from the text above:
   `Bug`; "+N" `enhancement`, `component: server`.
 - **The Feedback tab** shows each draft's body as the plain Markdown text
   that would be filed, in a `pre` built with `textContent`, not rendered;
-  there is no approval key and no POST route yet. The CLI reads the same
-  rows and needs `--character`; it never creates a database.
+  there is no approval key and no POST route yet. The CLI needs
+  `--character` and opens the database read-only (`mode=ro`): it creates,
+  migrates and changes nothing, and says so when the queue's table is
+  missing. It cannot flag items withheld; it hides them in its output.
 - **Not built in F5:** the `feedback_items` gauge of 4.12, drafting from
   shop items she has not picked up, and the other producers of 4.11.5.
 

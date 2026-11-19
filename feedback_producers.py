@@ -18,28 +18,31 @@ for ``feedback.note``:
 
 from __future__ import annotations
 
+import json
 import re
 import time
+from pathlib import Path
 from typing import Any, Collection, Iterable
 
 from . import constants as c
-from .feedback import Finding, excerpt, name, prose, utc_minute
+from .feedback import Finding, excerpt, name, prose, utc_day
 from .observations import MARKUP
 
 # The locked inputs and this build, for each draft's "Where".
 _VERSIONS: dict[str, str] | None = None
+LOCK_PATH = Path(__file__).with_name("dependencies.lock.json")
 
 
 def versions() -> dict[str, str]:
     """Locked content and Classic server releases and this playtester's
     build. The server's is the locked source release: her client cannot
-    read the live server's build."""
+    read the live server's build. The lock is read as JSON, not through
+    the downloader module."""
     global _VERSIONS
     if _VERSIONS is None:
         found: dict[str, str] = {}
         try:
-            from .compatibility import load_lock
-            inputs = load_lock()["inputs"]
+            inputs = json.loads(LOCK_PATH.read_text(encoding="utf-8"))["inputs"]
             for key, lock_key in (("content", "content"), ("server", "classic_server")):
                 release = inputs.get(lock_key, {}).get("release")
                 if isinstance(release, str) and release:
@@ -56,6 +59,16 @@ def versions() -> dict[str, str]:
             pass
         _VERSIONS = found
     return dict(_VERSIONS)
+
+
+def public_map(path: Any) -> str | None:
+    """A map path a draft may name: an authored map path ("/..."), never a
+    player's unique map (``/players/``, an apartment) or anything else the
+    client was told."""
+    path = str(path or "")
+    if not path.startswith("/") or "/players/" in path or path.startswith("/players"):
+        return None
+    return path
 
 
 def _stat(stats: dict[str, Any], key: str) -> int | None:
@@ -124,7 +137,7 @@ def plus_n_no_effect(entries: Iterable[tuple[str, int, int, Any]], *,
                 "on the item says so."),
             "where": prose("Items she carried; the server's item names and descriptions."),
             "versions": versions(),
-            "tried": [prose(f"{utc_minute(at)}: examined her gear; ",
+            "tried": [prose(f"{utc_day(at)}: examined her gear; ",
                             *[part for index, family in enumerate(families)
                               for part in ((", " if index else ""), name(family))],
                             " showed a “+N” with no combat effect.")],
@@ -166,7 +179,8 @@ def book_experience(row: dict[str, Any], *, stats: dict[str, Any], literacy: int
     at = float(row.get("at") or row.get("last_at") or time.time())
     factor = BOOK_EXP_MOD[intelligence]
     title = str(row.get("source_name") or "")
-    book = [name(title)] if title else ["an authored book"]
+    book = ["the book ", name(title)] if title else ["an authored book"]
+    where = public_map(row.get("map"))
     extra = [f"Int {intelligence}"] + ([f"Literacy {literacy}"] if literacy else [])
     return Finding(
         kind="bug", repo="atrinik/classic", subject=BOOK_SUBJECT, claim=BOOK_CLAIM,
@@ -179,9 +193,10 @@ def book_experience(row: dict[str, Any], *, stats: dict[str, Any], literacy: int
                 "negative, which counts as none, and the book is still marked read. "
                 "The table's comment says low Int should give less experience, not "
                 "none; the values read as if their sign were wrong."),
-            "where": prose(*book, " read on ", name(row.get("map") or "?"), "."),
+            "where": (prose("She read ", *book, " on map ", name(where), ".") if where
+                      else prose("She read ", *book, ".")),
             "versions": versions(),
-            "tried": [prose(f"{utc_minute(at)}: read ", *book, f" at Int {intelligence}.")],
+            "tried": [prose(f"{utc_day(at)}: read ", *book, f" at Int {intelligence}.")],
             "notes": [prose(f"At Int {intelligence} the factor is ",
                             name(f"{factor:.2f}"), ".")],
             "expected": prose("Less experience from books at low Int, not none."),
@@ -251,7 +266,7 @@ def typo(row: dict[str, Any], *, names: Collection[str] = (), stats: dict[str, A
         return None
     key = str(row.get("source_key") or "")
     where = _SOURCE_KEY.match(key)
-    if where is None:
+    if where is None or public_map(where.group("map")) is None:
         return None
     # Slips only from the lines that may be quoted: none from a dropped one.
     lines = excerpt([str(row.get("text") or "")], names)
@@ -270,7 +285,7 @@ def typo(row: dict[str, Any], *, names: Collection[str] = (), stats: dict[str, A
                           *listed, "."),
             "where": prose("Map ", name(map_path), f" ({x},{y})."),
             "versions": versions(),
-            "tried": [prose(f"{utc_minute(at)}: read the {label}'s text.")],
+            "tried": [prose(f"{utc_day(at)}: read the {label}'s text.")],
             "excerpts": lines,
             "expected": prose("The same text without the slip."),
             "state": state_parts(stats or {}),

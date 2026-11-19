@@ -187,7 +187,9 @@ def feedback_command(args: argparse.Namespace) -> int:
     ``--host``, ``--port``, ``--account`` and ``--character``, as the bot
     stores them; works whether or not the bot is running.
     """
-    from .feedback import short_fingerprint
+    import sqlite3
+
+    from .feedback import screen, short_fingerprint
     from .memory import BotMemory
 
     path = memory_path(args.runtime_state)
@@ -197,11 +199,36 @@ def feedback_command(args: argparse.Namespace) -> int:
     if not path.is_file():
         print(f"feedback: no memory database at {path}")
         return 1
-    memory = BotMemory(path, server=f"{args.host.casefold()}:{args.port}",
-                       account=args.account)
+    # Read-only: nothing is created, migrated or changed.
+    memory = BotMemory.open_read_only(path, server=f"{args.host.casefold()}:{args.port}",
+                                      account=args.account)
+    try:
+        if not memory.has_table("feedback_items"):
+            print(f"feedback: {path} has no feedback queue yet (no bot of this "
+                  "version has opened it)")
+            return 1
+        senders = (memory.chat_senders() if memory.has_table("chat_log") else [])
+    except sqlite3.Error as error:
+        print(f"feedback: cannot read {path}: {error}")
+        return 1
+    # Every item is checked against the private terms this command knows
+    # (the bot's own screening also uses names seen in its process).
+    code = ""
+    if args.access_code_file:
+        from .access_codes import read_access_code
+        try:
+            code = read_access_code(args.access_code_file)
+        except Exception as error:
+            print(f"feedback: cannot read the access code file: {error}")
+            return 1
+    private = [args.account, args.password, args.host, args.character,
+               args.certificate_sha256, args.party_name, args.operator_character,
+               code, *senders]
+
     if args.feedback_command == "list":
         items = memory.feedback_items(args.character, kind=args.kind, repo=args.repo,
                                       status=args.status, limit=args.limit)
+        screen(items, private)
         for item in items:
             item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
             item.pop("body_md", None)
@@ -212,7 +239,8 @@ def feedback_command(args: argparse.Namespace) -> int:
         if not items:
             print("No feedback items.")
         for item in items:
-            print(f"{item['id']:>5}  {item['short_fingerprint']}  {item['status']:<8} "
+            print(f"{item['id']:>5}  {item['short_fingerprint']}  "
+                  f"{'withheld' if item['withheld'] else item['status']:<8} "
                   f"{item['kind']:<8} {item['repo']:<19} x{item['occurrences']:<4} "
                   f"{item['title']}")
         return 0
@@ -220,6 +248,7 @@ def feedback_command(args: argparse.Namespace) -> int:
     if item is None:
         print(f"feedback: no single item matches {args.item!r}")
         return 1
+    screen([item], private)
     item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
     if args.json:
         item.pop("evidence_json", None)

@@ -63,7 +63,9 @@ FEEDBACK_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
 FEEDBACK_COLUMNS = ("id", "fingerprint", "repo", "kind", "subject", "target", "title",
                     "body_md", "labels_json", "issue_type", "evidence_json", "status",
                     "occurrences", "days", "first_seen", "last_seen", "decided_at",
-                    "decided_via", "issue_url", "error")
+                    "decided_via", "issue_url", "error", "withheld")
+# Distinct UTC dates kept per item for its day count.
+FEEDBACK_DATES = 1000
 
 
 def _add_column(db: sqlite3.Connection, table: str, definition: str) -> None:
@@ -300,6 +302,8 @@ class BotMemory:
                        occurrences INTEGER NOT NULL DEFAULT 1,
                        days INTEGER NOT NULL DEFAULT 1,
                        occurrence_keys_json TEXT NOT NULL DEFAULT '[]',
+                       dates_json TEXT NOT NULL DEFAULT '[]',
+                       withheld INTEGER NOT NULL DEFAULT 0,
                        first_seen REAL NOT NULL,
                        last_seen REAL NOT NULL,
                        remote_candidates_json TEXT,
@@ -317,9 +321,31 @@ class BotMemory:
         self._fact_inserts = 0
         self._fight_inserts = 0
 
+    @classmethod
+    def open_read_only(cls, path: Path, *, server: str, account: str) -> "BotMemory":
+        """A store that only reads an existing database: opened with
+        ``mode=ro``, creating nothing and migrating nothing (the feedback
+        CLI). A write through it fails."""
+        memory = cls.__new__(cls)
+        memory.path = Path(path)
+        memory.server = server.casefold().strip()
+        memory.account = account.casefold().strip()
+        memory.read_only = True
+        memory._chat_appends = memory._observation_inserts = memory._fact_inserts = 0
+        return memory
+
+    def has_table(self, name: str, *, timeout: float = 10.0) -> bool:
+        with self._connect(timeout) as db:
+            return db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                              (name,)).fetchone() is not None
+
     @contextmanager
     def _connect(self, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=timeout)
+        if getattr(self, "read_only", False):
+            db = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=ro", timeout=timeout,
+                                 uri=True)
+        else:
+            db = sqlite3.connect(self.path, timeout=timeout)
         try:
             yield db
         except Exception:
@@ -737,80 +763,91 @@ class BotMemory:
 
         An ``occurrence`` key already counted (among the newest
         ``FEEDBACK_OCCURRENCE_KEYS``) adds no occurrence; an empty key always
-        adds one. ``days`` grows when an occurrence falls on a later UTC day
-        than the last one. ``build(stored_evidence, occurrences, days,
-        first_seen, last_seen)`` returns the title, body, evidence, labels and
-        type; it is called for a new draft and for a draft, never for an
-        item past draft, which only gains occurrences. Whatever ``build``
-        raises leaves the row as it was. Returns the id and whether it is new.
+        adds one. ``days`` is the number of distinct UTC dates of counted
+        occurrences, whatever order they arrive in. ``build(stored_evidence,
+        occurrences, days, first_seen, last_seen)`` returns the title, body,
+        evidence, labels and type; it is called for a new draft and for a
+        draft, never for an item past draft, which only gains occurrences. A
+        draft built cleanly is no longer withheld. Whatever ``build`` raises
+        leaves the row as it was. A new draft in a full queue first evicts
+        the weakest draft (``_make_room``). Returns the id and whether it is
+        new.
         """
         folded = character.casefold()
         scope = (self.server, self.account, folded)
+        day = time.strftime("%Y-%m-%d", time.gmtime(at))
         with self._connect(timeout) as db:
             row = db.execute(
-                """SELECT id, status, occurrences, days, occurrence_keys_json,
+                """SELECT id, status, occurrences, occurrence_keys_json, dates_json,
                           first_seen, last_seen, evidence_json
                    FROM feedback_items
                    WHERE server = ? AND account = ? AND character = ? AND fingerprint = ?""",
                 (*scope, fingerprint)).fetchone()
             if row is None:
                 fields = build(None, 1, 1, at, at)
+                self._make_room(db, folded)
                 cursor = db.execute(
                     """INSERT INTO feedback_items
                            (server, account, character, fingerprint, repo, kind, subject,
                             title, body_md, labels_json, issue_type, evidence_json,
-                            occurrence_keys_json, first_seen, last_seen)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            occurrence_keys_json, dates_json, first_seen, last_seen)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (*scope, fingerprint, repo, kind, subject, fields["title"],
                      fields["body_md"], fields["labels_json"], fields["issue_type"],
                      fields["evidence_json"], json.dumps([occurrence] if occurrence else []),
-                     at, at))
-                row_id = int(cursor.lastrowid)
-                self._prune_feedback(db, folded)
-                return row_id, True
-            row_id, status, occurrences, days, keys_json, first_seen, last_seen, stored = row
-            try:
-                keys = [str(key) for key in json.loads(keys_json)]
-            except (TypeError, ValueError):
-                keys = []
+                     json.dumps([day]), at, at))
+                return int(cursor.lastrowid), True
+            row_id, status, occurrences, keys_json, dates_json, first_seen, last_seen, stored = row
+
+            def decoded(value: str) -> list[str]:
+                try:
+                    return [str(entry) for entry in json.loads(value)]
+                except (TypeError, ValueError):
+                    return []
+
+            keys, dates = decoded(keys_json), set(decoded(dates_json))
             if not occurrence or occurrence not in keys:
                 occurrences += 1
-                if time.gmtime(at)[:3] > time.gmtime(last_seen)[:3]:
-                    days += 1
+                dates.add(day)
                 if occurrence:
                     keys = (keys + [occurrence])[-FEEDBACK_OCCURRENCE_KEYS:]
+            ordered = sorted(dates)[-FEEDBACK_DATES:]
             first_seen, last_seen = min(first_seen, at), max(last_seen, at)
-            counts = (occurrences, days, json.dumps(keys), first_seen, last_seen)
+            counts = (occurrences, len(ordered), json.dumps(keys), json.dumps(ordered),
+                      first_seen, last_seen)
             if status != "draft":
                 db.execute(
                     """UPDATE feedback_items SET occurrences = ?, days = ?,
-                           occurrence_keys_json = ?, first_seen = ?, last_seen = ?
+                           occurrence_keys_json = ?, dates_json = ?, first_seen = ?,
+                           last_seen = ?
                        WHERE id = ?""", (*counts, row_id))
                 return int(row_id), False
             try:
                 evidence = json.loads(stored)
             except (TypeError, ValueError):
                 evidence = None
-            fields = build(evidence, occurrences, days, first_seen, last_seen)
+            fields = build(evidence, occurrences, len(ordered), first_seen, last_seen)
             db.execute(
                 """UPDATE feedback_items SET occurrences = ?, days = ?,
-                       occurrence_keys_json = ?, first_seen = ?, last_seen = ?,
-                       title = ?, body_md = ?, labels_json = ?, issue_type = ?,
-                       evidence_json = ?
+                       occurrence_keys_json = ?, dates_json = ?, first_seen = ?,
+                       last_seen = ?, title = ?, body_md = ?, labels_json = ?,
+                       issue_type = ?, evidence_json = ?, withheld = 0
                    WHERE id = ?""",
                 (*counts, fields["title"], fields["body_md"], fields["labels_json"],
                  fields["issue_type"], fields["evidence_json"], row_id))
         return int(row_id), False
 
-    def _prune_feedback(self, db: sqlite3.Connection, character: str) -> None:
-        """Drop the drafts over the cap: fewest occurrences, then least
-        recently seen, first. Other statuses are never dropped."""
+    def _make_room(self, db: sqlite3.Connection, character: str) -> None:
+        """Before a new draft: while the queue holds ``FEEDBACK_DRAFT_LIMIT``
+        drafts, evict the weakest (fewest occurrences, then least recently
+        seen), so a new draft always gets in and is never itself the one
+        dropped. Other statuses are never evicted."""
         scope = (self.server, self.account, character)
         (count,) = db.execute(
             """SELECT count(*) FROM feedback_items
                WHERE server = ? AND account = ? AND character = ? AND status = 'draft'""",
             scope).fetchone()
-        excess = count - FEEDBACK_DRAFT_LIMIT
+        excess = count - FEEDBACK_DRAFT_LIMIT + 1
         if excess > 0:
             db.execute(
                 """DELETE FROM feedback_items WHERE id IN (
@@ -819,6 +856,28 @@ class BotMemory:
                          AND status = 'draft'
                        ORDER BY occurrences, last_seen, id LIMIT ?)""",
                 (*scope, excess))
+
+    def withhold_feedback(self, character: str, ids: Iterable[int], *,
+                          timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
+        """Mark items withheld: their stored title or body names a private
+        term. They are shown and filed only once a clean render replaces it."""
+        ids = [int(item) for item in ids]
+        if not ids:
+            return
+        with self._connect(timeout) as db:
+            db.executemany(
+                """UPDATE feedback_items SET withheld = 1
+                   WHERE server = ? AND account = ? AND character = ? AND id = ?""",
+                [(self.server, self.account, character.casefold(), item) for item in ids])
+
+    def withhold_feedback_fingerprint(self, character: str, fingerprint: str, *,
+                                      timeout: float = FEEDBACK_SAVE_TIMEOUT) -> None:
+        """Mark the item of ``fingerprint`` withheld, if there is one."""
+        with self._connect(timeout) as db:
+            db.execute(
+                """UPDATE feedback_items SET withheld = 1
+                   WHERE server = ? AND account = ? AND character = ? AND fingerprint = ?""",
+                (self.server, self.account, character.casefold(), fingerprint))
 
     def feedback_items(self, character: str, *, kind: str = "", repo: str = "",
                        status: str = "", limit: int = 200,

@@ -944,13 +944,14 @@ function renderFeedback(f) {
     const item = node("div", "feedback-item");
     const head = node("div", "reading-head");
     head.append(node("b", "", FEEDBACK_KIND_LABELS[x.kind] || x.kind), node("strong", "", x.title),
-      node("span", x.status === "draft" ? "flag" : "flag warn", x.status), node("span", "flag", `×${x.occurrences}`));
+      node("span", x.status === "draft" && !x.withheld ? "flag" : "flag warn", x.withheld ? "withheld" : x.status), node("span", "flag", `×${x.occurrences}`));
     item.append(head);
     item.append(node("small", "", [x.repo, x.short_fingerprint, `${x.days} day${x.days === 1 ? "" : "s"}`, `first ${day(x.first_seen)}`, `last ${day(x.last_seen)}`, (x.labels || []).join(", ")].filter(Boolean).join(" · ")));
     const details = node("details");
     details.open = feedbackOpen.has(x.id);
     details.addEventListener("toggle", () => { if (details.open) feedbackOpen.add(x.id); else feedbackOpen.delete(x.id); });
-    details.append(node("summary", "", "Body as it would be filed"), node("pre", "feedback-body", x.body_md));
+    const body = x.withheld ? "Withheld: its text names a private term (a player, her account or the server). It is shown again only once she renders it again without one." : x.body_md;
+    details.append(node("summary", "", "Body as it would be filed"), node("pre", "feedback-body", body));
     item.append(details);
     return item;
   });

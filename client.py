@@ -349,6 +349,9 @@ class AtrinikClient:
         # other names drafts must never contain (the operator character).
         self._feedback_noted: set[tuple[str, str, str]] = set()
         self.feedback_private_names: set[str] = set()
+        # Chat senders her memory keeps, read once a login and extended by
+        # each new sender (_log_chat); None until first needed.
+        self._feedback_senders: set[str] | None = None
         # When the "+N with no effect" producer last ran (monotonic).
         self._equipment_feedback_at = float("-inf")
         # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
@@ -412,6 +415,7 @@ class AtrinikClient:
             value for value in records if isinstance(value, dict)
         ][-2000:] if isinstance(records, list) else []
         self._load_tile_facts(character)
+        self._feedback_senders = None
         self._feedback_sweep(character)
         # The life boundary in this (possibly reloaded) ledger: the previous
         # report's mark, found by value, or, in a fresh process with no mark,
@@ -2042,16 +2046,24 @@ class AtrinikClient:
         """Other characters she has seen: in this process, and every chat
         sender her memory keeps."""
         names = list(getattr(self.observations, "player_names", {}))
-        # A failure propagates: without the chat senders no draft is made.
-        names.extend(self._memory_store().chat_senders(timeout=FEEDBACK_READ_TIMEOUT))
+        if self._feedback_senders is None:
+            # A failure propagates: without the chat senders no draft is made.
+            self._feedback_senders = set(
+                self._memory_store().chat_senders(timeout=FEEDBACK_READ_TIMEOUT))
+        names.extend(self._feedback_senders)
         return names
+
+    def feedback_private_terms(self) -> list[str]:
+        """Every term no draft may show (feedback.screen, the dashboard)."""
+        return self._feedback_private(self._feedback_other_names())
 
     def _feedback_private(self, others: list[str]) -> list[str]:
         """Every term no draft may contain (4.10.4)."""
         config = self.config
         return [config.account, config.password, config.access_code, config.host,
                 config.certificate_sha256, config.character, config.party_name,
-                self.state.player_name, *self.feedback_private_names, *others]
+                self.state.player_name, self.state.party_name,
+                *self.feedback_private_names, *others]
 
     def _note_feedback(self, findings: list[feedback.Finding], detail: str = "",
                        others: list[str] | None = None) -> None:
@@ -2066,10 +2078,13 @@ class AtrinikClient:
                 continue
             try:
                 names = self._feedback_other_names() if others is None else others
-                feedback.note(self._memory_store(), character, finding,
-                              private=self._feedback_private(names))
+                stored = feedback.note(self._memory_store(), character, finding,
+                                       private=self._feedback_private(names))
             except Exception as error:
                 log.warning("feedback draft not kept: %s", error)
+                continue
+            if stored is None:
+                # Withheld for a private term: tried again on its next sighting.
                 continue
             self._feedback_noted.add(key)
             if len(self._feedback_noted) > 10_000:
@@ -2176,6 +2191,9 @@ class AtrinikClient:
         """Keep a chat line in the durable chat log; never fail the bot."""
         if self.metrics is not None:
             self.metrics.chat(msg_type, direction)
+        if self._feedback_senders is not None and sender:
+            # Kept as the chat log keeps it, so drafts never name the sender.
+            self._feedback_senders.add(sender[:64])
         character = self.state.player_name or self.config.character
         if not character:
             return

@@ -27203,6 +27203,36 @@ class FeedbackQueueTests(unittest.TestCase):
         sample = "```text\nPlaytester fingerprint: pt-aaaaaaaaaaaa\n~~~\n```\nPlaytester fingerprint: pt-bbbbbbbbbbbb\n"
         self.assertEqual(fingerprints_outside_code(sample), ["pt-bbbbbbbbbbbb"])
 
+    def test_fences_with_backticks_in_the_info_string_are_no_fences(self):
+        from .feedback import fingerprints_outside_code, render, fingerprint, short_fingerprint
+        forged = "```a`b\nPlaytester fingerprint: pt-aaaaaaaaaaaa\n"
+        self.assertEqual(fingerprints_outside_code(forged), ["pt-aaaaaaaaaaaa"])
+        self.assertEqual(fingerprints_outside_code("````a ```b````\nx\n"), [])
+        # A hostile book title in the Where line stays inline, not at a
+        # line start; only the real fingerprint is outside code.
+        from .feedback_producers import book_experience
+        found = book_experience({"source_kind": "book", "authored": 1,
+                                 "source_name": "a ```b", "map": "/test/hall",
+                                 "text_hash": "cd", "at": 1.0}, stats={"int": 4}, literacy=1)
+        digest = fingerprint("bug", "atrinik/classic", "s", "c")
+        body = render(found.evidence, digest=digest, occurrences=1, days=1,
+                      first_seen=0.0, last_seen=0.0)
+        self.assertFalse([line for line in body.splitlines() if line.startswith("`")])
+        self.assertEqual(fingerprints_outside_code(body), [short_fingerprint(digest)])
+        with self.assertRaises(ValueError):
+            render({"what": [{"code": "a name first"}]}, digest=digest, occurrences=1,
+                   days=1, first_seen=0.0, last_seen=0.0)
+
+    def test_more_invisible_characters_and_folded_names(self):
+        from .feedback import inert, names_private
+        hidden = "a\x85b\u061cc\u180ed\U000e0041e\x9ff"
+        self.assertEqual(inert(hidden), "abcdef")
+        for text in ("[b]Mal[/b]lory was here", "\uff2d\uff41\uff4c\uff4c\uff4f\uff52\uff59 waits",
+                     "Mal\u200blory", "[a=#charname]Mallory[/a] says"):
+            with self.subTest(text=text):
+                self.assertEqual(names_private(text, ["mallory"]), "mallory")
+        self.assertIsNone(names_private("Malloryland", ["mallory"]))
+
     def test_redaction_drops_lines_naming_a_seen_player(self):
         from .feedback import excerpt, names_private, EXCERPT_LINES, EXCERPT_CHARS
         lines = excerpt(["Zoey left the key here.\nThe gate is shut.\n\nMALLORY waits.",
@@ -27283,6 +27313,54 @@ class FeedbackQueueTests(unittest.TestCase):
         self.assertIn("- `torch` +1\n- `cape` +3", body)
         self.assertIn("- first\n- second", body)
 
+    def test_stored_items_are_screened_on_every_read(self):
+        from .feedback import note, screen, WITHHELD_TITLE
+        memory = self.memory()
+        draft_id, _ = note(memory, "Sera", self.finding(excerpts=["Ask Kiri at the gate."]),
+                           at=1.0)
+        filed_id, _ = note(memory, "Sera", self.finding("filed:x",
+                                                        excerpts=["Kiri was here."]), at=1.0)
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE feedback_items SET status = 'filed' WHERE id = ?", (filed_id,))
+        # Kiri is learned later: both the draft and the filed item fail now.
+        items = memory.feedback_items("Sera")
+        self.assertEqual(sorted(screen(items, ["kiri"])), sorted([draft_id, filed_id]))
+        self.assertTrue(all(item["withheld"] and item["title"] == WITHHELD_TITLE and
+                            item["body_md"] == "" for item in items))
+        memory.withhold_feedback("Sera", [draft_id, filed_id])
+        # Withheld stays withheld, even without the term, until a clean render.
+        items = memory.feedback_items("Sera")
+        self.assertEqual(screen(items, []), [])
+        self.assertTrue(all(item["withheld"] for item in items))
+        # A new occurrence still naming her is not stored and stays withheld.
+        self.assertIsNone(note(memory, "Sera", self.finding(
+            occurrence="later", excerpts=["Ask Kiri at the gate."]), private=["kiri"], at=2.0))
+        # A clean render (the evidence no longer quotes her) releases it.
+        note(memory, "Sera", self.finding(occurrence="clean", excerpts=["The gate."]), at=3.0)
+        released = {item["id"]: item for item in memory.feedback_items("Sera")}
+        self.assertEqual((released[draft_id]["withheld"], released[filed_id]["withheld"]),
+                         (0, 1))
+        screen(list(released.values()), ["kiri"])
+        self.assertIn("The gate.", released[draft_id]["body_md"])
+        # A draft that was clean when stored but now names a term is withheld
+        # by note() too, through its fingerprint.
+        fresh, _ = note(memory, "Sera", self.finding("fresh:y", excerpts=["Mira waits."]))
+        self.assertIsNone(note(memory, "Sera", self.finding("fresh:y", occurrence="z",
+                                                            excerpts=["Mira waits."]),
+                               private=["mira"]))
+        self.assertEqual(memory.feedback_item("Sera", str(fresh))["withheld"], 1)
+
+    def test_days_count_distinct_dates_in_any_order(self):
+        from .feedback import note
+        day = 86400.0
+        memory = self.memory()
+        note(memory, "Sera", self.finding(occurrence="a"), at=1_795_000_000.0 + 2 * day)
+        note(memory, "Sera", self.finding(occurrence="b"), at=1_795_000_000.0)
+        note(memory, "Sera", self.finding(occurrence="c"), at=1_795_000_000.0 + 2 * day + 60)
+        note(memory, "Sera", self.finding(occurrence="d"), at=1_795_000_000.0 + 60)
+        item, = memory.feedback_items("Sera")
+        self.assertEqual((item["occurrences"], item["days"]), (4, 2))
+
     def test_drafts_are_capped_fewest_occurrences_first(self):
         from . import memory as memory_module
         from .feedback import note
@@ -27299,6 +27377,13 @@ class FeedbackQueueTests(unittest.TestCase):
         subjects = {item["subject"]: item["status"] for item in memory.feedback_items("Sera")}
         self.assertEqual(subjects, {"keep:often": "draft", "old:once": "filed",
                                     "new:2": "draft", "new:3": "draft"})
+        # The queue was full when new:3 came: it got in, the weakest left.
+        with patch.object(memory_module, "FEEDBACK_DRAFT_LIMIT", 3):
+            _, created = note(memory, "Sera", self.finding("new:4"), at=20.0)
+        self.assertTrue(created)
+        self.assertIn("new:4", {item["subject"] for item in memory.feedback_items("Sera")})
+        self.assertEqual(sum(item["status"] == "draft"
+                             for item in memory.feedback_items("Sera")), 3)
 
 
 class FeedbackProducerTests(unittest.TestCase):
@@ -27332,6 +27417,22 @@ class FeedbackProducerTests(unittest.TestCase):
         # there is no draft.
         self.assertIsNone(typo({**row, "text": "Mallory: you need a the key."},
                                names=["mallory"]))
+
+    def test_drafts_name_only_public_maps_and_days(self):
+        from .feedback_producers import book_experience, public_map, typo
+        self.assertEqual(public_map("/shattered_islands/world_4_58"),
+                         "/shattered_islands/world_4_58")
+        for private in ("/players/sera/apartment", "/players", "relative/map", "", None):
+            self.assertIsNone(public_map(private), private)
+        row = {"source_kind": "book", "authored": 1, "source_name": "founding notes",
+               "map": "/players/sera/apartment", "text_hash": "ab", "at": 1_795_000_000.0}
+        found = book_experience(row, stats={"int": 3}, literacy=1)
+        flat = json.dumps(found.evidence)
+        self.assertNotIn("/players", flat)
+        self.assertNotRegex(flat, r"\d\d:\d\d")
+        self.assertIsNone(typo({"source_kind": "sign", "authored": 1,
+                                "source_key": "sign:/players/sera/apartment:1,1",
+                                "text": "You need a the key."}))
 
     def test_the_book_producer_needs_int_ten_or_lower(self):
         from .feedback_producers import book_experience
@@ -27486,14 +27587,48 @@ class FeedbackClientTests(unittest.TestCase):
         import io
         import contextlib as context
         from .cli import feedback_command, parser
+        from .equipment import BaseStats, base_to_json
+        from .web_server import WebControlServer
+
+        class Writer:
+            def __init__(self):
+                self.data = b""
+
+            def write(self, data):
+                self.data += data
+
+            async def drain(self):
+                pass
+
         _NETWORK_AUDIT["events"].clear()
         _NETWORK_AUDIT["armed"] = True
         try:
             client = self.client()
+            # A typo, a book at Int 9 and her cape: all three producers.
             asyncio.run(client.move(1))
             ObservationTests.say(client, "You need a the key to open this door.",
                                  color="00ffff")
-            item, = self.drafts(client)
+            client.state.place_item(Item(81, item_type=c.TYPE_BOOK, name="founding notes"),
+                                    client.state.player_tag)
+            asyncio.run(client.apply(81))
+            raw = book_packet("founding notes", "The hall was built in a single winter.\n")
+            asyncio.run(client._handle_book(Cursor(raw), raw))
+            client.faces = {5: "cape.101"}
+            cape = Item(15, item_type=c.TYPE_CLOAK, name="silk cape +2", face=5,
+                        quality=80, condition=100)
+            cape.extra["gear_examine"] = {"name": "silk cape +2",
+                                          "base": base_to_json(BaseStats()), "at": 0}
+            client.state.place_item(cape, 1)
+            client.note_equipment_feedback()
+            # The login sweep of a new process.
+            again = self.client()
+            self.assertEqual(len(self.drafts(again)), 3)
+            item = next(row for row in self.drafts(again) if row["kind"] == "clarity"
+                        and row["subject"].startswith("door:"))
+            # The dashboard route, called without its listener.
+            server = WebControlServer(again, TaskEngine(again), WorldGraph(), "127.0.0.1", 0)
+            writer = Writer()
+            asyncio.run(server._route(writer, "GET", "/api/feedback", b"", ""))
             base = ["--runtime-state", str(Path(self.directory.name) / "memory.sqlite3"),
                     "--host", "127.0.0.1", "--account", "seraacct", "--character", "Sera",
                     "feedback"]
@@ -27507,6 +27642,8 @@ class FeedbackClientTests(unittest.TestCase):
         finally:
             _NETWORK_AUDIT["armed"] = False
         self.assertEqual(_NETWORK_AUDIT["events"], [])
+        self.assertIn(b"200 OK", writer.data)
+        self.assertEqual(len(json.loads(writer.data.split(b"\r\n\r\n", 1)[1])["items"]), 3)
         text = out.getvalue()
         self.assertIn("Typo in the door text at /test/hall (5,4)", text)
         self.assertIn(item["body_md"], text)
@@ -27518,16 +27655,107 @@ class FeedbackClientTests(unittest.TestCase):
         finally:
             _NETWORK_AUDIT["armed"] = False
         self.assertIn("socket.__new__", _NETWORK_AUDIT["events"])
-        # And the queue's modules import no network library.
+        # The queue's modules, and every package module they import, import
+        # no network library.
         import ast
-        for module in ("feedback.py", "feedback_producers.py"):
-            tree = ast.parse((Path(__file__).with_name(module)).read_text())
+        seen, todo = set(), ["feedback", "feedback_producers", "memory"]
+        while todo:
+            module = todo.pop()
+            if module in seen:
+                continue
+            seen.add(module)
+            tree = ast.parse(Path(__file__).with_name(f"{module}.py").read_text())
             names = {alias.name.split(".")[0] for node in ast.walk(tree)
                      if isinstance(node, ast.Import) for alias in node.names}
-            names |= {(node.module or "").split(".")[0] for node in ast.walk(tree)
-                      if isinstance(node, ast.ImportFrom) and not node.level}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    if node.level:
+                        todo.extend([node.module] if node.module else
+                                    [alias.name for alias in node.names])
+                    else:
+                        names.add((node.module or "").split(".")[0])
             self.assertFalse(names & {"socket", "urllib", "http", "ssl", "asyncio",
-                                      "requests", "aioquic"}, module)
+                                      "requests", "aioquic", "smtplib"}, module)
+        self.assertLessEqual({"feedback", "feedback_producers", "memory", "observations",
+                              "build_info"}, seen)
+
+    def test_a_withheld_finding_is_tried_again(self):
+        from . import feedback
+        client = self.client()
+        calls = []
+        with patch.object(feedback, "note", side_effect=lambda *a, **k: calls.append(1)):
+            for _ in range(2):
+                asyncio.run(client.move(1))
+                ObservationTests.say(client, "You need a the key to open this door.",
+                                     color="00ffff")
+        self.assertEqual(len(calls), 2)
+
+    def test_chat_senders_are_read_once_a_login(self):
+        from .memory import BotMemory
+        client = self.client()
+        calls = []
+        original = BotMemory.chat_senders
+
+        def counted(memory, **kwargs):
+            calls.append(1)
+            return original(memory, **kwargs)
+
+        with patch.object(BotMemory, "chat_senders", counted):
+            client._feedback_other_names()
+            client._feedback_other_names()
+            client._log_chat(c.CHAT_TYPE_CHAT, "in", "Nadia", "hello")
+            self.assertIn("Nadia", client._feedback_other_names())
+            self.assertEqual(len(calls), 1)
+            client.load_character_memory("Sera")
+            client._feedback_other_names()
+            self.assertEqual(len(calls), 2)
+
+    def test_her_party_and_the_operator_are_private(self):
+        from .web_server import WebControlServer
+        client = self.client()
+        client.state.party_name = "Moonriders"
+        WebControlServer(client, TaskEngine(client), WorldGraph(), "127.0.0.1", 0,
+                         operator_character="Opal")
+        terms = client.feedback_private_terms()
+        self.assertIn("Moonriders", terms)
+        self.assertIn("Opal", terms)
+
+    def test_cli_reads_without_writing_and_screens(self):
+        import hashlib
+        import io
+        import contextlib as context
+        from .cli import feedback_command, parser
+        from .feedback import note
+        client = self.client()
+        memory = client._memory_store()
+        note(memory, "Sera", FeedbackQueueTests.finding(excerpts=["Ask Kiri."]))
+        memory.append_chat("Sera", c.CHAT_TYPE_CHAT, "in", "Kiri", "hi")
+        path = Path(self.directory.name) / "memory.sqlite3"
+        with sqlite3.connect(path) as db:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        base = ["--runtime-state", str(path), "--host", "127.0.0.1", "--account", "seraacct",
+                "--character", "Sera", "feedback"]
+        out = io.StringIO()
+        with context.redirect_stdout(out):
+            self.assertEqual(feedback_command(parser().parse_args(base + ["list"])), 0)
+            self.assertEqual(feedback_command(parser().parse_args(base + ["show", "1"])), 0)
+        self.assertIn("withheld", out.getvalue())
+        self.assertNotIn("Kiri", out.getvalue())
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+        self.assertEqual(memory.feedback_item("Sera", "1")["withheld"], 0)
+        # A database without the queue: a clear message, and nothing created.
+        other = Path(self.directory.name) / "old.sqlite3"
+        with sqlite3.connect(other) as db:
+            db.execute("CREATE TABLE memory (x)")
+        out = io.StringIO()
+        with context.redirect_stdout(out):
+            self.assertEqual(feedback_command(parser().parse_args(
+                ["--runtime-state", str(other), "--character", "Sera", "feedback", "list"])), 1)
+        self.assertIn("no feedback queue", out.getvalue())
+        with sqlite3.connect(other) as db:
+            self.assertEqual([row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")], ["memory"])
 
     def test_cli_needs_a_character_and_an_existing_database(self):
         import io
@@ -27572,6 +27800,18 @@ class FeedbackRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(body["counts"], {"draft": {"clarity": 1}})
             status, payload = await self.request("GET", "/api/feedback?repo=atrinik/classic")
             self.assertEqual(json.loads(payload)["items"], [])
+            # A name learned after the draft was stored withholds it on read.
+            note(self.client._memory_store(), "Sera",
+                 FeedbackQueueTests.finding("sign:/m:1,1", excerpts=["Kiri waits."]))
+            self.client.observations.player_names["kiri"] = 1.0
+            status, payload = await self.request("GET", "/api/feedback")
+            rows = {row["subject"]: row for row in json.loads(payload)["items"]}
+            self.assertEqual((rows["sign:/m:1,1"]["withheld"], rows["sign:/m:1,1"]["body_md"]),
+                             (True, ""))
+            self.assertFalse(rows[item["subject"]]["withheld"])
+            self.assertNotIn(b"Kiri", payload)
+            self.assertEqual(self.client._memory_store().feedback_item(
+                "Sera", str(rows["sign:/m:1,1"]["id"]))["withheld"], 1)
             # There is no write route in this phase.
             status, _ = await self.request("POST", f"/api/feedback/{item['id']}",
                                            {"action": "approve"})
@@ -27590,7 +27830,7 @@ class FeedbackRouteTests(unittest.IsolatedAsyncioTestCase):
         start = script.index("// ---------- feedback drafts")
         section = script[start:script.index("// ---------- polling", start)]
         self.assertNotIn("innerHTML", section)
-        self.assertIn('node("pre", "feedback-body", x.body_md)', section)
+        self.assertIn('node("pre", "feedback-body", body)', section)
 
 
 if __name__ == "__main__":

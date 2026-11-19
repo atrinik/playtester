@@ -459,8 +459,11 @@ are a later phase, and only an item the owner approves will ever be filed.
   repository, subject and claim, shown as `pt-` and 12 hex digits. The same
   fingerprint never makes a second draft, across restarts too; a new
   occurrence raises its count, and a draft's body is rendered again from its
-  evidence each time. At most 500 drafts a character, the fewest
-  occurrences dropped first.
+  evidence each time; its day count is the number of distinct dates. At
+  most 500 drafts a character: a new draft evicts the one with the fewest
+  occurrences, then the least recently seen. Drafts carry dates, never times
+  of day, and name a map only by its authored path, never a player's own
+  map.
 - **Privacy.** A draft holds only authored text and her own state. Game
   text appears only in a fenced code block longer than any backtick run in
   it, with HTML comment markers and invisible characters removed, so a
@@ -468,8 +471,11 @@ are a later phase, and only an item the owner approves will ever be filed.
   names are inline code. An excerpt line naming another character she has
   seen (in view, in `/who`, or any chat sender her memory keeps) is
   dropped. A draft whose title or body would contain her account,
-  character or the server's address, the password, the invite code, the
-  operator character or another character's name is not stored at all.
+  character or the server's address, the password, the invite code, her
+  party, the operator character or another character's name is not stored
+  at all. Every reader checks stored items again against the names known
+  now: one that names a private term is shown as withheld, with no body,
+  until it is rendered again without it.
 
 The dashboard's read-only **Feedback** tab lists the drafts, filtered by
 kind and repository, with the exact body that would be filed (`GET
@@ -484,8 +490,9 @@ atrinik-playtester --host HOST --port 1728 feedback show pt-4f1c2a9b0d3e
 
 `--host`, `--port`, `--account` and `--character` select her rows as the
 bot stores them; `list` takes `--kind`, `--repo` and `--status`, and
-`list --json` and `show --json` print JSON. The command reads the database directly, whether
-or not the bot is running, and needs no network and no game inputs.
+`list --json` and `show --json` print JSON. The command opens the database
+read-only, whether or not the bot is running, and needs no network and no
+game inputs.
 
 ## Operator assist
 

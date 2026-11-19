@@ -32,6 +32,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Collection, Iterable
 
@@ -59,7 +60,10 @@ SHORT_FINGERPRINT = re.compile(r"^pt-[0-9a-f]{12}$")
 # and the invisible formatting characters that reorder or hide text.
 _COMMENT = re.compile(r"<!--|-->")
 _INVISIBLE = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f­​-‏ -‮⁠-⁩﻿]")
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e"
+    "\u2060-\u2069\ufeff\U000e0000-\U000e007f]")
+# Game markup ("[b]", "[a=#charname]"): removed before names are compared.
+_MARKUP = re.compile(r"\[/?[a-z]+(?:=[^\]]*)?\]", re.I)
 _BACKTICKS = re.compile(r"`+")
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
@@ -116,18 +120,30 @@ def _term_pattern(term: str) -> re.Pattern:
     return re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.I)
 
 
+def fold(text: Any) -> str:
+    """Text as names are compared: NFKC, invisible characters and game
+    markup removed, whitespace collapsed, case folded."""
+    text = unicodedata.normalize("NFKC", str(text))
+    text = _MARKUP.sub(" ", _INVISIBLE.sub("", text))
+    return " ".join(text.split()).casefold()
+
+
 def private_terms(values: Iterable[Any]) -> list[str]:
-    """The distinct, case-folded, non-trivial terms to keep out of drafts."""
-    terms = {" ".join(str(value).split()).casefold() for value in values if value}
+    """The distinct, folded, non-trivial terms to keep out of drafts."""
+    terms = {fold(value) for value in values if value}
     return sorted(term for term in terms if len(term) >= 2)
 
 
 def names_private(text: str, terms: Collection[str]) -> str | None:
-    """The first private term ``text`` contains as a word, or None."""
-    folded = " ".join(inert(text).split()).casefold()
-    for term in terms:
-        if term in folded and _term_pattern(term).search(folded):
-            return term
+    """The first private term ``text`` contains as a word, or None; both
+    are compared folded (``fold``), so "[b]Zo[/b]" or a full-width or
+    zero-width-split name still matches."""
+    folded = fold(inert(text))
+    folded_joined = fold(_MARKUP.sub("", unicodedata.normalize("NFKC", str(text))))
+    for candidate in (folded, folded_joined):
+        for term in terms:
+            if term in candidate and _term_pattern(term).search(candidate):
+                return term
     return None
 
 
@@ -185,8 +201,9 @@ def _day(at: float) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(at))
 
 
-def utc_minute(at: float) -> str:
-    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(at))
+def utc_day(at: float) -> str:
+    """The day of a time, UTC: drafts never carry the time of day she played."""
+    return time.strftime("%Y-%m-%d", time.gmtime(at))
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,9 +258,14 @@ def render(evidence: dict[str, Any], *, digest: str, occurrences: int, days: int
     """The draft body (4.10.3), from its evidence and counts."""
     out: list[str] = []
 
-    def section(title: str, lines: list[str]) -> None:
-        if lines:
-            out.extend((f"### {title}", *lines, ""))
+    def section(title: str, lines: list[str], block: str = "") -> None:
+        for line in lines:
+            # A paragraph never opens with a code span: a name there could
+            # read as a fence opening to a lenient parser (producer bug).
+            if line.startswith(("`", "~")):
+                raise ValueError(f"a {title!r} line starts with a code span")
+        if block or lines:
+            out.extend((f"### {title}", *([block] if block else []), *lines, ""))
 
     section("What happened", [_parts(evidence.get("what"))])
     where = [_parts(evidence.get("where"))] if evidence.get("where") else []
@@ -257,12 +279,10 @@ def render(evidence: dict[str, Any], *, digest: str, occurrences: int, days: int
     section("What she tried", [f"- {_parts(line)}" for line in evidence.get("tried", [])])
     saw: list[str] = []
     excerpts = [str(line) for line in evidence.get("excerpts", [])][:EXCERPT_LINES]
-    if excerpts:
-        saw.append(quote(excerpts))
     saw.extend(f"- {_parts(item['text'])}" for item in evidence.get("items", [])
                if isinstance(item, dict) and item.get("text"))
     saw.extend(_parts(note) for note in evidence.get("notes", []))
-    section("What she saw", saw)
+    section("What she saw", saw, quote(excerpts) if excerpts else "")
     section("What she expected", [_parts(evidence["expected"])]
             if evidence.get("expected") else [])
     section("What the content says", [f"- {_parts(line)}"
@@ -295,7 +315,9 @@ def fingerprints_outside_code(body: str) -> list[str]:
                     len(match.group(1)) >= len(fence) and not line.strip(" `~")):
                 fence = ""
             continue
-        if match:
+        # A backtick fence's info string has no backtick (CommonMark): a
+        # line such as "```a```" is a code span, not a fence.
+        if match and not (match.group(1)[0] == "`" and "`" in line[match.end():]):
             fence = match.group(1)
             continue
         if line.startswith(FINGERPRINT_PREFIX):
@@ -338,7 +360,36 @@ def note(memory: Any, character: str, finding: Finding, *, at: float | None = No
             subject=finding.subject, at=at, occurrence=finding.occurrence,
             build=build, timeout=timeout)
     except PrivateText:
-        # Never logged with the term or the text: only that it happened.
+        # Never logged with the term or the text: only that it happened. A
+        # stored draft that would now name one is withheld until a clean
+        # render replaces it.
         log.warning("feedback draft %s not kept: it named a private term",
                     short_fingerprint(digest))
+        try:
+            memory.withhold_feedback_fingerprint(character, digest, timeout=timeout)
+        except Exception as error:
+            log.warning("feedback draft %s not withheld: %s", short_fingerprint(digest), error)
         return None
+
+
+WITHHELD_TITLE = "(withheld: it names a private term)"
+
+
+def screen(items: Iterable[dict[str, Any]], private: Collection[str]) -> list[int]:
+    """Check stored items against the current private terms before anyone
+    sees or files them (the dashboard, the CLI and the filer all call it):
+    a term learned after an item was rendered, or one in an item past
+    draft, is caught here. A failing or already withheld item is marked
+    ``withheld`` and its title and body are blanked in place. Returns the
+    ids that newly failed, for ``BotMemory.withhold_feedback``."""
+    terms = private_terms(private)
+    newly: list[int] = []
+    for item in items:
+        failed = names_private(f"{item.get('title', '')}\n{item.get('body_md', '')}", terms)
+        if failed is not None and not item.get("withheld"):
+            newly.append(int(item["id"]))
+        if failed is not None or item.get("withheld"):
+            item.update(withheld=True, title=WITHHELD_TITLE, body_md="")
+        else:
+            item["withheld"] = False
+    return newly

@@ -23,7 +23,8 @@ from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .equipment import equipment_report
-from .feedback import KINDS as FEEDBACK_KINDS, REPOS as FEEDBACK_REPOS, short_fingerprint
+from .feedback import (KINDS as FEEDBACK_KINDS, REPOS as FEEDBACK_REPOS,
+                       screen as screen_feedback, short_fingerprint)
 from .face_images import FaceImages
 from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from .alerts import active as active_alerts
@@ -955,6 +956,11 @@ class WebControlServer:
         self.operator_assist = operator_assist or OperatorAssist(
             client, engine, operator_character)
         self.dashboard.operator_assist = self.operator_assist
+        # The operator character never appears in a feedback draft.
+        private = getattr(client, "feedback_private_names", None)
+        operator = getattr(self.operator_assist, "operator_character", "") or operator_character
+        if isinstance(private, set) and operator:
+            private.add(operator)
         # The owner-only key /api/operator-assist requires; empty refuses all.
         self.operator_key = operator_key
         self._key_refusals_logged_at = 0.0
@@ -1165,6 +1171,18 @@ class WebControlServer:
                     counts = memory.feedback_counts(character, timeout=KNOWLEDGE_READ_TIMEOUT)
                 except sqlite3.OperationalError:
                     items, counts, busy = [], {}, True
+            if items:
+                # Checked against the current private terms on every read:
+                # an item naming one is withheld (blanked here, flagged in
+                # her memory) until a clean render replaces it.
+                try:
+                    newly = screen_feedback(items, self.client.feedback_private_terms())
+                    if newly:
+                        self.client._memory_store().withhold_feedback(
+                            character, newly, timeout=KNOWLEDGE_READ_TIMEOUT)
+                except Exception as error:
+                    log.warning("feedback screening failed: %s", error)
+                    items, busy = [], True
             for item in items:
                 item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
                 try:
