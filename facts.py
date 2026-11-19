@@ -37,6 +37,24 @@ LOCK_SOURCES = frozenset({"door", "gate", "lever", "sign", "magic_mouth"})
 READING_SOURCES = frozenset({"book", "scroll", "npc", "journal"})
 TEXT_SOURCES = LOCK_SOURCES | READING_SOURCES
 
+# The parser set: an observation it has read is not read again on a repeat
+# (observations.facts_version). Bump it whenever a parser changes.
+VERSION = "facts/1"
+
+# Tile facts (4.11.1) lapse after a week unless a refusal refreshes them,
+# and count only under the content revision they were seen with.
+TILE_FACT_SECONDS = 7 * 24 * 3600.0
+# With persist_tile_facts on, a remembered square or map is tried again
+# with one ordinary cast this long after it was last confirmed or tried
+# (and only when she is not hurt badly, TILE_PROBE_MIN_HEALTH); no refusal
+# within the attribution window refutes the fact, a refusal refreshes it.
+TILE_PROBE_SECONDS = 6 * 3600.0
+TILE_PROBE_WINDOW_SECONDS = 60.0
+TILE_PROBE_MIN_HEALTH = 0.5
+TILE_PROBE_ANSWER_SECONDS = 10.0
+# The longest a tile-fact decision waits to save the decision ledger.
+TILE_DECISION_SAVE_SECONDS = 0.25
+
 # Characters kept of a fact's value and of the sentence it came from.
 VALUE_LIMIT = 120
 DETAIL_LIMIT = 300
@@ -170,13 +188,14 @@ class Fact:
     detail: str = ""
     status: str = "candidate"
 
-    def row(self, *, at: float, observation_id: int | None = None) -> dict[str, Any]:
+    def row(self, *, at: float, observation_id: int | None = None, inputs: str = "",
+            expires_at: float | None = None) -> dict[str, Any]:
         return {"kind": self.kind, "subject": self.subject[:VALUE_LIMIT * 2],
                 "value": self.value[:VALUE_LIMIT],
                 "confidence": max(0.0, min(1.0, float(self.confidence))),
                 "status": self.status, "parser": self.parser,
                 "detail": self.detail[:DETAIL_LIMIT], "observation_id": observation_id,
-                "at": float(at)}
+                "inputs": inputs, "expires_at": expires_at, "at": float(at)}
 
 
 def tile_subject(map_path: str, x: int, y: int) -> str:

@@ -185,6 +185,24 @@ class ClientConfig:
 # for a death.
 DEATH_NOTICES = ("you have been defeated in combat!", "you have died.")
 
+# Tile facts (facts.py): positions of recent refusal lines remembered, the
+# least time between writes of the same fact, and the wait after a failed
+# write.
+TILE_REFUSAL_SQUARES = 64
+TILE_FACT_REFRESH_SECONDS = 3600.0
+TILE_FACT_RETRY_SECONDS = 60.0
+
+
+def _locked_content_inputs() -> str:
+    """``content:<revision>`` of the locked content, or "" without the lock."""
+    try:
+        from .compatibility import load_lock
+        revision = load_lock()["inputs"]["content"]["revision"]
+        return f"content:{revision}" if isinstance(revision, str) and revision else ""
+    except Exception:
+        return ""
+
+
 def _after(records: list, mark: Any) -> list:
     """The records after ``mark``: found by identity, or by value in a
     reloaded history (a decoded record equals the one saved); all of them
@@ -310,13 +328,27 @@ class AtrinikClient:
         self.observations = ObservationRecorder(
             lambda: self.authored_content, self._observation_dropped)
         # Her confirmed tile facts (facts.py), by (map, x, y), x = y = -1 for
-        # a whole map, loaded with her memory: the properties at each.
-        self.tile_facts: dict[tuple[str, int, int], set[str]] = {}
-        # Tile facts written in this process, so a repeat costs no write.
-        self._tile_facts_noted: set[tuple[tuple[str, int, int], str]] = set()
-        # Squares whose tile fact already recorded a decision in this process
-        # (tasks.spell_blocked_here).
-        self._tile_fact_decisions: set[tuple[str, int, int]] = set()
+        # a whole map, loaded with her memory: each property and when it was
+        # last confirmed (wall time).
+        self.tile_facts: dict[tuple[str, int, int], dict[str, float]] = {}
+        # The content revision tile facts are recorded under; a fact from
+        # another revision is ignored.
+        self.content_inputs = _locked_content_inputs()
+        # When each tile fact was last written in this process: a repeat
+        # within TILE_FACT_REFRESH_SECONDS costs no write.
+        self._tile_facts_noted: dict[tuple[tuple[str, int, int], str], float] = {}
+        # After a failed write, no tile-fact write before this (monotonic).
+        self._tile_fact_retry_at = 0.0
+        # Decisions a tile fact already recorded in this process.
+        self._tile_fact_decisions: set[tuple[tuple[str, int, int], str]] = set()
+        # Where she stood when each recent tile refusal line arrived, by
+        # message position, and when the last one arrived (wall time).
+        self._tile_refusal_squares: dict[int, tuple[str, int, int]] = {}
+        self._tile_refusal_at = 0.0
+        # Re-probes of remembered no-magic squares: when the open one began,
+        # and when each square was last probed.
+        self._tile_probes: dict[tuple[str, int, int], float] = {}
+        self._tile_probed_at: dict[tuple[str, int, int], float] = {}
 
     def load_character_memory(self, character: str) -> None:
         # Switching characters on a long-lived client: the previous one's
@@ -577,36 +609,80 @@ class AtrinikClient:
                 self._runtime_memory.get(character, {}))
 
     def _load_tile_facts(self, character: str) -> None:
-        """Her confirmed tile facts, kept from earlier sessions."""
+        """Her confirmed, unexpired tile facts of this content revision."""
         self.tile_facts = {}
         self._tile_facts_noted.clear()
         self._tile_fact_decisions.clear()
+        self._tile_probes.clear()
+        self._tile_probed_at.clear()
         if not character:
             return
         try:
-            rows = self._memory_store().tile_facts(character)
+            rows = self._memory_store().tile_facts(
+                character, now=time.time(), inputs=self.content_inputs)
         except Exception as error:  # Never fails a login.
             log.warning("tile facts not loaded: %s", error)
             return
-        for subject, value in rows:
+        for subject, value, at in rows:
             square = fact_parsers.parse_tile_subject(subject)
             if square is not None:
-                self.tile_facts.setdefault(square, set()).add(value)
+                self.tile_facts.setdefault(square, {})[value] = at
+
+    def _note_tile_refusal_line(self, text: str) -> None:
+        """Where she stands as a tile refusal arrives (note_tile_refusal)."""
+        if fact_parsers.tile_property(text) is None:
+            return
+        m = self.state.map
+        self._tile_refusal_squares[self.state.message_count - 1] = (
+            m.path, m.world_x, m.world_y)
+        while len(self._tile_refusal_squares) > TILE_REFUSAL_SQUARES:
+            del self._tile_refusal_squares[next(iter(self._tile_refusal_squares))]
+        self._tile_refusal_at = time.time()
+
+    def note_tile_refusal(self, position: int, value: str, whole_map: bool,
+                          text: str, attributed: bool) -> None:
+        """A tile refusal ``tasks.spell_blocked_here`` read at message
+        ``position``; ``attributed`` when her recent cast explains it.
+
+        Kept as a fact only when it certainly belongs to the cast: for a
+        whole map, she was on the cast's map when the line arrived; for a
+        square, she still stood on the square she cast from. Otherwise
+        (a potion drunk after an exit, say) nothing is kept.
+        """
+        cast = self.spell_cast
+        arrival = self._tile_refusal_squares.get(position)
+        if not attributed or cast is None or arrival is None:
+            return
+        if whole_map:
+            if cast[0][0] != arrival[0]:
+                return
+            where = (arrival[0], -1, -1)
+        elif cast[0] != arrival:
+            return
+        else:
+            where = arrival
+        self.note_tile_fact(where, value, text)
 
     def note_tile_fact(self, square: tuple[str, int, int], value: str,
                        text: str) -> None:
         """Keep a fixed server refusal at ``square`` (x = y = -1: the whole
-        map) as a confirmed tile fact (facts.py); never fails play.
+        map) as a confirmed tile fact (facts.py) for TILE_FACT_SECONDS under
+        this content revision; never fails or holds up play.
 
-        ``tasks.spell_blocked_here`` calls this for the square it marks. The
-        fact cites the stored observation of the same line, if any.
+        The fact cites the stored observation of the same line, if any. A
+        repeat is written at most once in TILE_FACT_REFRESH_SECONDS, and a
+        failed write waits TILE_FACT_RETRY_SECONDS before the next.
         """
         if not square[0]:
             return
-        self.tile_facts.setdefault(square, set()).add(value)
+        now = time.time()
+        self.tile_facts.setdefault(square, {})[value] = now
         character = getattr(self, "_memory_character", "")
-        if (not character or character != self.state.player_name or
-                (square, value) in self._tile_facts_noted):
+        if not character or character != self.state.player_name:
+            return
+        written = self._tile_facts_noted.get((square, value))
+        if ((written is not None and now - written < TILE_FACT_REFRESH_SECONDS) or
+                time.monotonic() < self._tile_fact_retry_at):
             return
         fact = fact_parsers.tile_fact(*square, value, text)
         try:
@@ -614,39 +690,124 @@ class AtrinikClient:
             observation = memory.observation_id(
                 character, f"system:{square[0]}", text_hash(text))
             _, created = memory.record_fact(
-                character, fact.row(at=time.time(), observation_id=observation))
-        except sqlite3.Error as error:
+                character, fact.row(at=now, observation_id=observation,
+                                    inputs=self.content_inputs,
+                                    expires_at=now + fact_parsers.TILE_FACT_SECONDS))
+        except Exception as error:
             log.warning("tile fact not kept: %s", error)
+            self._tile_fact_retry_at = time.monotonic() + TILE_FACT_RETRY_SECONDS
             return
-        except Exception:
-            log.exception("tile fact not kept")
-            return
-        self._tile_facts_noted.add((square, value))
+        self._tile_facts_noted[(square, value)] = now
         if created and self.metrics is not None:
             self.metrics.fact(fact.kind, fact.status)
 
+    def _tile_decision(self, where: tuple[str, int, int], action: str, *,
+                       once: bool = True) -> None:
+        """Record a tile-fact decision; never fails or waits long."""
+        if once:
+            if (where, action) in self._tile_fact_decisions:
+                return
+            self._tile_fact_decisions.add((where, action))
+        try:
+            self.record_action(action, f"{where[0]} (whole map)" if where[1:] == (-1, -1)
+                               else f"{where[0]} ({where[1]},{where[2]})",
+                               save_timeout=fact_parsers.TILE_DECISION_SAVE_SECONDS)
+        except Exception as error:
+            log.warning("tile fact decision not recorded: %s", error)
+
+    def tile_fact_blocks(self, square: tuple[str, int, int]) -> bool:
+        """Whether a remembered no-magic fact keeps her from casting on
+        ``square`` (``tasks.spell_blocked_here``, for healing only).
+
+        Off (``persist_tile_facts`` unset), never: it records once that she
+        would have held off. On, it blocks, except for one ordinary cast
+        TILE_PROBE_SECONDS after the fact was last confirmed or tried, when
+        she is not badly hurt. That cast refutes the fact when no refusal
+        arrives within TILE_PROBE_ANSWER_SECONDS; a refusal refreshes it.
+        """
+        now = time.time()
+        where = next((key for key in (square, (square[0], -1, -1))
+                      if now - self.tile_facts.get(key, {}).get("no_magic", -1e18)
+                      < fact_parsers.TILE_FACT_SECONDS), None)
+        if where is None or not square[0]:
+            return False
+        if not self.config.persist_tile_facts:
+            self._tile_decision(where, "tile-fact-no-magic-shadow")
+            return False
+        started = self._tile_probes.get(where)
+        if started is not None:
+            cast = self.spell_cast
+            if cast is not None and cast[2] >= started and (
+                    cast[0][0] == where[0] if where[1:] == (-1, -1) else cast[0] == where):
+                if self._tile_refusal_at >= cast[2]:
+                    # Refused again: the fact stands (refreshed when the
+                    # refusal was certainly the cast's).
+                    del self._tile_probes[where]
+                    self._tile_decision(where, "tile-fact-probe-refused", once=False)
+                    return True
+                if now - cast[2] <= fact_parsers.TILE_PROBE_ANSWER_SECONDS:
+                    return True  # Waiting for the answer to her one try.
+                del self._tile_probes[where]
+                self._refute_tile_fact(where)
+                return False
+            if now - started <= fact_parsers.TILE_PROBE_WINDOW_SECONDS:
+                return False  # Her one try is still open.
+            del self._tile_probes[where]
+        last = max(self.tile_facts[where]["no_magic"], self._tile_probed_at.get(where, 0.0))
+        stats = self.state.stats
+        maxhp = float(stats.get("maxhp", 0) or 0)
+        healthy = maxhp <= 0 or (float(stats.get("hp", 0) or 0) / maxhp >=
+                                 fact_parsers.TILE_PROBE_MIN_HEALTH)
+        if now - last >= fact_parsers.TILE_PROBE_SECONDS and healthy:
+            self._tile_probes[where] = self._tile_probed_at[where] = now
+            self._tile_decision(where, "tile-fact-probe", once=False)
+            return False
+        self._tile_decision(where, "tile-fact-no-magic")
+        return True
+
+    def _refute_tile_fact(self, where: tuple[str, int, int]) -> None:
+        """Her cast there drew no refusal: the square or map is not no-magic."""
+        self.tile_facts.get(where, {}).pop("no_magic", None)
+        self._tile_facts_noted.pop((where, "no_magic"), None)
+        self._tile_fact_decisions.discard((where, "tile-fact-no-magic"))
+        self._tile_decision(where, "tile-fact-refuted", once=False)
+        character = getattr(self, "_memory_character", "")
+        if not character or character != self.state.player_name:
+            return
+        try:
+            self._memory_store().refute_fact(
+                character, "tile-property", fact_parsers.tile_subject(*where), "no_magic",
+                at=time.time())
+        except Exception as error:
+            log.warning("tile fact not refuted: %s", error)
+            return
+        if self.metrics is not None:
+            self.metrics.fact("tile-property", "refuted")
+
     def _record_facts(self, character: str, observation: Observation,
-                      observation_id: int) -> None:
-        """The facts a stored observation states (facts.py), citing it."""
+                      observation_id: int, version: str | None) -> None:
+        """The facts a stored observation states (facts.py), citing it, in
+        one transaction; a row this parser set already read is skipped."""
+        if version == fact_parsers.VERSION:
+            return
         content = self.authored_content
         try:
             found = fact_parsers.parse(observation.row(),
                                        content.names if content is not None else None)
-        except Exception:
-            log.exception("fact parsers failed")
+            results = self._memory_store().record_facts(
+                character, observation_id,
+                [fact.row(at=observation.at, observation_id=observation_id)
+                 for fact in found], fact_parsers.VERSION)
+        except sqlite3.Error as error:
+            log.warning("facts not kept: %s", error)
             return
-        for fact in found:
-            try:
-                _, created = self._memory_store().record_fact(
-                    character, fact.row(at=observation.at, observation_id=observation_id))
-            except sqlite3.Error as error:
-                log.warning("fact not kept: %s", error)
-                return
-            except Exception:
-                log.exception("fact not kept")
-                return
-            if created and self.metrics is not None:
-                self.metrics.fact(fact.kind, fact.status)
+        except Exception:
+            log.exception("facts not kept")
+            return
+        if self.metrics is not None:
+            for fact, (_, created) in zip(found, results):
+                if created:
+                    self.metrics.fact(fact.kind, fact.status)
 
     def _memory_store(self) -> BotMemory:
         if self.memory is None:
@@ -1021,8 +1182,12 @@ class AtrinikClient:
             "last_bank_deposit_at"] = self.state.last_bank_deposit_at
         self._persist_character_memory()
 
-    def record_action(self, action: str, detail: str = "") -> None:
-        """Keep a bounded, map-aware history of orders sent by automation."""
+    def record_action(self, action: str, detail: str = "", *,
+                      save_timeout: float | None = None) -> None:
+        """Keep a bounded, map-aware history of orders sent by automation.
+
+        With ``save_timeout``, saving the ledger waits at most that long and
+        a failed save is logged, not raised."""
         if self.metrics is not None:
             self.metrics.action(action, detail)
         m = self.state.map
@@ -1064,7 +1229,13 @@ class AtrinikClient:
             # loaded yet. Saving the new process's short pre-login list under
             # that key would overwrite the existing SQLite decision ledger.
             character = self.state.player_name
-            if character:
+            if character and save_timeout is not None:
+                try:
+                    self._memory_store().save(character, "decisions",
+                                              self.decision_history, timeout=save_timeout)
+                except sqlite3.Error as error:
+                    log.warning("decision not saved: %s", error)
+            elif character:
                 self._memory_store().save(
                     character, "decisions", self.decision_history)
 
@@ -1578,6 +1749,7 @@ class AtrinikClient:
         msg_type, color = cur.u8(), cur.cstring()
         text = cur.cstring() if cur.remaining else ""
         self.state.add_message(msg_type, color, text)
+        self._note_tile_refusal_line(text)
         # Only what a review reads (time, type, text), bounded in size as well
         # as count: a report's own text length of each line, and no other
         # server field (a frame can be megabytes).
@@ -1834,7 +2006,8 @@ class AtrinikClient:
             if not isinstance(observation, Observation):
                 continue
             try:
-                row_id = self._memory_store().record_observation(character, observation.row())
+                row_id, version = self._memory_store().record_observation_parsed(
+                    character, observation.row())
             except sqlite3.Error as error:
                 log.warning("observation not kept: %s", error)
                 continue
@@ -1844,7 +2017,7 @@ class AtrinikClient:
             if self.metrics is not None:
                 self.metrics.observation(observation.source_kind)
             # Facts only from what was kept: the stored row is their source.
-            self._record_facts(character, observation, row_id)
+            self._record_facts(character, observation, row_id, version)
 
     def _observation_dropped(self, reason: str) -> None:
         if getattr(self, "metrics", None) is not None:

@@ -38,8 +38,8 @@ FACT_ROW_LIMIT = 20_000
 FACT_PRUNE_EVERY = 100
 FACT_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
 FACT_COLUMNS = ("id", "kind", "subject", "value", "confidence", "status",
-                "observation_id", "parser", "detail", "created_at", "updated_at",
-                "expires_at")
+                "observation_id", "parser", "detail", "inputs", "created_at",
+                "updated_at", "expires_at")
 
 
 class BotMemory:
@@ -133,6 +133,7 @@ class BotMemory:
                        observation_id INTEGER,
                        parser TEXT NOT NULL,
                        detail TEXT NOT NULL DEFAULT '',
+                       inputs TEXT NOT NULL DEFAULT '',
                        created_at REAL NOT NULL,
                        updated_at REAL NOT NULL,
                        expires_at REAL
@@ -146,6 +147,14 @@ class BotMemory:
             db.execute(
                 """CREATE INDEX IF NOT EXISTS facts_by_observation
                    ON facts (observation_id)""")
+            if "inputs" not in {row[1] for row in db.execute("PRAGMA table_info(facts)")}:
+                db.execute("ALTER TABLE facts ADD COLUMN inputs TEXT NOT NULL DEFAULT ''")
+            # The parser set that last read each observation (facts.VERSION):
+            # a repeat is read again only after the parsers change. Added to
+            # F1's table where it predates the column.
+            if "facts_version" not in {
+                    row[1] for row in db.execute("PRAGMA table_info(observations)")}:
+                db.execute("ALTER TABLE observations ADD COLUMN facts_version TEXT")
         self._chat_appends = 0
         self._observation_inserts = 0
         self._fact_inserts = 0
@@ -256,6 +265,13 @@ class BotMemory:
         """Store one observation (``Observation.row()``), or raise its seen
         count when the same text came from the same source before; returns
         the row id. ``timeout`` bounds the wait for a locked database."""
+        return self.record_observation_parsed(character, row, timeout=timeout)[0]
+
+    def record_observation_parsed(self, character: str, row: dict[str, Any], *,
+                                  timeout: float = OBSERVATION_SAVE_TIMEOUT
+                                  ) -> tuple[int, str | None]:
+        """``record_observation``, also returning the parser set that last
+        read the row (None when none has)."""
         folded = character.casefold()
         at = float(row["at"])
         with self._connect(timeout) as db:
@@ -275,8 +291,8 @@ class BotMemory:
                  int(bool(row.get("authored"))), str(row["text_hash"]),
                  str(row["text"])[:OBSERVATION_TEXT_LIMIT],
                  row.get("color") or "", row.get("msg_type")))
-            row_id, seen = db.execute(
-                """SELECT id, seen FROM observations
+            row_id, seen, version = db.execute(
+                """SELECT id, seen, facts_version FROM observations
                    WHERE server = ? AND account = ? AND character = ?
                      AND source_key = ? AND text_hash = ?""",
                 (self.server, self.account, folded, str(row["source_key"]),
@@ -285,7 +301,7 @@ class BotMemory:
                 self._observation_inserts += 1
                 if self._observation_inserts % OBSERVATION_PRUNE_EVERY == 0:
                     self._prune_observations(db, folded)
-        return int(row_id)
+        return int(row_id), version
 
     def _prune_observations(self, db: sqlite3.Connection, character: str) -> None:
         """Evict the least recently seen unreferenced rows over the cap."""
@@ -354,43 +370,78 @@ class BotMemory:
     def record_fact(self, character: str, row: dict[str, Any], *,
                     timeout: float = FACT_SAVE_TIMEOUT) -> tuple[int, bool]:
         """Store one fact (``Fact.row()``), or refresh the same (kind, subject,
-        value): the higher confidence wins, a candidate becomes confirmed but
-        never the reverse, and the first observation stays its source.
-        Returns the row id and whether the fact is new."""
+        value): the higher confidence wins, a confirmation confirms (also a
+        refuted fact), the first observation stays its source, and a later
+        expiry and non-empty inputs replace the stored ones. Returns the row
+        id and whether the fact is new."""
         folded = character.casefold()
+        with self._connect(timeout) as db:
+            return self._upsert_fact(db, folded, row)
+
+    def record_facts(self, character: str, observation_id: int,
+                     rows: list[dict[str, Any]], version: str, *,
+                     timeout: float = FACT_SAVE_TIMEOUT) -> list[tuple[int, bool]]:
+        """Store the facts one observation gave, and that parser set
+        ``version`` read it, in one transaction."""
+        folded = character.casefold()
+        with self._connect(timeout) as db:
+            out = [self._upsert_fact(db, folded, row) for row in rows]
+            db.execute("UPDATE observations SET facts_version = ? WHERE id = ?",
+                       (version, int(observation_id)))
+        return out
+
+    def _upsert_fact(self, db: sqlite3.Connection, folded: str,
+                     row: dict[str, Any]) -> tuple[int, bool]:
         at = float(row["at"])
         key = (self.server, self.account, folded, str(row["kind"]),
                str(row["subject"]), str(row["value"]))
-        with self._connect(timeout) as db:
-            existing = db.execute(
-                """SELECT id FROM facts WHERE server = ? AND account = ? AND character = ?
-                     AND kind = ? AND subject = ? AND value = ?""", key).fetchone()
-            db.execute(
-                """INSERT INTO facts
-                       (server, account, character, kind, subject, value, confidence,
-                        status, observation_id, parser, detail, created_at, updated_at,
-                        expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(server, account, character, kind, subject, value)
-                   DO UPDATE SET
-                       confidence = max(confidence, excluded.confidence),
-                       status = CASE WHEN excluded.status = 'confirmed'
-                                     THEN 'confirmed' ELSE status END,
-                       observation_id = coalesce(observation_id, excluded.observation_id),
-                       parser = excluded.parser,
-                       detail = CASE WHEN detail = '' THEN excluded.detail ELSE detail END,
-                       updated_at = max(updated_at, excluded.updated_at)""",
-                (*key, float(row["confidence"]), str(row["status"]),
-                 row.get("observation_id"), str(row["parser"]),
-                 str(row.get("detail") or ""), at, at, row.get("expires_at")))
-            (row_id,) = db.execute(
-                """SELECT id FROM facts WHERE server = ? AND account = ? AND character = ?
-                     AND kind = ? AND subject = ? AND value = ?""", key).fetchone()
-            if existing is None:
-                self._fact_inserts += 1
-                if self._fact_inserts % FACT_PRUNE_EVERY == 0:
-                    self._prune_facts(db, folded)
+        existing = db.execute(
+            """SELECT id FROM facts WHERE server = ? AND account = ? AND character = ?
+                 AND kind = ? AND subject = ? AND value = ?""", key).fetchone()
+        db.execute(
+            """INSERT INTO facts
+                   (server, account, character, kind, subject, value, confidence,
+                    status, observation_id, parser, detail, inputs, created_at,
+                    updated_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(server, account, character, kind, subject, value)
+               DO UPDATE SET
+                   confidence = max(confidence, excluded.confidence),
+                   status = CASE WHEN excluded.status = 'confirmed'
+                                 THEN 'confirmed' ELSE status END,
+                   observation_id = coalesce(observation_id, excluded.observation_id),
+                   parser = excluded.parser,
+                   detail = CASE WHEN detail = '' THEN excluded.detail ELSE detail END,
+                   inputs = CASE WHEN excluded.inputs = '' THEN inputs
+                                 ELSE excluded.inputs END,
+                   updated_at = max(updated_at, excluded.updated_at),
+                   expires_at = CASE WHEN excluded.expires_at IS NULL THEN expires_at
+                                     ELSE max(coalesce(expires_at, 0), excluded.expires_at)
+                                END""",
+            (*key, float(row["confidence"]), str(row["status"]),
+             row.get("observation_id"), str(row["parser"]),
+             str(row.get("detail") or ""), str(row.get("inputs") or ""), at, at,
+             row.get("expires_at")))
+        (row_id,) = db.execute(
+            """SELECT id FROM facts WHERE server = ? AND account = ? AND character = ?
+                 AND kind = ? AND subject = ? AND value = ?""", key).fetchone()
+        if existing is None:
+            self._fact_inserts += 1
+            if self._fact_inserts % FACT_PRUNE_EVERY == 0:
+                self._prune_facts(db, folded)
         return int(row_id), existing is None
+
+    def refute_fact(self, character: str, kind: str, subject: str, value: str, *,
+                    at: float, timeout: float = FACT_SAVE_TIMEOUT) -> bool:
+        """Mark a fact refuted (an outcome contradicted it); whether one was."""
+        with self._connect(timeout) as db:
+            cursor = db.execute(
+                """UPDATE facts SET status = 'refuted', updated_at = ?
+                   WHERE server = ? AND account = ? AND character = ?
+                     AND kind = ? AND subject = ? AND value = ?""",
+                (float(at), self.server, self.account, character.casefold(),
+                 kind, subject, value))
+        return cursor.rowcount > 0
 
     def _prune_facts(self, db: sqlite3.Connection, character: str) -> None:
         """Evict the least recently updated facts over the cap, candidates first."""
@@ -439,18 +490,20 @@ class BotMemory:
                 (self.server, self.account, character.casefold())).fetchall()
         return {kind: int(count) for kind, count in rows}
 
-    def tile_facts(self, character: str, *,
-                   timeout: float = 10.0) -> list[tuple[str, str]]:
-        """Her confirmed tile-property facts as (subject, value) pairs."""
+    def tile_facts(self, character: str, *, now: float, inputs: str,
+                   timeout: float = 10.0) -> list[tuple[str, str, float]]:
+        """Her confirmed, unexpired tile-property facts recorded under these
+        ``inputs`` (the content revision), as (subject, value, updated_at)."""
         with self._connect(timeout) as db:
             rows = db.execute(
-                """SELECT subject, value FROM facts
+                """SELECT subject, value, updated_at FROM facts
                    WHERE server = ? AND account = ? AND character = ?
                      AND kind = 'tile-property' AND status = 'confirmed'
+                     AND expires_at > ? AND inputs = ?
                    ORDER BY updated_at DESC LIMIT ?""",
-                (self.server, self.account, character.casefold(),
-                 FACT_ROW_LIMIT)).fetchall()
-        return [(str(subject), str(value)) for subject, value in rows]
+                (self.server, self.account, character.casefold(), float(now),
+                 inputs, FACT_ROW_LIMIT)).fetchall()
+        return [(str(subject), str(value), float(at)) for subject, value, at in rows]
 
     def import_legacy(self, state_path: Path, activity_path: Path) -> None:
         """Import the old unscoped JSON files once without modifying them."""

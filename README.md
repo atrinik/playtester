@@ -318,17 +318,30 @@ value; a repeat refreshes it. At most 20,000 a character, the least
 recently updated candidates evicted first.
 
 **Tile facts.** When the server refuses her magic ("Something blocks your
-spellcasting.", "Powerful countermagic cancels all spellcasting here!"),
-the square of her cast (or the whole map) is kept as a confirmed
-`tile-property: no_magic` fact, besides the one-hour mark idle survival
-already sets; "Powerful countermagic cancels all harmful magic here!" is
-kept as `no_harm` and changes nothing. Whether a remembered no-magic square
-stops her casting after a restart is the owner's choice:
+spellcasting.", "Powerful countermagic cancels all spellcasting here!") in
+answer to her own recent cast, the square of the cast (or the whole map)
+is kept as a confirmed `tile-property: no_magic` fact, besides the one-hour
+mark idle survival already sets; "Powerful countermagic cancels all
+harmful magic here!" is kept as `no_harm` and changes nothing. A fact is
+kept only when the refusal certainly belongs to the cast: for a square,
+she still stands where she cast; for a map, she is still on the cast's
+map. A refusal after a step or an exit (a potion drunk on the next map,
+say) is kept as nothing. Tile facts lapse after 7 days unless a refusal
+refreshes them, and count only under the content revision they were seen
+with (the locked `atrinik/content` revision, in the fact's `inputs`).
 
-- `--persist-tile-facts` (or `ATRINIK_BOT_PERSIST_TILE_FACTS=1`): she casts
-  no spell, scroll, rod or wand on a remembered square or map, as on a
-  square marked in this process (potions still work), and records a
-  `tile-fact-no-magic` decision once a square.
+Whether a remembered no-magic square stops her casting after a restart is
+the owner's choice:
+
+- `--persist-tile-facts` (or `ATRINIK_BOT_PERSIST_TILE_FACTS=1`): she heals
+  with no spell, scroll, rod or wand on a remembered square or map (potions
+  still work) and records a `tile-fact-no-magic` decision once a square.
+  Six hours after the fact was last confirmed or tried, and only while her
+  health is at least half, she may try one ordinary cast there
+  (`tile-fact-probe`): no refusal within 10 seconds refutes the fact
+  (`tile-fact-refuted`, status `refuted`), a refusal refreshes it
+  (`tile-fact-probe-refused`). The emergency recall never consults a
+  remembered fact: only a refusal in this process stops it.
 - Off (the default): the facts are written and shown, the one-hour mark
   alone decides, and a `tile-fact-no-magic-shadow` decision records once a
   square where she would have held off.
