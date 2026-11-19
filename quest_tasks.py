@@ -112,6 +112,77 @@ class DialogTask(BotTask):
         self._last_action = time.monotonic()
 
 
+class VoyageDialogTask(DialogTask):
+    """Follow one authored voyage dialogue exactly, or fail closed.
+
+    ``pages`` are the voyage's authored pages (dialogue_edges.DialoguePage):
+    each page she sees must match one exactly, text and every link, before
+    its authored link is chosen; nothing else is ever said or chosen. After
+    the last link the voyage must reach ``destination`` within
+    ``leave_seconds``. ``refused`` tells a failure the content caused (a
+    page that differs, a voyage that does not leave or lands elsewhere)
+    from one that says nothing about the voyage (no answer).
+    """
+
+    def __init__(self, npc: str, pages, destination: str, *,
+                 leave_seconds: float = 8.0, answer_seconds: float = 3.0):
+        super().__init__(npc, max_links=len(pages))
+        self.pages = tuple(pages)
+        self.destination = destination
+        self.leave_seconds = leave_seconds
+        self.answer_seconds = answer_seconds
+        self.refused = False
+        # When the last link was chosen (0.0 before).
+        self.left_at = 0.0
+        self._last_page: tuple | None = None
+
+    def _refuse(self, reason: str) -> None:
+        self.refused = True
+        self.fail(reason)
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        now = time.monotonic()
+        current = client.state.map.path
+        if self.left_at:
+            if current == self.destination:
+                self.complete()
+            elif current != self._start_map:
+                self._refuse(f"the voyage landed on {current}, not {self.destination}")
+            elif now - self.left_at > self.leave_seconds:
+                self._refuse("the voyage did not leave")
+            return
+        if current != self._start_map:
+            self.fail(f"left {self._start_map} before the voyage")
+            return
+        if not self._sent_hello:
+            await client.talk("hello", self.npc)
+            self._sent_hello = True
+            self._last_action = now
+            return
+        interface = client.state.interface
+        if interface is None or interface.title.casefold() != self.npc.casefold():
+            if now - self._last_action > self.answer_seconds:
+                self.fail(f"{self.npc} did not answer")
+            return
+        page = (interface.text, tuple(interface.links))
+        if page == self._last_page:
+            if now - self._last_action > self.answer_seconds:
+                self.fail(f"{self.npc} did not answer")
+            return
+        index = self.pages[self._followed].match(interface)
+        if index is None or not 0 <= index < len(interface.links):
+            self._refuse(f"{self.npc}'s page {self._followed + 1} is not the authored one")
+            return
+        self._last_page = page
+        await client.choose_interface_link(index)
+        self._followed += 1
+        self._last_action = now
+        if self._followed == len(self.pages):
+            self.left_at = now
+
+
 class EscapingDesertedIslandTask(BotTask):
     """Resume and finish the first formal quest from any recorded quest state."""
 

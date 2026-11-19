@@ -17,7 +17,7 @@ function applyStyles(root) {
 }
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts,engine_error";
-const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment,route_blocks,route_learned";
+const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment,route_blocks,route_learned,dialogue_edges";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -797,6 +797,30 @@ function renderLearned() {
   }
   $("#route-learned").replaceChildren(...rows);
 }
+// ---------- voyages (read-only; docs/ROUTING.md P4) ----------
+// NPC voyages and quest-gated exits, built with node() and text only.
+let lastVoyageSig = "";
+function renderVoyages() {
+  const d = slow.dialogue_edges, sig = JSON.stringify(d ?? null);
+  if (sig === lastVoyageSig) return;
+  lastVoyageSig = sig;
+  if (!d) return $("#voyages").replaceChildren(node("span", "muted", "Not available."));
+  const rows = [node("small", "muted", d.enabled ? "dialogue_edges on: her routes may use the voyages offered below." : "dialogue_edges off: her routes use no voyage and every quest-gated exit stays as before.")];
+  for (const v of d.voyages || []) {
+    const row = node("div", "quest");
+    row.append(node("strong", "", `${v.npc}: ${v.source} → ${v.destination}`), node("span", `flag ${v.status === "offered" ? "good" : ""}`.trim(), v.status));
+    const notes = [...(v.requires || []), ...(v.side_effects || []).map(x => `side effect: ${x}`), v.interface];
+    row.append(node("small", "", notes.join(" · ")));
+    rows.push(row);
+  }
+  for (const g of d.gated_exits || []) {
+    const row = node("div", "quest");
+    row.append(node("strong", "", `exit ${g.exit}`), node("span", "flag", g.open == null ? "flag off" : g.open ? "open" : "closed"), node("small", "", (g.requires || []).join(" · ")));
+    rows.push(row);
+  }
+  if (d.error) rows.push(node("small", "muted", d.error));
+  $("#voyages").replaceChildren(...rows);
+}
 // ---------- equipment (read-only) ----------
 // Effective item stats per gear family, built from DOM nodes and text only.
 // node() is shared with the Knowledge tab above.
@@ -980,7 +1004,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderBlocks(); renderLearned(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderVoyages(); renderBlocks(); renderLearned(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
     if ($("#tab-farming").classList.contains("active")) pollTerrain();
     if ($("#tab-feedback").classList.contains("active")) pollFeedback();

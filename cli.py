@@ -73,6 +73,13 @@ def parser() -> argparse.ArgumentParser:
         help="on remembered no-magic squares, heal with a potion before a spell "
              "(default: off, the facts are only recorded and shown)",
     )
+    p.add_argument(
+        "--dialogue-edges", action="store_true",
+        default=os.getenv("ATRINIK_BOT_DIALOGUE_EDGES", "").strip().casefold()
+        in ("1", "true", "yes", "on"),
+        help="plan with NPC dialogue voyages and quest-gated exits "
+             "(default: off; the owner turns it on after a supervised voyage)",
+    )
     p.add_argument("--register", action="store_true")
     p.add_argument("--create-character", action="store_true")
     p.add_argument("--archetype", default="half_elf_male")
@@ -334,6 +341,7 @@ async def main_async(args: argparse.Namespace) -> None:
         runtime_state_path=args.runtime_state,
         runtime_content_path=args.runtime_content,
         persist_tile_facts=args.persist_tile_facts,
+        dialogue_edges=args.dialogue_edges,
         register=args.register, create_character=args.create_character,
         character_archetype=args.archetype,
     )

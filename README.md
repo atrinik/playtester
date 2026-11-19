@@ -757,10 +757,29 @@ migrated once, and her decision ledger's map visits seed the crossing
 counts. The Tasks tab's **Learned routes** section lists the 25 subjects
 with the highest provisional cost (one death costs 30 minutes of travel,
 halving every 6 hours), their signals, the last event and when the cost
-falls below half. It is read-only, and the planner does not use it yet. The
-proposed design for
-alternative routes, unlocks such as keys, quests and NPC voyages, and costs
-learned from her own experience is in [docs/ROUTING.md](docs/ROUTING.md).
+falls below half. It is read-only, and the planner does not use it yet.
+
+NPC voyages and quest-gated exits wait behind the owner's `dialogue_edges`
+flag (`--dialogue-edges` or `ATRINIK_BOT_DIALOGUE_EDGES=1`), off by default:
+the owner turns it on after one supervised voyage. With it off, plans are
+exactly as before. With it on, the planner adds the content's dialogue
+teleports, such as Sam Goodberry's voyages between Incuna and Brynknot, and
+closes the Underground City lake portal until her journal shows Portal of
+Llwyfen's "A Strange Portal" done. A voyage is offered only when its quest
+state holds in her journal (Sam's Incuna voyage needs Lost Memories
+completed; an unloaded journal offers none), when its dialogue only talks
+and teleports (no quest step, purchase, enemy or typed text), and when its
+arrival has a known way back to where she boarded or to her savebed. The
+three voyages that move her savebed are never offered. She takes one by
+walking beside the NPC and following its authored pages exactly: a page
+that differs, a voyage that does not leave or lands elsewhere is refused
+for a day or until her keys or journal change, and is never clicked
+through. An owner block can name a voyage as
+`talk:SOURCE:NPC>DESTINATION`. The Tasks tab's **Voyages** section shows
+the flag, each voyage and why it is or is not offered, and the quest-gated
+exits. The design for alternative routes, unlocks such as keys, quests and
+NPC voyages, and costs learned from her own experience is in
+[docs/ROUTING.md](docs/ROUTING.md).
 
 ## Dependency and content boundaries
 
