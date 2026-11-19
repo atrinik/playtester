@@ -19,6 +19,20 @@ CHAT_TEXT_LIMIT = 1000
 # And at most this many lines per server and account, newest kept.
 CHAT_ROW_LIMIT = 300_000
 
+# Observations (docs/LEARNING_AND_FEEDBACK.md 4.2): at most this many rows a
+# character, the least recently seen unreferenced ones evicted first,
+# checked every OBSERVATION_PRUNE_EVERY new rows.
+OBSERVATION_ROW_LIMIT = 50_000
+OBSERVATION_PRUNE_EVERY = 100
+OBSERVATION_TEXT_LIMIT = 4000
+# The longest an observation waits for a locked database (seconds): a
+# reading is best effort and never stalls a tick.
+OBSERVATION_SAVE_TIMEOUT = 0.25
+# Tables and columns that keep an observation from eviction, where they
+# exist (the facts and locks of later phases).
+OBSERVATION_REFERENCES = (("facts", "observation_id"),
+                          ("locks", "hint_observation_id"))
+
 
 class BotMemory:
     """Small SQLite key/value store for durable autonomous decisions."""
@@ -66,7 +80,36 @@ class BotMemory:
             db.execute(
                 """CREATE INDEX IF NOT EXISTS chat_log_by_account
                    ON chat_log (server, account, at)""")
+            # What she read or was told, attributed where possible: only
+            # her own observations, never other players' text (observations.py).
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS observations (
+                       id INTEGER PRIMARY KEY,
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       first_at REAL NOT NULL,
+                       last_at REAL NOT NULL,
+                       seen INTEGER NOT NULL DEFAULT 1,
+                       map TEXT, x INTEGER, y INTEGER,
+                       source_kind TEXT NOT NULL,
+                       source_key TEXT NOT NULL,
+                       source_name TEXT,
+                       attribution TEXT NOT NULL,
+                       authored INTEGER NOT NULL,
+                       text_hash TEXT NOT NULL,
+                       text TEXT NOT NULL,
+                       color TEXT,
+                       msg_type INTEGER
+                   )""")
+            db.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS observations_dedup
+                   ON observations (server, account, character, source_key, text_hash)""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS observations_by_age
+                   ON observations (server, account, character, last_at)""")
         self._chat_appends = 0
+        self._observation_inserts = 0
 
     @contextmanager
     def _connect(self, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
@@ -168,6 +211,94 @@ class BotMemory:
         return [{"at": at, "channel": channel, "direction": direction,
                  "sender": who, "text": text}
                 for at, channel, direction, who, text in reversed(rows)]
+
+    def record_observation(self, character: str, row: dict[str, Any], *,
+                           timeout: float = OBSERVATION_SAVE_TIMEOUT) -> int:
+        """Store one observation (``Observation.row()``), or raise its seen
+        count when the same text came from the same source before; returns
+        the row id. ``timeout`` bounds the wait for a locked database."""
+        folded = character.casefold()
+        at = float(row["at"])
+        with self._connect(timeout) as db:
+            db.execute(
+                """INSERT INTO observations
+                       (server, account, character, first_at, last_at, seen,
+                        map, x, y, source_kind, source_key, source_name,
+                        attribution, authored, text_hash, text, color, msg_type)
+                   VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(server, account, character, source_key, text_hash)
+                   DO UPDATE SET seen = seen + 1,
+                                 last_at = max(last_at, excluded.last_at)""",
+                (self.server, self.account, folded, at, at,
+                 row.get("map") or "", row.get("x"), row.get("y"),
+                 str(row["source_kind"]), str(row["source_key"]),
+                 str(row.get("source_name") or "")[:200], str(row["attribution"]),
+                 int(bool(row.get("authored"))), str(row["text_hash"]),
+                 str(row["text"])[:OBSERVATION_TEXT_LIMIT],
+                 row.get("color") or "", row.get("msg_type")))
+            row_id, seen = db.execute(
+                """SELECT id, seen FROM observations
+                   WHERE server = ? AND account = ? AND character = ?
+                     AND source_key = ? AND text_hash = ?""",
+                (self.server, self.account, folded, str(row["source_key"]),
+                 str(row["text_hash"]))).fetchone()
+            if seen == 1:
+                self._observation_inserts += 1
+                if self._observation_inserts % OBSERVATION_PRUNE_EVERY == 0:
+                    self._prune_observations(db, folded)
+        return int(row_id)
+
+    def _prune_observations(self, db: sqlite3.Connection, character: str) -> None:
+        """Evict the least recently seen unreferenced rows over the cap."""
+        scope = (self.server, self.account, character)
+        (count,) = db.execute(
+            """SELECT count(*) FROM observations
+               WHERE server = ? AND account = ? AND character = ?""", scope).fetchone()
+        excess = count - OBSERVATION_ROW_LIMIT
+        if excess <= 0:
+            return
+        # Only references that exist: a table of a later phase, or one
+        # without the column, never fails the insert that pruned.
+        referenced = " ".join(
+            f"AND id NOT IN (SELECT {column} FROM {table} WHERE {column} IS NOT NULL)"
+            for table, column in OBSERVATION_REFERENCES
+            if column in {row[1] for row in db.execute(f"PRAGMA table_info({table})")})
+        db.execute(
+            f"""DELETE FROM observations WHERE id IN (
+                    SELECT id FROM observations
+                    WHERE server = ? AND account = ? AND character = ? {referenced}
+                    ORDER BY last_at, id LIMIT ?)""",
+            (*scope, excess))
+
+    def observations(self, character: str, *, limit: int = 100, source_kind: str = "",
+                     timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her most recently seen observations, newest first."""
+        query = """SELECT id, first_at, last_at, seen, map, x, y, source_kind,
+                          source_key, source_name, attribution, authored, text
+                   FROM observations
+                   WHERE server = ? AND account = ? AND character = ?"""
+        params: list[Any] = [self.server, self.account, character.casefold()]
+        if source_kind:
+            query += " AND source_kind = ?"
+            params.append(source_kind)
+        query += " ORDER BY last_at DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        columns = ("id", "first_at", "last_at", "seen", "map", "x", "y", "source_kind",
+                   "source_key", "source_name", "attribution", "authored", "text")
+        with self._connect(timeout) as db:
+            rows = db.execute(query, params).fetchall()
+        return [dict(zip(columns, row)) for row in rows]
+
+    def observation_counts(self, character: str, *,
+                           timeout: float = 10.0) -> dict[str, int]:
+        """Stored observations by source kind."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT source_kind, count(*) FROM observations
+                   WHERE server = ? AND account = ? AND character = ?
+                   GROUP BY source_kind""",
+                (self.server, self.account, character.casefold())).fetchall()
+        return {kind: int(count) for kind, count in rows}
 
     def import_legacy(self, state_path: Path, activity_path: Path) -> None:
         """Import the old unscoped JSON files once without modifying them."""

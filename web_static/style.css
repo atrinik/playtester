@@ -179,3 +179,10 @@ details summary { cursor: pointer; color: var(--muted); margin-top: .6rem; font-
 .alert.critical { color: #ff8a8a; background: #3a1d1d; }
 .alert.warn { color: #f3c969; background: #33291a; }
 .alert.info { color: #9cc8ff; background: #1b2a3d; }
+/* Knowledge: her observation ledger */
+.reading { background: #121719; border-radius: 6px; padding: .4rem .55rem; display: grid; gap: .2rem; font-size: 12px; }
+.reading-head { display: flex; flex-wrap: wrap; gap: .4rem; align-items: baseline; }
+.reading-head b { color: var(--gold); font-weight: 500; }
+.reading-head time { margin-left: auto; color: var(--muted); font-size: 11px; }
+.reading p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.reading small { color: var(--muted); overflow-wrap: anywhere; }

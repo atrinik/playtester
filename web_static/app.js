@@ -7,6 +7,14 @@ const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const clean = v => String(v ?? "").replace(/\[\/?[a-z]+(=[^\]]*)?\]/gi, "");
+// The Content-Security-Policy refuses inline style attributes, so rendered
+// HTML carries sizes and colours as data attributes and this sets them
+// through CSSOM: data-width (percent), data-indent (pixels), data-color (hex).
+function applyStyles(root) {
+  root.querySelectorAll("[data-width]").forEach(el => { el.style.width = `${el.dataset.width}%`; });
+  root.querySelectorAll("[data-indent]").forEach(el => { el.style.paddingLeft = `${el.dataset.indent}px`; });
+  root.querySelectorAll("[data-color]").forEach(el => { el.style.color = `#${el.dataset.color}`; });
+}
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts,engine_error";
 const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots";
@@ -80,7 +88,7 @@ const faceUrl = name => (name ? `/api/face/${encodeURIComponent(name)}` : "");
 function bar(label, value, max, cls) {
   const pct = Math.max(0, Math.min(100, ((+value || 0) / Math.max(1, +max || 1)) * 100));
   const low = cls === "hp" && pct < 30 ? " low" : "";
-  return `<div class="vital"><b>${label}</b><div class="bar ${cls}${low}"><i style="width:${pct}%"></i><span>${value ?? "—"} / ${max ?? "—"}</span></div></div>`;
+  return `<div class="vital"><b>${label}</b><div class="bar ${cls}${low}"><i data-width="${pct}"></i><span>${value ?? "—"} / ${max ?? "—"}</span></div></div>`;
 }
 let lastAlertsSig = "";
 function renderAlerts() {
@@ -283,6 +291,7 @@ $("#fa-objectives").addEventListener("click", e => {
 function renderVitals() {
   const s = live.stats || {};
   $("#vitals").innerHTML = bar("HP", s.hp, s.maxhp, "hp") + bar("SP", s.sp, s.maxsp, "sp") + bar("Food", s.food, 999, "food");
+  applyStyles($("#vitals"));
   const t = live.target;
   $("#target").innerHTML = t && t.id ? `Target: <b>${esc(t.name)}</b> · ${t.hp ?? "?"}% HP${t.combat ? " · fighting" : ""}` : "No target";
 }
@@ -293,7 +302,8 @@ function renderTask() {
     const leaf = steps[steps.length - 1];
     const circuit = steps.map(x => x.detail).filter(Boolean)[0];
     $("#task").innerHTML = `${esc(t.name)}<span class="state ${esc(t.status)}">${esc(t.status)}</span>${leaf && leaf !== steps[0] ? `<small>${esc(leaf.name)}</small>` : ""}${circuit ? `<small>${esc(circuit)}</small>` : ""}${t.error ? `<small class="flag bad">${esc(t.error)}</small>` : ""}`;
-    $("#trace").innerHTML = steps.map(x => `<div style="padding-left:${x.depth * 10}px">${esc(x.name)} · ${esc(x.status)}${x.error ? ` · ${esc(x.error)}` : ""}${x.detail ? `<br>${esc(x.detail)}` : ""}</div>`).join("");
+    $("#trace").innerHTML = steps.map(x => `<div data-indent="${(+x.depth || 0) * 10}">${esc(x.name)} · ${esc(x.status)}${x.error ? ` · ${esc(x.error)}` : ""}${x.detail ? `<br>${esc(x.detail)}` : ""}</div>`).join("");
+    applyStyles($("#trace"));
   } else {
     $("#task").innerHTML = `Idle<span class="state idle">no task</span>${last ? `<small>Last: ${esc(last.name)} · ${esc(last.status)}${last.error ? ` · ${esc(last.error)}` : ""}</small>` : ""}`;
     $("#trace").innerHTML = "";
@@ -307,7 +317,8 @@ function renderCharacter() {
   const stat = (k, label) => `<div class="stat"><b>${s[k] ?? "—"}</b><span>${label}</span></div>`;
   $("#stats").innerHTML = [["str", "STR"], ["dex", "DEX"], ["con", "CON"], ["int", "INT"], ["pow", "POW"], ["wc", "WC"], ["ac", "AC"], ["dam", "DAM"]].map(([k, l]) => stat(k, l)).join("");
   $("#skills").innerHTML = (live.skills || []).filter(k => k.level > 0).sort((a, b) => b.level - a.level).map(k =>
-    `<div class="skill"><span>${esc(k.name)}</span><b>${k.level}</b><div class="bar"><i style="width:${k.progress_percent || 0}%"></i></div></div>`).join("") || '<span class="muted">No skills yet</span>';
+    `<div class="skill"><span>${esc(k.name)}</span><b>${k.level}</b><div class="bar"><i data-width="${+k.progress_percent || 0}"></i></div></div>`).join("") || '<span class="muted">No skills yet</span>';
+  applyStyles($("#skills"));
   $("#protections").innerHTML = Object.entries(live.protections || {}).filter(([, v]) => v).map(([k, v]) => `<span>${esc(k)} ${v}%</span>`).join("") || '<span class="muted">None</span>';
   const e = live.economy || {};
   $("#wealth").textContent = `Carried ${coins(e.carried)} · Bank ${e.bank_known ? coins(e.banked) : "unknown"}` +
@@ -502,7 +513,8 @@ function renderChat() {
   const newest = msgs.length ? msgs[msgs.length - 1] : null;
   const sig = newest ? `${newest.time}|${newest.text}|${msgs.length}` : "";
   if (sig !== lastMessageSig || !box.childElementCount) {
-    box.innerHTML = msgs.map(m => `<div class="msg"><time>${new Date(m.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span style="color:#${/^[0-9a-f]{6}$/i.test(m.color || "") ? m.color : "e8e4d6"}">${esc(clean(m.text))}</span></div>`).join("");
+    box.innerHTML = msgs.map(m => `<div class="msg"><time>${new Date(m.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span data-color="${/^[0-9a-f]{6}$/i.test(m.color || "") ? m.color : "e8e4d6"}">${esc(clean(m.text))}</span></div>`).join("");
+    applyStyles(box);
     // The first load is history, not unread chat.
     if (lastMessageTime !== null && !$("#tab-chat").classList.contains("active"))
       unreadChat += msgs.filter(m => m.time > lastMessageTime).length;
@@ -556,7 +568,39 @@ $$(".tabs button").forEach(b => (b.onclick = () => {
   $$(".tab").forEach(x => x.classList.toggle("active", x.id === `tab-${b.dataset.tab}`));
   if (b.dataset.tab === "chat") { unreadChat = 0; renderChat(); const m = $("#messages"); m.scrollTop = m.scrollHeight; }
   if (b.dataset.tab === "activity") renderActivity();
+  if (b.dataset.tab === "knowledge") pollKnowledge();
 }));
+
+// ---------- knowledge (read-only) ----------
+// Her observation ledger: what she read or was told and where it came from.
+const KIND_LABELS = { door: "Door", gate: "Gate", lever: "Lever", sign: "Sign", magic_mouth: "Magic mouth", npc: "Dialogue", book: "Book", scroll: "Scroll", examine: "Examined", journal: "Journal", system: "Server" };
+let knowledgeBusy = false;
+async function pollKnowledge() {
+  if (knowledgeBusy) return;
+  knowledgeBusy = true;
+  try {
+    const kind = $("#knowledge-kind").value;
+    const r = await fetch(`/api/knowledge?limit=200${kind ? `&kind=${encodeURIComponent(kind)}` : ""}`, { cache: "no-store" });
+    if (r.ok) renderKnowledge(await r.json());
+  } finally { knowledgeBusy = false; }
+}
+function renderKnowledge(k) {
+  const counts = k.counts || {}, select = $("#knowledge-kind"), chosen = select.value;
+  const kinds = Object.keys(counts).sort();
+  const options = '<option value="">All sources</option>' + kinds.map(x => `<option value="${esc(x)}">${esc(KIND_LABELS[x] || x)} (${counts[x]})</option>`).join("");
+  if (select.dataset.sig !== options) { select.innerHTML = options; select.value = chosen; select.dataset.sig = options; }
+  const total = kinds.reduce((sum, x) => sum + counts[x], 0);
+  $("#knowledge-summary").textContent = `${total.toLocaleString()} reading${total === 1 ? "" : "s"} kept` +
+    (k.authored_index ? "" : " · authored-text index unavailable: only fact lines are kept") +
+    (k.busy ? " · the database is busy; try again shortly" : "");
+  const when = t => new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  $("#knowledge").innerHTML = (k.observations || []).map(o => `<div class="reading">
+    <div class="reading-head"><b>${esc(KIND_LABELS[o.source_kind] || o.source_kind)}</b><span>${esc(o.source_name || o.source_key)}</span><span class="flag">${esc(o.attribution)}</span>${o.seen > 1 ? `<span class="flag">×${esc(o.seen)}</span>` : ""}<time>${esc(when(o.last_at))}</time></div>
+    <p>${esc(clean(o.text))}</p>
+    <small>${esc(o.map)}${o.x == null ? "" : ` (${esc(o.x)}, ${esc(o.y)})`} · ${esc(o.source_key)}</small>
+  </div>`).join("") || '<span class="muted">Nothing read yet.</span>';
+}
+$("#knowledge-kind").onchange = pollKnowledge;
 
 // ---------- polling ----------
 let liveBusy = false, slowBusy = false;
@@ -579,6 +623,7 @@ async function pollSlow() {
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
     if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
   } finally { slowBusy = false; }
 }
 pollLive(); pollSlow();

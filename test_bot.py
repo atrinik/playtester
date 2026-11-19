@@ -6,6 +6,7 @@ import os
 import time
 import tempfile
 import shutil
+import sqlite3
 import unittest
 from unittest.mock import patch
 from contextlib import suppress
@@ -21478,7 +21479,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=20", page)
+        self.assertIn(b"/app.js?v=23", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -22940,6 +22941,609 @@ class OperatorAssistRouteTests(unittest.IsolatedAsyncioTestCase):
                 status, payload = await self.assist_post({"gold": gold, "to": "Sera"})
                 self.assertEqual(status, 409, payload)
                 self.assertIn("gold coin(s) per run", json.loads(payload)["error"])
+
+# Observation ledger (docs/LEARNING_AND_FEEDBACK.md 4.3.1, phase F1).
+OBSERVATION_ARCH = {
+    "door.arc": ("Object locked_door\ntype 20\nname door\nmsg\n"
+                 "You need a special key to open this door.\nendmsg\nend\n"),
+    "magicmouth.arc": ("Object magic_mouth\ntype 98\nwalk_on 1\nsys_object 1\nend\n"),
+    "sign.arc": "Object sign\ntype 98\nname sign\nend\n",
+    "lever.arc": "Object handle_lever\ntype 93\nname big lever\nend\n",
+    "monster.arc": "Object kobold\ntype 80\nmonster 1\nend\n",
+    "items.arc": ("Object sword\ntype 15\nend\nObject shield\ntype 33\nend\n"
+                  "Object axe\ntype 15\nend\nObject chest\ntype 122\nend\n"
+                  "Object book\ntype 8\nname book\nend\n"
+                  "Object brass_key\ntype 21\nname brass key\nend\n"),
+    "materials": "material_real 1\nname black iron\nend\n",
+    "messages": ("# books\nMSG\nThe old tale of the drowned king.\n"
+                 "He sleeps below the lake.\nENDMSG\n"),
+}
+OBSERVATION_MAP = """arch map
+name Room
+width 10
+height 10
+msg
+A header message is not a source.
+endmsg
+end
+arch locked_door
+slaying room_key
+x 5
+y 4
+end
+arch magic_mouth
+msg
+Beware the bridge!
+endmsg
+x 3
+y 3
+end
+arch sign
+msg
+Welcome to the room.
+endmsg
+x 7
+y 7
+end
+arch handle_lever
+x 6
+y 6
+end
+arch kobold
+name Warden Argoth
+x 1
+y 1
+end
+arch book
+name harbour notice
+msg
+The ferry leaves at dawn.
+endmsg
+x 2
+y 2
+end
+"""
+
+
+def observation_content(directory: Path):
+    from .observations import AuthoredContent
+    arch = Path(directory) / "content" / "arch"
+    maps = Path(directory) / "content" / "maps" / "test"
+    arch.mkdir(parents=True)
+    maps.mkdir(parents=True)
+    for name, text in OBSERVATION_ARCH.items():
+        (arch / name).write_text(text)
+    (maps / "room").write_text(OBSERVATION_MAP)
+    (maps / "notes.txt").write_text("arch is not a map\nmsg\nNot authored.\nendmsg\n")
+    return AuthoredContent.scan(Path(directory) / "content")
+
+
+def drawinfo(msg_type: int, color: str, text: str) -> bytes:
+    return bytes((msg_type,)) + color.encode() + b"\0" + text.encode() + b"\0"
+
+
+def book_packet(title: str, body: str, signer: str = "") -> bytes:
+    raw = b"[book]" + title.encode() + b"[/book]" + body.encode() + b"\0"
+    if signer:
+        raw += signer.encode() + b"\0" + b"3 Morning, Year 12\0"
+    return raw
+
+
+def interface_packet(title: str, text: str) -> bytes:
+    return (bytes((c.IF_TITLE,)) + title.encode() + b"\0" +
+            bytes((c.IF_TEXT,)) + text.encode() + b"\0")
+
+
+class ObservationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.content = observation_content(Path(self.directory.name))
+
+    def client(self, content=True):
+        from unittest.mock import AsyncMock
+        client = AtrinikClient(ClientConfig(
+            character="Sera",
+            runtime_state_path=str(Path(self.directory.name) / "memory.sqlite3")))
+        client.send = AsyncMock()
+        client.authored_content = self.content if content else None
+        client.state.player_name = "Sera"
+        client.state.player_tag = 1
+        client.load_character_memory("Sera")
+        client.state.phase = "playing"
+        self.at("/test/room", 5, 5, client)
+        return client
+
+    @staticmethod
+    def at(path, x, y, client):
+        client.state.map.path = path
+        client.state.map.world_x, client.state.map.world_y = x, y
+        # As a MAP2 update does.
+        client._observe(lambda recorder: recorder.note_position(client.state))
+
+    @staticmethod
+    def say(client, text, msg_type=c.CHAT_TYPE_GAME, color="ffffff"):
+        data = drawinfo(msg_type, color, text)
+        asyncio.run(client._handle_drawinfo(Cursor(data), data))
+
+    @staticmethod
+    def rows(client):
+        return client._memory_store().observations("Sera", limit=1000)
+
+    def test_book_packets_parse_into_title_and_body(self):
+        from .observations import parse_book
+        page = parse_book(book_packet("old tale", "Line one.\nLine two.\n"))
+        self.assertEqual((page.title, page.body, page.signed),
+                         ("old tale", "Line one.\nLine two.\n", False))
+        signed = parse_book(book_packet("diary", "My words.", signer="Zoey"))
+        self.assertEqual((signed.title, signed.body, signed.signed), ("diary", "My words.", True))
+        self.assertIsNone(parse_book(b"no book markup"))
+        self.assertIsNone(parse_book(b"[book]unterminated"))
+
+    def test_the_scan_indexes_authored_sources_texts_and_names(self):
+        from .observations import text_hash
+        door, = self.content.at("/test/room", 5, 4)
+        self.assertEqual((door.kind, door.name, door.key), ("door", "door", "door:/test/room:5,4"))
+        # The door inherits its archetype's message.
+        self.assertEqual(door.msg_hash, text_hash("You need a special key to open this door."))
+        mouth, = self.content.at("/test/room", 3, 3)
+        self.assertEqual((mouth.kind, mouth.key), ("magic_mouth", "mouth:/test/room:3,3"))
+        self.assertEqual(self.content.at("/test/room", 7, 7)[0].kind, "sign")
+        self.assertEqual(self.content.at("/test/room", 6, 6)[0].kind, "lever")
+        self.assertIn(text_hash("The old tale of the drowned king.\nHe sleeps below the lake."),
+                      self.content.texts)
+        self.assertNotIn(text_hash("Not authored."), self.content.texts)
+        self.assertIn("warden argoth", self.content.names)
+        self.assertEqual(self.content.at("/test/room", 0, 0), [])
+
+    def test_a_recorded_stream_yields_the_expected_attributed_rows(self):
+        client = self.client()
+        lever = Item(70, location=0, item_type=93, name="big lever")
+        book = Item(71, item_type=c.TYPE_BOOK, name="meet me at the tower")
+        sword = Item(72, item_type=c.TYPE_WEAPON, name="sword +2")
+        client.state.place_item(book, client.state.player_tag)
+        client.state.place_item(sword, client.state.player_tag)
+        # A bump north into the locked door; the server answers with its text.
+        asyncio.run(client.move(1))
+        self.say(client, "You need a special key to open this door.", color="00ffff")
+        # She walks onto the magic mouth.
+        self.at("/test/room", 3, 3, client)
+        self.say(client, "Beware the bridge!", color="00ffff")
+        # She applies the lever under her.
+        self.at("/test/room", 6, 6, client)
+        client.state.place_item(lever, 0)
+        asyncio.run(client.apply(70))
+        self.say(client, "You turn the big lever.")
+        # Dialogue pages are not kept in this phase.
+        raw = interface_packet("Warden Argoth", "Welcome, Sera. The gate is shut.")
+        asyncio.run(client._handle_interface(Cursor(raw), raw))
+        # An authored book from her bag, retitled by a player: kept under
+        # its authored title.
+        asyncio.run(client.apply(71))
+        raw = book_packet("meet me at the tower", "The ferry leaves at dawn.\n")
+        asyncio.run(client._handle_book(Cursor(raw), raw))
+        # An examine answer, ended by its blank line.
+        asyncio.run(client.examine(72))
+        self.say(client, "That is a sword +2")
+        self.say(client, "It needs a level of 5 to use.")
+        self.say(client, "Qua: 80 Con: 70.")
+        self.say(client, " ")
+        # An unattributed fact line, three times: one row seen three times.
+        for _ in range(3):
+            self.say(client, "Something blocks your spellcasting.")
+        # An unattributed line that is no fact is not kept.
+        self.say(client, "You feel much better now.")
+        client.observations.clock = lambda: time.time() + 5
+        client._observe(lambda recorder: recorder.flush(client.state))
+        rows = {row["source_key"]: row for row in self.rows(client)}
+        self.assertEqual(set(rows), {
+            "door:/test/room:5,4", "mouth:/test/room:3,3", "lever:/test/room:6,6",
+            "book:harbour notice:" + __import__("hashlib").sha256(
+                b"The ferry leaves at dawn.").hexdigest(),
+            "examine:sword", "system:/test/room"})
+        door = rows["door:/test/room:5,4"]
+        self.assertEqual((door["source_kind"], door["attribution"], door["authored"],
+                          door["x"], door["y"]), ("door", "timing", 1, 5, 5))
+        self.assertEqual((rows["mouth:/test/room:3,3"]["attribution"],
+                          rows["mouth:/test/room:3,3"]["source_kind"]),
+                         ("content-match", "magic_mouth"))
+        self.assertEqual((rows["lever:/test/room:6,6"]["attribution"],
+                          rows["lever:/test/room:6,6"]["source_name"]), ("timing", "big lever"))
+        book_row = next(row for key, row in rows.items() if key.startswith("book:"))
+        self.assertEqual((book_row["source_kind"], book_row["source_name"], book_row["authored"],
+                          book_row["text"]),
+                         ("book", "harbour notice", 1, "The ferry leaves at dawn."))
+        self.assertNotIn("tower", json.dumps(self.rows(client)))
+        self.assertEqual(rows["examine:sword"]["text"],
+                         "That is sword\nIt needs a level of 5 to use.\nQua: 80 Con: 70.")
+        system = rows["system:/test/room"]
+        self.assertEqual((system["seen"], system["attribution"]), (3, "none"))
+        self.assertNotIn("Sera", json.dumps(self.rows(client)))
+        metrics = client.metrics.registry.render()
+        self.assertIn('atrinik_playtester_observations_total{character="sera"', metrics)
+        self.assertIn('source="system"} 3', metrics)
+
+    def test_other_players_text_is_never_stored(self):
+        client = self.client()
+        door_text = "You need a special key to open this door."
+        # Chat quoting a door message, on every player channel.
+        asyncio.run(client.move(1))
+        for channel in sorted(c.PLAYER_CHAT_TYPES):
+            self.say(client, f"[a=#charname]Zoey[/a]: {door_text}", msg_type=channel,
+                     color="00ffff")
+        # A game line carrying the player-name link.
+        asyncio.run(client.move(1))
+        self.say(client, f"[a=#charname]Zoey[/a] {door_text}", color="00ffff")
+        # /who: each player, and the total.
+        self.say(client, " ")
+        self.say(client, "Mallory the female human (lvl 12) [AFK]")
+        self.say(client, "Sera the female elf (lvl 30)")
+        self.say(client, "There are 2 players online.")
+        # Dialogue naming a player she has seen (in /who) is dropped whole.
+        raw = interface_packet("Warden Argoth", "Mallory passed this way, Sera.")
+        asyncio.run(client._handle_interface(Cursor(raw), raw))
+        # A player in view (named in white) makes dialogue naming her unsafe.
+        client.state.map.tile(9, 9).objects[13] = MapObject(
+            13, 1, 0, c.MAP_FLAG_NAME, name="Quinlan", name_color="ffffff", target_id=9)
+        raw = interface_packet("Warden Argoth", "Quinlan, step back!")
+        asyncio.run(client._handle_interface(Cursor(raw), raw))
+        # A broadcast from a magic mouth next to her that she did not trigger,
+        # with that player in view, is not hers.
+        self.at("/test/room", 3, 4, client)
+        self.say(client, "Beware the bridge!", color="00ffff")
+        # A signed book, even with authored text, and an unmatched unsigned one.
+        for raw in (book_packet("old tale", "The old tale of the drowned king.\n"
+                                            "He sleeps below the lake.\n", signer="Zoey"),
+                    book_packet("my notes", "Meet me at the docks.\n")):
+            asyncio.run(client._handle_book(Cursor(raw), raw))
+        # A renamed item's examine, and a signed book's.
+        renamed = Item(80, item_type=c.TYPE_WEAPON, name="Zoey's blade")
+        diary = Item(81, item_type=c.TYPE_BOOK, name="diary")
+        client.state.place_item(renamed, client.state.player_tag)
+        client.state.place_item(diary, client.state.player_tag)
+        asyncio.run(client.examine(80))
+        self.say(client, "That is Zoey's blade")
+        self.say(client, "You name it Zoey's blade.")
+        self.say(client, "Qua: 80 Con: 70.")
+        asyncio.run(client.examine(81))
+        self.say(client, "That is (signed; permanently finalized) diary")
+        self.say(client, "Something is written in it.")
+        client.observations.clock = lambda: time.time() + 5
+        client._observe(lambda recorder: recorder.flush(client.state))
+        self.assertEqual(self.rows(client), [])
+        # The names were remembered only in memory, to filter with.
+        self.assertIn("mallory", client.observations.player_names)
+        self.assertIn("zoey", client.observations.player_names)
+        drops = client.metrics.registry.render()
+        for reason in ("chat", "player-link", "who-list", "signed-book",
+                       "unmatched-book", "renamed-item"):
+            self.assertIn(f'reason="{reason}"}}', drops)
+
+    def test_without_the_index_only_fact_lines_are_kept(self):
+        client = self.client(content=False)
+        raw = book_packet("old tale", "The old tale of the drowned king.\n")
+        asyncio.run(client._handle_book(Cursor(raw), raw))
+        # Navy text after a bump or a step cannot be verified: not kept.
+        asyncio.run(client.move(1))
+        self.say(client, "This door is shut.", color="00ffff")
+        self.say(client, "Guard says: Halt, Bob!", color="00ffff")
+        self.at("/test/room", 5, 4, client)
+        self.say(client, "A voice whispers.", color="00ffff")
+        # Nor a door phrase: no authored door can be checked at the target.
+        later = time.time() + 2
+        client.observations.clock = lambda: later
+        asyncio.run(client.move(1))
+        self.say(client, "You open the door with the brass key.")
+        # An examine: its name cannot be checked either.
+        client.state.place_item(Item(72, item_type=c.TYPE_WEAPON, name="sword"),
+                                client.state.player_tag)
+        asyncio.run(client.examine(72))
+        self.say(client, "That is a sword")
+        self.say(client, " ")
+        self.say(client, "Something blocks your spellcasting.")
+        self.assertEqual([row["source_key"] for row in self.rows(client)],
+                         ["system:/test/room"])
+        drops = client.metrics.registry.render()
+        self.assertIn('reason="book-unverified"}', drops)
+        self.assertIn('reason="examine-unverified"}', drops)
+
+    def test_lines_inside_a_timing_window_are_not_the_sources(self):
+        client = self.client()
+        lever = Item(70, location=0, item_type=93, name="big lever")
+        sign = Item(71, location=0, item_type=98, name="sign")
+        self.at("/test/room", 6, 6, client)
+        client.state.place_item(lever, 0)
+        client.state.place_item(sign, 0)
+        unrelated = [("ffffff", "Bob starved to death."),
+                     ("ffffff", "You hit the rat for 4 damage."),
+                     ("ffffff", "Mallory casts remove depletion on you."),
+                     ("ffffff", "The big lever is broken."),
+                     ("00ffff", "Guard says: Halt, Bob!"),
+                     ("00ffff", "\nTavern keeper says: hello"),
+                     ("00ffff", "You have been defeated in combat!"),
+                     ("00ffff", "Welcome to the hall.")]
+        # Before and after her own answer, no line in the window is the lever's.
+        asyncio.run(client.apply(70))
+        for color, text in unrelated:
+            self.say(client, text, color=color)
+        self.say(client, "You turn the big lever.")
+        for color, text in unrelated:
+            self.say(client, text, color=color)
+        # Nor the sign's, nor the bumped door's (whose square has a source).
+        asyncio.run(client.apply(71))
+        self.at("/test/room", 5, 5, client)
+        asyncio.run(client.move(1))
+        for color, text in unrelated:
+            self.say(client, text, color=color)
+        self.assertEqual([row["source_key"] for row in self.rows(client)],
+                         ["lever:/test/room:6,6"])
+        self.assertEqual(self.rows(client)[0]["seen"], 1)
+
+    def test_a_player_seen_earlier_out_of_view_is_still_filtered(self):
+        client = self.client()
+        client.state.map.tile(9, 9).objects[13] = MapObject(
+            13, 1, 0, c.MAP_FLAG_NAME, name="Quinlan", name_color="ffffff", target_id=9)
+        self.at("/test/room", 5, 5, client)
+        client.state.map.tile(9, 9).objects.clear()
+        self.assertIn("quinlan", client.observations.player_names)
+        self.assertEqual(client.observations._players_in_view(client.state), set())
+        self.assertIsNone(client.observations._clean("Quinlan waits here.", client.state))
+        self.assertEqual(client.observations._clean("Sera waits here.", client.state),
+                         "{activator.name} waits here.")
+        # Her name split by markup is dropped, not kept half-replaced.
+        self.assertIsNone(client.observations._clean("[b]Se[/b]ra waits.", client.state))
+
+    def test_dialogue_pages_are_never_kept(self):
+        client = self.client()
+        pages = [("Post office clerk",
+                  "The following items have been sent to you:\n"
+                  "#1: sword (Zoey) ([a=:withdraw 1]withdraw[/a], [a=:delete 1]delete[/a])"),
+                 ("Warden Argoth", "meet me at the old tower tonight bring gold"),
+                 ("Guild guard", "Welcome, Alice the Master Smith."),
+                 ("Warden Argoth", "Welcome, Sera. The gate is shut.")]
+        for title, text in pages:
+            raw = interface_packet(title, text)
+            asyncio.run(client._handle_interface(Cursor(raw), raw))
+        self.assertEqual(self.rows(client), [])
+
+    def test_player_titled_items_and_book_lines_are_not_sources(self):
+        client = self.client()
+        for tag, kind, name in ((80, c.TYPE_BOOK, "diary of tom: meet at the tower"),
+                                (81, c.TYPE_CONTAINER, "chest [Captain]"),
+                                (82, c.TYPE_BOOK, "warden argoth")):
+            client.state.place_item(Item(tag, item_type=kind, name=name),
+                                    client.state.player_tag)
+        # A player-edited unsigned book: its shown name is the player's title.
+        asyncio.run(client.examine(80))
+        self.say(client, "That is diary of tom: meet at the tower (unread)")
+        self.say(client, "Something is written in it.")
+        self.say(client, " ")
+        # A container a guild titled with a rank.
+        asyncio.run(client.examine(81))
+        self.say(client, "That is chest [Captain]")
+        self.say(client, " ")
+        # A book a player named after an authored name: no book examine is kept.
+        asyncio.run(client.examine(82))
+        self.say(client, "That is warden argoth")
+        self.say(client, "Something is written in it.")
+        self.say(client, " ")
+        # The same book lying on the ground arrives untyped (the look window
+        # sends no UPD_TYPE): its examine cannot be verified and is dropped.
+        client.state.place_item(Item(83, name="warden argoth"), 0)
+        asyncio.run(client.examine(83))
+        self.say(client, "That is warden argoth")
+        self.say(client, "Something is written in it.")
+        self.say(client, " ")
+        # Book lines that open like a door's answer, after a bump at the door.
+        asyncio.run(client.move(1))
+        self.say(client, "You open the door with the brass key and start reading.")
+        self.say(client, "You open the door with the brass key and find it empty.")
+        # A door phrase where no authored door stands at the bump target,
+        # and a lever phrase where no lever stands.
+        later = time.time() + 2
+        client.observations.clock = lambda: later
+        asyncio.run(client.move(5))
+        self.say(client, "You open the door with the brass key.")
+        client.state.place_item(Item(70, location=0, item_type=93, name="big lever"), 0)
+        asyncio.run(client.apply(70))
+        self.say(client, "You turn the big lever.")
+        # The lever's authored name must match too.
+        self.at("/test/room", 6, 6, client)
+        client.observations.clock = lambda: later + 5
+        asyncio.run(client.apply(70))
+        self.say(client, "You turn the little lever.")
+        self.assertEqual(self.rows(client), [])
+        drops = client.metrics.registry.render()
+        self.assertIn('reason="unauthored-item"}', drops)
+        self.assertIn('reason="book-examine"}', drops)
+
+    def test_door_phrases_need_an_authored_key_and_books_keep_authored_spacing(self):
+        client = self.client()
+        later = [time.time()]
+        client.observations.clock = lambda: later[0]
+        # A key with a player's words in its name is not authored.
+        asyncio.run(client.move(1))
+        self.say(client, "You open the door with the key to Zoey's room.")
+        later[0] += 2
+        asyncio.run(client.move(1))
+        self.say(client, "You open the door with the brass key.")
+        # A book's received spacing could carry a message: the normalized
+        # authored form is kept.
+        raw = book_packet("harbour notice", "The   ferry\nleaves  at\tdawn.  \n")
+        asyncio.run(client._handle_book(Cursor(raw), raw))
+        rows = {row["source_key"]: row["text"] for row in self.rows(client)}
+        self.assertEqual(rows["door:/test/room:5,4"], "You open the door with the brass key.")
+        self.assertEqual(next(text for key, text in rows.items() if key.startswith("book:")),
+                         "The ferry leaves at dawn.")
+        self.assertEqual(len(rows), 2)
+
+    def test_examines_keep_only_their_own_answer(self):
+        client = self.client()
+        for tag, name in ((72, "sword"), (73, "shield"), (74, "axe")):
+            client.state.place_item(Item(tag, item_type=c.TYPE_WEAPON, name=name),
+                                    client.state.player_tag)
+        # Soulbound to another player: dropped whole.
+        asyncio.run(client.examine(72))
+        self.say(client, "That is a sword")
+        self.say(client, "It is soulbound to Bob.")
+        self.say(client, " ")
+        # A broadcast inside the answer: dropped whole, the line not kept.
+        asyncio.run(client.examine(72))
+        self.say(client, "That is a sword")
+        self.say(client, "Mallory casts remove depletion on you.")
+        self.say(client, "Qua: 80 Con: 70.")
+        self.say(client, " ")
+        # No blank line in time: dropped.
+        asyncio.run(client.examine(74))
+        self.say(client, "That is an axe")
+        client.observations.clock = lambda: time.time() + 5
+        client._observe(lambda recorder: recorder.flush(client.state))
+        client.observations.clock = time.time
+        self.assertEqual(self.rows(client), [])
+        # Two examines in flight are answered in the order she asked.
+        asyncio.run(client.examine(72))
+        asyncio.run(client.examine(73))
+        for name in ("sword", "shield"):
+            self.say(client, f"That is a {name}")
+            self.say(client, "It weighs 2.000 kg.")
+            self.say(client, " ")
+        rows = {row["source_key"]: row["text"] for row in self.rows(client)}
+        self.assertEqual(rows, {"examine:sword": "That is sword\nIt weighs 2.000 kg.",
+                                "examine:shield": "That is shield\nIt weighs 2.000 kg."})
+
+    def test_a_full_table_evicts_the_oldest_unreferenced_rows(self):
+        from . import memory as memory_module
+        from .memory import BotMemory
+        store = BotMemory(Path(self.directory.name) / "cap.sqlite3", server="s", account="a")
+
+        def row(index):
+            return {"at": 1000.0 + index, "map": "/m", "x": 0, "y": 0,
+                    "source_kind": "system", "source_key": f"system:/m{index}",
+                    "attribution": "none", "authored": 0, "text_hash": f"h{index}",
+                    "text": f"line {index}"}
+
+        with patch.object(memory_module, "OBSERVATION_ROW_LIMIT", 3), \
+                patch.object(memory_module, "OBSERVATION_PRUNE_EVERY", 1):
+            first = store.record_observation("Sera", row(0))
+            with store._connect() as db:
+                # A later phase's fact still cites the oldest row; a locks
+                # table without the column is skipped, not an error.
+                db.execute("CREATE TABLE facts (id INTEGER PRIMARY KEY, observation_id INTEGER)")
+                db.execute("INSERT INTO facts (observation_id) VALUES (?)", (first,))
+                db.execute("CREATE TABLE locks (source_key TEXT)")
+            for index in range(1, 6):
+                store.record_observation("Sera", row(index))
+            # A repeat is no new row and evicts nothing.
+            store.record_observation("Sera", {**row(5), "at": 2000.0})
+        texts = sorted(entry["text"] for entry in store.observations("Sera"))
+        self.assertEqual(texts, ["line 0", "line 4", "line 5"])
+        self.assertEqual(next(entry["seen"] for entry in store.observations("Sera")
+                              if entry["text"] == "line 5"), 2)
+        self.assertEqual(store.observation_counts("Sera"), {"system": 3})
+        self.assertEqual(store.observations("Mallory"), [])
+
+    def test_the_recorder_never_changes_play(self):
+        client = self.client()
+        events = []
+        client.add_handler(lambda event: events.append(event.kind))
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("recorder bug")
+
+        client.observations.on_message = broken
+        self.say(client, "YOU HAVE DIED.")
+        self.assertEqual(client.state.messages[-1][3], "YOU HAVE DIED.")
+        self.assertIn("message", events)
+        self.assertIn("death", [entry["action"] for entry in client.action_history])
+        # A locked database drops the reading, not the line.
+        del client.observations.on_message
+        with patch.object(type(client._memory_store()), "record_observation",
+                          side_effect=sqlite3.OperationalError("database is locked")):
+            self.say(client, "Something blocks your spellcasting.")
+        self.assertEqual(client.state.messages[-1][3], "Something blocks your spellcasting.")
+        self.assertEqual(self.rows(client), [])
+        # Without a loaded character nothing is written.
+        other = AtrinikClient(ClientConfig(
+            runtime_state_path=str(Path(self.directory.name) / "other.sqlite3")))
+        other.state.map.path = "/test/room"
+        data = drawinfo(c.CHAT_TYPE_GAME, "ffffff", "Something blocks your spellcasting.")
+        asyncio.run(other._handle_drawinfo(Cursor(data), data))
+        self.assertFalse((Path(self.directory.name) / "other.sqlite3").exists())
+
+    def test_the_real_content_scan_finds_authored_mouths_and_book_messages(self):
+        from .navigation import CONTENT_ROOT
+        from .observations import AuthoredContent, text_hash
+        world = CONTENT_ROOT / "maps" / "shattered_islands" / "world_2_52_-3"
+        content = AuthoredContent.scan(CONTENT_ROOT, maps=[world])
+        mouth = content.at("/shattered_islands/world_2_52_-3", 11, 8)
+        self.assertEqual([source.kind for source in mouth], ["magic_mouth"])
+        self.assertEqual(mouth[0].msg_hash, text_hash(
+            "The passage appears caved-in, but it might be possible to get through..."))
+        self.assertIn(text_hash("*undecipherable text*"), content.texts)
+
+
+class DashboardSecurityTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = WebTests.asyncSetUp
+    asyncTearDown = WebTests.asyncTearDown
+    raw_get = MetricsRouteTests.raw_get
+
+    async def test_every_response_carries_the_content_security_policy(self):
+        from .web_server import CONTENT_SECURITY_POLICY
+        self.assertEqual(CONTENT_SECURITY_POLICY,
+                         "default-src 'self'; script-src 'self'; object-src 'none'; "
+                         "frame-ancestors 'none'; base-uri 'none'")
+        for path in ("/", "/app.js", "/style.css", "/api/state?include=phase",
+                     "/api/knowledge", "/metrics", "/missing"):
+            head, _ = await self.raw_get(path)
+            self.assertIn(f"Content-Security-Policy: {CONTENT_SECURITY_POLICY}\r\n", head, path)
+
+    def test_the_page_has_nothing_the_policy_would_refuse(self):
+        import re
+        from .web_server import STATIC
+        html = (STATIC / "index.html").read_text()
+        script = (STATIC / "app.js").read_text()
+        # No inline style attribute or block, in the page or in any HTML the
+        # script builds; styles are set through CSSOM (applyStyles).
+        for name, text in (("index.html", html), ("app.js", script)):
+            self.assertNotRegex(text, r"(?i)\sstyle\s*=", name)
+            self.assertNotRegex(text, r"(?i)<style", name)
+        # No inline script or event-handler attribute, and only same-origin
+        # script and stylesheet sources.
+        self.assertEqual(re.findall(r"<script(?![^>]*\ssrc=)[^>]*>", html), [])
+        self.assertNotRegex(html, r"(?i)\son[a-z]+\s*=")
+        self.assertNotRegex(script, r"(?i)<[^>]*\son[a-z]+\s*=")
+        self.assertNotIn("javascript:", html + script)
+        for source in re.findall(r'(?:src|href)="([^"]+)"', html):
+            self.assertTrue(source.startswith("/"), source)
+        self.assertNotRegex(script, r"\beval\(|new Function\(")
+
+    async def test_the_knowledge_route_reads_her_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.client.config.character = "Sera"
+            self.client._memory_path = Path(directory) / "memory.sqlite3"
+            self.client.memory = None
+            status, payload = await self.request("GET", "/api/knowledge")
+            self.assertEqual((status, json.loads(payload)["observations"]), (200, []))
+            self.client.state.player_name = "Sera"
+            self.client.load_character_memory("Sera")
+            self.client.state.map.path = "/m"
+            data = drawinfo(c.CHAT_TYPE_GAME, "ffffff", "Something blocks your spellcasting.")
+            await self.client._handle_drawinfo(Cursor(data), data)
+            status, payload = await self.request("GET", "/api/knowledge?kind=system&limit=5")
+            body = json.loads(payload)
+            self.assertEqual(status, 200)
+            self.assertEqual([row["source_key"] for row in body["observations"]], ["system:/m"])
+            self.assertEqual((body["counts"], body["authored_index"], body["busy"]),
+                             ({"system": 1}, False, False))
+            # A locked database answers at once, empty and busy.
+            from .memory import BotMemory
+            with patch.object(BotMemory, "observations",
+                              side_effect=sqlite3.OperationalError("database is locked")):
+                status, payload = await self.request("GET", "/api/knowledge")
+            self.assertEqual((status, json.loads(payload)["busy"]), (200, True))
+
+    request = WebTests.request
+
 
 if __name__ == "__main__":
     unittest.main()

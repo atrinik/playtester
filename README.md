@@ -159,7 +159,11 @@ diagnostics, but ordinary runs use the locked cached runtime by default.
 Use `atrinik-playtester --help` for transport, registration, character,
 dashboard, navigation, quest, farming, banking, selling, and storage options.
 The dashboard binds to loopback and rejects cross-origin control requests; use
-an authenticated local tunnel instead of exposing it directly.
+an authenticated local tunnel instead of exposing it directly. Every response
+carries a Content-Security-Policy (`default-src 'self'; script-src 'self';
+object-src 'none'; frame-ancestors 'none'; base-uri 'none'`): the page loads
+nothing from elsewhere, runs no inline script, and sets element styles
+through CSSOM rather than inline `style` attributes, which the policy refuses.
 
 The dashboard's Stop outlives a restart. It is stored in the runtime state
 database for the configured `--character`, and the `autoplay` command then
@@ -239,12 +243,59 @@ Counters:
 | `tasks_started_total` | `task` | top-level tasks started |
 | `tasks_finished_total` | `task`, `status` | top-level tasks that completed, failed or were stopped from the dashboard (stopping counts as failed); a task replaced by another is not counted |
 | `state_seconds_total` | `state` | seconds `fighting`, `resting`, `travelling`, `shopping` (shops, temple, NPC dialogue), `busy`, `idle` or `disconnected` (not playing) |
+| `observations_total` | `source` | [observations](#observation-ledger) stored, by source kind; a repeat of a stored reading counts again |
+| `observations_dropped_total` | `reason` | readings the ingestion filter refused: `chat`, `player-link`, `who-list`, `player-name`, `signed-book`, `unmatched-book`, `book-unverified`, `renamed-item`, `examine-interrupted`, `unauthored-item`, `examine-unverified`, `book-examine` |
 
 The time in each state follows the latest recorded action that marks one. For
 example, a target or a kite step means fighting, and a step or route decision
 means travelling. Actions that mark none, such as applying an item, keep the
 current state. A task that has not yet done anything that marks a state is
 `busy`; with no task running, she is `idle`.
+
+## Observation ledger
+
+She keeps what she reads or is told in the `observations` table of the
+runtime state database (`observations.py`, `memory.py`; the design is
+[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md) 4.2 and
+4.3.1, phase F1). Recording changes nothing she does.
+
+- **Only her own observations.** Player chat channels, lines carrying a
+  player-name link, `/who` roster lines, books a player signed, unsigned
+  books whose text matches no authored text, renamed items and any line
+  naming another character she has seen (chat senders, `/who`, players
+  in view) are never stored. Her own name becomes `{activator.name}`, as in
+  authored text. Other players' names are held only in memory, to
+  filter with, so after a restart only players seen since then are known.
+- **Only exact matches with authored content.** Sign, door and
+  magic-mouth text must equal the authored message of an object on or next
+  to her square (`timing` when her own bump, apply or step in the previous
+  1.5 seconds reached it, else `content-match`; a broadcast she did not
+  cause, with another player in view, is not hers). A fixed server phrase
+  ("You open the door with the key.", "You turn the lever.", "Nothing is
+  written on it.") is kept only when an authored door, lever or sign of
+  that name stands where her one bump or apply in the window reached.
+  Books are kept when their text is authored, under the authored title,
+  never the one received, and as the normalized authored form, never the
+  received spacing. Examines of books are not kept (a player can name a
+  book anything); an examine is kept only when the item's shown
+  name is an authored name and every line is one of the forms the server's
+  examine sends; one soulbound to someone is dropped. Dialogue pages are
+  not kept (NPC scripts build them from player data; see the design's
+  phase F13). An unattributed line is stored, as `system:<map>`, only when
+  it is a fact line (for now "Something blocks your spellcasting."). The
+  same text from the same source raises the row's `seen` count.
+- **The authored-text index** is scanned from the locked content (maps,
+  archetypes, artifacts, materials and the book message file, about 1.3
+  seconds) when the `web` or `autoplay` command starts. Without it only
+  fact lines are kept.
+- **Bounded.** At most 50,000 rows a character, 4,000 characters of text a
+  row; when full, the least recently seen rows that no later table refers to
+  are evicted first. Writes wait at most 0.25 seconds for a locked database
+  and otherwise drop the reading, never the game line.
+
+The dashboard's read-only **Knowledge** tab lists recent readings by source
+(`GET /api/knowledge?kind=SOURCE&limit=N`, newest first, up to 1000, under
+the same loopback and `Host` rules as `/api/state`).
 
 ## Operator assist
 

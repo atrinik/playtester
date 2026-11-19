@@ -238,6 +238,10 @@ async def main_async(args: argparse.Namespace) -> None:
         engine.set_task(DepositItemsTask(args.container, tuple(args.item)))
     elif args.task in ("web", "autoplay"):
         graph = WorldGraph().build()
+        # The authored-text index her observation ledger attributes and
+        # verifies books with; about 1.3 s, before play starts.
+        from .observations import load_authored_content
+        client.authored_content = load_authored_content()
         bundle = getattr(args, "bundle", None)
         if bundle is not None:
             client.farm_analyzer = FarmAnalyzer.from_bundle(bundle)

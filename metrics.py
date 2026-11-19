@@ -310,6 +310,20 @@ class BotMetrics:
             "state_seconds_total",
             "Seconds spent fighting, resting, travelling, shopping, idle or disconnected.",
             "state")
+        # Her own readings (observations.py): kept, by source kind, and
+        # refused by the ingestion filter, by reason. Both label sets are
+        # code-defined.
+        self.observations = counter(
+            "observations_total",
+            "Observations stored (a repeat counts again), by source kind.", "source")
+        self.observations_dropped = counter(
+            "observations_dropped_total",
+            "Readings the ingestion filter refused, by reason: chat, player link, "
+            "/who roster, another player's name, signed or unmatched book, renamed item, "
+            "interrupted examine, examined item without an authored name.",
+            "reason")
+        self.observation_sources = LabelLimit(32)
+        self.drop_reasons = LabelLimit(32)
 
     def attach(self, engine: Any) -> None:
         """The task engine: task types, and idle time when no task runs."""
@@ -490,6 +504,14 @@ class BotMetrics:
                    c.CHAT_TYPE_PRIVATE: "tell", c.CHAT_TYPE_PARTY: "party"}.get(
                        msg_type, OTHER)
         self.chat_lines.inc((*self.base(), "out" if direction == "out" else "in", channel))
+
+    @_never_raises
+    def observation(self, source_kind: str) -> None:
+        self.observations.inc((*self.base(), self.observation_sources(source_kind)))
+
+    @_never_raises
+    def observation_dropped(self, reason: str) -> None:
+        self.observations_dropped.inc((*self.base(), self.drop_reasons(reason)))
 
     @_never_raises
     def death(self, cause: Any) -> None:

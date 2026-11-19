@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,14 @@ from .tasks import (BankTask, BotTask, BuyShopUpgradeTask, DepositItemsTask,
 
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).with_name("web_static")
+# Every response's Content-Security-Policy (docs/LEARNING_AND_FEEDBACK.md
+# 4.10.5): scripts, styles, images and requests only from the dashboard
+# itself; no inline script or style (the page sets styles through CSSOM),
+# no plugins, no framing and no <base> rewriting.
+# The longest the Knowledge tab waits for a locked database (seconds).
+KNOWLEDGE_READ_TIMEOUT = 0.25
+CONTENT_SECURITY_POLICY = ("default-src 'self'; script-src 'self'; object-src 'none'; "
+                           "frame-ancestors 'none'; base-uri 'none'")
 
 # Levels 0-30 of the classic server's new_levels table. Only used when the
 # bundled server source cannot be read; levels past it report unknown progress.
@@ -867,6 +876,7 @@ class WebControlServer:
         header = (f"HTTP/1.1 {status} {labels.get(status, 'Error')}\r\n"
                   f"Content-Type: {content_type}\r\nContent-Length: {len(body)}\r\n"
                   f"Cache-Control: {cache}\r\nX-Content-Type-Options: nosniff\r\n"
+                  f"Content-Security-Policy: {CONTENT_SECURITY_POLICY}\r\n"
                   "Connection: close\r\n\r\n").encode()
         writer.write(header + body)
         await writer.drain()
@@ -949,6 +959,29 @@ class WebControlServer:
                 limit=int((params.get("limit") or ["200"])[0]),
                 sender=(params.get("sender") or [""])[0]) if character else []
             await self._reply(writer, 200, _json_bytes({"chat": history}))
+            return
+        if method == "GET" and path == "/api/knowledge":
+            # Her observation ledger, read-only: ?kind=SOURCE_KIND&limit=N
+            # (newest N, up to 1000). Rows passed the ingestion filter, so
+            # they hold no chat and no other player's name.
+            params = parse_qs(query)
+            character = getattr(self.client, "_memory_character", "")
+            observations, counts, busy = [], {}, False
+            if character:
+                memory = self.client._memory_store()
+                try:
+                    # A locked database must not hold up the event loop.
+                    observations = memory.observations(
+                        character, limit=int((params.get("limit") or ["100"])[0]),
+                        source_kind=(params.get("kind") or [""])[0],
+                        timeout=KNOWLEDGE_READ_TIMEOUT)
+                    counts = memory.observation_counts(
+                        character, timeout=KNOWLEDGE_READ_TIMEOUT)
+                except sqlite3.OperationalError:
+                    observations, counts, busy = [], {}, True
+            await self._reply(writer, 200, _json_bytes({
+                "observations": observations, "counts": counts, "busy": busy,
+                "authored_index": getattr(self.client, "authored_content", None) is not None}))
             return
         if method == "GET" and path.startswith("/api/face/"):
             image = self.face_images.png(path[len("/api/face/"):])

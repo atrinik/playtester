@@ -1,7 +1,9 @@
 # Learning from the world and playtester feedback
 
-Status: design proposal, not implemented. Nothing here changes behaviour
-until the phased pull requests at the end land.
+Status: design proposal. Phase F1 (the observation ledger) is implemented;
+"F1 as built" in section 6 records where it differs from this text. Nothing
+else here is implemented, and nothing here changes behaviour until the
+phased pull requests at the end land.
 
 The owner wants Sera to learn from what she reads and does in the world, and
 to turn what confuses her into feedback that improves the game. She chose
@@ -1445,6 +1447,83 @@ name is replaced in dialogue; book packets parse into title and body; an
 unattributed fact line deduplicates; a full table evicts the oldest
 unreferenced rows; no behaviour change.
 
+*F1 as built* (`observations.py`, `memory.py`, the Knowledge tab). Where
+the code and the server differ from the text above, the code follows the
+server:
+
+- Magic mouths use the key `mouth:/map:x,y` (the prefix the `locks` table
+  in 4.2 already uses), and the row's `x`, `y` are where she stood; the key
+  carries the source's square.
+- Players in view are told from creatures by the MAP2 name colour: the
+  server colours players white, green (her party) or red (PvP), and
+  creatures by level (`request.c`), so a white name, or a green or red name
+  that no authored object carries, is a player. MAP2 has no player flag.
+- **Only what matches authored content exactly is kept.** Review showed
+  that each looser rule let other players' text through, so F1 is
+  narrower than 4.3.1:
+  - Sign, door, magic-mouth and custom lever text must equal the authored
+    message of an object on or next to her square; timing only labels
+    such a match `timing`. The timing window alone never attributes a
+    line: the server sends unrelated lines in it that name players
+    without a link ("%s starved to death.", "%s says: ..." from NPC talk
+    and `Object.Say`, "%s casts ... on you", guard shouts).
+  - Fixed phrasings ("You open the %s with the %s.", "The %s is opened
+    for you.", "The %s is locked.", "The %s won't budge.", "You turn the
+    %s.", "Nothing is written on it.", "You are unable to decipher the
+    strange symbols.") are kept only when an authored door or gate of that
+    name stands at or next to her bump's target, or an authored lever of
+    that name (or a sign) under her apply. Each consumes the one bump or
+    ground apply of its kind in the window; with two in the window
+    nothing is kept. Lines ending "and start reading." or "and find it
+    empty." (`book.c`, whose book name a player sets) are never a door's,
+    and the key named in "You open the %s with the %s." must be an
+    authored name too.
+  - Books are kept only when the body's hash is authored text, under the
+    authored title from the index (the name of the map or archetype book
+    carrying that message; empty for the book message file's texts),
+    never the received title, which a player can set on an unsigned copy.
+    The stored text is the normalized form that matched, so the received
+    spacing (a possible side channel) is not kept.
+  - An examine is kept only when the shown name, less count, item race,
+    material, "+N" and parenthesised states, is an authored object or
+    archetype name (or plural); the row and its first line use that
+    authored name. A player-titled book or a guild-ranked container is
+    dropped (`unauthored-item`). Examines of books are never kept
+    (`book-examine`): a player can name a book anything, an authored name
+    included (`book_edit.c`), and books are captured from their packets.
+    Without the index, examines are dropped as `examine-unverified`.
+  - **Dialogue pages are not kept in F1.** NPC scripts build pages from
+    player data (post-office senders, auction sellers, guild ranks,
+    jailed players), and no word-level check separates it from authored
+    text. Dialogue capture moves to F13.
+- The authored-text index holds the messages of maps, archetypes, artifacts
+  and the book message file (`arch/messages`), authored book titles,
+  object and archetype names and plurals, and material names
+  (`arch/materials`). The server's other generated books (bestiary,
+  artifact and spell path texts, `readable.c`) are not indexed, so they are
+  dropped as unmatched, like player-edited books. The index is scanned once
+  when `web` or `autoplay` starts (about 1.3 s); without it only
+  unattributed fact lines are kept.
+- "Characters she has seen" are chat senders, `/who` names and players in
+  view since the process started; they are kept only in memory, so the set
+  starts empty after a restart.
+- Until F2's parsers exist, the only unattributed fact lines are the
+  no-magic refusals "Something blocks your spellcasting." and "Something
+  blocks your spell." The variant naming her item ("...the magic of your
+  %s") is not kept, because a player-renamed item could carry its name.
+- An examine is kept only when every line after "That is ..." is one of
+  the forms `types/player.c` `examine` sends, an item's story is authored
+  text, and its closing blank line arrives within 1.5 s. Any other line
+  inside it drops the whole answer, as do "You name it ...", "... soulbound
+  to NAME." and a signed book, because these name a player. Answers pair
+  with her examines oldest first.
+- Book packets answer only her own apply, so they need no timing window.
+  The quest journal is not stored (`quests.parse_quest_book` reads it).
+- "Oldest" for eviction means least recently seen (`last_at`); rows cited
+  by `facts.observation_id` or `locks.hint_observation_id` are kept once
+  those tables exist.
+- The CSP adds `base-uri 'none'` to the policy in 4.10.5.
+
 **F2. `feat(knowledge)`: deterministic fact parsers and persistent tile
 facts.** The `facts` table and the parsers in 4.3.2. Tile facts persist
 PR #97's `spell_blocked_here` signal behind `persist_tile_facts`, default
@@ -1555,7 +1634,12 @@ unfamiliar NPC with dialogue on maps she visits, and follow only
 non-consequential links, in coordination with
 [#17](https://github.com/atrinik/playtester/issues/17): never a link whose
 interface action is `teleport`, `enemy`, a quest start or turn-in, a
-purchase, or free text. Records pages as observations.
+purchase, or free text. Records pages as observations, but only pages of
+an explicit allowlist of NPC scripts whose text is literal authored
+strings: the index gains the hashes of those scripts' string literals
+(with `{activator.name}` and other substitutions resolved to fixed forms),
+and a page is kept only when it matches them exactly. F1 keeps no
+dialogue, because scripts build pages from player data (4.10.4).
 *Accept:* Warden Argoth's fixture records the "key" page and never follows
 the insult chain (its last step sets `enemy="player"`); a teleporting link
 is never followed.

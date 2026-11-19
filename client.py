@@ -25,6 +25,7 @@ from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameSta
 from .alerts import ProgressWatch
 from .memory import BotMemory
 from .metrics import BotMetrics
+from .observations import AuthoredContent, Observation, ObservationRecorder
 from . import post_mortem
 from .self_improvement import PLAYER_CHANNELS
 from .trends import Trends
@@ -297,6 +298,12 @@ class AtrinikClient:
         self.animations = self._load_animations()
         # Background farm ranking; set by the CLI when the bundle provides it.
         self.farm_analyzer = None
+        # Her own readings (observations.py), kept in memory's observations
+        # table. The authored-text index is loaded by the CLI at start-up;
+        # without it only unattributed fact lines are kept.
+        self.authored_content: AuthoredContent | None = None
+        self.observations = ObservationRecorder(
+            lambda: self.authored_content, self._observation_dropped)
 
     def load_character_memory(self, character: str) -> None:
         # Switching characters on a long-lived client: the previous one's
@@ -1494,6 +1501,8 @@ class AtrinikClient:
         cutoff = self.state.messages[-1][0] - post_mortem.REVIEW_HISTORY_SECONDS
         while self.review_messages and self.review_messages[0][0] < cutoff:
             self.review_messages.popleft()
+        self._observe(lambda recorder: recorder.on_message(
+            self.state, msg_type, color, text))
         # A player can type "your balance is ..." in chat; only game and NPC
         # messages are the bank's (the banker itself answers in a dialogue).
         if (msg_type not in c.PLAYER_CHAT_TYPES and
@@ -1719,6 +1728,39 @@ class AtrinikClient:
         level = int(skill.extra.get("level", 0) or 0) if skill else 0
         display = skill_name.removesuffix(" weapons").title()
         return f"{display}, currently level {level}" if level else display
+
+    def _observe(self, step: Callable[[ObservationRecorder], Any]) -> None:
+        """Feed the observation recorder and keep what it returns; never
+        fails or delays play (a locked database drops the reading)."""
+        recorder = getattr(self, "observations", None)
+        if recorder is None:
+            return
+        try:
+            observations = step(recorder) or ()
+        except Exception:
+            log.exception("observation recorder failed")
+            return
+        # Only once her memory is open: a reading belongs to her character.
+        character = getattr(self, "_memory_character", "")
+        if not observations or not character or character != self.state.player_name:
+            return
+        for observation in observations:
+            if not isinstance(observation, Observation):
+                continue
+            try:
+                self._memory_store().record_observation(character, observation.row())
+            except sqlite3.Error as error:
+                log.warning("observation not kept: %s", error)
+                continue
+            except Exception:
+                log.exception("observation not kept")
+                continue
+            if self.metrics is not None:
+                self.metrics.observation(observation.source_kind)
+
+    def _observation_dropped(self, reason: str) -> None:
+        if getattr(self, "metrics", None) is not None:
+            self.metrics.observation_dropped(reason)
 
     def _log_chat(self, msg_type: int, direction: str, sender: str,
                   text: str) -> None:
@@ -2380,6 +2422,7 @@ class AtrinikClient:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
         self._observe_map_change(old_path, m)
+        self._observe(lambda recorder: recorder.note_position(self.state))
         # Movement arrives in map packets, between stats packets and polls.
         self.progress_watch.observe(self.state)
         await self.emit("map", {"path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y, "changed_map": old_path != m.path})
@@ -2433,6 +2476,7 @@ class AtrinikClient:
     async def _handle_book(self, cur: Cursor, raw: bytes) -> None:
         self.state.books.append(raw)
         del self.state.books[:-20]
+        self._observe(lambda recorder: recorder.on_book(self.state, raw))
         if b"Quest List" in raw or b"No quests to speak of" in raw:
             # Quest catalog loading depends on verified content tooling. Keep
             # ordinary client imports and non-book protocol handling usable
@@ -2469,6 +2513,7 @@ class AtrinikClient:
             raise ValueError("direction must be 0..8")
         self.record_action("retreat" if run else "step",
                            f"direction={direction}")
+        self._observe(lambda recorder: recorder.note_move(self.state, direction))
         # Epoch zero keeps ordinary direct actions outside keyboard replacement.
         await self.send(Packet(c.S_MOVE).u8(direction).u8(int(run)).u32(0))
 
@@ -2530,12 +2575,15 @@ class AtrinikClient:
         if self.metrics is not None:
             self.metrics.apply(item)
         self.record_action("apply", item.name if item else str(tag or "below"))
+        self._observe(lambda recorder: recorder.note_apply(self.state, item))
         packet = Packet(c.S_ITEM_APPLY).u32(max(0, tag))
         if tag <= 0:
             packet.u8(apply_action)
         await self.send(packet)
 
     async def examine(self, tag: int) -> None:
+        item = self.state.items.get(tag)
+        self._observe(lambda recorder: recorder.note_examine(self.state, item))
         await self.send(Packet(c.S_ITEM_EXAMINE).u32(tag))
 
     async def move_item(self, destination: int, tag: int, quantity: int = 0) -> None:

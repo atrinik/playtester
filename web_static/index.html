@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Atrinik Observer</title>
-  <link rel="stylesheet" href="/style.css?v=14">
+  <link rel="stylesheet" href="/style.css?v=15">
 </head>
 <body>
   <header class="topbar">
@@ -79,6 +79,7 @@
         <button data-tab="chat">Chat <span id="chat-badge" class="badge"></span></button>
         <button data-tab="quests">Quests</button>
         <button data-tab="farming">Farming</button>
+        <button data-tab="knowledge">Knowledge</button>
         <button data-tab="tasks">Tasks</button>
       </nav>
 
@@ -127,6 +128,13 @@
         <p class="muted small">Ranked by the farming analyzer from the locked content and Classic experience tables, simulating Sera's live combat stats. Rates are model estimates for comparing spots, not live measurements.</p>
       </div>
 
+      <div id="tab-knowledge" class="tab scroll">
+        <div class="row between"><h2>Recent readings</h2><select id="knowledge-kind"><option value="">All sources</option></select></div>
+        <p id="knowledge-summary" class="muted small"></p>
+        <div id="knowledge" class="list"><span class="muted">Loading…</span></div>
+        <p class="muted small">Only what she read herself and what matches authored content exactly: signs, doors, levers, magic mouths, authored books and examined authored items. Chat, dialogue, other players' names, signed or unknown books and renamed or player-titled items are never kept. Read-only.</p>
+      </div>
+
       <div id="tab-tasks" class="tab scroll">
         <p class="muted small">Starting any of these replaces autoplay until it finishes; use <b>Start autoplay</b> to return to the campaign.</p>
         <section class="form">
@@ -156,6 +164,6 @@
     </section>
   </main>
   <div id="toast" role="status"></div>
-  <script src="/app.js?v=20"></script>
+  <script src="/app.js?v=23"></script>
 </body>
 </html>
