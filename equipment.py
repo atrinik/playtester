@@ -43,6 +43,7 @@ except ModuleNotFoundError:
 
 from . import constants as c
 from .model import Item
+from .observations import authored_item_name
 
 log = logging.getLogger(__name__)
 
@@ -392,9 +393,13 @@ def item_base(client: Any, item: Item) -> tuple[str, BaseStats] | None:
     family = known[0] if known is not None else ""
     examined = item.extra.get("gear_examine")
     if isinstance(examined, dict) and examined.get("name") == item.name:
-        return family, base_from_json(examined.get("base")) or BaseStats()
+        base = base_from_json(examined.get("base")) or BaseStats()
+        if base != BaseStats() or item.item_type not in MAGIC_HIDDEN_TYPES:
+            return family, base
     if item.item_type in MAGIC_HIDDEN_TYPES:
-        # Their names show the description in full.
+        # An untitled ring, amulet or trinket shows its description in its
+        # name, and examine does not repeat it (item.c object_get_title,
+        # object_get_name_description).
         shown = parse_description(item.name)
         if shown is not None:
             return family, shown
@@ -672,12 +677,16 @@ class GearExaminer:
             # its flags, then its description (types/player.c examine).
             text = re.sub(r"^That is an? ", "That is ", str(entry[3]).strip())
             rest = text[len(prefix):]
-            if not text.startswith(prefix) or rest and not rest.startswith(" "):
+            # After the name come only its state flags, "(...)" or a
+            # locked item's " *", and the description: never more name.
+            if not text.startswith(prefix) or rest and not rest.startswith((" (", " *")):
                 continue
             if item is not None:
+                # A ring's, amulet's or trinket's description is in its name.
+                shown = (name + rest if item.item_type in MAGIC_HIDDEN_TYPES else rest)
                 item.extra["gear_examine"] = {
                     "name": name,
-                    "base": base_to_json(parse_description(rest) or BaseStats()),
+                    "base": base_to_json(parse_description(shown) or BaseStats()),
                     "at": time.time()}
                 item.extra.pop("gear_examine_attempts", None)
             self.pending = None
@@ -685,8 +694,13 @@ class GearExaminer:
         if self.clock() - sent_at <= self.ANSWER_TIMEOUT:
             return False
         if item is not None:
-            item.extra["gear_examine_attempts"] = int(
-                item.extra.get("gear_examine_attempts", 0) or 0) + 1
+            # A name that is not authored is most likely her own rename,
+            # which examine never shows: one try is enough.
+            content = getattr(client, "authored_content", None)
+            renamed = content is not None and authored_item_name(content, name) is None
+            item.extra["gear_examine_attempts"] = (
+                self.MAX_ATTEMPTS if renamed else
+                int(item.extra.get("gear_examine_attempts", 0) or 0) + 1)
             item.extra["gear_examine_retry_at"] = self.clock() + self.RETRY_AFTER
         log.info("gear examine of %s got no answer", name)
         self.pending = None
@@ -726,7 +740,11 @@ class GearExaminer:
         if self.old_score is None or (not force and now - self.shadow_at < self.SHADOW_INTERVAL):
             return
         self.shadow_at = now
-        report = equipment_report(client, self.policy, self.old_score)
+        try:
+            report = equipment_report(client, self.policy, self.old_score)
+        except Exception as error:   # a diagnostic must never stop her farm
+            log.warning("gear shadow comparison failed: %s", error)
+            return
         divergent = [family for family in report["families"] if family["diverges"]]
         signature = tuple((family["type"], *((family[key] or {}).get("tag", 0)
                                              for key in ("old_choice", "new_choice")))
@@ -755,6 +773,18 @@ class GearExaminer:
             log.info("gear-shadow %s", detail)
             if recorder is not None:
                 recorder("gear-shadow", detail)
+
+
+def gear_examine_pending(client: Any) -> bool:
+    """Whether her gear examine still waits for its answer.
+
+    The recall wand and mana crystal examines wait for it, so that only one
+    examine is ever in flight. It settles itself here (answered, or given up
+    after ``ANSWER_TIMEOUT``), so a farm that stopped ticking never holds
+    them for longer.
+    """
+    examiner = getattr(client, "gear_examiner", None)
+    return examiner is not None and not examiner.read_answer(client)
 
 
 def gear_examiner(client: Any) -> GearExaminer:

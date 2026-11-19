@@ -367,8 +367,9 @@ what she wears and buys.
 - **Examining carried gear.** On a quiet farm tick (no threat in view, the
   recall-wand rule) she examines each identified gear item she carries
   once a session, what she wears first: one at a time, at least 2 seconds
-  apart, never while a recall-wand or mana-crystal examine waits for its
-  answer, waiting up to 5 seconds for each. Examine shows the base stats
+  apart, waiting up to 5 seconds for each. Recall-wand and mana-crystal
+  examines wait for its answer and it for theirs, so only one examine is
+  ever in flight. Examine shows the base stats
   without the "+N"; until an item is examined its archetype's base stats
   are used.
 - **Shadow logging.** At most every 30 seconds she compares, per gear

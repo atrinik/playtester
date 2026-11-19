@@ -31,7 +31,7 @@ except ModuleNotFoundError:
 
 from . import constants as c
 from . import requirements as req
-from . import unlocks
+from .equipment import gear_examine_pending
 from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
 
@@ -7487,7 +7487,9 @@ class FarmCircuitTask(BotTask):
         if farm._wand_examine is None:
             # That answer settled one wand: start the next, if any.
             await farm.check_recall_wand(client)
-        return farm._wand_examine is not None
+        # A gear examine in flight holds the next wand back for its answer.
+        return farm._wand_examine is not None or (
+            gear_examine_pending(client) and farm.next_recall_wand(client) is not None)
 
     async def _tick_running_service(self, client: AtrinikClient) -> bool:
         """Tick the maintenance trip under way, if any, and settle its end.

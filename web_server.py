@@ -572,7 +572,7 @@ class DashboardState:
                          "progress is not all earned")})
         return alerts
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, include: set[str] | None = None) -> dict[str, Any]:
         state, task = self.client.state, self.engine.task
         inventory = []
         skills = []
@@ -703,7 +703,9 @@ class DashboardState:
             "post_mortems": list(reversed(
                 getattr(self.client, "post_mortems", [])[-10:])),
             "alerts": self.alerts(),
-            "equipment": self.equipment(),
+            # Built only for the polls that ask for it (the slow one).
+            **({"equipment": self.equipment()}
+               if include is None or "equipment" in include else {}),
         }
 
     def equipment(self) -> dict[str, Any]:
@@ -712,8 +714,13 @@ class DashboardState:
         examiner = getattr(self.client, "gear_examiner", None)
         # The policy her farm last examined with (caster or melee scoring).
         policy = getattr(examiner, "policy", None) or InventoryPolicy()
-        return equipment_report(self.client, policy,
-                                carried_gear_score(self.client, policy))
+        try:
+            return equipment_report(self.client, policy,
+                                    carried_gear_score(self.client, policy))
+        except Exception as error:   # never let the panel break /api/state
+            log.warning("equipment panel unavailable: %s", error)
+            return {"families": [], "examined": 0, "shadow": [],
+                    "error": f"equipment unavailable: {error}"}
 
     def prometheus(self) -> str:
         """The Prometheus exposition: activity counters and live gauges."""
@@ -949,10 +956,10 @@ class WebControlServer:
                      path: str, body: bytes, query: str = "",
                      headers: dict[str, str] | None = None) -> None:
         if method == "GET" and path == "/api/state":
-            snapshot = self.dashboard.snapshot()
             include = {
                 key for value in parse_qs(query).get("include", [])
                 for key in value.split(",") if key}
+            snapshot = self.dashboard.snapshot(include or None)
             if not include or "trends" in include:
                 # A day of buckets: built only for polls that ask for it.
                 snapshot["trends"] = self.client.trends.summary()

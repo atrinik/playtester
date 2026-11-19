@@ -6271,6 +6271,38 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(len(client.direct_moves), 2)
         self.assertNotEqual(client.direct_moves[1][0], first_direction)
 
+    def test_farm_examines_gear_only_on_a_quiet_tick_behind_the_wand(self):
+        calls = []
+
+        class Examiner:
+            async def tick(self, client, policy, score):
+                calls.append(score)
+                return False
+
+        def quiet_farm():
+            client = self._combat_client()
+            client.state.map.tiles.clear()
+            client.state.map.world_x, client.state.map.world_y = 1, 11
+            node = MapNode(path="/test", width=12, height=14)
+            node.terrain = {(x, y): 1 for x in range(12) for y in range(14)}
+            task = FarmTask(zone="/test", patrol=[(7, 9)])
+            task.map_node, task.map_bounds = node, (12, 14)
+            return client, task
+
+        with patch("atrinik_bot.tasks.gear_examiner", lambda client: Examiner()):
+            client, task = quiet_farm()
+            asyncio.run(task.tick(client))
+            self.assertEqual(len(calls), 1)
+            # A recall wand examine waiting for its answer holds it back.
+            client, task = quiet_farm()
+            task._wand_examine = (77, time.time())
+            asyncio.run(task.tick(client))
+            self.assertEqual(len(calls), 1)
+            # A monster in view: no examine at all.
+            client = self._combat_client()
+            asyncio.run(FarmTask(zone="/test").tick(client))
+            self.assertEqual(len(calls), 1)
+
     def test_cornered_pack_fights_adjacent_blocker_to_open_exit(self):
         client = self._combat_client()
         client.state.map.tiles.clear()
@@ -21600,6 +21632,109 @@ class EquipmentTests(unittest.TestCase):
         rows = client._memory_store().observations("Sera", limit=10)
         self.assertEqual([row["source_key"] for row in rows], ["examine:sword"])
 
+    def test_examined_rings_amulets_and_trinkets_keep_the_stats_in_their_names(self):
+        # An untitled one shows its description in its name and examine does
+        # not repeat it (item.c object_get_title, object_get_name_description).
+        from .equipment import GearExaminer, item_effective_stats
+        client = self.section_two_client()
+        examiner = GearExaminer(clock=lambda: 100.0)
+        for tag, item_type, name in (
+                (50, c.TYPE_RING, "ring (Str+1) (Protections: fire +10%)"),
+                (51, c.TYPE_AMULET, "amulet (Pow+2) (mana reg.+0.8)"),
+                (52, c.TYPE_TRINKET, "trinket (ac+1)")):
+            with self.subTest(name=name):
+                client.state.place_item(Item(tag, item_type=item_type, name=name,
+                                             quality=80, condition=100), 1)
+                examiner.pending = (tag, name, client.state.message_count, 100.0)
+                client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                         f"That is {name} (magical) (worn)")
+                self.assertTrue(examiner.read_answer(client))
+                stats = item_effective_stats(client, client.state.items[tag])
+                self.assertEqual(stats.source, "examine")
+        ring, amulet, trinket = (item_effective_stats(client, client.state.items[tag])
+                                 for tag in (50, 51, 52))
+        self.assertEqual((ring.stats, ring.protections), ((("Str", 1),), (("fire", 10.0),)))
+        self.assertEqual((amulet.stats, amulet.regen_sp), ((("Pow", 2),), 2))
+        self.assertEqual(trinket.ac, 1)
+        # An empty base stored for one (as before this fix) falls back to its name.
+        client.state.items[50].extra["gear_examine"]["base"] = {}
+        self.assertEqual(item_effective_stats(client, client.state.items[50]).stats,
+                         (("Str", 1),))
+
+    def test_an_answer_must_name_exactly_the_examined_item(self):
+        from .equipment import GearExaminer
+        client = self.section_two_client()
+        client.state.place_item(Item(60, item_type=c.TYPE_WEAPON, name="sword",
+                                     quality=80, condition=100), 1)
+        examiner = GearExaminer(clock=lambda: 100.0)
+        examiner.pending = (60, "sword", client.state.message_count, 100.0)
+        for line in ("That is sword +2 (wc+9)", "That is swordfish (wc+9)",
+                     "That is sword of fire (wc+9)"):
+            client.state.add_message(c.CHAT_TYPE_GAME, "ffffff", line)
+            self.assertFalse(examiner.read_answer(client), line)
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff", "That is sword * (wc+2)")
+        self.assertTrue(examiner.read_answer(client))
+        self.assertEqual(client.state.items[60].extra["gear_examine"]["base"]["wc"], 2)
+
+    def test_a_renamed_item_is_tried_once(self):
+        # Examine shows the real name, never her rename: a name that is not
+        # authored gets one try, an authored one three.
+        from .equipment import GearExaminer
+        from .tasks import InventoryPolicy
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        client = self.section_two_client()
+        client.authored_content = observation_content(Path(directory.name))
+        now = [100.0]
+        examiner = GearExaminer(clock=lambda: now[0])
+        for tag, name in ((61, "Lucky Blade"), (62, "sword")):
+            client.state.place_item(Item(tag, item_type=c.TYPE_WEAPON, name=name,
+                                         quality=80, condition=100), 1)
+            examiner.pending = (tag, name, client.state.message_count, now[0])
+            now[0] += GearExaminer.ANSWER_TIMEOUT + 1
+            self.assertTrue(examiner.read_answer(client))
+        self.assertFalse(GearExaminer.wanted(client.state.items[61], InventoryPolicy()))
+        self.assertEqual(client.state.items[62].extra["gear_examine_attempts"], 1)
+
+    def test_wand_and_crystal_examines_wait_for_a_gear_examine(self):
+        from .equipment import GearExaminer, gear_examine_pending
+        from .tasks import ManaCrystal
+        client = self.section_two_client()
+        now = [100.0]
+        client.gear_examiner = GearExaminer(clock=lambda: now[0])
+        client.gear_examiner.pending = (11, "silksteel chain mail +1",
+                                        client.state.message_count, now[0])
+        sent = []
+
+        async def examine(tag):
+            sent.append(tag)
+
+        client.examine = examine
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    name="pine wand of word of recall (lvl 17)")
+        crystal = Item(78, item_type=c.TYPE_POWER_CRYSTAL, name="crystal")
+        for item in (wand, crystal):
+            client.state.place_item(item, 1)
+        farm = FarmTask(zone="/test")
+        self.assertTrue(gear_examine_pending(client))
+        asyncio.run(farm.check_recall_wand(client))
+        self.assertTrue(asyncio.run(ManaCrystal.learn(client, crystal)))
+        self.assertEqual(sent, [])
+        self.assertIsNone(farm._wand_examine)
+        # Its answer settles it; then each goes in turn.
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                 "That is silksteel chain mail +1 (ac+6)")
+        self.assertFalse(gear_examine_pending(client))
+        asyncio.run(farm.check_recall_wand(client))
+        self.assertEqual(sent, [77])
+        # With no answer it gives up after the timeout and frees them.
+        client.gear_examiner.pending = (13, "shear steel falchion +2",
+                                        client.state.message_count, now[0])
+        self.assertTrue(asyncio.run(ManaCrystal.learn(client, crystal)))
+        now[0] += GearExaminer.ANSWER_TIMEOUT + 1
+        self.assertTrue(asyncio.run(ManaCrystal.learn(client, crystal)))
+        self.assertEqual(sent, [77, 78])
+
 
 class BuildInfoTests(unittest.TestCase):
     COMMIT = "4a29be882631e570df3028c6e6ead2893b3d4723"
@@ -22056,6 +22191,30 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(status, 400)
         self.assertIn(b"no longer underfoot", payload)
+
+    async def test_the_equipment_panel_is_built_only_for_the_slow_poll(self):
+        self.client.state.player_tag = 1
+        self.client.faces = {5: "cape.101"}
+        self.client.state.place_item(Item(15, item_type=c.TYPE_CLOAK, name="silk cape +2",
+                                          face=5, quality=80, condition=100,
+                                          flags=c.ITEM_APPLIED), 1)
+        status, payload = await self.request("GET", "/api/state?include=equipment")
+        self.assertEqual(status, 200)
+        cloak, = json.loads(payload)["equipment"]["families"]
+        self.assertIn("+2 on a cape adds no AC: it has no base AC, WC, damage, "
+                      "block or absorb", cloak["worn"][0]["notes"])
+        from . import web_server
+        with patch.object(web_server, "equipment_report",
+                          side_effect=AssertionError("built for the live poll")):
+            status, payload = await self.request("GET", "/api/state?include=phase,inventory")
+            self.assertEqual(status, 200)
+            self.assertNotIn("equipment", json.loads(payload))
+        # A failure (say, no content) answers with an error for the tab only.
+        with patch.object(web_server, "equipment_report", side_effect=OSError("no content")):
+            status, payload = await self.request("GET", "/api/state?include=equipment,phase")
+        body = json.loads(payload)
+        self.assertEqual((status, body["equipment"]["error"], body["equipment"]["families"]),
+                         (200, "equipment unavailable: no content", []))
 
     async def test_dashboard_and_task_replacement_without_login(self):
         status, page = await self.request("GET", "/")

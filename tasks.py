@@ -26,7 +26,7 @@ from .targeting import select_target, target_set_aside
 from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      format_money, map_object_visual_name,
                      update_bank_balance)
-from .equipment import gear_examiner
+from .equipment import gear_examine_pending, gear_examiner
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
 
@@ -1315,6 +1315,9 @@ class ManaCrystal:
             return False
         if now < float(item.extra.get("crystal_examine_retry_at", 0.0)):
             return False
+        if gear_examine_pending(client):
+            # One examine in flight at a time: hers answers first.
+            return True
         item.extra["crystal_examine"] = (client.state.message_count, now)
         await client.examine(item.tag)
         return True
@@ -4961,19 +4964,24 @@ class FarmTask(BotTask):
                     recorder("recall-wand-charges", f"tag={tag} charges={charges}")
             return
         examine = getattr(client, "examine", None)
+        wand = self.next_recall_wand(client)
+        # One examine in flight at a time: a gear examine answers first.
+        if wand is None or examine is None or gear_examine_pending(client):
+            return
+        self._wand_examined.add(wand.tag)
+        self._wand_examine = (wand.tag, time.time())
+        await examine(wand.tag)
+
+    def next_recall_wand(self, client: AtrinikClient) -> Item | None:
+        """The next recall wand of unknown charge to examine, if any."""
         policy = InventoryPolicy()
-        wand = next((
+        return next((
             item for item in client.state.inventory
             if item.item_type == c.TYPE_WAND and
             re.search(r"\bword of recall\b", item.name, re.I) and
             policy.identified(item) and
             item.tag not in wand_charges(client) and
             item.tag not in self._wand_examined), None)
-        if wand is None or examine is None:
-            return
-        self._wand_examined.add(wand.tag)
-        self._wand_examine = (wand.tag, time.time())
-        await examine(wand.tag)
 
     def remember_safe_position(self, client: AtrinikClient) -> None:
         """Retain a short breadcrumb trail from before hostile contact."""

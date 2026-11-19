@@ -1659,7 +1659,11 @@ code follows the server:
   launcher is wielded (`living.c:997-1005`); the panel values the shield
   on its own. The protections of several items combine with diminishing
   returns (`living.c:596-606`); the panel shows each item's own value,
-  scaled by its condition. A "(speed+N)" item's speed is not counted.
+  scaled by its condition. A "(speed+N)" item's speed is not counted. An
+  unexamined body armour's speed cap is its archetype's, without the
+  "+N" factor (`treasure.c:846-847`). A ring's, amulet's or trinket's
+  "+N" is never shown, so it is taken as 0, although the server adds it to
+  any AC, WC, damage, block or absorb they have (`living.c:564-593`).
 
 What was built:
 
@@ -1678,12 +1682,18 @@ What was built:
   recall-wand examine has its answer and while no mana-crystal examine
   waits, one identified, worn or carried gear item at a time, what she
   wears first; at least 2 seconds apart; it waits up to 5 seconds for the
-  answer ("That is " and her item's shown name) before the next. One
-  examine in flight at a time keeps F1's recorder, which pairs answers with
-  her oldest unanswered examine, in step. An item is examined again when
-  its name changes (identification, a new "+N"), after a relog (new tags)
-  or, with no answer, up to three times five minutes apart. Lights are not
-  examined.
+  answer ("That is " and her item's shown name, followed only by its
+  state flags and description) before the next. The recall wand and mana
+  crystal examines in turn wait for a gear examine's answer (the walk out
+  of a farm too, while a wand still needs examining), so only one examine
+  is ever in flight, which keeps F1's recorder, pairing answers with her
+  oldest unanswered examine, in step. An item is examined again when its
+  name changes (identification, a new "+N"), after a relog (new tags) or,
+  with no answer, up to three times five minutes apart; a name that is not
+  authored (most likely her own rename, which examine never shows) gets
+  one try. Lights are not examined. An untitled ring's, amulet's or
+  trinket's description is in its name, which examine does not repeat, so
+  it is read from the name.
 - **Shadow logging.** Every 30 seconds at most, on the same quiet tick, she
   compares, per gear family, what the current score (`gear_score` plus the
   archetype's base score, as the equip loop ranks) and the effective-stats
@@ -1694,7 +1704,11 @@ What was built:
   examine score's weights on the effective values (protections at 8 a
   percent) and the caster weights when she scores as a caster; F4 settles
   the weights, including recent damage taken, after the owner reviews the
-  log.
+  log. The comparison does not apply the equip loop's per-task rules: it
+  compares launchers even when the farm never readies one
+  (`allow_launchers`), and it does not skip items the loop already tried
+  once (`_upgrade_attempts`). Girdles and lights are shown but not
+  compared, since the loop never chooses them by score.
 - **The Equipment tab** lists each gear family she carries: what she wears
   and the best identified, uncursed candidate she could wear, each with
   both scores, its effective stats and notes, the per-stat deltas, and
