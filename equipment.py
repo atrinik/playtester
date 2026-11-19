@@ -42,7 +42,7 @@ except ModuleNotFoundError:
     from world_content_audit import load_archetypes
 
 from . import constants as c
-from .model import CHAT_MESSAGE_TYPES, PLAYER_NAME_LINK, Item
+from .model import Item
 from .observations import authored_item_name
 
 log = logging.getLogger(__name__)
@@ -623,10 +623,12 @@ class GearExaminer:
     wand rule). It waits for each answer, or gives up after
     ``ANSWER_TIMEOUT`` seconds, before the next one, and leaves at least
     ``SPACING`` seconds between examines; it never starts while a recall
-    wand or mana crystal examine waits for its answer. The observation
-    recorder pairs each answer with her oldest unanswered examine, so one
-    at a time keeps both readers in step. Results live in the item's
-    extras, which a relog replaces: each new tag is examined again.
+    wand or mana crystal examine waits for its answer, and those wait for
+    its. Each reader reads only the lines after its own examine was sent.
+    The walk out of a farm may abandon a waiting examine (``abandon``);
+    nothing is then sent for ``ANSWER_TIMEOUT + SPACING`` seconds. Results
+    live in the item's extras, which a relog replaces: each new tag is
+    examined again.
     """
 
     ANSWER_TIMEOUT = 5.0
@@ -645,11 +647,9 @@ class GearExaminer:
         self.shadow_signature: tuple = ()
         self.shadow_log: list[dict[str, Any]] = []
         self.policy: Any = None
-        # An abandoned examine whose answer may still come: (name, message
-        # position, sent at).
-        self.late: tuple[str, int, float] | None = None
-        # The message position of the last late answer consumed.
-        self.consumed_through = -1
+        # After an abandon, nothing is sent before this (clock time), so the
+        # abandoned examine's late answer comes before any new one is asked.
+        self.paused_until = float("-inf")
         self.old_score: Callable[[Item], int] | None = None
 
     @staticmethod
@@ -675,17 +675,12 @@ class GearExaminer:
         tag, name, start, sent_at = self.pending
         item = client.state.items.get(tag)
         prefix = f"That is {name}"
-        position = max(start, client.state.message_offset)
-        # Every line, chat too, so each keeps its position; only server
-        # game lines without a player's name link can answer.
-        for offset, entry in enumerate(client.state.messages_since(start, chat=True)):
-            if (len(entry) < 4 or entry[1] != c.CHAT_TYPE_GAME or
-                    entry[1] in CHAT_MESSAGE_TYPES or PLAYER_NAME_LINK in str(entry[3])):
+        # Only lines after this examine was sent; only server game lines,
+        # never one with a player's name link (messages_since drops those).
+        for entry in client.state.messages_since(start):
+            if len(entry) < 4 or entry[1] != c.CHAT_TYPE_GAME:
                 continue
             text = str(entry[3]).strip()
-            if (position + offset <= self.consumed_through or
-                    self._late_answer(text, position + offset)):
-                continue
             if not _answers(text, name):
                 continue
             text = re.sub(r"^That is an? ", "That is ", text)
@@ -717,28 +712,18 @@ class GearExaminer:
 
     def abandon(self, client: Any) -> None:
         """Give up the pending examine at once, without counting an attempt,
-        so a recall wand examine need not wait for it. Its late answer is
-        consumed, never read as a later examine's."""
+        so a recall wand examine need not wait for it.
+
+        Nothing more is sent for ``ANSWER_TIMEOUT + SPACING`` seconds: the
+        abandoned answer, if it still comes, arrives before any new examine
+        is asked, and no reader takes it (nothing is pending for it).
+        """
         if self.pending is None or self.read_answer(client):
             return
-        tag, name, start, sent_at = self.pending
-        self.late = (name, start, sent_at)
+        name = self.pending[1]
         self.pending = None
+        self.paused_until = self.clock() + self.ANSWER_TIMEOUT + self.SPACING
         log.info("gear examine of %s abandoned for a recall wand examine", name)
-
-    def _late_answer(self, text: str, position: int) -> bool:
-        """Whether a line is the abandoned examine's late answer (consumed)."""
-        if self.late is None:
-            return False
-        name, start, sent_at = self.late
-        if self.clock() - sent_at > self.ANSWER_TIMEOUT:
-            self.late = None
-            return False
-        if position >= start and _answers(text, name):
-            self.late = None
-            self.consumed_through = position
-            return True
-        return False
 
     async def tick(self, client: Any, policy: Any,
                    old_score: Callable[[Item], int]) -> bool:
@@ -756,6 +741,7 @@ class GearExaminer:
         self.shadow(client)
         examine = getattr(client, "examine", None)
         if (examine is None or now - self.last_sent < self.SPACING or
+                now < self.paused_until or
                 not getattr(client.state, "inventory_replay_complete", True) or
                 self.other_examine_pending(client)):
             return False

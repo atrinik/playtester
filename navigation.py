@@ -7474,8 +7474,9 @@ class FarmCircuitTask(BotTask):
         True while a wand examine waits for its answer
         (FarmTask.check_recall_wand gives it up after 5 s), so she walks out
         only once every wand's charge is known or its examine timed out. A
-        gear examine still waiting is abandoned at once (its late answer is
-        consumed), so the hold is never longer than the wand's own. The farm
+        gear examine still waiting is abandoned at once (GearExaminer.abandon
+        pauses the examiner until its late answer has passed), so the hold
+        is never longer than the wand's own. The farm
         examines on its own quiet ticks, but only on the farm map: live, each
         life brought new tags for her two empty wands (most likely her
         checkpoint relogs), the empty marks were lost with the old tags, and

@@ -1686,17 +1686,25 @@ What was built:
   state flags and description) before the next. The recall wand and mana
   crystal examines in turn wait for a gear examine's answer, and the tick
   that settles it sends no new gear examine, so a waiting crystal or wand
-  goes next. Only one examine is in flight, which keeps F1's recorder,
-  pairing answers with her oldest unanswered examine, in step. The one
+  goes next. So normally only one examine is in flight. The one
   exception: the walk out of a farm, which holds until her wands are
   examined, abandons a waiting gear examine at once rather than wait for
-  it (no attempt is counted, and its late answer is consumed, never read
-  as a later item's); its answer then still comes first, in order. An item is examined again when its
-  name changes (identification, a new "+N"), after a relog (new tags) or,
+  it. No attempt is counted, and the gear examiner then sends nothing for
+  7 seconds (the 5-second answer wait and the 2-second spacing), so the
+  abandoned answer, if it comes, arrives before her next gear examine is
+  asked; nothing reads it, since each reader reads only lines after its own
+  examine. F1's recorder may then pair that answer, if it is later than
+  its 1.5-second window, with the wand's examine action instead. That is
+  benign: the row's name comes from the answer's own line and only the
+  item type is taken from the action, so the gear examine is kept under
+  its authored name, or dropped, and the wand's own answer may go
+  unrecorded. An item is examined again when its name changes (identification, a new "+N"), after a relog (new tags) or,
   with no answer, up to three times five minutes apart; a name that is not
   authored (most likely her own rename, which examine never shows) gets
   one try; the name is also tried without a title ("of Fire") or what
   follows its "+N", since the authored-name index holds no artifact titles.
+  That leniency also lets a rename ending " of <anything>" after an
+  authored name ("sword of Bob") have its three tries.
   An item name longer than the protocol's 127 bytes is truncated in her
   inventory (`socket/item.c:56-70`, `ITEM_NAME_SIZE`), so its examine
   never matches and times out; an untitled ring's or amulet's stats past

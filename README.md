@@ -368,9 +368,13 @@ what she wears and buys.
   recall-wand rule) she examines each identified gear item she carries
   once a session, what she wears first: one at a time, at least 2 seconds
   apart, waiting up to 5 seconds for each. Recall-wand and mana-crystal
-  examines wait for its answer and it for theirs, so only one examine is
-  in flight; only the walk out of a farm, waiting for her wands' charges,
-  abandons a waiting gear examine instead. Examine shows the base stats
+  examines wait for its answer and it for theirs, so normally only one
+  examine is in flight. The walk out of a farm, waiting for her wands'
+  charges, abandons a waiting gear examine instead; the gear examiner then
+  pauses for 7 seconds, so its late answer, read by nothing, comes before
+  her next gear examine is asked. The observation ledger may then pair that late
+  answer with the wand's examine; the row still carries the item's name
+  from its own line, and the wand's answer may go unrecorded. Examine shows the base stats
   without the "+N"; until an item is examined its archetype's base stats
   are used.
 - **Shadow logging.** At most every 30 seconds she compares, per gear

@@ -21737,41 +21737,63 @@ class EquipmentTests(unittest.TestCase):
 
     def test_the_walk_out_abandons_a_gear_examine_for_a_wand(self):
         # The walk out holds for her wands' charges; a gear examine still
-        # waiting is given up at once, not waited for.
+        # waiting is given up at once, not waited for, and the examiner then
+        # pauses so that its late answer comes before anything is asked again.
         from types import SimpleNamespace
         from .equipment import GearExaminer
         from .navigation import FarmCircuitTask
-        client = self.section_two_client()
-        client.decision_history = []
-        now = [100.0]
-        examiner = client.gear_examiner = GearExaminer(clock=lambda: now[0])
-        examiner.pending = (15, "silk cape +2", client.state.message_count, now[0])
-        sent = []
+        from .tasks import InventoryPolicy, carried_gear_score
+        policy = InventoryPolicy()
+        for late in (True, False):
+            with self.subTest(late_answer=late):
+                client = self.section_two_client()
+                client.decision_history = []
+                now = [100.0]
+                examiner = client.gear_examiner = GearExaminer(clock=lambda: now[0])
+                score = carried_gear_score(client, policy)
+                for item in client.state.inventory:
+                    if item.tag != 15:     # only the cape is left to examine
+                        item.extra["gear_examine"] = {"name": item.name, "base": {}}
+                sent = []
 
-        async def examine(tag):
-            sent.append(tag)
+                async def examine(tag):
+                    sent.append(tag)
 
-        client.examine = examine
-        client.state.place_item(Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
-                                     name="pine wand of word of recall (lvl 17)"), 1)
-        farm = FarmTask(zone="/test")
-        holding = asyncio.run(FarmCircuitTask._await_recall_wand_charges(
-            SimpleNamespace(), client, farm))
-        self.assertTrue(holding)
-        self.assertEqual(sent, [77])
-        self.assertIsNone(examiner.pending)
-        cape = client.state.items[15]
-        self.assertNotIn("gear_examine_attempts", cape.extra)
-        # The cape is asked again; the abandoned examine's late answer comes
-        # first and is consumed, never read as the new one's.
-        examiner.pending = (15, "silk cape +2", client.state.message_count, now[0])
-        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff", "That is silk cape +2 (ac+9)")
-        self.assertFalse(examiner.read_answer(client))
-        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
-                                 "That is silk cape +2 (Protections: impact +3%)")
-        self.assertTrue(examiner.read_answer(client))
-        self.assertEqual(cape.extra["gear_examine"]["base"]["ac"], 0)
-        self.assertIsNone(examiner.late)
+                client.examine = examine
+                asyncio.run(examiner.tick(client, policy, score))
+                self.assertEqual(sent, [15])
+                client.state.place_item(Item(
+                    77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    name="pine wand of word of recall (lvl 17)"), 1)
+                farm = FarmTask(zone="/test")
+                self.assertTrue(asyncio.run(FarmCircuitTask._await_recall_wand_charges(
+                    SimpleNamespace(), client, farm)))
+                self.assertEqual(sent, [15, 77])
+                self.assertIsNone(examiner.pending)
+                cape = client.state.items[15]
+                self.assertNotIn("gear_examine_attempts", cape.extra)
+                if late:
+                    # Its answer still comes; nothing is pending for it.
+                    client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                             "That is silk cape +2 (ac+9)")
+                client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                         "It has 4 charges left.")
+                farm._wand_examine = None
+                # Paused: nothing is asked again within ANSWER_TIMEOUT + SPACING.
+                now[0] += GearExaminer.ANSWER_TIMEOUT + GearExaminer.SPACING - 0.5
+                asyncio.run(examiner.tick(client, policy, score))
+                self.assertEqual(sent, [15, 77])
+                self.assertNotIn("gear_examine", cape.extra)
+                now[0] += 1
+                asyncio.run(examiner.tick(client, policy, score))
+                self.assertEqual(sent, [15, 77, 15])
+                client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                         "That is silk cape +2 (Protections: impact +3%)")
+                self.assertTrue(examiner.read_answer(client))
+                self.assertEqual((cape.extra["gear_examine"]["base"]["ac"],
+                                  cape.extra["gear_examine"]["base"]["protections"]),
+                                 (0, (("impact", 3),)))
+                self.assertNotIn("gear_examine_attempts", cape.extra)
 
     def test_a_crystal_examine_goes_next_once_a_gear_examine_settles(self):
         from .equipment import GearExaminer
