@@ -1476,18 +1476,22 @@ is set. Notes against the text above:
   reaches the walks a task starts later, as `MorgeeanShipKeyTask` does.
 - **The care crossing** (`require_care`) is decided before the first step,
   in `NavigateTask.tick`. She waits for full HP and SP and a ready recall
-  only at a safe place: no hostile contact for 10 s, no creature that is not
-  authored peaceful within 8 tiles, and either her savebed or a map without
-  hostile spawns. Off her savebed on a map with hostile spawns she first
+  only at a safe place: no creature that is not authored peaceful within 8
+  tiles, and either her savebed or a map without hostile spawns. Combat text
+  is not read for this: damage over time ("poison hit you", a damaging
+  disease symptom) reads like a hit, and would keep a poisoned or diseased
+  character from ever being safe. A fight, or an attacker she cannot see,
+  holds the trip in its defence instead. Off her savebed on a map with hostile spawns she first
   walks to her savebed by a route that crosses no block
   (`essential-care-staging`), whatever else makes the place unsafe; with no
   such walk, or no savebed known, she waits where she stands. Resting at a
   safe place, HP or SP that has not risen above its peak for 60 s counts as
   full (`CARE_PLATEAU_SECONDS`), so a disease or poison that keeps it below
-  the maximum cannot hold her forever; the override then says so. Hostile
-  contact since the peak, or a gap of more than 5 s between care checks
-  (a fight holds the trip and skips them), starts the plateau afresh, so a
-  fight's damage and the regeneration after it never count as one. The wait
+  the maximum cannot hold her forever; the override then says so. A
+  hostile in view at a check, or a gap of more than 5 s between care checks
+  (a fight holds the trip in its defence, which skips them), starts the
+  plateau afresh, so a fight's damage and the regeneration after it never
+  count as one. Damage over time does not. The wait
   pauses no safety: whatever keeps her alive on a trip runs as it does on
   any other, such as healing, eating, the low-health retreat and defence
   (`NavigateThenTask`), the recovery phase's emergency recall, Stop and the

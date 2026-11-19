@@ -1893,9 +1893,8 @@ ESSENTIAL_TRIPS = frozenset({"food", "cure", "depletion", "savebed", "funding",
 CARE_WAIT_SECONDS = 600.0
 CARE_OWNER_BLOCK = "owner-block"
 CARE_BOUNDED = "bounded"
-# A safe place to wait (NavigateTask._care_place): no hostile contact for
-# this long, and no creature that is not authored peaceful this close.
-CARE_CONTACT_SECONDS = 10.0
+# A safe place to wait (NavigateTask._care_place): no creature that is not
+# authored peaceful this close.
 CARE_SAFE_RADIUS = 8
 # Within this many tiles of her savebed she waits there.
 CARE_HOME_TOLERANCE = 2
@@ -1911,24 +1910,6 @@ CARE_PLATEAU_GAP_SECONDS = 5.0
 # A new trip's owner-block wait for the same subjects keeps the start of one
 # left within this long (autoplay's handover rebuilds trips).
 CARE_WAIT_RESUME_SECONDS = 300.0
-
-
-# How far back the care rule looks for hostile contact (seconds).
-CARE_CONTACT_LOOKBACK_SECONDS = 3600.0
-
-
-def _last_hostile_contact_at(client: AtrinikClient) -> float:
-    """When combat text last showed an enemy acting on her (wall clock), as
-    recent_hostile_contact reads it; 0.0 if not within the lookback."""
-    cutoff = time.time() - CARE_CONTACT_LOOKBACK_SECONDS
-    for timestamp, _, _, raw in reversed(getattr(client.state, "messages", ())):
-        if timestamp < cutoff:
-            break
-        text = raw.casefold()
-        if (" hit you" in text or " misses you" in text or
-                text.startswith(("you block ", "you dodge ", "you parry "))):
-            return float(timestamp)
-    return 0.0
 
 
 class OwnerBlockRefusal(Exception):
@@ -1970,8 +1951,8 @@ class CareCrossing:
     # food trip.
     key: tuple[str, ...] = ()
     food: bool = False
-    # Per vital ("hp", "sp"): the highest value seen resting, since when
-    # (care clock) and its wall-clock time; and the last care check.
+    # Per vital ("hp", "sp"): the highest value seen resting and since when;
+    # and the last care check.
     peaks: dict = field(default_factory=dict)
     plateaued: bool = False
     checked_at: float = 0.0
@@ -2416,12 +2397,15 @@ class NavigateTask(BotTask):
     def _care_place(self, client: AtrinikClient) -> str:
         """Why where she stands is no place to wait for care, or "".
 
-        Safe is: no hostile contact for CARE_CONTACT_SECONDS, no creature
-        that is not authored peaceful within CARE_SAFE_RADIUS, and either
-        her savebed or a map without hostile spawns (a town, a building).
+        Safe is: no creature that is not authored peaceful within
+        CARE_SAFE_RADIUS, and either her savebed or a map without hostile
+        spawns (a town, a building). Combat text is not read: damage over
+        time ("poison hit you", a disease symptom) reads like a hit, so a
+        poisoned or diseased character would never be safe. A fight holds
+        the trip in its defence, which skips the care checks, and an attack
+        she cannot see holds it too (the unseen-attacker retreat), so that
+        gap restarts the plateau (_care_missing).
         """
-        if recent_hostile_contact(client, CARE_CONTACT_SECONDS):
-            return "hostile contact"
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
         node = self.graph.nodes.get(m.path)
@@ -2456,19 +2440,17 @@ class NavigateTask(BotTask):
 
     @staticmethod
     def _vital_full(care: "CareCrossing", key: str, value: int, maximum: int,
-                    now: float, resting: bool, contact_at: float = 0.0) -> bool:
+                    now: float, resting: bool) -> bool:
         """At its maximum, or, resting at a safe place, not risen above its
         peak for CARE_PLATEAU_SECONDS: a disease or poison that keeps it
         below the maximum must not hold her forever (the plateau counts as
-        full). Hostile contact since the peak (``contact_at``, wall clock)
-        starts it afresh: a fight's damage is no plateau, and neither is
-        the regeneration after it."""
+        full). Not resting (a hostile in view, on the walk home) starts it
+        afresh, and so does a gap between checks (_care_missing)."""
         if maximum > 0 and value >= maximum:
             return True
         best = care.peaks.get(key)
-        if (not resting or best is None or value > best[0] or
-                contact_at > best[2]):
-            care.peaks[key] = (value, now, time.time())
+        if not resting or best is None or value > best[0]:
+            care.peaks[key] = (value, now)
             return False
         if now - best[1] >= CARE_PLATEAU_SECONDS:
             care.plateaued = True
@@ -2491,10 +2473,9 @@ class NavigateTask(BotTask):
             if care.checked_at and now - care.checked_at > CARE_PLATEAU_GAP_SECONDS:
                 care.peaks.clear()
             care.checked_at = now
-            contact = _last_hostile_contact_at(client)
-            if maxhp <= 0 or not self._vital_full(care, "hp", hp, maxhp, now, resting, contact):
+            if maxhp <= 0 or not self._vital_full(care, "hp", hp, maxhp, now, resting):
                 missing.append("full HP")
-            if maxsp > 0 and not self._vital_full(care, "sp", sp, maxsp, now, resting, contact):
+            if maxsp > 0 and not self._vital_full(care, "sp", sp, maxsp, now, resting):
                 missing.append("full SP")
         if not care_recall_ready(client, starving=care.starving):
             missing.append("a ready recall")

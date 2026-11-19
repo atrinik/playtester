@@ -614,7 +614,7 @@ cure, the depletion service, a savebed move, a trip that funds one of them,
 and the recovery phase's recall shopping and walk home) crosses a block, and
 only when every route does; a block never sends a trip through a hazard
 the planner otherwise avoids. It waits at a safe place (her savebed, or a
-map without hostile spawns, with no hostile in view or contact; on a map
+map without hostile spawns, with no hostile in view; on a map
 with hostile spawns she walks to her savebed first) for full HP and SP, or
 HP and SP that have stopped rising for a minute, and a ready recall when she
 owns one, then holds fire until the block is behind her. That wait has no

@@ -25371,7 +25371,7 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.walking(task))
         self.assertEqual(task.destination, "/home")
         self.assertEqual(self.client.actions(), ["essential-care-staging"])
-        self.assertIn("a safe place (hostile contact)", task.care.missing)
+        self.assertIn("a safe place (a hostile in view)", task.care.missing)
 
     async def test_hunger_ends_the_walk_home_too(self):
         self.graph = blocks_graph(detour=False)
@@ -25426,34 +25426,81 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.rest(task, now, CARE_PLATEAU_SECONDS))
         self.assertTrue(await self.rest(task, now, 5))
 
-    async def test_a_fight_during_the_wait_is_no_plateau(self):
-        from .navigation import CARE_PLATEAU_SECONDS
-
+    async def plateau_trip(self, hp, now):
         self.graph = blocks_graph(detour=False)
         self.block("/blocked")
-        self.client.state.stats.update(hp=98)
-        now = [100.0]
+        self.client.state.stats.update(hp=hp)
         task = self.trip("cure")
         self.assertFalse(await self.walking(task))
         task.care.clock = lambda: now[0]
         task.care.peaks.clear()
         task.care.checked_at = 0.0
         self.assertFalse(await self.walking(task))
+        return task
+
+    async def test_a_fight_during_the_wait_is_no_plateau(self):
+        from .navigation import CARE_PLATEAU_SECONDS
+
+        now = [100.0]
+        task = await self.plateau_trip(98, now)
         # A cornered fight holds the trip (the defence skips the care check)
-        # for 50 s; she ends it at half health and regenerates.
-        self.client.state.add_message(0, "ffffff", "The rat hit you for 40 damage.")
+        # for 61 s; she ends it at 73 HP and regenerates.
         now[0] += 61
         self.client.state.stats.update(hp=73)
         self.assertFalse(await self.walking(task))
         self.assertIn("full HP", task.care.missing)
-        # Contact older than the place rule's 10 s still restarts it.
-        self.client.state.messages[-1] = (time.time() - 30,) + tuple(
-            self.client.state.messages[-1][1:])
-        task.care.peaks["hp"] = (73, now[0] - 120, time.time() - 120)
-        self.assertFalse(await self.walking(task))
         # Only a new plateau, a minute without a rise, counts as full.
         self.assertFalse(await self.rest(task, now, CARE_PLATEAU_SECONDS - 5))
         self.assertTrue(await self.rest(task, now, 5))
+
+    async def test_damage_over_time_text_does_not_stop_the_plateau(self):
+        from .navigation import CARE_PLATEAU_SECONDS
+
+        now = [100.0]
+        task = await self.plateau_trip(90, now)
+        hp = 90
+        for _ in range(int(CARE_PLATEAU_SECONDS // 5) - 1):
+            # Poison pulses and disease symptoms read like hits.
+            hp -= 1
+            self.client.state.stats.update(hp=hp)
+            self.client.state.add_message(0, "ffffff",
+                                          "poison hit you for 1 (1) poison damage.")
+            self.client.state.add_message(0, "ffffff", "Fever hit you for 1 damage.")
+            self.assertFalse(await self.rest(task, now, 5))
+            self.assertEqual(task.care.missing, ("full HP",))
+        self.assertTrue(await self.rest(task, now, 5))
+        self.assertIn("no longer rising", self.client.decision_history[-1]["detail"])
+
+    async def test_a_hostile_in_view_restarts_the_plateau(self):
+        from .navigation import CARE_PLATEAU_SECONDS
+
+        now = [100.0]
+        task = await self.plateau_trip(90, now)
+        self.assertFalse(await self.rest(task, now, CARE_PLATEAU_SECONDS - 10))
+        tile = self.client.state.map.tile(8, 8)
+        tile.objects[3] = MapObject(3, 1, 0, 0, name="kobold", target_id=99)
+        self.assertFalse(await self.rest(task, now, 5))
+        self.assertIn("a safe place (a hostile in view)", task.care.missing)
+        tile.objects.clear()
+        self.assertFalse(await self.rest(task, now, CARE_PLATEAU_SECONDS - 5))
+        self.assertTrue(await self.rest(task, now, 5))
+
+    def test_a_cache_retry_behind_the_walls_comes_before_crossing(self):
+        self.block("/blocked")
+        calls = []
+        original = self.graph.route_points
+
+        def flaky(*args, **kwargs):
+            calls.append(bool(kwargs.get("walls")))
+            if len(calls) == 1:
+                raise ValueError("stale component cache")
+            return original(*args, **kwargs)
+
+        self.graph.route_points = flaky
+        task = self.trip("cure")
+        self.assertEqual(self.maps(task._plan(self.client)), ["/detour_1", "/detour_2", "/goal"])
+        self.assertIsNone(task.care)
+        self.assertEqual(calls, [True, True])
 
     async def test_a_block_never_relaxes_a_hazard_tier_but_soft_retries_come_first(self):
         tunnel = "/shattered_islands/world_1_1_-1"
