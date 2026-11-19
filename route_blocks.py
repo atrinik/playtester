@@ -37,12 +37,14 @@ MAX_BLOCK_SECONDS = 7 * 24 * 3600
 NOTE_LIMIT = 200
 SUBJECT_LIMIT = 512
 # The planner's cache of her blocks is re-read this often (seconds); a
-# dashboard write refreshes it at once.
+# dashboard write refreshes it at once. After a failed read it is retried
+# this soon instead.
 REFRESH_SECONDS = 60.0
+RETRY_SECONDS = 5.0
 # The longest a read or write waits for a locked database (seconds): the
 # planner never stalls a tick on it, and the dashboard answers promptly.
 READ_TIMEOUT = 0.25
-WRITE_TIMEOUT = 2.0
+WRITE_TIMEOUT = 0.25
 
 MAP, EXIT, SEAM = "map", "exit", "seam"
 _EXIT = re.compile(r"exit:(?P<source>/[^>]*):(?P<x>-?\d+),(?P<y>-?\d+)>(?P<destination>/.+)")
@@ -157,7 +159,8 @@ def walls_for(subjects: Iterable[str]) -> OwnerWalls:
 
 
 class _Cache:
-    __slots__ = ("character", "rows", "loaded_at", "walls_key", "walls", "warned")
+    __slots__ = ("character", "rows", "loaded_at", "walls_key", "walls", "warned",
+                 "failed")
 
     def __init__(self, character: str):
         self.character = character
@@ -166,6 +169,8 @@ class _Cache:
         self.walls_key: tuple[str, ...] | None = None
         self.walls = NO_WALLS
         self.warned = False
+        # The last read failed: retry after RETRY_SECONDS.
+        self.failed = False
 
 
 def _character(client: Any) -> str:
@@ -189,17 +194,21 @@ def _cache(client: Any) -> _Cache | None:
 
 def _refresh(client: Any, cache: _Cache, *, force: bool = False) -> None:
     now = time.monotonic()
-    if not force and now - cache.loaded_at < REFRESH_SECONDS:
+    interval = RETRY_SECONDS if cache.failed else REFRESH_SECONDS
+    if not force and now - cache.loaded_at < interval:
         return
     cache.loaded_at = now
     try:
         cache.rows = client._memory_store().route_blocks(
             cache.character, now=time.time(), timeout=READ_TIMEOUT)
-        cache.warned = False
+        cache.warned = cache.failed = False
     except (OSError, sqlite3.Error) as exc:
-        # Keep the last rows read: a busy database never lifts a block.
+        # Keep the last rows read: a busy database never lifts a block. A
+        # failed read, the first one included, is retried within seconds.
+        cache.failed = True
         if not cache.warned:
-            log.warning("could not read her route blocks: %s", exc)
+            log.warning("could not read her route blocks (retrying every %.0f s): %s",
+                        RETRY_SECONDS, exc)
             cache.warned = True
 
 

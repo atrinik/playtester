@@ -668,8 +668,8 @@ function renderBlocks() {
     const row = document.createElement("div");
     row.className = "quest";
     row.append(blockText("strong", `${c.trip || "trip"} to ${c.destination}`));
-    const state = c.cleared ? (c.starving ? "crossing starving" : "crossing") : c.staging ? "walking to her savebed" : "waiting";
-    row.append(blockText("span", state, c.cleared ? (c.starving ? "flag bad" : "flag warn") : c.alerted ? "flag bad" : "flag"));
+    const state = c.cleared ? (c.starving ? "crossing starving" : c.food ? "crossing hungry" : "crossing") : c.staging ? "walking to her savebed" : "waiting";
+    row.append(blockText("span", state, c.cleared ? (c.food ? "flag bad" : "flag warn") : c.alerted ? "flag bad" : "flag"));
     row.append(blockText("small", `${c.subjects.join(", ")} · ${c.mode} · waited ${blockSpan(c.waiting_seconds)}${c.missing.length && !c.cleared ? ` · needs ${c.missing.join(", ")}` : ""}`));
     care.push(row);
   }

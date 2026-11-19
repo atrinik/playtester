@@ -71,6 +71,14 @@ And a fourth round:
 - **Probe limits confirmed:** at most 3 probes a day, and a 300 s ceiling
   (a sixth of a death) for a low-danger approach (4.6).
 
+And a fifth (2026-11-18):
+
+- **Hungry food trips too.** Any food trip that must cross an owner block,
+  hungry or starving, needs only a ready recall, if she owns one, plus
+  hold-fire. Waiting to regenerate burns food, so the wait itself would
+  starve her. A hungry crossing is recorded as `essential-care-food` and
+  alerted like the starving one (4.5).
+
 This document first records what the navigator does today, then the gaps
 against that model, then the design and a plan of small pull requests.
 
@@ -951,11 +959,13 @@ can stop a trip (owner decision). Farm trips use selection instead (below).
     only route crosses an owner block waits for care with no time limit.
     After `CARE_WAIT_SECONDS` it raises a dashboard alert and keeps
     waiting.
-  - **Starvation.** A food trip while starving cannot wait for full HP and
+  - **Food trips.** A food trip while starving cannot wait for full HP and
     SP, because she may not regenerate. Its care condition is a ready recall
     when she owns one, plus hold-fire, including when it crosses an owner
-    block. This is the one exception; it records `essential-care-starving`
-    and is alerted on the dashboard (owner-approved).
+    block. It records `essential-care-starving` and is alerted on the
+    dashboard (owner-approved). The owner extended this to hungry food
+    trips (2026-11-18): regenerating burns food, so waiting would starve
+    her. A hungry crossing records `essential-care-food`, alerted alike.
 
 **Farm selection: value minus danger.** A per-spot budget fails at the
 edges: it divides by zero when a rate is 0, goes negative when rankings mix
@@ -1422,8 +1432,11 @@ is set. Notes against the text above:
   character) namespace. Expired rows are deleted on the next read rather
   than by a timer; a block stops counting at its expiry whether or not its
   row is gone. The planner reads blocks through a per-client cache,
-  refreshed every 60 s and at once after a dashboard write. A busy database
-  keeps the last blocks read: it never lifts one.
+  refreshed every 60 s and at once after a dashboard write. A failed read
+  keeps the last blocks read (a busy database never lifts one) and is
+  retried every 5 s until one succeeds. Before the first successful read
+  the planner knows no blocks; that gap lasts until the retry. Writes wait
+  at most 0.25 s for the database and answer 503 when it is busy.
 - **Writes** go through `POST /api/route-blocks` (`add` with a subject, whole
   seconds from 3,600 to 604,800 and an optional note; `remove` with a
   subject). Besides the loopback listener, the `Host` check and the `Origin`
@@ -1432,15 +1445,20 @@ is set. Notes against the text above:
   no approval key: 4.7 asks for the existing control endpoints' protections,
   and LEARNING 4.10.5's approval key belongs to feedback filing. Each write
   is a `route-block` or `route-unblock` decision.
-- **Walls.** `NavigateTask._plan` passes the walls to every tier, strict and
-  fallback alike, as `route_points(walls=...)`: a blocked map is never
-  entered except as the destination, and a blocked exit or seam is never
-  taken. When no route avoids them, an essential trip takes the route
-  planned without them, which may cross more than one block; choosing the
-  route that crosses the fewest waits for P6's costs. Any other trip fails
-  with `owner block: every route to ... crosses ...`. The level-18 farm
-  return fallback (1.7) does not retry such a failure, and an analyzer spot
-  behind a block is quarantined as unreachable, as before.
+- **Walls.** `NavigateTask._route_points` applies the walls tier by tier,
+  strict and fallback alike, as `route_points(walls=...)`: a blocked map is
+  never entered except as the destination, and a blocked exit or seam is
+  never taken. A block never relaxes a hazard tier. When a tier finds no
+  route behind the walls, the same tier is tried without them; if that
+  succeeds, the block is the only obstacle. An essential trip then takes
+  that route with care. Any other trip fails with
+  `owner block: every route to ... crosses ...`, which no tier catches, so
+  it is never sent through a relaxed hazard instead. Only a tier that fails
+  without the walls too relaxes, as before. The route taken may cross more
+  than one block; choosing the one that crosses the fewest waits for P6's
+  costs. The level-18 farm return fallback (1.7) does not retry a block
+  failure, and an analyzer spot behind a block is quarantined as
+  unreachable, as before.
 - **Estimates ignore blocks.** The map-level `route()`, the savebed search
   and shortlist, `town_safely_reachable`, #94's reachability verdicts and
   the quest catalog's direct `route_points` call do not read blocks. So a
@@ -1458,9 +1476,13 @@ is set. Notes against the text above:
   in `NavigateTask.tick`. She waits for full HP and SP and a ready recall
   only at a safe place: no hostile contact for 10 s, no creature that is not
   authored peaceful within 8 tiles, and either her savebed or a map without
-  hostile spawns. On a map with hostile spawns she first walks to her
-  savebed by a route that crosses no block (`essential-care-staging`); with
-  no such walk, or no savebed known, she waits where she stands. The wait
+  hostile spawns. Off her savebed on a map with hostile spawns she first
+  walks to her savebed by a route that crosses no block
+  (`essential-care-staging`), whatever else makes the place unsafe; with no
+  such walk, or no savebed known, she waits where she stands. Resting at a
+  safe place, HP or SP that has not risen for 60 s counts as full
+  (`CARE_PLATEAU_SECONDS`), so a disease or poison that keeps it below the
+  maximum cannot hold her forever; the override then says so. The wait
   pauses no safety: whatever keeps her alive on a trip runs as it does on
   any other, such as healing, eating, the low-health retreat and defence
   (`NavigateThenTask`), the recovery phase's emergency recall, Stop and the
@@ -1476,20 +1498,28 @@ is set. Notes against the text above:
   which replaces the stuck alert while it lasts. `CARE_BOUNDED`, for P6's
   budget and strict overrides, goes after 600 s and records
   `essential-care-timeout`; nothing uses it yet. A removed or expired block
-  ends the wait at once. A trip other than a food trip does not wait while
-  she is hungry: it fails (`essential-care-yield`), and the food trip goes
-  first; regenerating to full burns food (`player_do_some_living`), so
-  waiting could otherwise starve her.
-- **Starving.** A food trip while starving (`starving_without_food`) needs
-  only a ready recall, without the safe place, and holds fire. A recall spell
-  she lacks the SP for does not count as owned then: at food 0 the server
-  regenerates no SP, so she could never ready it. The crossing records
-  `essential-care-starving`, alerted critically while it lasts and as a
-  warning for an hour after.
+  ends the wait at once. A trip other than a food trip does not wait, or
+  walk home to wait, while she is hungry: it fails
+  (`essential-care-yield`), and the food trip goes first; regenerating to
+  full burns food (`player_do_some_living`), so waiting could otherwise
+  starve her. Autoplay's handover can rebuild a trip: a new owner-block
+  wait for the same blocked subjects, within 300 s of the last one's tick,
+  keeps its start (`CARE_WAIT_RESUME_SECONDS`), so the alert is not
+  postponed. A crossing that clears forgets it.
+- **Food trips.** A food trip, hungry or starving (owner decisions of
+  2026-11-15 and 2026-11-18), needs only a ready recall, without the safe
+  place or a walk home, and holds fire. While she is starving
+  (`starving_without_food`) a recall spell she lacks the SP for does not
+  count as owned: at food 0 the server regenerates no SP, so she could
+  never ready it. The crossing records `essential-care-starving` or, hungry,
+  `essential-care-food`, alerted critically while it lasts and as a warning
+  for an hour after.
 - **Crossing.** The crossing records `essential-route-override`. Once under
   way she does not wait again on later replans. `NavigateThenTask` holds
-  fire on every map, the destination included, until no block is left
-  ahead; the cornered last resort still fights back.
+  fire on every map, the destination included, while a crossed block is
+  underfoot or still on her route. Each tick checks the remaining route, so
+  hold-fire ends once she has crossed, without a replan. The cornered last
+  resort still fights back.
 - **Dashboard.** `/api/state` has a `route_blocks` field: the active blocks,
   the care crossings under way and the last 25 care decisions. The Tasks
   tab's **Owner blocks** section has the form (subject, 1 h to 7 d, note),

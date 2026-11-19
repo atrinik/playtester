@@ -1902,6 +1902,30 @@ CARE_HOME_TOLERANCE = 2
 # After a failed walk to her savebed, she waits where she stands this long
 # before trying again.
 CARE_STAGING_RETRY_SECONDS = 120.0
+# Resting at a safe place, HP or SP that has not risen for this long counts
+# as full: a disease or poison may keep it below the maximum.
+CARE_PLATEAU_SECONDS = 60.0
+# A new trip's owner-block wait for the same subjects keeps the start of one
+# left within this long (autoplay's handover rebuilds trips).
+CARE_WAIT_RESUME_SECONDS = 300.0
+
+
+class OwnerBlockRefusal(Exception):
+    """An optional trip's only route crosses an owner block. Not a
+    ValueError, so no hazard tier catches it and relaxes (NavigateTask._plan
+    turns it into one)."""
+
+
+def _care_waits(client: AtrinikClient) -> dict[tuple[str, ...], tuple[float, float]]:
+    """Owner-block care waits by subjects: (start, last seen), per client."""
+    waits = getattr(client, "_care_waits", None)
+    if not isinstance(waits, dict):
+        waits = {}
+        try:
+            client._care_waits = waits
+        except AttributeError:
+            pass
+    return waits
 
 
 @dataclass(slots=True)
@@ -1920,6 +1944,12 @@ class CareCrossing:
     alerted: bool = False
     holding: bool = False
     missing: tuple[str, ...] = ()
+    # The subjects key of _care_waits, and whether this is a food trip.
+    key: tuple[str, ...] = ()
+    food: bool = False
+    # Per vital ("hp", "sp"): the highest value seen resting and since when.
+    peaks: dict = field(default_factory=dict)
+    plateaued: bool = False
 
 
 def care_recall_ready(client: AtrinikClient, *, starving: bool = False) -> bool:
@@ -2074,8 +2104,11 @@ class NavigateTask(BotTask):
             tuple, float, float, float | None] | None = None
         # The kind of essential trip this is (ESSENTIAL_TRIPS), or "".
         self.essential = ""
-        # The owner walls of the plan under way (_plan).
+        # The owner walls of the plan under way (_plan), its client, and the
+        # blocks its route crosses (_route_points).
         self._walls: OwnerWalls = NO_WALLS
+        self._plan_client: AtrinikClient | None = None
+        self._crossed: tuple[str, ...] = ()
         # A care crossing (require_care), and while she walks to her
         # savebed to wait for it, the trip's own destination fields.
         self.care: CareCrossing | None = None
@@ -2188,8 +2221,38 @@ class NavigateTask(BotTask):
         return {path for path, until in hazards.items() if until > now}
 
     def _route_points(self, *args, **kwargs) -> list[MapEdge]:
-        """The graph's component route, behind this plan's owner walls."""
-        return self.graph.route_points(*args, walls=self._walls, **kwargs)
+        """One tier's component route, behind this plan's owner walls.
+
+        A block never relaxes a hazard tier: when the tier finds no route
+        behind the walls, the same tier is tried without them. If that
+        succeeds, the block is the only obstacle: an essential trip takes
+        that route and crosses with care (_plan), any other trip is refused
+        with OwnerBlockRefusal, which no tier catches. Only when the tier
+        fails without the walls too does its ValueError reach the tier,
+        which then relaxes as it always did.
+        """
+        walls = self._walls
+        try:
+            route = self.graph.route_points(*args, walls=walls, **kwargs)
+        except ValueError as blocked:
+            if not walls:
+                raise
+            try:
+                route = self.graph.route_points(*args, **kwargs)
+            except ValueError:
+                raise blocked from None
+            crossed = walls.crossings(route, self.destination)
+            if not crossed:
+                raise blocked from None
+            client = self._plan_client
+            if self._care_staging is not None or not self.is_essential(client):
+                raise OwnerBlockRefusal(
+                    f"owner block: every route to {self.destination} crosses "
+                    f"{', '.join(crossed)} ({blocked})") from None
+            self._crossed = crossed
+            return route
+        self._crossed = ()
+        return route
 
     def is_essential(self, client: AtrinikClient) -> bool:
         """Whether this trip is essential now (ROUTING 4.5): a cure, the
@@ -2204,35 +2267,23 @@ class NavigateTask(BotTask):
         """The route from where she stands (or ``origin``), behind the
         owner's blocks, or ValueError.
 
-        Owner blocks (route_blocks) are transit walls for every trip. When
-        every route crosses one, an essential trip (is_essential) takes the
-        route planned without them and crosses with care (require_care); any
+        Owner blocks (route_blocks) are transit walls for every trip, tier
+        by tier (_route_points): a block never makes the planner relax a
+        hazard. When a tier's only route crosses one, an essential trip
+        (is_essential) takes it and crosses with care (require_care); any
         other trip fails with the block as its reason. A walk to a safe
         place for that care never crosses one.
         """
-        walls = route_blocks.owner_walls(client)
-        self._walls = walls
+        self._walls = route_blocks.owner_walls(client)
+        self._plan_client, self._crossed = client, ()
         try:
             route = self._plan_tiers(client, origin=origin)
-        except ValueError as blocked:
-            if not walls:
-                raise
-            self._walls = NO_WALLS
-            try:
-                route = self._plan_tiers(client, origin=origin)
-            except ValueError:
-                raise blocked from None
-            finally:
-                self._walls = walls
-            crossed = walls.crossings(route, self.destination)
-            if not crossed:
-                return route
-            subjects = ", ".join(crossed)
-            if self._care_staging is not None or not self.is_essential(client):
-                raise ValueError(
-                    f"owner block: every route to {self.destination} crosses "
-                    f"{subjects} ({blocked})") from None
-            self.require_care(CARE_OWNER_BLOCK, crossed)
+        except OwnerBlockRefusal as refusal:
+            raise ValueError(str(refusal)) from None
+        finally:
+            self._plan_client = None
+        if self._crossed:
+            self.require_care(CARE_OWNER_BLOCK, self._crossed, client=client)
             return route
         if self.care is not None and self._care_staging is None:
             # A block that expired or was removed, or one already behind
@@ -2244,17 +2295,31 @@ class NavigateTask(BotTask):
         return route
 
     def require_care(self, mode: str, subjects: Sequence[str], *,
-                     clock: Callable[[], float] = time.monotonic) -> "CareCrossing":
+                     clock: Callable[[], float] = time.monotonic,
+                     client: AtrinikClient | None = None) -> "CareCrossing":
         """Cross only with care (ROUTING 4.5): before the first step she
         waits, at a safe place, for full HP and SP and a ready recall when
         she owns one, then holds fire in transit. ``mode`` is
         CARE_OWNER_BLOCK (wait without limit, alerting after
         CARE_WAIT_SECONDS) or CARE_BOUNDED (budget and strict-plan
-        overrides: after CARE_WAIT_SECONDS she goes anyway). A starving food
-        trip waits only for the recall."""
+        overrides: after CARE_WAIT_SECONDS she goes anyway). A food trip
+        waits only for the recall.
+
+        An owner-block wait for the same subjects that another trip left
+        within CARE_WAIT_RESUME_SECONDS (autoplay's handover rebuilds trips)
+        keeps its start, so its alert is not postponed (``client`` holds
+        that record)."""
         care = self.care
         if care is None or care.finished:
-            care = self.care = CareCrossing(mode, tuple(subjects), clock(), clock=clock)
+            since = clock()
+            key = tuple(sorted(subjects))
+            if mode == CARE_OWNER_BLOCK and client is not None:
+                waits = _care_waits(client)
+                previous = waits.get(key)
+                if previous is not None and since - previous[1] <= CARE_WAIT_RESUME_SECONDS:
+                    since = previous[0]
+                waits[key] = (since, clock())
+            care = self.care = CareCrossing(mode, tuple(subjects), since, clock=clock, key=key)
         else:
             care.subjects = tuple(dict.fromkeys((*care.subjects, *subjects)))
             if mode == CARE_OWNER_BLOCK:
@@ -2267,6 +2332,36 @@ class NavigateTask(BotTask):
         """Hold fire in transit for a care crossing, waiting or crossing."""
         return self.care is not None and not self.care.finished
 
+    def _care_ahead(self, map_path: str) -> bool:
+        """Whether a blocked subject of the care crossing is where she stands
+        or still on her route."""
+        care = self.care
+        if care is None:
+            return False
+        subjects = set(care.subjects)
+        if route_blocks.map_subject(map_path) in subjects:
+            return True
+        return any(
+            route_blocks.edge_subject(edge) in subjects or
+            (edge.destination != self.destination and
+             route_blocks.map_subject(edge.destination) in subjects)
+            for edge in self.route)
+
+    def care_holds_fire(self, map_path: str) -> bool:
+        """Hold fire for a care crossing on ``map_path``: while waiting, and
+        once crossing until no block it crosses is left, here or ahead. Then
+        the crossing is finished."""
+        care = self.care
+        if care is None or care.finished:
+            return False
+        # An empty route is not yet replanned: nothing is known to be behind her.
+        if (care.cleared and self._care_staging is None and
+                (self.route or map_path == self.destination) and
+                not self._care_ahead(map_path)):
+            care.finished = True
+            return False
+        return True
+
     def care_status(self, now: float | None = None) -> dict | None:
         """The care crossing for the dashboard, or None."""
         care = self.care
@@ -2275,10 +2370,13 @@ class NavigateTask(BotTask):
         now = care.clock() if now is None else now
         return {"mode": care.mode, "subjects": list(care.subjects),
                 "trip": self.essential, "destination": self.destination,
-                "cleared": care.cleared, "starving": care.starving,
+                "cleared": care.cleared, "starving": care.starving, "food": care.food,
                 "waiting_seconds": round(max(0.0, (care.cleared_at or now) - care.since), 1),
                 "alerted": care.alerted, "missing": list(care.missing),
                 "staging": self._care_staging is not None}
+
+    def _hostile_map(self, path: str) -> bool:
+        return any(not spawn.peaceful for spawn in self.graph.named_spawns.get(path, ()))
 
     def _care_place(self, client: AtrinikClient) -> str:
         """Why where she stands is no place to wait for care, or "".
@@ -2304,7 +2402,7 @@ class NavigateTask(BotTask):
                 return "a hostile in view"
         if self._at_savebed(client):
             return ""
-        if any(not spawn.peaceful for spawn in self.graph.named_spawns.get(m.path, ())):
+        if self._hostile_map(m.path):
             return "a map with hostile spawns"
         return ""
 
@@ -2321,23 +2419,44 @@ class NavigateTask(BotTask):
         return home is not None and m.path == home[0] and max(
             abs(m.world_x - home[1][0]), abs(m.world_y - home[1][1])) <= CARE_HOME_TOLERANCE
 
-    def _care_missing(self, client: AtrinikClient, starving: bool) -> list[str]:
-        """What the care rule still waits for."""
+    @staticmethod
+    def _vital_full(care: "CareCrossing", key: str, value: int, maximum: int,
+                    now: float, resting: bool) -> bool:
+        """At its maximum, or, resting at a safe place, not risen for
+        CARE_PLATEAU_SECONDS: a disease or poison that keeps it below the
+        maximum must not hold her forever (the plateau counts as full)."""
+        if maximum > 0 and value >= maximum:
+            return True
+        best = care.peaks.get(key)
+        if not resting or best is None or value > best[0]:
+            care.peaks[key] = (value, now)
+            return False
+        if now - best[1] >= CARE_PLATEAU_SECONDS:
+            care.plateaued = True
+            return True
+        return False
+
+    def _care_missing(self, client: AtrinikClient, lenient: bool) -> list[str]:
+        """What the care rule still waits for. A food trip (``lenient``)
+        waits for the recall only."""
+        care = self.care
+        assert care is not None
         missing = []
-        stats = client.state.stats
-        if not starving:
+        place = "" if lenient else self._care_place(client)
+        if not lenient:
+            stats = client.state.stats
+            now = care.clock()
             hp, maxhp = int(stats.get("hp", 0) or 0), int(stats.get("maxhp", 0) or 0)
             sp, maxsp = int(stats.get("sp", 0) or 0), int(stats.get("maxsp", 0) or 0)
-            if maxhp <= 0 or hp < maxhp:
+            resting = not place and self._care_staging is None
+            if maxhp <= 0 or not self._vital_full(care, "hp", hp, maxhp, now, resting):
                 missing.append("full HP")
-            if maxsp > 0 and sp < maxsp:
+            if maxsp > 0 and not self._vital_full(care, "sp", sp, maxsp, now, resting):
                 missing.append("full SP")
-        if not care_recall_ready(client, starving=starving):
+        if not care_recall_ready(client, starving=care.starving):
             missing.append("a ready recall")
-        if not starving:
-            place = self._care_place(client)
-            if place:
-                missing.append(f"a safe place ({place})")
+        if place:
+            missing.append(f"a safe place ({place})")
         return missing
 
     def _record(self, client: AtrinikClient, action: str, detail: str) -> None:
@@ -2369,6 +2488,8 @@ class NavigateTask(BotTask):
             return False
         self._issued_goal = self._issued_click = None
         self._last_progress = now
+        if self.care is not None:
+            self.care.holding = False
         self._record(client, "essential-care-staging",
                      f"to her savebed {home[0]} to wait for care before crossing "
                      f"{', '.join(self.care.subjects) if self.care else ''}")
@@ -2383,48 +2504,59 @@ class NavigateTask(BotTask):
         self.route = []
         self._issued_goal = self._issued_click = None
         self._last_progress = time.monotonic()
+        if self.care is not None:
+            # The wait at her savebed starts with its own clear.
+            self.care.holding = False
 
     async def _care_hold(self, client: AtrinikClient) -> bool:
         """The care rule before a care crossing: True while she must not
         move on this tick (waiting, or the trip just yielded).
 
-        She waits only at a safe place (_care_place): elsewhere she walks to
-        her savebed first, by a block-free route, and waits where she stands
-        only when there is none. Everything that keeps her alive runs
-        meanwhile, outside this task: healing, eating, the low-health
-        retreat and defence (NavigateThenTask), the emergency recall (the
-        farm circuit and the recovery phase), Stop and the operator hold.
+        She waits only at a safe place (_care_place). On a map with hostile
+        spawns she first walks to her savebed, by a block-free route, and
+        waits where she stands only when there is none. Everything that
+        keeps her alive runs meanwhile, outside this task: healing, eating,
+        the low-health retreat and defence (NavigateThenTask), the
+        emergency recall (the recovery phase), Stop and the operator hold.
         A trip other than a food trip yields to hunger rather than wait
-        while she starves: it fails, and the food trip goes first.
+        while she starves: it fails, and the food trip goes first. A food
+        trip waits only for a ready recall: waiting for full HP and SP
+        burns food (player_do_some_living), so it would starve her.
         """
         care = self.care
         if care is None or care.cleared:
             return False
         now = care.clock()
-        care.starving = self.essential == "food" and starving_without_food(client)
+        if care.key in _care_waits(client):
+            _care_waits(client)[care.key] = (care.since, now)
+        care.food = self.essential == "food"
+        care.starving = care.food and starving_without_food(client)
+        if (care.mode == CARE_OWNER_BLOCK and
+                not set(care.subjects) & route_blocks.active_subjects(client)):
+            # Every block it waited for expired or was removed meanwhile:
+            # plan again, behind whatever walls are left.
+            _care_waits(client).pop(care.key, None)
+            self._end_care_staging()
+            self.care, self.route = None, []
+            self._issued_goal = self._issued_click = None
+            return False
+        if not care.food and hungry(client):
+            self._record(client, "essential-care-yield",
+                         f"{self.essential} trip to {self.destination}: hungry, the "
+                         f"food trip goes first ({', '.join(care.subjects)})")
+            self._end_care_staging()
+            await client.clear_actions()
+            self.fail(f"care wait before crossing {', '.join(care.subjects)} "
+                      "yielded to hunger")
+            return True
         if self._care_staging is not None:
             if self._at_savebed(client):
                 self._end_care_staging()
             else:
                 # Walking to her savebed: the ordinary movement runs.
-                care.missing = tuple(self._care_missing(client, care.starving))
+                care.missing = tuple(self._care_missing(client, care.food))
                 return False
-        if (care.mode == CARE_OWNER_BLOCK and
-                not set(care.subjects) & route_blocks.active_subjects(client)):
-            # Every block it waited for expired or was removed meanwhile:
-            # plan again, behind whatever walls are left.
-            self.care, self.route = None, []
-            self._issued_goal = self._issued_click = None
-            return False
-        if self.essential != "food" and hungry(client):
-            self._record(client, "essential-care-yield",
-                         f"{self.essential} trip to {self.destination}: hungry, the "
-                         f"food trip goes first ({', '.join(care.subjects)})")
-            await client.clear_actions()
-            self.fail(f"care wait before crossing {', '.join(care.subjects)} "
-                      "yielded to hunger")
-            return True
-        missing = self._care_missing(client, care.starving)
+        missing = self._care_missing(client, care.food)
         care.missing = tuple(missing)
         timeout = (care.mode == CARE_BOUNDED and now - care.since >= CARE_WAIT_SECONDS)
         if not missing or timeout:
@@ -2435,11 +2567,14 @@ class NavigateTask(BotTask):
             care.alerted = True
             self._record(client, "essential-care-alert",
                          f"{self.essential} trip to {self.destination} waited "
-                         f"{CARE_WAIT_SECONDS:.0f} s to cross {', '.join(care.subjects)}; "
+                         f"{now - care.since:.0f} s to cross {', '.join(care.subjects)}; "
                          f"still waiting for {', '.join(missing)}")
-        if any(item.startswith("a safe place (a map with hostile") for item in missing):
-            if self._begin_care_staging(client):
-                return False
+        # The walk home is decided by the map alone: a hostile in view or a
+        # hit on a respawning map must not keep her waiting there.
+        if (not care.food and not self._at_savebed(client) and
+                self._hostile_map(client.state.map.path) and
+                self._begin_care_staging(client)):
+            return False
         if not care.holding:
             care.holding = True
             await client.clear_actions()
@@ -2455,9 +2590,13 @@ class NavigateTask(BotTask):
         care = self.care
         assert care is not None
         care.cleared, care.cleared_at = True, care.clock()
+        _care_waits(client).pop(care.key, None)
         subjects = ", ".join(care.subjects)
         how = ("starving: a ready recall and hold-fire only" if care.starving else
+               "hungry: a ready recall and hold-fire only" if care.food else
                "waited too long; going anyway, holding fire" if timeout else
+               "HP and SP full or no longer rising, a ready recall, holding fire"
+               if care.plateaued else
                "full HP and SP, a ready recall, holding fire")
         self._record(client, "essential-route-override",
                      f"{self.essential} trip to {self.destination} crosses {subjects} "
@@ -2465,6 +2604,9 @@ class NavigateTask(BotTask):
         if care.starving:
             self._record(client, "essential-care-starving",
                          f"food trip to {self.destination} crosses {subjects} starving")
+        elif care.food:
+            self._record(client, "essential-care-food",
+                         f"food trip to {self.destination} crosses {subjects} hungry")
         if timeout:
             self._record(client, "essential-care-timeout",
                          f"{self.essential} trip to {self.destination} after "
@@ -3285,8 +3427,11 @@ class NavigateTask(BotTask):
         if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
             return
         self._record_progress(client)
-        if self.care is not None and await self._care_hold(client):
-            return
+        if self.care is not None:
+            # A crossing with no block left here or ahead is finished.
+            self.care_holds_fire(client.state.map.path)
+            if await self._care_hold(client):
+                return
         if client.state.map.path == self.destination and not self.route:
             if self.destination_xy is None:
                 # The final S_MOVE_PATH may contain compressed steps beyond a
@@ -3880,7 +4025,7 @@ class NavigateThenTask(BotTask):
         # the cornered last resort below still fights back.
         hold_fire = (
             (m.path != self.navigation.destination or
-             self.navigation.care_hold_fire) and
+             self.navigation.care_holds_fire(m.path)) and
             not (recent_hostile_contact(client, 3.0) and
                  (self.navigation.status == TaskStatus.FAILED or
                   time.monotonic() - self._last_moved_at >=

@@ -288,10 +288,12 @@ class DashboardState:
 
     # Decisions the Blocks section lists: each care crossing and its outcome.
     CARE_ACTIONS = ("essential-route-override", "essential-care-starving",
+                    "essential-care-food",
                     "essential-care-timeout", "essential-care-alert",
                     "essential-care-wait", "essential-care-staging",
                     "essential-care-yield")
-    # A starving crossing stays alerted this long (seconds).
+    # A food trip's crossing (hungry or starving) stays alerted this long
+    # (seconds).
     STARVING_CROSSING_ALERT_SECONDS = 3600.0
 
     def care_crossings(self) -> list[dict[str, Any]]:
@@ -335,7 +337,7 @@ class DashboardState:
 
     def care_alerts(self) -> list[dict[str, str]]:
         """A care wait across an owner block past CARE_WAIT_SECONDS, and a
-        starving crossing (owner-approved; ROUTING 4.5)."""
+        food trip's crossing, hungry or starving (owner-approved; ROUTING 4.5)."""
         alerts = []
         for care in self.care_crossings():
             subjects = ", ".join(care["subjects"])
@@ -347,21 +349,25 @@ class DashboardState:
                              f"{int(care['waiting_seconds'] // 60)} min to cross the "
                              f"owner block {subjects}: needs "
                              f"{', '.join(care['missing']) or 'nothing more'}")})
-            if care["cleared"] and care["starving"]:
+            if care["cleared"] and care.get("food"):
                 alerts.append({
-                    "id": "essential-care-starving", "level": "critical",
-                    "text": (f"Starving: food trip crossing the owner block {subjects} "
-                             "with only a ready recall and hold-fire")})
-        if not any(alert["id"] == "essential-care-starving" for alert in alerts):
+                    "id": ("essential-care-starving" if care["starving"]
+                           else "essential-care-food"), "level": "critical",
+                    "text": (f"{'Starving' if care['starving'] else 'Hungry'}: food trip "
+                             f"crossing the owner block {subjects} with only a ready "
+                             "recall and hold-fire")})
+        food_ids = ("essential-care-starving", "essential-care-food")
+        if not any(alert["id"] in food_ids for alert in alerts):
             cutoff = time.time() - self.STARVING_CROSSING_ALERT_SECONDS
             latest = next((record for record in reversed(self.client.decision_history)
                            if isinstance(record, dict) and
-                           record.get("action") == "essential-care-starving" and
+                           record.get("action") in food_ids and
                            float(record.get("time", 0.0) or 0.0) >= cutoff), None)
             if latest is not None:
                 alerts.append({
-                    "id": "essential-care-starving", "level": "warn",
-                    "text": ("Starving crossing of an owner block in the last hour: "
+                    "id": latest["action"], "level": "warn",
+                    "text": ("A food trip crossed an owner block in the last hour "
+                             "with only a recall and hold-fire: "
                              f"{latest.get('detail', '')}")})
         return alerts
 

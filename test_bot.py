@@ -25234,11 +25234,17 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         task.route = []
         self.client.state.stats.update(hp=50)
         self.assertTrue(await self.walking(task))
-        # Once nothing blocked is left on her way, hold-fire ends.
+        # Hold-fire lasts while a block is ahead or underfoot...
         self.client.state.map.path = "/blocked"
-        task.route = []
         self.assertTrue(await self.walking(task))
-        self.assertFalse(task.care_hold_fire)
+        self.assertEqual(self.maps(task.route), ["/goal"])
+        self.assertTrue(task.care_holds_fire("/blocked"))
+        # ...and ends once she has crossed it, without any replan.
+        self.client.state.map.path = "/goal"
+        await self.walking(task)
+        self.assertFalse(task.care_holds_fire("/goal"))
+        self.assertTrue(task.care.finished)
+        self.assertEqual(dashboard.route_blocks()["care"], [])
 
     async def test_an_owner_block_wait_has_no_limit_and_alerts_after_600_s(self):
         from .navigation import CARE_WAIT_SECONDS
@@ -25269,7 +25275,9 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_bounded_override_goes_after_600_s_and_records_the_timeout(self):
         from .navigation import CARE_BOUNDED
 
-        self.client.state.stats.update(hp=10)
+        rod = Item(50, name="rod of word of recall", item_type=c.TYPE_ROD, quality=60)
+        self.client.state.place_item(rod, 7)
+        self.client.recall_device_retry_at = {50: time.monotonic() + 3600}
         now = [100.0]
         task = self.trip("funding")
         await task.start(self.client)
@@ -25280,7 +25288,7 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.actions(),
                          ["essential-care-wait", "essential-route-override",
                           "essential-care-timeout"])
-        self.assertIn("without full HP", self.client.decision_history[-1]["detail"])
+        self.assertIn("without a ready recall", self.client.decision_history[-1]["detail"])
 
     async def test_a_starving_food_trip_waits_only_for_a_ready_recall(self):
         self.graph = blocks_graph(detour=False)
@@ -25334,12 +25342,158 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.walking(task))
         self.assertEqual(task.destination, "/goal")
         self.assertTrue(task.care.cleared)
+        # Arriving short of full HP, the wait at her savebed starts afresh.
+        task = self.trip("savebed")
+        self.client.state.map.path, self.client.state.map.world_x = "/start", 1
+        self.client.state.stats.update(hp=50)
+        self.assertTrue(await self.walking(task))
+        clears = self.client.clears
+        self.client.state.map.path, self.client.state.map.world_x = "/home", 3
+        self.assertFalse(await self.walking(task))
+        self.assertEqual(self.client.clears, clears + 1)
+        self.assertEqual(self.client.actions()[-1], "essential-care-wait")
+        self.client.state.stats.update(hp=100)
         # A hostile in view is no place to wait either, savebed or not.
         task = self.trip("savebed")
         self.client.state.map.tile(8, 8).objects[3] = MapObject(3, 1, 0, 0, name="kobold",
                                                                   target_id=99)
         self.assertFalse(await self.walking(task))
         self.assertEqual(task.care.missing, ("a safe place (a hostile in view)",))
+
+    async def test_hostiles_on_a_spawn_map_never_keep_her_from_walking_home(self):
+        self.graph = blocks_graph(detour=False)
+        self.graph.named_spawns["/start"] = [NamedSpawn("/start", 8, 0, "rat", ("rat",))]
+        self.block("/blocked")
+        self.client.state.map.tile(8, 8).objects[3] = MapObject(3, 1, 0, 0, name="rat",
+                                                                  target_id=99)
+        self.client.state.add_message(0, "ffffff", "The rat hit you for 3 damage.")
+        task = self.trip("cure")
+        self.assertTrue(await self.walking(task))
+        self.assertEqual(task.destination, "/home")
+        self.assertEqual(self.client.actions(), ["essential-care-staging"])
+        self.assertIn("a safe place (hostile contact)", task.care.missing)
+
+    async def test_hunger_ends_the_walk_home_too(self):
+        self.graph = blocks_graph(detour=False)
+        self.graph.named_spawns["/start"] = [NamedSpawn("/start", 8, 0, "rat", ("rat",))]
+        self.block("/blocked")
+        task = self.trip("cure")
+        self.assertTrue(await self.walking(task))
+        self.assertEqual(task.destination, "/home")
+        self.client.state.stats.update(food=100)
+        self.assertFalse(await self.walking(task))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(task.destination, "/goal")
+        self.assertEqual(self.client.actions()[-1], "essential-care-yield")
+
+    async def test_hp_held_down_by_a_disease_counts_as_full_after_a_plateau(self):
+        from .navigation import CARE_PLATEAU_SECONDS
+
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=90)
+        now = [100.0]
+        task = self.trip("cure")
+        self.assertFalse(await self.walking(task))
+        task.care.clock = lambda: now[0]
+        task.care.peaks.clear()
+        self.assertFalse(await self.walking(task))
+        now[0] += CARE_PLATEAU_SECONDS - 1
+        self.client.state.stats.update(hp=88)  # the disease, not a rise
+        self.assertFalse(await self.walking(task))
+        self.assertEqual(task.care.missing, ("full HP",))
+        now[0] += 1
+        self.assertTrue(await self.walking(task))
+        self.assertIn("no longer rising", self.client.decision_history[-1]["detail"])
+        # A rise restarts the plateau, and it counts only while resting.
+        task = self.trip("cure")
+        self.assertFalse(await self.walking(task))
+        task.care.clock = lambda: now[0]
+        task.care.peaks.clear()
+        self.assertFalse(await self.walking(task))
+        now[0] += 30
+        self.client.state.stats.update(hp=89)
+        self.assertFalse(await self.walking(task))
+        now[0] += CARE_PLATEAU_SECONDS - 1
+        self.assertFalse(await self.walking(task))
+
+    async def test_a_block_never_relaxes_a_hazard_tier(self):
+        self.graph = blocks_graph(detour=False)
+        hazard = MapNode("/hazard", width=10, height=1)
+        hazard.terrain = {(x, 0): 1 for x in range(10)}
+        self.graph.nodes["/hazard"] = hazard
+        self.graph.nodes["/start"].edges.append(MapEdge("/start", "/hazard", 0, 0, 0, 0))
+        hazard.edges.append(MapEdge("/hazard", "/goal", 9, 0, 0, 0))
+        self.graph.map_monster_levels["/hazard"] = {"dragon": 99}
+        self.block("/blocked")
+        # Without the block the safe road is taken; with it, an optional
+        # trip is refused instead of sent through the over-level map...
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                task = self.trip()
+                task.strict_safety = strict
+                task.allow_ranged_hazard_fallback = True
+                with self.assertRaisesRegex(ValueError, "owner block"):
+                    task._plan(self.client)
+                # ...and an essential trip crosses the block with care.
+                task = self.trip("cure")
+                task.strict_safety = strict
+                self.assertEqual(self.maps(task._plan(self.client)), ["/blocked", "/goal"])
+                self.assertEqual(task.care.subjects, ("map:/blocked",))
+        # A tier that fails without the block relaxes as before.
+        self.route_blocks.remove_block(self.client, "/blocked")
+        self.graph.nodes["/start"].edges[:] = [
+            edge for edge in self.graph.nodes["/start"].edges if edge.destination != "/blocked"]
+        self.block("/home")
+        task = self.trip()
+        self.assertEqual(self.maps(task._plan(self.client)), ["/hazard", "/goal"])
+        self.assertTrue(task._threat_fallback)
+
+    async def test_a_rebuilt_trip_keeps_the_wait_start_for_the_same_block(self):
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=10)
+        first = self.trip("cure")
+        self.assertFalse(await self.walking(first))
+        second = self.trip("cure")
+        self.assertFalse(await self.walking(second))
+        self.assertEqual(second.care.since, first.care.since)
+        # Once a crossing clears, the next wait starts afresh.
+        self.client.state.stats.update(hp=100)
+        self.assertTrue(await self.walking(second))
+        third = self.trip("cure")
+        self.client.state.stats.update(hp=10)
+        self.assertFalse(await self.walking(third))
+        self.assertGreater(third.care.since, first.care.since)
+
+    async def test_a_hungry_food_trip_waits_only_for_a_ready_recall(self):
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.stats.update(hp=20, sp=0, food=100)
+        self.client.state.map.tile(8, 8).objects[3] = MapObject(3, 1, 0, 0, name="kobold",
+                                                                  target_id=99)
+        task = self.trip("food")
+        self.assertTrue(await self.walking(task))
+        self.assertEqual(self.client.actions(),
+                         ["essential-route-override", "essential-care-food"])
+        self.assertIn("hungry: a ready recall and hold-fire only",
+                      self.client.decision_history[0]["detail"])
+        dashboard = DashboardState(self.client, types.SimpleNamespace(task=task, idle_survival=None),
+                                   self.graph, {})
+        alert, = dashboard.care_alerts()
+        self.assertEqual((alert["id"], alert["level"]), ("essential-care-food", "critical"))
+        self.assertIn(alert["text"].split(":")[0], "Hungry")
+
+    def test_a_failed_read_is_retried_within_seconds(self):
+        self.block("/blocked")
+        self.client._owner_block_cache = None
+        with patch.object(self.client.memory, "route_blocks",
+                          side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertFalse(self.route_blocks.owner_walls(self.client))
+        cache = self.client._owner_block_cache
+        self.assertTrue(cache.failed)
+        cache.loaded_at -= self.route_blocks.RETRY_SECONDS
+        self.assertEqual(self.route_blocks.owner_walls(self.client).maps, {"/blocked"})
 
     async def test_a_non_food_trip_yields_to_hunger_instead_of_waiting(self):
         self.graph = blocks_graph(detour=False)
@@ -25435,7 +25589,8 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         trip = temple_food_trip(self.graph, self.client)
         self.assertEqual((trip.task.priest, trip.navigation.essential), ("Near", "food"))
         self.assertTrue(await self.walking(trip.navigation))
-        self.assertEqual(self.client.actions(), ["essential-route-override"])
+        self.assertEqual(self.client.actions(),
+                         ["essential-route-override", "essential-care-food"])
 
 
 class OwnerBlockRouteTests(unittest.IsolatedAsyncioTestCase):

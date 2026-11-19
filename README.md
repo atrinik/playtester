@@ -612,14 +612,18 @@ in the runtime state database (`route_blocks`) and are written only through
 cross-site. Only an essential trip (food while she is hungry or starving, a
 cure, the depletion service, a savebed move, a trip that funds one of them,
 and the recovery phase's recall shopping and walk home) crosses a block, and
-only when every route does. It waits at a safe place (her savebed, or a map
-without hostile spawns, with no hostile in view or contact) for full HP and
-SP and a ready recall when she owns one, then holds fire on the way. That
-wait has no limit and raises a dashboard alert after 10 minutes, and a
-non-food trip gives way to a food trip once she is hungry. A starving food
-trip waits only for a ready recall. Each crossing is recorded
-(`essential-route-override`, and `essential-care-starving` for a starving
-one, which is also alerted) and listed under **Care crossings**. The proposed design for
+only when every route does; a block never sends a trip through a hazard
+the planner otherwise avoids. It waits at a safe place (her savebed, or a
+map without hostile spawns, with no hostile in view or contact; on a map
+with hostile spawns she walks to her savebed first) for full HP and SP, or
+HP and SP that have stopped rising for a minute, and a ready recall when she
+owns one, then holds fire until the block is behind her. That wait has no
+limit and raises a dashboard alert after 10 minutes, and a non-food trip
+gives way to a food trip once she is hungry. A food trip, hungry or
+starving, waits only for a ready recall, since waiting to regenerate burns
+food. Each crossing is recorded (`essential-route-override`, plus
+`essential-care-food` or `essential-care-starving` for a food trip, which is
+also alerted) and listed under **Care crossings**. The proposed design for
 alternative routes, unlocks such as keys, quests and NPC voyages, and costs
 learned from her own experience is in [docs/ROUTING.md](docs/ROUTING.md).
 
