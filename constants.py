@@ -307,6 +307,8 @@ TYPE_NUGGET = 117
 TYPE_CONTAINER = 122
 TYPE_POWER_CRYSTAL = 156
 TYPE_CORPSE = 157
+TYPE_DISEASE = 158
+TYPE_SYMPTOM = 159
 TYPE_POISONING = 105
 
 # Spell descriptor flags sent in a spell inventory item's extra metadata.

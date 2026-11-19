@@ -397,30 +397,34 @@ design is [docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md)
 
 - **A fight** starts at the first combat line of hers in a while (a hit or
   miss on her, a block, dodge or parry, her own hit or kill) and ends 10
-  seconds after the last one, when she leaves the map, or when she dies;
-  a fight longer than 15 minutes is cut there. It ends `died` on her
-  death, `recalled` after her emergency recall, `won` when she killed
-  something, and `retreated` otherwise.
+  seconds after the last one, when she leaves the map (crossing a tile
+  seam to the next map keeps it), or 2 seconds after her death (hits until
+  then still count, as in the failure review); a fight longer than 15
+  minutes is cut there. It ends `died` on her death, `recalled` after her
+  emergency recall, `won` when she killed something, and `retreated`
+  otherwise. Damage over time from her own poisoning or disease ("poison
+  hit you for ...") names no attacker and starts no fight.
 - **The square** is read when the fight starts, and again where she stands
   when a second attacker hits her within 8 seconds. Its `reach` is how
   many of her 8 neighbours a walking monster could stand on, from the
   authored walkability she plans with (a door counts; the server lets a
-  monster hit a diagonal neighbour past a wall corner). Its feature is
+  monster hit a diagonal neighbour past a wall corner; off the map counts
+  only toward a tiled neighbour). Its feature is
   `corridor` (reach 2, opposite each other), `doorway` (a door on or next
   to her, or a one-wide gap into a room), `open` (reach 7 or 8 and at least
   20 standable squares within 2), `room` (anything else), or `unknown` off
   the world graph.
 - **Counts only.** Peak attackers (the most distinct attackers within 8
   seconds, counted exactly as the failure review counts packs), ranged
-  monsters in view and how many a wall or door covers along the
-  projectile ray, creatures and players in view, kills, damage taken and
+  monsters in view and how many a wall or door covers (on the cells an
+  aimed bullet crosses, as `bullet_ray_clear` tests them), creatures and players in view, kills, damage taken and
   seconds. No attacker's or player's name is stored.
 - **Bounded.** The recorder reads only new server lines each engine step
   and looks at the creatures in view only during a fight; a fight keeps at
   most 2,000 hits. A row waits at most 0.25 seconds for a locked database
   and is otherwise dropped; at most 20,000 rows a character, oldest
-  evicted first. An error in the recorder is logged and forgets the fight,
-  never reaching the game loop.
+  evicted first. An error in the recorder forgets the fight and never
+  reaches the game loop; it is logged once, then counted every 10 minutes.
 
 The read-only **Terrain** panel on the dashboard's Farming tab lists her
 recent fights and the rates learned per feature, peak attackers and

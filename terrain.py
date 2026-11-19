@@ -17,7 +17,8 @@ tie-breakers behind a flag.
   both axes on its own level (``can_hit``, server ``types/monster.c``)
   without checking walls, so a diagonal neighbour reaches her past a wall
   corner and all 8 count. A door counts as standable: monsters that open
-  doors stand in the open doorway.
+  doors stand in the open doorway. Off the map counts only in a direction
+  another map is tiled to.
 - ``corridor``: ``reach`` 2, and the two squares opposite each other.
 - ``doorway``: a door on or next to her square, or a one-wide gap (walls
   on two opposite sides) with a room on one side.
@@ -25,9 +26,15 @@ tie-breakers behind a flag.
   window.
 - ``room``: anything else; ``unknown`` off the world graph.
 
-**Cover** from a ranged or caster monster in view: a wall or door on the
-straight line to it, through the cells of the server's projectile flight
-(``tasks.ray_cells``, the ray ``bullet_ray_clear`` aims with).
+**Cover** from a ranged or caster monster in view: a wall or door on a
+cell the server's projectile flight crosses before it, exactly the cells
+``bullet_ray_clear`` tests (``tasks.cover_cells``).
+
+**A fight** starts at her first combat line and ends 10 seconds after the
+last, when she leaves the map other than over a tile seam, or 2 seconds
+after her death (hits until then still count, as in the failure review).
+Damage over time from her own poisoning or disease names no attacker and
+starts no fight.
 
 The recorder is fed once an engine step (``tasks.observe_fight``) and never
 raises into play: its work a step is the new server lines and, during a
@@ -60,7 +67,8 @@ ROOM_SIDE_SQUARES = 7
 CELL_SIZE = 8  # ROUTING's cells: cell:{path}:{x//8},{y//8}
 
 # A fight ends this long after the last contact (a hit, miss, block or kill
-# either way), when she leaves the map, or when she dies.
+# either way), when she leaves the map other than over a tile seam, or
+# DEATH_GRACE_SECONDS after her death.
 QUIET_SECONDS = 10.0
 # The longest fight kept as one row: a longer one is cut and the next
 # contact starts another.
@@ -79,6 +87,16 @@ _CONTACT = re.compile(
     r"^(?:.+? misses you\b|you (?:block|dodge|parry) |you hit .+? for \d|you killed )",
     re.I)
 _KILL = re.compile(r"^you killed ", re.I)
+# Damage over time from her own forces names the force, not a creature:
+# a poisoning pulse ("poison hit you for N (M) poison damage.", the
+# poisoning archetype's name; server types/poisoning.c) or a disease's
+# symptom (types/symptom.c). Neither is an attacker nor starts a fight;
+# the names of the poisoning, force, disease and symptom objects she
+# carries are ignored too (FightView.ignored).
+DAMAGE_OVER_TIME = frozenset({"poison", "poisoning", "symptom", "disease"})
+# Hits up to this long after her death notice still belong to the fight,
+# as in the failure review (self_improvement.review_failure).
+DEATH_GRACE_SECONDS = 2.0
 
 
 class Terrain(NamedTuple):
@@ -89,18 +107,38 @@ class Terrain(NamedTuple):
     standable: int = 0  # standable squares in the window, hers included
 
 
-def _standable(node: Any, x: int, y: int, tiled: bool) -> bool:
-    if 0 <= x < node.width and 0 <= y < node.height:
+def _side(value: int, size: int) -> int:
+    return -1 if value < 0 else 1 if value >= size else 0
+
+
+def tile_directions(node: Any) -> dict[tuple[int, int], str]:
+    """The map's tiled neighbours by direction (-1, 0 or 1 in each axis):
+    a declared ``tile_path_N`` or a coordinate neighbour, whose edge the
+    world graph places just past that side or corner. Up and down links,
+    placed inside the map, are no direction."""
+    directions: dict[tuple[int, int], str] = {}
+    for edge in getattr(node, "edges", ()):
+        if getattr(edge, "kind", "") != "tile":
+            continue
+        direction = (_side(edge.x, node.width), _side(edge.y, node.height))
+        if direction != (0, 0):
+            directions.setdefault(direction, edge.destination)
+    return directions
+
+
+def _standable(node: Any, x: int, y: int, tiled: dict[tuple[int, int], str]) -> bool:
+    side = (_side(x, node.width), _side(y, node.height))
+    if side == (0, 0):
         return bool(node.walkable(x, y))
-    # Off the map: another map continues there only on a tiled map.
-    return tiled
+    # Off the map: another map continues there only where a tile links one.
+    return side in tiled
 
 
 def features(node: Any, x: int, y: int) -> Terrain:
     """The terrain feature of world square (x, y) on ``node`` (a MapNode)."""
     if node is None:
         return Terrain(UNKNOWN, None)
-    tiled = any(getattr(edge, "kind", "") == "tile" for edge in node.edges)
+    tiled = tile_directions(node)
     ok = {(dx, dy): _standable(node, x + dx, y + dy, tiled)
           for dy in range(-WINDOW, WINDOW + 1) for dx in range(-WINDOW, WINDOW + 1)}
     open_neighbours = [offset for offset in NEIGHBOURS if ok[offset]]
@@ -128,24 +166,25 @@ def features(node: Any, x: int, y: int) -> Terrain:
 
 
 def covered(node: Any, origin: tuple[int, int], target: tuple[int, int],
-            ray: Callable[[int, int, int], Sequence[tuple[int, int]]]) -> bool:
-    """Whether a wall or door stands on the straight line between world
-    squares ``origin`` and ``target``: a cell of the projectile flight
-    (``ray``, offsets from the origin) before the target's own."""
-    if node is None:
+            before: Callable[[int, int], Sequence[tuple[int, int]]]) -> bool:
+    """Whether a wall or door stands between world squares ``origin`` and
+    ``target`` on the projectile's flight: ``before`` gives the cells it
+    crosses before the target (offsets; ``tasks.cover_cells``, the cells
+    ``bullet_ray_clear`` tests), so a corner cell covers a diagonal
+    neighbour as it stops a bullet."""
+    if node is None or origin == target:
         return False
     dx, dy = target[0] - origin[0], target[1] - origin[1]
-    span = max(abs(dx), abs(dy))
-    if span <= 1:
-        return False
     blocked, doors = node.blocked, node.doors
-    for cell in ray(dx, dy, span):
-        if cell == (dx, dy) or max(abs(cell[0]), abs(cell[1])) > span:
-            break
+    for cell in before(dx, dy):
         world = (origin[0] + cell[0], origin[1] + cell[1])
         if world in blocked or world in doors:
             return True
     return False
+
+
+def _seams(node: Any) -> frozenset[str]:
+    return frozenset(tile_directions(node).values()) if node is not None else frozenset()
 
 
 @dataclass(slots=True)
@@ -174,6 +213,9 @@ class FightView:
     # Fills hostiles and players when a fight needs them, so a step without
     # a fight never looks at the creatures in view.
     scan: Callable[[], tuple[Sequence[Hostile], int]] | None = None
+    # Folded hitter names that are no attacker: her own damage-over-time
+    # forces (DAMAGE_OVER_TIME is always ignored).
+    ignored: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -194,6 +236,12 @@ class Fight:
     players: int = 0
     second_attacker: bool = False
     recalled: bool = False
+    # The map she fights on now, and the maps tiled to it: crossing a
+    # tile seam keeps the fight.
+    current_map: str = ""
+    seams: frozenset[str] = frozenset()
+    # Her death, while hits within DEATH_GRACE_SECONDS may still come.
+    died_at: float | None = None
     # Kept until the step after the snapshot: re-read from the view.
     pending_snapshot: bool = True
 
@@ -221,12 +269,16 @@ class FightRecorder:
     "emergency-recall" decisions as they are recorded.
     """
 
-    def __init__(self, ray: Callable[[int, int, int], Sequence[tuple[int, int]]]
+    def __init__(self, ray: Callable[[int, int], Sequence[tuple[int, int]]]
                  | None = None):
         self.ray = ray
         self.fight: Fight | None = None
         # The message position read up to (GameState.message_count).
         self.position: int | None = None
+        # Failures since the last report, and when one was last logged
+        # (monotonic; tasks.observe_fight).
+        self.failures = 0
+        self.failure_reported_at: float | None = None
         self._notes: list[tuple[float, str]] = []
 
     @property
@@ -248,17 +300,27 @@ class FightRecorder:
         fight = self.fight
         if fight is not None and fight.character != view.character:
             self.reset()
+        fight = self.fight
+        if fight is not None and fight.died_at is None and \
+                view.map != fight.current_map and view.map in fight.seams:
+            # Over a tile seam: the same fight, on the next map.
+            fight.current_map, fight.seams = view.map, _seams(view.node)
         notes = sorted(self._notes)
         self._notes.clear()
+        ignored = DAMAGE_OVER_TIME | view.ignored
         for entry in view.messages:
             if not from_server(entry):
                 continue
             stamp, text = float(entry[0]), str(entry[-1]).strip()
             while notes and notes[0][0] <= stamp:
-                rows.extend(self._apply_note(*notes.pop(0)))
+                self._apply_note(*notes.pop(0))
+            if self.fight is not None and self.fight.died_at is not None and \
+                    stamp > self.fight.died_at + DEATH_GRACE_SECONDS:
+                rows.append(self._end(self.fight.died_at, "died"))
             hit = parse_hit(text)
-            contact = hit is not None or bool(_CONTACT.match(text))
-            if not contact:
+            if hit is not None and hit[0].casefold() in ignored:
+                continue
+            if hit is None and not _CONTACT.match(text):
                 continue
             if self.fight is None:
                 self.fight = self._start(view, stamp)
@@ -271,20 +333,23 @@ class FightRecorder:
                 if not fight.second_attacker and self._second_attacker(fight, hit[0], stamp):
                     # The feature at the moment the second attacker arrived.
                     fight.second_attacker = True
-                    if fight.map == view.map:
-                        fight.x, fight.y = view.x, view.y
+                    if fight.current_map == view.map and fight.died_at is None:
+                        fight.map, fight.x, fight.y = view.map, view.x, view.y
                         fight.terrain = features(view.node, view.x, view.y)
                         fight.pending_snapshot = True
             elif _KILL.match(text):
                 fight.kills += 1
         for note in notes:
-            rows.extend(self._apply_note(*note))
+            self._apply_note(*note)
         fight = self.fight
         if fight is None:
             return rows
-        if fight.map != view.map:
-            rows.append(self._end(fight.last_contact,
-                                  "recalled" if fight.recalled else "retreated"))
+        if fight.died_at is not None:
+            if view.now > fight.died_at + DEATH_GRACE_SECONDS:
+                rows.append(self._end(fight.died_at, "died"))
+            return rows
+        if fight.current_map != view.map:
+            rows.append(self._end(fight.last_contact, self._quiet_outcome(fight)))
             return rows
         self._watch(fight, view)
         if view.now - fight.last_contact >= QUIET_SECONDS:
@@ -313,16 +378,17 @@ class FightRecorder:
 
     def _start(self, view: FightView, stamp: float) -> Fight:
         return Fight(view.character, stamp, view.map, view.x, view.y,
-                     features(view.node, view.x, view.y), stamp)
+                     features(view.node, view.x, view.y), stamp,
+                     current_map=view.map, seams=_seams(view.node))
 
-    def _apply_note(self, at: float, action: str) -> list[dict[str, Any]]:
+    def _apply_note(self, at: float, action: str) -> None:
         fight = self.fight
-        if fight is None:
-            return []
+        if fight is None or fight.died_at is not None:
+            return
         if action == "death":
-            return [self._end(at, "died")]
-        fight.recalled = True
-        return []
+            fight.died_at = at
+        else:
+            fight.recalled = True
 
     def _end(self, ended: float, outcome: str) -> dict[str, Any]:
         fight, self.fight = self.fight, None

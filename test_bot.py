@@ -25875,8 +25875,9 @@ class OwnerBlockRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.blocks())["care"], [])
 
 
-def terrain_node(rows, path="/t", doors=(), tiled=False):
-    """A MapNode from rows of text: '.' standable, '#' wall, '+' a door."""
+def terrain_node(rows, path="/t", doors=(), tiled=()):
+    """A MapNode from rows of text: '.' standable, '#' wall, '+' a door;
+    ``tiled`` names the (dx, dy) directions other maps are tiled to."""
     node = MapNode(path, width=len(rows[0]), height=len(rows))
     for y, row in enumerate(rows):
         for x, char in enumerate(row):
@@ -25884,8 +25885,13 @@ def terrain_node(rows, path="/t", doors=(), tiled=False):
             if char == "+":
                 node.doors.add((x, y))
     node.doors.update(doors)
-    if tiled:
-        node.edges.append(MapEdge(path, "/next", 0, 0, kind="tile"))
+    for dx, dy in tiled:
+        side = lambda d, size: -1 if d < 0 else size if d > 0 else size // 2
+        node.edges.append(MapEdge(path, f"/next_{dx}_{dy}", side(dx, node.width),
+                                  side(dy, node.height), kind="tile"))
+    # An up link (inside the map) is no direction.
+    node.edges.append(MapEdge(path, "/above", node.width // 2, node.height // 2,
+                              kind="tile"))
     return node
 
 
@@ -25940,26 +25946,60 @@ class TerrainTests(unittest.TestCase):
         self.assertEqual(features(None, 3, 3), ("unknown", None, 0))
 
     def test_off_the_map_counts_only_where_another_map_continues(self):
-        from .terrain import features
+        from .terrain import features, tile_directions
         rows = ["." * 7] * 7
         self.assertEqual(features(terrain_node(rows), 0, 0)[:2], ("room", 3))
-        self.assertEqual(features(terrain_node(rows, tiled=True), 0, 0)[:2], ("open", 8))
+        every = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
+        self.assertEqual(features(terrain_node(rows, tiled=every), 0, 0)[:2], ("open", 8))
+        # Only the tiled directions: west alone adds the three squares west.
+        west = terrain_node(rows, tiled=[(-1, 0)])
+        self.assertEqual(tile_directions(west), {(-1, 0): "/next_-1_0"})
+        self.assertEqual(features(west, 0, 0).reach, 5)
+        self.assertEqual(features(west, 0, 3).reach, 8)
+        self.assertEqual(features(terrain_node(rows, tiled=[(0, -1)]), 0, 3).reach, 5)
+        self.assertEqual(features(terrain_node(rows, tiled=[(-1, -1)]), 0, 0).reach, 4)
 
     def test_cover_follows_the_projectile_ray(self):
-        from .tasks import ray_cells
+        from .tasks import cover_cells
         from .terrain import covered
         node = terrain_node(["." * 9] * 9)
-        self.assertFalse(covered(node, (1, 4), (7, 4), ray_cells))
+        self.assertFalse(covered(node, (1, 4), (7, 4), cover_cells))
         node.terrain[(4, 4)] = 0
         node.blocked.add((4, 4))
-        self.assertTrue(covered(node, (1, 4), (7, 4), ray_cells))
+        self.assertTrue(covered(node, (1, 4), (7, 4), cover_cells))
         # Beyond the target, or beside the line, a wall gives no cover.
-        self.assertFalse(covered(node, (1, 4), (3, 4), ray_cells))
-        self.assertFalse(covered(node, (1, 5), (7, 5), ray_cells))
+        self.assertFalse(covered(node, (1, 4), (3, 4), cover_cells))
+        self.assertFalse(covered(node, (1, 5), (7, 5), cover_cells))
         node.doors.add((4, 5))
-        self.assertTrue(covered(node, (1, 5), (7, 5), ray_cells))
-        self.assertFalse(covered(node, (1, 4), (2, 5), ray_cells))
-        self.assertFalse(covered(None, (1, 4), (7, 4), ray_cells))
+        self.assertTrue(covered(node, (1, 5), (7, 5), cover_cells))
+        # A wall on the corner covers a diagonal neighbour, as it stops a bullet.
+        self.assertFalse(covered(node, (1, 1), (2, 2), cover_cells))
+        node.blocked.add((2, 1))
+        self.assertTrue(covered(node, (1, 1), (2, 2), cover_cells))
+        self.assertFalse(covered(node, (4, 4), (4, 4), cover_cells))
+        self.assertFalse(covered(None, (1, 4), (7, 4), cover_cells))
+
+    def test_cover_matches_bullet_ray_clear_everywhere(self):
+        import random
+        from .tasks import cover_cells
+        from .terrain import covered
+        rng = random.Random(10)
+        node = terrain_node(["." * 17] * 17)
+        for _ in range(40):
+            square = (rng.randrange(17), rng.randrange(17))
+            if square != (8, 8):
+                (node.blocked if rng.random() < 0.7 else node.doors).add(square)
+        client = AtrinikClient(ClientConfig())
+        m = client.state.map
+        m.path, m.world_x, m.world_y = "/t", 8, 8
+        task = FarmTask()
+        task.map_node = node
+        for x in range(17):
+            for y in range(17):
+                if (x, y) == (8, 8):
+                    continue
+                self.assertEqual(covered(node, (8, 8), (x, y), cover_cells),
+                                 not task.bullet_ray_clear(client, x, y, 0), (x, y))
 
     @staticmethod
     def view(now, messages=(), *, x=3, y=3, node=None, map="/t", hostiles=(),
@@ -25999,10 +26039,14 @@ class TerrainTests(unittest.TestCase):
                 rows += recorder.observe(self.view(message[0], [message], node=open_node))
             death = messages[-1][0] + 0.5
             recorder.note("death", death)
-            rows += recorder.observe(self.view(death + 1, [self.line(death - 0.1, "You have died.")],
-                                               map="/bed"))
+            # Hits up to 2 s after her death still count, as in the review.
+            after = [self.line(death - 0.1, "You have died."),
+                     self.line(death + 1.5, "kobold hit you for 4 (-4) slash damage.")]
+            rows += recorder.observe(self.view(death + 1, after[:1], map="/bed"))
+            self.assertEqual(rows, [])
+            rows += recorder.observe(self.view(death + 3, after[1:], map="/bed"))
             row, = rows
-            review = review_failure(messages, [], {"time": death, "action": "death"}, [])
+            review = review_failure(messages + after, [], {"time": death, "action": "death"}, [])
             self.assertEqual(row["outcome"], "died")
             self.assertEqual(row["peak_attackers"], review.peak_attackers, script)
             self.assertEqual(row["damage_taken"], review.damage_taken, script)
@@ -26054,11 +26098,57 @@ class TerrainTests(unittest.TestCase):
         recorder.note("death", 40.0)
         self.assertEqual(recorder.observe(self.view(41.0, [self.line(40.5, "You feel hungry.")])), [])
         self.assertFalse(recorder.active)
+        # A kill, then a map change: won.
+        recorder.observe(self.view(50.0, [hit(50.0), self.line(51.0, "You killed orc.")]))
+        row, = recorder.observe(self.view(52.0, map="/elsewhere"))
+        self.assertEqual((row["outcome"], row["map"], row["ended"]), ("won", "/t", 51.0))
+        # A hit after the 2 s that follow her death ends that fight and starts
+        # another.
+        recorder.observe(self.view(60.0, [hit(60.0)]))
+        recorder.note("death", 61.0)
+        row, = recorder.observe(self.view(62.0, [hit(63.5)], map="/bed"))
+        self.assertEqual((row["outcome"], row["ended"], row["damage_taken"]), ("died", 61.0, 1))
+        self.assertEqual((recorder.fight.map, recorder.fight.started), ("/bed", 63.5))
+
+    def test_crossing_a_tile_seam_keeps_the_fight(self):
+        from .terrain import FightRecorder
+        recorder = FightRecorder()
+        west = terrain_node(["." * 7] * 7, path="/w", tiled=[(1, 0)])
+        east = terrain_node(["." * 7] * 7, path="/next_1_0", tiled=[(-1, 0)])
+        hit = lambda at, who="orc": self.line(at, f"{who} hit you for 1.")
+        recorder.observe(self.view(1.0, [hit(1.0)], node=west, map="/w", x=6))
+        self.assertEqual(recorder.observe(self.view(2.0, [hit(2.0, "wolf")], node=east,
+                                                    map="/next_1_0", x=0)), [])
+        # The second attacker's square is read on the new map.
+        self.assertEqual((recorder.fight.map, recorder.fight.x), ("/next_1_0", 0))
+        # A map not tiled to this one ends it.
+        row, = recorder.observe(self.view(3.0, map="/town"))
+        self.assertEqual((row["outcome"], row["peak_attackers"], row["map"]),
+                         ("retreated", 2, "/next_1_0"))
+
+    def test_damage_over_time_and_player_lines_are_no_attackers(self):
+        from .terrain import FightRecorder
+        recorder = FightRecorder()
+        lines = [self.line(1.0, "poison hit you for 3 (3) poison damage."),
+                 self.line(1.5, "coughing fit hit you for 2 (2) internal damage."),
+                 self.line(2.0, "Zoey hit you for 9 (-9) slash damage.", c.CHAT_TYPE_CHAT),
+                 self.line(2.5, "[a=#charname]Zoey[/a] hit you for 9 (-9) slash damage.")]
+        view = self.view(3.0, lines)
+        view.ignored = frozenset({"coughing fit"})
+        self.assertEqual(recorder.observe(view), [])
+        self.assertFalse(recorder.active)
+        # Within a fight they add neither an attacker nor damage.
+        view = self.view(5.0, [self.line(4.0, "orc hit you for 1."),
+                               self.line(4.5, "poison hit you for 3 (3) poison damage."),
+                               self.line(4.6, "[a=#charname]Zoey[/a] hit you for 9.")])
+        recorder.observe(view)
+        row, = recorder.observe(self.view(20.0))
+        self.assertEqual((row["peak_attackers"], row["damage_taken"]), (1, 1))
 
     def test_cover_players_and_hostiles_are_counted(self):
-        from .tasks import ray_cells
+        from .tasks import cover_cells
         from .terrain import FightRecorder, Hostile
-        recorder = FightRecorder(ray_cells)
+        recorder = FightRecorder(cover_cells)
         node = terrain_node(["." * 9] * 9)
         node.blocked.add((5, 4))
         hostiles = [Hostile(7, 4, True), Hostile(2, 8, True), Hostile(3, 4)]
@@ -26166,7 +26256,11 @@ class FightStorageTests(unittest.TestCase):
         self.assertEqual(observe_fight(client), 0)
         self.assertTrue(client.fight_recorder.active)
         self.say(client, "You have died.")
-        self.assertEqual(observe_fight(client), 1)
+        # Hits for 2 s after her death still belong to the fight.
+        self.assertEqual(observe_fight(client), 0)
+        from . import terrain
+        with patch.object(terrain, "DEATH_GRACE_SECONDS", -1.0):
+            self.assertEqual(observe_fight(client), 1)
         row, = client._memory_store().fights("Sera")
         self.assertEqual({key: row[key] for key in (
             "map", "x", "y", "cell", "feature", "reach", "peak_attackers", "ranged_attackers",
@@ -26189,9 +26283,20 @@ class FightStorageTests(unittest.TestCase):
         self.assertEqual(inspect.signature(BotMemory.record_fight).parameters["timeout"].default,
                          memory.FIGHT_SAVE_TIMEOUT)
         client = self.client()
-        with patch.object(client.fight_recorder, "observe", side_effect=RuntimeError("boom")), \
-                self.assertLogs("atrinik_bot.tasks", "ERROR"):
-            self.assertEqual(tasks.observe_fight(client), 0)
+        with patch.object(client.fight_recorder, "observe", side_effect=RuntimeError("boom")):
+            with self.assertLogs("atrinik_bot.tasks", "ERROR") as logged:
+                self.assertEqual(tasks.observe_fight(client), 0)
+                # A repeat is counted, not logged again every step.
+                for _ in range(5):
+                    self.assertEqual(tasks.observe_fight(client), 0)
+                tasks.log.error("marker")
+            self.assertEqual(len(logged.records), 2)
+            self.assertEqual(client.fight_recorder.failures, 5)
+            client.fight_recorder.failure_reported_at -= tasks.FIGHT_ERROR_REPORT_SECONDS
+            with self.assertLogs("atrinik_bot.tasks", "ERROR") as logged:
+                tasks.observe_fight(client)
+            self.assertEqual([record.getMessage() for record in logged.records],
+                             ["fight recorder failed 6 more times"])
         row = {"character": "Sera", "started": 1.0, "ended": 2.0, "map": "/t", "x": 1, "y": 1,
                "cell": "cell:/t:0,0", "feature": "room", "reach": 5, "peak_attackers": 1,
                "ranged_attackers": 0, "ranged_covered": 0, "hostiles_in_view": 1,

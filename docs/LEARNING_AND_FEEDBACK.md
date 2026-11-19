@@ -1816,8 +1816,9 @@ from 4.2 and 4.7, the code follows the server:
   (`BEHAVIOR_OPEN_DOORS`, `types/door.c`) stand in the open doorway.
   Locked gates and static blockers do not. Walkability is the player's
   (`MapNode.walkable`), so a flying or swimming monster on water is not
-  counted. Off the map counts as standable only on a map with tiled
-  neighbours.
+  counted. Off the map counts as standable only in a direction another
+  map is tiled to (`tile_path_1` to `_8` or a coordinate neighbour, by
+  the side or corner the world graph puts its edge on).
 - **Features** are taken in order: `corridor` (reach 2, opposite each
   other), `doorway` (a door on or next to her square, or walls on two
   opposite sides with at least 7 of the 10 squares in the two rows beyond
@@ -1826,20 +1827,33 @@ from 4.2 and 4.7, the code follows the server:
   A dead end has reach 1 and is a `room`.
 - **A fight** starts at her first combat line (a hit or miss on her, a
   block, dodge or parry, her own hit or kill; server lines only) and ends
-  10 seconds after the last, when she leaves the map, or at her death.
-  The outcome is `died` at her `death` decision, `recalled` after an
-  `emergency-recall` decision in the fight, `won` when she killed
-  something, else `retreated`. A fight is cut after 15 minutes.
+  10 seconds after the last, when she leaves the map other than over a
+  tile seam (a map tiled to the current one continues the fight), or 2
+  seconds after her `death` decision: hits until then count, as in
+  `review_failure`'s window, and the row ends at the death. The outcome is
+  `died`, `recalled` after an `emergency-recall` decision in the fight,
+  `won` when she killed something, else `retreated`; leaving the map
+  follows the same rule. A fight is cut after 15 minutes.
+- **Damage over time is no attacker.** A poisoning pulse ("poison hit you
+  for N (M) poison damage.", `types/poisoning.c` through `attack.c`, under
+  the poisoning archetype's name) and a disease symptom
+  (`types/symptom.c`) name her own force as the hitter. Those names
+  (`poison`, `poisoning`, `symptom`, `disease`) and the names of the
+  poisoning, force, disease and symptom objects she carries neither start
+  a fight nor count as attackers or damage. `review_failure` is
+  unchanged and still counts them, so a fatal fight with a poison pulse
+  can show more peak attackers there than in its row.
 - **The feature is read** when the fight starts and again, with her
   square, when a second distinct attacker hits her within 8 seconds.
   `peak_attackers` uses `review_failure`'s own count
   (`self_improvement.peak_attackers`, now shared) over the fight's hits,
-  so on a fatal fight within the review's 60-second window both agree; a
-  longer fight counts all its hits.
+  so on a fatal fight within the review's 60-second window both agree
+  (damage over time aside, above); a longer fight counts all its hits.
 - **More columns than 4.2:** `x`, `y` (her square at the snapshot),
   `ranged_covered` (ranged or caster monsters in view at the snapshot
-  with a wall or door on the projectile ray, as `bullet_ray_clear`
-  tests), `hostiles_in_view` and `players_in_view` (the most at once),
+  with a wall or door on a cell an aimed bullet crosses before them:
+  `tasks.cover_cells`, the same cells `bullet_ray_clear` tests, so a
+  corner cell covers a diagonal neighbour), `hostiles_in_view` and `players_in_view` (the most at once),
   and `kills`. Ranged means a name marker (`RANGED_RESIDENT_MARKERS`) or
   an authored caster on the map. `ranged_attackers` is the most ranged
   monsters in view, not attackers proven by combat text, which names
@@ -1850,8 +1864,8 @@ from 4.2 and 4.7, the code follows the server:
 - **Bounds:** the engine feeds the recorder once a step, before the
   task's tick; it reads only new server lines, scans the creatures in
   view only during a fight, keeps at most 2,000 hits a fight and 16
-  pending decisions, and never raises (an error is logged and forgets
-  the fight). A row waits at most 0.25 s for a locked database and is
+  pending decisions, and never raises (an error forgets the fight, and
+  is logged once, then counted every 10 minutes). A row waits at most 0.25 s for a locked database and is
   otherwise dropped. Rows are capped at 20,000 a character, oldest
   evicted first, checked every 100 rows; there is no time retention.
 - **Rates** on the panel are summed in SQLite per feature, peak attackers

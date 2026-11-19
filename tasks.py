@@ -323,6 +323,29 @@ def ray_cells(dx: int, dy: int, reach: int) -> tuple[tuple[int, int], ...]:
     return tuple(cells)
 
 
+def ray_split(dx: int, dy: int, reach: int
+              ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """A ray at offset (dx, dy)'s cells (ray_cells, out to reach) before the
+    target cell, and those after it. Off the exact line, the cells no
+    farther than the target (Chebyshev) come before it."""
+    cells = list(ray_cells(dx, dy, reach))
+    if (dx, dy) in cells:
+        index = cells.index((dx, dy))
+        return cells[:index], cells[index + 1:]
+    span = max(abs(dx), abs(dy))
+    return ([cell for cell in cells
+             if max(abs(cell[0]), abs(cell[1])) <= span],
+            [cell for cell in cells
+             if max(abs(cell[0]), abs(cell[1])) > span])
+
+
+def cover_cells(dx: int, dy: int) -> list[tuple[int, int]]:
+    """The cells an aimed bullet at offset (dx, dy) crosses before it,
+    exactly as FarmTask.bullet_ray_clear tests them (its BULLET_RANGE, or
+    farther for a farther target): what gives cover (terrain.covered)."""
+    return ray_split(dx, dy, max(FarmTask.BULLET_RANGE, abs(dx), abs(dy)))[0]
+
+
 def healing_outpaced(client: AtrinikClient, seconds: float = 8.0) -> bool:
     """Whether she lost health across at least two recent heals.
 
@@ -2067,16 +2090,7 @@ class FarmTask(BotTask):
                    origin: tuple[int, int]
                    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
         """The ray's cells before the target cell, and those after it."""
-        dx, dy = x - origin[0], y - origin[1]
-        cells = list(ray_cells(dx, dy, self.BULLET_RANGE))
-        if (dx, dy) in cells:
-            index = cells.index((dx, dy))
-            return cells[:index], cells[index + 1:]
-        span = max(abs(dx), abs(dy))
-        return ([cell for cell in cells
-                 if max(abs(cell[0]), abs(cell[1])) <= span],
-                [cell for cell in cells
-                 if max(abs(cell[0]), abs(cell[1])) > span])
+        return ray_split(x - origin[0], y - origin[1], self.BULLET_RANGE)
 
     def bullet_ray_clear(self, client: AtrinikClient, x: int, y: int,
                          target_id: int, *,
@@ -7342,6 +7356,15 @@ class BindSavebedTask(BotTask):
         self.applied_at = now
 
 
+# Objects in her inventory that hit her as themselves (server poisoning,
+# force, disease and symptom types): no attacker of a fight.
+OWN_FORCE_TYPES = frozenset({c.TYPE_POISONING, c.TYPE_FORCE, c.TYPE_DISEASE,
+                             c.TYPE_SYMPTOM})
+# A failing fight recorder logs its traceback once, then a count at most
+# this often (seconds).
+FIGHT_ERROR_REPORT_SECONDS = 600.0
+
+
 def fight_view(client: AtrinikClient, recorder: terrain.FightRecorder
                ) -> terrain.FightView | None:
     """What this step shows the fight recorder: her square, the new server
@@ -7379,9 +7402,14 @@ def fight_view(client: AtrinikClient, recorder: terrain.FightRecorder
             hostiles.append(terrain.Hostile(m.world_x + x - cx, m.world_y + y - cy, ranged))
         return hostiles, players
 
+    # Her own damage-over-time forces name themselves as the hitter.
+    ignored = frozenset(
+        plain(item.name) for item in state.inventory
+        if item.item_type in OWN_FORCE_TYPES and item.name) if messages else frozenset()
     return terrain.FightView(
         now=time.time(), character=state.player_name, map=m.path,
-        x=m.world_x, y=m.world_y, node=node, messages=messages, scan=scan)
+        x=m.world_x, y=m.world_y, node=node, messages=messages, scan=scan,
+        ignored=ignored)
 
 
 def observe_fight(client: AtrinikClient) -> int:
@@ -7393,14 +7421,24 @@ def observe_fight(client: AtrinikClient) -> int:
         return 0
     try:
         if recorder.ray is None:
-            recorder.ray = ray_cells
+            recorder.ray = cover_cells
         view = fight_view(client, recorder)
         if view is None:
             return 0
         return sum(bool(client.store_fight(row)) for row in recorder.observe(view))
     except Exception:
-        # A broken recorder must not keep failing: forget its fight.
-        log.exception("fight recorder failed")
+        # A broken recorder must not keep failing: forget its fight. A
+        # repeated failure is logged once in full, then counted.
+        now = time.monotonic()
+        failures = getattr(recorder, "failures", 0) + 1
+        reported = getattr(recorder, "failure_reported_at", None)
+        if reported is None:
+            log.exception("fight recorder failed")
+            recorder.failure_reported_at, failures = now, 0
+        elif now - reported >= FIGHT_ERROR_REPORT_SECONDS:
+            log.error("fight recorder failed %d more times", failures)
+            recorder.failure_reported_at, failures = now, 0
+        recorder.failures = failures
         with contextlib.suppress(Exception):
             recorder.reset()
         return 0
