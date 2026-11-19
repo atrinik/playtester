@@ -27,6 +27,8 @@ from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      format_money, map_object_visual_name,
                      update_bank_balance)
 from .equipment import gear_examine_pending, gear_examiner
+from . import terrain
+from .observations import is_player, plain
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
 
@@ -7340,6 +7342,70 @@ class BindSavebedTask(BotTask):
         self.applied_at = now
 
 
+def fight_view(client: AtrinikClient, recorder: terrain.FightRecorder
+               ) -> terrain.FightView | None:
+    """What this step shows the fight recorder: her square, the new server
+    lines and, during a fight, the creatures and players in view (players
+    only counted). None while she is not playing."""
+    state = client.state
+    m = state.map
+    if state.phase != "playing" or not m.path or not state.player_name:
+        recorder.position = None
+        return None
+    count = state.message_count
+    if recorder.position is None or recorder.position > count:
+        # From now on: the history before this step is no fight of ours.
+        recorder.position = count
+    messages = state.messages_since(recorder.position)
+    recorder.position = count
+    graph = getattr(client, "world_graph", None)
+    node = getattr(graph, "nodes", {}).get(m.path) if graph is not None else None
+    def scan() -> tuple[list[terrain.Hostile], int]:
+        content = getattr(client, "authored_content", None)
+        own = plain(state.player_name)
+        casters = getattr(node, "caster_identities", ()) or ()
+        cx, cy = m.width // 2, m.height // 2
+        hostiles: list[terrain.Hostile] = []
+        players = 0
+        for x, y, obj in m.targets():
+            if is_player(obj, own, content):
+                players += 1
+                continue
+            if obj.is_friend or plain(obj.name) == own:
+                continue
+            semantic = map_object_semantic(client, obj).casefold()
+            ranged = (any(marker in semantic for marker in RANGED_RESIDENT_MARKERS) or
+                      any(_same_semantic_identity(identity, semantic) for identity in casters))
+            hostiles.append(terrain.Hostile(m.world_x + x - cx, m.world_y + y - cy, ranged))
+        return hostiles, players
+
+    return terrain.FightView(
+        now=time.time(), character=state.player_name, map=m.path,
+        x=m.world_x, y=m.world_y, node=node, messages=messages, scan=scan)
+
+
+def observe_fight(client: AtrinikClient) -> int:
+    """Feed one engine step to her fight recorder (terrain.py) and keep the
+    fights that ended; returns how many were kept. Recording changes nothing
+    she does and never raises into play."""
+    recorder = getattr(client, "fight_recorder", None)
+    if recorder is None:
+        return 0
+    try:
+        if recorder.ray is None:
+            recorder.ray = ray_cells
+        view = fight_view(client, recorder)
+        if view is None:
+            return 0
+        return sum(bool(client.store_fight(row)) for row in recorder.observe(view))
+    except Exception:
+        # A broken recorder must not keep failing: forget its fight.
+        log.exception("fight recorder failed")
+        with contextlib.suppress(Exception):
+            recorder.reset()
+        return 0
+
+
 class TaskEngine:
     # The pause after an unexpected error in an engine step (seconds): it
     # doubles with each consecutive failed step up to the maximum, and a
@@ -7592,6 +7658,8 @@ class TaskEngine:
 
     async def run(self) -> None:
         while self.running:
+            # Her fight records (terrain.py): read-only, never raises.
+            observe_fight(self.client)
             try:
                 await self._step()
             except ConnectionError as exc:

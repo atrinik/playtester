@@ -159,6 +159,24 @@ def _name_pattern(name: str) -> re.Pattern:
     return re.compile(rf"(?<!\w){re.escape(name)}(?!\w)", re.I)
 
 
+def is_player(obj: Any, own: str, content: "AuthoredContent | None") -> bool:
+    """Whether a visible living object is another player, by its MAP2 name
+    colour: white, or green or red with a name no authored object carries."""
+    name = plain(obj.name)
+    if not name or name == own:
+        return False
+    color = str(obj.name_color).casefold()
+    return color == WHITE or (color in PLAYER_NAME_COLORS and (
+        content is None or name not in content.names))
+
+
+def players_in_view(state: GameState, content: "AuthoredContent | None") -> set[str]:
+    """The folded names of the other players in view."""
+    own = plain(state.player_name)
+    return {plain(obj.name) for _, _, obj in state.map.targets()
+            if is_player(obj, own, content)}
+
+
 @dataclass(slots=True, frozen=True)
 class BookPage:
     title: str
@@ -584,18 +602,7 @@ class ObservationRecorder:
             del self.player_names[next(iter(self.player_names))]
 
     def _players_in_view(self, state: GameState) -> set[str]:
-        content = self.content()
-        own = plain(state.player_name)
-        names: set[str] = set()
-        for _, _, obj in state.map.targets():
-            name = plain(obj.name)
-            if not name or name == own:
-                continue
-            color = obj.name_color.casefold()
-            if color == WHITE or (color in PLAYER_NAME_COLORS and (
-                    content is None or name not in content.names)):
-                names.add(name)
-        return names
+        return players_in_view(state, self.content())
 
     def _remember_view(self, state: GameState) -> set[str]:
         """Players in view now, remembered for as long as the process runs."""

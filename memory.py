@@ -37,6 +37,17 @@ OBSERVATION_REFERENCES = (("facts", "observation_id"),
 FACT_ROW_LIMIT = 20_000
 FACT_PRUNE_EVERY = 100
 FACT_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
+# Fights by terrain (4.2 and 4.7, phase F10, terrain.py): at most this many
+# rows a character, the oldest evicted first, checked every
+# FIGHT_PRUNE_EVERY new rows. A row is best effort: it waits at most
+# FIGHT_SAVE_TIMEOUT for a locked database and is otherwise dropped.
+FIGHT_ROW_LIMIT = 20_000
+FIGHT_PRUNE_EVERY = 100
+FIGHT_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
+FIGHT_COLUMNS = ("id", "started", "ended", "map", "x", "y", "cell", "feature",
+                 "reach", "peak_attackers", "ranged_attackers", "ranged_covered",
+                 "hostiles_in_view", "players_in_view", "kills", "damage_taken",
+                 "seconds", "outcome")
 FACT_COLUMNS = ("id", "kind", "subject", "value", "confidence", "status",
                 "observation_id", "parser", "detail", "inputs", "created_at",
                 "updated_at", "expires_at")
@@ -162,6 +173,35 @@ class BotMemory:
             # (facts.VERSION): a repeat is read again only after it changes.
             _add_column(db, "facts", "inputs TEXT NOT NULL DEFAULT ''")
             _add_column(db, "observations", "facts_version TEXT")
+            # One row a fight (terrain.py): where she stood, how many hit
+            # her at once and how it ended. Counts only: no attacker's or
+            # other player's name.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS fight_positions (
+                       id INTEGER PRIMARY KEY,
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       started REAL NOT NULL,
+                       ended REAL NOT NULL,
+                       map TEXT NOT NULL,
+                       x INTEGER, y INTEGER,
+                       cell TEXT NOT NULL,
+                       feature TEXT NOT NULL,
+                       reach INTEGER,
+                       peak_attackers INTEGER NOT NULL,
+                       ranged_attackers INTEGER NOT NULL,
+                       ranged_covered INTEGER NOT NULL DEFAULT 0,
+                       hostiles_in_view INTEGER NOT NULL DEFAULT 0,
+                       players_in_view INTEGER NOT NULL DEFAULT 0,
+                       kills INTEGER NOT NULL DEFAULT 0,
+                       damage_taken INTEGER NOT NULL,
+                       seconds REAL NOT NULL,
+                       outcome TEXT NOT NULL
+                   )""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS fight_positions_by_age
+                   ON fight_positions (server, account, character, ended)""")
             # The owner's route and map blocks (docs/ROUTING.md 4.7): each a
             # transit wall until ``until`` (wall clock), set and removed only
             # from the loopback dashboard (route_blocks.py).
@@ -179,6 +219,7 @@ class BotMemory:
         self._chat_appends = 0
         self._observation_inserts = 0
         self._fact_inserts = 0
+        self._fight_inserts = 0
 
     @contextmanager
     def _connect(self, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
@@ -521,6 +562,76 @@ class BotMemory:
                 (self.server, self.account, character.casefold(), float(now),
                  inputs, FACT_ROW_LIMIT)).fetchall()
         return [(str(subject), str(value), float(at)) for subject, value, at in rows]
+
+    def record_fight(self, character: str, row: dict[str, Any], *,
+                     timeout: float = FIGHT_SAVE_TIMEOUT) -> int:
+        """Store one fight (``terrain.Fight.row()``); returns its id.
+        ``timeout`` bounds the wait for a locked database."""
+        folded = character.casefold()
+        values = tuple(row[column] for column in FIGHT_COLUMNS[1:])
+        with self._connect(timeout) as db:
+            cursor = db.execute(
+                f"""INSERT INTO fight_positions
+                        (server, account, character, {", ".join(FIGHT_COLUMNS[1:])})
+                    VALUES (?, ?, ?, {", ".join("?" * (len(FIGHT_COLUMNS) - 1))})""",
+                (self.server, self.account, folded, *values))
+            self._fight_inserts += 1
+            if self._fight_inserts % FIGHT_PRUNE_EVERY == 0:
+                db.execute(
+                    """DELETE FROM fight_positions WHERE id IN (
+                           SELECT id FROM fight_positions
+                           WHERE server = ? AND account = ? AND character = ?
+                           ORDER BY ended DESC, id DESC LIMIT -1 OFFSET ?)""",
+                    (self.server, self.account, folded, FIGHT_ROW_LIMIT))
+        return int(cursor.lastrowid)
+
+    def fights(self, character: str, *, limit: int = 100, since: float | None = None,
+               timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her most recent fights, newest first; with ``since``, only those
+        that ended then or later."""
+        query = f"""SELECT {", ".join(FIGHT_COLUMNS)} FROM fight_positions
+                    WHERE server = ? AND account = ? AND character = ?"""
+        params: list[Any] = [self.server, self.account, character.casefold()]
+        if since is not None:
+            query += " AND ended >= ?"
+            params.append(float(since))
+        query += " ORDER BY ended DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), FIGHT_ROW_LIMIT)))
+        with self._connect(timeout) as db:
+            rows = db.execute(query, params).fetchall()
+        return [dict(zip(FIGHT_COLUMNS, row)) for row in rows]
+
+    def fight_buckets(self, character: str, *, now: float, days: int = 60,
+                      timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her fights of the last ``days`` days summed per feature, peak
+        attackers (0, 1, 2, 3 for three or more), ranged monsters in view
+        or not, and whole days of age: a few hundred rows at most, however
+        many fights are kept."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                """SELECT feature, min(3, max(0, peak_attackers)), ranged_attackers > 0,
+                          CAST((? - ended) / 86400 AS INTEGER) AS age,
+                          count(*), sum(max(0, seconds)), sum(max(0, damage_taken)),
+                          sum(outcome = 'died')
+                   FROM fight_positions
+                   WHERE server = ? AND account = ? AND character = ? AND ended >= ?
+                   GROUP BY 1, 2, 3, 4""",
+                (float(now), self.server, self.account, character.casefold(),
+                 float(now) - days * 86400.0)).fetchall()
+        return [{"feature": feature, "attackers": int(attackers), "ranged": bool(ranged),
+                 "age_days": max(0, int(age)), "fights": int(count),
+                 "seconds": float(seconds or 0.0), "damage": float(damage or 0.0),
+                 "deaths": int(deaths or 0)}
+                for feature, attackers, ranged, age, count, seconds, damage, deaths in rows]
+
+    def fight_count(self, character: str, *, timeout: float = 10.0) -> int:
+        """Stored fights."""
+        with self._connect(timeout) as db:
+            (count,) = db.execute(
+                """SELECT count(*) FROM fight_positions
+                   WHERE server = ? AND account = ? AND character = ?""",
+                (self.server, self.account, character.casefold())).fetchone()
+        return int(count)
 
     def set_route_block(self, character: str, subject: str, *, created_at: float,
                         until: float, note: str = "", timeout: float = 10.0) -> None:

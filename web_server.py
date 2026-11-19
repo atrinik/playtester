@@ -31,6 +31,7 @@ from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_far
                          FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
 from . import route_blocks
+from . import terrain
 from .navigation_spots import navigation_spot_catalog
 from .unlocks import gate_counts, unlock_state
 from .operator_assist import (KEY_HEADER, MAX_GOLD_PER_RUN, OperatorAssist,
@@ -1118,6 +1119,12 @@ class WebControlServer:
                     self.client.config, "persist_tile_facts", False)),
                 "authored_index": getattr(self.client, "authored_content", None) is not None}))
             return
+        if method == "GET" and path == "/api/terrain":
+            # Her fights by terrain (terrain.py), read-only: the newest
+            # ?limit=N (up to 200) and the decayed rates over all kept.
+            # Counts only: no attacker's or other player's name is stored.
+            await self._reply(writer, 200, _json_bytes(self._terrain(parse_qs(query))))
+            return
         if method == "GET" and path.startswith("/api/face/"):
             image = self.face_images.png(path[len("/api/face/"):])
             if image is None:
@@ -1192,6 +1199,30 @@ class WebControlServer:
             await self._reply(writer, 200, (STATIC / filename).read_bytes(), content_type)
             return
         await self._reply(writer, 404, _json_bytes({"error": "not found"}))
+
+    def _terrain(self, params: dict[str, list[str]]) -> dict[str, Any]:
+        """The Terrain panel: recent fights and the learned rates."""
+        character = getattr(self.client, "_memory_character", "")
+        fights: list[dict[str, Any]] = []
+        buckets: list[dict[str, Any]] = []
+        total, busy = 0, False
+        try:
+            limit = max(1, min(200, int((params.get("limit") or ["30"])[0])))
+        except ValueError:
+            limit = 30
+        if character:
+            memory = self.client._memory_store()
+            try:
+                # A locked database must not hold up the event loop.
+                fights = memory.fights(character, limit=limit, timeout=KNOWLEDGE_READ_TIMEOUT)
+                buckets = memory.fight_buckets(character, now=time.time(),
+                                               timeout=KNOWLEDGE_READ_TIMEOUT)
+                total = memory.fight_count(character, timeout=KNOWLEDGE_READ_TIMEOUT)
+            except sqlite3.OperationalError:
+                fights, buckets, busy = [], [], True
+        return {"fights": fights, "total": total, "rates": terrain.rates(buckets),
+                "busy": busy,
+                "terrain_known": getattr(self.client, "world_graph", None) is not None}
 
     def _route_block_write(self, data: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Add or remove one owner block; (HTTP status, reply)."""

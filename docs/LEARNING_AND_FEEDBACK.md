@@ -1,9 +1,9 @@
 # Learning from the world and playtester feedback
 
 Status: design proposal. Phases F1 (the observation ledger), F2 (fact
-parsers and tile facts) and F3 (effective item stats) are implemented;
-"F1 as built", "F2 as built" and "F3 as built" in
-section 6 record where they differ from this text. Nothing else here is
+parsers and tile facts), F3 (effective item stats) and F10 (fights by
+terrain) are implemented; "F1 as built", "F2 as built", "F3 as built" and
+"F10 as built" in section 6 record where they differ from this text. Nothing else here is
 implemented, and nothing here changes behaviour until the phased pull
 requests at the end land.
 
@@ -863,8 +863,8 @@ doors), over a 5x5 window:
   monster in view, using the same ray cells as `bullet_ray_clear`
   (COMBAT.md "Aimed bullets").
 
-Whether a monster can attack diagonally past a wall corner was not checked
-in the server; that is exactly why `reach` is learned rather than assumed.
+A monster attacks diagonally past a wall corner: the server's `can_hit`
+checks only distance (F10 as built).
 
 **Recording.** Each engagement writes one `fight_positions` row: the
 feature at the moment the second attacker arrived (or at the start, for one),
@@ -1803,6 +1803,62 @@ aggregate to one draft per region; rejected aggregates are not redrafted.
 *Accept:* a synthetic corridor map yields `reach` 2 and `corridor`; peak
 attackers match `review_failure`'s on recorded fights.
 
+*F10 as built* (`terrain.py`, `memory.py`, `tasks.observe_fight`, the
+Terrain panel on the Farming tab). Where the code and the server differ
+from 4.2 and 4.7, the code follows the server:
+
+- **Diagonal reach is settled.** The Classic server lets a monster hit
+  whatever is within one square in both axes on its own level
+  (`can_hit`, `server/src/types/monster.c`) with no wall check, so a
+  diagonal neighbour reaches her past a wall corner. `reach` counts all
+  8 neighbours; a diagonal pair of opposite squares is a `corridor`. A
+  door counts as standable: monsters that open doors
+  (`BEHAVIOR_OPEN_DOORS`, `types/door.c`) stand in the open doorway.
+  Locked gates and static blockers do not. Walkability is the player's
+  (`MapNode.walkable`), so a flying or swimming monster on water is not
+  counted. Off the map counts as standable only on a map with tiled
+  neighbours.
+- **Features** are taken in order: `corridor` (reach 2, opposite each
+  other), `doorway` (a door on or next to her square, or walls on two
+  opposite sides with at least 7 of the 10 squares in the two rows beyond
+  one of the openings standable), `open`, `room`; `unknown` when her map
+  is not in the world graph (the CLI passes it for `web` and `autoplay`).
+  A dead end has reach 1 and is a `room`.
+- **A fight** starts at her first combat line (a hit or miss on her, a
+  block, dodge or parry, her own hit or kill; server lines only) and ends
+  10 seconds after the last, when she leaves the map, or at her death.
+  The outcome is `died` at her `death` decision, `recalled` after an
+  `emergency-recall` decision in the fight, `won` when she killed
+  something, else `retreated`. A fight is cut after 15 minutes.
+- **The feature is read** when the fight starts and again, with her
+  square, when a second distinct attacker hits her within 8 seconds.
+  `peak_attackers` uses `review_failure`'s own count
+  (`self_improvement.peak_attackers`, now shared) over the fight's hits,
+  so on a fatal fight within the review's 60-second window both agree; a
+  longer fight counts all its hits.
+- **More columns than 4.2:** `x`, `y` (her square at the snapshot),
+  `ranged_covered` (ranged or caster monsters in view at the snapshot
+  with a wall or door on the projectile ray, as `bullet_ray_clear`
+  tests), `hostiles_in_view` and `players_in_view` (the most at once),
+  and `kills`. Ranged means a name marker (`RANGED_RESIDENT_MARKERS`) or
+  an authored caster on the map. `ranged_attackers` is the most ranged
+  monsters in view, not attackers proven by combat text, which names
+  only species.
+- **Privacy:** only counts are stored. Attacker names (combat text, which
+  can name a player in a PvP area) stay in memory for the pack count and
+  are dropped with the fight; players in view are only counted.
+- **Bounds:** the engine feeds the recorder once a step, before the
+  task's tick; it reads only new server lines, scans the creatures in
+  view only during a fight, keeps at most 2,000 hits a fight and 16
+  pending decisions, and never raises (an error is logged and forgets
+  the fight). A row waits at most 0.25 s for a locked database and is
+  otherwise dropped. Rows are capped at 20,000 a character, oldest
+  evicted first, checked every 100 rows; there is no time retention.
+- **Rates** on the panel are summed in SQLite per feature, peak attackers
+  (0, 1, 2, 3+), ranged in view and whole day of age over the last 60
+  days, then weighted with the 7-day half-life at the middle of each day.
+  `fight_positions_total{feature,outcome}` counts stored rows.
+
 **F11. `feat(combat)`: terrain-aware tie-breakers.** The rules in 4.7 behind
 `terrain_tactics`, after a shadow soak and the owner's approval.
 *Accept:* in a synthetic map, a two-monster pack retreat picks the corridor
@@ -1941,8 +1997,10 @@ that needs it: question 1 before F6, question 3 before F6, questions 5 and
 
 ## 8. Known uncertainties
 
-- Monster diagonal attacks past wall corners were not checked, so `reach`
-  in 4.7 is a model to be confirmed by her fights.
+- Monster diagonal attacks past wall corners: checked for F10. The
+  server's `can_hit` has no wall test, so they happen and `reach` counts
+  all 8 neighbours. Whether a monster's *path* can get to a diagonal
+  square past a corner was not checked; her fights confirm it.
 - Whether the client sees the contents of her closed key ring was not
   verified (ROUTING section 7). Key trials rely on the server searching
   containers (`key.c:52-62`), which it does.

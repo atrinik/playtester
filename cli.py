@@ -250,6 +250,8 @@ async def main_async(args: argparse.Namespace) -> None:
         # verifies books with; about 1.3 s, before play starts.
         from .observations import load_authored_content
         client.authored_content = load_authored_content()
+        # The authored walkability her fight records read terrain from.
+        client.world_graph = graph
         # Index gear archetypes by face now, not on her first quiet tick.
         from .equipment import archetypes_by_face
         try:

@@ -22324,7 +22324,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=27", page)
+        self.assertIn(b"/app.js?v=29", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -24977,7 +24977,7 @@ class DashboardSecurityTests(unittest.IsolatedAsyncioTestCase):
                          "default-src 'self'; script-src 'self'; object-src 'none'; "
                          "frame-ancestors 'none'; base-uri 'none'")
         for path in ("/", "/app.js", "/style.css", "/api/state?include=phase",
-                     "/api/knowledge", "/metrics", "/missing"):
+                     "/api/knowledge", "/api/terrain", "/metrics", "/missing"):
             head, _ = await self.raw_get(path)
             self.assertIn(f"Content-Security-Policy: {CONTENT_SECURITY_POLICY}\r\n", head, path)
 
@@ -25873,6 +25873,426 @@ class OwnerBlockRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200, payload)
         self.assertIsNone(self.engine.task)
         self.assertEqual((await self.blocks())["care"], [])
+
+
+def terrain_node(rows, path="/t", doors=(), tiled=False):
+    """A MapNode from rows of text: '.' standable, '#' wall, '+' a door."""
+    node = MapNode(path, width=len(rows[0]), height=len(rows))
+    for y, row in enumerate(rows):
+        for x, char in enumerate(row):
+            node.terrain[(x, y)] = 0 if char == "#" else 1
+            if char == "+":
+                node.doors.add((x, y))
+    node.doors.update(doors)
+    if tiled:
+        node.edges.append(MapEdge(path, "/next", 0, 0, kind="tile"))
+    return node
+
+
+class TerrainTests(unittest.TestCase):
+    """Fights by terrain (terrain.py, docs/LEARNING_AND_FEEDBACK.md F10)."""
+
+    CORRIDOR = ["#######",
+                "#######",
+                "#######",
+                ".......",
+                "#######",
+                "#######",
+                "#######"]
+
+    def test_a_synthetic_corridor_yields_reach_2_and_corridor(self):
+        from .terrain import features
+        self.assertEqual(features(terrain_node(self.CORRIDOR), 3, 3)[:2], ("corridor", 2))
+        turned = ["".join(row[x] for row in self.CORRIDOR) for x in range(7)]
+        self.assertEqual(features(terrain_node(turned), 3, 3)[:2], ("corridor", 2))
+        # A diagonal pair is a corridor too: a monster hits past a corner.
+        diagonal = ["#######"] * 2 + ["##.####", "###.###", "####.##"] + ["#######"] * 2
+        self.assertEqual(features(terrain_node(diagonal), 3, 3)[:2], ("corridor", 2))
+        # Two squares not opposite each other are no corridor; a dead end
+        # has reach 1.
+        bend = ["#######"] * 2 + ["###.###", "###..##", "#######"] + ["#######"] * 2
+        self.assertEqual(features(terrain_node(bend), 3, 3)[:2], ("room", 2))
+        dead_end = ["#######"] * 3 + ["###..##"] + ["#######"] * 3
+        self.assertEqual(features(terrain_node(dead_end), 3, 3)[:2], ("room", 1))
+
+    def test_doorways_open_ground_and_rooms(self):
+        from .terrain import features
+        gap = [".......",
+               ".......",
+               ".......",
+               "###.###",
+               "###.###",
+               "###.###",
+               "###.###"]
+        self.assertEqual(features(terrain_node(gap), 3, 3)[:2], ("doorway", 4))
+        # Beside a door; a door counts as standable for reach.
+        door = self.CORRIDOR[:3] + ["...+..."] + self.CORRIDOR[4:]
+        self.assertEqual(features(terrain_node(door), 4, 3)[:2], ("corridor", 2))
+        room_door = ["#######", "#.....#", "#.....#", "#.....#", "#..+..#", "#.....#", "#######"]
+        self.assertEqual(features(terrain_node(room_door), 3, 3)[:2], ("doorway", 8))
+        self.assertEqual(features(terrain_node(["." * 7] * 7), 3, 3), ("open", 8, 25))
+        # A room's wall: reach 5.
+        self.assertEqual(features(terrain_node(["#######"] * 3 + ["." * 7] * 4), 3, 3)[:2],
+                         ("room", 5))
+        # Seven neighbours but fewer than 20 standable squares: a room.
+        cramped = ["#######", "#######", "##...##", "##...##", "##..###", "#######", "#######"]
+        self.assertEqual(features(terrain_node(cramped), 3, 3)[:2], ("room", 7))
+        self.assertEqual(features(None, 3, 3), ("unknown", None, 0))
+
+    def test_off_the_map_counts_only_where_another_map_continues(self):
+        from .terrain import features
+        rows = ["." * 7] * 7
+        self.assertEqual(features(terrain_node(rows), 0, 0)[:2], ("room", 3))
+        self.assertEqual(features(terrain_node(rows, tiled=True), 0, 0)[:2], ("open", 8))
+
+    def test_cover_follows_the_projectile_ray(self):
+        from .tasks import ray_cells
+        from .terrain import covered
+        node = terrain_node(["." * 9] * 9)
+        self.assertFalse(covered(node, (1, 4), (7, 4), ray_cells))
+        node.terrain[(4, 4)] = 0
+        node.blocked.add((4, 4))
+        self.assertTrue(covered(node, (1, 4), (7, 4), ray_cells))
+        # Beyond the target, or beside the line, a wall gives no cover.
+        self.assertFalse(covered(node, (1, 4), (3, 4), ray_cells))
+        self.assertFalse(covered(node, (1, 5), (7, 5), ray_cells))
+        node.doors.add((4, 5))
+        self.assertTrue(covered(node, (1, 5), (7, 5), ray_cells))
+        self.assertFalse(covered(node, (1, 4), (2, 5), ray_cells))
+        self.assertFalse(covered(None, (1, 4), (7, 4), ray_cells))
+
+    @staticmethod
+    def view(now, messages=(), *, x=3, y=3, node=None, map="/t", hostiles=(),
+             players=0, character="sera"):
+        from .terrain import FightView
+        return FightView(now=now, character=character, map=map, x=x, y=y,
+                         node=node, messages=list(messages), hostiles=list(hostiles),
+                         players=players)
+
+    @staticmethod
+    def line(at, text, msg_type=c.CHAT_TYPE_GAME):
+        return (at, msg_type, "ffffff", text)
+
+    def test_peak_attackers_match_the_failure_review_on_recorded_fights(self):
+        from .self_improvement import review_failure
+        from .terrain import FightRecorder
+        open_node = terrain_node(["." * 7] * 7)
+        fights = [
+            [(100.0, "orc hit you for 5 (-5) slash damage."),
+             (103.0, "orc archer hit you for 3 (-3) pierce damage."),
+             (104.0, "orc misses you!"),
+             (106.0, "kobold hit you for 2 (-2) impact damage."),
+             (120.0, "orc hit you for 9 (-9) slash damage.")],
+            [(200.0, "giant hit you for 30 (-30) impact damage."),
+             (215.0, "giant hit you for 31 (-31) impact damage.")],
+            [(300.0, "You hit wolf for 4 (4) with slash."),
+             (301.0, "wolf hit you for 2 (-2) slash damage."),
+             (302.0, "wolf hit you for 2 (-2) slash damage."),
+             (309.5, "jackal hit you for 1 (-1) slash damage."),
+             (310.0, "Zoey hit you for 7 (-7) slash damage.", c.CHAT_TYPE_CHAT)],
+        ]
+        for script in fights:
+            recorder = FightRecorder()
+            messages = [self.line(at, text, *rest) for at, text, *rest in script]
+            rows = []
+            for message in messages:
+                rows += recorder.observe(self.view(message[0], [message], node=open_node))
+            death = messages[-1][0] + 0.5
+            recorder.note("death", death)
+            rows += recorder.observe(self.view(death + 1, [self.line(death - 0.1, "You have died.")],
+                                               map="/bed"))
+            row, = rows
+            review = review_failure(messages, [], {"time": death, "action": "death"}, [])
+            self.assertEqual(row["outcome"], "died")
+            self.assertEqual(row["peak_attackers"], review.peak_attackers, script)
+            self.assertEqual(row["damage_taken"], review.damage_taken, script)
+            self.assertEqual(row["ended"], death)
+        self.assertEqual(review.peak_attackers, 2)
+
+    def test_the_feature_is_taken_when_the_second_attacker_arrives(self):
+        from .terrain import FightRecorder
+        recorder = FightRecorder()
+        node = terrain_node([".......", ".......", ".......", ".......",
+                             "###.###", "###.###", "###.###"])
+        self.assertEqual(recorder.observe(self.view(10.0, [self.line(10.0, "orc hit you for 1.")],
+                                                    node=node, x=3, y=1)), [])
+        self.assertEqual(recorder.fight.terrain.feature, "open")
+        # She stepped into the corridor before the second one hit.
+        recorder.observe(self.view(12.0, [self.line(12.0, "orc chief hit you for 2.")],
+                                   node=node, x=3, y=5))
+        self.assertEqual((recorder.fight.terrain.feature, recorder.fight.y), ("corridor", 5))
+        # A third does not move it again.
+        recorder.observe(self.view(13.0, [self.line(13.0, "orc archer hit you for 2.")],
+                                   node=node, x=3, y=1))
+        row, = recorder.observe(self.view(30.0, node=node, x=3, y=1))
+        self.assertEqual((row["feature"], row["reach"], row["y"], row["cell"]),
+                         ("corridor", 2, 5, "cell:/t:0,0"))
+        self.assertEqual((row["peak_attackers"], row["outcome"], row["ended"]),
+                         (3, "retreated", 13.0))
+
+    def test_outcomes_won_retreated_recalled_and_died(self):
+        from .terrain import FightRecorder
+        recorder = FightRecorder()
+        hit = lambda at: self.line(at, "orc hit you for 1.")
+        # Won: she killed something and contact ended.
+        recorder.observe(self.view(1.0, [hit(1.0)]))
+        recorder.observe(self.view(2.0, [self.line(2.0, "You killed orc.")]))
+        self.assertEqual(recorder.observe(self.view(11.0)), [])
+        row, = recorder.observe(self.view(12.0))
+        self.assertEqual((row["outcome"], row["kills"], row["seconds"]), ("won", 1, 1.0))
+        # Retreated: she left the map without a kill.
+        recorder.observe(self.view(20.0, [hit(20.0)]))
+        row, = recorder.observe(self.view(21.0, map="/elsewhere"))
+        self.assertEqual(row["outcome"], "retreated")
+        # Recalled: her emergency recall, then the map change.
+        recorder.observe(self.view(30.0, [hit(30.0)]))
+        recorder.note("emergency-recall", 31.0)
+        recorder.observe(self.view(31.5))
+        row, = recorder.observe(self.view(33.0, map="/town"))
+        self.assertEqual(row["outcome"], "recalled")
+        # A death with no fight records nothing; nor do non-combat lines.
+        recorder.note("death", 40.0)
+        self.assertEqual(recorder.observe(self.view(41.0, [self.line(40.5, "You feel hungry.")])), [])
+        self.assertFalse(recorder.active)
+
+    def test_cover_players_and_hostiles_are_counted(self):
+        from .tasks import ray_cells
+        from .terrain import FightRecorder, Hostile
+        recorder = FightRecorder(ray_cells)
+        node = terrain_node(["." * 9] * 9)
+        node.blocked.add((5, 4))
+        hostiles = [Hostile(7, 4, True), Hostile(2, 8, True), Hostile(3, 4)]
+        recorder.observe(self.view(50.0, [self.line(50.0, "orc hit you for 1.")], node=node,
+                                   x=2, y=4, players=2, hostiles=hostiles))
+        recorder.observe(self.view(51.0, node=node, x=2, y=4, players=1, hostiles=hostiles[:1]))
+        row, = recorder.observe(self.view(70.0, node=node))
+        self.assertEqual((row["ranged_attackers"], row["ranged_covered"], row["hostiles_in_view"],
+                          row["players_in_view"]), (2, 1, 3, 2))
+
+    def test_recording_is_bounded(self):
+        from . import terrain
+        recorder = terrain.FightRecorder()
+        messages = [self.line(1.0 + index * 0.001, f"orc{index % 50} hit you for 1.")
+                    for index in range(terrain.MAX_HITS + 500)]
+        recorder.observe(self.view(5.0, messages))
+        self.assertEqual(len(recorder.fight.hits), terrain.MAX_HITS)
+        self.assertEqual(recorder.fight.damage, terrain.MAX_HITS + 500)
+        # A fight lasting past the cap is cut; the next contact starts another.
+        late = 1.0 + terrain.MAX_FIGHT_SECONDS
+        row, = recorder.observe(self.view(late, [self.line(late - 1, "orc hit you for 1.")]))
+        self.assertEqual(row["ended"], late)
+        self.assertFalse(recorder.active)
+        for _ in range(terrain.MAX_NOTES * 3):
+            recorder.note("death", 1.0)
+        self.assertEqual(len(recorder._notes), terrain.MAX_NOTES)
+        recorder.note("step", 1.0)
+        self.assertEqual(len(recorder._notes), terrain.MAX_NOTES)
+
+    def test_another_character_drops_the_fight(self):
+        from .terrain import FightRecorder
+        recorder = FightRecorder()
+        recorder.observe(self.view(1.0, [self.line(1.0, "orc hit you for 1.")]))
+        self.assertEqual(recorder.observe(self.view(30.0, character="other")), [])
+        self.assertFalse(recorder.active)
+
+    def test_rates_weight_days_with_a_seven_day_half_life(self):
+        from .terrain import rates
+        buckets = [
+            {"feature": "open", "attackers": 2, "ranged": False, "age_days": 0, "fights": 2,
+             "seconds": 20.0, "damage": 100.0, "deaths": 1},
+            {"feature": "open", "attackers": 2, "ranged": False, "age_days": 7, "fights": 1,
+             "seconds": 10.0, "damage": 10.0, "deaths": 0},
+            {"feature": "corridor", "attackers": 1, "ranged": True, "age_days": 1, "fights": 1,
+             "seconds": 0.0, "damage": 0.0, "deaths": 0},
+            {"feature": "room", "attackers": "x"},
+        ]
+        corridor, open_ground = rates(buckets)
+        self.assertEqual((corridor["feature"], corridor["damage_per_second"],
+                          corridor["death_rate"]), ("corridor", None, 0.0))
+        recent, old = 0.5 ** (0.5 / 7), 0.5 ** (7.5 / 7)
+        self.assertEqual(open_ground["fights"], 3)
+        self.assertAlmostEqual(open_ground["death_rate"], recent / (2 * recent + old), places=3)
+        self.assertAlmostEqual(open_ground["damage_per_second"],
+                               (100 * recent + 10 * old) / (20 * recent + 10 * old), places=2)
+
+
+class FightStorageTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "memory.sqlite3"
+
+    def client(self):
+        from unittest.mock import AsyncMock
+        client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=str(self.path)))
+        client.send = AsyncMock()
+        client.state.player_name = "Sera"
+        client.state.player_tag = 1
+        client.load_character_memory("Sera")
+        client.state.phase = "playing"
+        m = client.state.map
+        m.path, m.world_x, m.world_y = "/t", 3, 3
+        graph = WorldGraph()
+        graph.nodes["/t"] = terrain_node(TerrainTests.CORRIDOR)
+        client.world_graph = graph
+        return client
+
+    @staticmethod
+    def say(client, text, msg_type=c.CHAT_TYPE_GAME):
+        data = drawinfo(msg_type, "ffffff", text)
+        asyncio.run(client._handle_drawinfo(Cursor(data), data))
+
+    def test_a_fight_in_play_is_stored_by_terrain_with_counts_only(self):
+        from .tasks import observe_fight
+        client = self.client()
+        m = client.state.map
+        self.say(client, "orc hit you for 3 (-3) slash damage.")
+        # The recorder starts reading at its first step: earlier lines are
+        # no fight of hers.
+        self.assertEqual(observe_fight(client), 0)
+        self.assertFalse(client.fight_recorder.active)
+        # A player, an archer and an orc in view (view centre 8,8 is 3,3).
+        m.tile(9, 8).objects[3] = MapObject(3, 1, 0, 0, name="Zoey", name_color="ffffff",
+                                            target_id=7)
+        m.tile(12, 8).objects[3] = MapObject(3, 1, 0, 0, name="orc archer",
+                                             name_color="ff0000", target_id=8)
+        m.tile(7, 8).objects[3] = MapObject(3, 1, 0, 0, name="orc", name_color="ff0000",
+                                            target_id=9)
+        m.tile(8, 8).objects[3] = MapObject(3, 1, 0, 0, name="Sera", name_color="ffffff",
+                                            target_id=1)
+        self.say(client, "orc hit you for 3 (-3) slash damage.")
+        self.say(client, "Zoey hit you for 4 (-4) slash damage.")
+        self.say(client, "Zoey: hello", c.CHAT_TYPE_CHAT)
+        self.assertEqual(observe_fight(client), 0)
+        self.assertTrue(client.fight_recorder.active)
+        self.say(client, "You have died.")
+        self.assertEqual(observe_fight(client), 1)
+        row, = client._memory_store().fights("Sera")
+        self.assertEqual({key: row[key] for key in (
+            "map", "x", "y", "cell", "feature", "reach", "peak_attackers", "ranged_attackers",
+            "ranged_covered", "hostiles_in_view", "players_in_view", "damage_taken", "outcome")},
+            {"map": "/t", "x": 3, "y": 3, "cell": "cell:/t:0,0", "feature": "corridor",
+             "reach": 2, "peak_attackers": 2, "ranged_attackers": 1, "ranged_covered": 0,
+             "hostiles_in_view": 2, "players_in_view": 1, "damage_taken": 7, "outcome": "died"})
+        # No player's name, nor an attacker's, is stored anywhere in the row.
+        with sqlite3.connect(self.path) as db:
+            stored = db.execute("SELECT * FROM fight_positions").fetchall()
+        self.assertNotIn("zoey", repr(stored).casefold())
+        self.assertNotIn("orc", repr(stored).casefold())
+        self.assertEqual(client._memory_store().fight_count("Sera"), 1)
+
+    def test_recording_never_raises_into_play_and_waits_briefly(self):
+        import inspect
+        from . import memory, tasks
+        from .memory import BotMemory
+        self.assertLessEqual(memory.FIGHT_SAVE_TIMEOUT, 0.25)
+        self.assertEqual(inspect.signature(BotMemory.record_fight).parameters["timeout"].default,
+                         memory.FIGHT_SAVE_TIMEOUT)
+        client = self.client()
+        with patch.object(client.fight_recorder, "observe", side_effect=RuntimeError("boom")), \
+                self.assertLogs("atrinik_bot.tasks", "ERROR"):
+            self.assertEqual(tasks.observe_fight(client), 0)
+        row = {"character": "Sera", "started": 1.0, "ended": 2.0, "map": "/t", "x": 1, "y": 1,
+               "cell": "cell:/t:0,0", "feature": "room", "reach": 5, "peak_attackers": 1,
+               "ranged_attackers": 0, "ranged_covered": 0, "hostiles_in_view": 1,
+               "players_in_view": 0, "kills": 0, "damage_taken": 1, "seconds": 1.0,
+               "outcome": "won"}
+        with patch.object(BotMemory, "record_fight",
+                          side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertFalse(client.store_fight(row))
+        with patch.object(BotMemory, "record_fight", side_effect=ValueError("bad")), \
+                self.assertLogs("atrinik_bot.client", "ERROR"):
+            self.assertFalse(client.store_fight(row))
+        # Another character's row, or none logged in, is not kept.
+        self.assertFalse(client.store_fight({**row, "character": "other"}))
+        self.assertTrue(client.store_fight(row))
+        self.assertIn('fight_positions_total{', client.metrics.render())
+        # Not playing: nothing is read, and the cursor restarts on return.
+        client.state.phase = "connecting"
+        self.assertEqual(tasks.observe_fight(client), 0)
+        self.assertIsNone(client.fight_recorder.position)
+
+    def test_rows_are_capped_newest_kept(self):
+        from . import memory
+        store = memory.BotMemory(self.path, server="s", account="a")
+        row = {"started": 0.0, "map": "/t", "x": 1, "y": 1, "cell": "c", "feature": "room",
+               "reach": 5, "peak_attackers": 1, "ranged_attackers": 0, "ranged_covered": 0,
+               "hostiles_in_view": 0, "players_in_view": 0, "kills": 0, "damage_taken": 1,
+               "seconds": 1.0, "outcome": "won"}
+        with patch.object(memory, "FIGHT_ROW_LIMIT", 5), patch.object(memory, "FIGHT_PRUNE_EVERY", 3):
+            for index in range(12):
+                store.record_fight("Sera", {**row, "ended": float(index)})
+        self.assertEqual([fight["ended"] for fight in store.fights("Sera")],
+                         [11.0, 10.0, 9.0, 8.0, 7.0])
+        buckets = store.fight_buckets("Sera", now=86400.0 * 2)
+        self.assertEqual([(b["feature"], b["age_days"], b["fights"]) for b in buckets],
+                         [("room", 1, 5)])
+        self.assertEqual(store.fight_buckets("Sera", now=86400.0 * 90), [])
+
+    def test_the_engine_feeds_the_recorder_every_step(self):
+        from . import tasks
+        client = self.client()
+        engine = TaskEngine(client)
+
+        def stop(observed):
+            engine.running = False
+            return 0
+        with patch.object(tasks, "observe_fight", side_effect=stop) as observed:
+            asyncio.run(engine.run())
+        observed.assert_called_once_with(client)
+
+
+class TerrainRouteTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = WebTests.asyncSetUp
+    asyncTearDown = WebTests.asyncTearDown
+    request = WebTests.request
+
+    async def test_the_terrain_route_reads_her_fights_and_rates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.client.config.character = "Sera"
+            self.client._memory_path = Path(directory) / "memory.sqlite3"
+            self.client.memory = None
+            status, payload = await self.request("GET", "/api/terrain")
+            self.assertEqual((status, json.loads(payload)),
+                             (200, {"fights": [], "total": 0, "rates": [], "busy": False,
+                                    "terrain_known": False}))
+            self.client.state.player_name = "Sera"
+            self.client.load_character_memory("Sera")
+            now = time.time()
+            row = {"character": "Sera", "started": now - 30, "map": "/t", "x": 3, "y": 3,
+                   "cell": "cell:/t:0,0", "feature": "corridor", "reach": 2,
+                   "peak_attackers": 2, "ranged_attackers": 0, "ranged_covered": 0,
+                   "hostiles_in_view": 2, "players_in_view": 0, "kills": 1,
+                   "damage_taken": 20, "seconds": 10.0, "outcome": "won"}
+            for index in range(3):
+                self.assertTrue(self.client.store_fight({**row, "ended": now - 20 + index}))
+            status, payload = await self.request("GET", "/api/terrain?limit=2")
+            body = json.loads(payload)
+            self.assertEqual((status, body["total"], len(body["fights"])), (200, 3, 2))
+            self.assertEqual(body["fights"][0]["ended"], now - 18)
+            rate, = body["rates"]
+            self.assertEqual((rate["feature"], rate["attackers"], rate["ranged"], rate["fights"],
+                              rate["damage_per_second"], rate["death_rate"]),
+                             ("corridor", 2, False, 3, 2.0, 0.0))
+            status, payload = await self.request("GET", "/api/terrain?limit=x")
+            self.assertEqual(len(json.loads(payload)["fights"]), 3)
+            # A locked database answers at once, empty and busy.
+            from .memory import BotMemory
+            with patch.object(BotMemory, "fights",
+                              side_effect=sqlite3.OperationalError("database is locked")):
+                status, payload = await self.request("GET", "/api/terrain")
+            self.assertEqual((status, json.loads(payload)["busy"]), (200, True))
+
+    def test_the_panel_is_built_from_dom_nodes(self):
+        from .web_server import STATIC
+        script = (STATIC / "app.js").read_text()
+        html = (STATIC / "index.html").read_text()
+        panel = script[script.index("function renderTerrain"):script.index("// ---------- polling")]
+        self.assertIn("node(", panel)
+        self.assertNotIn("innerHTML", panel)
+        for element in ("terrain-summary", "terrain-rates", "terrain-fights"):
+            self.assertIn(f'id="{element}"', html)
+        self.assertIn('if (b.dataset.tab === "farming") pollTerrain();', script)
 
 
 if __name__ == "__main__":

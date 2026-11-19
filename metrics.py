@@ -329,6 +329,12 @@ class BotMetrics:
             "facts_total", "Facts first stored, by kind and status.", "kind", "status")
         self.fact_kinds = LabelLimit(32)
         self.fact_statuses = LabelLimit(8)
+        # Fights by terrain (terrain.py): rows stored, by feature and outcome.
+        self.fight_positions = counter(
+            "fight_positions_total", "Fights recorded, by terrain feature and outcome.",
+            "feature", "outcome")
+        self.fight_features = LabelLimit(8)
+        self.fight_outcomes = LabelLimit(8)
 
     def attach(self, engine: Any) -> None:
         """The task engine: task types, and idle time when no task runs."""
@@ -521,6 +527,11 @@ class BotMetrics:
     @_never_raises
     def fact(self, kind: str, status: str) -> None:
         self.facts.inc((*self.base(), self.fact_kinds(kind), self.fact_statuses(status)))
+
+    @_never_raises
+    def fight_position(self, feature: str, outcome: str) -> None:
+        self.fight_positions.inc((*self.base(), self.fight_features(feature),
+                                  self.fight_outcomes(outcome)))
 
     @_never_raises
     def death(self, cause: Any) -> None:
