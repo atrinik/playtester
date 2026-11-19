@@ -51,6 +51,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, NamedTuple, Sequence
 
+from .observations import plain
 from .self_improvement import (PACK_WINDOW_SECONDS, from_server, parse_hit,
                                peak_attackers)
 
@@ -88,12 +89,14 @@ _CONTACT = re.compile(
     re.I)
 _KILL = re.compile(r"^you killed ", re.I)
 # Damage over time from her own forces names the force, not a creature:
-# a poisoning pulse ("poison hit you for N (M) poison damage.", the
+# a poisoning pulse ("poison hit you for N (M) poison damage.", under the
 # poisoning archetype's name; server types/poisoning.c) or a disease's
-# symptom (types/symptom.c). Neither is an attacker nor starts a fight;
-# the names of the poisoning, force, disease and symptom objects she
-# carries are ignored too (FightView.ignored).
-DAMAGE_OVER_TIME = frozenset({"poison", "poisoning", "symptom", "disease"})
+# symptom, which the server names after its disease (disease.c), so
+# "flu hit you ..." (types/symptom.c). Neither is an attacker nor starts a
+# fight. The authored disease names come with each step
+# (FightView.ignored, tasks.disease_names); both sides are compared folded
+# by observations.plain.
+DAMAGE_OVER_TIME = frozenset({"poison"})
 # Hits up to this long after her death notice still belong to the fight,
 # as in the failure review (self_improvement.review_failure).
 DEATH_GRACE_SECONDS = 2.0
@@ -213,8 +216,9 @@ class FightView:
     # Fills hostiles and players when a fight needs them, so a step without
     # a fight never looks at the creatures in view.
     scan: Callable[[], tuple[Sequence[Hostile], int]] | None = None
-    # Folded hitter names that are no attacker: her own damage-over-time
-    # forces (DAMAGE_OVER_TIME is always ignored).
+    # Hitter names (folded by observations.plain) that are no attacker:
+    # authored diseases and her own carried forces (DAMAGE_OVER_TIME is
+    # always ignored).
     ignored: frozenset[str] = frozenset()
 
 
@@ -318,7 +322,7 @@ class FightRecorder:
                     stamp > self.fight.died_at + DEATH_GRACE_SECONDS:
                 rows.append(self._end(self.fight.died_at, "died"))
             hit = parse_hit(text)
-            if hit is not None and hit[0].casefold() in ignored:
+            if hit is not None and plain(hit[0]) in ignored:
                 continue
             if hit is None and not _CONTACT.match(text):
                 continue

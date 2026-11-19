@@ -26130,12 +26130,10 @@ class TerrainTests(unittest.TestCase):
         from .terrain import FightRecorder
         recorder = FightRecorder()
         lines = [self.line(1.0, "poison hit you for 3 (3) poison damage."),
-                 self.line(1.5, "coughing fit hit you for 2 (2) internal damage."),
+                 self.line(1.2, "Poison hit you for 3 (3) poison damage."),
                  self.line(2.0, "Zoey hit you for 9 (-9) slash damage.", c.CHAT_TYPE_CHAT),
                  self.line(2.5, "[a=#charname]Zoey[/a] hit you for 9 (-9) slash damage.")]
-        view = self.view(3.0, lines)
-        view.ignored = frozenset({"coughing fit"})
-        self.assertEqual(recorder.observe(view), [])
+        self.assertEqual(recorder.observe(self.view(3.0, lines)), [])
         self.assertFalse(recorder.active)
         # Within a fight they add neither an attacker nor damage.
         view = self.view(5.0, [self.line(4.0, "orc hit you for 1."),
@@ -26275,6 +26273,25 @@ class FightStorageTests(unittest.TestCase):
         self.assertNotIn("orc", repr(stored).casefold())
         self.assertEqual(client._memory_store().fight_count("Sera"), 1)
 
+    def test_disease_symptoms_from_the_content_are_no_attackers(self):
+        from .tasks import disease_names, observe_fight
+        names = disease_names()
+        # Symptoms carry their disease's authored name (server disease.c).
+        self.assertTrue({"flu", "cold", "pneumonic plague"} <= names, sorted(names))
+        client = self.client()
+        observe_fight(client)
+        self.say(client, "flu hit you for 2 (2) internal damage.")
+        self.say(client, "Pneumonic Plague hit you for 5 (5) internal damage.")
+        self.say(client, "poison hit you for 3 (3) poison damage.")
+        self.assertEqual(observe_fight(client), 0)
+        self.assertFalse(client.fight_recorder.active)
+        # In a fight they add no attacker and no damage.
+        self.say(client, "orc hit you for 1 (-1) slash damage.")
+        self.say(client, "flu hit you for 2 (2) internal damage.")
+        observe_fight(client)
+        self.assertEqual((client.fight_recorder.fight.hits[0][1], len(client.fight_recorder.fight.hits),
+                          client.fight_recorder.fight.damage), ("orc", 1, 1))
+
     def test_recording_never_raises_into_play_and_waits_briefly(self):
         import inspect
         from . import memory, tasks
@@ -26297,6 +26314,18 @@ class FightStorageTests(unittest.TestCase):
                 tasks.observe_fight(client)
             self.assertEqual([record.getMessage() for record in logged.records],
                              ["fight recorder failed 6 more times"])
+            tasks.observe_fight(client)
+        # A step that works reports what was not, and re-arms the traceback.
+        with self.assertLogs("atrinik_bot.tasks", "ERROR") as logged:
+            tasks.observe_fight(client)
+        self.assertEqual([record.getMessage() for record in logged.records],
+                         ["fight recorder failed 1 more times"])
+        self.assertEqual((client.fight_recorder.failures,
+                          client.fight_recorder.failure_reported_at), (0, None))
+        with patch.object(client.fight_recorder, "observe", side_effect=RuntimeError("again")), \
+                self.assertLogs("atrinik_bot.tasks", "ERROR") as logged:
+            tasks.observe_fight(client)
+        self.assertIsNotNone(logged.records[0].exc_info)
         row = {"character": "Sera", "started": 1.0, "ended": 2.0, "map": "/t", "x": 1, "y": 1,
                "cell": "cell:/t:0,0", "feature": "room", "reach": 5, "peak_attackers": 1,
                "ranged_attackers": 0, "ranged_covered": 0, "hostiles_in_view": 1,

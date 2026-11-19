@@ -7365,6 +7365,29 @@ OWN_FORCE_TYPES = frozenset({c.TYPE_POISONING, c.TYPE_FORCE, c.TYPE_DISEASE,
 FIGHT_ERROR_REPORT_SECONDS = 600.0
 
 
+@lru_cache(maxsize=1)
+def disease_names() -> frozenset[str]:
+    """The folded names (and plurals) of the authored diseases (type 158) in
+    the locked content. The server names each symptom after its disease
+    (disease.c), so a symptom's damage reads "flu hit you ...". Diseases and
+    symptoms are system objects the client is never sent, so only the
+    content names them. Loaded once; without content, none."""
+    try:
+        records = load_archetypes()
+    except Exception as error:
+        log.warning("disease names unavailable: %s", error)
+        return frozenset()
+    names: set[str] = set()
+    for arch, record in records.items():
+        attrs = record.get("attrs", {})
+        if str(attrs.get("type", "")).strip() != str(c.TYPE_DISEASE):
+            continue
+        for name in (attrs.get("name") or arch, attrs.get("name_pl")):
+            if name and plain(str(name)):
+                names.add(plain(str(name)))
+    return frozenset(names)
+
+
 def fight_view(client: AtrinikClient, recorder: terrain.FightRecorder
                ) -> terrain.FightView | None:
     """What this step shows the fight recorder: her square, the new server
@@ -7402,8 +7425,9 @@ def fight_view(client: AtrinikClient, recorder: terrain.FightRecorder
             hostiles.append(terrain.Hostile(m.world_x + x - cx, m.world_y + y - cy, ranged))
         return hostiles, players
 
-    # Her own damage-over-time forces name themselves as the hitter.
-    ignored = frozenset(
+    # Damage over time names its force as the hitter: an authored disease
+    # (its symptoms carry its name) or a force she carries.
+    ignored = disease_names() | frozenset(
         plain(item.name) for item in state.inventory
         if item.item_type in OWN_FORCE_TYPES and item.name) if messages else frozenset()
     return terrain.FightView(
@@ -7425,7 +7449,7 @@ def observe_fight(client: AtrinikClient) -> int:
         view = fight_view(client, recorder)
         if view is None:
             return 0
-        return sum(bool(client.store_fight(row)) for row in recorder.observe(view))
+        kept = sum(bool(client.store_fight(row)) for row in recorder.observe(view))
     except Exception:
         # A broken recorder must not keep failing: forget its fight. A
         # repeated failure is logged once in full, then counted.
@@ -7442,6 +7466,12 @@ def observe_fight(client: AtrinikClient) -> int:
         with contextlib.suppress(Exception):
             recorder.reset()
         return 0
+    if getattr(recorder, "failure_reported_at", None) is not None:
+        # Recovered: report what was not, and log the next failure in full.
+        if recorder.failures:
+            log.error("fight recorder failed %d more times", recorder.failures)
+        recorder.failure_reported_at, recorder.failures = None, 0
+    return kept
 
 
 class TaskEngine:

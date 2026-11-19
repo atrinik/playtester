@@ -403,7 +403,9 @@ design is [docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md)
   minutes is cut there. It ends `died` on her death, `recalled` after her
   emergency recall, `won` when she killed something, and `retreated`
   otherwise. Damage over time from her own poisoning or disease ("poison
-  hit you for ...") names no attacker and starts no fight.
+  hit you for ...", or a symptom under its disease's name, "flu hit you
+  for ...", from the authored diseases in the locked content) names no
+  attacker and starts no fight.
 - **The square** is read when the fight starts, and again where she stands
   when a second attacker hits her within 8 seconds. Its `reach` is how
   many of her 8 neighbours a walking monster could stand on, from the
@@ -424,7 +426,8 @@ design is [docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md)
   most 2,000 hits. A row waits at most 0.25 seconds for a locked database
   and is otherwise dropped; at most 20,000 rows a character, oldest
   evicted first. An error in the recorder forgets the fight and never
-  reaches the game loop; it is logged once, then counted every 10 minutes.
+  reaches the game loop; it is logged once, then counted every 10 minutes
+  until a step works again.
 
 The read-only **Terrain** panel on the dashboard's Farming tab lists her
 recent fights and the rates learned per feature, peak attackers and

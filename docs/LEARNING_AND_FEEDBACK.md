@@ -1837,12 +1837,18 @@ from 4.2 and 4.7, the code follows the server:
 - **Damage over time is no attacker.** A poisoning pulse ("poison hit you
   for N (M) poison damage.", `types/poisoning.c` through `attack.c`, under
   the poisoning archetype's name) and a disease symptom
-  (`types/symptom.c`) name her own force as the hitter. Those names
-  (`poison`, `poisoning`, `symptom`, `disease`) and the names of the
-  poisoning, force, disease and symptom objects she carries neither start
-  a fight nor count as attackers or damage. `review_failure` is
-  unchanged and still counts them, so a fatal fight with a poison pulse
-  can show more peak attackers there than in its row.
+  (`types/symptom.c`) name the force as the hitter, and the server names
+  each symptom after its disease (`disease.c`): "flu hit you ...",
+  "pneumonic plague hit you ...". Diseases and symptoms are system
+  objects the client is never sent, so the names come from the locked
+  content: every authored disease archetype's name and plural (type 158;
+  no artifact is a disease), loaded once at start-up
+  (`tasks.disease_names`), plus `poison` and the names of the poisoning
+  and force objects she carries. Both sides are compared folded
+  (`observations.plain`). Such a line neither starts a fight nor counts
+  as an attacker or damage. A disease a map renames is not covered.
+  `review_failure` is unchanged and still counts them, so a fatal fight
+  with such a pulse can show more peak attackers there than in its row.
 - **The feature is read** when the fight starts and again, with her
   square, when a second distinct attacker hits her within 8 seconds.
   `peak_attackers` uses `review_failure`'s own count
@@ -1865,7 +1871,8 @@ from 4.2 and 4.7, the code follows the server:
   task's tick; it reads only new server lines, scans the creatures in
   view only during a fight, keeps at most 2,000 hits a fight and 16
   pending decisions, and never raises (an error forgets the fight, and
-  is logged once, then counted every 10 minutes). A row waits at most 0.25 s for a locked database and is
+  is logged once, then counted every 10 minutes; the next step that
+  works reports the count and re-arms the full log). A row waits at most 0.25 s for a locked database and is
   otherwise dropped. Rows are capped at 20,000 a character, oldest
   evicted first, checked every 100 rows; there is no time retention.
 - **Rates** on the panel are summed in SQLite per feature, peak attackers

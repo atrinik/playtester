@@ -259,6 +259,9 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception as error:
             logging.getLogger(__name__).warning(
                 "gear archetype index unavailable: %s", error)
+        # And the disease names her fight records ignore, now too (never raises).
+        from .tasks import disease_names
+        disease_names()
         bundle = getattr(args, "bundle", None)
         if bundle is not None:
             client.farm_analyzer = FarmAnalyzer.from_bundle(bundle)
