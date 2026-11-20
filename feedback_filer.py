@@ -227,7 +227,24 @@ def _dict(data: Any) -> dict[str, Any]:
 
 
 # Anything shaped like a JWT or a GitHub token, whoever's.
-_CREDENTIAL_SHAPES = re.compile(r"eyJ[\w-]*(?:\.[\w-]*){0,2}|\bgh[a-z]_\w+|\bgithub_pat_\w+")
+# No word boundary before the prefixes: "token_ghs_..." must match too.
+_CREDENTIAL_SHAPES = re.compile(
+    r"eyJ[\w-]*(?:\.[\w-]*){0,2}|gh[a-z]_\w+|github_pat_\w+"
+    r"|(?<![A-Za-z0-9])v1\.[0-9a-f]{40}(?![0-9a-f])")
+
+
+def _block_sigterm() -> bool:
+    """Hold SIGTERM back (it stays pending) while the run cleans up."""
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        return True
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _unblock_sigterm(blocked: bool) -> None:
+    if blocked:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
 
 
 def _redact(text: str, auth: str) -> str:
@@ -426,12 +443,31 @@ class Filer:
     # -- the queue -------------------------------------------------------
     def recover(self) -> None:
         """Items a crashed run left behind: ``checking`` goes back to
-        ``approved`` (nothing was created); ``filing`` becomes ``failed``,
-        since GitHub may have created the issue."""
+        ``approved`` (nothing was created). ``filing`` whose create the audit
+        shows succeeded (or whose URL was kept) is filed, unverified
+        (``filed-unlabelled`` for an issue: its labels and type were never
+        read back); any other ``filing`` becomes ``failed``, since GitHub
+        may have created it."""
         for item in self.memory.feedback_items(self.character, status="checking", limit=1000):
             self.memory.update_feedback(self.character, item["id"], expect_status=("checking",),
                                         fields={"status": "approved"})
         for item in self.memory.feedback_items(self.character, status="filing", limit=1000):
+            url = item.get("issue_url") or ""
+            if not url:
+                created = [row for row in self.memory.feedback_filings(item_id=item["id"])
+                           if row["request"].startswith("POST /repos/") and
+                           200 <= int(row["http_status"] or 0) < 300 and row["issue_url"]]
+                url = created[-1]["issue_url"] if created else ""
+            if url:
+                comment = "#issuecomment-" in url
+                self.memory.update_feedback(
+                    self.character, item["id"], expect_status=("filing",),
+                    fields={"status": "filed" if comment else "filed-unlabelled",
+                            "issue_url": url,
+                            "error": None if comment else (
+                                "a filer run stopped after creating it: labels and type "
+                                "were not read back")})
+                continue
             self.memory.update_feedback(
                 self.character, item["id"], expect_status=("filing",),
                 fields={"status": "failed", "error": (
@@ -500,9 +536,15 @@ class Filer:
                                f"internal error ({error.__class__.__name__}); nothing "
                                "more was sent for it")
         finally:
-            self.close()
-            if previous is not None:
-                signal.signal(signal.SIGTERM, previous)
+            # A SIGTERM now waits until the token is revoked and the key
+            # forgotten, then reaches the handler the run started with.
+            blocked = _block_sigterm()
+            try:
+                self.close()
+            finally:
+                if previous is not None:
+                    signal.signal(signal.SIGTERM, previous)
+                _unblock_sigterm(blocked)
         return 1 if self.failures else 0
 
     @staticmethod
@@ -624,15 +666,17 @@ class Filer:
 
     def close(self) -> None:
         """Revoke this run's tokens and forget them, also while throttled."""
-        for repo, session in list(self._sessions.items()):
-            try:
-                self.github.request("DELETE", "/installation/token",
-                                    auth=f"Bearer {session.token}", repo=repo,
-                                    cleanup=True)
-            except FilingError:
-                pass
-        self._sessions.clear()
-        self._key = None
+        try:
+            for repo, session in list(self._sessions.items()):
+                try:
+                    self.github.request("DELETE", "/installation/token",
+                                        auth=f"Bearer {session.token}", repo=repo,
+                                        cleanup=True)
+                except Exception:
+                    pass
+        finally:
+            self._sessions.clear()
+            self._key = None
 
     def candidates(self, item: dict[str, Any], session: Session,
                    number: int | None) -> list[dict[str, str]]:

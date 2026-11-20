@@ -28829,6 +28829,99 @@ class FeedbackFilingTests(unittest.TestCase):
             self.assertNotIn(jwt, text)
             self.assertNotIn(str(self.key_path), text)
 
+    def test_token_shapes_are_redacted_anywhere(self):
+        from .feedback_filer import _redact
+        legacy = "v1." + "0123456789abcdef" * 2 + "01234567"
+        for text in ("token_ghs_abc123DEF", "aghs_abc123", "x ghp_Zz9 y",
+                     "github_pat_11AB_cd", f"old {legacy} token", "eyJhbGci.eyJ.sig"):
+            cleaned = _redact(text, "")
+            self.assertIn("[redacted]", cleaned, text)
+            for fragment in ("abc123", "Zz9", "11AB", "0123456789abcdef", "eyJ"):
+                self.assertNotIn(fragment, cleaned, text)
+        self.assertEqual(_redact("version v1.2.3 and v1.85.0", ""), "version v1.2.3 and v1.85.0")
+
+    def test_an_interrupted_create_is_recovered_from_the_audit(self):
+        item_id = self.approved()
+        memory = self.game._memory_store()
+        memory.update_feedback("Sera", item_id, expect_status=("approved",),
+                               fields={"status": "filing"})
+        memory.record_feedback_filing({
+            "item_id": item_id, "at": time.time() - 5, "repo": "atrinik/content",
+            "request": "POST /repos/atrinik/content/issues", "http_status": 201,
+            "issue_url": "https://github.com/atrinik/content/issues/55"})
+        github = FakeGitHub()
+        self.filer(github).run()
+        item = self.item(item_id)
+        self.assertEqual((item["status"], item["issue_url"]),
+                         ("filed-unlabelled", "https://github.com/atrinik/content/issues/55"))
+        self.assertIn("not read back", item["error"])
+        self.assertEqual(github.calls, [])
+
+    def test_the_claims_refuse_edits_and_stale_screens(self):
+        memory = self.game._memory_store()
+        # Edited between the duplicate search and the create.
+        first = self.approved()
+        github = FakeGitHub()
+        github.on_search = lambda: memory.update_feedback(
+            "Sera", first, expect_status=("checking",),
+            fields={"updated_at": time.time() + 5})
+        self.filer(github).run()
+        self.assertEqual(self.item(first)["status"], "approved")
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+        self.cli("reject", str(first))
+        # Approved again after the bot's last screen: the claim refuses it.
+        second = self.approved("sign:/test/hall:7,7")
+        stale = self.item(second)
+        memory.update_feedback("Sera", second, expect_status=("approved",),
+                               fields={"decided_at": float(stale["screened_at"]) + 10})
+        github = FakeGitHub()
+        lines = []
+        filer = self.filer(github, out=lines.append)
+        filer.file(stale)
+        self.assertEqual(self.item(second)["status"], "approved")
+        self.assertEqual(github.calls, [])
+        self.assertTrue(any("lost its screen" in line for line in lines))
+
+    def test_sigterm_revokes_the_token_and_waits_during_cleanup(self):
+        import signal
+        from .feedback_filer import Filer
+        # The handler itself: an exit the run's cleanup sees.
+        previous = Filer._on_sigterm()
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        received = []
+        original = signal.signal(signal.SIGTERM, lambda *_: received.append(1))
+        self.addCleanup(signal.signal, signal.SIGTERM, original)
+        # A SIGTERM while creating: the run exits, and still revokes.
+        item_id = self.approved()
+        github = FakeGitHub()
+        fake = github.__call__
+
+        def send(method, url, headers, body):
+            if method == "POST" and url.endswith("/repos/atrinik/content/issues"):
+                os.kill(os.getpid(), signal.SIGTERM)
+            if method == "DELETE":
+                # And one during cleanup: held until revocation is done.
+                os.kill(os.getpid(), signal.SIGTERM)
+                self.assertEqual(received, [])
+            return fake(method, url, headers, body)
+
+        filer = self.filer(send)
+        with self.assertRaises(SystemExit):
+            filer.run()
+        self.assertEqual(github.paths()[-1], "/installation/token")
+        self.assertEqual((filer._sessions, filer._key), ({}, None))
+        # The pending signal reached the handler the run started with.
+        self.assertEqual(received, [1])
+        self.assertIs(signal.getsignal(signal.SIGTERM).__class__, type(lambda: 0))
+        self.assertEqual(self.item(item_id)["status"], "filing")
+        self.filer(FakeGitHub()).run()
+        self.assertEqual(self.item(item_id)["status"], "failed")
+
     def test_helpers(self):
         from .feedback import (clean_body, clean_labels, issue_type, search_terms,
                                fingerprint)

@@ -508,7 +508,10 @@ def _feedback_decide(args: argparse.Namespace, memory, private: list) -> int:
     if feedback.screen([candidate], private):
         print("feedback: not edited: the new text names a private term")
         return 1
-    fields.update(status="draft", edited=1, updated_at=now, error=None, file_anyway=0,
+    # Timestamped only now, after the body was read and screened, so a
+    # bot pass in between cannot count the new text as screened.
+    fields.update(status="draft", edited=1, updated_at=time.time(), error=None,
+                  file_anyway=0,
                   remote_candidates_json=None)
     if not memory.update_feedback(args.character, item_id, fields=fields,
                                   require_screened=True, **scope):

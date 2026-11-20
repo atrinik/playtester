@@ -1919,8 +1919,9 @@ refuses withheld and unscreened items.
 - **The filer** (`atrinik-playtester feedback file [--app-id ID]
   [--app-key-file PATH] [--dry-run] [--limit N]`) takes an exclusive lock
   beside the database, resets an item a crashed run left in `checking` to
-  `approved` and one left in `filing` to `failed` (GitHub may have created
-  it), then files approved items, oldest approval first, at most `--limit`
+  `approved`, marks one left in `filing` `filed-unlabelled` (or `filed`,
+  for a comment) when its audit shows the create succeeded, and `failed`
+  otherwise (GitHub may have created it), then files approved items, oldest approval first, at most `--limit`
   (5) a run. It files an item only when it is not withheld, the running bot
   screened it since its last change *and* since its approval, and it passes
   the filer's own screen with the terms the filer knows (her account,
@@ -1936,7 +1937,9 @@ refuses withheld and unscreened items.
   earlier run goes to `needs-review` (match `earlier-run`) unless the owner
   approved it `--file-anyway`. Any unexpected error fails the item with
   only its error type ("internal error (ValueError)"), never leaving it in
-  `checking` or `filing`. A SIGTERM ends the run through the same cleanup.
+  `checking` or `filing`. A SIGTERM ends the run through the same cleanup,
+  and one during the cleanup waits until the token is revoked and the key
+  forgotten.
   The commands refuse to run as anyone but the database file's owner, and
   the lock file is opened without following links, mode 0600.
 - **The credential.** The key is read from `--app-key-file` or the unit's
