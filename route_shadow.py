@@ -581,4 +581,3 @@ def summarise_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"rows": len(rows), "counts": counts,
             "subjects": reasons.most_common(15),
             "differences": differences[-SHADOW_SHOWN:]}
-
