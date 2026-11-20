@@ -271,6 +271,12 @@ def feedback_command(args: argparse.Namespace) -> int:
     if not path.is_file():
         print(f"feedback: no memory database at {path}")
         return 1
+    if path.stat().st_uid != os.geteuid():
+        # SQLite's -wal and -shm files, and the filer's lock, would belong to
+        # another user and could stop the bot from opening its memory.
+        print(f"feedback: run this as the user that owns {path} (the bot's service "
+              "user)")
+        return 2
     writes = args.feedback_command in FEEDBACK_WRITES
     server = f"{args.host.casefold()}:{args.port}"
     # Read-only for list and show: nothing is created, migrated or changed.
@@ -472,6 +478,8 @@ def _feedback_decide(args: argparse.Namespace, memory, private: list) -> int:
         title = feedback.clean_title(args.title) if args.title is not None else item["title"]
         labels = (feedback.clean_labels(args.labels.split(","))
                   if args.labels is not None else feedback.labels(item))
+        # As the filer will send them: with the playtester label, at most ten.
+        feedback.clean_labels([*labels, feedback.FILED_LABEL])
         issue_type = (("" if args.issue_type == "default" else args.issue_type)
                       if args.issue_type is not None else item["issue_type"])
         repo = args.repo or item["repo"]
@@ -518,7 +526,13 @@ def _feedback_file(args: argparse.Namespace, memory, path: Path, private: list) 
     from .feedback_filer import Filer, FilingError, key_path, load_app_key
 
     lock_path = path.with_name(path.name + ".filer.lock")
-    with open(lock_path, "a") as lock:
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW |
+                             os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        print(f"feedback: cannot open the filer's lock: {error.strerror or error}")
+        return 1
+    with os.fdopen(descriptor, "r+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -777,21 +791,19 @@ async def main_async(args: argparse.Namespace) -> None:
     tasks = [asyncio.create_task(client.run())]
     if args.task != "observe":
         tasks.append(asyncio.create_task(engine.run()))
-    screening = None
     if web_server is not None:
         tasks.append(asyncio.create_task(web_server.serve()))
-        # Screens approved and edited feedback with her full private terms,
-        # which the CLI's approve and the filer require (phase F6); it
-        # never ends by itself, so it is cancelled when the rest end.
-        screening = asyncio.create_task(client.screen_feedback_periodically())
+    # Screens approved and edited feedback with her full private terms,
+    # which the CLI's approve and the filer require (phase F6), in every
+    # mode; it never ends by itself, so it is cancelled when the rest end.
+    screening = asyncio.create_task(client.screen_feedback_periodically())
     if client.farm_analyzer is not None:
         tasks.append(asyncio.create_task(
             run_periodically(client.farm_analyzer, client)))
     try:
         await asyncio.gather(*tasks)
     finally:
-        if screening is not None:
-            screening.cancel()
+        screening.cancel()
         if client.farm_analyzer is not None:
             await client.farm_analyzer.close()
         if web_server is not None:

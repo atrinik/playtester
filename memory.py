@@ -1073,13 +1073,14 @@ class BotMemory:
                                  timeout: float = FEEDBACK_SAVE_TIMEOUT
                                  ) -> list[dict[str, Any]]:
         """The items the running bot screens on its poll: every approved
-        item (the filer needs a screen after approval), and every other open
-        item whose text changed since its last screen (an edit)."""
+        item and every item the filer is working on (it needs a screen after
+        approval, and stops filing one withheld meanwhile), and every other
+        open item whose text changed since its last screen (an edit)."""
         with self._connect(timeout) as db:
             rows = db.execute(
                 f"""SELECT {", ".join(FEEDBACK_COLUMNS)} FROM feedback_items
                     WHERE server = ? AND account = ? AND character = ? AND withheld = 0
-                      AND (status = 'approved' OR
+                      AND (status IN ('approved', 'checking', 'filing') OR
                            (status IN ({", ".join("?" * len(FEEDBACK_OPEN_STATUSES))})
                             AND screened_at < updated_at))
                     ORDER BY updated_at LIMIT ?""",
@@ -1090,11 +1091,14 @@ class BotMemory:
     def update_feedback(self, character: str, item_id: int, *, expect_status: Iterable[str],
                         fields: dict[str, Any], updated_at: float | None = None,
                         require_screened: bool = False,
+                        screened_after_decision: bool = False,
                         timeout: float = 10.0) -> bool:
         """Change one item in one statement, only while it is still in one of
         ``expect_status`` (and, with ``updated_at``, its text unchanged since
         it was read; with ``require_screened``, not withheld and screened by
-        the running bot since that change). Returns whether it changed: a
+        the running bot since that change; with ``screened_after_decision``,
+        also screened since the owner's approval: the filer's claim). Returns
+        whether it changed: a
         concurrent change (the bot, another command) leaves it alone."""
         allowed = {"status", "title", "body_md", "labels_json", "issue_type", "repo",
                    "target", "decided_at", "decided_via", "issue_url", "error",
@@ -1111,8 +1115,10 @@ class BotMemory:
         if updated_at is not None:
             query += " AND updated_at = ?"
             params.append(updated_at)
-        if require_screened:
+        if require_screened or screened_after_decision:
             query += " AND withheld = 0 AND screened_at >= updated_at AND updated_at > 0"
+        if screened_after_decision:
+            query += " AND screened_at >= coalesce(decided_at, 0)"
         with self._connect(timeout) as db:
             return db.execute(query, params).rowcount == 1
 

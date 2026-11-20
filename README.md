@@ -539,15 +539,18 @@ atrinik-playtester --host HOST --port 1728 feedback show 12 --markdown
 
 The filer, `atrinik-playtester feedback file`, files approved items one at
 a time: it refuses an item that is withheld or that the running bot has not
-screened since its approval, screens it again itself, checks GitHub for an
+screened since its approval (checked again when it claims the item, so one
+withheld or edited meanwhile is never filed), screens it again itself, checks GitHub for an
 issue with the same fingerprint or the same map in its title (holding a
 match in `needs-review`), creates the issue with the item's labels, the
 `playtester` label and the type (`Bug`, `Feature` or `Task`), reads it
 back, and marks it `filed`, or `filed-unlabelled` when GitHub dropped a
 label or the type. A `comment:` target is posted as a comment instead. It
 files at most 5 items an hour and 20 a day, 60 s apart, honours GitHub's
-`Retry-After` with a back-off from 10 minutes, and stops while GitHub's
-remaining quota is under 50. Every request is a row in her memory's
+`Retry-After` and secondary limits with a back-off from 10 minutes, and
+stops while GitHub's remaining core quota is under 50. It never follows a
+redirect, and an item an earlier run already filed goes to `needs-review`.
+The commands run only as the user that owns her memory database. Every request is a row in her memory's
 `feedback_filings` audit table. Without the App key (or with `--dry-run`)
 it sends nothing, leaves the items approved and prints their Markdown
 copies.
@@ -570,8 +573,14 @@ the key, its path, the JWT or the token. One-time setup before live filing:
 3. Create the `playtester` label in each of the three repositories (the
    filer never creates labels; without it items are filed
    `filed-unlabelled`).
-4. Add the filer's units next to the bot's service, with the bot's user,
-   environment file and runtime state:
+4. Add the filer's units next to the bot's service, with the bot's user
+   and runtime state. Give the filer its own environment file with only
+   what it needs: `ATRINIK_BOT_ACCOUNT` and `ATRINIK_BOT_CHARACTER` (they
+   select her rows), `ATRINIK_BOT_RUNTIME_STATE`, and for its own screen
+   `ATRINIK_BOT_PARTY`, `ATRINIK_BOT_OPERATOR_CHARACTER` and
+   `ATRINIK_BOT_CERTIFICATE_SHA256`. It does not need the game password or
+   invite code: it never logs in, and the running bot's screen with every
+   private term, which the filer requires after each approval, covers them.
 
    ```ini
    # atrinik-playtester-feedback-file.service
@@ -580,11 +589,17 @@ the key, its path, the JWT or the token. One-time setup before live filing:
    # The bot's service user, and the bot service's own environment file
    # (account, character, runtime state and the other private terms).
    User=playtester
-   EnvironmentFile=BOT_ENVIRONMENT_FILE
+   EnvironmentFile=/etc/atrinik-playtester/feedback-filer.env
    Environment=ATRINIK_PLAYTESTER_FEEDBACK_APP_ID=APP_ID
    LoadCredential=feedback-app.pem:/etc/atrinik-playtester/feedback-app.pem
    ExecStart=/opt/atrinik-playtester/current/venv/bin/atrinik-playtester --host HOST --port 1728 feedback file
    NoNewPrivileges=yes
+   LimitCORE=0
+   PrivateTmp=yes
+   ProtectHome=yes
+   ProtectSystem=strict
+   # The directory of ATRINIK_BOT_RUNTIME_STATE (her memory and its lock).
+   ReadWritePaths=STATE_DIRECTORY
 
    # atrinik-playtester-feedback-file.timer
    [Timer]

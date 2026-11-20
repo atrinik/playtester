@@ -1207,6 +1207,7 @@ class WebControlServer:
             params = parse_qs(query)
             character = getattr(self.client, "_memory_character", "")
             items, counts, busy = [], {}, False
+            read_at = time.time()
             if character:
                 memory = self.client._memory_store()
                 try:
@@ -1234,7 +1235,7 @@ class WebControlServer:
                     memory.mark_feedback_screened(
                         character, [item["id"] for item in items if not item["withheld"]],
                         versions={item["id"]: item["updated_at"] for item in items},
-                        timeout=KNOWLEDGE_READ_TIMEOUT)
+                        at=read_at, timeout=KNOWLEDGE_READ_TIMEOUT)
                 except Exception as error:
                     log.warning("feedback screening failed: %s", error)
                     items, busy = [], True

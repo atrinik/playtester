@@ -33,9 +33,12 @@ Markdown copies are printed for the owner to file by hand (the dry run).
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import re
+import signal
+import stat
 import time
 import urllib.error
 import urllib.parse
@@ -66,6 +69,7 @@ REQUEST_TIMEOUT = 30.0
 RESPONSE_LIMIT = 4 * 1024 * 1024
 PAGES = 10
 ERROR_CHARS = 300
+RESPONSE_MESSAGE_CHARS = 4096
 
 Send = Callable[[str, str, dict[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 
@@ -97,19 +101,38 @@ class Session:
     labels: dict[str, str] = field(default_factory=dict)
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: urllib would send the Authorization header
+    to whatever ``Location`` says. A 3xx is returned as the answer."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
 def urllib_send(method: str, url: str, headers: dict[str, str],
                 body: bytes | None) -> tuple[int, dict[str, str], bytes]:
-    """One HTTPS request to the GitHub API with the standard library."""
+    """One HTTPS request to the GitHub API with the standard library; a
+    redirect is never followed."""
     if not url.startswith(API + "/"):
         raise FilingError("refusing a request outside the GitHub API")
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        with _OPENER.open(request, timeout=REQUEST_TIMEOUT) as response:
             return (response.status, {k.casefold(): v for k, v in response.headers.items()},
                     response.read(RESPONSE_LIMIT))
     except urllib.error.HTTPError as error:
-        data = error.read(RESPONSE_LIMIT) if error.fp is not None else b""
+        try:
+            data = error.read(RESPONSE_LIMIT) if error.fp is not None else b""
+        except (OSError, http.client.HTTPException):
+            data = b""
+        finally:
+            error.close()
         return error.code, {k.casefold(): v for k, v in (error.headers or {}).items()}, data
+    except http.client.HTTPException as error:
+        raise FilingError(f"cannot reach GitHub: {error.__class__.__name__}") from None
     except (urllib.error.URLError, OSError) as error:
         # The reason only: never the request, which carries the credential.
         reason = getattr(error, "reason", None) or error.__class__.__name__
@@ -129,12 +152,15 @@ def load_app_key(path: Path) -> Any:
     """The App's RSA private key. The file must be owned by this user or
     root and readable by nobody else. Errors never name the path or show
     its contents."""
+    from cryptography.exceptions import UnsupportedAlgorithm
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 
     try:
         with open(path, "rb") as handle:
             info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise FilingError("the App key is not a regular file")
             data = handle.read(KEY_BYTES)
     except OSError as error:
         raise FilingError(f"cannot read the App key: {error.strerror or 'error'}") from None
@@ -143,7 +169,7 @@ def load_app_key(path: Path) -> Any:
                           "and readable by nobody else (mode 0400 or 0600)")
     try:
         key = serialization.load_pem_private_key(data, password=None)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, UnsupportedAlgorithm):
         raise FilingError("the App key is not an unencrypted PEM private key") from None
     finally:
         del data
@@ -192,7 +218,26 @@ def comment_target(item: dict[str, Any]) -> int | None:
 def _message(response: Response) -> str:
     data = response.data
     message = data.get("message", "") if isinstance(data, dict) else ""
-    return " ".join(str(message).split())[:ERROR_CHARS]
+    return " ".join(str(message).split())[:RESPONSE_MESSAGE_CHARS]
+
+
+def _dict(data: Any) -> dict[str, Any]:
+    """A JSON answer as a dict ({} for anything else)."""
+    return data if isinstance(data, dict) else {}
+
+
+# Anything shaped like a JWT or a GitHub token, whoever's.
+_CREDENTIAL_SHAPES = re.compile(r"eyJ[\w-]*(?:\.[\w-]*){0,2}|\bgh[a-z]_\w+|\bgithub_pat_\w+")
+
+
+def _redact(text: str, auth: str) -> str:
+    """``text`` with the request's credential, and anything shaped like a
+    JWT or a token, removed, in case an answer echoes one. Done before any
+    truncation, so no fragment survives."""
+    for secret in {auth, auth.removeprefix("Bearer ")}:
+        if len(secret) >= 8:
+            text = text.replace(secret, "[redacted]")
+    return _CREDENTIAL_SHAPES.sub("[redacted]", text)
 
 
 class GitHub:
@@ -264,13 +309,14 @@ class GitHub:
     def request(self, method: str, path: str, *, auth: str, body: Any = None,
                 query: dict[str, Any] | None = None, item_id: int | None = None,
                 repo: str = "", audit_url: Callable[[Any], str] | None = None,
-                finishing: bool = False) -> Response:
+                finishing: bool = False, cleanup: bool = False) -> Response:
         """One request; raises ``Throttled`` instead of sending while
         throttled, and ``FilingError`` on a non-2xx answer. ``finishing``
         (reading back an issue just created) is sent despite a low quota
-        noticed in this run, which stops only later requests."""
+        noticed in this run, which stops only later requests; ``cleanup``
+        (revoking this run's token) is sent despite any local wait."""
         retry, reason = self.wait_until()
-        if retry and not (finishing and retry == self.stop_at):
+        if retry and not cleanup and not (finishing and retry == self.stop_at):
             raise Throttled(reason, retry)
         url = API + path + (("?" + urllib.parse.urlencode(query)) if query else "")
         headers = {"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT,
@@ -285,9 +331,14 @@ class GitHub:
         try:
             status, response_headers, raw = self.send(method, url, headers, payload)
         except FilingError as error:
-            row["error"] = str(error)[:ERROR_CHARS]
+            row["error"] = _redact(str(error), auth)[:ERROR_CHARS]
             self.memory.record_feedback_filing(row)
-            raise
+            raise FilingError(row["error"]) from None
+        except Exception as error:
+            # Anything else from the transport: its type only.
+            row["error"] = f"cannot reach GitHub: {error.__class__.__name__}"
+            self.memory.record_feedback_filing(row)
+            raise FilingError(row["error"]) from None
         finally:
             del headers
         try:
@@ -299,18 +350,26 @@ class GitHub:
         row["http_status"] = status
         retry_after = self._retry_after(response, at)
         remaining = response.headers.get("x-ratelimit-remaining", "")
+        message = _redact(_message(response), auth)
         throttled = status == 429 or (status == 403 and (
-            "retry-after" in response.headers or remaining == "0"))
+            "retry-after" in response.headers or remaining == "0" or
+            "rate limit" in message.casefold()))
+        # The floor is for the core quota: the search quota is 30 a minute,
+        # so its remaining count is always under it.
+        resource = response.headers.get("x-ratelimit-resource", "").strip().casefold()
+        limit = response.headers.get("x-ratelimit-limit", "")
+        core = resource == "core" or (not resource and not (limit.isdigit() and
+                                                            int(limit) < 1000))
         if throttled:
             row["retry_at"] = at + self._backoff(retry_after)
-            row["error"] = (f"throttled by GitHub ({status}): " + _message(response))[:ERROR_CHARS]
-        elif remaining.isdigit() and int(remaining) < RATE_FLOOR:
+            row["error"] = (f"throttled by GitHub ({status}): " + message)[:ERROR_CHARS]
+        elif core and remaining.isdigit() and int(remaining) < RATE_FLOOR:
             reset = response.headers.get("x-ratelimit-reset", "")
             self.stop_at = float(reset) if reset.isdigit() else at + BACKOFF_START
             self.stop_reason = f"GitHub's remaining request quota is under {RATE_FLOOR}"
             row["retry_at"] = self.stop_at
         elif not 200 <= status < 300:
-            row["error"] = (f"GitHub answered {status}: " + _message(response))[:ERROR_CHARS]
+            row["error"] = (f"GitHub answered {status}: " + message)[:ERROR_CHARS]
         if 200 <= status < 300 and audit_url is not None:
             row["issue_url"] = audit_url(data)
         self.memory.record_feedback_filing(row)
@@ -426,6 +485,7 @@ class Filer:
         if not self.app_id:
             self.out("ERROR set --app-id (or ATRINIK_PLAYTESTER_FEEDBACK_APP_ID)")
             return 2
+        previous = self._on_sigterm()
         try:
             for item in ready[:max(0, limit)]:
                 try:
@@ -434,16 +494,58 @@ class Filer:
                     when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(error.retry_at))
                     self.out(f"stopped: {error}; trying again after {when}")
                     return 0
+                except Exception as error:
+                    # Never stranded mid-way, and never a request in the text.
+                    self._fail(int(item["id"]), ("checking", "filing"),
+                               f"internal error ({error.__class__.__name__}); nothing "
+                               "more was sent for it")
         finally:
             self.close()
+            if previous is not None:
+                signal.signal(signal.SIGTERM, previous)
         return 1 if self.failures else 0
 
+    @staticmethod
+    def _on_sigterm() -> Any:
+        """Turn SIGTERM (systemd stopping the unit) into an exit through
+        ``close``, so the token is revoked. None off the main thread."""
+        def stop(signum: int, frame: Any) -> None:
+            raise SystemExit(128 + signum)
+        try:
+            return signal.signal(signal.SIGTERM, stop)
+        except ValueError:
+            return None
+
     # -- one item ----------------------------------------------------------
+    def _claim(self, item_id: int, expect: str, status: str, updated_at: float) -> bool:
+        """Move an item on only while it is unwithheld, its text unchanged
+        and screened by the running bot since its change and its approval
+        (one statement: a withhold or an edit in between wins)."""
+        return self.memory.update_feedback(
+            self.character, item_id, expect_status=(expect,), fields={"status": status},
+            updated_at=updated_at, screened_after_decision=True)
+
     def file(self, item: dict[str, Any]) -> None:
         item_id, short = int(item["id"]), feedback.short_fingerprint(item["fingerprint"])
         self.github.check_caps()
-        if not self._set(item_id, ("approved",), status="checking"):
-            self.out(f"#{item_id} {short} changed meanwhile; left alone")
+        if not self._claim(item_id, "approved", "checking", item["updated_at"]):
+            self.out(f"#{item_id} {short} changed, was withheld or lost its screen "
+                     "meanwhile; left alone")
+            return
+        # Exactly the text claimed, screened again here.
+        item = self.memory.feedback_item(self.character, str(item_id)) or {}
+        reason = self.refusal(item) if item.get("status") == "checking" else "changed"
+        if reason:
+            self._set(item_id, ("checking",), status="approved")
+            self.out(f"#{item_id} {short} not filed: {reason}")
+            return
+        if item.get("issue_url") and not item.get("file_anyway"):
+            # A filing an earlier run started may exist: the owner decides.
+            self._set(item_id, ("checking",), status="needs-review",
+                      remote_candidates_json=json.dumps(
+                          [{"url": item["issue_url"], "match": "earlier-run"}]))
+            self.out(f"#{item_id} {short} needs review: an earlier run filed it as "
+                     f"{item['issue_url']}")
             return
         try:
             number = comment_target(item)
@@ -464,7 +566,10 @@ class Filer:
         except FilingError as error:
             self._fail(item_id, ("checking",), str(error))
             return
-        if not self._set(item_id, ("checking",), status="filing"):
+        if not self._claim(item_id, "checking", "filing", item["updated_at"]):
+            self._set(item_id, ("checking",), status="approved")
+            self.out(f"#{item_id} {short} was withheld or changed while it was checked; "
+                     "not filed")
             return
         try:
             if number is None:
@@ -497,7 +602,7 @@ class Filer:
         try:
             installation = self.github.request(
                 "GET", f"/repos/{owner}/{name}/installation", auth=f"Bearer {jwt}", repo=repo)
-            installation_id = (installation.data or {}).get("id")
+            installation_id = _dict(installation.data).get("id")
             if not isinstance(installation_id, int):
                 raise FilingError("the App is not installed on the repository")
             minted = self.github.request(
@@ -506,7 +611,7 @@ class Filer:
                 body={"repositories": [name], "permissions": {"issues": "write"}})
         finally:
             del jwt
-        token = (minted.data or {}).get("token")
+        token = _dict(minted.data).get("token")
         if not isinstance(token, str) or not token:
             raise FilingError("GitHub returned no installation token")
         session = Session(token)
@@ -518,13 +623,12 @@ class Filer:
         return session
 
     def close(self) -> None:
-        """Revoke this run's tokens and forget them (unexpired tokens of a
-        run GitHub throttled lapse within the hour)."""
+        """Revoke this run's tokens and forget them, also while throttled."""
         for repo, session in list(self._sessions.items()):
             try:
                 self.github.request("DELETE", "/installation/token",
                                     auth=f"Bearer {session.token}", repo=repo,
-                                    finishing=True)
+                                    cleanup=True)
             except FilingError:
                 pass
         self._sessions.clear()
@@ -544,7 +648,9 @@ class Filer:
                                          auth=auth, repo=repo, item_id=item_id)
             pattern = issue_url_pattern(repo, comment=True)
             for comment in comments:
-                url = str((comment or {}).get("html_url", ""))
+                if not isinstance(comment, dict):
+                    continue
+                url = str(comment.get("html_url", ""))
                 if pattern.match(url) and short in feedback.fingerprints_outside_code(
                         str(comment.get("body") or "")):
                     found.setdefault(url, "fingerprint")
@@ -557,8 +663,8 @@ class Filer:
             response = self.github.request("GET", "/search/issues", auth=auth, repo=repo,
                                            item_id=item_id,
                                            query={"q": query, "per_page": 30})
-            results = (response.data or {}).get("items", []) if isinstance(
-                response.data, dict) else []
+            results = _dict(response.data).get("items", [])
+            results = results if isinstance(results, list) else []
             for issue in results:
                 if not isinstance(issue, dict) or "pull_request" in issue:
                     continue
@@ -602,15 +708,16 @@ class Filer:
         try:
             back = self.github.request("GET", f"/repos/{repo}/issues/{number}", auth=auth,
                                        repo=repo, item_id=item_id, finishing=True)
-            data = back.data if isinstance(back.data, dict) else {}
-            present = {str(label.get("name", "")).casefold() for label in data.get("labels", [])
+            data = _dict(back.data)
+            shown_labels = data.get("labels")
+            present = {str(label.get("name", "")).casefold()
+                       for label in (shown_labels if isinstance(shown_labels, list) else [])
                        if isinstance(label, dict)}
             missing += [label for label in sendable if label.casefold() not in present]
             shown = data.get("type")
             type_missing = not (isinstance(shown, dict) and shown.get("name") == kind)
-        except Throttled:
-            missing, type_missing = missing + ["(not read back)"], True
-        except FilingError:
+        except Exception:
+            # Throttled, failed or malformed: it exists, unverified.
             missing, type_missing = missing + ["(not read back)"], True
         if missing or type_missing:
             parts = ([f"labels {', '.join(missing)}"] if missing else []) + (

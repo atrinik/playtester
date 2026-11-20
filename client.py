@@ -2188,6 +2188,9 @@ class AtrinikClient:
             return 0
         try:
             memory = self._memory_store()
+            # Marked screened as of the read: an approval after it needs
+            # the next pass.
+            read_at = time.time()
             items = memory.feedback_items_to_screen(character, timeout=FEEDBACK_READ_TIMEOUT)
             versions = {int(item["id"]): item["updated_at"] for item in items}
             newly = feedback.screen(items, self.feedback_private_terms())
@@ -2195,7 +2198,7 @@ class AtrinikClient:
                 memory.withhold_feedback(character, newly, timeout=FEEDBACK_READ_TIMEOUT)
             clean = [int(item["id"]) for item in items if not item["withheld"]]
             memory.mark_feedback_screened(character, clean, versions=versions, refresh=True,
-                                          timeout=FEEDBACK_READ_TIMEOUT)
+                                          at=read_at, timeout=FEEDBACK_READ_TIMEOUT)
             self.feedback_attention = memory.feedback_attention(
                 character, timeout=FEEDBACK_READ_TIMEOUT)
         except Exception as error:

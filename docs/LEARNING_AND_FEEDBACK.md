@@ -1899,7 +1899,8 @@ refuses withheld and unscreened items.
   Approval prints the Markdown copy (`feedback show --markdown` prints it
   again).
 - **Edit** cleans the new text (comment markers and invisible characters
-  removed; one line and 256 characters for a title; at most ten labels),
+  removed; one line and 256 characters for a title; at most ten labels
+  counting the `playtester` label the filer adds),
   keeps the fingerprint footer outside any code block (adding it when the
   body lacks it, refusing a body that shows another fingerprint or leaves a
   code block open), and without `--body-file` renders the body again from
@@ -1908,10 +1909,11 @@ refuses withheld and unscreened items.
   new screen by the running bot and a new approval, and later occurrences
   only raise its counts (its text is the owner's). A `comment:` target must
   be an issue of the item's own repository.
-- **The running bot screens the queue** every 60 s (and the dashboard on
-  each read, as in F5): every approved item, and every open item whose
-  text changed since its last screen (an edit). Only text unchanged since
-  it was read is marked screened. The same pass counts `filed-unlabelled`,
+- **The running bot screens the queue** every 60 s in every mode (and the
+  dashboard on each read, as in F5): every approved item, every item the
+  filer is checking or filing, and every open item whose text changed
+  since its last screen (an edit). Only text unchanged since it was read
+  is marked screened, and as of the read, not of the write. The same pass counts `filed-unlabelled`,
   `needs-review` and `failed` items for the dashboard's alerts, so a live
   poll never reads the database for them.
 - **The filer** (`atrinik-playtester feedback file [--app-id ID]
@@ -1921,10 +1923,22 @@ refuses withheld and unscreened items.
   it), then files approved items, oldest approval first, at most `--limit`
   (5) a run. It files an item only when it is not withheld, the running bot
   screened it since its last change *and* since its approval, and it passes
-  the filer's own screen with the terms the filer knows (the bot's
-  configuration and every chat sender in her memory; names she saw only in
+  the filer's own screen with the terms the filer knows (her account,
+  character, server, party, operator character and certificate pin from its
+  configuration, and every chat sender in her memory; names she saw only in
   a process are known only to that process, which is why the bot's screen
   after approval is required). A failing item is withheld and skipped.
+  These conditions are checked again in the same statement that claims the
+  item (`approved` to `checking`) and again for `checking` to `filing`,
+  with the text unchanged, and the filer files exactly the row it claimed,
+  read again after the claim: an item withheld or edited after the run
+  began is never filed. An item that already has an issue URL from an
+  earlier run goes to `needs-review` (match `earlier-run`) unless the owner
+  approved it `--file-anyway`. Any unexpected error fails the item with
+  only its error type ("internal error (ValueError)"), never leaving it in
+  `checking` or `filing`. A SIGTERM ends the run through the same cleanup.
+  The commands refuse to run as anyone but the database file's owner, and
+  the lock file is opened without following links, mode 0600.
 - **The credential.** The key is read from `--app-key-file` or the unit's
   systemd credential `$CREDENTIALS_DIRECTORY/feedback-app.pem`; the file
   must be owned by the filer's user or root with no group or other access.
@@ -1935,7 +1949,12 @@ refuses withheld and unscreened items.
   and mint a token limited to that one repository with `issues: write`;
   the token is revoked (`DELETE /installation/token`) when the run ends.
   Neither the key, its path, the JWT nor a token is printed, logged, stored
-  or put in an error. The App ID (not secret) comes from `--app-id` or
+  or put in an error: GitHub's error messages are cleaned of the request's
+  credential and of anything shaped like a JWT or token before they are
+  shortened and stored, and transport errors keep only their type. The key
+  file must be a regular file. Requests go only to `https://api.github.com`
+  and never follow a redirect (urllib would resend the `Authorization`
+  header to the new location); a 3xx is a failure. The App ID (not secret) comes from `--app-id` or
   `ATRINIK_PLAYTESTER_FEEDBACK_APP_ID`.
 - **Remote dedup** searches `repo:R is:issue "pt-…"` and, for a new issue,
   `repo:R is:issue in:title "TERM"`, where the term is the subject's map
@@ -1955,12 +1974,15 @@ refuses withheld and unscreened items.
 - **Rate limits** are computed from `feedback_filings` (which has a
   `retry_at` column): at most 5 issues or comments created in an hour and
   20 in a day, at least 60 s after the last create attempt (the filer
-  waits), and no request while any row's `retry_at` is ahead. A 429, or a
-  403 with `Retry-After` or an exhausted quota, waits the longer of
-  `Retry-After` and 10 minutes doubled for each throttle since the last
-  successful create (at most a day); the item goes back to `approved`. A
-  response with `x-ratelimit-remaining` under 50 stops the run until
-  GitHub's reset (an issue just created is still read back). Any other
+  waits), and no request while any row's `retry_at` is ahead (except
+  revoking the run's token). A 429, or a 403 with `Retry-After`, an
+  exhausted quota or a "rate limit" message (GitHub's secondary limits),
+  waits the longer of `Retry-After` and 10 minutes doubled for each
+  throttle since the last successful create (at most a day); the item goes
+  back to `approved`. A response from the `core` quota
+  (`x-ratelimit-resource`) with `x-ratelimit-remaining` under 50 stops the
+  run until GitHub's reset (an issue just created is still read back); the
+  search quota (30 a minute) does not count against that floor. Any other
   non-2xx answer marks the item `failed`.
 - **Dry run.** Without a key (or with `--dry-run`) nothing is sent and no
   audit row is written: approved items stay approved and their Markdown

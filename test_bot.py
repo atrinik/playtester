@@ -27988,7 +27988,11 @@ class FeedbackRouteTests(unittest.IsolatedAsyncioTestCase):
 class FakeGitHub:
     """GitHub's REST API as the filer uses it, recording every call."""
     TOKEN = "ghs_FakeInstallationToken0123456789abcdefXYZ"
-    OK = {"x-ratelimit-remaining": "4000", "x-ratelimit-reset": "0"}
+    # GitHub's per-resource quotas: core 5,000 an hour, search 30 a minute.
+    OK = {"x-ratelimit-resource": "core", "x-ratelimit-limit": "5000",
+          "x-ratelimit-remaining": "4000", "x-ratelimit-reset": "0"}
+    SEARCH = {"x-ratelimit-resource": "search", "x-ratelimit-limit": "30",
+              "x-ratelimit-remaining": "29", "x-ratelimit-reset": "0"}
 
     def __init__(self, *, labels=("bug", "maps", "enhancement", "component: server",
                                   "playtester")):
@@ -28000,6 +28004,7 @@ class FakeGitHub:
         self.queued = {}
         self.issues = {}
         self.jwts = []
+        self.on_search = None
 
     def queue(self, method, path, status, headers=None, body=None):
         self.queued.setdefault((method, path), []).append((status, headers or {}, body))
@@ -28030,8 +28035,10 @@ class FakeGitHub:
         if path.endswith("/labels"):
             return reply(200, [{"name": name} for name in self.labels])
         if path == "/search/issues":
-            return reply(200, {"items": self.search[
-                "title" if "in:title" in query["q"][0] else "fingerprint"]})
+            if self.on_search is not None:
+                self.on_search()
+            return 200, dict(self.SEARCH), json.dumps({"items": self.search[
+                "title" if "in:title" in query["q"][0] else "fingerprint"]}).encode()
         if method == "DELETE" and path == "/installation/token":
             return 204, dict(self.OK), b""
         created = re.fullmatch(r"/repos/(atrinik/\w+)/issues", path)
@@ -28082,6 +28089,13 @@ class FeedbackFilingTests(unittest.TestCase):
                      "--account", "seraacct", "--password", "hunter2",
                      "--character", "Sera", "feedback"]
         self.game = FeedbackClientTests.client(self)
+
+    def dump(self):
+        db = sqlite3.connect(self.path)
+        try:
+            return "\n".join(db.iterdump())
+        finally:
+            db.close()
 
     def cli(self, *args):
         import io
@@ -28298,7 +28312,7 @@ class FeedbackFilingTests(unittest.TestCase):
         created, = [row for row in rows if row["request"] == "POST /repos/atrinik/content/issues"]
         self.assertEqual((created["item_id"], created["http_status"], created["issue_url"]),
                          (item_id, 201, item["issue_url"]))
-        dump = "\n".join(sqlite3.connect(self.path).iterdump())
+        dump = self.dump()
         for secret in (github.TOKEN, jwt, str(self.key_path)):
             self.assertNotIn(secret, dump)
             self.assertNotIn(secret, "\n".join(lines))
@@ -28385,6 +28399,8 @@ class FeedbackFilingTests(unittest.TestCase):
         self.assertEqual(self.filer(github, clock=lambda: now[0], out=lines.append).run(), 0)
         self.assertEqual(self.item(item_id)["status"], "approved")
         self.assertTrue(any("stopped: throttled by GitHub (403)" in line for line in lines))
+        # The token is revoked even while backing off.
+        self.assertEqual(github.paths()[-1], "/installation/token")
         throttled, = [row for row in self.game._memory_store().feedback_filings()
                       if row["http_status"] == 403]
         self.assertAlmostEqual(throttled["retry_at"] - throttled["at"], 600.0, delta=1)
@@ -28590,7 +28606,7 @@ class FeedbackFilingTests(unittest.TestCase):
             served.append(writer.data.decode("utf-8", "replace"))
         state = [
             json.dumps(server.dashboard.snapshot(), default=str),
-            "\n".join(sqlite3.connect(self.path).iterdump()),
+            self.dump(),
             repr(vars(game)), repr(vars(server)), repr(vars(server.dashboard)),
             json.dumps(dict(os.environ)), *served, "\n".join(records), "\n".join(lines)]
         for path in self.root.rglob("*"):
@@ -28618,6 +28634,200 @@ class FeedbackFilingTests(unittest.TestCase):
         self.assertNotIn("feedback_filer", seen)
         self.assertNotIn("cli", seen)
         self.assertIn("web_server", seen)
+
+    def test_search_and_create_in_one_run_with_real_quota_headers(self):
+        # The search quota (30 a minute) is always under the core floor of
+        # 50: it must not stop the run.
+        item_id = self.approved()
+        github = FakeGitHub()
+        self.assertEqual(self.filer(github).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "filed")
+        self.assertIn("/search/issues", github.paths())
+        self.assertIn("/repos/atrinik/content/issues", github.paths("POST"))
+
+    def test_an_item_withheld_after_the_check_is_never_filed(self):
+        from .feedback_filer import Filer
+        memory = self.game._memory_store()
+        # Withheld between the start-of-run check and the claim.
+        first = self.approved()
+        original = Filer.file
+
+        def withheld_first(filer, item):
+            memory.withhold_feedback("Sera", [item["id"]])
+            return original(filer, item)
+
+        github = FakeGitHub()
+        with patch.object(Filer, "file", withheld_first):
+            self.filer(github).run()
+        self.assertEqual(self.item(first)["status"], "approved")
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+        # Withheld while it is checked (during the duplicate search): the
+        # move to filing is refused.
+        self.cli("reject", str(first))
+        second = self.approved("sign:/test/hall:7,7")
+        github = FakeGitHub()
+        github.on_search = lambda: memory.withhold_feedback("Sera", [second])
+        self.filer(github).run()
+        self.assertEqual((self.item(second)["status"], self.item(second)["withheld"]),
+                         ("approved", 1))
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+        # Edited after the check: the claim sees a changed text.
+        third = self.approved("sign:/m:3,3", excerpts=["The gate is shut."])
+        original = Filer.file
+
+        def edited(filer, item):
+            memory.update_feedback("Sera", item["id"], expect_status=("approved",),
+                                   fields={"updated_at": time.time() + 5})
+            return original(filer, item)
+
+        github = FakeGitHub()
+        with patch.object(Filer, "file", edited):
+            self.filer(github).run()
+        self.assertEqual(self.item(third)["status"], "approved")
+        self.assertEqual(github.calls, [])
+
+    def test_unexpected_errors_fail_the_item_and_labels_are_checked_at_edit(self):
+        item_id = self.note()
+        labels = ",".join(f"l{index}" for index in range(10))
+        code, out = self.cli("edit", str(item_id), "--labels", labels)
+        self.assertEqual(code, 2)
+        self.assertIn("more than 10 labels", out)
+        # A row with too many labels anyway (an older edit): failed, not
+        # stranded in filing, and the text names no request.
+        self.game._memory_store().update_feedback(
+            "Sera", item_id, expect_status=("draft",),
+            fields={"labels_json": json.dumps(labels.split(","))})
+        self.cli("approve", str(item_id))
+        self.game.screen_feedback_queue()
+        github = FakeGitHub()
+        self.assertEqual(self.filer(github).run(), 1)
+        item = self.item(item_id)
+        self.assertEqual(item["status"], "failed")
+        self.assertEqual(item["error"], "internal error (ValueError); nothing more was "
+                                        "sent for it")
+        # A read-back that is not an issue at all: filed, unverified.
+        other = self.approved("sign:/test/hall:7,7")
+        github = FakeGitHub()
+        github.queue("GET", "/repos/atrinik/content/issues/100", 200, FakeGitHub.OK, [1, 2])
+        self.filer(github).run()
+        self.assertEqual(self.item(other)["status"], "filed-unlabelled")
+
+    def test_a_secondary_rate_limit_without_retry_after_backs_off(self):
+        item_id = self.approved()
+        github = FakeGitHub()
+        github.queue("POST", "/repos/atrinik/content/issues", 403, {},
+                     {"message": "You have exceeded a secondary rate limit."})
+        self.assertEqual(self.filer(github).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "approved")
+        row = [row for row in self.game._memory_store().feedback_filings()
+               if row["http_status"] == 403][-1]
+        self.assertAlmostEqual(row["retry_at"] - row["at"], 600.0, delta=1)
+
+    def test_an_item_an_earlier_run_filed_needs_review(self):
+        item_id = self.approved()
+        self.game._memory_store().update_feedback(
+            "Sera", item_id, expect_status=("approved",),
+            fields={"status": "failed",
+                    "issue_url": "https://github.com/atrinik/content/issues/41"})
+        self.assertEqual(self.cli("approve", str(item_id))[0], 0)
+        self.game.screen_feedback_queue()
+        github = FakeGitHub()
+        self.filer(github).run()
+        item = self.item(item_id)
+        self.assertEqual(item["status"], "needs-review")
+        self.assertEqual(json.loads(item["remote_candidates_json"]), [
+            {"url": "https://github.com/atrinik/content/issues/41", "match": "earlier-run"}])
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+
+    def test_only_the_database_owner_runs_the_commands_and_keys_are_files(self):
+        from .feedback_filer import FilingError, load_app_key
+        with patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+            code, out = self.cli("list")
+        self.assertEqual(code, 2)
+        self.assertIn("run this as the user that owns", out)
+        with self.assertRaises(FilingError) as raised:
+            load_app_key(Path("/dev/null"))
+        self.assertIn("not a regular file", str(raised.exception))
+        # The lock is never followed through a link.
+        lock = self.path.with_name(self.path.name + ".filer.lock")
+        lock.symlink_to(self.root / "elsewhere")
+        code, out = self.cli("file", "--dry-run")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot open the filer's lock", out)
+        self.assertFalse((self.root / "elsewhere").exists())
+
+    def test_urllib_send_never_follows_a_redirect_or_leaks_on_errors(self):
+        import http.server
+        import logging
+        import threading
+        from . import feedback_filer
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def answer(self):
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                if self.path.startswith("/redirect"):
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{port}/steal")
+                    self.end_headers()
+                elif self.path.endswith("/installation"):
+                    # An answer that echoes the credential.
+                    body = json.dumps({"message": "bad " + self.headers["Authorization"]})
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body.encode())
+                else:
+                    self.close_connection = True
+                    self.connection.close()
+
+            do_GET = do_POST = do_DELETE = answer
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        api = f"http://127.0.0.1:{port}"
+        env = {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}
+        with patch.object(feedback_filer, "API", api), patch.dict(os.environ, env):
+            status, _, _ = feedback_filer.urllib_send(
+                "GET", f"{api}/redirect", {"Authorization": "Bearer secret-value-123"}, None)
+            self.assertEqual(status, 302)
+            self.assertEqual([path for _, path, _ in seen], ["/redirect"])
+            with self.assertRaises(feedback_filer.FilingError) as raised:
+                feedback_filer.urllib_send("GET", f"{api}/drop", {}, None)
+            self.assertNotIn("Traceback", str(raised.exception))
+            # A whole run through urllib_send: a 500 echoing the JWT, then a
+            # dropped connection; nothing keeps either credential.
+            item_id = self.approved()
+            records = []
+
+            class Keep(logging.Handler):
+                def emit(self, record):
+                    records.append(self.format(record))
+
+            handler = Keep()
+            logging.getLogger().addHandler(handler)
+            lines = []
+            try:
+                filer = self.filer(None, out=lines.append)
+                filer.github.send = feedback_filer.urllib_send
+                self.assertEqual(filer.run(), 1)
+            finally:
+                logging.getLogger().removeHandler(handler)
+        jwt = [auth for _, path, auth in seen if path.endswith("/installation")][0]
+        jwt = jwt.removeprefix("Bearer ")
+        self.assertEqual(self.item(item_id)["status"], "failed")
+        dump = self.dump()
+        self.assertIn("[redacted]", dump)
+        for text in (dump, "\n".join(lines), "\n".join(records)):
+            self.assertNotIn(jwt, text)
+            self.assertNotIn(str(self.key_path), text)
 
     def test_helpers(self):
         from .feedback import (clean_body, clean_labels, issue_type, search_terms,
