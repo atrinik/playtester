@@ -29058,6 +29058,81 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         self.deaths_on_blocked()
         self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/detour_1")
 
+    def vendors(self):
+        from .navigation import DialogueVendor
+        near = DialogueVendor("/blocked", 5, 0, "Near", "/python/generic/merchant.py",
+                              treasure_lists=("random_wand",))
+        far = DialogueVendor("/detour_2", 5, 0, "Far", "/python/generic/merchant.py",
+                             treasure_lists=("random_wand",))
+        return near, far
+
+    def rankings(self):
+        """Where the temple, food and recall rankings send her."""
+        from .navigation import FarmCircuitTask, FoodProfile, temple_food_trip
+        near, far = self.vendors()
+        self.graph.temple_priests = [near, far]
+        self.graph.dialogue_vendors = [near, far]
+        bread = FoodProfile("bread", 100, 5, 0.5, True)
+        circuit = FarmCircuitTask(self.graph, [("/goal", "rat")])
+        with patch.object(self.graph, "dialogue_food_stock", lambda vendor: (bread,)), \
+                patch.object(self.graph, "find_dialogue_vendors",
+                             lambda *args, **kwargs: [near, far]):
+            return (temple_food_trip(self.graph, self.client).navigation.destination,
+                    circuit._new_food_resupply(self.client).navigation.destination,
+                    circuit._new_recall_shopping(self.client).navigation.destination)
+
+    def test_rankings_put_over_budget_vendors_after_safe_ones(self):
+        self.client.config.learned_route_costs = True
+        self.assertEqual(self.rankings(), ("/blocked",) * 3)
+        # A recent death on the nearer vendor's map: a hazard, passed over.
+        self.learn((60, "map:/blocked", "death", 1.0))
+        self.assertEqual(self.rankings(), ("/detour_2",) * 3)
+        # Failures on its exit alone: over the budget, so after the safe one.
+        self.learn((60, "exit:/start:9,0>/blocked", "blocked", 4000.0))
+        self.assertEqual(self.rankings(), ("/detour_2",) * 3)
+        self.assertEqual(self.client.actions(), [])
+
+    async def test_an_owner_block_and_a_budget_override_merge(self):
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.route_blocks.add_block(self.client, self.graph, "/blocked", 3600)
+        self.learn((60, "map:/goal", "death", 1.0))
+        task = self.running(self.trip("cure"))
+        task._plan(self.client)
+        care = task.care
+        self.assertEqual(care.mode, "owner-block")
+        self.assertEqual(set(care.subjects), {"map:/blocked", "map:/goal"})
+        self.assertEqual(care.bounded, ("map:/goal",))
+        self.assertFalse(await task._care_hold(self.client))
+        self.assertTrue(care.cleared)
+        # Hold-fire lasts past the block, while the dangerous destination
+        # is ahead and on it.
+        task.route = task.route[1:]
+        self.assertTrue(task.care_holds_fire("/blocked"))
+        task.route = []
+        self.assertTrue(task.care_holds_fire("/goal"))
+
+    def test_bounded_care_names_every_learned_subject_on_the_route(self):
+        from .navigation import bounded_care_subjects, learned_route
+        graph = WorldGraph()
+        for path in ("/start", "/a", "/b", "/c", "/d", "/goal"):
+            node = MapNode(path, width=10, height=1)
+            node.terrain = {(x, 0): 1 for x in range(10)}
+            graph.nodes[path] = node
+        for source, destination in (("/start", "/a"), ("/a", "/b"), ("/b", "/c"),
+                                    ("/c", "/d"), ("/d", "/goal")):
+            graph.nodes[source].edges.append(MapEdge(source, destination, 9, 0, 0, 0))
+        self.graph = graph
+        self.learn(*[(60, f"map:{path}", "death", 1.0) for path in ("/a", "/b", "/c", "/d")],
+                   (60, "exit:/b:9,0>/c", "blocked", 1000.0))
+        task = self.trip("cure")
+        task._walls = self.route_blocks.owner_walls(self.client)
+        snapshot = task._trip_snapshot(self.client)
+        plan = self.route_costs.drain(learned_route(snapshot))
+        self.assertEqual(plan.care, "bounded")
+        self.assertEqual(set(bounded_care_subjects(plan, snapshot)),
+                         {"map:/a", "map:/b", "map:/c", "map:/d", "exit:/b:9,0>/c"})
+
     def test_one_recent_death_counts_fully_against_the_budget(self):
         # Owner decision, 2026-11-19: a death counts in full for budgets
         # and overrides until it is older than its half-life.
@@ -29357,6 +29432,9 @@ class RouteShadowTests(unittest.TestCase):
 
         for kind in progress:
             shadow.jobs[kind] = self.route_shadow._Job(kind, job(kind), None, time.time())
+        # Round robin: one leads each step, the other only with time left.
+        shadow.step(self.client, budget=0.0)
+        self.assertEqual(sorted(progress.values()), [0, 1])
         shadow.step(self.client, budget=0.0)
         self.assertEqual(progress, {"trip": 1, "farm": 1})
 

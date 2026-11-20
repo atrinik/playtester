@@ -954,6 +954,8 @@ can stop a trip (owner decision). Farm trips use selection instead (below).
   it is older than its half-life (6 h), then decays as everywhere else. So
   one recent death on the only route declines an errand and sends an
   essential trip through the care crossing, as the one-death budget means.
+  The budget weight is therefore a step at 6 h onto the normal decay curve:
+  1800 s up to 6 h, then 900 s at once, halving every 6 h from there.
   Route choice, the strict avoid set and the farm score and caps keep the
   decaying cost, so 4.5's death-rate bounds hold.
 - **Essential trips** are food when hungry or starving, a cure or the
@@ -1874,16 +1876,23 @@ the live plans. Notes against the text above:
 - **Planning probes** (a trip not started: the temple, food and recall
   vendor rankings, `town_safely_reachable`) have no side effects: no
   decision, no metric, no bounded care. They rank by the cheapest route
-  even over its budget, after safe ones (`over_budget`); the trip they
-  rank for decides when it runs. A food probe is food-kind. The town
+  even over its budget, with its threat fields set as for any route, so a
+  learned hazard on it is passed over as before, and every ranking (temple,
+  food, recall) puts an over-budget route after safe ones (`over_budget`);
+  the trip they rank for decides when it runs. A food probe is food-kind. The town
   reach proxy carries her flag and learned model, so with the flag on its
   strict verdict uses learned danger of 900 s or more, as live strict trips
   do.
-- **Care subjects.** A bounded override crosses the subjects that make its
-  learned danger, else (a strict override for content hazards alone) the
-  route's maps in the strict avoid set or with a prior at the avoid level.
-  Hold-fire for a bounded override includes the destination when it is
-  one of them; an owner-blocked destination still is no crossing.
+- **Care subjects.** A bounded override crosses every subject on its route
+  with learned danger at the strict level (900 s), else every one with
+  any, else (a strict override for content hazards alone) the route's maps
+  in the strict avoid set or with a prior at the avoid level. Hold-fire
+  for a bounded override includes the destination when it is one of them;
+  an owner-blocked destination still is no crossing. A route both blocked
+  and over budget waits as an owner block (no time limit) and keeps the
+  bounded subjects (`CareCrossing.bounded`): hold-fire lasts until neither
+  a crossed block nor a bounded subject is left here or ahead, and only
+  the blocks' expiry ends its wait.
 - **Strict.** The avoid set is today's with learned danger of 900 s or more
   in place of `route_hazards` (a test compares the sets); within it the
   search is weighted. An essential strict trip with no strict route takes
@@ -1897,9 +1906,12 @@ the live plans. Notes against the text above:
   least one state expansion. At most one trip and one farm comparison are
   in flight, a trip every 15 s at most and the same trip (kind, map,
   destination, live route) every 10 minutes; the farm score every 5
-  minutes unless its inputs change, and never within 30 s. Each job in
-  flight advances at least one expansion a step, so neither starves the
-  other. The engine steps the shadow after every step, with or without a
+  minutes unless its inputs change, and never within 30 s. The jobs in
+  flight take turns leading a step: the leader may use the whole 20 ms and
+  always advances one expansion, the other only while time is left. A
+  step so costs at most 20 ms plus one expansion of the leader (a state, a
+  chokepoint reach or one spot's search), and each job leads every other
+  step. The engine steps the shadow after every step, with or without a
   task, so rows are written while she idles, and once more at shutdown. A
   comparison still running after 3 minutes is dropped. Every hook catches
   its own errors. A whole-world search takes about 0.4 s, so a comparison

@@ -102,6 +102,7 @@ class RouteShadow:
     _decided: dict[tuple, float] = field(default_factory=dict)
     _farm: tuple[Any, float] = (None, -math.inf)
     _next_flush: float = -math.inf
+    _turn: int = -1
     _warned: bool = False
     skipped: int = 0
     dropped: int = 0
@@ -181,14 +182,24 @@ class RouteShadow:
     # Work.
 
     def step(self, client: Any, budget: float = SHADOW_STEP_SECONDS) -> None:
-        """Advance the comparisons in flight for about ``budget`` seconds:
-        each by at least one state expansion (so neither starves the
-        other), then while time is left. Pending rows are written too, so
+        """Advance the comparisons in flight for about ``budget`` seconds,
+        round robin: the leading job at least one expansion, the rest while
+        time is left. Pending rows are written too, so
         this also runs while no task does (TaskEngine.run)."""
         if self.jobs:
             started = self.monotonic()
             deadline = started + budget
-            for kind in list(self.jobs):
+            # Round robin: each step one job leads and may use the whole
+            # budget (at least one expansion); the others advance only while
+            # time is left. So a step costs at most the budget plus one
+            # expansion of the leading job (a state, a chokepoint reach or
+            # one spot's graph_search), and with N jobs each leads every
+            # Nth step, so none starves.
+            kinds = list(self.jobs)
+            if kinds:
+                self._turn = (self._turn + 1) % len(kinds)
+                kinds = kinds[self._turn:] + kinds[:self._turn]
+            for index, kind in enumerate(kinds):
                 job = self.jobs[kind]
                 if self.clock() - job.started > SHADOW_JOB_MAX_SECONDS:
                     del self.jobs[kind]
@@ -197,9 +208,8 @@ class RouteShadow:
                 result, done = None, False
                 began = self.monotonic()
                 try:
-                    # At least one expansion a step, so a search always
-                    # progresses; then more while the budget lasts.
-                    next(job.generator)
+                    if index == 0:
+                        next(job.generator)
                     while self.monotonic() < deadline:
                         next(job.generator)
                 except StopIteration as stop:

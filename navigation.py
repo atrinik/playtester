@@ -2177,7 +2177,25 @@ def bounded_care_subjects(plan: route_costs.LearnedPlan,
     learned subjects that make its danger, else (an override for content
     hazards alone) the route's maps in the strict avoid set or with a
     content prior at the avoid level, else every map it enters."""
-    subjects = [subject for subject, _ in (plan.cost.worst if plan.cost else ())]
+    view, context = snapshot.context.view, snapshot.context
+    route = plan.route or ()
+
+    def learned_subjects(threshold: float) -> list[str]:
+        found = []
+        for edge in route:
+            if view.budget_danger(edge.destination) >= threshold > 0 or (
+                    threshold <= 0 and view.budget_danger(edge.destination) > 0):
+                found.append(route_blocks.map_subject(edge.destination))
+            subject = context.subject(edge)
+            value = view.edge_danger(subject)
+            if (value >= threshold > 0) or (threshold <= 0 and value > 0):
+                found.append(subject)
+        return found
+
+    # Every subject on the route with learned danger at the strict level,
+    # else every one with any (not the truncated worst list).
+    subjects = (learned_subjects(route_costs.STRICT_LEARNED_AVOID_SECONDS) or
+                learned_subjects(0.0))
     if not subjects:
         priors = snapshot.context.priors
         subjects = [route_blocks.map_subject(edge.destination) for edge in plan.route or ()
@@ -2226,6 +2244,10 @@ class CareCrossing:
     peaks: dict = field(default_factory=dict)
     plateaued: bool = False
     checked_at: float = 0.0
+    # The subjects a budget or strict-plan override (CARE_BOUNDED) crosses;
+    # kept when an owner block makes the crossing CARE_OWNER_BLOCK, so its
+    # destination hold-fire survives the merge.
+    bounded: tuple[str, ...] = ()
 
 
 def care_recall_ready(client: AtrinikClient, *, starving: bool = False) -> bool:
@@ -2597,11 +2619,14 @@ class NavigateTask(BotTask):
             self._plan_client = None
         if not learned:
             self._shadow(client, origin, route, "")
-        if self._crossed:
-            self.require_care(CARE_OWNER_BLOCK, self._crossed, client=client)
-            return route
-        if self._bounded:
-            self.require_care(CARE_BOUNDED, self._bounded, client=client)
+        if self._crossed or self._bounded:
+            # Both may hold at once (a blocked and over-budget route): the
+            # crossing waits as an owner block and keeps the bounded
+            # subjects too.
+            if self._crossed:
+                self.require_care(CARE_OWNER_BLOCK, self._crossed, client=client)
+            if self._bounded:
+                self.require_care(CARE_BOUNDED, self._bounded, client=client)
             return route
         if self.care is not None and self._care_staging is None:
             # A block that expired or was removed, or one already behind
@@ -2650,6 +2675,8 @@ class NavigateTask(BotTask):
             if mode == CARE_OWNER_BLOCK:
                 # An owner block never times out, whatever else asked.
                 care.mode = CARE_OWNER_BLOCK
+        if mode == CARE_BOUNDED:
+            care.bounded = tuple(dict.fromkeys((*care.bounded, *subjects)))
         return care
 
     def _care_ahead(self, map_path: str) -> bool:
@@ -2662,11 +2689,13 @@ class NavigateTask(BotTask):
         if route_blocks.map_subject(map_path) in subjects:
             return True
         # A blocked destination is no crossing (a block is a transit wall);
-        # a dangerous one under a budget or strict override is.
-        bounded = care.mode == CARE_BOUNDED
+        # a dangerous one under a budget or strict override is, also once an
+        # owner block has merged into that crossing.
+        bounded = set(care.bounded)
         return any(
             route_blocks.edge_subject(edge) in subjects or
-            ((bounded or edge.destination != self.destination) and
+            ((edge.destination != self.destination or
+              route_blocks.map_subject(edge.destination) in bounded) and
              route_blocks.map_subject(edge.destination) in subjects)
             for edge in self.route)
 
@@ -2866,7 +2895,8 @@ class NavigateTask(BotTask):
         care.food = self.essential == "food"
         care.starving = care.food and starving_without_food(client)
         if (care.mode == CARE_OWNER_BLOCK and
-                not set(care.subjects) & route_blocks.active_subjects(client)):
+                not (set(care.subjects) - set(care.bounded)) &
+                route_blocks.active_subjects(client)):
             # Every block it waited for expired or was removed meanwhile:
             # plan again, behind whatever walls are left.
             _care_waits(client).pop(care.key, None)
@@ -3054,6 +3084,16 @@ class NavigateTask(BotTask):
             route_shadow.note_live_plan(client, plan)
         if plan.outcome == route_costs.BLOCKED:
             raise OwnerBlockRefusal(plan.reason)
+        # The threat fields describe the route returned, a probe's
+        # over-budget candidate included, so its ranking sees the hazards.
+        hazards = {path for path, seconds in snapshot.context.priors.items()
+                   if seconds >= route_costs.PRIOR_OVERLEVEL_SECONDS}
+        taken = plan.route or plan.candidate or []
+        self._route_threat_maps = {edge.destination for edge in taken
+                                   if edge.destination in hazards}
+        self._threat_fallback = bool(self._route_threat_maps) or any(
+            snapshot.context.view.map_danger(edge.destination) >=
+            route_costs.STRICT_LEARNED_AVOID_SECONDS for edge in taken)
         if plan.route is None:
             if plan.outcome == route_costs.DECLINED:
                 if not live and plan.candidate:
@@ -3068,13 +3108,6 @@ class NavigateTask(BotTask):
             self._record(client, "route-budget-override" if not plan.strict_relaxed
                          else "route-strict-override",
                          route_shadow.plan_detail(plan, self.destination))
-        hazards = {path for path, seconds in snapshot.context.priors.items()
-                   if seconds >= route_costs.PRIOR_OVERLEVEL_SECONDS}
-        self._route_threat_maps = {edge.destination for edge in plan.route
-                                   if edge.destination in hazards}
-        self._threat_fallback = bool(self._route_threat_maps) or any(
-            snapshot.context.view.map_danger(edge.destination) >=
-            route_costs.STRICT_LEARNED_AVOID_SECONDS for edge in plan.route)
         return plan.route
 
     def _shadow(self, client: AtrinikClient,
@@ -8449,8 +8482,9 @@ class FarmCircuitTask(BotTask):
             immediate_roll = any(
                 value.casefold() in ("random_wand", "random_mtools")
                 for value in vendor.treasure_lists)
-            ranked.append((len(route), not immediate_roll, vendor.level,
-                           vendor.name.casefold(), vendor))
+            # Over its budget comes after every safe vendor.
+            ranked.append((navigation.over_budget, len(route), not immediate_roll,
+                           vendor.level, vendor.name.casefold(), vendor))
         vendor = (min(ranked, key=lambda entry: entry[:-1])[-1]
                   if ranked else DialogueVendor(
             "/shattered_islands/world_4_47", 11, 13, "sage",
