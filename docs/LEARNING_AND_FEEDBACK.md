@@ -2,9 +2,10 @@
 
 Status: design proposal. Phases F1 (the observation ledger), F2 (fact
 parsers and tile facts), F3 (effective item stats), F5 (the draft
-feedback queue) and F10 (fights by terrain) are implemented; "F1 as
-built", "F2 as built", "F3 as built", "F5 as built" and "F10 as built" in
-section 6 record where they differ from this text. Nothing else here is
+feedback queue), F6 (owner approval and GitHub filing) and F10 (fights by
+terrain) are implemented; "F1 as built", "F2 as built", "F3 as built",
+"F5 as built", "F6 as built" and "F10 as built" in section 6 record where
+they differ from this text. Nothing else here is
 implemented, and nothing here changes behaviour until the phased pull
 requests at the end land.
 
@@ -26,7 +27,8 @@ all of the following:
    from its hints becomes a feedback item, so the map can be fixed.
 5. **A playtester feedback queue that the owner approves.** Sera collects
    deduplicated findings with evidence in a draft queue on her dashboard.
-   Only an item the owner approves is filed as a GitHub issue: on
+   Only an item the owner approves (with the CLI on CT130) is filed as a
+   GitHub issue: on
    `atrinik/content` for content, on `atrinik/classic` for engine and client
    bugs, and on `atrinik/playtester` for findings about the bot itself. The
    only credential is a small GitHub App with Issues write, whose key only
@@ -256,7 +258,8 @@ reach a square.
   authenticates, and whether it forwards, strips or rewrites `Origin`, was
   not checked: the bot is stopped and contact was limited to GET. The
   check is a single owner-run request (open question 1). The design does
-  not depend on the answer (4.10.5).
+  not depend on the answer: since 2026-11-19 approval is CLI-only and the
+  dashboard has no feedback write route (4.10.5).
 - The page builds HTML with template strings and an `esc` helper
   (`web_static/app.js:8`). Responses send `X-Content-Type-Options: nosniff`
   (`web_server.py:795`) but no Content-Security-Policy.
@@ -380,7 +383,9 @@ is unverified (ROUTING section 7).
    behaviour.
 6. **Nothing leaves the machine without the owner.** Drafts stay local. No
    GitHub request of any kind, searches included, happens before the owner
-   approves an item. The GitHub App key is read only by the filer (4.10.6).
+   approves an item, and she approves only with the CLI on CT130, never on
+   the dashboard (4.10.5). The GitHub App key is read only by the filer
+   (4.10.6).
 7. **The world is shared.** She never changes the world in a way another
    player would notice and could not undo: no one-shot levers, no using up a
    sign's limited readings, no marking a shared book as read (4.4, 4.6).
@@ -502,13 +507,14 @@ CREATE TABLE feedback_items (
   occurrences INTEGER NOT NULL,
   first_seen REAL, last_seen REAL,
   remote_candidates_json TEXT,-- possible existing issues, after approval
-  decided_at REAL, decided_via TEXT,  -- dashboard | cli
+  decided_at REAL, decided_via TEXT,  -- cli (the only way, 4.10.5)
   issue_url TEXT, error TEXT,
   UNIQUE (server, account, character, fingerprint)
 );
 CREATE TABLE feedback_filings (          -- append-only audit
   id INTEGER PRIMARY KEY, item_id INTEGER, at REAL, request TEXT,
-  repo TEXT, http_status INTEGER, issue_url TEXT, error TEXT
+  repo TEXT, http_status INTEGER, issue_url TEXT, error TEXT,
+  retry_at REAL                           -- when GitHub said to come back
 );
 ```
 
@@ -1050,7 +1056,8 @@ itself (section 2's starvation loop, futile casts) go to
   the issue footer (`Playtester fingerprint: pt-4f1c2a9b0d3e`), because
   whether GitHub search indexes HTML comments was not verified. A match
   outside a code block sets `needs-review` with the candidates; the owner then
-  marks it a duplicate or files anyway. No match proceeds to filing.
+  marks it a duplicate (`feedback reject --duplicate URL`) or files anyway
+  (`feedback approve --file-anyway`). No match proceeds to filing.
 - **Existing balance issues.** A `balance` item whose subject matches an
   existing issue (for example
   [atrinik/classic#628](https://github.com/atrinik/classic/issues/628),
@@ -1129,35 +1136,34 @@ from what the maps say.
 
 #### 4.10.5 Approval and dashboard security
 
-- Drafts appear on a dashboard **Feedback** tab: list, filters by kind and
-  repo, the rendered body, and buttons to approve, reject, snooze (7 days)
-  and edit title, body, labels and repo. After approval it shows the
-  filer's duplicate candidates for items in `needs-review`.
+Approval is CLI-only (owner decision, 2026-11-19, question 1). The
+dashboard shows the queue and never changes it.
+
+- **The Feedback tab** lists the items with filters by kind and repo, each
+  body as the plain Markdown text that would be filed (the copy to file by
+  hand), the issue URL once filed, the filer's error, and for an item in
+  `needs-review` the filer's duplicate candidates. It has no buttons that
+  change anything.
 - **Rendering.** All game-derived text is escaped with `esc`
-  (`web_static/app.js:8`). The body preview uses a Markdown renderer that
-  emits no raw HTML, links or images. Every response gains a
-  Content-Security-Policy (`default-src 'self'; script-src 'self';
-  object-src 'none'; frame-ancestors 'none'`). Its default `style-src`
-  blocks inline `style=` attributes, which existing panels use
-  (`app.js:83`, `:280`, `:294`, `:488`), so F1 converts them to CSSOM
-  assignments as `app.js:101` already does, rather than allowing inline
-  styles.
-- **Endpoints.** `GET /api/feedback`, and `POST /api/feedback/<id>` with an
-  action, under the existing loopback and Origin rules
-  (`web_server.py:800-822`).
-- **Approval needs more than reaching the dashboard.** A POST without an
-  `Origin` passes today, and the dashboard is reachable through the lab's
-  reverse proxy, which may or may not forward `Origin` (1.9). So approval,
-  edit and reject actions also require an approval key: a random secret in
-  an owner-only file (mode 0600) outside the repository and state
-  directory, sent in an `X-Playtester-Approval` header that the dashboard
-  asks for once a browser session and keeps in `sessionStorage`. Without
-  the file, the Feedback tab is read-only.
+  (`web_static/app.js:8`) or built as text nodes; bodies are never
+  rendered as Markdown. Every response gains a Content-Security-Policy
+  (`default-src 'self'; script-src 'self'; object-src 'none';
+  frame-ancestors 'none'`). Its default `style-src` blocks inline `style=`
+  attributes, which existing panels use (`app.js:83`, `:280`, `:294`,
+  `:488`), so F1 converts them to CSSOM assignments as `app.js:101` already
+  does, rather than allowing inline styles.
+- **Endpoints.** `GET /api/feedback` only, under the existing loopback and
+  Origin rules (`web_server.py:800-822`). There is no feedback write route
+  of any method, so neither the lab proxy's handling of `Origin` (1.9) nor
+  any header can approve, edit or reject an item from the dashboard, and no
+  approval key exists.
 - **The CLI.** `atrinik-playtester feedback list|show|approve|reject|edit`
-  runs on CT130 and writes the same SQLite rows directly through
-  `BotMemory` (WAL, short lock timeout), with `decided_via = cli`. It works
-  whether or not the bot is running; the bot reads the queue on its next
-  poll.
+  runs on CT130 as the bot's service user and writes the same SQLite rows
+  directly through `BotMemory` (WAL, short lock timeout), with
+  `decided_via = cli`. It works whether or not the bot is running; it
+  approves only an item the running bot has screened with its full private
+  terms since the item last changed, and the filer files it only after the
+  running bot has screened it again since the approval.
 - **Behaviour flags are not dashboard-controlled.** `try_locks`,
   `persist_tile_facts`, `terrain_tactics`, `effective_gear_scoring` and
   `measure_gear` are read from the bot's configuration on CT130 at start.
@@ -1197,7 +1203,10 @@ from what the maps say.
   the type may behave the same way, so the filer reads the issue back after
   creating it. If labels or type are missing, it marks the item
   `filed-unlabelled` and the dashboard shows an alert; it does not retry. A
-  shared `playtester` label is open question 3.
+  Every issue also gets the `playtester` label, which the owner creates by
+  hand in all three repositories (owner decision, 2026-11-19, question 3);
+  the App has no right to create labels. Issue types are the
+  organization's `Bug`, `Feature` and `Task`.
 - **Rate limits.** At most 5 filings an hour and 20 a day, at least 60 s
   apart, and no request while GitHub's `x-ratelimit-remaining` is under 50.
   A 403 or 429 honours `Retry-After` and backs off exponentially from 10
@@ -1316,8 +1325,8 @@ rates by feature).
   before approval; mocked GitHub for duplicate, success, labels dropped, 403
   with `Retry-After` and the hourly cap; neither the App key, its file path, a
   JWT nor a token appears in any state the game process serializes (a test
-  serializes all of it and searches); a POST without the approval key is
-  refused; no POST changes a behaviour flag.
+  serializes all of it and searches); the dashboard has no feedback write
+  route; no POST changes a behaviour flag.
 
 ## 5. Concrete examples from the content
 
@@ -1844,9 +1853,9 @@ differs from the text above:
   ("recieve"). Slips are looked for only in the lines that may be quoted.
   Each new observation is read as it is stored, and the newest 1,000 of each
   kind once a login.
-- **Labels and types** are proposals until open question 3 is answered:
-  typos `bug`, `maps`; the book formula `bug`, `component: server`, type
-  `Bug`; "+N" `enhancement`, `component: server`.
+- **Labels and types** were proposals until open question 3 was answered
+  (2026-11-19, see F6): typos `bug`, `maps`; the book formula `bug`,
+  `component: server`, type `Bug`; "+N" `enhancement`, `component: server`.
 - **The Feedback tab** shows each draft's body as the plain Markdown text
   that would be filed, in a `pre` built with `textContent`, not rendered;
   there is no approval key and no POST route yet. The CLI needs
@@ -1857,16 +1866,133 @@ differs from the text above:
 - **Not built in F5:** the `feedback_items` gauge of 4.12, drafting from
   shop items she has not picked up, and the other producers of 4.11.5.
 
-**F6. `feat(feedback)`: owner approval and GitHub filing.** The approval key,
-CLI `approve|reject|edit`, the separate filer unit and command, App key and
-installation-token handling, post-approval dedup and `needs-review`, labels
-and types with read-back, rate limits, dry run, comments for balance targets
-and audit rows.
+**F6. `feat(feedback)`: owner approval and GitHub filing.** CLI
+`approve|reject|edit` (approval is CLI-only, owner decision 2026-11-19), the
+separate filer unit and command, App key and installation-token handling,
+post-approval dedup and `needs-review`, labels (with the `playtester` label)
+and types with read-back, rate limits, dry run, comments for balance
+targets and audit rows.
 *Accept:* with no App key, approval leaves the item approved with a Markdown
 copy; mocked GitHub tests for success, duplicate, labels dropped, 403 with
 `Retry-After` and the hourly cap; the game process never reads the App key
-or a token;
-a POST without the approval key is refused.
+or a token (a test serializes all of its state and searches for the key's
+path, the JWT and the token); the dashboard has no feedback write route;
+the filer screens every item against the private terms before filing and
+refuses withheld and unscreened items.
+
+*F6 as built* (`feedback_filer.py`, `cli.py`, `feedback.py`, `memory.py`,
+`client.py`, the Feedback tab). Where the code differs from the text above:
+
+- **Deciding.** `feedback approve ITEM [--file-anyway]`, `feedback reject
+  ITEM [--duplicate ISSUE_URL]` and `feedback edit ITEM [--title]
+  [--body-file FILE|-] [--labels a,b] [--type Bug|Feature|Task|default]
+  [--repo] [--target new-issue|ISSUE_URL]`. Each changes one row in one
+  statement, only while it is in the status and has the text it was read
+  with (a concurrent change by the bot or the filer wins, and the command
+  says so). Approve and edit need an item that is not withheld and that the
+  running bot screened since it last changed (`feedback.readable`), and
+  that passes the CLI's own screen (the configured terms and every chat
+  sender); a failing item is withheld. Reject also works on a withheld
+  item. Items can be decided from `draft`, `approved`, `needs-review`,
+  `failed` (approving again is the retry) and `snoozed`; `--file-anyway` is
+  only for `needs-review` and makes the filer skip the remote check.
+  Approval prints the Markdown copy (`feedback show --markdown` prints it
+  again).
+- **Edit** cleans the new text (comment markers and invisible characters
+  removed; one line and 256 characters for a title; at most ten labels
+  counting the `playtester` label the filer adds),
+  keeps the fingerprint footer outside any code block (adding it when the
+  body lacks it, refusing a body that shows another fingerprint or leaves a
+  code block open), and without `--body-file` renders the body again from
+  its evidence (or keeps an earlier edited body). It is screened before it
+  is stored; then the item is a `draft` again with `edited` set, needs a
+  new screen by the running bot and a new approval, and later occurrences
+  only raise its counts (its text is the owner's). A `comment:` target must
+  be an issue of the item's own repository.
+- **The running bot screens the queue** every 60 s in every mode (and the
+  dashboard on each read, as in F5): every approved item, every item the
+  filer is checking or filing, and every open item whose text changed
+  since its last screen (an edit). Only text unchanged since it was read
+  is marked screened, and as of the read, not of the write. The same pass counts `filed-unlabelled`,
+  `needs-review` and `failed` items for the dashboard's alerts, so a live
+  poll never reads the database for them.
+- **The filer** (`atrinik-playtester feedback file [--app-id ID]
+  [--app-key-file PATH] [--dry-run] [--limit N]`) takes an exclusive lock
+  beside the database, resets an item a crashed run left in `checking` to
+  `approved`, marks one left in `filing` `filed-unlabelled` (or `filed`,
+  for a comment) when its audit shows the create succeeded, and `failed`
+  otherwise (GitHub may have created it), then files approved items, oldest approval first, at most `--limit`
+  (5) a run. It files an item only when it is not withheld, the running bot
+  screened it since its last change *and* since its approval, and it passes
+  the filer's own screen with the terms the filer knows (her account,
+  character, server, party, operator character and certificate pin from its
+  configuration, and every chat sender in her memory; names she saw only in
+  a process are known only to that process, which is why the bot's screen
+  after approval is required). A failing item is withheld and skipped.
+  These conditions are checked again in the same statement that claims the
+  item (`approved` to `checking`) and again for `checking` to `filing`,
+  with the text unchanged, and the filer files exactly the row it claimed,
+  read again after the claim: an item withheld or edited after the run
+  began is never filed. An item that already has an issue URL from an
+  earlier run goes to `needs-review` (match `earlier-run`) unless the owner
+  approved it `--file-anyway`. Any unexpected error fails the item with
+  only its error type ("internal error (ValueError)"), never leaving it in
+  `checking` or `filing`. A SIGTERM ends the run through the same cleanup,
+  and one during the cleanup waits until the token is revoked and the key
+  forgotten.
+  The commands refuse to run as anyone but the database file's owner, and
+  the lock file is opened without following links, mode 0600.
+- **The credential.** The key is read from `--app-key-file` or the unit's
+  systemd credential `$CREDENTIALS_DIRECTORY/feedback-app.pem`; the file
+  must be owned by the filer's user or root with no group or other access.
+  The JWT is RS256 (`iat` a minute back, 9 minutes valid, `iss` the App ID)
+  and is signed with the `cryptography` package, which the locked `aioquic`
+  dependency already requires and the QUIC transport already imports: no
+  new dependency. It is used only to look up the repository's installation
+  and mint a token limited to that one repository with `issues: write`;
+  the token is revoked (`DELETE /installation/token`) when the run ends.
+  Neither the key, its path, the JWT nor a token is printed, logged, stored
+  or put in an error: GitHub's error messages are cleaned of the request's
+  credential and of anything shaped like a JWT or token before they are
+  shortened and stored, and transport errors keep only their type. The key
+  file must be a regular file. Requests go only to `https://api.github.com`
+  and never follow a redirect (urllib would resend the `Authorization`
+  header to the new location); a 3xx is a failure. The App ID (not secret) comes from `--app-id` or
+  `ATRINIK_PLAYTESTER_FEEDBACK_APP_ID`.
+- **Remote dedup** searches `repo:R is:issue "pt-…"` and, for a new issue,
+  `repo:R is:issue in:title "TERM"`, where the term is the subject's map
+  path (`door:/map:x,y` gives `/map`) or its name (`formula:book_exp_mod`
+  gives `book_exp_mod`). A result counts when its fingerprint is outside a
+  code block, or its title contains the term; pull requests and URLs
+  outside the repository are ignored. For a `comment:` target the issue's
+  comments are read instead. Candidates are stored as URLs and the match
+  kind only.
+- **Labels and types.** The filer sends the item's labels plus
+  `playtester`, only those that exist in the repository (read once a run),
+  and the item's type, or by kind `Bug` for `bug`, `Feature` for `qol`,
+  `Task` otherwise. Typos are now type `Bug` and "+N" `Feature`. A label
+  missing from the repository or from the issue read back, or a missing
+  type, makes the item `filed-unlabelled` with the missing names in its
+  error; it is not retried. A comment carries no labels or type.
+- **Rate limits** are computed from `feedback_filings` (which has a
+  `retry_at` column): at most 5 issues or comments created in an hour and
+  20 in a day, at least 60 s after the last create attempt (the filer
+  waits), and no request while any row's `retry_at` is ahead (except
+  revoking the run's token). A 429, or a 403 with `Retry-After`, an
+  exhausted quota or a "rate limit" message (GitHub's secondary limits),
+  waits the longer of `Retry-After` and 10 minutes doubled for each
+  throttle since the last successful create (at most a day); the item goes
+  back to `approved`. A response from the `core` quota
+  (`x-ratelimit-resource`) with `x-ratelimit-remaining` under 50 stops the
+  run until GitHub's reset (an issue just created is still read back); the
+  search quota (30 a minute) does not count against that floor. Any other
+  non-2xx answer marks the item `failed`.
+- **Dry run.** Without a key (or with `--dry-run`) nothing is sent and no
+  audit row is written: approved items stay approved and their Markdown
+  copies (repository, labels, type, title, body) are printed.
+- **Not built in F6:** snoozing, and releasing a withheld item (it can only
+  be rejected; the finding is drafted again if its fingerprint is ever
+  free). The `feedback_items` gauge of 4.12 is still not built.
 
 **F7. `feat(exploration)`: safe lock and lever trials.** `locks`,
 `interactions`, `LockTrialTask` with connection resolution (4.4.1), the
@@ -2086,11 +2212,24 @@ folded into the sections cited:
   assist's own `operator-assist` alert and `operator_assisted` metric),
   which matters when these features are evaluated.
 
-Questions 1, 3, 5, 6, 7 and 11 remain open. Each is asked before the phase
-that needs it: question 1 before F6, question 3 before F6, questions 5 and
-6 before F9, question 7 before F16, and question 11 before F12.
+Settled on 2026-11-19, before F6:
 
-1. **Approval security.** Does the lab proxy in front of
+- **Approval security (question 1).** CLI only: `atrinik-playtester
+  feedback approve|reject|edit` on CT130, run as the bot's service user.
+  The dashboard stays read-only for feedback: no approval key and no
+  feedback POST route, so the proxy's `Origin` handling no longer matters
+  for approval (4.10.5).
+- **Labels and types (question 3).** A `playtester` label in
+  `atrinik/content`, `atrinik/classic` and `atrinik/playtester`, created by
+  hand when F6 lands (the App has no label rights and the filer never
+  creates labels), and the organization's issue types `Bug`, `Feature` and
+  `Task` (4.10.6).
+
+Questions 5, 6, 7 and 11 remain open. Each is asked before the phase that
+needs it: questions 5 and 6 before F9, question 7 before F16, and question
+11 before F12.
+
+1. **Approval security** (settled 2026-11-19: CLI only). Does the lab proxy in front of
    `playtester.atrinik.orion.milkyway` authenticate, and does it forward,
    strip or rewrite `Origin`? One request answers the second part without
    changing anything: a POST to a path that does not exist, with
@@ -2101,7 +2240,7 @@ that needs it: question 1 before F6, question 3 before F6, questions 5 and
    installed on `atrinik/content` and `atrinik/classic` with Issues write?
    Whose account files the issues? (A token without push access may get its
    labels and type dropped, 4.10.6.)
-3. **Labels and types.** Create a `playtester` label in all three repositories,
+3. **Labels and types** (settled 2026-11-19: yes, both). Create a `playtester` label in all three repositories,
    and use the organization issue types (`Bug`, `Feature`, `Task`)?
 4. **Findings about the playtester itself** (the starvation loop, futile
    casts): dashboard-only, or also filed to `atrinik/playtester` through the
@@ -2146,6 +2285,7 @@ that needs it: question 1 before F6, question 3 before F6, questions 5 and
 - The green torch in 5.6 being the "fake torch" is an inference.
 - The stats the dashboard reported (Str 3, Int 1) were read from
   `/api/state` and not cross-checked against the server.
-- The proxy's authentication and `Origin` handling (1.9) were not checked.
+- The proxy's authentication and `Origin` handling (1.9) were not checked;
+  since approval is CLI-only, nothing depends on them.
 - 4.11.2 reads the book experience table as a sign error; the original
   intent was not checked in Classic history.

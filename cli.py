@@ -168,7 +168,8 @@ def parser() -> argparse.ArgumentParser:
              "the bot's service user")
     feedback = sub.add_parser(
         "feedback",
-        help="her draft feedback queue, read from her memory database (no network)")
+        help="her feedback queue in her memory database: list, show, approve, "
+             "reject and edit (no network), and the separate filer (file)")
     feedback_sub = feedback.add_subparsers(dest="feedback_command", required=True)
     feedback_list = feedback_sub.add_parser("list", help="list feedback items")
     feedback_list.add_argument("--kind", default="")
@@ -180,6 +181,48 @@ def parser() -> argparse.ArgumentParser:
         "show", help="one item's title and the exact body that would be filed")
     feedback_show.add_argument("item", help="its id, or its fingerprint (pt-...)")
     feedback_show.add_argument("--json", action="store_true")
+    feedback_show.add_argument("--markdown", action="store_true",
+                               help="print the Markdown copy to file by hand")
+    feedback_approve = feedback_sub.add_parser(
+        "approve", help="approve one screened item for the filer (run as the bot's "
+                        "service user on CT130)")
+    feedback_approve.add_argument("item", help="its id, or its fingerprint (pt-...)")
+    feedback_approve.add_argument(
+        "--file-anyway", action="store_true",
+        help="for an item in needs-review: file it despite the possible duplicates")
+    feedback_reject = feedback_sub.add_parser("reject", help="reject one item for good")
+    feedback_reject.add_argument("item", help="its id, or its fingerprint (pt-...)")
+    feedback_reject.add_argument(
+        "--duplicate", metavar="ISSUE_URL", default="",
+        help="mark it a duplicate of this existing issue instead")
+    feedback_edit = feedback_sub.add_parser(
+        "edit", help="change an item's title, body, labels, type, repository or "
+                     "target; it becomes a draft again and is screened again")
+    feedback_edit.add_argument("item", help="its id, or its fingerprint (pt-...)")
+    feedback_edit.add_argument("--title")
+    feedback_edit.add_argument("--body-file", type=Path,
+                               help="the new Markdown body ('-' reads standard input)")
+    feedback_edit.add_argument("--labels", help="comma-separated; empty for none")
+    feedback_edit.add_argument("--type", dest="issue_type",
+                               choices=("Bug", "Feature", "Task", "default"))
+    feedback_edit.add_argument("--repo", choices=("atrinik/content", "atrinik/classic",
+                                                  "atrinik/playtester"))
+    feedback_edit.add_argument("--target", metavar="new-issue|ISSUE_URL",
+                               help="a new issue, or a comment on this existing issue")
+    feedback_file = feedback_sub.add_parser(
+        "file", help="the filer: file approved items with the GitHub App (its own "
+                     "systemd unit; without the App key, a dry run)")
+    feedback_file.add_argument(
+        "--app-id", default=os.getenv("ATRINIK_PLAYTESTER_FEEDBACK_APP_ID", ""),
+        help="the GitHub App's ID or client ID")
+    feedback_file.add_argument(
+        "--app-key-file", type=Path,
+        help="the App's private key (default: the unit's systemd credential "
+             "feedback-app.pem in $CREDENTIALS_DIRECTORY)")
+    feedback_file.add_argument("--dry-run", action="store_true",
+                               help="send nothing; print the Markdown copies")
+    feedback_file.add_argument("--limit", type=int, default=5,
+                               help="at most this many items a run (default: %(default)s)")
     shadow = sub.add_parser(
         "route-shadow",
         help="her shadow planning report, read from her memory database (no network)")
@@ -201,20 +244,25 @@ def memory_path(runtime_state: str) -> Path:
             if requested.suffix.casefold() == ".json" else requested)
 
 
+FEEDBACK_WRITES = ("approve", "reject", "edit", "file")
+NOT_SCREENED = "(not yet screened by the running bot)"
+
+
 def feedback_command(args: argparse.Namespace) -> int:
-    """``feedback list|show``: read-only, local, no network (phase F5).
+    """``feedback list|show|approve|reject|edit|file``: local, and no
+    network except ``file`` (the filer, feedback_filer.py).
 
     Reads the rows of the server, account and character given by
     ``--host``, ``--port``, ``--account`` and ``--character``, as the bot
-    stores them; works whether or not the bot is running.
+    stores them; works whether or not the bot is running. ``list`` and
+    ``show`` open the database read-only; ``approve``, ``reject``, ``edit``
+    and ``file`` change rows but never create or migrate the database.
     """
     import sqlite3
     import sys
 
-    from .feedback import common_terms, readable, screen, short_fingerprint
+    from .feedback import common_terms
     from .memory import BotMemory
-
-    NOT_SCREENED = "(not yet screened by the running bot)"
 
     path = memory_path(args.runtime_state)
     if not args.character:
@@ -223,13 +271,26 @@ def feedback_command(args: argparse.Namespace) -> int:
     if not path.is_file():
         print(f"feedback: no memory database at {path}")
         return 1
-    # Read-only: nothing is created, migrated or changed.
-    memory = BotMemory.open_read_only(path, server=f"{args.host.casefold()}:{args.port}",
-                                      account=args.account)
+    if path.stat().st_uid != os.geteuid():
+        # SQLite's -wal and -shm files, and the filer's lock, would belong to
+        # another user and could stop the bot from opening its memory.
+        print(f"feedback: run this as the user that owns {path} (the bot's service "
+              "user)")
+        return 2
+    writes = args.feedback_command in FEEDBACK_WRITES
+    server = f"{args.host.casefold()}:{args.port}"
+    # Read-only for list and show: nothing is created, migrated or changed.
+    memory = (BotMemory.open_existing if writes else BotMemory.open_read_only)(
+        path, server=server, account=args.account)
     try:
         if not memory.has_table("feedback_items"):
             print(f"feedback: {path} has no feedback queue yet (no bot of this "
                   "version has opened it)")
+            return 1
+        if writes and not (memory.has_columns("feedback_items", ("edited", "file_anyway"))
+                           and memory.has_table("feedback_filings")):
+            print(f"feedback: {path} has a queue from an older version; start the bot "
+                  "of this version once so it can update it")
             return 1
         senders = (memory.chat_senders() if memory.has_table("chat_log") else [])
     except sqlite3.Error as error:
@@ -251,34 +312,46 @@ def feedback_command(args: argparse.Namespace) -> int:
     for term in common_terms(private):
         print(f"feedback: warning: the private term {term!r} is a common word; "
               "items containing it are withheld", file=sys.stderr)
-
-    def gate(items: list[dict]) -> None:
-        """Text only for items the running bot screened with its full terms
-        since they last changed (feedback.readable), and that pass this
-        command's own screen; the rest show metadata only."""
-        unscreened = [item for item in items if not readable(item)]
-        screen(items, private)
-        for item in unscreened:
-            if not item["withheld"]:
-                item.update(title=NOT_SCREENED, body_md="", subject="", labels_json="[]",
-                            issue_type="", error="", screened=False)
-        for item in items:
-            item.setdefault("screened", not item["withheld"])
-            item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
-            item.pop("evidence_json", None)
-
     try:
-        if args.feedback_command == "list":
-            items = memory.feedback_items(args.character, kind=args.kind, repo=args.repo,
-                                          status=args.status, limit=args.limit)
-        else:
-            item = memory.feedback_item(args.character, args.item)
-            items = [] if item is None else [item]
+        if args.feedback_command == "file":
+            return _feedback_file(args, memory, path, private)
+        if writes:
+            return _feedback_decide(args, memory, private)
+        return _feedback_read(args, memory, path, private)
     except sqlite3.Error as error:
         print(f"feedback: cannot read the queue in {path} (a database from another "
-              f"version?): {error}")
+              f"version, or busy?): {error}")
         return 1
-    gate(items)
+
+
+def _gate(items: list[dict], private: list) -> None:
+    """Text only for items the running bot screened with its full terms
+    since they last changed (feedback.readable), and that pass this
+    command's own screen; the rest show metadata only."""
+    from .feedback import readable, screen, short_fingerprint
+
+    unscreened = [item for item in items if not readable(item)]
+    screen(items, private)
+    for item in unscreened:
+        if not item["withheld"]:
+            item.update(title=NOT_SCREENED, body_md="", subject="", labels_json="[]",
+                        issue_type="", error="", screened=False)
+    for item in items:
+        item.setdefault("screened", not item["withheld"])
+        item["short_fingerprint"] = short_fingerprint(item["fingerprint"])
+        item.pop("evidence_json", None)
+
+
+def _feedback_read(args: argparse.Namespace, memory, path: Path, private: list) -> int:
+    from .feedback import markdown_copy
+
+    if args.feedback_command == "list":
+        items = memory.feedback_items(args.character, kind=args.kind, repo=args.repo,
+                                      status=args.status, limit=args.limit)
+    else:
+        item = memory.feedback_item(args.character, args.item)
+        items = [] if item is None else [item]
+    _gate(items, private)
     if args.feedback_command == "list":
         for item in items:
             item.pop("body_md", None)
@@ -300,15 +373,188 @@ def feedback_command(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(item, indent=2, sort_keys=True, ensure_ascii=False))
         return 0
+    if args.markdown:
+        if not item["screened"]:
+            print(f"feedback: #{item['id']} is withheld or {NOT_SCREENED}")
+            return 1
+        print(markdown_copy(item), end="")
+        return 0
     print(f"#{item['id']} {item['short_fingerprint']} "
           f"{'withheld' if item['withheld'] else item['status']} {item['kind']} "
           f"-> {item['repo']} ({item['target']})")
     print(f"Labels: {', '.join(json.loads(item['labels_json'] or '[]')) or 'none'}"
           f"{'; type ' + item['issue_type'] if item['issue_type'] else ''}")
+    if item.get("issue_url"):
+        print(f"Issue: {item['issue_url']}")
+    if item["screened"] and item.get("error"):
+        print(f"Error: {item['error']}")
+    if item.get("remote_candidates_json") and item["status"] == "needs-review":
+        for candidate in json.loads(item["remote_candidates_json"] or "[]"):
+            print(f"Possible duplicate ({candidate.get('match')}): {candidate.get('url')}")
     print(f"Title: {item['title']}")
     print()
     print(item["body_md"], end="")
     return 0
+
+
+def _feedback_decide(args: argparse.Namespace, memory, private: list) -> int:
+    """``approve``, ``reject`` and ``edit`` (owner decision, 2026-11-19: the
+    CLI is the only way to decide; the dashboard stays read-only). Each
+    changes one row in one statement, only if it has not changed since it
+    was read here."""
+    import re
+    import sys
+
+    from . import feedback
+
+    item = memory.feedback_item(args.character, args.item)
+    if item is None:
+        print(f"feedback: no single item matches {args.item!r}")
+        return 1
+    item_id, status, now = int(item["id"]), str(item["status"]), time.time()
+    label = f"#{item_id} {feedback.short_fingerprint(item['fingerprint'])}"
+    if status not in ("draft", "approved", "needs-review", "failed", "snoozed"):
+        print(f"feedback: {label} is {status}; it can no longer be decided")
+        return 1
+    scope = {"expect_status": (status,), "updated_at": item["updated_at"]}
+    changed = (f"feedback: {label} changed meanwhile (the bot, the filer or another "
+               "command); look at it again")
+
+    if args.feedback_command == "reject":
+        fields = {"status": "rejected", "decided_at": now, "decided_via": "cli"}
+        if args.duplicate:
+            if re.fullmatch(r"https://github\.com/(atrinik/(content|classic|playtester))"
+                            r"/issues/\d+", args.duplicate) is None:
+                print("feedback: --duplicate must be an issue URL in atrinik/content, "
+                      "atrinik/classic or atrinik/playtester")
+                return 2
+            fields.update(status="duplicate", issue_url=args.duplicate)
+        if not memory.update_feedback(args.character, item_id, fields=fields, **scope):
+            print(changed)
+            return 1
+        print(f"{'Marked' if args.duplicate else 'Rejected'} {label}"
+              f"{' a duplicate of ' + args.duplicate if args.duplicate else ''}.")
+        return 0
+
+    # Approve and edit need text the running bot screened since it changed.
+    if item["withheld"]:
+        print(f"feedback: {label} is withheld (it names a private term); it can only "
+              "be rejected")
+        return 1
+    if not feedback.readable(item):
+        print(f"feedback: {label} is {NOT_SCREENED} since it last changed; the bot "
+              "screens it within about a minute while it runs")
+        return 1
+    if feedback.screen([dict(item)], private):
+        memory.withhold_feedback(args.character, [item_id], timeout=10.0)
+        print(f"feedback: {label} names a private term; it is withheld")
+        return 1
+
+    if args.feedback_command == "approve":
+        if status == "approved":
+            print(f"feedback: {label} is already approved")
+            return 0
+        if status == "needs-review" and not args.file_anyway:
+            print(f"feedback: {label} has possible duplicates (see `feedback show`); "
+                  "reject it with --duplicate ISSUE_URL, or approve it with --file-anyway")
+            return 1
+        if args.file_anyway and status != "needs-review":
+            print("feedback: --file-anyway is only for an item in needs-review")
+            return 2
+        fields = {"status": "approved", "decided_at": now, "decided_via": "cli",
+                  "error": None, "file_anyway": int(args.file_anyway)}
+        if not memory.update_feedback(args.character, item_id, fields=fields,
+                                      require_screened=True, **scope):
+            print(changed)
+            return 1
+        print(f"Approved {label}. The filer files it once the running bot has screened it "
+              "again; without the App key it stays approved, and this is its Markdown "
+              "copy to file by hand:\n")
+        print(feedback.markdown_copy(item), end="")
+        return 0
+
+    # edit: the new text is cleaned, re-rendered or kept, and screened.
+    try:
+        title = feedback.clean_title(args.title) if args.title is not None else item["title"]
+        labels = (feedback.clean_labels(args.labels.split(","))
+                  if args.labels is not None else feedback.labels(item))
+        # As the filer will send them: with the playtester label, at most ten.
+        feedback.clean_labels([*labels, feedback.FILED_LABEL])
+        issue_type = (("" if args.issue_type == "default" else args.issue_type)
+                      if args.issue_type is not None else item["issue_type"])
+        repo = args.repo or item["repo"]
+        target = item["target"]
+        if args.target is not None:
+            target = ("new-issue" if args.target == "new-issue"
+                      else f"comment:{args.target}")
+        if target != "new-issue":
+            if re.fullmatch(rf"comment:https://github\.com/{re.escape(repo)}/issues/\d+",
+                            target) is None:
+                raise ValueError(f"the target must be an issue URL in {repo}")
+        if args.body_file is not None:
+            raw = (sys.stdin.read(feedback.BODY_CHARS * 2) if str(args.body_file) == "-"
+                   else args.body_file.read_text(encoding="utf-8")[:feedback.BODY_CHARS * 2])
+            body = feedback.clean_body(raw, item["fingerprint"])
+        elif item.get("edited"):
+            body = feedback.clean_body(item["body_md"], item["fingerprint"])
+        else:
+            body = feedback.rerender(item)
+    except (OSError, ValueError) as error:
+        print(f"feedback: not edited: {error}")
+        return 2
+    fields = {"title": title, "body_md": body, "labels_json": json.dumps(labels),
+              "issue_type": issue_type, "repo": repo, "target": target}
+    candidate = {**item, **fields}
+    if feedback.screen([candidate], private):
+        print("feedback: not edited: the new text names a private term")
+        return 1
+    # Timestamped only now, after the body was read and screened, so a
+    # bot pass in between cannot count the new text as screened.
+    fields.update(status="draft", edited=1, updated_at=time.time(), error=None,
+                  file_anyway=0,
+                  remote_candidates_json=None)
+    if not memory.update_feedback(args.character, item_id, fields=fields,
+                                  require_screened=True, **scope):
+        print(changed)
+        return 1
+    print(f"Edited {label}; it is a draft again. The running bot screens it within "
+          "about a minute; then approve it.")
+    return 0
+
+
+def _feedback_file(args: argparse.Namespace, memory, path: Path, private: list) -> int:
+    """The filer (feedback_filer.py), one run under an exclusive lock."""
+    import fcntl
+
+    from .feedback_filer import Filer, FilingError, key_path, load_app_key
+
+    lock_path = path.with_name(path.name + ".filer.lock")
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW |
+                             os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        print(f"feedback: cannot open the filer's lock: {error.strerror or error}")
+        return 1
+    with os.fdopen(descriptor, "r+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("feedback: another filer run is in progress")
+            return 1
+        key = None
+        located = key_path(args.app_key_file)
+        if not args.dry_run and located is not None and located.exists():
+            try:
+                key = load_app_key(located)
+            except FilingError as error:
+                print(f"ERROR {error}")
+                return 2
+        elif not args.dry_run and args.app_key_file is not None:
+            print("ERROR the App key file does not exist")
+            return 2
+        filer = Filer(memory, args.character, private=private, app_id=args.app_id, key=key)
+        del key
+        return filer.run(dry_run=args.dry_run, limit=args.limit)
 
 
 def route_shadow_command(args: argparse.Namespace) -> int:
@@ -550,12 +796,17 @@ async def main_async(args: argparse.Namespace) -> None:
         tasks.append(asyncio.create_task(engine.run()))
     if web_server is not None:
         tasks.append(asyncio.create_task(web_server.serve()))
+    # Screens approved and edited feedback with her full private terms,
+    # which the CLI's approve and the filer require (phase F6), in every
+    # mode; it never ends by itself, so it is cancelled when the rest end.
+    screening = asyncio.create_task(client.screen_feedback_periodically())
     if client.farm_analyzer is not None:
         tasks.append(asyncio.create_task(
             run_periodically(client.farm_analyzer, client)))
     try:
         await asyncio.gather(*tasks)
     finally:
+        screening.cancel()
         if client.farm_analyzer is not None:
             await client.farm_analyzer.close()
         if web_server is not None:
@@ -643,7 +894,8 @@ def operator_assist(args: argparse.Namespace) -> int:
 def main() -> None:
     args = parser().parse_args()
     if args.task == "feedback":
-        # Local and read-only: needs no game inputs and no network.
+        # Local: needs no game inputs; only ``feedback file`` (the filer,
+        # its own unit) talks to GitHub.
         raise SystemExit(feedback_command(args))
     if args.task == "route-shadow":
         raise SystemExit(route_shadow_command(args))

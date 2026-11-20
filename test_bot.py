@@ -22324,7 +22324,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=34", page)
+        self.assertIn(b"/app.js?v=35", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -27954,10 +27954,17 @@ class FeedbackRouteTests(unittest.IsolatedAsyncioTestCase):
             from .feedback import readable
             self.assertTrue(readable(self.client._memory_store().feedback_item(
                 "Sera", str(item["id"]))))
-            # There is no write route in this phase.
-            status, _ = await self.request("POST", f"/api/feedback/{item['id']}",
-                                           {"action": "approve"})
-            self.assertEqual(status, 404)
+            # There is no write route: the owner decides with the CLI
+            # (owner decision, 2026-11-19), with or without any header.
+            for path in (f"/api/feedback/{item['id']}", "/api/feedback",
+                         f"/api/feedback/{item['id']}/approve"):
+                for method in ("POST", "PUT", "PATCH", "DELETE"):
+                    status, _ = await self.request(
+                        method, path, {"action": "approve", "id": item["id"]},
+                        {"X-Playtester-Approval": "anything"})
+                    self.assertIn(status, (404, 405), (method, path))
+            self.assertEqual(self.client._memory_store().feedback_item(
+                "Sera", str(item["id"]))["status"], "draft")
             from .memory import BotMemory
             with patch.object(BotMemory, "feedback_items",
                               side_effect=sqlite3.OperationalError("database is locked")):
@@ -27974,6 +27981,966 @@ class FeedbackRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("innerHTML", section)
         self.assertIn('node("pre", "feedback-body", body)', section)
 
+
+# Owner approval with the CLI and the separate GitHub filer
+# (docs/LEARNING_AND_FEEDBACK.md 4.10.5, 4.10.6, phase F6). GitHub is a
+# fake: no request leaves the process.
+class FakeGitHub:
+    """GitHub's REST API as the filer uses it, recording every call."""
+    TOKEN = "ghs_FakeInstallationToken0123456789abcdefXYZ"
+    # GitHub's per-resource quotas: core 5,000 an hour, search 30 a minute.
+    OK = {"x-ratelimit-resource": "core", "x-ratelimit-limit": "5000",
+          "x-ratelimit-remaining": "4000", "x-ratelimit-reset": "0"}
+    SEARCH = {"x-ratelimit-resource": "search", "x-ratelimit-limit": "30",
+              "x-ratelimit-remaining": "29", "x-ratelimit-reset": "0"}
+
+    def __init__(self, *, labels=("bug", "maps", "enhancement", "component: server",
+                                  "playtester")):
+        self.calls = []
+        self.labels = list(labels)
+        self.search = {"fingerprint": [], "title": []}
+        self.comments = []
+        self.drop_labels = self.drop_type = False
+        self.queued = {}
+        self.issues = {}
+        self.jwts = []
+        self.on_search = None
+
+    def queue(self, method, path, status, headers=None, body=None):
+        self.queued.setdefault((method, path), []).append((status, headers or {}, body))
+
+    def __call__(self, method, url, headers, body):
+        import re
+        import urllib.parse
+        parts = urllib.parse.urlsplit(url)
+        assert url.startswith("https://api.github.com/"), url
+        path, query = parts.path, urllib.parse.parse_qs(parts.query)
+        data = json.loads(body) if body else None
+        self.calls.append((method, path, query, dict(headers), data))
+        if self.queued.get((method, path)):
+            status, extra, reply = self.queued[(method, path)].pop(0)
+            return status, extra, json.dumps(reply or {}).encode()
+
+        def reply(status, value):
+            return status, dict(self.OK), json.dumps(value).encode()
+
+        auth = headers.get("Authorization", "")
+        if method == "GET" and re.fullmatch(r"/repos/atrinik/\w+/installation", path):
+            self.jwts.append(auth.removeprefix("Bearer "))
+            return reply(200, {"id": 77})
+        if method == "POST" and path == "/app/installations/77/access_tokens":
+            assert auth == f"Bearer {self.jwts[-1]}"
+            return reply(201, {"token": self.TOKEN})
+        assert auth == f"Bearer {self.TOKEN}", (method, path)
+        if path.endswith("/labels"):
+            return reply(200, [{"name": name} for name in self.labels])
+        if path == "/search/issues":
+            if self.on_search is not None:
+                self.on_search()
+            return 200, dict(self.SEARCH), json.dumps({"items": self.search[
+                "title" if "in:title" in query["q"][0] else "fingerprint"]}).encode()
+        if method == "DELETE" and path == "/installation/token":
+            return 204, dict(self.OK), b""
+        created = re.fullmatch(r"/repos/(atrinik/\w+)/issues", path)
+        if method == "POST" and created:
+            number = 100 + len(self.issues)
+            self.issues[number] = {
+                "number": number,
+                "html_url": f"https://github.com/{created.group(1)}/issues/{number}",
+                "labels": [] if self.drop_labels else [{"name": n} for n in data["labels"]],
+                "type": None if self.drop_type else {"name": data.get("type")}}
+            return reply(201, self.issues[number])
+        one = re.fullmatch(r"/repos/(atrinik/\w+)/issues/(\d+)", path)
+        if method == "GET" and one:
+            return reply(200, self.issues[int(one.group(2))])
+        comments = re.fullmatch(r"/repos/(atrinik/\w+)/issues/(\d+)/comments", path)
+        if comments and method == "GET":
+            return reply(200, self.comments)
+        if comments and method == "POST":
+            return reply(201, {"html_url": f"https://github.com/{comments.group(1)}/issues/"
+                                           f"{comments.group(2)}#issuecomment-5"})
+        raise AssertionError(f"unexpected {method} {path}")
+
+    def paths(self, method=None):
+        return [path for verb, path, *_ in self.calls if method in (None, verb)]
+
+
+class FeedbackFilingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        cls.rsa = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cls.pem = cls.rsa.private_bytes(serialization.Encoding.PEM,
+                                        serialization.PrivateFormat.PKCS8,
+                                        serialization.NoEncryption())
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.path = self.root / "memory.sqlite3"
+        self.content = feedback_content(self.root)
+        self.key_path = self.root / "app-secret" / "feedback-app.pem"
+        self.key_path.parent.mkdir()
+        self.key_path.write_bytes(self.pem)
+        self.key_path.chmod(0o600)
+        self.base = ["--runtime-state", str(self.path), "--host", "127.0.0.1",
+                     "--account", "seraacct", "--password", "hunter2",
+                     "--character", "Sera", "feedback"]
+        self.game = FeedbackClientTests.client(self)
+
+    def dump(self):
+        db = sqlite3.connect(self.path)
+        try:
+            return "\n".join(db.iterdump())
+        finally:
+            db.close()
+
+    def cli(self, *args):
+        import io
+        import contextlib as context
+        from .cli import feedback_command, parser
+        out = io.StringIO()
+        with context.redirect_stdout(out), context.redirect_stderr(io.StringIO()):
+            code = feedback_command(parser().parse_args(self.base + list(args)))
+        return code, out.getvalue()
+
+    def note(self, subject="door:/test/hall:5,4", **evidence):
+        from .feedback import note
+        item_id, _ = note(self.game._memory_store(), "Sera",
+                          FeedbackQueueTests.finding(subject, **evidence),
+                          private=self.game.feedback_private_terms())
+        return item_id
+
+    def item(self, item_id):
+        return self.game._memory_store().feedback_item("Sera", str(item_id))
+
+    def approved(self, subject="door:/test/hall:5,4", **evidence):
+        """A draft, approved with the CLI and screened again by the bot."""
+        item_id = self.note(subject, **evidence)
+        code, out = self.cli("approve", str(item_id))
+        self.assertEqual(code, 0, out)
+        self.game.screen_feedback_queue()
+        return item_id
+
+    def filer(self, github, *, clock=None, key=True, out=None, sleeps=None):
+        from .feedback_filer import Filer, load_app_key
+        from .memory import BotMemory
+        memory = BotMemory.open_existing(self.path, server="127.0.0.1:1728",
+                                         account="seraacct")
+        return Filer(memory, "Sera", private=["seraacct", "hunter2", "Sera"],
+                     app_id="12345", key=load_app_key(self.key_path) if key else None,
+                     send=github, clock=clock, out=(out if out is not None else [].append),
+                     sleep=(sleeps.append if sleeps is not None else (lambda _: None)))
+
+    def test_cli_approves_only_what_the_running_bot_screened(self):
+        item_id = self.note()
+        draft = self.item(item_id)
+        # An edit: re-rendered, screened by this command, a draft again and
+        # unscreened until the running bot screens it.
+        code, out = self.cli("edit", str(item_id), "--title", "Typo  on the hall door",
+                             "--labels", "bug, maps", "--type", "Bug")
+        self.assertEqual(code, 0, out)
+        edited = self.item(item_id)
+        self.assertEqual((edited["title"], edited["issue_type"], edited["edited"],
+                          edited["status"]), ("Typo on the hall door", "Bug", 1, "draft"))
+        self.assertEqual(edited["body_md"], draft["body_md"])
+        self.assertGreater(edited["updated_at"], edited["screened_at"])
+        code, out = self.cli("approve", str(item_id))
+        self.assertEqual(code, 1)
+        self.assertIn("not yet screened by the running bot", out)
+        self.assertEqual(self.item(item_id)["status"], "draft")
+        self.assertEqual(self.game.screen_feedback_queue(), 1)
+        code, out = self.cli("approve", str(item_id))
+        self.assertEqual(code, 0, out)
+        approved = self.item(item_id)
+        self.assertEqual((approved["status"], approved["decided_via"]), ("approved", "cli"))
+        # Approval prints the Markdown copy to file by hand.
+        self.assertIn("Repository: atrinik/content (a new issue)", out)
+        self.assertIn("Labels: bug, maps, playtester", out)
+        self.assertIn(approved["body_md"], out)
+        # Another occurrence keeps the owner's text.
+        self.note()
+        self.assertEqual(self.item(item_id)["title"], "Typo on the hall door")
+        # Editing an approved item makes it a draft again.
+        body = self.root / "body.md"
+        body.write_text("A shorter report.\n")
+        code, out = self.cli("edit", str(item_id), "--body-file", str(body))
+        self.assertEqual(code, 0, out)
+        edited = self.item(item_id)
+        self.assertEqual(edited["status"], "draft")
+        self.assertTrue(edited["body_md"].startswith("A shorter report.\n\n---\n"))
+        from .feedback import fingerprints_outside_code, short_fingerprint
+        self.assertEqual(fingerprints_outside_code(edited["body_md"]),
+                         [short_fingerprint(edited["fingerprint"])])
+        # A body naming a private term, or another fingerprint, is refused.
+        self.game.screen_feedback_queue()
+        for text in ("Ask Sera about it.", "Playtester fingerprint: pt-000000000000"):
+            body.write_text(text)
+            code, out = self.cli("edit", str(item_id), "--body-file", str(body))
+            self.assertNotEqual(code, 0)
+            self.assertIn("not edited", out)
+        self.assertEqual(self.item(item_id)["body_md"], edited["body_md"])
+        # A target must be an issue of the item's repository.
+        code, out = self.cli("edit", str(item_id), "--target",
+                             "https://github.com/atrinik/classic/issues/628")
+        self.assertEqual(code, 2)
+        # Reject, and a duplicate.
+        code, _ = self.cli("reject", str(item_id))
+        self.assertEqual((code, self.item(item_id)["status"]), (0, "rejected"))
+        code, _ = self.cli("approve", str(item_id))
+        self.assertEqual(code, 1)
+        other = self.note("sign:/test/hall:7,7")
+        code, _ = self.cli("reject", str(other), "--duplicate", "https://example.invalid/1")
+        self.assertEqual(code, 2)
+        code, _ = self.cli("reject", str(other), "--duplicate",
+                           "https://github.com/atrinik/content/issues/9")
+        self.assertEqual((code, self.item(other)["status"], self.item(other)["issue_url"]),
+                         (0, "duplicate", "https://github.com/atrinik/content/issues/9"))
+
+    def test_cli_refuses_withheld_items_but_rejects_them(self):
+        item_id = self.note("sign:/m:1,1", excerpts=["Kiri waits."])
+        self.game.observations.player_names["kiri"] = 1.0
+        self.game.screen_feedback_queue()  # not approved and unchanged: not screened
+        self.assertEqual(self.item(item_id)["withheld"], 0)
+        # The CLI knows Kiri from the chat log: it withholds and refuses.
+        self.game._memory_store().append_chat("Sera", c.CHAT_TYPE_CHAT, "in", "Kiri", "hi")
+        code, out = self.cli("approve", str(item_id))
+        self.assertEqual(code, 1)
+        self.assertNotIn("Kiri", out)
+        self.assertEqual(self.item(item_id)["withheld"], 1)
+        code, out = self.cli("edit", str(item_id), "--title", "Something else")
+        self.assertEqual(code, 1)
+        self.assertIn("withheld", out)
+        code, _ = self.cli("reject", str(item_id))
+        self.assertEqual((code, self.item(item_id)["status"]), (0, "rejected"))
+
+    def test_without_the_app_key_approved_items_stay_approved(self):
+        item_id = self.approved()
+        _NETWORK_AUDIT["events"].clear()
+        _NETWORK_AUDIT["armed"] = True
+        try:
+            with patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": ""}):
+                code, out = self.cli("file", "--app-id", "12345")
+            code_dry, out_dry = self.cli("file", "--app-id", "12345", "--dry-run",
+                                         "--app-key-file", str(self.key_path))
+        finally:
+            _NETWORK_AUDIT["armed"] = False
+        self.assertEqual(_NETWORK_AUDIT["events"], [])
+        self.assertEqual((code, code_dry), (0, 0))
+        item = self.item(item_id)
+        self.assertEqual(item["status"], "approved")
+        self.assertIn("no App key", out)
+        self.assertIn("dry run", out_dry)
+        for text in (out, out_dry):
+            self.assertIn("Title: Typo in the door text", text)
+            self.assertIn(item["body_md"], text)
+        self.assertEqual(self.game._memory_store().feedback_filings(), [])
+        code, out = self.cli("show", str(item_id), "--markdown")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("Repository: atrinik/content (a new issue)\n"))
+
+    def test_the_command_reads_the_key_from_its_systemd_credential(self):
+        from . import feedback_filer
+        item_id = self.approved()
+        github = FakeGitHub()
+        with patch.object(feedback_filer, "urllib_send", github), \
+                patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": str(self.key_path.parent)}):
+            code, out = self.cli("file", "--app-id", "12345")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.item(item_id)["status"], "filed")
+        self.assertIn("filed: https://github.com/atrinik/content/issues/100", out)
+        self.assertNotIn(github.TOKEN, out)
+        # A second run waits for the first: the lock is exclusive.
+        import fcntl
+        with open(self.path.with_name(self.path.name + ".filer.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            code, out = self.cli("file", "--app-id", "12345", "--dry-run")
+        self.assertEqual(code, 1)
+        self.assertIn("another filer run", out)
+
+    def test_a_missing_key_file_and_a_loose_one_are_refused(self):
+        self.approved()
+        code, out = self.cli("file", "--app-id", "1", "--app-key-file",
+                             str(self.root / "none.pem"))
+        self.assertEqual(code, 2)
+        self.key_path.chmod(0o644)
+        code, out = self.cli("file", "--app-id", "1", "--app-key-file", str(self.key_path))
+        self.assertEqual(code, 2)
+        self.assertIn("readable by nobody else", out)
+        self.assertNotIn(str(self.key_path), out)
+
+    def test_the_filer_files_an_approved_item(self):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        import base64
+        item_id = self.approved()
+        github = FakeGitHub()
+        lines = []
+        self.assertEqual(self.filer(github, out=lines.append).run(), 0)
+        item = self.item(item_id)
+        self.assertEqual((item["status"], item["issue_url"]),
+                         ("filed", "https://github.com/atrinik/content/issues/100"))
+        posted = [data for verb, path, _, _, data in github.calls
+                  if verb == "POST" and path == "/repos/atrinik/content/issues"]
+        self.assertEqual(posted, [{"title": item["title"], "body": item["body_md"],
+                                   "labels": ["bug", "maps", "playtester"], "type": "Task"}])
+        # One repository, issues: write, from a verifiable RS256 JWT.
+        minted, = [data for verb, path, _, _, data in github.calls
+                   if path == "/app/installations/77/access_tokens"]
+        self.assertEqual(minted, {"repositories": ["content"],
+                                  "permissions": {"issues": "write"}})
+        jwt, = github.jwts
+        header, claims, signature = jwt.split(".")
+        pad = lambda part: base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+        self.rsa.public_key().verify(pad(signature), f"{header}.{claims}".encode(),
+                                     padding.PKCS1v15(), hashes.SHA256())
+        claims = json.loads(pad(claims))
+        self.assertEqual((json.loads(pad(header))["alg"], claims["iss"]), ("RS256", 12345))
+        self.assertLessEqual(claims["exp"] - claims["iat"], 600)
+        # Searched only after approval, with the fingerprint and the map.
+        queries = [query["q"][0] for _, path, query, _, _ in github.calls
+                   if path == "/search/issues"]
+        self.assertEqual(queries, [
+            f'repo:atrinik/content is:issue "pt-{item["fingerprint"][:12]}"',
+            'repo:atrinik/content is:issue in:title "/test/hall"'])
+        self.assertEqual(github.paths()[-1], "/installation/token")
+        # Audit rows: requests only, no credential.
+        rows = self.game._memory_store().feedback_filings()
+        self.assertIn("POST /repos/atrinik/content/issues", [row["request"] for row in rows])
+        created, = [row for row in rows if row["request"] == "POST /repos/atrinik/content/issues"]
+        self.assertEqual((created["item_id"], created["http_status"], created["issue_url"]),
+                         (item_id, 201, item["issue_url"]))
+        dump = self.dump()
+        for secret in (github.TOKEN, jwt, str(self.key_path)):
+            self.assertNotIn(secret, dump)
+            self.assertNotIn(secret, "\n".join(lines))
+        # Nothing approved is left: another run sends nothing.
+        github.calls.clear()
+        self.assertEqual(self.filer(github).run(), 0)
+        self.assertEqual(github.calls, [])
+
+    def test_a_possible_duplicate_needs_review(self):
+        from .feedback import short_fingerprint
+        item_id = self.approved()
+        short = short_fingerprint(self.item(item_id)["fingerprint"])
+        github = FakeGitHub()
+        github.search["fingerprint"] = [
+            # A fingerprint quoted in a code block counts for nothing.
+            {"html_url": "https://github.com/atrinik/content/issues/7", "title": "x",
+             "body": f"```\nPlaytester fingerprint: {short}\n```\n"},
+            {"html_url": "https://github.com/atrinik/content/issues/8", "title": "y",
+             "body": f"text\n---\nPlaytester fingerprint: {short}\n"},
+            # Another repository's URL is never taken.
+            {"html_url": "https://example.invalid/issues/9", "title": "z",
+             "body": f"Playtester fingerprint: {short}\n"}]
+        github.search["title"] = [
+            {"html_url": "https://github.com/atrinik/content/issues/3",
+             "title": "Doors in /TEST/hall are confusing", "body": ""},
+            {"html_url": "https://github.com/atrinik/content/pull/4",
+             "title": "/test/hall", "pull_request": {}}]
+        self.assertEqual(self.filer(github).run(), 0)
+        item = self.item(item_id)
+        self.assertEqual(item["status"], "needs-review")
+        self.assertEqual(json.loads(item["remote_candidates_json"]), [
+            {"url": "https://github.com/atrinik/content/issues/8", "match": "fingerprint"},
+            {"url": "https://github.com/atrinik/content/issues/3", "match": "title"}])
+        self.assertNotIn("POST /repos/atrinik/content/issues",
+                         [f"{verb} {path}" for verb, path, *_ in github.calls])
+        code, out = self.cli("show", str(item_id))
+        self.assertIn("Possible duplicate (fingerprint): "
+                      "https://github.com/atrinik/content/issues/8", out)
+        code, out = self.cli("approve", str(item_id))
+        self.assertEqual(code, 1)
+        self.assertIn("--file-anyway", out)
+        code, out = self.cli("approve", str(item_id), "--file-anyway")
+        self.assertEqual(code, 0, out)
+        self.game.screen_feedback_queue()
+        github.calls.clear()
+        self.assertEqual(self.filer(github).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "filed")
+        self.assertNotIn("/search/issues", github.paths())
+
+    def test_dropped_labels_or_type_mark_it_filed_unlabelled(self):
+        from .web_server import WebControlServer
+        first = self.approved()
+        github = FakeGitHub(labels=("bug", "maps"))  # no playtester label yet
+        self.assertEqual(self.filer(github).run(), 0)
+        item = self.item(first)
+        self.assertEqual(item["status"], "filed-unlabelled")
+        self.assertIn("labels playtester", item["error"])
+        second = self.approved("sign:/test/hall:7,7")
+        github = FakeGitHub()
+        github.drop_labels = github.drop_type = True
+        self.assertEqual(self.filer(github).run(), 0)
+        item = self.item(second)
+        self.assertEqual(item["status"], "filed-unlabelled")
+        self.assertIn("labels bug, maps, playtester and type Task", item["error"])
+        # No retry: it stays filed-unlabelled.
+        github.calls.clear()
+        self.filer(github).run()
+        self.assertEqual(github.calls, [])
+        # The dashboard alerts (counted by the running bot's queue screen).
+        self.game.screen_feedback_queue()
+        server = WebControlServer(self.game, TaskEngine(self.game), WorldGraph(),
+                                  "127.0.0.1", 0)
+        alert, = [alert for alert in server.dashboard.alerts()
+                  if alert["id"] == "feedback-filed-unlabelled"]
+        self.assertIn("2 feedback items filed without", alert["text"])
+
+    def test_a_403_with_retry_after_backs_off(self):
+        item_id = self.approved()
+        github = FakeGitHub()
+        github.queue("POST", "/repos/atrinik/content/issues", 403,
+                     {"Retry-After": "30"}, {"message": "secondary rate limit"})
+        now = [time.time()]
+        lines = []
+        self.assertEqual(self.filer(github, clock=lambda: now[0], out=lines.append).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "approved")
+        self.assertTrue(any("stopped: throttled by GitHub (403)" in line for line in lines))
+        # The token is revoked even while backing off.
+        self.assertEqual(github.paths()[-1], "/installation/token")
+        throttled, = [row for row in self.game._memory_store().feedback_filings()
+                      if row["http_status"] == 403]
+        self.assertAlmostEqual(throttled["retry_at"] - throttled["at"], 600.0, delta=1)
+        # Before then, no request at all.
+        github.calls.clear()
+        now[0] += 300
+        self.assertEqual(self.filer(github, clock=lambda: now[0]).run(), 0)
+        self.assertEqual(github.calls, [])
+        # Afterwards it tries again; a second throttle doubles the wait, and
+        # a long Retry-After wins.
+        now[0] += 400
+        github.queue("POST", "/repos/atrinik/content/issues", 429, {}, {})
+        self.filer(github, clock=lambda: now[0]).run()
+        second = [row for row in self.game._memory_store().feedback_filings()
+                  if row["http_status"] in (403, 429)][-1]
+        self.assertAlmostEqual(second["retry_at"] - second["at"], 1200.0, delta=1)
+        now[0] += 1300
+        github.queue("POST", "/repos/atrinik/content/issues", 403,
+                     {"Retry-After": "9000"}, {})
+        self.filer(github, clock=lambda: now[0]).run()
+        third = [row for row in self.game._memory_store().feedback_filings()
+                 if row["http_status"] in (403, 429)][-1]
+        self.assertAlmostEqual(third["retry_at"] - third["at"], 9000.0, delta=1)
+        now[0] += 9100
+        self.assertEqual(self.filer(github, clock=lambda: now[0]).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "filed")
+        # A plain 403 (no permission) fails the item instead.
+        other = self.approved("sign:/test/hall:7,7")
+        github.queue("POST", "/repos/atrinik/content/issues", 403, {},
+                     {"message": "Resource not accessible by integration"})
+        now[0] += 3600
+        self.assertEqual(self.filer(github, clock=lambda: now[0]).run(), 1)
+        item = self.item(other)
+        self.assertEqual(item["status"], "failed")
+        self.assertIn("Resource not accessible", item["error"])
+        # The owner retries by approving it again.
+        code, out = self.cli("approve", str(other))
+        self.assertEqual(code, 0, out)
+
+    def test_a_low_quota_stops_the_run(self):
+        first = self.approved()
+        second = self.approved("sign:/test/hall:7,7")
+        github = FakeGitHub()
+        github.queue("POST", "/repos/atrinik/content/issues", 201,
+                     {"x-ratelimit-remaining": "10",
+                      "x-ratelimit-reset": str(int(time.time()) + 900)},
+                     {"number": 100, "html_url": "https://github.com/atrinik/content/issues/100"})
+        github.queue("GET", "/repos/atrinik/content/issues/100", 200,
+                     {"x-ratelimit-remaining": "10",
+                      "x-ratelimit-reset": str(int(time.time()) + 900)},
+                     {"number": 100, "labels": [{"name": "bug"}, {"name": "maps"},
+                                                {"name": "playtester"}],
+                      "type": {"name": "Task"}})
+        self.filer(github).run()
+        # The issue just created is still read back; nothing else is sent.
+        self.assertEqual((self.item(first)["status"], self.item(second)["status"]),
+                         ("filed", "approved"))
+        self.assertEqual(github.paths()[-2:], ["/repos/atrinik/content/issues/100",
+                                               "/installation/token"])
+        github.calls.clear()
+        self.filer(github).run()
+        self.assertEqual(github.calls, [])
+
+    def test_the_hourly_cap_and_spacing(self):
+        memory = self.game._memory_store()
+        now = time.time()
+        for minutes in (50, 40, 30, 20, 10):
+            memory.record_feedback_filing({
+                "item_id": 0, "at": now - minutes * 60, "repo": "atrinik/content",
+                "request": "POST /repos/atrinik/content/issues", "http_status": 201})
+        item_id = self.approved()
+        github = FakeGitHub()
+        lines = []
+        self.assertEqual(self.filer(github, out=lines.append).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "approved")
+        self.assertEqual(github.calls, [])
+        self.assertTrue(any("hourly cap of 5" in line for line in lines))
+        # Eleven minutes later the oldest has aged out; the last attempt was
+        # 30 s ago, so the filer waits the rest of a minute first.
+        sleeps = []
+        later = now + 11 * 60
+        memory.record_feedback_filing({
+            "item_id": 0, "at": later - 30, "repo": "atrinik/content",
+            "request": "POST /repos/atrinik/content/issues", "http_status": 500})
+        self.assertEqual(self.filer(github, clock=lambda: later, sleeps=sleeps).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "filed")
+        self.assertEqual(len(sleeps), 1)
+        self.assertAlmostEqual(sleeps[0], 30.0, delta=0.5)
+        # The daily cap: 20 in a day.
+        for minutes in range(20):
+            memory.record_feedback_filing({
+                "item_id": 0, "at": later - 7200 - minutes * 600, "repo": "atrinik/content",
+                "request": "POST /repos/atrinik/content/issues", "http_status": 201})
+        self.approved("sign:/test/hall:7,7")
+        lines = []
+        self.filer(github, clock=lambda: later + 7200, out=lines.append).run()
+        self.assertTrue(any("daily cap of 20" in line for line in lines), lines)
+
+    def test_the_filer_refuses_unscreened_and_withheld_items(self):
+        stale = self.note()
+        code, _ = self.cli("approve", str(stale))
+        self.assertEqual(code, 0)
+        # Not screened by the running bot since the approval.
+        github = FakeGitHub()
+        lines = []
+        self.filer(github, out=lines.append).run()
+        self.assertEqual(github.calls, [])
+        self.assertEqual(self.item(stale)["status"], "approved")
+        self.assertTrue(any("not yet screened" in line for line in lines))
+        self.assertEqual(self.cli("reject", str(stale))[0], 0)
+        # Screened, but the filer's own terms (a chat sender) catch it.
+        named = self.approved("sign:/m:1,1", excerpts=["Kiri waits."])
+        self.game.screen_feedback_queue()
+        self.game._memory_store().append_chat("Sera", c.CHAT_TYPE_CHAT, "in", "Kiri", "hi")
+        filer = self.filer(github)
+        filer.private.append("Kiri")
+        filer.run()
+        self.assertEqual(self.item(named)["withheld"], 1)
+        self.assertEqual(self.item(named)["status"], "approved")
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+        # The running bot withholds an approved item once it learns a name
+        # in it, and the filer never files a withheld item.
+        third = self.approved("sign:/m:2,2", excerpts=["Nadia waits."])
+        self.game.observations.player_names["nadia"] = 1.0
+        self.game.screen_feedback_queue()
+        self.assertEqual(self.item(third)["withheld"], 1)
+        github.calls.clear()
+        self.filer(github).run()
+        self.assertEqual(github.calls, [])
+
+    def test_a_stale_run_is_recovered_and_comments_target_an_issue(self):
+        from .feedback import short_fingerprint
+        item_id = self.approved()
+        memory = self.game._memory_store()
+        self.assertTrue(memory.update_feedback("Sera", item_id, expect_status=("approved",),
+                                               fields={"status": "filing"}))
+        github = FakeGitHub()
+        self.assertEqual(self.filer(github).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "failed")
+        self.assertEqual(github.calls, [])
+        # A balance-style comment on an existing issue.
+        code, out = self.cli("edit", str(item_id), "--target",
+                             "https://github.com/atrinik/content/issues/12")
+        self.assertEqual(code, 0, out)
+        self.game.screen_feedback_queue()
+        self.assertEqual(self.cli("approve", str(item_id))[0], 0)
+        self.game.screen_feedback_queue()
+        short = short_fingerprint(self.item(item_id)["fingerprint"])
+        github.comments = [{"html_url": "https://github.com/atrinik/content/issues/12"
+                                        "#issuecomment-1",
+                            "body": f"~~~\nPlaytester fingerprint: {short}\n~~~"}]
+        self.assertEqual(self.filer(github).run(), 0)
+        item = self.item(item_id)
+        self.assertEqual((item["status"], item["issue_url"]),
+                         ("filed", "https://github.com/atrinik/content/issues/12"
+                                   "#issuecomment-5"))
+        posted, = [data for verb, path, _, _, data in github.calls if verb == "POST"
+                   and path == "/repos/atrinik/content/issues/12/comments"]
+        self.assertEqual(posted, {"body": item["body_md"]})
+
+    def test_the_game_process_never_holds_the_key_or_a_token(self):
+        import ast
+        import logging
+        from .web_server import WebControlServer
+        item_id = self.approved()
+        github = FakeGitHub()
+        records = []
+
+        class Keep(logging.Handler):
+            def emit(self, record):
+                records.append(self.format(record))
+
+        handler = Keep()
+        logging.getLogger().addHandler(handler)
+        try:
+            lines = []
+            self.assertEqual(self.filer(github, out=lines.append).run(), 0)
+        finally:
+            logging.getLogger().removeHandler(handler)
+        self.assertEqual(self.item(item_id)["status"], "filed")
+        jwt, = github.jwts
+        pem_lines = [line for line in self.pem.decode().splitlines() if "-----" not in line]
+        secrets = [github.TOKEN, jwt, str(self.key_path), self.key_path.parent.name,
+                   *pem_lines[:3]]
+        # Everything the game process keeps or serves.
+        game = FeedbackClientTests.client(self)
+        game.screen_feedback_queue()
+        server = WebControlServer(game, TaskEngine(game), WorldGraph(), "127.0.0.1", 0)
+
+        class Writer:
+            data = b""
+
+            def write(self, data):
+                self.data += data
+
+            async def drain(self):
+                pass
+
+        served = []
+        for path in ("/api/state", "/api/feedback", "/metrics", "/api/knowledge"):
+            writer = Writer()
+            asyncio.run(server._route(writer, "GET", path, b"", ""))
+            served.append(writer.data.decode("utf-8", "replace"))
+        state = [
+            json.dumps(server.dashboard.snapshot(), default=str),
+            self.dump(),
+            repr(vars(game)), repr(vars(server)), repr(vars(server.dashboard)),
+            json.dumps(dict(os.environ)), *served, "\n".join(records), "\n".join(lines)]
+        for path in self.root.rglob("*"):
+            if path.is_file() and path != self.key_path:
+                state.append(path.read_bytes().decode("utf-8", "replace"))
+        everything = "\n".join(state)
+        for secret in secrets:
+            self.assertNotIn(secret, everything)
+        self.assertIn(self.item(item_id)["issue_url"], everything)
+        # No game module imports the filer.
+        seen, todo = set(), ["client", "web_server", "autoplay", "tasks", "memory",
+                             "feedback", "feedback_producers", "operator_assist"]
+        while todo:
+            module = todo.pop()
+            if module in seen:
+                continue
+            seen.add(module)
+            source = Path(__file__).with_name(f"{module}.py")
+            if not source.exists():
+                continue
+            for node in ast.walk(ast.parse(source.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.level:
+                    todo.extend([node.module] if node.module else
+                                [alias.name for alias in node.names])
+        self.assertNotIn("feedback_filer", seen)
+        self.assertNotIn("cli", seen)
+        self.assertIn("web_server", seen)
+
+    def test_search_and_create_in_one_run_with_real_quota_headers(self):
+        # The search quota (30 a minute) is always under the core floor of
+        # 50: it must not stop the run.
+        item_id = self.approved()
+        github = FakeGitHub()
+        self.assertEqual(self.filer(github).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "filed")
+        self.assertIn("/search/issues", github.paths())
+        self.assertIn("/repos/atrinik/content/issues", github.paths("POST"))
+
+    def test_an_item_withheld_after_the_check_is_never_filed(self):
+        from .feedback_filer import Filer
+        memory = self.game._memory_store()
+        # Withheld between the start-of-run check and the claim.
+        first = self.approved()
+        original = Filer.file
+
+        def withheld_first(filer, item):
+            memory.withhold_feedback("Sera", [item["id"]])
+            return original(filer, item)
+
+        github = FakeGitHub()
+        with patch.object(Filer, "file", withheld_first):
+            self.filer(github).run()
+        self.assertEqual(self.item(first)["status"], "approved")
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+        # Withheld while it is checked (during the duplicate search): the
+        # move to filing is refused.
+        self.cli("reject", str(first))
+        second = self.approved("sign:/test/hall:7,7")
+        github = FakeGitHub()
+        github.on_search = lambda: memory.withhold_feedback("Sera", [second])
+        self.filer(github).run()
+        self.assertEqual((self.item(second)["status"], self.item(second)["withheld"]),
+                         ("approved", 1))
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+        # Edited after the check: the claim sees a changed text.
+        third = self.approved("sign:/m:3,3", excerpts=["The gate is shut."])
+        original = Filer.file
+
+        def edited(filer, item):
+            memory.update_feedback("Sera", item["id"], expect_status=("approved",),
+                                   fields={"updated_at": time.time() + 5})
+            return original(filer, item)
+
+        github = FakeGitHub()
+        with patch.object(Filer, "file", edited):
+            self.filer(github).run()
+        self.assertEqual(self.item(third)["status"], "approved")
+        self.assertEqual(github.calls, [])
+
+    def test_unexpected_errors_fail_the_item_and_labels_are_checked_at_edit(self):
+        item_id = self.note()
+        labels = ",".join(f"l{index}" for index in range(10))
+        code, out = self.cli("edit", str(item_id), "--labels", labels)
+        self.assertEqual(code, 2)
+        self.assertIn("more than 10 labels", out)
+        # A row with too many labels anyway (an older edit): failed, not
+        # stranded in filing, and the text names no request.
+        self.game._memory_store().update_feedback(
+            "Sera", item_id, expect_status=("draft",),
+            fields={"labels_json": json.dumps(labels.split(","))})
+        self.cli("approve", str(item_id))
+        self.game.screen_feedback_queue()
+        github = FakeGitHub()
+        self.assertEqual(self.filer(github).run(), 1)
+        item = self.item(item_id)
+        self.assertEqual(item["status"], "failed")
+        self.assertEqual(item["error"], "internal error (ValueError); nothing more was "
+                                        "sent for it")
+        # A read-back that is not an issue at all: filed, unverified.
+        other = self.approved("sign:/test/hall:7,7")
+        github = FakeGitHub()
+        github.queue("GET", "/repos/atrinik/content/issues/100", 200, FakeGitHub.OK, [1, 2])
+        self.filer(github).run()
+        self.assertEqual(self.item(other)["status"], "filed-unlabelled")
+
+    def test_a_secondary_rate_limit_without_retry_after_backs_off(self):
+        item_id = self.approved()
+        github = FakeGitHub()
+        github.queue("POST", "/repos/atrinik/content/issues", 403, {},
+                     {"message": "You have exceeded a secondary rate limit."})
+        self.assertEqual(self.filer(github).run(), 0)
+        self.assertEqual(self.item(item_id)["status"], "approved")
+        row = [row for row in self.game._memory_store().feedback_filings()
+               if row["http_status"] == 403][-1]
+        self.assertAlmostEqual(row["retry_at"] - row["at"], 600.0, delta=1)
+
+    def test_an_item_an_earlier_run_filed_needs_review(self):
+        item_id = self.approved()
+        self.game._memory_store().update_feedback(
+            "Sera", item_id, expect_status=("approved",),
+            fields={"status": "failed",
+                    "issue_url": "https://github.com/atrinik/content/issues/41"})
+        self.assertEqual(self.cli("approve", str(item_id))[0], 0)
+        self.game.screen_feedback_queue()
+        github = FakeGitHub()
+        self.filer(github).run()
+        item = self.item(item_id)
+        self.assertEqual(item["status"], "needs-review")
+        self.assertEqual(json.loads(item["remote_candidates_json"]), [
+            {"url": "https://github.com/atrinik/content/issues/41", "match": "earlier-run"}])
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+
+    def test_only_the_database_owner_runs_the_commands_and_keys_are_files(self):
+        from .feedback_filer import FilingError, load_app_key
+        with patch.object(os, "geteuid", return_value=os.geteuid() + 1):
+            code, out = self.cli("list")
+        self.assertEqual(code, 2)
+        self.assertIn("run this as the user that owns", out)
+        with self.assertRaises(FilingError) as raised:
+            load_app_key(Path("/dev/null"))
+        self.assertIn("not a regular file", str(raised.exception))
+        # The lock is never followed through a link.
+        lock = self.path.with_name(self.path.name + ".filer.lock")
+        lock.symlink_to(self.root / "elsewhere")
+        code, out = self.cli("file", "--dry-run")
+        self.assertEqual(code, 1)
+        self.assertIn("cannot open the filer's lock", out)
+        self.assertFalse((self.root / "elsewhere").exists())
+
+    def test_urllib_send_never_follows_a_redirect_or_leaks_on_errors(self):
+        import http.server
+        import logging
+        import threading
+        from . import feedback_filer
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def answer(self):
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                if self.path.startswith("/redirect"):
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{port}/steal")
+                    self.end_headers()
+                elif self.path.endswith("/installation"):
+                    # An answer that echoes the credential.
+                    body = json.dumps({"message": "bad " + self.headers["Authorization"]})
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body.encode())
+                else:
+                    self.close_connection = True
+                    self.connection.close()
+
+            do_GET = do_POST = do_DELETE = answer
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        api = f"http://127.0.0.1:{port}"
+        env = {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}
+        with patch.object(feedback_filer, "API", api), patch.dict(os.environ, env):
+            status, _, _ = feedback_filer.urllib_send(
+                "GET", f"{api}/redirect", {"Authorization": "Bearer secret-value-123"}, None)
+            self.assertEqual(status, 302)
+            self.assertEqual([path for _, path, _ in seen], ["/redirect"])
+            with self.assertRaises(feedback_filer.FilingError) as raised:
+                feedback_filer.urllib_send("GET", f"{api}/drop", {}, None)
+            self.assertNotIn("Traceback", str(raised.exception))
+            # A whole run through urllib_send: a 500 echoing the JWT, then a
+            # dropped connection; nothing keeps either credential.
+            item_id = self.approved()
+            records = []
+
+            class Keep(logging.Handler):
+                def emit(self, record):
+                    records.append(self.format(record))
+
+            handler = Keep()
+            logging.getLogger().addHandler(handler)
+            lines = []
+            try:
+                filer = self.filer(None, out=lines.append)
+                filer.github.send = feedback_filer.urllib_send
+                self.assertEqual(filer.run(), 1)
+            finally:
+                logging.getLogger().removeHandler(handler)
+        jwt = [auth for _, path, auth in seen if path.endswith("/installation")][0]
+        jwt = jwt.removeprefix("Bearer ")
+        self.assertEqual(self.item(item_id)["status"], "failed")
+        dump = self.dump()
+        self.assertIn("[redacted]", dump)
+        for text in (dump, "\n".join(lines), "\n".join(records)):
+            self.assertNotIn(jwt, text)
+            self.assertNotIn(str(self.key_path), text)
+
+    def test_token_shapes_are_redacted_anywhere(self):
+        from .feedback_filer import _redact
+        legacy = "v1." + "0123456789abcdef" * 2 + "01234567"
+        for text in ("token_ghs_abc123DEF", "aghs_abc123", "x ghp_Zz9 y",
+                     "github_pat_11AB_cd", f"old {legacy} token", "eyJhbGci.eyJ.sig"):
+            cleaned = _redact(text, "")
+            self.assertIn("[redacted]", cleaned, text)
+            for fragment in ("abc123", "Zz9", "11AB", "0123456789abcdef", "eyJ"):
+                self.assertNotIn(fragment, cleaned, text)
+        self.assertEqual(_redact("version v1.2.3 and v1.85.0", ""), "version v1.2.3 and v1.85.0")
+
+    def test_an_interrupted_create_is_recovered_from_the_audit(self):
+        item_id = self.approved()
+        memory = self.game._memory_store()
+        memory.update_feedback("Sera", item_id, expect_status=("approved",),
+                               fields={"status": "filing"})
+        memory.record_feedback_filing({
+            "item_id": item_id, "at": time.time() - 5, "repo": "atrinik/content",
+            "request": "POST /repos/atrinik/content/issues", "http_status": 201,
+            "issue_url": "https://github.com/atrinik/content/issues/55"})
+        github = FakeGitHub()
+        self.filer(github).run()
+        item = self.item(item_id)
+        self.assertEqual((item["status"], item["issue_url"]),
+                         ("filed-unlabelled", "https://github.com/atrinik/content/issues/55"))
+        self.assertIn("not read back", item["error"])
+        self.assertEqual(github.calls, [])
+
+    def test_the_claims_refuse_edits_and_stale_screens(self):
+        memory = self.game._memory_store()
+        # Edited between the duplicate search and the create.
+        first = self.approved()
+        github = FakeGitHub()
+        github.on_search = lambda: memory.update_feedback(
+            "Sera", first, expect_status=("checking",),
+            fields={"updated_at": time.time() + 5})
+        self.filer(github).run()
+        self.assertEqual(self.item(first)["status"], "approved")
+        self.assertNotIn("/repos/atrinik/content/issues", github.paths("POST"))
+        self.cli("reject", str(first))
+        # Approved again after the bot's last screen: the claim refuses it.
+        second = self.approved("sign:/test/hall:7,7")
+        stale = self.item(second)
+        memory.update_feedback("Sera", second, expect_status=("approved",),
+                               fields={"decided_at": float(stale["screened_at"]) + 10})
+        github = FakeGitHub()
+        lines = []
+        filer = self.filer(github, out=lines.append)
+        filer.file(stale)
+        self.assertEqual(self.item(second)["status"], "approved")
+        self.assertEqual(github.calls, [])
+        self.assertTrue(any("lost its screen" in line for line in lines))
+
+    def test_sigterm_revokes_the_token_and_waits_during_cleanup(self):
+        import signal
+        from .feedback_filer import Filer
+        # The handler itself: an exit the run's cleanup sees.
+        previous = Filer._on_sigterm()
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        received = []
+        original = signal.signal(signal.SIGTERM, lambda *_: received.append(1))
+        self.addCleanup(signal.signal, signal.SIGTERM, original)
+        # A SIGTERM while creating: the run exits, and still revokes.
+        item_id = self.approved()
+        github = FakeGitHub()
+        fake = github.__call__
+
+        def send(method, url, headers, body):
+            if method == "POST" and url.endswith("/repos/atrinik/content/issues"):
+                os.kill(os.getpid(), signal.SIGTERM)
+            if method == "DELETE":
+                # And one during cleanup: held until revocation is done.
+                os.kill(os.getpid(), signal.SIGTERM)
+                self.assertEqual(received, [])
+            return fake(method, url, headers, body)
+
+        filer = self.filer(send)
+        with self.assertRaises(SystemExit):
+            filer.run()
+        self.assertEqual(github.paths()[-1], "/installation/token")
+        self.assertEqual((filer._sessions, filer._key), ({}, None))
+        # The pending signal reached the handler the run started with.
+        self.assertEqual(received, [1])
+        self.assertIs(signal.getsignal(signal.SIGTERM).__class__, type(lambda: 0))
+        self.assertEqual(self.item(item_id)["status"], "filing")
+        self.filer(FakeGitHub()).run()
+        self.assertEqual(self.item(item_id)["status"], "failed")
+
+    def test_helpers(self):
+        from .feedback import (clean_body, clean_labels, issue_type, search_terms,
+                               fingerprint)
+        from .feedback_filer import Session
+        self.assertNotIn("ghs_x", repr(Session("ghs_x")))
+        self.assertEqual(search_terms("door:/shattered_islands/world_5_57_-2:13,14"),
+                         ["/shattered_islands/world_5_57_-2"])
+        self.assertEqual(search_terms("formula:book_exp_mod"), ["book_exp_mod"])
+        self.assertEqual(search_terms('x:"ab"'), [])
+        self.assertEqual(clean_labels([" bug", "Bug", "", "maps "]), ["bug", "maps"])
+        with self.assertRaises(ValueError):
+            clean_labels(["a" * 51])
+        self.assertEqual(issue_type({"kind": "qol"}), "Feature")
+        self.assertEqual(issue_type({"kind": "bug", "issue_type": "Task"}), "Task")
+        digest = fingerprint("bug", "atrinik/classic", "s", "c")
+        with self.assertRaises(ValueError):
+            clean_body("```\nunclosed", digest)
+        self.assertIn("Playtester fingerprint: pt-", clean_body("<!-- x -->Hi", digest))
+        self.assertNotIn("<!--", clean_body("<!-- x -->Hi", digest))
 
 # Dialogue voyages and quest-gated exits, behind the dialogue_edges flag
 # (docs/ROUTING.md 4.2, phase P4).

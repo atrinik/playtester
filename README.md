@@ -439,10 +439,12 @@ fights weighted with a 7-day half-life (`GET /api/terrain?limit=N`, up to
 
 She collects what confuses her as deduplicated drafts in a local queue
 (`feedback.py`, `feedback_producers.py`; the design is
-[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md) 4.10, phase
-F5). Nothing leaves the machine: no draft is filed, no GitHub request of
-any kind is made, and the queue's code opens no socket. Approval and filing
-are a later phase, and only an item the owner approves will ever be filed.
+[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md) 4.10, phases
+F5 and F6). Nothing leaves the machine until the owner approves an item with
+the CLI on CT130: the game process and the queue's code open no socket and
+never see the GitHub credential. Only the separate filer (`feedback file`,
+its own systemd unit) files approved items, as issues signed by a small
+GitHub App; see "Approval and filing" below.
 
 - **Producers.** "+N with no effect": an examined item of hers whose name
   shows "+N" on a type and base that gain nothing from it (a `silk cape +2`),
@@ -475,11 +477,15 @@ are a later phase, and only an item the owner approves will ever be filed.
   party, the operator character or another character's name is not stored
   at all. Every reader checks stored items again against the names known
   now: one that names a private term is withheld, shown with no text, and
-  stays withheld (only an owner action in a later phase may release it).
+  stays withheld; it can only be rejected.
 
-The dashboard's read-only **Feedback** tab lists the drafts, filtered by
-kind and repository, with the exact body that would be filed (`GET
-/api/feedback?kind=KIND&repo=OWNER/NAME&status=STATUS&limit=N`). On CT130:
+The dashboard's read-only **Feedback** tab lists the items, filtered by
+kind and repository, with the exact body that would be filed (the Markdown
+copy), the issue once filed, the filer's error and an item's possible
+duplicates (`GET /api/feedback?kind=KIND&repo=OWNER/NAME&status=STATUS&limit=N`).
+It has no write route: approving, rejecting and editing are CLI-only (owner
+decision, 2026-11-19). Items filed without their labels or type, waiting on
+a duplicate review, or failed raise dashboard alerts. On CT130:
 
 ```sh
 # With the service's ATRINIK_BOT_ACCOUNT, ATRINIK_BOT_CHARACTER and
@@ -499,6 +505,112 @@ running bot)" and the metadata. Run it as the bot's service user: SQLite
 may create the database's `-wal` and `-shm` files even for a read-only
 reader when the bot is stopped, and files created by another user can then
 stop the bot from opening its database.
+
+### Approval and filing
+
+The owner decides on CT130, as the bot's service user (with its
+environment, so the CLI knows the account, character and the other private
+terms; for example `sudo -u playtester` and the release's full path, as for
+operator assist below):
+
+```sh
+atrinik-playtester --host HOST --port 1728 feedback approve 12
+atrinik-playtester --host HOST --port 1728 feedback reject 13
+atrinik-playtester --host HOST --port 1728 feedback reject 14 --duplicate https://github.com/atrinik/content/issues/9
+atrinik-playtester --host HOST --port 1728 feedback approve 14 --file-anyway
+atrinik-playtester --host HOST --port 1728 feedback edit 12 --title "..." --labels bug,maps --type Bug
+atrinik-playtester --host HOST --port 1728 feedback edit 12 --body-file body.md
+atrinik-playtester --host HOST --port 1728 feedback show 12 --markdown
+```
+
+- `approve` takes only an item that is not withheld and that the running
+  bot has screened with her full private terms since it last changed (the
+  bot screens approved and edited items every minute); it prints the
+  Markdown copy. `--file-anyway` files an item the filer held in
+  `needs-review` despite its possible duplicates. Approving a `failed` item
+  is the retry.
+- `reject` ends an item; `--duplicate URL` marks it a duplicate of an
+  existing issue. A withheld item can only be rejected.
+- `edit` changes the title, body (`-` reads standard input), labels, type
+  (`default` chooses by kind), repository or target (`new-issue`, or an
+  issue URL in the item's repository to post it as a comment). The body
+  keeps its fingerprint footer, is screened before it is stored, and the
+  item becomes a draft again, to be screened by the bot and approved again.
+
+The filer, `atrinik-playtester feedback file`, files approved items one at
+a time: it refuses an item that is withheld or that the running bot has not
+screened since its approval (checked again when it claims the item, so one
+withheld or edited meanwhile is never filed), screens it again itself, checks GitHub for an
+issue with the same fingerprint or the same map in its title (holding a
+match in `needs-review`), creates the issue with the item's labels, the
+`playtester` label and the type (`Bug`, `Feature` or `Task`), reads it
+back, and marks it `filed`, or `filed-unlabelled` when GitHub dropped a
+label or the type. A `comment:` target is posted as a comment instead. It
+files at most 5 items an hour and 20 a day, 60 s apart, honours GitHub's
+`Retry-After` and secondary limits with a back-off from 10 minutes, and
+stops while GitHub's remaining core quota is under 50. It never follows a
+redirect, and an item an earlier run already filed goes to `needs-review`.
+The commands run only as the user that owns her memory database. Every request is a row in her memory's
+`feedback_filings` audit table. Without the App key (or with `--dry-run`)
+it sends nothing, leaves the items approved and prints their Markdown
+copies.
+
+The key is read only by the filer, from its systemd credential
+(`$CREDENTIALS_DIRECTORY/feedback-app.pem`) or `--app-key-file`, which
+must be readable by nobody else. The filer signs a short-lived RS256 JWT
+with it (the `cryptography` package, already required by `aioquic`), mints
+an installation token for the one repository it files to with
+`issues: write`, revokes it when done, and never prints, logs or stores
+the key, its path, the JWT or the token. One-time setup before live filing:
+
+1. Create a GitHub App owned by the `atrinik` organization with repository
+   permissions Issues: read and write and Metadata: read-only, nothing
+   else, no webhook; install it on `atrinik/content`, `atrinik/classic` and
+   `atrinik/playtester` only. Note its App ID and generate a private key.
+2. On CT130, place the key as `/etc/atrinik-playtester/feedback-app.pem`,
+   `root:root`, mode `0400`, so that only systemd can read it and hand it
+   to the filer's unit.
+3. Create the `playtester` label in each of the three repositories (the
+   filer never creates labels; without it items are filed
+   `filed-unlabelled`).
+4. Add the filer's units next to the bot's service, with the bot's user
+   and runtime state. Give the filer its own environment file with only
+   what it needs: `ATRINIK_BOT_ACCOUNT` and `ATRINIK_BOT_CHARACTER` (they
+   select her rows), `ATRINIK_BOT_RUNTIME_STATE`, and for its own screen
+   `ATRINIK_BOT_PARTY`, `ATRINIK_BOT_OPERATOR_CHARACTER` and
+   `ATRINIK_BOT_CERTIFICATE_SHA256`. It does not need the game password or
+   invite code: it never logs in, and the running bot's screen with every
+   private term, which the filer requires after each approval, covers them.
+
+   ```ini
+   # atrinik-playtester-feedback-file.service
+   [Service]
+   Type=oneshot
+   # The bot's service user, and the bot service's own environment file
+   # (account, character, runtime state and the other private terms).
+   User=playtester
+   EnvironmentFile=/etc/atrinik-playtester/feedback-filer.env
+   Environment=ATRINIK_PLAYTESTER_FEEDBACK_APP_ID=APP_ID
+   LoadCredential=feedback-app.pem:/etc/atrinik-playtester/feedback-app.pem
+   ExecStart=/opt/atrinik-playtester/current/venv/bin/atrinik-playtester --host HOST --port 1728 feedback file
+   NoNewPrivileges=yes
+   LimitCORE=0
+   PrivateTmp=yes
+   ProtectHome=yes
+   ProtectSystem=strict
+   # The directory of ATRINIK_BOT_RUNTIME_STATE (her memory and its lock).
+   ReadWritePaths=STATE_DIRECTORY
+
+   # atrinik-playtester-feedback-file.timer
+   [Timer]
+   OnBootSec=10min
+   OnUnitActiveSec=15min
+   [Install]
+   WantedBy=timers.target
+   ```
+
+   The game's own unit must not have the `LoadCredential=` line or the key
+   path in its environment.
 
 ## Operator assist
 
