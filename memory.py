@@ -69,6 +69,36 @@ FEEDBACK_COLUMNS = ("id", "fingerprint", "repo", "kind", "subject", "target", "t
 FEEDBACK_DATES = 1000
 
 
+# A route_shadow row's detail, at most this long: trimmed field by field,
+# never cut mid-text, so it stays valid JSON.
+SHADOW_DETAIL_LIMIT = 8000
+
+
+def _shadow_detail(entry: dict[str, Any]) -> str:
+    def dump(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+    text = dump(entry)
+    if len(text) <= SHADOW_DETAIL_LIMIT:
+        return text
+    trimmed = dict(entry)
+    for side in ("live", "shadow"):
+        if isinstance(trimmed.get(side), dict):
+            trimmed[side] = {**trimmed[side], "maps": list(trimmed[side].get("maps") or [])[:5]}
+    for key in ("reason", "why"):
+        if isinstance(trimmed.get(key), str):
+            trimmed[key] = trimmed[key][:200]
+    if isinstance(trimmed.get("paused"), dict):
+        trimmed["paused"] = dict(list(trimmed["paused"].items())[:3])
+    text = dump(trimmed)
+    if len(text) <= SHADOW_DETAIL_LIMIT:
+        return text
+    core = ("at", "kind", "trip", "result", "outcome", "source", "destination", "care",
+            "budget")
+    return dump({**{key: trimmed[key] for key in core if key in trimmed},
+                 "trimmed": True})
+
+
 def _add_column(db: sqlite3.Connection, table: str, definition: str) -> None:
     """Add a column unless it exists (race-free: the duplicate is ignored)."""
     try:
@@ -1195,8 +1225,7 @@ class BotMemory:
                        (server, account, character, at, kind, trip, result, detail)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 [(*scope, float(entry["at"]), str(entry["kind"]), str(entry["trip"]),
-                  str(entry["result"]),
-                  json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)[:8000])
+                  str(entry["result"]), _shadow_detail(entry))
                  for entry in entries])
             db.execute(
                 """DELETE FROM route_shadow WHERE rowid IN (

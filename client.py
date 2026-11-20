@@ -1442,6 +1442,7 @@ class AtrinikClient:
         for character, reports in self._live_post_mortems.items():
             if reports:
                 self._save_post_mortems(character, reports)
+        route_shadow.close(self)
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"

@@ -770,8 +770,8 @@ deaths. Today's hazard tiers become graded content costs that steer the
 route but never stop a trip. Behind the owner's `learned_route_costs` flag
 (`--learned-route-costs` or `ATRINIK_BOT_LEARNED_ROUTE_COSTS=1`), off by
 default, a trip takes the cheapest route by those costs; an errand whose
-cheapest route carries one expected death or more of learned danger is
-declined and retried later, while an essential trip goes anyway with the
+cheapest route carries one expected death or more of learned danger (a
+death counts in full until it is 6 hours old) is declined and retried later, while an essential trip goes anyway with the
 owner-block care rules, waiting at most 10 minutes
 (`route-budget-override`, `route-strict-override`, then
 `essential-care-timeout`). With the flag off, plans and farm choices are

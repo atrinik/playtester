@@ -328,6 +328,9 @@ class RouteRecorder:
         self._warned = False
         self._learned: tuple[str, float, dict] | None = None
         self.written = 0
+        # Successful writes that changed anything (events, traversals,
+        # recoveries, requirements): route_costs re-reads her model on it.
+        self.changes = 0
         self.dropped = 0
 
     # Her character.
@@ -673,6 +676,8 @@ class RouteRecorder:
                 self._warned = True
             return False
         self.written += len(self.events)
+        if self._pending() or migration is not None:
+            self.changes += 1
         self.migrated = True
         self._warned = False
         self.events, self.traversals, self.requirements = [], {}, {}

@@ -27,7 +27,7 @@ from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      format_money, map_object_visual_name,
                      update_bank_balance)
 from .equipment import gear_examine_pending, gear_examiner
-from . import terrain
+from . import route_shadow, terrain
 from .observations import is_player, plain
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
@@ -7678,10 +7678,6 @@ class TaskEngine:
             # empty map that login just reset either.
             return
         await self._tick_task(task)
-        # Shadow planning (route_shadow.py): a bounded slice of the learned
-        # plans' searches, after the task's own tick. Never raises.
-        from . import route_shadow
-        route_shadow.step(self.client)
 
     def _report_step_error(self, exc: Exception) -> None:
         """Log an engine step error: a new one in full, a repeat counted."""
@@ -7760,4 +7756,9 @@ class TaskEngine:
             # disconnected ``_step`` returns early without running upkeep.
             if self.step_error_count and self.client.state.phase == "playing":
                 self._step_succeeded()
+            # Shadow planning (route_shadow.py): a bounded slice of the
+            # learned plans' searches after each step, and its pending rows
+            # written, idle or not. Never raises.
+            route_shadow.step(self.client)
             await asyncio.sleep(self.tick_rate)
+        route_shadow.close(self.client)

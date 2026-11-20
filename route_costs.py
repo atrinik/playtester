@@ -176,9 +176,16 @@ class LearnedView:
     travel: dict[str, tuple[float, float]] = field(default_factory=dict)
     # map path -> the signals that make up its danger: {signal: seconds}
     signals: dict[str, dict[str, float]] = field(default_factory=dict)
+    # map path -> learned danger for budget and override comparisons: a
+    # death counts in full until it is older than its half-life (owner
+    # decision, 2026-11-19), every other row as in ``maps``.
+    budget_maps: dict[str, float] = field(default_factory=dict)
 
     def map_danger(self, path: str) -> float:
         return self.maps.get(path, 0.0)
+
+    def budget_danger(self, path: str) -> float:
+        return self.budget_maps.get(path, 0.0)
 
     def edge_danger(self, subject: str) -> float:
         return self.edges.get(subject, 0.0)
@@ -200,6 +207,20 @@ class RouteCostModel:
     loaded_at: float = 0.0
     character: str = ""
     _views: dict = field(default_factory=dict)
+    # Each distinct kit text parsed once per model (not per row and view).
+    _kits: dict = field(default_factory=dict)
+
+    def _kit_counts(self, text: str, kit: dict | None, verdicts: dict) -> bool:
+        if not text or not kit:
+            return True
+        verdict = verdicts.get(text)
+        if verdict is None:
+            if text not in self._kits:
+                self._kits[text] = _kit(text)
+            earlier = self._kits[text]
+            verdict = verdicts[text] = (earlier is None or
+                                        survivability_unchanged(kit, earlier))
+        return verdict
 
     def view(self, now: float, kit: dict | None = None) -> LearnedView:
         """The costs at ``now`` (cached per minute and kit)."""
@@ -208,8 +229,10 @@ class RouteCostModel:
         if cached is not None:
             return cached
         view = LearnedView(now)
+        verdicts: dict[str, bool] = {}
         for at, subject, signal, magnitude, row_kit, recovery in self.rows:
-            if signal not in route_events.WEIGHTS or not kit_counts(row_kit, kit):
+            if signal not in route_events.WEIGHTS or not self._kit_counts(
+                    row_kit, kit, verdicts):
                 continue
             factor = 1.0 if signal == route_events.DEATH else max(0.0, min(1.0, recovery))
             value = route_events.contribution(signal, magnitude, now - at) * factor
@@ -219,6 +242,11 @@ class RouteCostModel:
             if kind == "map":
                 path = subject[len("map:"):]
                 view.maps[path] = view.maps.get(path, 0.0) + value
+                full = value
+                if (signal == route_events.DEATH and
+                        now - at < route_events.HALF_LIVES[route_events.DEATH]):
+                    full = route_events.WEIGHTS[route_events.DEATH] * magnitude
+                view.budget_maps[path] = view.budget_maps.get(path, 0.0) + full
                 parts = view.signals.setdefault(path, {})
                 parts[signal] = parts.get(signal, 0.0) + value
             elif kind == route_events.CELL:
@@ -253,11 +281,15 @@ def learned_model(client: Any, *, now: float | None = None,
     MODEL_REFRESH_SECONDS, sooner (but not within MODEL_MIN_REFRESH_SECONDS)
     after the recorder wrote. Never raises: a failed read keeps the last
     model (an empty one before the first)."""
+    source = getattr(client, "route_cost_source", None)
+    if source is not None and source is not client:
+        # A planning proxy (town_safely_reachable) plans with her model.
+        return learned_model(source, now=now, refresh=refresh)
     recorder = route_events.recorder(client)
     character = recorder.character if recorder is not None else ""
     model = getattr(client, "_route_cost_model", None)
     monotonic = time.monotonic()
-    written = recorder.written if recorder is not None else 0
+    written = recorder.changes if recorder is not None else 0
     state = getattr(client, "_route_cost_model_state", (None, -math.inf, -1))
     if isinstance(model, RouteCostModel) and model.character == character and not refresh:
         age = monotonic - state[1]
@@ -373,6 +405,8 @@ class RouteCost:
     prior: float = 0.0
     learned: float = 0.0
     lam: float = 1.0
+    # Learned danger as budgets and overrides weigh it (LearnedView.budget_maps).
+    budget_learned: float = 0.0
     edges: list[EdgeCost] = field(default_factory=list)
     worst: list[tuple[str, float]] = field(default_factory=list)
 
@@ -382,7 +416,8 @@ class RouteCost:
 
     def describe(self) -> dict[str, Any]:
         return {"time": round(self.time), "prior": round(self.prior),
-                "learned": round(self.learned), "total": round(self.total),
+                "learned": round(self.learned), "budget_learned": round(self.budget_learned),
+                "total": round(self.total),
                 "edges": len(self.edges),
                 "worst": [[subject, round(value)] for subject, value in self.worst]}
 
@@ -442,6 +477,7 @@ class CostContext:
             cost.time += time_
             cost.prior += prior
             cost.learned += on_map + on_edge
+            cost.budget_learned += self.view.budget_danger(edge.destination) + on_edge
             if on_map:
                 key = map_subject(edge.destination)
                 contributions[key] = contributions.get(key, 0.0) + on_map
@@ -569,6 +605,9 @@ class LearnedPlan:
     crossed: tuple[str, ...] = ()
     reason: str = ""
     strict_relaxed: bool = False
+    # The cheapest route a DECLINED plan did not take (planning probes
+    # rank by it: the trip they rank for decides when it runs).
+    candidate: list | None = None
 
     def subjects(self) -> tuple[str, ...]:
         return tuple(edge_subject(edge) for edge in self.route or ())
@@ -593,12 +632,15 @@ class TripSnapshot:
     trip: str
     strict_avoided: frozenset
     context: CostContext
+    # Her walk to her savebed to wait for care (NavigateTask's care
+    # staging): no budget, and no owner block crossed.
+    staging: bool = False
 
 
 def plan_budget(snapshot: TripSnapshot) -> float | None:
     """The trip's danger budget (4.5): none for farm trips (they choose by
-    score) and strict trips (a per-map budget), one expected death for
-    every other trip."""
-    if snapshot.strict or snapshot.trip == FARM:
+    score), strict trips (a per-map budget) and the walk home to wait for
+    care, one expected death for every other trip."""
+    if snapshot.strict or snapshot.staging or snapshot.trip == FARM:
         return None
     return ERRAND_BUDGET_SECONDS

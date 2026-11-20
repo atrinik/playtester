@@ -2142,17 +2142,50 @@ def learned_route(snapshot: route_costs.TripSnapshot):
     cost = context.evaluate(route, snapshot.source_xy,
                             lambda edge: _edge_arrival(graph, edge))
     budget = route_costs.plan_budget(snapshot)
-    if budget is not None and cost.learned >= budget:
+    # A death counts in full for the budget until it is older than its
+    # half-life (owner decision, 2026-11-19): budget_learned.
+    if budget is not None and cost.budget_learned >= budget:
         worst = ", ".join(f"{subject} {value:.0f} s" for subject, value in cost.worst)
         if not snapshot.essential:
             return route_costs.LearnedPlan(
                 None, route_costs.DECLINED, snapshot.trip, cost=cost, budget=budget,
-                reason=f"route declined: learned danger {cost.learned:.0f} s on the "
-                       f"way to {snapshot.destination} is over the {snapshot.trip} "
+                candidate=route,
+                reason=f"route declined: learned danger {cost.budget_learned:.0f} s on "
+                       f"the way to {snapshot.destination} is over the {snapshot.trip} "
                        f"budget of {budget:.0f} s ({worst})")
         outcome, care = route_costs.OVERRIDE, CARE_BOUNDED
     return route_costs.LearnedPlan(route, outcome, snapshot.trip, cost=cost, budget=budget,
                                    care=care, crossed=crossed, strict_relaxed=relaxed)
+
+
+def danger_weight(client: Any, *, optional: bool) -> float:
+    """λ (ROUTING 4.5): SAFETY_LAMBDA while she plays for safety, is
+    depleted or has no ready recall, or on an optional trip; else 1."""
+    try:
+        recall = bool(FarmTask.emergency_recall_candidates(client))
+    except Exception:
+        recall = True
+    state = client.state
+    careful = (effective_farm_objective(state) == "safety" or
+               depleted_for_temple(state) or not recall or optional)
+    return route_costs.SAFETY_LAMBDA if careful else 1.0
+
+
+def bounded_care_subjects(plan: route_costs.LearnedPlan,
+                          snapshot: route_costs.TripSnapshot) -> tuple[str, ...]:
+    """What a budget or strict-plan override crosses with care: the
+    learned subjects that make its danger, else (an override for content
+    hazards alone) the route's maps in the strict avoid set or with a
+    content prior at the avoid level, else every map it enters."""
+    subjects = [subject for subject, _ in (plan.cost.worst if plan.cost else ())]
+    if not subjects:
+        priors = snapshot.context.priors
+        subjects = [route_blocks.map_subject(edge.destination) for edge in plan.route or ()
+                    if edge.destination in snapshot.strict_avoided or
+                    priors.get(edge.destination, 0.0) >= route_costs.PRIOR_OVERLEVEL_SECONDS]
+    if not subjects:
+        subjects = [route_blocks.map_subject(edge.destination) for edge in plan.route or ()]
+    return tuple(dict.fromkeys(subjects))
 
 
 def _care_waits(client: AtrinikClient) -> dict[tuple[str, ...], tuple[float, float, bool]]:
@@ -2628,9 +2661,12 @@ class NavigateTask(BotTask):
         subjects = set(care.subjects)
         if route_blocks.map_subject(map_path) in subjects:
             return True
+        # A blocked destination is no crossing (a block is a transit wall);
+        # a dangerous one under a budget or strict override is.
+        bounded = care.mode == CARE_BOUNDED
         return any(
             route_blocks.edge_subject(edge) in subjects or
-            (edge.destination != self.destination and
+            ((bounded or edge.destination != self.destination) and
              route_blocks.map_subject(edge.destination) in subjects)
             for edge in self.route)
 
@@ -2935,11 +2971,24 @@ class NavigateTask(BotTask):
             self._threat_fallback = True
         return route
 
+    @property
+    def over_budget(self) -> bool:
+        """The last learned plan's route was over its budget, or needed a
+        strict override (a planning probe's ranking puts it after safe
+        ones, as it does a route across an owner block)."""
+        plan = self.learned_plan
+        return plan is not None and plan.outcome in (route_costs.DECLINED,
+                                                     route_costs.OVERRIDE)
+
     def trip_kind(self, client: AtrinikClient | None) -> str:
-        """The trip's kind for its budget and the shadow report: its
-        essential kind while essential, FARM, STRICT for a strict trip, or
-        ERRAND (quest steps included: they share the errand budget)."""
-        if client is not None and self._care_staging is None and self.is_essential(client):
+        """The trip's kind for the shadow report and metrics: "home" for
+        the walk to her savebed to wait for care, its essential kind (a
+        food trip is food-kind whether or not she is hungry yet: whether it
+        is essential now is is_essential's), FARM, STRICT for a strict
+        trip, or ERRAND (quest steps included: they share its budget)."""
+        if self._care_staging is not None:
+            return "home"
+        if self.essential:
             return self.essential
         if self.trip:
             return self.trip
@@ -2960,18 +3009,13 @@ class NavigateTask(BotTask):
         view = model.view(time.time(), route_costs.current_kit(client))
         priors = route_costs.content_priors(self.graph, level,
                                             lethal=self.KNOWN_LETHAL_TRANSIT)
-        essential = self._care_staging is None and self.is_essential(client)
+        staging = self._care_staging is not None
+        essential = not staging and self.is_essential(client)
         trip = self.trip_kind(client)
-        try:
-            recall = bool(FarmTask.emergency_recall_candidates(client))
-        except Exception:
-            recall = True
-        careful = (effective_farm_objective(client.state) == "safety" or
-                   depleted_for_temple(client.state) or not recall or
-                   (not essential and trip != route_costs.FARM))
         context = route_costs.CostContext(
             self.graph, view, priors, pace=route_costs.seconds_per_tile(stats),
-            lam=route_costs.SAFETY_LAMBDA if careful else 1.0)
+            lam=danger_weight(client, optional=not (essential or staging or
+                                                    trip == route_costs.FARM)))
         strict_avoided = frozenset()
         if self.strict_safety:
             strict_avoided = frozenset(
@@ -2982,9 +3026,9 @@ class NavigateTask(BotTask):
                 {path for path, seconds in view.maps.items()
                  if seconds >= route_costs.STRICT_LEARNED_AVOID_SECONDS})
         return route_costs.TripSnapshot(
-            self.graph, source, source_xy, self.destination, self._goal_points(),
-            self._allow_locked(client), self._excluded_edges, self._walls, self._offer,
-            self.strict_safety, essential, trip, strict_avoided, context)
+            self.graph, source, source_xy, self.destination, list(self._goal_points()),
+            self._allow_locked(client), set(self._excluded_edges), self._walls, self._offer,
+            self.strict_safety, essential, trip, strict_avoided, context, staging=staging)
 
     def _plan_learned(self, client: AtrinikClient,
                       origin: tuple[str, tuple[int, int]] | None = None) -> list[MapEdge]:
@@ -3001,19 +3045,26 @@ class NavigateTask(BotTask):
             _clear_components(self.graph)
             plan = drain(learned_route(snapshot))
         self.learned_plan = plan
-        route_shadow.note_live_plan(client, plan)
+        # A planning probe (a trip not started: the temple, food and recall
+        # vendor rankings, the town reach check) has no side effects: no
+        # decision, no metric, no care. It ranks by the cheapest route even
+        # over its budget; the trip it ranks for decides when it runs.
+        live = self.status == TaskStatus.RUNNING
+        if live:
+            route_shadow.note_live_plan(client, plan)
         if plan.outcome == route_costs.BLOCKED:
             raise OwnerBlockRefusal(plan.reason)
         if plan.route is None:
             if plan.outcome == route_costs.DECLINED:
-                self._record(client, "route-declined", route_shadow.plan_detail(
-                    plan, self.destination))
+                if not live and plan.candidate:
+                    return plan.candidate
+                if live:
+                    self._record(client, "route-declined", route_shadow.plan_detail(
+                        plan, self.destination))
             raise ValueError(plan.reason)
         self._crossed = plan.crossed
-        if plan.care == CARE_BOUNDED:
-            worst = tuple(subject for subject, _ in (plan.cost.worst if plan.cost else ()))
-            self._bounded = worst or tuple(route_blocks.map_subject(edge.destination)
-                                           for edge in plan.route[:1])
+        if plan.care == CARE_BOUNDED and live:
+            self._bounded = bounded_care_subjects(plan, snapshot)
             self._record(client, "route-budget-override" if not plan.strict_relaxed
                          else "route-strict-override",
                          route_shadow.plan_detail(plan, self.destination))
@@ -5519,11 +5570,22 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
     learned = {map_path: until for map_path, until in
                (getattr(client.state, "route_hazards", None) or {}).items()
                if until > now}
+    # With learned_route_costs on, the proxy plans as her live strict trips
+    # do: her flag, her learned model (learned danger of 900 s or more in
+    # place of route_hazards) and her kit.
     proxy = types.SimpleNamespace(state=types.SimpleNamespace(
         stats={"level": level}, route_hazards=learned,
-        map=types.SimpleNamespace(path=path, world_x=0, world_y=0)))
+        map=types.SimpleNamespace(path=path, world_x=0, world_y=0)),
+        config=getattr(client, "config", None), route_cost_source=client,
+        farm_analyzer=getattr(client, "farm_analyzer", None))
     access = unlocks.unlock_state(client, graph).access
-    key = (id(graph), path, level, frozenset(learned), access)
+    strict_learned: frozenset[str] = frozenset()
+    if learned_route_costs(client):
+        view = route_costs.learned_model(client).view(now, route_costs.current_kit(client))
+        strict_learned = frozenset(
+            map_path for map_path, seconds in view.maps.items()
+            if seconds >= route_costs.STRICT_LEARNED_AVOID_SECONDS)
+    key = (id(graph), path, level, frozenset(learned), access, strict_learned)
     if key not in _town_reach_cache and len(_town_reach_cache) > 512:
         _town_reach_cache.clear()
     results = _town_reach_cache.setdefault(key, {})
@@ -5976,7 +6038,8 @@ def farm_shadow_snapshot(client: AtrinikClient, graph: "WorldGraph",
     context = route_costs.CostContext(
         graph, view, route_costs.content_priors(
             graph, level, lethal=NavigateTask.KNOWN_LETHAL_TRANSIT),
-        pace=route_costs.seconds_per_tile(stats))
+        pace=route_costs.seconds_per_tile(stats),
+        lam=danger_weight(client, optional=False))
     free = frozenset(path for path in (origin[0], getattr(client.state, "savebed_map", "") or "")
                      if path)
     live_key = farm_spot_key(live[0], live[2]) if live else ""
@@ -6158,8 +6221,8 @@ def temple_food_trip(graph: "WorldGraph", client: AtrinikClient, *,
             continue
         if not navigation._threat_fallback:
             # A priest only reachable across an owner block comes last.
-            ranked.append((navigation.care is not None, len(route),
-                           priest.name.casefold(), priest))
+            ranked.append((navigation.care is not None or navigation.over_budget,
+                           len(route), priest.name.casefold(), priest))
     if not ranked:
         return None
     priest = min(ranked, key=lambda entry: entry[:-1])[-1]
@@ -7588,7 +7651,7 @@ class FarmCircuitTask(BotTask):
                 continue
             if not navigation._threat_fallback:
                 ranked.append((
-                    navigation.care is not None, len(route),
+                    navigation.care is not None or navigation.over_budget, len(route),
                     unit_cost / profile.nutrition,
                     profile.weight / profile.nutrition,
                     -profile.nutrition,

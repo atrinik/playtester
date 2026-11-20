@@ -79,6 +79,12 @@ And a fifth (2026-11-18):
   starve her. A hungry crossing is recorded as `essential-care-food` and
   alerted like the starving one (4.5).
 
+And a sixth (2026-11-19):
+
+- **One recent death counts fully** against a trip's budget: a death
+  counts its whole 1800 s for budget and override comparisons until it is
+  older than its 6 h half-life, then decays as before (4.5).
+
 This document first records what the navigator does today, then the gaps
 against that model, then the design and a plan of small pull requests.
 
@@ -943,6 +949,13 @@ can stop a trip (owner decision). Farm trips use selection instead (below).
 - **Optional errands** (upgrade sweeps, utility shopping, junk sale) and
   **quest steps** get a budget of one expected death, 1800 s (owner
   decision). Above it, the trip is declined and retried later.
+- **One recent death counts fully** (owner decision, 2026-11-19). For the
+  budget and override comparisons, a death counts at its full 1800 s until
+  it is older than its half-life (6 h), then decays as everywhere else. So
+  one recent death on the only route declines an errand and sends an
+  essential trip through the care crossing, as the one-death budget means.
+  Route choice, the strict avoid set and the farm score and caps keep the
+  decaying cost, so 4.5's death-rate bounds hold.
 - **Essential trips** are food when hungry or starving, a cure or the
   depletion service, the savebed move, and a bank trip that pays for one of
   these. They are never declined into stranding. When their budget, their
@@ -1843,18 +1856,34 @@ the live plans. Notes against the text above:
   optional trips (every trip but a farm or essential one), else 1.
 - **Kit and recovery.** `farm_analyzer.survivability_unchanged` is #94's
   predicate on the four fields a row keeps, and
-  `CombatProfile.no_survivability_gain` now calls it. A safe pass is a
+  `CombatProfile.no_survivability_gain` now calls it. Each distinct kit
+  text is parsed once per model. The model is re-read early after any
+  write that changed something, traversals and recoveries included. A safe pass is a
   timed crossing with no damage or recall on that visit; it multiplies the
   map's and the edge's earlier recall, damage and blocked rows by 0.7, in
   a new `recovery` column of `route_events`. Deaths keep 1; cells never
   recover.
 - **Budgets.** A budget compares learned danger only: content priors never
-  decline a trip. Farm and strict trips have none; every other trip
-  (errands and quest steps, which report as `errand`) has 1800 s. Because
-  danger decays from the moment of the death, a sole route with one death
-  is at the budget only at once and under it seconds later: an errand is
-  declined by two recent deaths (within about 6 h), not by one. Declined
+  decline a trip. Farm and strict trips and the walk home to wait for care
+  have none; every other trip (errands and quest steps, which report as
+  `errand`) has 1800 s. A death counts its full 1800 s against it until it
+  is 6 h old (owner decision, 2026-11-19: `LearnedView.budget_maps`,
+  `RouteCost.budget_learned`), so one recent death on the only route
+  declines an errand and overrides an essential trip with care. Declined
   live trips record `route-declined` and fail, to be retried.
+- **Planning probes** (a trip not started: the temple, food and recall
+  vendor rankings, `town_safely_reachable`) have no side effects: no
+  decision, no metric, no bounded care. They rank by the cheapest route
+  even over its budget, after safe ones (`over_budget`); the trip they
+  rank for decides when it runs. A food probe is food-kind. The town
+  reach proxy carries her flag and learned model, so with the flag on its
+  strict verdict uses learned danger of 900 s or more, as live strict trips
+  do.
+- **Care subjects.** A bounded override crosses the subjects that make its
+  learned danger, else (a strict override for content hazards alone) the
+  route's maps in the strict avoid set or with a prior at the avoid level.
+  Hold-fire for a bounded override includes the destination when it is
+  one of them; an owner-blocked destination still is no crossing.
 - **Strict.** The avoid set is today's with learned danger of 900 s or more
   in place of `route_hazards` (a test compares the sets); within it the
   search is weighted. An essential strict trip with no strict route takes
@@ -1868,17 +1897,23 @@ the live plans. Notes against the text above:
   least one state expansion. At most one trip and one farm comparison are
   in flight, a trip every 15 s at most and the same trip (kind, map,
   destination, live route) every 10 minutes; the farm score every 5
-  minutes unless its inputs change, and never within 30 s. A comparison
-  still running after 3 minutes is dropped. Every hook catches its own
-  errors. A whole-world search takes about 0.4 s, so a comparison
-  completes over roughly 20 to 40 engine steps.
+  minutes unless its inputs change, and never within 30 s. Each job in
+  flight advances at least one expansion a step, so neither starves the
+  other. The engine steps the shadow after every step, with or without a
+  task, so rows are written while she idles, and once more at shutdown. A
+  comparison still running after 3 minutes is dropped. Every hook catches
+  its own errors. A whole-world search takes about 0.4 s, so a comparison
+  completes over roughly 20 to 40 engine steps. A shadow without a route
+  where the live plan has none either is an agreement. The snapshot copies
+  the trip's goals and runtime exclusions.
 - **Logs.** `route-shadow-diverge` (another route, a route where the live
   plan has none, another spot) and `route-shadow-decline` (declined, no
   route, blocked, an essential override, farming paused), each at most
   once an hour for the same trip and result. Every comparison, agreements
   included, is a row in the new `route_shadow` table (7 days, 10,000 rows)
   with both routes' maps, time, prior, learned danger, worst subjects, the
-  first difference and what the shadow saves by part. The `route-shadow`
+  first difference and what the shadow saves by part, trimmed field by
+  field to stay valid JSON within 8,000 characters. The `route-shadow`
   command summarises it per trip kind, read-only, for the divergence
   report; the Tasks tab's **Shadow routes** section shows the counts, the
   last farm comparison and the last 20 differences.
@@ -1887,7 +1922,8 @@ the live plans. Notes against the text above:
   each ranking), from one weighted search from her savebed; chokepoints
   are found on that search's states for the 12 most dangerous learned maps,
   so it runs no extra whole-world search and never touches #94's shared
-  reach cache or its rate limit. While she is depleted at the temple
+  reach cache or its rate limit. Its search weighs danger with λ as a farm
+  trip's would. While she is depleted at the temple
   threshold it does not run. The care rule's wait is P8's; the shadow
   reports `care` from D ≥ 1800.
 - **Incident replay.** On the locked content, from the `world_1_67_1` bed,
@@ -1962,7 +1998,8 @@ owner-approved flag flips after a 24 h shadow soak and a divergence report,
 the owner-approved starving exception (a starving food trip may cross an owner
 block with only a ready recall plus hold-fire, recorded as
 `essential-care-starving` and alerted on the dashboard), and the probe limits
-(3 a day, 300 s ceiling).
+(3 a day, 300 s ceiling), and, on 2026-11-19, that one recent death counts
+in full against a trip's budget until it is older than its half-life.
 
 A separate learning-and-feedback design is coming in
 `docs/LEARNING_AND_FEEDBACK.md` (doors and hints, books and facts, terrain

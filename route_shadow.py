@@ -182,7 +182,9 @@ class RouteShadow:
 
     def step(self, client: Any, budget: float = SHADOW_STEP_SECONDS) -> None:
         """Advance the comparisons in flight for about ``budget`` seconds:
-        each by at least one state expansion, then while time is left."""
+        each by at least one state expansion (so neither starves the
+        other), then while time is left. Pending rows are written too, so
+        this also runs while no task does (TaskEngine.run)."""
         if self.jobs:
             started = self.monotonic()
             deadline = started + budget
@@ -212,8 +214,6 @@ class RouteShadow:
                 if done:
                     del self.jobs[kind]
                     job.finish(client, result)
-                if self.monotonic() >= deadline:
-                    break
         self.flush(client)
 
     def run(self, client: Any) -> None:
@@ -233,7 +233,11 @@ class RouteShadow:
                                   lambda edge: _edge_arrival(snapshot.graph, edge))
                      if live_route else None)
         shadow = plan.subjects()
-        if plan.route is None:
+        if (plan.route is None and not live_route and
+                plan.outcome in (route_costs.NO_ROUTE, route_costs.BLOCKED)):
+            # Neither plan found a way: they agree.
+            result = AGREED
+        elif plan.route is None:
             result = plan.outcome
         elif not live_route or shadow != context["live"]:
             result = DIVERGED
@@ -528,6 +532,11 @@ def request_farm(client: Any, graph: Any, live: tuple | None) -> None:
 def step(client: Any, budget: float = SHADOW_STEP_SECONDS) -> None:
     """One task-engine step: advance the comparisons for at most ``budget``."""
     _guard("step", lambda value: value.step(client, budget), client)
+
+
+def close(client: Any) -> None:
+    """Shutdown: write the pending rows once more."""
+    _guard("close", lambda value: value.flush(client, force=True), client)
 
 
 def note_live_plan(client: Any, plan: route_costs.LearnedPlan) -> None:

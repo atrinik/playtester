@@ -26608,6 +26608,55 @@ class RouteEventTests(unittest.TestCase):
                 for row in db.execute(f"SELECT * FROM {table}"):
                     self.assertNotIn("zoey", json.dumps(row).casefold())
 
+    def test_a_safe_pass_recovers_earlier_damage_but_never_deaths(self):
+        from . import route_costs
+        task = self.trip()
+        self.into_hall(task)
+        self.client.route_recorder.on_message(self.client, 0, "The orc hit you for 50")
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task)
+        self.events()
+        store = self.client._memory_store()
+        store.record_route_events("Sera", events=[
+            {"at": self.clock[0] - 1, "subject": "map:/hall", "signal": "death",
+             "magnitude": 1.0}])
+        changes = self.client.route_recorder.changes
+        # A pass that took damage recovers nothing (its own hits least of all).
+        rows = {(row["signal"]): row["recovery"] for row in store.route_event_rows("Sera")}
+        self.assertEqual(rows, {"damage": 1.0, "death": 1.0})
+        task = self.trip()
+        self.into_hall(task)
+        self.at(self.client, "/goal", 5, 5)
+        self.tick(task)
+        self.events()
+        self.assertGreater(self.client.route_recorder.changes, changes)
+        rows = {row["signal"]: row["recovery"] for row in store.route_event_rows("Sera")
+                if row["subject"] == "map:/hall"}
+        self.assertEqual(rows, {"damage": 0.7, "death": 1.0})
+        model = route_costs.RouteCostModel(rows=store.route_cost_rows("Sera"))
+        view = model.view(self.clock[0])
+        self.assertAlmostEqual(view.map_danger("/hall"), 1800 * 0.5 ** (1 / 21600) +
+                               300 * 0.5 * 0.7 * 0.5 ** (
+                                   (self.clock[0] - min(row[0] for row in model.rows)) / 21600),
+                               delta=2)
+
+    def test_an_existing_route_events_table_gains_the_recovery_column(self):
+        from .memory import BotMemory
+        path = Path(self.directory) / "p5.sqlite3"
+        with sqlite3.connect(path) as db:
+            db.execute("""CREATE TABLE route_events (
+                server TEXT NOT NULL, account TEXT NOT NULL, character TEXT NOT NULL,
+                at REAL NOT NULL, subject TEXT NOT NULL, signal TEXT NOT NULL,
+                magnitude REAL NOT NULL, kit TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '')""")
+            db.execute("INSERT INTO route_events VALUES ('s', 'a', 'sera', ?, 'map:/x', "
+                       "'damage', 1.0, '', '')", (time.time(),))
+        store = BotMemory(path, server="s", account="a")
+        row, = store.route_cost_rows("Sera")
+        self.assertEqual((row[1], row[5]), ("map:/x", 1.0))
+        store.record_route_events("Sera", recoveries=[("map:/x", time.time() + 1)])
+        self.assertAlmostEqual(store.route_cost_rows("Sera")[0][5], 0.7)
+
     def test_damage_on_a_crossed_map_counts_as_a_share_of_her_health(self):
         task = self.trip()
         self.into_hall(task)
@@ -28717,6 +28766,15 @@ class LearnedCostModelTests(unittest.TestCase):
             self.assertEqual(profile.no_survivability_gain(earlier),
                              self.route_costs.kit_counts(then, now))
 
+    def test_each_kit_is_parsed_once(self):
+        then = json.dumps({"max_health": 200})
+        model = self.route_costs.RouteCostModel(rows=learned_rows(
+            *[(i, "map:/a", "damage", 0.1, then) for i in range(50)], now=self.now))
+        with patch.object(self.route_costs, "_kit", wraps=self.route_costs._kit) as parsed:
+            model.view(self.now, {"max_health": 150})
+            model.view(self.now + 120, {"max_health": 150})
+        self.assertEqual(parsed.call_count, 1)
+
     def test_recovery_never_reduces_deaths(self):
         view = self.view((0, "map:/a", "death", 1.0, "", 0.49),
                          (0, "map:/a", "damage", 1.0, "", 0.49))
@@ -28853,7 +28911,7 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         self.client = LearnedClient(Path(self.directory) / "memory.sqlite3")
         self.graph = blocks_graph()
         self.enterContext(patch.object(route_costs, "learned_model",
-                                       lambda client, **_: client.route_model))
+                                       lambda client, **_: getattr(client, "route_cost_source", client).route_model))
 
     def learn(self, *rows):
         self.client.route_model = self.route_costs.RouteCostModel(
@@ -28871,6 +28929,11 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
 
     def maps(self, route) -> list[str]:
         return [edge.destination for edge in route or ()]
+
+    @staticmethod
+    def running(task):
+        task.status = TaskStatus.RUNNING
+        return task
 
     def shadow_plan(self, task):
         from .navigation import learned_route
@@ -28951,7 +29014,7 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         self.client.config.learned_route_costs = True
         self.graph = blocks_graph(detour=False)
         self.deaths_on_blocked()
-        task = self.trip()
+        task = self.running(self.trip())
         with self.assertRaisesRegex(ValueError, "route declined"):
             task._plan(self.client)
         self.assertIn("route-declined", self.client.actions())
@@ -28983,8 +29046,8 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         self.graph = blocks_graph(detour=False)
         self.deaths_on_blocked()
         with self.assertRaisesRegex(ValueError, "avoiding every known hazard"):
-            self.trip(strict=True)._plan(self.client)
-        task = self.trip("funding", strict=True)
+            self.running(self.trip(strict=True))._plan(self.client)
+        task = self.running(self.trip("funding", strict=True))
         self.assertEqual(self.maps(task._plan(self.client)), ["/blocked", "/goal"])
         self.assertEqual(task.care.mode, "bounded")
         self.assertIn("route-strict-override", self.client.actions())
@@ -28994,6 +29057,113 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/blocked")
         self.deaths_on_blocked()
         self.assertEqual(self.maps(self.trip()._plan(self.client))[0], "/detour_1")
+
+    def test_one_recent_death_counts_fully_against_the_budget(self):
+        # Owner decision, 2026-11-19: a death counts in full for budgets
+        # and overrides until it is older than its half-life.
+        self.graph = blocks_graph(detour=False)
+        for age in (60, 5 * 3600):
+            with self.subTest(age=age):
+                self.learn((age, "map:/blocked", "death", 1.0))
+                plan = self.shadow_plan(self.trip())
+                self.assertEqual(plan.outcome, "declined")
+                self.assertEqual(round(plan.cost.budget_learned), 1800)
+                self.assertLess(plan.cost.learned, 1800)
+                plan = self.shadow_plan(self.trip("cure"))
+                self.assertEqual((plan.outcome, plan.care), ("override", "bounded"))
+        # Past its half-life it decays as before: under the budget.
+        self.learn((6 * 3600 + 60, "map:/blocked", "death", 1.0))
+        plan = self.shadow_plan(self.trip())
+        self.assertEqual(plan.outcome, "planned")
+        self.assertLess(plan.cost.budget_learned, 900)
+        # The farm score's caps keep the decaying cost (4.5's death rates).
+        view = self.client.route_model.view(time.time())
+        self.assertLess(view.map_danger("/blocked"), 900)
+
+    def test_a_content_only_strict_override_crosses_the_hazards_with_care(self):
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.graph.map_monster_levels = {"/blocked": {"dragon": 90}}
+        task = self.running(self.trip("funding", strict=True))
+        self.assertEqual(self.maps(task._plan(self.client)), ["/blocked", "/goal"])
+        self.assertEqual((task.care.mode, task.care.subjects), ("bounded", ("map:/blocked",)))
+
+    async def test_care_holds_fire_on_a_dangerous_destination(self):
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.learn((60, "map:/goal", "death", 1.0))
+        task = self.running(self.trip("cure"))
+        task._plan(self.client)
+        self.assertEqual(task.care.subjects, ("map:/goal",))
+        self.assertFalse(await task._care_hold(self.client))
+        self.assertTrue(task.care.cleared)
+        # Crossing: hold-fire lasts while the destination is ahead...
+        self.assertTrue(task.care_holds_fire("/start"))
+        # ...and on it.
+        task.route = []
+        self.assertTrue(task.care_holds_fire("/goal"))
+
+    def test_planning_probes_have_no_side_effects(self):
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        metrics = []
+        self.client.metrics = types.SimpleNamespace(route_plan=lambda *a: metrics.append(a))
+        for essential in ("", "cure", "food"):
+            with self.subTest(essential=essential):
+                probe = self.trip(essential)
+                # Ranked by its cheapest route, even over its budget.
+                self.assertEqual(self.maps(probe._plan(self.client)), ["/blocked", "/goal"])
+                self.assertIsNone(probe.care)
+                self.assertTrue(probe.over_budget)
+        self.assertEqual((self.client.actions(), metrics), ([], []))
+        # A food vendor probe is food-kind, hungry or not.
+        self.assertEqual(self.trip("food").trip_kind(self.client), "food")
+
+    def test_the_walk_home_for_care_is_never_declined(self):
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        task = self.trip("cure", destination="/goal")
+        task._care_staging = ("saved",)
+        task.destination = "/goal"
+        plan = self.shadow_plan(task)
+        self.assertEqual((plan.trip, plan.outcome, plan.budget), ("home", "planned", None))
+        # It never crosses an owner block either.
+        self.route_blocks.add_block(self.client, self.graph, "/blocked", 3600)
+        self.assertEqual(self.shadow_plan(task).outcome, "blocked")
+
+    def test_the_snapshot_copies_what_the_live_trip_may_change(self):
+        task = self.trip()
+        task._approach = [(1, 1)]
+        task.destination_xy, task.tolerance = (2, 2), 1
+        task._exclude_edge(self.graph.nodes["/start"].edges[0])
+        task._walls = self.route_blocks.owner_walls(self.client)
+        snapshot = task._trip_snapshot(self.client)
+        task._approach.append((3, 3))
+        task._edge_exclusions.clear()
+        self.assertEqual(snapshot.goals, [(1, 1)])
+        self.assertEqual(len(snapshot.excluded), 1)
+
+    def test_town_reach_follows_learned_costs_with_the_flag_on(self):
+        from .navigation import town_safely_reachable, _town_reach_cache
+        from . import navigation
+        graph = blocks_graph(detour=False)
+        services = (("/goal", None, 0),)
+        self.client.config.learned_route_costs = True
+        with patch.object(navigation, "TOWN_SERVICES", services), \
+                patch.object(navigation, "_farm_starts", lambda graph, path: [(1, 0)]), \
+                patch.object(navigation.unlocks, "unlock_state",
+                             lambda client, graph: types.SimpleNamespace(access=False)):
+            _town_reach_cache.clear()
+            self.assertTrue(town_safely_reachable(self.client, graph, "/start", [9]))
+            self.deaths_on_blocked()
+            _town_reach_cache.clear()
+            self.assertFalse(town_safely_reachable(self.client, graph, "/start", [9]))
+            # As a live strict trip from there.
+            self.graph = graph
+            with self.assertRaisesRegex(ValueError, "avoiding every known hazard"):
+                self.running(self.trip(strict=True))._plan(self.client)
+        self.assertEqual(self.client.actions(), [])
 
 
 class RouteShadowTests(unittest.TestCase):
@@ -29007,7 +29177,7 @@ class RouteShadowTests(unittest.TestCase):
         self.client = LearnedClient(Path(self.directory) / "memory.sqlite3")
         self.graph = blocks_graph()
         self.enterContext(patch.object(route_costs, "learned_model",
-                                       lambda client, **_: client.route_model))
+                                       lambda client, **_: getattr(client, "route_cost_source", client).route_model))
 
     def learn(self, *rows):
         self.client.route_model = self.route_costs.RouteCostModel(
@@ -29166,6 +29336,75 @@ class RouteShadowTests(unittest.TestCase):
         self.assertIn("errand", text)
         self.assertIn("diverged 1", text)
         self.assertIn("map:/blocked", text)
+
+    def test_a_shadow_no_route_where_the_live_plan_failed_is_agreement(self):
+        self.graph = blocks_graph(detour=False)
+        self.graph.nodes["/blocked"].edges.clear()
+        _, live = self.plan()
+        self.assertIsInstance(live, str)
+        self.client.route_shadow.run(self.client)
+        self.assertEqual([row["result"] for row in self.rows()], ["agreed"])
+        self.assertEqual(self.client.actions(), [])
+
+    def test_each_job_progresses_every_step(self):
+        shadow = self.client.route_shadow
+        progress = {"trip": 0, "farm": 0}
+
+        def job(kind):
+            while True:
+                progress[kind] += 1
+                yield
+
+        for kind in progress:
+            shadow.jobs[kind] = self.route_shadow._Job(kind, job(kind), None, time.time())
+        shadow.step(self.client, budget=0.0)
+        self.assertEqual(progress, {"trip": 1, "farm": 1})
+
+    def test_rows_stay_valid_json_capped_and_pruned(self):
+        from . import route_events
+        entry = {"at": time.time(), "kind": "trip", "trip": "errand", "result": "diverged",
+                 "source": "/a", "destination": "/b", "reason": "x" * 9000,
+                 "live": {"maps": ["/m" * 50] * 200}, "shadow": {"maps": []}}
+        self.client.memory.record_route_shadow("Sera", [entry])
+        row, = self.client.memory.route_shadow_rows("Sera")
+        self.assertEqual(row["detail"]["result"], "diverged")
+        self.assertLessEqual(len(json.dumps(row["detail"])), 8100)
+        old = {**entry, "reason": "", "live": {}, "at": time.time() - route_events.SHADOW_MAX_AGE - 5}
+        with patch.object(route_events, "SHADOW_ROW_CAP", 3):
+            self.client.memory.record_route_shadow(
+                "Sera", [old] + [{**entry, "reason": "", "live": {}, "at": time.time() + i}
+                                 for i in range(5)])
+        rows = self.client.memory.route_shadow_rows("Sera")
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(row["at"] > time.time() - 60 for row in rows))
+
+    def test_rows_are_written_while_idle_and_at_shutdown(self):
+        shadow = self.client.route_shadow
+        shadow.pending.append({"at": time.time(), "kind": "trip", "trip": "errand",
+                               "result": "agreed"})
+        shadow._next_flush = float("inf")
+        self.route_shadow.close(self.client)
+        self.assertEqual(len(self.client.memory.route_shadow_rows("Sera")), 1)
+        shadow.pending.append({"at": time.time(), "kind": "trip", "trip": "errand",
+                               "result": "agreed"})
+        shadow._next_flush = float("-inf")
+        self.route_shadow.step(self.client)
+        self.assertEqual(len(self.client.memory.route_shadow_rows("Sera")), 2)
+
+    def test_the_engine_steps_the_shadow_without_a_task(self):
+        engine = TaskEngine(self.client, tick_rate=0.0)
+        calls = []
+        with patch.object(self.route_shadow, "step", lambda client: (
+                calls.append(client), setattr(engine, "running", False))), \
+                patch.object(self.route_shadow, "close", lambda client: calls.append("close")):
+            engine.running = True
+            asyncio.run(engine.run())
+        self.assertEqual(calls, [self.client, "close"])
+
+    def test_the_farm_shadow_weighs_danger_by_lambda(self):
+        from .navigation import danger_weight
+        self.client.state.farm_objective = "safety"
+        self.assertEqual(danger_weight(self.client, optional=False), 2.0)
 
     def test_metrics_count_shadow_results(self):
         from .metrics import BotMetrics
