@@ -31,7 +31,7 @@ from . import feedback_producers
 from .observations import AuthoredContent, Observation, ObservationRecorder, text_hash
 from . import post_mortem
 from .terrain import FightRecorder
-from . import route_events
+from . import route_events, route_shadow
 from .self_improvement import PLAYER_CHANNELS, from_server
 from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
@@ -185,6 +185,11 @@ class ClientConfig:
     # exits (dialogue_edges.py). Off (the default) plans exactly as before;
     # the owner turns it on after one supervised voyage.
     dialogue_edges: bool = False
+    # docs/ROUTING.md P6/P7: plan with learned route costs, errand budgets
+    # and the essential override (route_costs.py). Off (the default), plans
+    # and farm choices are as before and the learned ones run in the shadow
+    # (route_shadow.py); the owner turns it on after the shadow soak.
+    learned_route_costs: bool = False
 
 
 # kill_player (server types/player.c) sends exactly one of these, as the whole
@@ -348,6 +353,8 @@ class AtrinikClient:
         # Her route events (route_events.py, docs/ROUTING.md 4.4): what
         # crossing the world costs her, written best effort.
         self.route_recorder = route_events.RouteRecorder()
+        # Shadow planning with learned costs (route_shadow.py, ROUTING P6).
+        self.route_shadow = route_shadow.RouteShadow()
         # The feedback queue (feedback.py): (fingerprint, occurrence, detail)
         # already noted in this process, so a repeat costs no write, and
         # other names drafts must never contain (the operator character).
@@ -1435,6 +1442,7 @@ class AtrinikClient:
         for character, reports in self._live_post_mortems.items():
             if reports:
                 self._save_post_mortems(character, reports)
+        route_shadow.close(self)
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"

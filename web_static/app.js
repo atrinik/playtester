@@ -17,7 +17,7 @@ function applyStyles(root) {
 }
 
 const LIVE_KEYS = "phase,connected,character,stats,level_progress,target,current_action,task,last_task,map,inventory,inventory_ready,ground,messages,interface,economy,conditions,protections,skills,party,alerts,engine_error";
-const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment,route_blocks,route_learned,dialogue_edges";
+const SLOW_KEYS = "build,farming_analysis,post_mortems,trends,decisions,actions,quests,quest_journal,farm_spots,navigation_spots,unlocks,equipment,route_blocks,route_learned,dialogue_edges,route_shadow";
 // Server inventory also carries objects the real client keeps out of the bag.
 const HIDDEN_TYPES = new Set([29, 43, 105, 114]); // spell, skill, poisoning, force
 const CATEGORIES = [
@@ -769,7 +769,7 @@ function renderFacts(k) {
 }
 $("#fact-kind").onchange = pollKnowledge;
 // ---------- learned route subjects (read-only; docs/ROUTING.md 4.4, 4.8) ----------
-// Built with node() and textContent only. The planner does not use them yet.
+// Built with node() and textContent only. route_costs.py reads the same rows.
 const SIGNAL_LABELS = { death: ["death", "deaths"], recall: ["recall", "recalls"], damage: ["damage", "damage"], blocked: ["held exit", "held exits"], crossing_failed: ["failed crossing", "failed crossings"] };
 const signalCount = (k, n) => `${n} ${(SIGNAL_LABELS[k] || [k, k])[n === 1 ? 0 : 1]}`;
 const learnedCost = s => (s < 60 ? `${Math.round(s)} s` : blockSpan(s));
@@ -796,6 +796,54 @@ function renderLearned() {
     rows.push(node("small", "muted", `${l.learned || 0} subjects with a cost · ${l.traversed || 0} crossed · events (7 d): ${totals || "none"}${l.pending ? ` · ${l.pending} not written yet` : ""}${l.migrated ? "" : " · history not migrated yet"}`));
   }
   $("#route-learned").replaceChildren(...rows);
+}
+// ---------- shadow routes (read-only; docs/ROUTING.md 4.8, P6) ----------
+// Built with node() and textContent only.
+let lastShadowSig = "";
+const shadowCost = c => (c && c.total != null ? `${learnedCost(c.time)} travel, ${learnedCost(c.prior)} prior, ${learnedCost(c.learned)} learned` : "no route");
+function renderShadow() {
+  const d = slow.route_shadow, sig = JSON.stringify(d ?? null);
+  if (sig === lastShadowSig) return;
+  lastShadowSig = sig;
+  if (!d) return $("#route-shadow").replaceChildren(node("span", "muted", "Not available."));
+  const rows = [node("small", "muted", d.enabled ? "learned_route_costs on: her live plans use learned costs; the counts below are live plans." : "learned_route_costs off: her plans are as before; the learned ones only run in the shadow.")];
+  for (const [kind, trips] of Object.entries(d.counts || {})) {
+    for (const [trip, results] of Object.entries(trips)) {
+      const row = node("div", "quest");
+      const total = Object.values(results).reduce((a, b) => a + b, 0);
+      row.append(node("strong", "", `${kind} · ${trip}`), node("span", "flag", `${total}`), node("small", "", Object.entries(results).map(([r, n]) => `${r} ${n}`).join(", ")));
+      rows.push(row);
+    }
+  }
+  if (!Object.keys(d.counts || {}).length) rows.push(node("span", "muted", "No comparison yet."));
+  const farm = d.farm;
+  if (farm) {
+    const row = node("div", "quest");
+    const spot = s => (s && s.name ? `${s.name} (D ${s.danger ?? "?"} s${s.score != null ? `, score ${s.score}` : ""})` : "none");
+    row.append(node("strong", "", "Farm score"), node("span", `flag ${farm.result === "agreed" ? "good" : "warn"}`, farm.result), node("small", "", `live ${spot(farm.live)} · shadow ${spot(farm.shadow)}${farm.care ? " · with farm-route care" : ""}${(farm.chokepoints || []).length ? ` · chokepoints: ${farm.chokepoints.join(", ")}` : ""}`));
+    rows.push(row);
+  }
+  for (const e of d.recent || []) {
+    const row = node("div", "quest");
+    const title = e.kind === "farm" ? `farm: ${(e.live || {}).name || "none"} → ${(e.shadow || {}).name || "none"}` : `${e.trip}: ${e.source} → ${e.destination}`;
+    row.append(node("strong", "", title), node("span", `flag ${e.result === "diverged" ? "warn" : "bad"}`, e.result));
+    const notes = [blockWhen(e.at)];
+    if (e.kind === "trip") {
+      notes.push(`live: ${(e.live || {}).edges || 0} edges, ${(e.live || {}).error || shadowCost(e.live)}`);
+      notes.push(`shadow: ${(e.shadow || {}).edges || 0} edges, ${shadowCost(e.shadow)}`);
+      if (e.why) notes.push(e.why);
+      if (e.reason) notes.push(e.reason);
+      if (e.care) notes.push(`care: ${e.care}`);
+      const worst = ((e.shadow || {}).worst || []).map(([s, v]) => `${s} ${learnedCost(v)}`).join(", ");
+      if (worst) notes.push(`worst: ${worst}`);
+    } else if (e.paused && Object.keys(e.paused).length) {
+      notes.push(`paused: ${Object.entries(e.paused).slice(0, 3).map(([k, v]) => `${k} ${v}`).join("; ")}`);
+    }
+    row.append(node("small", "", notes.join(" · ")));
+    rows.push(row);
+  }
+  rows.push(node("small", "muted", `${(d.in_flight || []).length} in flight · ${d.skipped || 0} skipped by the throttle · ${d.dropped || 0} dropped · model v${d.model_version || 0}`));
+  $("#route-shadow").replaceChildren(...rows);
 }
 // ---------- voyages (read-only; docs/ROUTING.md P4) ----------
 // NPC voyages and quest-gated exits, built with node() and text only.
@@ -1004,7 +1052,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderVoyages(); renderBlocks(); renderLearned(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderVoyages(); renderBlocks(); renderLearned(); renderShadow(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
     if ($("#tab-farming").classList.contains("active")) pollTerrain();
     if ($("#tab-feedback").classList.contains("active")) pollFeedback();

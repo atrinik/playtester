@@ -80,6 +80,14 @@ def parser() -> argparse.ArgumentParser:
         help="plan with NPC dialogue voyages and quest-gated exits "
              "(default: off; the owner turns it on after a supervised voyage)",
     )
+    p.add_argument(
+        "--learned-route-costs", action="store_true",
+        default=os.getenv("ATRINIK_BOT_LEARNED_ROUTE_COSTS", "").strip().casefold()
+        in ("1", "true", "yes", "on"),
+        help="plan with learned route costs, errand budgets and the essential "
+             "override (default: off; the learned plans run in the shadow until "
+             "the owner approves the flip)",
+    )
     p.add_argument("--register", action="store_true")
     p.add_argument("--create-character", action="store_true")
     p.add_argument("--archetype", default="half_elf_male")
@@ -172,6 +180,12 @@ def parser() -> argparse.ArgumentParser:
         "show", help="one item's title and the exact body that would be filed")
     feedback_show.add_argument("item", help="its id, or its fingerprint (pt-...)")
     feedback_show.add_argument("--json", action="store_true")
+    shadow = sub.add_parser(
+        "route-shadow",
+        help="her shadow planning report, read from her memory database (no network)")
+    shadow.add_argument("--hours", type=float, default=24.0,
+                        help="how far back to summarise (default: 24)")
+    shadow.add_argument("--json", action="store_true")
     deposit = sub.add_parser("deposit")
     deposit.add_argument("--container", required=True)
     deposit.add_argument("--item", action="append", required=True)
@@ -297,6 +311,66 @@ def feedback_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def route_shadow_command(args: argparse.Namespace) -> int:
+    """``route-shadow``: the shadow planner's divergence report (ROUTING P6,
+    for the P7 and P8 gates), read-only, local, no network: per trip kind,
+    how often the learned plan agreed with the live one, took another
+    route, or would decline or override the trip; the subjects behind the
+    differences; and the newest differences."""
+    import sqlite3
+    import time
+
+    from .memory import BotMemory
+    from .route_shadow import summarise_rows
+
+    path = memory_path(args.runtime_state)
+    if not args.character:
+        print("route-shadow: set --character (or ATRINIK_BOT_CHARACTER)")
+        return 2
+    if not path.is_file():
+        print(f"route-shadow: no memory database at {path}")
+        return 1
+    memory = BotMemory.open_read_only(path, server=f"{args.host.casefold()}:{args.port}",
+                                      account=args.account)
+    since = time.time() - max(0.0, args.hours) * 3600.0
+    try:
+        if not memory.has_table("route_shadow"):
+            print(f"route-shadow: {path} has no shadow rows yet (no bot of this "
+                  "version has opened it)")
+            return 1
+        rows = memory.route_shadow_rows(args.character, since=since)
+    except sqlite3.Error as error:
+        print(f"route-shadow: cannot read {path}: {error}")
+        return 1
+    report = summarise_rows(rows)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    print(f"{report['rows']} comparisons in the last {args.hours:g} h")
+    for kind, trips in sorted(report["counts"].items()):
+        for trip, results in sorted(trips.items()):
+            total = sum(results.values())
+            parts = ", ".join(f"{result} {count}" for result, count in sorted(results.items()))
+            print(f"  {kind:<4} {trip:<10} {total:>5}: {parts}")
+    if report["subjects"]:
+        print("Subjects behind the differences:")
+        for subject, count in report["subjects"]:
+            print(f"  {count:>4}  {subject}")
+    if report["differences"]:
+        print("Newest differences:")
+    for row in report["differences"]:
+        detail = row["detail"]
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(row["at"]))
+        where = (f"{detail.get('source', '')} -> {detail.get('destination', '')}"
+                 if row["kind"] == "trip" else
+                 f"live {(detail.get('live') or {}).get('name', '')} / shadow "
+                 f"{(detail.get('shadow') or {}).get('name', '')}")
+        why = detail.get("why") or detail.get("reason") or ""
+        print(f"  {stamp} {row['kind']} {row['trip']} {row['result']}: {where}"
+              f"{'; ' + why if why else ''}")
+    return 0
+
+
 def autoplay_hold_reason(client) -> str:
     """Why the ``autoplay`` command must start idle, or "" to autoplay.
 
@@ -342,6 +416,7 @@ async def main_async(args: argparse.Namespace) -> None:
         runtime_content_path=args.runtime_content,
         persist_tile_facts=args.persist_tile_facts,
         dialogue_edges=args.dialogue_edges,
+        learned_route_costs=args.learned_route_costs,
         register=args.register, create_character=args.create_character,
         character_archetype=args.archetype,
     )
@@ -570,6 +645,8 @@ def main() -> None:
     if args.task == "feedback":
         # Local and read-only: needs no game inputs and no network.
         raise SystemExit(feedback_command(args))
+    if args.task == "route-shadow":
+        raise SystemExit(route_shadow_command(args))
     if args.task == "operator-assist":
         # Needs no game inputs: it only talks to the running bot.
         raise SystemExit(operator_assist(args))

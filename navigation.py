@@ -18,6 +18,7 @@ from pathlib import Path
 import time
 import types
 from collections.abc import Callable, Iterable, Sequence
+from typing import Any
 
 try:
     from tools.world_content_audit import (ROOT as CONTENT_ROOT,
@@ -33,10 +34,13 @@ from . import constants as c
 from . import dialogue_edges
 from . import requirements as req
 from . import route_blocks
+from . import route_costs
 from . import route_events
+from . import route_shadow
 from . import unlocks
 from .equipment import abandon_gear_examine
 from .route_blocks import NO_WALLS, OwnerWalls
+from .route_costs import drain
 from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
 
@@ -1510,7 +1514,32 @@ class WorldGraph:
                           walls: OwnerWalls | None = None,
                           offer: dialogue_edges.DialogueOffer | None = None,
                           stop_maps: set[str] | None = None):
+        """Every walkable component reachable from ``source_xy``, and how
+        (_expand_component_states, run to the end)."""
+        return drain(self._expand_component_states(
+            source, source_xy, destination, allow_locked=allow_locked,
+            excluded=excluded, avoided_maps=avoided_maps,
+            penalized_maps=penalized_maps, walls=walls, offer=offer,
+            stop_maps=stop_maps))
+
+    def _expand_component_states(
+            self, source: str, source_xy: tuple[int, int],
+            destination: str | None, *,
+            allow_locked=False,
+            excluded: set[tuple[str, str]] | None = None,
+            avoided_maps: set[str] | None = None,
+            penalized_maps: set[str] | None = None,
+            walls: OwnerWalls | None = None,
+            offer: dialogue_edges.DialogueOffer | None = None,
+            stop_maps: set[str] | None = None,
+            edge_cost: Callable[[MapEdge, tuple[int, int], tuple[int, int]], float]
+            | None = None):
         """Every walkable component reachable from ``source_xy``, and how.
+
+        A generator: it yields after each state it expands, so a caller
+        with a per-tick time budget (route_shadow.py) can spread one search
+        over several ticks; drain() runs it to the end. Its return value is
+        the search below.
 
         Breadth-first over exact walkable components across maps: the
         states (map, component key), the arrival square of each, and the
@@ -1523,6 +1552,9 @@ class WorldGraph:
         ``dialogue_edges`` flag) adds its voyages and closes the quest-gated
         exits it names; without one the graph is the static one.
         ``stop_maps`` ends the search once it reaches one of them.
+        ``edge_cost`` (route_costs.py, ROUTING P6) prices each transition
+        from (edge, the square she leaves from, the arrival square); its
+        costs replace the penalty flags in the result's sixth field.
         """
         start_component = self._component(
             source, source_xy, allow_locked=allow_locked)
@@ -1591,10 +1623,14 @@ class WorldGraph:
                             positions.append(arrival)
                         targets.append(target)
                         edge_metadata.append(len(route_edges))
-                        edge_costs.append(edge.destination in (penalized_maps or ()))
+                        if edge_cost is None:
+                            edge_costs.append(edge.destination in (penalized_maps or ()))
+                        else:
+                            edge_costs.append(edge_cost(adjusted, position, arrival))
                         route_edges.append(adjusted)
             offsets.append(len(targets))
             cursor += 1
+            yield
         return (states, positions, offsets, targets, edge_metadata,
                 edge_costs, route_edges)
 
@@ -1621,6 +1657,8 @@ class WorldGraph:
                      penalized_maps: set[str] | None = None,
                      walls: OwnerWalls | None = None,
                      offer: dialogue_edges.DialogueOffer | None = None,
+                     edge_cost: Callable[[MapEdge, tuple[int, int], tuple[int, int]], float]
+                     | None = None,
                      ) -> list[MapEdge]:
         """Route end-to-end between exact walkable components across maps.
 
@@ -1628,13 +1666,38 @@ class WorldGraph:
         one, so the route crosses as few of them as it can and, among those,
         is the shortest. ``walls`` (the owner's blocks) are never crossed.
         ``offer`` adds dialogue voyages and closes quest-gated exits
-        (dialogue_edges.py); None plans on the static graph.
+        (dialogue_edges.py); None plans on the static graph. ``edge_cost``
+        (route_costs.py) makes it the cheapest route by those costs instead,
+        penalized maps ignored (route_points_iter).
         """
+        return drain(self.route_points_iter(
+            source, source_xy, destination, destination_points,
+            allow_locked=allow_locked, excluded=excluded,
+            avoided_maps=avoided_maps, penalized_maps=penalized_maps,
+            walls=walls, offer=offer, edge_cost=edge_cost))
+
+    def route_points_iter(self, source: str, source_xy: tuple[int, int],
+                          destination: str,
+                          destination_points: list[tuple[int, int]], *,
+                          allow_locked: bool = False,
+                          excluded: set[tuple[str, str]] | None = None,
+                          avoided_maps: set[str] | None = None,
+                          penalized_maps: set[str] | None = None,
+                          walls: OwnerWalls | None = None,
+                          offer: dialogue_edges.DialogueOffer | None = None,
+                          edge_cost: Callable[[MapEdge, tuple[int, int], tuple[int, int]],
+                                              float] | None = None):
+        """route_points as a generator that yields while it expands the
+        world (_expand_component_states); its return value is the route.
+        With ``edge_cost`` each transition costs that many seconds, in
+        tenths (route_costs.COST_SCALE) and at least one, and the native
+        search is Dijkstra over them."""
         states, positions, offsets, targets, edge_metadata, edge_costs, \
-            route_edges = self._component_states(
+            route_edges = yield from self._expand_component_states(
                 source, source_xy, destination, allow_locked=allow_locked,
                 excluded=excluded, avoided_maps=avoided_maps,
-                penalized_maps=penalized_maps, walls=walls, offer=offer)
+                penalized_maps=penalized_maps, walls=walls, offer=offer,
+                edge_cost=edge_cost)
         goals = [
             index for index, ((map_path, _), position)
             in enumerate(zip(states, positions))
@@ -1647,12 +1710,17 @@ class WorldGraph:
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
                 f"{destination} {destination_points}")
-        # A simple route has fewer transitions than there are states, so one
-        # penalized entry outweighs any detour: crossings first, then length.
-        penalty = len(states) + 1
+        if edge_cost is not None:
+            costs = [route_costs.scaled(cost) for cost in edge_costs]
+        else:
+            # A simple route has fewer transitions than there are states, so
+            # one penalized entry outweighs any detour: crossings first, then
+            # length.
+            penalty = len(states) + 1
+            costs = ([1 + penalty * flagged for flagged in edge_costs]
+                     if penalized_maps else None)
         result = graph_search(
-            offsets, targets, 0, goals, metadata=edge_metadata,
-            costs=[1 + penalty * flagged for flagged in edge_costs] if penalized_maps else None)
+            offsets, targets, 0, goals, metadata=edge_metadata, costs=costs)
         if result.status != "found":
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
@@ -1997,6 +2065,147 @@ class OwnerBlockRefusal(Exception):
     turns it into one)."""
 
 
+def learned_route_costs(client: Any) -> bool:
+    """The owner's learned_route_costs flag (ROUTING P6/P7): live plans use
+    learned costs, budgets and the essential override. Off (the default),
+    plans are as before and the learned plans run in the shadow
+    (route_shadow.py)."""
+    return bool(getattr(getattr(client, "config", None), "learned_route_costs", False))
+
+
+def learned_route(snapshot: route_costs.TripSnapshot):
+    """Plan ``snapshot``'s trip with learned costs (ROUTING 4.5): a
+    generator that yields while it expands the world and returns a
+    route_costs.LearnedPlan.
+
+    One weighted search: each edge costs its travel time plus the entered
+    map's content prior and learned danger (route_costs.CostContext), so
+    content hazards are costs, never walls, and the safest route wins.
+    Walls are the owner's blocks (P3's rules: an essential trip crosses
+    one with care when every route does; any other trip is BLOCKED), and
+    for a strict trip the strict avoid set, with learned danger at
+    STRICT_LEARNED_AVOID_SECONDS or more in place of route_hazards. A
+    strict trip that finds no route is NO_ROUTE, or, if essential, takes
+    the cheapest route with CARE_BOUNDED care (OVERRIDE). Any other trip but
+    a farm trip has a budget: learned danger at or above it DECLINES an
+    optional trip and makes an essential one an OVERRIDE. Content priors
+    never count toward a budget.
+    """
+    graph = snapshot.graph
+    context = snapshot.context
+    base = {"allow_locked": snapshot.access, "excluded": snapshot.excluded,
+            "offer": snapshot.offer, "edge_cost": context.edge_cost}
+    args = (snapshot.source, snapshot.source_xy, snapshot.destination, snapshot.goals)
+
+    def search(avoided):
+        try:
+            route = yield from graph.route_points_iter(
+                *args, avoided_maps=avoided, walls=snapshot.walls or None, **base)
+            return route, ()
+        except ValueError as walled:
+            if not snapshot.walls:
+                raise
+            route = yield from graph.route_points_iter(*args, avoided_maps=avoided, **base)
+            crossed = snapshot.walls.crossings(route, snapshot.destination)
+            if not crossed:
+                raise walled from None
+            if not snapshot.essential:
+                raise OwnerBlockRefusal(
+                    f"owner block: every route to {snapshot.destination} crosses "
+                    f"{', '.join(crossed)} ({walled})") from None
+            return route, crossed
+
+    outcome, care, relaxed = route_costs.PLANNED, "", False
+    try:
+        if snapshot.strict:
+            try:
+                if (snapshot.destination != snapshot.source and
+                        snapshot.destination in snapshot.strict_avoided):
+                    raise ValueError(f"{snapshot.destination} is itself a known hazard")
+                route, crossed = yield from search(set(snapshot.strict_avoided))
+            except ValueError as exc:
+                if not snapshot.essential:
+                    return route_costs.LearnedPlan(
+                        None, route_costs.NO_ROUTE, snapshot.trip,
+                        reason=f"no route to {snapshot.destination} avoiding every "
+                               f"known hazard: {exc}")
+                route, crossed = yield from search(None)
+                outcome, care, relaxed = route_costs.OVERRIDE, CARE_BOUNDED, True
+        else:
+            route, crossed = yield from search(None)
+    except OwnerBlockRefusal as refusal:
+        return route_costs.LearnedPlan(None, route_costs.BLOCKED, snapshot.trip,
+                                       reason=str(refusal))
+    except ValueError as exc:
+        return route_costs.LearnedPlan(None, route_costs.NO_ROUTE, snapshot.trip,
+                                       reason=str(exc))
+    cost = context.evaluate(route, snapshot.source_xy,
+                            lambda edge: _edge_arrival(graph, edge))
+    budget = route_costs.plan_budget(snapshot)
+    # A death counts in full for the budget until it is older than its
+    # half-life (owner decision, 2026-11-19): budget_learned.
+    if budget is not None and cost.budget_learned >= budget:
+        worst = ", ".join(f"{subject} {value:.0f} s" for subject, value in cost.worst)
+        if not snapshot.essential:
+            return route_costs.LearnedPlan(
+                None, route_costs.DECLINED, snapshot.trip, cost=cost, budget=budget,
+                candidate=route,
+                reason=f"route declined: learned danger {cost.budget_learned:.0f} s on "
+                       f"the way to {snapshot.destination} is over the {snapshot.trip} "
+                       f"budget of {budget:.0f} s ({worst})")
+        outcome, care = route_costs.OVERRIDE, CARE_BOUNDED
+    return route_costs.LearnedPlan(route, outcome, snapshot.trip, cost=cost, budget=budget,
+                                   care=care, crossed=crossed, strict_relaxed=relaxed)
+
+
+def danger_weight(client: Any, *, optional: bool) -> float:
+    """λ (ROUTING 4.5): SAFETY_LAMBDA while she plays for safety, is
+    depleted or has no ready recall, or on an optional trip; else 1."""
+    try:
+        recall = bool(FarmTask.emergency_recall_candidates(client))
+    except Exception:
+        recall = True
+    state = client.state
+    careful = (effective_farm_objective(state) == "safety" or
+               depleted_for_temple(state) or not recall or optional)
+    return route_costs.SAFETY_LAMBDA if careful else 1.0
+
+
+def bounded_care_subjects(plan: route_costs.LearnedPlan,
+                          snapshot: route_costs.TripSnapshot) -> tuple[str, ...]:
+    """What a budget or strict-plan override crosses with care: the
+    learned subjects that make its danger, else (an override for content
+    hazards alone) the route's maps in the strict avoid set or with a
+    content prior at the avoid level, else every map it enters."""
+    view, context = snapshot.context.view, snapshot.context
+    route = plan.route or ()
+
+    def learned_subjects(threshold: float) -> list[str]:
+        found = []
+        for edge in route:
+            if view.budget_danger(edge.destination) >= threshold > 0 or (
+                    threshold <= 0 and view.budget_danger(edge.destination) > 0):
+                found.append(route_blocks.map_subject(edge.destination))
+            subject = context.subject(edge)
+            value = view.edge_danger(subject)
+            if (value >= threshold > 0) or (threshold <= 0 and value > 0):
+                found.append(subject)
+        return found
+
+    # Every subject on the route with learned danger at the strict level,
+    # else every one with any (not the truncated worst list).
+    subjects = (learned_subjects(route_costs.STRICT_LEARNED_AVOID_SECONDS) or
+                learned_subjects(0.0))
+    if not subjects:
+        priors = snapshot.context.priors
+        subjects = [route_blocks.map_subject(edge.destination) for edge in plan.route or ()
+                    if edge.destination in snapshot.strict_avoided or
+                    priors.get(edge.destination, 0.0) >= route_costs.PRIOR_OVERLEVEL_SECONDS]
+    if not subjects:
+        subjects = [route_blocks.map_subject(edge.destination) for edge in plan.route or ()]
+    return tuple(dict.fromkeys(subjects))
+
+
 def _care_waits(client: AtrinikClient) -> dict[tuple[str, ...], tuple[float, float, bool]]:
     """Owner-block care waits by (trip kind, *subjects): (start, last seen,
     alerted), per client."""
@@ -2035,6 +2244,10 @@ class CareCrossing:
     peaks: dict = field(default_factory=dict)
     plateaued: bool = False
     checked_at: float = 0.0
+    # The subjects a budget or strict-plan override (CARE_BOUNDED) crosses;
+    # kept when an owner block makes the crossing CARE_OWNER_BLOCK, so its
+    # destination hold-fire survives the merge.
+    bounded: tuple[str, ...] = ()
 
 
 def care_recall_ready(client: AtrinikClient, *, starving: bool = False) -> bool:
@@ -2203,6 +2416,15 @@ class NavigateTask(BotTask):
         self._voyage_approach: tuple[tuple, float, float] | None = None
         self._plan_client: AtrinikClient | None = None
         self._crossed: tuple[str, ...] = ()
+        # What kind of trip this is for its route budget and the shadow
+        # report (route_costs: FARM, or "" for an errand); an essential
+        # trip reports its essential kind.
+        self.trip = ""
+        # The learned-cost plan (ROUTING P6, the owner's learned_route_costs
+        # flag): the last one, and the subjects a budget or strict-plan
+        # override crosses with CARE_BOUNDED care.
+        self.learned_plan: route_costs.LearnedPlan | None = None
+        self._bounded: tuple[str, ...] = ()
         # A care crossing (require_care), and while she walks to her
         # savebed to wait for it, the trip's own destination fields.
         self.care: CareCrossing | None = None
@@ -2381,22 +2603,39 @@ class NavigateTask(BotTask):
         """
         self._walls = route_blocks.owner_walls(client)
         self._offer = dialogue_edges.dialogue_offer(client, self.graph)
-        self._plan_client, self._crossed = client, ()
+        self._plan_client, self._crossed, self._bounded = client, (), ()
+        learned = learned_route_costs(client)
         try:
             route = self._plan_tiers(client, origin=origin)
         except OwnerBlockRefusal as refusal:
+            if not learned:
+                self._shadow(client, origin, None, str(refusal))
             raise ValueError(str(refusal)) from None
+        except ValueError as exc:
+            if not learned:
+                self._shadow(client, origin, None, str(exc))
+            raise
         finally:
             self._plan_client = None
-        if self._crossed:
-            self.require_care(CARE_OWNER_BLOCK, self._crossed, client=client)
+        if not learned:
+            self._shadow(client, origin, route, "")
+        if self._crossed or self._bounded:
+            # Both may hold at once (a blocked and over-budget route): the
+            # crossing waits as an owner block and keeps the bounded
+            # subjects too.
+            if self._crossed:
+                self.require_care(CARE_OWNER_BLOCK, self._crossed, client=client)
+            if self._bounded:
+                self.require_care(CARE_BOUNDED, self._bounded, client=client)
             return route
         if self.care is not None and self._care_staging is None:
             # A block that expired or was removed, or one already behind
             # her: nothing left to cross. Hold-fire ends with it.
             if self.care.cleared:
                 self.care.finished = True
-            elif self.care.mode == CARE_OWNER_BLOCK:
+            elif self.care.mode in (CARE_OWNER_BLOCK, CARE_BOUNDED):
+                # Nothing left that needs care (a block lifted, or, with
+                # learned costs on, danger decayed under the budget).
                 self.care = None
         return route
 
@@ -2436,6 +2675,8 @@ class NavigateTask(BotTask):
             if mode == CARE_OWNER_BLOCK:
                 # An owner block never times out, whatever else asked.
                 care.mode = CARE_OWNER_BLOCK
+        if mode == CARE_BOUNDED:
+            care.bounded = tuple(dict.fromkeys((*care.bounded, *subjects)))
         return care
 
     def _care_ahead(self, map_path: str) -> bool:
@@ -2447,9 +2688,14 @@ class NavigateTask(BotTask):
         subjects = set(care.subjects)
         if route_blocks.map_subject(map_path) in subjects:
             return True
+        # A blocked destination is no crossing (a block is a transit wall);
+        # a dangerous one under a budget or strict override is, also once an
+        # owner block has merged into that crossing.
+        bounded = set(care.bounded)
         return any(
             route_blocks.edge_subject(edge) in subjects or
-            (edge.destination != self.destination and
+            ((edge.destination != self.destination or
+              route_blocks.map_subject(edge.destination) in bounded) and
              route_blocks.map_subject(edge.destination) in subjects)
             for edge in self.route)
 
@@ -2649,7 +2895,8 @@ class NavigateTask(BotTask):
         care.food = self.essential == "food"
         care.starving = care.food and starving_without_food(client)
         if (care.mode == CARE_OWNER_BLOCK and
-                not set(care.subjects) & route_blocks.active_subjects(client)):
+                not (set(care.subjects) - set(care.bounded)) &
+                route_blocks.active_subjects(client)):
             # Every block it waited for expired or was removed meanwhile:
             # plan again, behind whatever walls are left.
             _care_waits(client).pop(care.key, None)
@@ -2742,6 +2989,8 @@ class NavigateTask(BotTask):
         # unroutable or change which other hazards are relaxed, and leaving
         # the map she stands on is free while re-entering it is not.
         # ``origin`` plans from another (map, tile) than where she stands.
+        if learned_route_costs(client):
+            return self._plan_learned(client, origin)
         learned = self._learned_route_hazards(client)
         if self.strict_safety:
             return self._plan_strict(client, learned, origin)
@@ -2751,6 +3000,127 @@ class NavigateTask(BotTask):
             # never "threat-free" when choosing between optional destinations.
             self._threat_fallback = True
         return route
+
+    @property
+    def over_budget(self) -> bool:
+        """The last learned plan's route was over its budget, or needed a
+        strict override (a planning probe's ranking puts it after safe
+        ones, as it does a route across an owner block)."""
+        plan = self.learned_plan
+        return plan is not None and plan.outcome in (route_costs.DECLINED,
+                                                     route_costs.OVERRIDE)
+
+    def trip_kind(self, client: AtrinikClient | None) -> str:
+        """The trip's kind for the shadow report and metrics: "home" for
+        the walk to her savebed to wait for care, its essential kind (a
+        food trip is food-kind whether or not she is hungry yet: whether it
+        is essential now is is_essential's), FARM, STRICT for a strict
+        trip, or ERRAND (quest steps included: they share its budget)."""
+        if self._care_staging is not None:
+            return "home"
+        if self.essential:
+            return self.essential
+        if self.trip:
+            return self.trip
+        return route_costs.STRICT if self.strict_safety else route_costs.ERRAND
+
+    def _trip_snapshot(self, client: AtrinikClient,
+                       origin: tuple[str, tuple[int, int]] | None = None,
+                       ) -> route_costs.TripSnapshot:
+        """This trip's planning inputs for the learned-cost planner
+        (learned_route): what it plans from and to, behind which walls,
+        and the costs it prices edges with."""
+        source, source_xy = origin or (
+            client.state.map.path,
+            (client.state.map.world_x, client.state.map.world_y))
+        stats = getattr(client.state, "stats", {}) or {}
+        level = max(1, int(stats.get("level", 0) or 0))
+        model = route_costs.learned_model(client)
+        view = model.view(time.time(), route_costs.current_kit(client))
+        priors = route_costs.content_priors(self.graph, level,
+                                            lethal=self.KNOWN_LETHAL_TRANSIT)
+        staging = self._care_staging is not None
+        essential = not staging and self.is_essential(client)
+        trip = self.trip_kind(client)
+        context = route_costs.CostContext(
+            self.graph, view, priors, pace=route_costs.seconds_per_tile(stats),
+            lam=danger_weight(client, optional=not (essential or staging or
+                                                    trip == route_costs.FARM)))
+        strict_avoided = frozenset()
+        if self.strict_safety:
+            strict_avoided = frozenset(
+                self._known_ranged_hazard_maps(client, any_level=True) |
+                self._known_overlevel_hazard_maps(client) |
+                self._known_pack_hazard_maps(source) |
+                set(self.KNOWN_LETHAL_TRANSIT) |
+                {path for path, seconds in view.maps.items()
+                 if seconds >= route_costs.STRICT_LEARNED_AVOID_SECONDS})
+        return route_costs.TripSnapshot(
+            self.graph, source, source_xy, self.destination, list(self._goal_points()),
+            self._allow_locked(client), set(self._excluded_edges), self._walls, self._offer,
+            self.strict_safety, essential, trip, strict_avoided, context, staging=staging)
+
+    def _plan_learned(self, client: AtrinikClient,
+                      origin: tuple[str, tuple[int, int]] | None = None) -> list[MapEdge]:
+        """The live plan with learned costs (the owner's learned_route_costs
+        flag; ROUTING 4.5, P7 turns it on): learned_route, then its side
+        effects. An optional trip over its budget fails (it is retried
+        later); an essential one over its budget, or whose strict plan
+        failed, takes the cheapest route with CARE_BOUNDED care (_plan);
+        owner blocks keep P3's rules."""
+        snapshot = self._trip_snapshot(client, origin)
+        plan = drain(learned_route(snapshot))
+        if plan.outcome == route_costs.NO_ROUTE:
+            # Components are derived data; retry once with a fresh cache.
+            _clear_components(self.graph)
+            plan = drain(learned_route(snapshot))
+        self.learned_plan = plan
+        # A planning probe (a trip not started: the temple, food and recall
+        # vendor rankings, the town reach check) has no side effects: no
+        # decision, no metric, no care. It ranks by the cheapest route even
+        # over its budget; the trip it ranks for decides when it runs.
+        live = self.status == TaskStatus.RUNNING
+        if live:
+            route_shadow.note_live_plan(client, plan)
+        if plan.outcome == route_costs.BLOCKED:
+            raise OwnerBlockRefusal(plan.reason)
+        # The threat fields describe the route returned, a probe's
+        # over-budget candidate included, so its ranking sees the hazards.
+        hazards = {path for path, seconds in snapshot.context.priors.items()
+                   if seconds >= route_costs.PRIOR_OVERLEVEL_SECONDS}
+        taken = plan.route or plan.candidate or []
+        self._route_threat_maps = {edge.destination for edge in taken
+                                   if edge.destination in hazards}
+        self._threat_fallback = bool(self._route_threat_maps) or any(
+            snapshot.context.view.map_danger(edge.destination) >=
+            route_costs.STRICT_LEARNED_AVOID_SECONDS for edge in taken)
+        if plan.route is None:
+            if plan.outcome == route_costs.DECLINED:
+                if not live and plan.candidate:
+                    return plan.candidate
+                if live:
+                    self._record(client, "route-declined", route_shadow.plan_detail(
+                        plan, self.destination))
+            raise ValueError(plan.reason)
+        self._crossed = plan.crossed
+        if plan.care == CARE_BOUNDED and live:
+            self._bounded = bounded_care_subjects(plan, snapshot)
+            self._record(client, "route-budget-override" if not plan.strict_relaxed
+                         else "route-strict-override",
+                         route_shadow.plan_detail(plan, self.destination))
+        return plan.route
+
+    def _shadow(self, client: AtrinikClient,
+                origin: tuple[str, tuple[int, int]] | None,
+                route: list[MapEdge] | None, error: str) -> None:
+        """With the learned_route_costs flag off: hand the live plan to the
+        shadow planner (route_shadow.py), which plans the same trip with
+        learned costs on later ticks and logs where they differ. Only a
+        trip under way (not a planning probe), never its walk home to wait
+        for care. Never raises."""
+        if self.status != TaskStatus.RUNNING or self._care_staging is not None:
+            return
+        route_shadow.request_trip(client, self, origin, route, error)
 
     def _plan_strict(self, client: AtrinikClient, learned: set[str],
                      origin: tuple[str, tuple[int, int]] | None = None,
@@ -5233,11 +5603,22 @@ def town_safely_reachable(client: AtrinikClient, graph: "WorldGraph",
     learned = {map_path: until for map_path, until in
                (getattr(client.state, "route_hazards", None) or {}).items()
                if until > now}
+    # With learned_route_costs on, the proxy plans as her live strict trips
+    # do: her flag, her learned model (learned danger of 900 s or more in
+    # place of route_hazards) and her kit.
     proxy = types.SimpleNamespace(state=types.SimpleNamespace(
         stats={"level": level}, route_hazards=learned,
-        map=types.SimpleNamespace(path=path, world_x=0, world_y=0)))
+        map=types.SimpleNamespace(path=path, world_x=0, world_y=0)),
+        config=getattr(client, "config", None), route_cost_source=client,
+        farm_analyzer=getattr(client, "farm_analyzer", None))
     access = unlocks.unlock_state(client, graph).access
-    key = (id(graph), path, level, frozenset(learned), access)
+    strict_learned: frozenset[str] = frozenset()
+    if learned_route_costs(client):
+        view = route_costs.learned_model(client).view(now, route_costs.current_kit(client))
+        strict_learned = frozenset(
+            map_path for map_path, seconds in view.maps.items()
+            if seconds >= route_costs.STRICT_LEARNED_AVOID_SECONDS)
+    key = (id(graph), path, level, frozenset(learned), access, strict_learned)
     if key not in _town_reach_cache and len(_town_reach_cache) > 512:
         _town_reach_cache.clear()
     results = _town_reach_cache.setdefault(key, {})
@@ -5498,6 +5879,22 @@ def analyzer_farm_choice(
         client: AtrinikClient, graph: "WorldGraph", *, search: bool = True,
         search_verdict: bool | None = None
 ) -> tuple[str, tuple[tuple[str, str], ...], dict] | None:
+    """The objective farmed now, with its highest-ranked usable spot
+    (_analyzer_farm_choice). With ``search`` (autoplay's own call, not the
+    dashboard's or the metrics'), the farm score's shadow (ROUTING P6,
+    route_shadow.py) is offered this choice to compare against; that never
+    changes the choice or raises."""
+    choice = _analyzer_farm_choice(client, graph, search=search,
+                                   search_verdict=search_verdict)
+    if search:
+        route_shadow.request_farm(client, graph, choice)
+    return choice
+
+
+def _analyzer_farm_choice(
+        client: AtrinikClient, graph: "WorldGraph", *, search: bool = True,
+        search_verdict: bool | None = None
+) -> tuple[str, tuple[tuple[str, str], ...], dict] | None:
     """The objective farmed now, with its highest-ranked usable spot.
 
     The farming analyzer is the source of truth. The only exceptions are live
@@ -5602,6 +5999,171 @@ def analyzer_farm_choice(
     return usable[0] if usable else None
 
 
+# The farm score's shadow (ROUTING 4.5, 4.9, P6): spots scored per ranking,
+# and learned maps checked for being a chokepoint, at most this many.
+SHADOW_FARM_CANDIDATES = 25
+SHADOW_CHOKEPOINT_CHECKS = 12
+
+
+@dataclass(slots=True)
+class FarmShadowSnapshot:
+    """The farm score's inputs, taken once (route_shadow.py)."""
+
+    graph: "WorldGraph"
+    origin: str
+    origin_xy: tuple[int, int]
+    free: frozenset[str]
+    access: Any
+    walls: Any
+    offer: Any
+    context: route_costs.CostContext
+    candidates: list[tuple[route_costs.FarmCandidate, tuple[tuple[str, str], ...]]]
+    live: str
+
+
+def farm_spot_key(objective: str, spot: dict) -> str:
+    return f"{objective}:{spot.get('path') or spot.get('name') or ''}"
+
+
+def farm_shadow_snapshot(client: AtrinikClient, graph: "WorldGraph",
+                         live: tuple | None) -> FarmShadowSnapshot | None:
+    """What the farm score (route_costs.farm_score) would choose from,
+    mirroring analyzer_farm_choice's usable spots without #94's
+    route_death_blocked_maps, which P8 replaces with the score: the
+    effective objective's ranking first, then the chosen one; quarantined
+    spots skipped; spots hazardous for her kit skipped unless every spot
+    is, then the least dangerous. None when there is nothing to score, or
+    while she is depleted at the temple threshold (autoplay does not farm
+    then, and the strict town check, not the score, decides)."""
+    analyzer = getattr(client, "farm_analyzer", None)
+    if analyzer is None or depleted_for_temple(client.state):
+        return None
+    origin = route_death_origin(client, graph)
+    if origin is None:
+        return None
+    chosen = getattr(client.state, "farm_objective", DEFAULT_OBJECTIVE)
+    quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
+    now = time.time()
+    usable, hazardous = [], []
+    for position, objective in enumerate(dict.fromkeys(
+            (effective_farm_objective(client.state), chosen))):
+        for rank, spot in enumerate(analyzer.ranking(objective)[:SHADOW_FARM_CANDIDATES]):
+            legs = analyzer_spot_legs(spot, graph)
+            if not legs or any(float(quarantine.get(path, 0.0) or 0.0) > now
+                               for path, _ in legs):
+                continue
+            candidate = route_costs.FarmCandidate(
+                farm_spot_key(objective, spot), str(spot.get("name") or ""), objective,
+                position, rank, route_costs.spot_rate(spot, objective))
+            entry = (candidate, legs, spot)
+            (hazardous if kit_hazardous_spot(client, spot, legs) else usable).append(entry)
+    if not usable and hazardous:
+        usable = [min(hazardous, key=lambda entry: (
+            float(entry[2].get("danger", 0.0) or 0.0),
+            -farm_analyzer_plan.approach_safety(entry[2]),
+            entry[0].position, entry[0].rank))]
+    if not usable:
+        return None
+    stats = getattr(client.state, "stats", {}) or {}
+    level = max(1, int(stats.get("level", 0) or 0))
+    model = route_costs.learned_model(client)
+    view = model.view(now, route_costs.current_kit(client))
+    context = route_costs.CostContext(
+        graph, view, route_costs.content_priors(
+            graph, level, lethal=NavigateTask.KNOWN_LETHAL_TRANSIT),
+        pace=route_costs.seconds_per_tile(stats),
+        lam=danger_weight(client, optional=False))
+    free = frozenset(path for path in (origin[0], getattr(client.state, "savebed_map", "") or "")
+                     if path)
+    live_key = farm_spot_key(live[0], live[2]) if live else ""
+    return FarmShadowSnapshot(
+        graph, origin[0], origin[1], free,
+        NavigateTask(graph, origin[0])._allow_locked(client),
+        route_blocks.owner_walls(client), dialogue_edges.dialogue_offer(client, graph),
+        context, [(candidate, legs) for candidate, legs, _ in usable], live_key)
+
+
+def _reach_without(offsets: list[int], targets: list[int], maps: list[str],
+                   removed: str) -> set[str]:
+    """The maps reachable from state 0 of a component search without
+    entering ``removed`` (#94's chokepoint test, on the search's states)."""
+    if maps[0] == removed:
+        return set()
+    seen = {0}
+    pending = [0]
+    while pending:
+        state = pending.pop()
+        for target in targets[offsets[state]:offsets[state + 1]]:
+            if target not in seen and maps[target] != removed:
+                seen.add(target)
+                pending.append(target)
+    return {maps[state] for state in seen}
+
+
+def farm_shadow(snapshot: FarmShadowSnapshot):
+    """The farm score's choice (ROUTING 4.5) for ``snapshot``: a generator
+    that yields while it searches and returns (route_costs.FarmScore, the
+    chokepoints found).
+
+    One weighted search from her savebed (route_death_origin) prices every
+    spot's cheapest route at once. ``D(spot)`` is the learned danger of
+    every map on that route and on the spot's legs, each map once, plus
+    the failures of the route's edges; her savebed map and the map she
+    starts from add nothing. A learned map whose removal cuts off more than
+    CHOKEPOINT_SHARE of the maps she reaches is a chokepoint (#94's test):
+    its danger counts toward the chokepoint cap, not the per-spot cap.
+    Content priors steer the route only; they are not in ``D`` (4.5).
+    """
+    graph, context = snapshot.graph, snapshot.context
+    states, _, offsets, targets, metadata, costs, route_edges = \
+        yield from graph._expand_component_states(
+            snapshot.origin, snapshot.origin_xy, None, allow_locked=snapshot.access,
+            walls=snapshot.walls or None, offer=snapshot.offer,
+            edge_cost=context.edge_cost)
+    weights = [route_costs.scaled(cost) for cost in costs]
+    maps = [path for path, _ in states]
+    everywhere = set(maps)
+    view = context.view
+    learned = sorted((path for path in everywhere
+                      if path not in snapshot.free and view.map_danger(path) > 0),
+                     key=lambda path: (-view.map_danger(path), path))
+    chokepoints = set()
+    for path in learned[:SHADOW_CHOKEPOINT_CHECKS]:
+        cut = len(everywhere - _reach_without(offsets, targets, maps, path))
+        if cut > route_costs.CHOKEPOINT_SHARE * len(everywhere):
+            chokepoints.add(path)
+        yield
+    first_states: dict[str, list[int]] = {}
+    for index, path in enumerate(maps):
+        first_states.setdefault(path, []).append(index)
+    for candidate, legs in snapshot.candidates:
+        goals = first_states.get(legs[0][0])
+        result = None
+        if goals:
+            result = graph_search(offsets, targets, 0, goals, metadata=metadata,
+                                  costs=weights)
+        if result is None or result.status != "found":
+            candidate.reason = f"no route to {legs[0][0]}"
+            continue
+        route = [route_edges[index] for index in result.transitions]
+        crossed = dict.fromkeys([edge.destination for edge in route] +
+                                [path for path, _ in legs])
+        danger, choke = 0.0, {}
+        for path in crossed:
+            if path in snapshot.free:
+                continue
+            value = view.map_danger(path)
+            danger += value
+            if value and path in chokepoints:
+                choke[path] = value
+        danger += sum(view.edge_danger(context.subject(edge)) for edge in route)
+        candidate.danger, candidate.chokepoints = danger, choke
+        candidate.maps = tuple(crossed)
+        yield
+    return route_costs.farm_score([candidate for candidate, _ in snapshot.candidates]), \
+        chokepoints
+
+
 def analyzer_farm_selection(
         client: AtrinikClient, graph: "WorldGraph"
 ) -> tuple[tuple[tuple[str, str], ...], dict] | None:
@@ -5692,8 +6254,8 @@ def temple_food_trip(graph: "WorldGraph", client: AtrinikClient, *,
             continue
         if not navigation._threat_fallback:
             # A priest only reachable across an owner block comes last.
-            ranked.append((navigation.care is not None, len(route),
-                           priest.name.casefold(), priest))
+            ranked.append((navigation.care is not None or navigation.over_budget,
+                           len(route), priest.name.casefold(), priest))
     if not ranked:
         return None
     priest = min(ranked, key=lambda entry: entry[:-1])[-1]
@@ -6961,6 +7523,9 @@ class FarmCircuitTask(BotTask):
             safety=farm.safety)
         task.navigation.allow_ranged_hazard_fallback = (
             self.clear_hostile_route)
+        # A farm trip has no route budget: farm selection weighs its
+        # danger (ROUTING 4.5).
+        task.navigation.trip = route_costs.FARM
         return task
 
     @staticmethod
@@ -7119,7 +7684,7 @@ class FarmCircuitTask(BotTask):
                 continue
             if not navigation._threat_fallback:
                 ranked.append((
-                    navigation.care is not None, len(route),
+                    navigation.care is not None or navigation.over_budget, len(route),
                     unit_cost / profile.nutrition,
                     profile.weight / profile.nutrition,
                     -profile.nutrition,
@@ -7917,8 +8482,9 @@ class FarmCircuitTask(BotTask):
             immediate_roll = any(
                 value.casefold() in ("random_wand", "random_mtools")
                 for value in vendor.treasure_lists)
-            ranked.append((len(route), not immediate_roll, vendor.level,
-                           vendor.name.casefold(), vendor))
+            # Over its budget comes after every safe vendor.
+            ranked.append((navigation.over_budget, len(route), not immediate_roll,
+                           vendor.level, vendor.name.casefold(), vendor))
         vendor = (min(ranked, key=lambda entry: entry[:-1])[-1]
                   if ranked else DialogueVendor(
             "/shattered_islands/world_4_47", 11, 13, "sage",
