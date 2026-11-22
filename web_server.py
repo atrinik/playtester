@@ -390,8 +390,9 @@ class DashboardState:
                     "id": ("essential-care-starving" if care["starving"]
                            else "essential-care-food"), "level": "critical",
                     "text": (f"{'Starving' if care['starving'] else 'Hungry'}: food trip "
-                             f"crossing the owner block {subjects} with only a ready "
-                             "recall and hold-fire")})
+                             f"crossing the owner block {subjects} with only "
+                             f"{'a ready recall and ' if care.get('recall_ready') else ''}"
+                             "hold-fire")})
         food_ids = ("essential-care-starving", "essential-care-food")
         if not any(alert["id"] in food_ids for alert in alerts):
             cutoff = time.time() - self.STARVING_CROSSING_ALERT_SECONDS
@@ -403,7 +404,7 @@ class DashboardState:
                 alerts.append({
                     "id": latest["action"], "level": "warn",
                     "text": ("A food trip crossed an owner block in the last hour "
-                             "with only a recall and hold-fire: "
+                             "with only hold-fire (and a ready recall if she had one): "
                              f"{latest.get('detail', '')}")})
         return alerts
 

@@ -835,17 +835,20 @@ in the runtime state database (`route_blocks`) and are written only through
 `Origin`, and `application/json` only, which an HTML form cannot send
 cross-site. Only an essential trip (food while she is hungry or starving, a
 cure, the depletion service, a savebed move, a trip that funds one of them,
-and the recovery phase's recall shopping and walk home) crosses a block, and
+and the recovery phase's walk home) crosses a block, and
 only when every route does; a block never sends a trip through a hazard
 the planner otherwise avoids. It waits at a safe place (her savebed, or a
 map without hostile spawns, with no hostile in view; on a map
 with hostile spawns she walks to her savebed first) for full HP and SP, or
 HP and SP that have stopped rising for a minute, and a ready recall when she
-owns one, then holds fire until the block is behind her. That wait has no
-limit and raises a dashboard alert after 10 minutes, and a non-food trip
-gives way to a food trip once she is hungry. A food trip, hungry or
-starving, waits only for a ready recall, since waiting to regenerate burns
-food. Each crossing is recorded (`essential-route-override`, plus
+owns one she could ready, then holds fire until the block is behind her.
+That wait has no limit and raises a dashboard alert after 10 minutes, and
+a non-food trip gives way to a food trip once she is hungry. A food trip,
+hungry or starving, waits only for a ready recall, since waiting to
+regenerate burns food. A working recall is never a blocker (owner
+decision, 2026-11-22): with only empty or unusable recall sources she
+does not wait for one, and a food trip then crosses with hold-fire alone.
+Each crossing is recorded (`essential-route-override`, plus
 `essential-care-food` or `essential-care-starving` for a food trip, which is
 also alerted) and listed under **Care crossings**.
 

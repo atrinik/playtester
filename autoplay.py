@@ -11,7 +11,7 @@ from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
 from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          NavigateThenTask, RecoveryTask,
-                         emergency_recall_unusable,
+                         has_working_recall, recall_alerts,
                          WorldGraph, analyzer_farm_selection,
                          farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
@@ -288,8 +288,7 @@ class AutoplayTask(BotTask):
         priority does not clear it: the recall is still missing."""
         level = int(client.state.stats.get("level", 0) or 0)
         if (getattr(client.state, "recall_unavailable", "") and
-                (level < RECALL_REQUIRED_LEVEL or
-                 not emergency_recall_unusable(client))):
+                (level < RECALL_REQUIRED_LEVEL or has_working_recall(client))):
             setter = getattr(client, "set_recall_unavailable", None)
             if setter is not None:
                 setter("")
@@ -301,16 +300,20 @@ class AutoplayTask(BotTask):
                         ) -> tuple[list[dict[str, str]], bool]:
         """Dashboard alerts while farming is unsafe, from live state, and
         whether she is waiting at her savebed on an alerted blocker (then
-        the stuck alert would say nothing new).
+        the stuck alert would say nothing new). Also, in any phase, the
+        recall note (recall_alerts), which never blocks farming.
 
         The farming-suspended warning follows the live reason in any phase;
         the specific blockers come from the recovery phase.
         """
-        reason = farming_unsafe_reason(client)
-        if not reason or self.status != TaskStatus.RUNNING:
+        if self.status != TaskStatus.RUNNING:
             return [], False
+        recall = recall_alerts(client)
+        reason = farming_unsafe_reason(client)
+        if not reason:
+            return recall, False
         alerts = [{"id": "farming-suspended", "level": "warn",
-                   "text": f"Farming suspended: {reason}"}]
+                   "text": f"Farming suspended: {reason}"}] + recall
         waiting = False
         if isinstance(self.child, RecoveryTask):
             blockers = self.child.alerts(client)

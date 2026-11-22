@@ -6466,14 +6466,22 @@ class BuyShopUpgradeTask(BotTask):
 
 
 class BuyDialogueStockTask(BotTask):
-    """Inspect an identified dialogue merchant and buy matching stock."""
+    """Inspect an identified dialogue merchant and buy matching stock.
+
+    With ``try_alternatives``, stock she cannot afford (beyond
+    ``cash_reserve``) is passed over for the next matching choice; when
+    none is affordable it fails naming the cheapest quote. A quote it
+    cannot pay is still recorded under ``observation_key`` (the cheapest
+    one), so later decisions know the real price.
+    """
 
     LINK = re.compile(r"\[a=([^:\]]*):([^\]]*)\]", re.I)
 
     def __init__(self, merchant: str, item_pattern: str, *, quantity: int = 1,
                  preferred: tuple[str, ...] = (), cash_reserve: int = 1_000,
                  observation_key: str = "", max_purchases: int = 1,
-                 distinct_patterns: tuple[str, ...] = ()):
+                 distinct_patterns: tuple[str, ...] = (),
+                 try_alternatives: bool = False):
         super().__init__(f"buy-dialogue-stock:{item_pattern}")
         self.merchant = merchant
         self.item_pattern = re.compile(item_pattern, re.I)
@@ -6484,6 +6492,11 @@ class BuyDialogueStockTask(BotTask):
         self.max_purchases = max(1, int(max_purchases))
         self.distinct_patterns = tuple(
             re.compile(value, re.I) for value in distinct_patterns)
+        self.try_alternatives = try_alternatives
+        # The cheapest quote she could not pay: (item, unit cost).
+        self.cheapest_unaffordable: tuple[str, int] | None = None
+        self._declined: set[str] = set()
+        self._stock: list[str] = []
         self.checked = False
         self.purchased = False
         self.purchase_count = 0
@@ -6547,6 +6560,7 @@ class BuyDialogueStockTask(BotTask):
             not re.match(r"buy\s+\d+\s", destination, re.I) and
             self.item_pattern.search(destination[4:]) and
             destination[4:].casefold() not in self._bought_names and
+            destination[4:].casefold() not in self._declined and
             not any(index in self._bought_groups and pattern.search(
                         destination[4:])
                     for index, pattern in enumerate(self.distinct_patterns))
@@ -6595,6 +6609,7 @@ class BuyDialogueStockTask(BotTask):
                           self._dialogue_diagnostic(client))
                 return
             self.checked = True
+            self._stock = list(destinations)
             self._item_name = self._select_stock(client, destinations)
             if not self._item_name:
                 self.complete()
@@ -6619,14 +6634,30 @@ class BuyDialogueStockTask(BotTask):
                 return
             wallet = BuyShopUpgradeTask.wallet_value(client)
             total_cost = cost * self.quantity
+            quote_recorder = getattr(client, "record_vendor_quote", None)
             if total_cost > max(0, wallet - self.cash_reserve):
+                if (self.cheapest_unaffordable is None or
+                        cost < self.cheapest_unaffordable[1]):
+                    self.cheapest_unaffordable = (self._item_name, int(cost))
+                if self.try_alternatives:
+                    self._declined.add(self._item_name.casefold())
+                    alternative = self._select_stock(client, self._stock)
+                    if alternative:
+                        self._item_name = alternative
+                        client.state.interface = None
+                        await client.talk(f"buy {alternative}", self.merchant)
+                        self._sent_at = now
+                        return
+                item, unit = self.cheapest_unaffordable
+                if quote_recorder is not None and self.observation_key:
+                    quote_recorder(self.observation_key, item, unit)
                 self.fail(
-                    f"merchant stock costs {format_money(total_cost)}, wallet "
+                    f"merchant stock costs "
+                    f"{format_money(unit * self.quantity)}, wallet "
                     f"{format_money(wallet)}, reserve "
                     f"{format_money(self.cash_reserve)}")
                 return
             self._cost = total_cost
-            quote_recorder = getattr(client, "record_vendor_quote", None)
             if quote_recorder is not None and self.observation_key:
                 quote_recorder(
                     self.observation_key, self._item_name, int(cost))

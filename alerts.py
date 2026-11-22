@@ -3,7 +3,7 @@
 Raised for repeated deaths, starvation, an idle character that cannot reach
 food, a character that is stuck while autoplay runs, a lost connection, and
 a task engine whose steps keep failing. Autoplay adds its own while farming
-is unsafe (AutoplayTask.recovery_alerts).
+is unsafe, and its non-blocking recall note (AutoplayTask.recovery_alerts).
 The client keeps a ``ProgressWatch`` current; the dashboard serves the active
 alerts on every live poll.
 """
