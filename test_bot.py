@@ -16722,19 +16722,34 @@ class CasterFirstTests(unittest.TestCase):
         self.assertEqual(task._engaged_target[0], 300)
         self.assertIn(True, client.combat)
 
-    def test_a_caster_shooting_within_reach_comes_before_the_engaged_orc(self):
+    def test_a_caster_named_in_a_hit_within_reach_comes_before_the_orc(self):
         client, task = self._seam_fight()
         self._put(client, 13, 8, "orc warrior", 100)
         self._put(client, 6, 8, "orc sorcerer", 300)
         task.remember_engagement(client, 13, 8, 100)
-        # The hit names the missile, not the caster two squares away.
-        self._say(client,
-                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        self._say(client, "orc sorcerer misses you!")
         asyncio.run(task.tick(client))
         self.assertEqual(client.targets[-1], (6, 8, 300))
         self.assertEqual(task._engaged_target[0], 300)
-        self.assertNotIn("caster-cover",
-                         [action for action, _ in client.recorded])
+
+    def test_a_missile_hit_switches_no_target(self):
+        client, task = self._seam_fight()
+        # The orc she fights beside her, a sorcerer two squares off.
+        self._put(client, 9, 8, "orc warrior", 100)
+        self._put(client, 6, 8, "orc sorcerer", 300)
+        task.remember_engagement(client, 9, 8, 100)
+        # A missile names no caster: she keeps the orc beside her.
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        self.assertIsNone(task.caster_first(client))
+        # Named, the sorcerer is hers, unless the step toward it puts
+        # another attacker beside her.
+        self._say(client, "orc sorcerer misses you!")
+        self.assertEqual(task.caster_first(client)[3].target_id, 300)
+        self._put(client, 6, 7, "orc outlaw", 101)
+        self._put(client, 6, 9, "orc outlaw", 102)
+        self.assertIsNone(task.caster_first(client))
+
 
     def _pack(self, hp=32, terrain=None):
         client, task = self._seam_fight()
@@ -16845,31 +16860,149 @@ class CasterFirstTests(unittest.TestCase):
         self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]][1], 0)
         self.assertNotIn("seam=1", dict(client.recorded)["retreat-choice"])
 
-    def test_she_steps_behind_a_wall_from_a_caster_out_of_reach(self):
+    def test_a_seam_step_is_not_taken_again_within_the_cooldown(self):
+        client, task = self._pocket()
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertIn("seam=1", dict(client.recorded)["retreat-choice"])
+        # The walk brought her straight back into the pocket.
+        client.recorded.clear()
+        task._retreat_attempt = None
+        task._last_retreat_step_at = 0.0
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertNotIn("seam=1", dict(client.recorded)["retreat-choice"])
+        # Once it has passed, the seam serves again.
+        client.recorded.clear()
+        task._retreat_attempt = None
+        task._last_retreat_step_at = 0.0
+        task._seam_step_at -= task.SEAM_STEP_COOLDOWN_SECONDS
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertIn("seam=1", dict(client.recorded)["retreat-choice"])
+
+    def test_a_seam_step_needs_room_away_from_the_seam(self):
+        client, task = self._pocket()
+        # Only the two rows by the seam are open there: running along it
+        # is no escape.
+        north = client.world_graph.nodes["/next_0_-1"]
+        north.terrain = {(x, y): 1 for x in range(5) for y in (3, 4)}
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertNotIn("seam=1", dict(client.recorded)["retreat-choice"])
+
+    def _cover_fight(self):
+        """A sorcerer five squares west shooting through a gap in a wall,
+        while she fights an orc warrior three squares east."""
         client, task = self._seam_fight()
-        node = task.map_node
-        # A wall with a gap: the sorcerer 5 west shoots along row 12.
-        node.blocked.update({(10, 11), (10, 13), (11, 11), (11, 13)})
-        self._put(client, 3, 8, "orc sorcerer", 300)
+        task.map_node.blocked.update({(10, 11), (10, 13), (11, 11), (11, 13)})
         self._say(client,
                   "magic bullet hit you for 65 (0) weapon magic damage.")
-        asyncio.run(task.tick(client))
-        self.assertIn("caster-cover",
-                      [action for action, _ in client.recorded])
-        self.assertEqual(len(client.direct_moves), 1)
-        dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        self._put(client, 11, 8, "orc warrior", 100)
+        task.remember_engagement(client, 11, 8, 100)
+        return client, task
+
+    def _run(self, client, task, creatures, ticks=10):
+        """Tick, placing the creatures at their world squares and moving
+        her as each step (direct or towards a view square) would."""
+        m = client.state.map
+        trail = []
+        for _ in range(ticks):
+            m.tiles.clear()
+            for (x, y), name, target_id in creatures:
+                self._put(client, 8 + x - m.world_x, 8 + y - m.world_y,
+                          name, target_id)
+            task._last_action = 0.0
+            task._retreat_attempt = None
+            direct, moves = len(client.direct_moves), len(client.moves)
+            asyncio.run(task.tick(client))
+            if len(client.direct_moves) > direct:
+                dx, dy = c.DIRECTION_DELTAS[client.direct_moves[-1][0]]
+            elif len(client.moves) > moves:
+                vx, vy = client.moves[-1]
+                dx, dy = (vx > 8) - (vx < 8), (vy > 8) - (vy < 8)
+            else:
+                dx = dy = 0
+            m.world_x += dx
+            m.world_y += dy
+            trail.append((m.world_x, m.world_y))
+        return trail
+
+    def test_she_steps_behind_a_wall_and_holds_there(self):
         from .tasks import wall_covers
-        self.assertTrue(wall_covers(node, {}, (7, 12), (12 + dx, 12 + dy)))
-        # Covered, she holds rather than walk back out to a target, and
-        # takes no second cover step.
-        client.state.map.world_x += dx
-        client.state.map.world_y += dy
-        client.state.map.tiles.clear()
-        self._put(client, 3 - dx, 8 - dy, "orc sorcerer", 300)
-        task._last_action = 0.0
+        client, task = self._cover_fight()
+        trail = self._run(client, task, [
+            ((7, 12), "orc sorcerer", 300), ((15, 12), "orc warrior", 100)])
+        actions = [action for action, _ in client.recorded]
+        self.assertEqual(actions.count("caster-cover"), 1)
+        self.assertEqual(len(client.direct_moves), 1)
+        # Holding, she walks to no target: the orc comes to her.
+        self.assertEqual(client.moves, [])
+        self.assertEqual(len(set(trail)), 1, trail)
+        self.assertTrue(wall_covers(task.map_node, {}, (7, 12), trail[-1]))
+        # Put back into the line, the same hit starts no second step.
+        m = client.state.map
+        m.world_x, m.world_y = 12, 12
+        m.tiles.clear()
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self.assertFalse(asyncio.run(task.break_caster_sight(client)))
+        self._say(client,
+                  "magic bullet hit you for 60 (0) weapon magic damage.")
+        self.assertTrue(asyncio.run(task.break_caster_sight(client)))
+
+    def test_no_cover_from_the_caster_she_is_going_for(self):
+        # The reviewer's oscillation: the sorcerer is her target; cover
+        # from it and the approach to it alternated.
+        client, task = self._seam_fight()
+        task.map_node.blocked.update({(10, 11), (10, 13), (11, 11), (11, 13)})
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        trail = self._run(client, task, [((7, 12), "orc sorcerer", 300)])
+        self.assertNotIn("caster-cover",
+                         [action for action, _ in client.recorded])
+        self.assertEqual(task._engaged_target[0], 300)
+        # She closes in, never stepping back out again.
+        distances = [max(abs(x - 7), abs(y - 12)) for x, y in trail]
+        self.assertEqual(distances, sorted(distances, reverse=True))
+        self.assertLess(distances[-1], 5)
+
+    def test_cover_waits_for_heals_and_the_flee_threshold(self):
+        client, task = self._cover_fight()
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self.assertFalse(task.cover_allowed(client, 0.50, 0.55))
+        self.assertTrue(task.cover_allowed(client, 0.60, 0.55))
+        # A heal just sent is in flight.
+        task.safety._last_heal = time.monotonic()
+        self.assertFalse(task.cover_allowed(client, 0.90, 0.55))
+        task.safety._last_heal = 0.0
+        # A usable heal at the heal threshold is due.
+        client.state.stats.update(sp=20)
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        self.assertFalse(task.cover_allowed(client, 0.65, 0.55))
+        self.assertTrue(task.cover_allowed(client, 0.75, 0.55))
+        # Below the flee threshold the tick heals and retreats instead.
+        client.state.stats.update(hp=10, maxhp=32)
+        task.safety.flee_below = 0.55
         asyncio.run(task.tick(client))
-        self.assertEqual(
-            [action for action, _ in client.recorded].count("caster-cover"), 1)
+        self.assertNotIn("caster-cover",
+                         [action for action, _ in client.recorded])
+
+    def test_a_cover_step_never_opens_another_casters_line(self):
+        client, task = self._seam_fight()
+        node = task.map_node
+        # West caster A is walled off from her; north caster B is not.
+        # The one open square leaves B's line but enters A's.
+        node.blocked.update({(10, 12), (11, 10)})
+        node.terrain = {(12, 12): 1, (11, 11): 1}
+        from .tasks import wall_covers
+        self.assertTrue(wall_covers(node, {}, (7, 12), (12, 12)))
+        self.assertFalse(wall_covers(node, {}, (12, 7), (12, 12)))
+        self.assertTrue(wall_covers(node, {}, (12, 7), (11, 11)))
+        self.assertFalse(wall_covers(node, {}, (7, 12), (11, 11)))
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self._put(client, 8, 3, "orc sorcerer", 301)
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        self.assertFalse(asyncio.run(task.break_caster_sight(client)))
+        self.assertEqual(client.direct_moves, [])
 
     def test_no_cover_step_without_a_spell_hit(self):
         client, task = self._seam_fight()
@@ -16881,10 +17014,10 @@ class CasterFirstTests(unittest.TestCase):
         self.assertEqual(client.direct_moves, [])
 
     def test_the_underground_city_pocket_from_the_incident(self):
-        """1_3 (7, 1), on the room side of the door at (8, 1), with 1_2's
-        orc sorcerers (spawns (4, 18) and (0, 19)) in line across the
-        seam: she steps through the doorway to the corridor side, out of
-        both lines."""
+        """1_3 (7, 1), on the room side of the door at (8, 1), fighting
+        an orc warrior, with 1_2's orc sorcerers (spawns (4, 18) and
+        (0, 19)) in line across the seam: she steps through the doorway
+        to the corridor side, out of both lines."""
         from .tasks import area_caster_identities, tiled_neighbours, wall_covers
         graph = built_graph()
         farm = graph.nodes[self.UC + "3"]
@@ -16904,33 +17037,21 @@ class CasterFirstTests(unittest.TestCase):
         task = FarmTask(zone=m.path)
         task.map_node = farm
         task.map_bounds = (farm.width, farm.height)
-
-        def place():
-            m.tiles.clear()
-            for index, (x, y) in enumerate(sorcerers):
-                self._put(client, 8 + x - m.world_x, 8 + y - m.world_y,
-                          "orc sorcerer", 300 + index)
-
-        steps = []
-        for _ in range(3):
-            place()
+        creatures = [(sorcerer, "orc sorcerer", 300 + index)
+                     for index, sorcerer in enumerate(sorcerers)]
+        creatures.append(((3, 1), "orc warrior", 100))
+        task.remember_engagement(client, 4, 8, 100)
+        trail = []
+        for _ in range(4):
+            # A fresh bullet each time she is still in a line.
             self._say(client,
                       "magic bullet hit you for 65 (0) weapon magic damage.")
-            task._last_action = 0.0
-            task._retreat_attempt = None
-            moved = len(client.direct_moves)
-            asyncio.run(task.tick(client))
-            if len(client.direct_moves) == moved:
-                break
-            dx, dy = c.DIRECTION_DELTAS[client.direct_moves[-1][0]]
-            m.world_x += dx
-            m.world_y += dy
-            steps.append((m.world_x, m.world_y))
-        self.assertTrue(steps)
-        here = (m.world_x, m.world_y)
-        self.assertGreater(here[0], 8, steps)
+            trail += self._run(client, task, creatures, ticks=1)
+        here = trail[-1]
+        self.assertGreater(here[0], 8, trail)
         self.assertTrue(all(wall_covers(farm, seams, sorcerer, here)
-                            for sorcerer in sorcerers), steps)
+                            for sorcerer in sorcerers), trail)
+        self.assertEqual(client.moves, [])
 
 
 class NavigationTests(unittest.TestCase):

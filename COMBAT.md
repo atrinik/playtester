@@ -1280,47 +1280,63 @@ Now, on the farm map:
   corners (`area_caster_identities`, through `terrain.tile_directions`).
   This is used for target choice, the stationary-caster orbit and the
   fight record's ranged count (`fight_positions.ranged_attackers`).
-- **Caster first** (`caster_first`). A caster within
-  `CASTER_FIRST_REACH` (2) is fought before any melee attacker, the
-  engaged one included, when it is hurting her: it is beside her, its
-  name is in a recent hit or miss, or an aimed spell hit her in the last
-  `COVER_HIT_SECONDS` (12 s) and no wall stands between it and her.
-  Across a seam only an adjacent caster counts, and it then counts as a
-  threat. The same rank comes first when she picks one attacker among
-  several: the first contact she commits to, the pursued stand, the
-  cornered breakout's blocker. A breakout or stand latched on a melee
-  attacker switches to a caster that comes beside her.
-- **Breaking a caster's line** (`break_caster_sight`). The rule applies
-  after an aimed spell hit in the last 12 s, while every visible caster
-  with a clear line to her is out of reach. She then takes one step that
-  puts an authored wall between her and as many of them as possible
-  (`wall_covers`). The line is the server's projectile flight
+- **Caster first** (`caster_first`). A caster is fought before any melee
+  attacker, the engaged one included, when it is beside her (across a
+  seam too, where it then counts as a threat). It is also fought first
+  when it stands within `CASTER_FIRST_REACH` (2) on the farm map and its
+  name is in a recent hit or miss, provided the step toward it puts no
+  more other attackers beside her than she has now. A missile's hit
+  ("magic bullet hit you") names no caster and switches no target, so
+  she does not leave the orc beside her for a caster past the pack. The
+  same rank comes first when she picks one attacker among several: the
+  first contact she commits to, the pursued stand, the cornered
+  breakout's blocker. A breakout or stand latched on a melee attacker
+  switches to a caster that comes beside her.
+- **Breaking a caster's line** (`break_caster_sight`). One step that
+  puts an authored wall between her and the casters she is not going
+  for (`wall_covers`). The line is the server's projectile flight
   (`cover_cells`, from the caster), across seams. A wall there also takes
   away the sight a monster needs to cast at all (`monster_cast_spell`,
   `server/src/types/monster.c`). Doors do not count, because orcs open
-  them. Rules for the step:
-  - It never puts more attackers beside her than she has now.
-  - Among the steps, she takes first the one that covers the most
-    casters, then the square fewer melee attackers can reach
-    (`terrain.features`), then the one farthest from the nearest other
-    hostile.
-  - It is recorded as `caster-cover`, and its square is learned as
-    blocked if it never lands.
-  - It runs before healing and the retreats, but not while she runs from
-    losing heals (`out_healed_running`). A step in flight lets the rest
-    of the tick, healing first, go on.
-  - For `COVER_HOLD_SECONDS` (4 s) afterwards she neither approaches nor
-    kites a melee target. It comes to her. A caster target is still
-    approached.
-  - In the incident pocket she steps through the doorway (8, 1) to the
-    corridor side, which neither sorcerer can see.
+  them. Its gates:
+  - an aimed spell hit in the last `COVER_HIT_SECONDS` (12 s) that is
+    newer than the one her last cover step answered, so an old hit never
+    starts another;
+  - `caster_first` has no caster for her;
+  - her engaged or selected target is no caster she covers from: if she
+    is going for it, she goes for it. Cover from her own target alternated
+    with the approach to it, step by step (review of
+    [pull request 131](https://github.com/atrinik/playtester/pull/131));
+  - above the tick's flee threshold, with no heal in flight (within the
+    safety's heal cooldown of the last) and none due (a usable heal at or
+    below the heal threshold), so it never pre-empts a heal
+    (`cover_allowed`), and not while she runs from losing heals.
+
+  The square must have strictly fewer clear lines from the visible
+  casters than hers, and no more attackers beside it. Among those squares
+  she takes first the one with the fewest lines, then the one fewer melee
+  attackers can reach (`terrain.features`), then the one farthest from
+  the nearest other hostile. The step is recorded as `caster-cover`, and
+  its square is learned as blocked if it never lands. For
+  `COVER_HOLD_SECONDS` (4 s) afterwards she approaches and kites no
+  target at all: they come to her. In the incident pocket she steps
+  through the doorway (8, 1) to the corridor side, which neither sorcerer
+  can see.
+
+  Bolts that reflect off walls (lightning, negative energy bolt) do not
+  follow the straight line past a wall. For them cover rests on the sight
+  check alone, which the same wall takes away.
 - **A seam pocket is no dead end.** The low-health retreat may step onto
   a map tiled to the farm map, but only when every step on the farm map
-  is a dead end (an escape depth under 2) or there is none. The square
-  must be walkable and unoccupied on that map. The step must gain
-  distance from the nearest threat, and the square must have no more
-  hostiles within 4 tiles than hers. The decision is
-  `retreat-choice ... seam=1`.
+  is a dead end (an escape depth under 2) or there is none. The rules:
+  - The square must be walkable and unoccupied on that map.
+  - From it she must be able to get at least 2 squares away from the
+    seam edge (`seam_escape`), since running along the seam is no escape.
+  - The step must gain distance from the nearest threat.
+  - The square must have no more hostiles within 4 tiles than hers.
+  - No second seam step follows within `SEAM_STEP_COOLDOWN_SECONDS`
+    (20 s): off the farm map the circuit's walk brings her straight back.
+  - The decision is `retreat-choice ... seam=1`.
 - **No stand into a losing pack.** A pursued stand that is due, against
   two or more attackers beside her while she is losing, gives way to a
   step that sheds the nearest of them (`pursued-stand-declined`). Losing
@@ -1348,7 +1364,10 @@ Accepted limits:
   attacker of its own. Out-of-league marks still match only the hits'
   names, as noted above;
 - the farm still neither pulls nor walks to creatures across a seam. Only
-  an adjacent caster there is fought.
+  an adjacent caster there is fought. One two squares across a seam is
+  not, and the cover step treats it like any other caster in view;
+- cover steps are judged at their square. She does not plan a path to
+  cover, and two casters may leave no square with fewer lines.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 
