@@ -4703,6 +4703,86 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertTrue(task.checked)
         self.assertFalse(task.purchased)
 
+    def test_dialogue_stock_counts_a_stack_arriving_by_its_plural(self):
+        # Live, 2026-11-23 (v1.97.0): the food resupply bought 25 chicken
+        # legs (her money fell by 5s) but failed "merchant stock did not
+        # enter inventory": the stack arrives as "free-range chicken legs"
+        # (the server's name_pl for a stack), which the exact singular
+        # pattern did not match. A failure retries, and a retry re-buys.
+        import re
+
+        from .tasks import stock_names
+
+        self.assertIn("free-range chicken legs",
+                      stock_names("free-range chicken leg"))
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance = 2_245
+                self.state.bank_balance_known = True
+                self.talks = []
+                self.decisions = []
+
+            async def talk(self, message, npc):
+                self.talks.append((message, npc))
+
+            def record_action(self, action, detail):
+                self.decisions.append((action, detail))
+
+        def bought(held=None):
+            client = FakeClient()
+            if held is not None:
+                client.state.place_item(held, 7)
+            name = "free-range chicken leg"
+            task = BuyDialogueStockTask(
+                "tavern keeper", rf"^{re.escape(name)}$", quantity=25,
+                preferred=(name,), cash_reserve=1_000)
+            asyncio.run(task.tick(client))
+            client.state.interface = InterfaceState(
+                title="tavern keeper", links=[f"[a=:buy {name}]Leg[/a]"])
+            asyncio.run(task.tick(client))
+            client.state.interface = InterfaceState(
+                title="tavern keeper",
+                objects=[Item(20, name=name,
+                              extra={"message": f"{name} for 20 copper"})],
+                links=[f"[a=:buy 25 {name}]25[/a]"])
+            asyncio.run(task.tick(client))
+            self.assertEqual(client.talks[-1],
+                             (f"buy 25 {name}", "tavern keeper"))
+            self.assertEqual(client.state.bank_balance, 1_745)
+            return client, task
+
+        # A new stack of 25 under its plural name.
+        client, task = bought()
+        client.state.place_item(Item(
+            31, item_type=c.TYPE_FOOD, name="free-range chicken legs",
+            quantity=25), 7)
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertTrue(task.purchased)
+        self.assertEqual(client.decisions[-1], (
+            "dialogue-stock-buy", "free-range chicken legs cost=5s"))
+        # Merged into the one leg she held: the same tag, renamed and grown.
+        client, task = bought(Item(
+            30, item_type=c.TYPE_FOOD, name="free-range chicken leg"))
+        client.state.place_item(Item(
+            30, item_type=c.TYPE_FOOD, name="free-range chicken legs",
+            quantity=26), 7)
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertTrue(task.purchased)
+        # Nothing arrived: still a failure, and her unchanged stack is not
+        # taken for the purchase.
+        client, task = bought(Item(
+            30, item_type=c.TYPE_FOOD, name="free-range chicken legs",
+            quantity=3))
+        task._sent_at -= 9.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(task.error, "merchant stock did not enter inventory")
+        self.assertFalse(task.purchased)
+
     def test_recall_stock_falls_back_to_a_cheaper_choice_and_records_the_cheapest(self):
         # Live, 2026-11-22: "merchant stock costs 95s 95c, wallet 24s 13c,
         # reserve 10s". She now tries every recall choice, and the cheapest
