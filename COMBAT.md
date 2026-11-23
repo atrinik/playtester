@@ -631,7 +631,9 @@ which objective she farmed, because farming was what paid the fee.
 `farming_unsafe_reason` held farming in two cases. The second, a missing
 working recall, was removed by the
 [owner decision of 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22),
-which supersedes it; depletion is the only case left:
+which supersedes it; depletion is the only case left, and an unaffordable
+cure no longer holds it for good (the
+[owner decision of 2026-11-23](#an-unaffordable-cure-is-never-a-blocker-owner-decision-2026-11-23)):
 
 - depletion at the temple-service threshold (`DEPLETION_SERVICE_THRESHOLD`,
   3 points, shown as `conditions.depletion_threshold`, with the live
@@ -709,7 +711,8 @@ recovery phase:
   and the cure and funding trips stay strict;
 - depleted: the strict temple cure when she can pay (a depletion potion
   first); otherwise the cure-funding path (identify-all, junk sale,
-  deposit, the apartment chest);
+  deposit, the apartment chest); and once none of it is left to start,
+  the [cure-funding farm](#an-unaffordable-cure-is-never-a-blocker-owner-decision-2026-11-23);
 - otherwise waits at her savebed.
 
 Recovery never shops for recall: no recall is bought with the cure's
@@ -728,7 +731,9 @@ clears as soon as its condition does:
   phase;
 - `cure-unfunded`: depleted, short of the fee, and no funding trip under
   way (one that is merely due does not hide it). Operator assist can give
-  her the gold;
+  her the gold. Critical while she is parked, a warning while she farms
+  to fund the cure (see the
+  [owner decision of 2026-11-23](#an-unaffordable-cure-is-never-a-blocker-owner-decision-2026-11-23));
 - `cure-unreachable`: three strict temple trips in a row refused for want
   of a safe route from her savebed. Each refusal is a recorded decision
   (`cure-route-refused`, reset by `cure-route-cleared` or
@@ -859,6 +864,73 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
   arrives, the cheapest price she could not pay is still recorded. A
   recall spell costing more SP than her whole bar is not a recall source.
 
+## An unaffordable cure is never a blocker (owner decision, 2026-11-23)
+
+Live, on 2026-11-23 (v1.92.0), depletion 7 held farming. The cure cost
+2,865 copper, she had 2,245 with her bank balance, nothing she carried
+would sell, and the chest trip that would have funded it failed
+("storage container contents did not load"). The `cure-unfunded` alert
+went critical and she parked at her savebed for good: the same deadlock
+as the recall one above. The owner's decision: an unaffordable cure must
+not block her either.
+
+- **Farming funds it.** When the recovery phase, at her savebed, finds
+  depletion due, the cure short of her wallet and known bank balance (the
+  funding path's own measure, `_cure_shortfall`, with no margin), and no
+  funding trip to start (identify-all, junk sale, deposit and the chest
+  trip each found nothing or failed and wait their retry), it records
+  `cure-funding-farm` and ends. While that runs (`cure_funding_farm`),
+  `farming_unsafe_reason` lets her farm. An unknown bank balance never
+  starts it: the bank visit comes first.
+- **A careful farm.** It follows the analyzer's safety ranking alone,
+  never the chosen objective: its easiest usable spot, by the ordinary
+  rules (quarantine, route deaths, kit hazard, strict town reach), except
+  that when every usable spot is hazardous for her kit it does not farm
+  the least dangerous one but waits (the 2026-11-17 spiral farmed exactly
+  that fallback). It makes no optional trip (savebed rebinding, upgrade, spell, utility and
+  recall shopping, the ship key) and no mana-crystal detour. The one
+  exception is the [healing-potion restock](#healing-potion-restock),
+  which otherwise waits while depletion is due: a depleted farm without
+  heals is the 2026-11-17 death spiral. On the funding farm it buys only
+  up to `HEAL_RESTOCK_LOW` (2), the least that makes her prepared, and
+  takes only a strict route, deferred (`heal-restock-deferred`) when there
+  is none. The unprepared hold and the
+  circuit's maintenance trips (food, bank, identify, storage, junk sale,
+  the chest) run as ever.
+- **Until she can pay.** Affordability is read live on every tick: as
+  soon as the coins she carries, or they and her known bank balance, pay
+  for the cure, farming is unsafe again,
+  autoplay hands over to recovery as usual (essential trips and a farm
+  fight finish first) and recovery takes her to the temple. Autoplay
+  records `cure-funding-farm-funded`, but the farm and its deaths stay
+  until the cure: should she drop short again before the temple, she
+  farms on with the same count. It ends (`cure-funding-farm-ended`) once
+  depletion is no longer due (the client's own depletion reset ends it
+  too, even while autoplay is stopped), or
+  `CURE_FUNDING_FARM_KEEP_SECONDS` (24 h) after it was funded without a
+  cure. Only then is a later shortfall a fresh decision.
+- **No death loop.** A death while funding is no reason to stop: depletion
+  is already due, and the fee grows only with her level (65 copper a
+  level, `_depletion_service_cost`), not with the points. After
+  `CURE_FUNDING_FARM_DEATHS` (3) deaths since the start she stops,
+  autoplay records `cure-funding-farm-backoff`, and recovery parks her
+  with the critical alert again. Only after
+  `CURE_FUNDING_FARM_BACKOFF_SECONDS` (24 h) may another funding farm
+  start, with its deaths counted afresh.
+- **Persisted, so it survives Stop and restarts.** Its state is her
+  character memory (`GameState.cure_funding_farm_*`: start, deaths
+  counted and up to when, when it was funded, backoff end), not the bounded
+  decision history, from which a long farm's start and deaths would
+  scroll out. Deaths are counted from the `death` decisions and folded
+  into the persisted count every autoplay tick. The `cure-funding-farm`,
+  `cure-funding-farm-funded`, `cure-funding-farm-ended` and
+  `cure-funding-farm-backoff` decisions are its audit trail.
+- **Alerts.** While she farms for it, `cure-unfunded` is a warning naming
+  both amounts and her deaths while funding; it is critical again while
+  no farm spot is usable and she waits for one (an explained wait, so no
+  `stuck` alert), and while she parks after the backoff (with the time to the next try). Operator assist is
+  unchanged and still offered in the text.
+
 ## Healing-potion restock
 
 Live, on 2026-11-22, Sera died at critical health with no usable heal: no
@@ -878,7 +950,7 @@ so she is rarely without a heal:
   unidentified potion or a spellbook is no heal to either. Healing spells,
   rods and wands are not counted, on purpose: the restock is the backup
   for when her SP or charges run out. Not with depletion due (the recovery phase
-  comes first), not above the food trips' load limit (80 % of her carry
+  comes first), except on the cure-funding farm, not above the food trips' load limit (80 % of her carry
   weight), and only with the money for one item plus the 1,000 copper
   reserve (`HEAL_RESTOCK_RESERVE`): with a healing quote from the last day
   (`heal_restock_quote`, vendor quote `heal-restock`), its price plus the
@@ -930,7 +1002,8 @@ so she is rarely without a heal:
   (`heal-restock-deferred`), not a day. Once the hold's ten minutes run
   out, it goes like any optional trip, ahead of the others. Prepared (a
   ready recall, SP for a healing spell, or 90 % HP), it is an ordinary
-  optional trip. Never while depletion is due.
+  optional trip. Never while depletion is due, except on the
+  [cure-funding farm](#an-unaffordable-cure-is-never-a-blocker-owner-decision-2026-11-23).
 - **No loops.** A merchant with no healing stock she can use, stock that
   ran short of the low mark, or no merchant at all backs her off for a
   day; a failed trip (she could pay for none, a route declined, a
