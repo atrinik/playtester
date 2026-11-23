@@ -1177,7 +1177,9 @@ class WorldGraph:
         Burnt Forest at a pack of three to eight. The pack at each spawn
         adds them to its own map's and the spot's other maps' spawns within
         their detection radius, as for the analyzer, and is reported only
-        where a neighbour adds to it (else 0). ``aggressive`` counts every
+        where a seam adds to it (else 0): a neighbour's spawns, or the
+        spot's other maps' within detection radius across its own seams,
+        which the analyzer, judging each map alone, misses too. ``aggressive`` counts every
         neighbour spawn within SEAM_REACH_TILES. Distances are Chebyshev,
         ignoring walls, as in the analyzer's own estimate.
         """
@@ -1215,7 +1217,9 @@ class WorldGraph:
                                    abs(target.y - spawn.y - dy))
                     detects = distance <= spawn.aggro_radius
                     if inside:
-                        local += detects
+                        # The spot's other map, across its own seam: the
+                        # analyzer, judging each map alone, misses it too.
+                        seam += detects
                         continue
                     key = (spawn.map_path, spawn.x, spawn.y)
                     if distance - ring <= reach:
@@ -6744,34 +6748,41 @@ def _analyzer_farm_choice(
     if not usable and hazardous and not funding:
         # Every usable spot is hazardous for her kit: farm the least
         # dangerous one rather than idle until the hazard ages out, the
-        # one with the safer approach on a tie. Never on the cure-funding
+        # one with the safer approach on a tie; a spot whose own
+        # encounters stay under her health (not risky_spot, seam exposure
+        # included) before any that do not. Never on the cure-funding
         # farm: depleted, she waits for a spot that is not (the 2026-11-17
         # death spiral farmed exactly that fallback).
         usable = [min(hazardous, key=lambda entry: (
+            plan.risky_spot(entry[2]),
             float(entry[2].get("danger", 0.0) or 0.0),
             -plan.approach_safety(entry[2]), order[id(entry)]))]
     if funding:
-        # The cure-funding farm takes only a spot with a safe approach whose
-        # danger is under half her health and under every spot rated
-        # hazardous for her kit, and waits when none is left. Live, on
+        # The cure-funding farm takes only a spot with a safe approach and
+        # a safe spot (neither risky_approach nor risky_spot, seam exposure
+        # included) whose danger is under half her health and under every
+        # spot rated hazardous for her kit, and waits when none is left. Live, on
         # 2026-11-23, with the safety view 250 deep, a replay walked down
         # to a 118.3 spot with a risky approach; the circuits that killed
         # and out-damaged her rated 103.5 and 125.8. Single failures only
         # order the rest (recent_kit_failures). A hazardous spot caps
         # whether or not it is quarantined or behind a route death: the
-        # spot her kit just failed on still says what is too much.
+        # spot her kit just failed on still says what is too much, and so
+        # does one seam exposure leaves out (the raw ranking caps: the
+        # exposure never changes a spot's danger).
         stats = getattr(client.state, "stats", {}) or {}
         profile = current_combat_kit(client)
         health = float(getattr(profile, "max_health", 0) or
                         stats.get("maxhp", 0) or 0)
         cap = FUNDING_FARM_DANGER_SHARE * health if health > 0 else float("inf")
-        for spot in seam_ranking(client, graph, "safety"):
+        for spot in analyzer.ranking("safety"):
             legs = analyzer_spot_legs(spot, graph)
             if (legs and _spot_danger(spot) < cap and
                     kit_hazardous_spot(client, spot, legs)):
                 cap = _spot_danger(spot)
         usable = [entry for entry in usable
                   if not plan.risky_approach(entry[2]) and
+                  not plan.risky_spot(entry[2]) and
                   _spot_danger(entry[2]) < cap]
         failures = recent_kit_failures(client)
         recent = {id(entry): sum(1 for maps in failures
@@ -6889,6 +6900,7 @@ def farm_shadow_snapshot(client: AtrinikClient, graph: "WorldGraph",
             (hazardous if kit_hazardous_spot(client, spot, legs) else usable).append(entry)
     if not usable and hazardous:
         usable = [min(hazardous, key=lambda entry: (
+            farm_analyzer_plan.risky_spot(entry[2]),
             float(entry[2].get("danger", 0.0) or 0.0),
             -farm_analyzer_plan.approach_safety(entry[2]),
             entry[0].position, entry[0].rank))]

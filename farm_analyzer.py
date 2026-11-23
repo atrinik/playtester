@@ -205,7 +205,8 @@ class SeamExposure:
     """What a spot's seam neighbours add (navigation.WorldGraph.seam_exposure).
 
     ``pack``: the most aggressive spawns at once at any of the spot's
-    spawns where a neighbour adds to it (0 where none does): all within
+    spawns where a seam adds to it, a neighbour's or one between the
+    spot's own maps (0 where none does): all within
     their detection radius, and the neighbours' casters within
     SEAM_REACH_TILES of her pull square. ``aggressive`` and ``casters``:
     the neighbours' aggressive spawns, and casters among them, within
@@ -817,8 +818,12 @@ class FarmAnalyzer:
         ranked = self.ranking(objective)
         return ranked[0] if ranked else None
 
-    def snapshot(self, objective: str) -> dict[str, Any]:
+    def snapshot(self, objective: str,
+                 ranked: list[dict] | None = None) -> dict[str, Any]:
+        """The dashboard's view; ``ranked`` replaces the raw ranking (the
+        seam-adjusted one, navigation.seam_ranking)."""
         objective = objective if objective in OBJECTIVES else DEFAULT_OBJECTIVE
+        ranked = self.ranking(objective) if ranked is None else ranked
         return {
             "status": self.status,
             "error": self.error,
@@ -834,8 +839,9 @@ class FarmAnalyzer:
             "rejected_origins": sorted(self.rejected_origins),
             "ranking": [
                 {**{key: item.get(key) for key in SUMMARY_FIELDS},
-                 "approach_risky": risky_approach(item)}
-                for item in self.ranking(objective)[:5]
+                 "approach_risky": risky_approach(item),
+                 "spot_risky": risky_spot(item)}
+                for item in ranked[:5]
             ],
         }
 

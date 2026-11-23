@@ -49,7 +49,8 @@ KIT_HAZARD_FAILURES = 3
 KIT_HAZARD_WINDOW_SECONDS = 24 * 3600.0
 KIT_HAZARD_CAUSES = frozenset({"pack", "out-damaged"})
 # An emergency recall on the way to a spot counts toward its kit hazard
-# when this many attackers hit her at once: an approach pack that large is
+# when this many attackers hit her at once (peak_individuals: three orc
+# warriors count three, though one name): an approach pack that large is
 # the area's own pack, not a stray. Live, on 2026-11-23, three orcs forced
 # a recall at the Underground City entrance at 02:43 on the way to the
 # circuit whose casters and orcs killed her at 19:13; counted, the two
@@ -84,12 +85,16 @@ class FailureReview:
     peak_attackers: int = 0
     damage_by_type: dict[str, int] = field(default_factory=dict)
     damage_taken: int = 0
+    # Estimated individual attackers at once (peak_individuals): three
+    # orc warriors are one name but three attackers.
+    peak_individuals: int = 0
 
     def summary(self) -> dict[str, Any]:
         return {
             "time": self.time, "kind": self.kind, "map": self.map,
             "cause": self.cause, "detail": self.detail,
             "attackers": dict(self.attackers), "peak_attackers": self.peak_attackers,
+            "peak_individuals": self.peak_individuals,
             "damage_by_type": dict(self.damage_by_type),
             "damage_taken": self.damage_taken,
         }
@@ -138,6 +143,43 @@ def peak_attackers(hits: Iterable[tuple[float, str]]) -> int:
     return peak
 
 
+# Hits of one name this close together are from different attackers. The
+# hit text names no individual, and one monster swings far less often: an
+# orc's weapon_speed of 0.035 per tick at 8 ticks a second is a swing about
+# every 3.6 seconds (server/src/types/monster.c, weapon_speed_left).
+BURST_SECONDS = 1.0
+
+
+def peak_individuals(hits: Iterable[tuple[float, str]]) -> int:
+    """Estimated individual attackers at once among (time, attacker) hits.
+
+    Within any PACK_WINDOW_SECONDS, each name counts as many attackers as
+    its most hits less than BURST_SECONDS apart, at least one; the names are
+    summed. Never below peak_attackers (distinct names). An estimate:
+    same-named attackers that never hit within a second of each other
+    count as one.
+    """
+    ordered = sorted(hits, key=lambda hit: hit[0])
+    peak = 0
+    for index, (start, _) in enumerate(ordered):
+        window: dict[str, list[float]] = {}
+        for stamp, who in ordered[index:]:
+            if stamp - start > PACK_WINDOW_SECONDS:
+                break
+            window.setdefault(who, []).append(stamp)
+        total = 0
+        for stamps in window.values():
+            burst, end = 1, 0
+            for first, stamp in enumerate(stamps):
+                end = max(end, first)
+                while end + 1 < len(stamps) and stamps[end + 1] - stamp < BURST_SECONDS:
+                    end += 1
+                burst = max(burst, end - first + 1)
+            total += burst
+        peak = max(peak, total)
+    return peak
+
+
 def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
                    failure: dict, spot_paths: Iterable[str]) -> FailureReview:
     """Classify a failure from the combat messages and decisions before it."""
@@ -160,6 +202,7 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
         attackers[who] = attackers.get(who, 0) + 1
         damage_by_type[kind] = damage_by_type.get(kind, 0) + amount
     peak = peak_attackers((stamp, who) for stamp, who, _, _ in hits)
+    individuals = peak_individuals((stamp, who) for stamp, who, _, _ in hits)
     damage = sum(damage_by_type.values())
     starved = any(
         record.get("action") == "emergency-disengage" and
@@ -192,6 +235,7 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
     return FailureReview(
         time=when, kind=str(failure.get("action", "")), map=failure_map,
         cause=cause, detail=detail, attackers=attackers, peak_attackers=peak,
+        peak_individuals=individuals,
         damage_by_type=damage_by_type, damage_taken=damage)
 
 
@@ -273,7 +317,7 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
                     KIT_HAZARD_WINDOW_SECONDS]
     failure = {"time": review.time, "cause": review.cause,
                "kind": review.kind, "map": review.map,
-               "peak_attackers": int(review.peak_attackers),
+               "peak_individuals": int(review.peak_individuals),
                "kit": dict(kit or {})}
     if map_damage is not None:
         failure["map_damage"] = int(map_damage)
@@ -292,9 +336,9 @@ def hazard_failure(entry: dict, record: dict | None = None) -> bool:
 
     Pack and out-damaged failures on the spot count, and so does a death on
     the way to it ("route"). An emergency recall on the way counts only
-    with ROUTE_PACK_ATTACKERS or more attackers at once. A failure stored
-    before its peak was kept takes it from the review of the same time and
-    kind in its ``record``.
+    with ROUTE_PACK_ATTACKERS or more individual attackers at once
+    (peak_individuals). A failure stored before that was kept takes it
+    from the review of the same time and kind in its ``record``.
     """
     cause = entry.get("cause")
     if cause in KIT_HAZARD_CAUSES:
@@ -304,23 +348,27 @@ def hazard_failure(entry: dict, record: dict | None = None) -> bool:
     if entry.get("kind") == "death":
         return True
     return (entry.get("kind") == "emergency-recall" and
-            _peak_attackers(entry, record) >= ROUTE_PACK_ATTACKERS)
+            _peak_individuals(entry, record) >= ROUTE_PACK_ATTACKERS)
 
 
-def _peak_attackers(entry: dict, record: dict | None) -> int:
-    """A kit failure's peak attackers, from its own entry or its review."""
+def _peak_individuals(entry: dict, record: dict | None) -> int:
+    """A kit failure's estimated individual attackers at once
+    (peak_individuals), from its own entry, else from the review of the
+    same time and kind: its peak_individuals, or for a review stored
+    before that, its distinct names (peak_attackers, a lower bound)."""
     def number(value) -> int:
         try:
             return int(value or 0)
         except (TypeError, ValueError):
             return 0
 
-    if "peak_attackers" in entry:
-        return number(entry.get("peak_attackers"))
+    if "peak_individuals" in entry:
+        return number(entry.get("peak_individuals"))
     for review in (record or {}).get("reviews", ()) or ():
         if (isinstance(review, dict) and review.get("time") == entry.get("time") and
                 review.get("kind") == entry.get("kind")):
-            return number(review.get("peak_attackers"))
+            return number(review.get("peak_individuals",
+                                     review.get("peak_attackers")))
     return 0
 
 

@@ -124,9 +124,10 @@ class StubAnalyzer:
     def ranking(self, objective):
         return list(self.rankings.get(objective, ()))
 
-    def snapshot(self, objective):
+    def snapshot(self, objective, ranked=None):
+        ranked = self.ranking(objective) if ranked is None else ranked
         return {"status": self.status, "objective": objective,
-                "ranking": self.ranking(objective)[:5]}
+                "ranking": ranked[:5]}
 
 
 class TempleTrip(BotTask):
@@ -20317,6 +20318,83 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(small["max_aggro_pack"], 3.0)
         self.assertEqual(small["spot_safety_score"], 0.95)
 
+    def test_seam_exposure_counts_a_circuits_own_interior_seams(self):
+        from .navigation import WorldGraph, MapNode, NamedSpawn
+
+        graph = WorldGraph()
+        west, east = "/test/west", "/test/east"
+        for path in (west, east):
+            graph.nodes[path] = MapNode(path, width=10, height=10)
+        from .navigation import MapEdge
+        graph.nodes[west].edges.append(MapEdge(west, east, 10, 5, kind="tile"))
+        graph.nodes[east].edges.append(MapEdge(east, west, -1, 5, kind="tile"))
+        graph.named_spawns[west].append(NamedSpawn(west, 9, 5, "orc", ("orc",), aggro_radius=3))
+        graph.named_spawns[east].append(NamedSpawn(east, 0, 5, "orc", ("orc",), aggro_radius=3))
+        graph.named_spawns[east].append(NamedSpawn(east, 1, 6, "orc", ("orc",), aggro_radius=3))
+        # Each map alone has pack 1 at the west orc; across the circuit's
+        # own seam the east pair joins it: 3, with no outside neighbour.
+        exposure = graph.seam_exposure([west, east])
+        self.assertEqual((exposure.pack, exposure.aggressive, exposure.maps), (3, 0, ()))
+        # Outside the spot, the east map is a neighbour.
+        alone = graph.seam_exposure([west])
+        self.assertEqual((alone.pack, alone.aggressive, alone.maps), (3, 2, (east,)))
+
+    def test_hazardous_fallback_prefers_a_spot_that_is_not_risky(self):
+        from . import self_improvement as si
+        from .navigation import analyzer_farm_selection
+
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
+        trees["danger"], pocket["danger"] = 1.5, 2.0
+        trees.update(spot_safety_score=0.6, safety_score=0.6)
+        client = self.client({"xp": [trees, pocket]})
+        client.farm_analyzer.profile = self.kit()
+        failures = [{"time": time.time(), "cause": "pack",
+                     "kit": self.kit().describe()}] * si.KIT_HAZARD_FAILURES
+        client.state.farm_adaptations = {
+            spot["path"]: {"level": 3, "kit_failures": failures}
+            for spot in (trees, pocket)}
+        self.assertEqual(analyzer_farm_selection(
+            client, built_graph())[1]["name"], "Pocket")
+
+    def test_dashboard_ranks_with_seam_exposure(self):
+        from .web_server import DashboardState
+
+        uc = self.UC
+        city = analyzer_spot("The Underground City circuit", [
+            uc + "1_3", uc + "2_2", uc + "2_3", uc + "3_2"], ["orc warrior L38"],
+            aggressive=29)
+        city.update(danger=115.6, max_aggro_pack=1.0, safety_score=1.0)
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [city, trees]})
+        client.farm_analyzer.profile = self.kit(max_health=330)
+        dashboard = DashboardState(client, TaskEngine(client), built_graph(), {})
+        ranking = dashboard.farming_analysis()["ranking"]
+        self.assertGreater(ranking[0]["max_aggro_pack"], 1.0)
+        self.assertTrue(ranking[0]["seam_casters"])
+        # The analyzer's own snapshot marks a risky spot of the ranking given.
+        from pathlib import Path
+        from .farm_analyzer import FarmAnalyzer
+
+        analyzer = FarmAnalyzer(Path("/nonexistent"), Path("/nonexistent"), Path("/nonexistent"))
+        analyzer.report = {"rankings": {"xp": [trees]}}
+        shown = analyzer.snapshot("xp", [dict(trees, spot_safety_score=0.5)])["ranking"]
+        self.assertEqual([(spot["name"], spot["spot_risky"]) for spot in shown],
+                         [("Trees", True)])
+        self.assertFalse(analyzer.snapshot("xp")["ranking"][0]["spot_risky"])
+        # Capped at her pack, it is neither shown nor offered.
+        client.farm_analyzer.profile = self.kit(max_health=330, max_aggro_pack=2)
+        self.assertEqual([spot["name"] for spot in dashboard.farming_analysis()["ranking"]],
+                         ["Trees"])
+        self.assertEqual([spot["name"] for spot in dashboard.analyzer_farm_spots()],
+                         ["#1 Trees"])
+        from .web_server import WebControlServer
+
+        server = WebControlServer(client, TaskEngine(client), built_graph())
+        self.assertEqual(server._ranked_spot(trees["path"])["name"], "Trees")
+        with self.assertRaises(ValueError):
+            server._ranked_spot(city["path"])
+
     def test_a_seam_exposed_circuit_is_demoted_or_left_out(self):
         from .navigation import analyzer_farm_selection
 
@@ -23815,6 +23893,13 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             {"xp": [trees], "safety": [cave, trees]})
         choice = analyzer_farm_choice(client, built_graph(), search=False)
         self.assertEqual((choice[0], choice[2]["name"]), ("safety", "Cave"))
+        # A spot whose own encounters cost more than her health bar (seam
+        # exposure included) is never the funding farm, even the only one.
+        exposed = dict(cave, name="Exposed cave", spot_safety_score=0.9,
+                       safety_score=0.9)
+        client.farm_analyzer = StubAnalyzer(
+            {"xp": [trees], "safety": [exposed]})
+        self.assertIsNone(analyzer_farm_choice(client, built_graph(), search=False))
         # No usable spot: autoplay waits where she is, and the warning
         # turns critical, an explained wait rather than being stuck.
         client.farm_analyzer = StubAnalyzer({"xp": [trees], "safety": []})
@@ -24503,7 +24588,7 @@ class SelfImprovementTests(unittest.TestCase):
         # Live, 2026-11-23: a three-orc recall on the way at 02:43, then the
         # pack death at the spot at 19:13, make two.
         record, _ = si.learn({}, pack_recall, now=1000.0, kit=kit, maps=[self.SPOT])
-        self.assertEqual(record["kit_failures"][-1]["peak_attackers"], 3)
+        self.assertEqual(record["kit_failures"][-1]["peak_individuals"], 3)
         record, _ = si.learn(record, died, now=1000.0, kit=kit, maps=[self.SPOT])
         hazard = lambda record: si.kit_hazard(  # noqa: E731
             {self.SPOT: record}, self.SPOT, [self.SPOT], kit.__eq__, now=1000.0)
@@ -24516,7 +24601,12 @@ class SelfImprovementTests(unittest.TestCase):
         self.assertTrue(hazard(record))
         # A recall stored before its peak was kept takes it from its review.
         for entry in record["kit_failures"]:
-            entry.pop("peak_attackers")
+            entry.pop("peak_individuals")
+        self.assertTrue(hazard(record))
+        # A review stored before individuals were counted gives its
+        # distinct names.
+        for review in record["reviews"]:
+            review.pop("peak_individuals")
         self.assertTrue(hazard(record))
         for review in record["reviews"]:
             review["peak_attackers"] = 2
@@ -24525,6 +24615,41 @@ class SelfImprovementTests(unittest.TestCase):
         # marks no map.
         self.assertEqual(si.route_death_maps(
             {self.SPOT: record}, lambda kit: True, now=1000.0), set())
+
+    def test_route_pack_recalls_count_identical_attackers(self):
+        from . import self_improvement as si
+
+        # Three orc warriors are one name: distinct names say one attacker,
+        # hits of that name within a second of each other say three.
+        kit = {"skill": "slash weapons", "skill_level": 35}
+        trio = ["orc warrior hit you for 30 (-30) slash damage."] * 3
+        recall = self.review(trio, failure_map="/underground_city/entrance",
+                             action="emergency-recall")
+        self.assertEqual(recall.peak_attackers, 1)
+        self.assertEqual(recall.peak_individuals, 1)  # a second apart each
+        messages = [(990.0 + offset, 2, "ff0000", text)
+                    for offset, text in zip((0.0, 0.3, 0.6), trio)]
+        burst = si.review_failure(
+            messages, [], {"time": 1000.0, "action": "emergency-recall",
+                           "map": "/underground_city/entrance"}, [self.SPOT])
+        self.assertEqual((burst.cause, burst.peak_attackers, burst.peak_individuals),
+                         ("route", 1, 3))
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "orc"), (3.6, "orc"), (7.2, "orc")]), 1)
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "orc"), (0.5, "orc"), (0.2, "sorcerer")]), 3)
+        self.assertGreaterEqual(si.peak_individuals(
+            [(0.0, "a"), (2.0, "b"), (4.0, "c")]), 3)
+        record = {}
+        for _ in range(si.KIT_HAZARD_FAILURES):
+            record, _ = si.learn(record, burst, now=1000.0, kit=kit, maps=[self.SPOT])
+        self.assertTrue(si.kit_hazard({self.SPOT: record}, self.SPOT, [self.SPOT],
+                                      kit.__eq__, now=1000.0))
+        record = {}
+        for _ in range(si.KIT_HAZARD_FAILURES):
+            record, _ = si.learn(record, recall, now=1000.0, kit=kit, maps=[self.SPOT])
+        self.assertFalse(si.kit_hazard({self.SPOT: record}, self.SPOT, [self.SPOT],
+                                       kit.__eq__, now=1000.0))
 
     def test_kit_hazard_reads_records_persisted_before_maps_were_kept(self):
         from . import self_improvement as si

@@ -1300,14 +1300,16 @@ counted toward the spot's kit hazard. Three changes:
   to one of the spot's maps, side or diagonal, outside the spot; the
   circuit never clears it. At each of the spot's spawns, the pack counts
   every aggressive spawn within its own detection radius, the analyzer's
-  rule now across the seam, plus each neighbour caster within
+  rule now across every seam, the circuit's own interior seams included
+  (the analyzer judges each map alone), plus each neighbour caster within
   `SEAM_REACH_TILES` (10) of her pull square (the spawn's detection
   radius from it). Distances ignore walls, as the analyzer's do. Counting
   every melee spawn that near too would put the open Burnt Forest at a
   pack of three to eight and leave almost no overworld spot under the cap
   below. Every ranked spot (each objective, the cure-funding farm's
-  safety view and the farm-score shadow alike) keeps the analyzer's order
-  and gets: `max_aggro_pack` the larger of the two packs; seam casters in
+  safety view, the farm-score shadow and the dashboard's Farming tab,
+  farm picker and manual farm task alike) keeps the analyzer's order and
+  gets: `max_aggro_pack` the larger of the two packs; seam casters in
   `danger_flags` (`seam caster×N`), with `seam_casters`,
   `seam_aggressive_spawns` (neighbour spawns within 10 tiles) and
   `seam_maps`; and a spot safety of at most her maximum health over the
@@ -1322,7 +1324,11 @@ counted toward the spot's kit hazard. Three changes:
   Autoplay farms spots that are neither that nor a risky approach first,
   in rank order, as for approaches; the risky ones after them, the safest
   first, and on a safety tie (one approach capping them all) by their own
-  safety.
+  safety. The cure-funding farm never takes a risky spot, and the
+  every-spot-hazardous fallback takes the least dangerous spot that is
+  not risky before any that is. The funding farm's danger cap still reads
+  every hazardous spot of the raw ranking, those seam exposure leaves out
+  included.
 - **A pack she can hold.** Outside Wizardry training (pack 1, unchanged),
   `combat_profile` now ranks for `max_aggro_pack`
   `SINGLE_TARGET_MAX_AGGRO_PACK` (2): she fights one target at a time and
@@ -1331,9 +1337,16 @@ counted toward the spot's kit hazard. Three changes:
   Underground City maps of pack 3 or more leave every circuit.
 - **Pack recalls on the way count** toward the spot's kit hazard
   (`hazard_failure`): an emergency recall on the way with
-  `ROUTE_PACK_ATTACKERS` (3) or more attackers at once. Each kit failure
-  now keeps its peak; one stored before reads it from the review of the
-  same time. The 02:43 recall and the 19:13 death make two;
+  `ROUTE_PACK_ATTACKERS` (3) or more individual attackers at once
+  (`peak_individuals`). The hit text names no individual, so three orc
+  warriors are one name: within any 8 s, each name counts as many
+  attackers as its most hits less than `BURST_SECONDS` (1 s) apart, at
+  least one, and the names are summed. One monster swings far less often
+  (an orc's `weapon_speed` 0.035 a tick at 8 ticks a second is a swing
+  about every 3.6 s), but same-named attackers that never hit within a
+  second of each other still count as one, so it is an estimate. Each
+  kit failure now keeps it; one stored before reads it from the review of
+  the same time, or that review's distinct names when it predates this. The 02:43 recall and the 19:13 death make two;
   `KIT_HAZARD_FAILURES` stays 3. Route deaths counted already. Recalls
   with fewer attackers, and the route-death map rule, are unchanged.
 
@@ -1343,7 +1356,9 @@ the default origins: allowing any pack, as live, the death circuit is still
 the XP view's first spot, now risky (pack 4, safety 0.62), and every
 non-risky spot is a Burnt Forest circuit hazardous for her kit; so she
 would farm the least exposed Underground City circuit instead
-(`1_2 + 1_3 + 2_2 + 3_2`, sorcerers inside it). Ranked at pack 2, no
+(`0_4 + 1_2 + 1_3 + 1_4`, sorcerers inside it). Allowing any pack is not
+enough, and a cap of 3 is not either (she would farm the risky
+`1_2 + 1_3 + 2_2 + 3_2`), so the cap stays 2. Ranked at pack 2, no
 Underground City circuit is left, and seam exposure removes `1_3` alone
 (pack 3), `world_4_73`, `world_7_71` and two Hemlock Cave maps from the
 safety view. Her XP view is then all Burnt Forest circuits; with her kit
