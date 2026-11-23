@@ -882,12 +882,17 @@ not block her either.
   starts it: the bank visit comes first.
 - **A careful farm.** It follows the analyzer's safety ranking alone,
   never the chosen objective: its easiest usable spot, by the ordinary
-  rules (quarantine, route deaths, kit hazard, strict town reach). It
-  makes no optional trip (savebed rebinding, upgrade, spell, utility and
+  rules (quarantine, route deaths, kit hazard, strict town reach), except
+  that when every usable spot is hazardous for her kit it does not farm
+  the least dangerous one but waits (the 2026-11-17 spiral farmed exactly
+  that fallback). It makes no optional trip (savebed rebinding, upgrade, spell, utility and
   recall shopping, the ship key) and no mana-crystal detour. The one
   exception is the [healing-potion restock](#healing-potion-restock),
   which otherwise waits while depletion is due: a depleted farm without
-  heals is the 2026-11-17 death spiral. The unprepared hold and the
+  heals is the 2026-11-17 death spiral. On the funding farm it buys only
+  up to `HEAL_RESTOCK_LOW` (2), the least that makes her prepared, and
+  takes only a strict route, deferred (`heal-restock-deferred`) when there
+  is none. The unprepared hold and the
   circuit's maintenance trips (food, bank, identify, storage, junk sale,
   the chest) run as ever.
 - **Until she can pay.** Affordability is read live on every tick: as
@@ -895,12 +900,16 @@ not block her either.
   for the cure, farming is unsafe again,
   autoplay hands over to recovery as usual (essential trips and a farm
   fight finish first) and recovery takes her to the temple. Autoplay
-  records `cure-funding-farm-ended` (funded, or depletion no longer due).
-  A later shortfall is a fresh decision, and so is a new episode: a farm
-  started at more depletion points than she has now (she was cured while
-  autoplay was not running) is no farm.
+  records `cure-funding-farm-funded`, but the farm and its deaths stay
+  until the cure: should she drop short again before the temple, she
+  farms on with the same count. It ends (`cure-funding-farm-ended`) once
+  depletion is no longer due (the client's own depletion reset ends it
+  too, even while autoplay is stopped), or
+  `CURE_FUNDING_FARM_KEEP_SECONDS` (24 h) after it was funded without a
+  cure. Only then is a later shortfall a fresh decision.
 - **No death loop.** A death while funding is no reason to stop: depletion
-  is already due, and its fee does not grow with the points. After
+  is already due, and the fee grows only with her level (65 copper a
+  level, `_depletion_service_cost`), not with the points. After
   `CURE_FUNDING_FARM_DEATHS` (3) deaths since the start she stops,
   autoplay records `cure-funding-farm-backoff`, and recovery parks her
   with the critical alert again. Only after
@@ -908,17 +917,16 @@ not block her either.
   start, with its deaths counted afresh.
 - **Persisted, so it survives Stop and restarts.** Its state is her
   character memory (`GameState.cure_funding_farm_*`: start, deaths
-  counted, starting depletion points, backoff end), not the bounded
+  counted and up to when, when it was funded, backoff end), not the bounded
   decision history, from which a long farm's start and deaths would
   scroll out. Deaths are counted from the `death` decisions and folded
   into the persisted count every autoplay tick. The `cure-funding-farm`,
-  `cure-funding-farm-ended` and `cure-funding-farm-backoff` decisions are
-  its audit trail.
+  `cure-funding-farm-funded`, `cure-funding-farm-ended` and
+  `cure-funding-farm-backoff` decisions are its audit trail.
 - **Alerts.** While she farms for it, `cure-unfunded` is a warning naming
   both amounts and her deaths while funding; it is critical again while
   no farm spot is usable and she waits for one (an explained wait, so no
-  `stuck` alert), and while she parks
-  after the backoff (with the time to the next try). Operator assist is
+  `stuck` alert), and while she parks after the backoff (with the time to the next try). Operator assist is
   unchanged and still offered in the text.
 
 ## Healing-potion restock

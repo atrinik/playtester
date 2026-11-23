@@ -551,20 +551,21 @@ class AtrinikClient:
                     record.get("cure_funding_farm_deaths", 0) or 0))
                 self.state.cure_funding_farm_counted_at = max(0.0, float(
                     record.get("cure_funding_farm_counted_at", 0.0) or 0.0))
-                self.state.cure_funding_farm_points = max(0, int(
-                    record.get("cure_funding_farm_points", 0) or 0))
+                self.state.cure_funding_farm_funded_at = max(0.0, float(
+                    record.get("cure_funding_farm_funded_at", 0.0) or 0.0))
                 self.state.cure_funding_farm_retry_until = max(0.0, float(
                     record.get("cure_funding_farm_retry_until", 0.0) or 0.0))
                 if not all(math.isfinite(value) for value in (
                         self.state.cure_funding_farm_since,
                         self.state.cure_funding_farm_counted_at,
+                        self.state.cure_funding_farm_funded_at,
                         self.state.cure_funding_farm_retry_until)):
                     raise ValueError("not finite")
             except (TypeError, ValueError, OverflowError):
                 self.state.cure_funding_farm_since = 0.0
                 self.state.cure_funding_farm_deaths = 0
                 self.state.cure_funding_farm_counted_at = 0.0
-                self.state.cure_funding_farm_points = 0
+                self.state.cure_funding_farm_funded_at = 0.0
                 self.state.cure_funding_farm_retry_until = 0.0
             hazards = record.get("route_hazards", {})
             self.state.route_hazards = {
@@ -675,7 +676,7 @@ class AtrinikClient:
             self.state.cure_funding_farm_since = 0.0
             self.state.cure_funding_farm_deaths = 0
             self.state.cure_funding_farm_counted_at = 0.0
-            self.state.cure_funding_farm_points = 0
+            self.state.cure_funding_farm_funded_at = 0.0
             self.state.cure_funding_farm_retry_until = 0.0
             self.state.route_hazards = {}
             self.state.vendor_quotes = {}
@@ -1003,7 +1004,7 @@ class AtrinikClient:
         self._persist_character_memory()
 
     def set_cure_funding_farm(self, *, since: float, deaths: int = 0,
-                              counted_at: float = 0.0, points: int = 0,
+                              counted_at: float = 0.0, funded_at: float = 0.0,
                               retry_until: float = 0.0) -> None:
         """Persist the cure-funding farm's state (navigation.
         cure_funding_farm_state) across restarts: its decision records
@@ -1011,14 +1012,14 @@ class AtrinikClient:
         self.state.cure_funding_farm_since = max(0.0, float(since))
         self.state.cure_funding_farm_deaths = max(0, int(deaths))
         self.state.cure_funding_farm_counted_at = max(0.0, float(counted_at))
-        self.state.cure_funding_farm_points = max(0, int(points))
+        self.state.cure_funding_farm_funded_at = max(0.0, float(funded_at))
         self.state.cure_funding_farm_retry_until = max(0.0, float(retry_until))
         character = self.state.player_name or self.config.character
         if not character:
             return
         memory = self._runtime_memory.setdefault(character, {})
         for key in ("cure_funding_farm_since", "cure_funding_farm_deaths",
-                    "cure_funding_farm_counted_at", "cure_funding_farm_points",
+                    "cure_funding_farm_counted_at", "cure_funding_farm_funded_at",
                     "cure_funding_farm_retry_until"):
             memory[key] = getattr(self.state, key)
         self._persist_character_memory()

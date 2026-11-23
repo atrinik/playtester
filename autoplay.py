@@ -312,6 +312,8 @@ class AutoplayTask(BotTask):
         await client.set_combat(False)
         await client.clear_target()
         self._handover_since = None
+        # Recovery may end in a cure-funding farm: no stale no-spot wait.
+        self._awaiting_ranking_recorded = False
         await self._set_child(client, "recovery", RecoveryTask(
             self.graph, backoffs=self._circuit_backoffs))
 
