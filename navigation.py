@@ -63,9 +63,9 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     healing_outpaced, recent_hostile_attackers,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
-                    combat_allowed, UnpreparedHold, wand_known_empty)
-from .tasks import (RECALL_REQUIRED_LEVEL, heal_consumables,
-                    out_of_heals_and_recall, reads_scrolls)
+                    combat_allowed, out_of_heals_and_recall,
+                    UnpreparedHold, wand_known_empty)
+from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
 log = logging.getLogger(__name__)
 
 
@@ -4213,7 +4213,12 @@ class NavigateThenTask(BotTask):
         self._defending = False
         self._last_defense_action = 0.0
         self._retreat_attempt: tuple[str, int, int, float] | None = None
+        # Where she stood when the step in _retreat_attempt was sent.
+        self._retreat_from: tuple[str, int, int] | None = None
+        # Retreat squares a step to which never landed, and when each was
+        # learned; they expire (_prune_retreat_blocked).
         self._retreat_blocked: set[tuple[str, int, int]] = set()
+        self._retreat_blocked_at: dict[tuple[str, int, int], float] = {}
         self._trail: list[tuple[str, int, int]] = []
         self._combat_attempt: tuple[str, int, int, float] | None = None
         self._combat_blocked: set[tuple[str, int, int]] = set()
@@ -4238,6 +4243,14 @@ class NavigateThenTask(BotTask):
         self._recovering_after_combat = False
         self._transit_stall: tuple[
             int, str, int, int, int, int, int, float] | None = None
+        # A critical escape (_critical_escape_due) under way: it holds until
+        # she is back above the heal threshold or has a heal or recall again.
+        self._escaping = False
+
+    async def start(self, client: AtrinikClient) -> None:
+        await super().start(client)
+        # A new walk starts no escape of an earlier one.
+        self._escaping = False
 
     async def _bypass_pack_blocked_exit(
             self, client: AtrinikClient) -> bool:
@@ -4344,20 +4357,71 @@ class NavigateThenTask(BotTask):
             self._trail.append(position)
             del self._trail[:-200]
 
+    # A retreat square learned as blocked is tried again after this long:
+    # what blocked it was most often a creature, which moves on.
+    RETREAT_BLOCKED_SECONDS = 30.0
+
+    def _prune_retreat_blocked(self, path: str, now: float) -> None:
+        """Forget blocked retreat squares older than RETREAT_BLOCKED_SECONDS
+        or on another map than ``path``."""
+        for key in list(self._retreat_blocked):
+            learned = self._retreat_blocked_at.get(key)
+            if (key[0] != path or learned is None or
+                    now - learned >= self.RETREAT_BLOCKED_SECONDS):
+                self._retreat_blocked.discard(key)
+                self._retreat_blocked_at.pop(key, None)
+
+    def _retreat_step_pending(self, client: AtrinikClient,
+                              now: float) -> bool:
+        """Resolve the direct retreat step in flight, or wait for it.
+
+        It is done once she stands on its square. Once she stands anywhere
+        else than where she sent it (pushed, teleported, a map change) it is
+        forgotten. Still where she was after movement_ack_timeout, its square
+        is learned as blocked: static map analysis cannot see every runtime
+        wall or blocking object. Until then it is waited for (True), as the
+        farm's retreat_ack_pending does: replacing it sooner learned nothing.
+        Live (2026-11-22, the Old Outpost) Sera alternated two unlanding
+        steps every half second in a doorway for 12 s until she died.
+        """
+        m = client.state.map
+        self._prune_retreat_blocked(m.path, now)
+        if self._retreat_attempt is None:
+            return False
+        position = (m.path, m.world_x, m.world_y)
+        path, x, y, sent_at = self._retreat_attempt
+        if position == (path, x, y) or (
+                self._retreat_from is not None and
+                position != self._retreat_from):
+            self._retreat_attempt = None
+            return False
+        if now - sent_at >= movement_ack_timeout(client):
+            self._retreat_blocked.add((path, x, y))
+            self._retreat_blocked_at[(path, x, y)] = now
+            self._retreat_attempt = None
+            return False
+        return True
+
+    def _send_retreat_step(self, client: AtrinikClient, x: int, y: int,
+                           now: float) -> None:
+        m = client.state.map
+        self._retreat_attempt = (m.path, x, y, now)
+        self._retreat_from = (m.path, m.world_x, m.world_y)
+
     async def _retreat_step(self, client: AtrinikClient, threats,
-                            *, avoid_backtrack: bool = False) -> bool:
-        """Take one authored-walkable step away from the visible pack."""
+                            *, avoid_backtrack: bool = False,
+                            gain_only: bool = False) -> bool:
+        """Take one authored-walkable step away from the visible pack.
+
+        While a step is in flight it waits for it (_retreat_step_pending)
+        and answers True. ``gain_only`` takes only a step that increases
+        her separation from the nearest threat: an equal-distance step can
+        shuffle between two squares beside a creature that stands still.
+        """
         m = client.state.map
         now = time.monotonic()
-        if self._retreat_attempt is not None:
-            path, x, y, sent_at = self._retreat_attempt
-            if (m.path, m.world_x, m.world_y) == (path, x, y):
-                self._retreat_attempt = None
-            elif now - sent_at >= movement_ack_timeout(client):
-                # Learn from a direct move which made no progress; static map
-                # analysis cannot see every runtime wall or blocking object.
-                self._retreat_blocked.add((path, x, y))
-                self._retreat_attempt = None
+        if self._retreat_step_pending(client, now):
+            return True
 
         nodes = getattr(self.navigation.graph, "nodes", {})
         node = nodes.get(m.path)
@@ -4387,7 +4451,8 @@ class NavigateThenTask(BotTask):
             distances = [max(abs(point[0] - x), abs(point[1] - y))
                          for x, y in threat_world]
             minimum = min(distances)
-            if minimum < current_min:
+            if minimum < current_min or (
+                    gain_only and minimum == current_min):
                 continue
             backtrack = int(previous == (m.path, *point))
             trail_score = -backtrack if avoid_backtrack else backtrack
@@ -4418,13 +4483,36 @@ class NavigateThenTask(BotTask):
         # continue into walls after combat had ended.
         await client.move(direction)
         dx, dy = c.DIRECTION_DELTAS[direction]
-        self._retreat_attempt = (
-            m.path, m.world_x + dx, m.world_y + dy, now)
+        self._send_retreat_step(client, m.world_x + dx, m.world_y + dy, now)
         self.navigation._issued_goal = None
         self.navigation._issued_click = None
         self.navigation._last_progress = time.monotonic()
         self._last_defense_action = time.monotonic()
         return True
+
+    def _critical_escape_due(self, client: AtrinikClient, ratio: float,
+                             nearby) -> bool:
+        """Whether to run from ``nearby`` rather than fight or walk on.
+
+        Only while she has neither a usable heal nor a ready recall
+        (out_of_heals_and_recall), and an attacker is on her: she was hit in
+        the last 3 s or one is within 2 tiles. It starts at the safety's flee
+        threshold and, once started (``_escaping``), holds until she is above
+        its heal threshold, so she does not turn back into the fight at the
+        first point of health over it. Live (2026-11-22, v1.87.0) Sera,
+        starving with no heal and no recall on the mana-crystal-upgrade
+        errand, went on through the Old Outpost for three minutes from 69 %
+        and died among its troll guards.
+        """
+        if (ratio > self.safety.heal_below or
+                not out_of_heals_and_recall(client, self.safety)):
+            self._escaping = False
+            return False
+        if not self._escaping and ratio > self.safety.flee_below:
+            return False
+        return bool(nearby) and (
+            recent_hostile_contact(client, 3.0) or
+            any(threat[0] <= 2 for threat in nearby))
 
     async def _unseen_attacker_retreat(self, client: AtrinikClient) -> bool:
         """Back away along the trail from an attacker she cannot see.
@@ -4438,15 +4526,8 @@ class NavigateThenTask(BotTask):
         """
         m = client.state.map
         now = time.monotonic()
-        if self._retreat_attempt is not None:
-            path, x, y, sent_at = self._retreat_attempt
-            if (m.path, m.world_x, m.world_y) == (path, x, y):
-                self._retreat_attempt = None
-            elif now - sent_at < movement_ack_timeout(client):
-                return True
-            else:
-                self._retreat_blocked.add((path, x, y))
-                self._retreat_attempt = None
+        if self._retreat_step_pending(client, now):
+            return True
         node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
         if node is None or len(self._trail) < 2:
             return False
@@ -4468,7 +4549,7 @@ class NavigateThenTask(BotTask):
         self._defending = True
         await client.clear_actions()
         await client.move(direction)
-        self._retreat_attempt = (path, x, y, now)
+        self._send_retreat_step(client, x, y, now)
         self.navigation._issued_goal = None
         self.navigation._issued_click = None
         self.navigation._last_progress = now
@@ -4559,8 +4640,15 @@ class NavigateThenTask(BotTask):
                             node.walkable(*point, allow_locked=allow_locked)):
                         self.navigation._threat_blocked.add(point)
 
-    async def _defend_while_navigating(self, client: AtrinikClient) -> bool:
-        """Pause an encounter approach to heal or clear an aggroed pack."""
+    async def _defend_while_navigating(self, client: AtrinikClient,
+                                       *, own_walk: bool = False) -> bool:
+        """Pause an encounter approach to heal or clear an aggroed pack.
+
+        ``own_walk``: called from this task's own tick, the only caller for
+        which the critical escape (_critical_escape_due) runs. The farm
+        circuit's legs and holds and the recovery phase's defence call it
+        without.
+        """
         if not self.combat_approach or not combat_allowed(client):
             # In recall mode (combat_allowed) the farm task only retreats.
             return False
@@ -4733,6 +4821,27 @@ class NavigateThenTask(BotTask):
         safety_action_issued = (
             self.safety._last_heal != last_heal or
             self.safety._last_food != last_food)
+        escape_due = (own_walk and not isinstance(self.task, FarmTask) and
+                      not safety_action_issued and
+                      self._critical_escape_due(client, ratio, nearby))
+        if (escape_due and
+                await self._retreat_step(
+                    client, nearby, avoid_backtrack=True, gain_only=True)):
+            # Critical with no heal and no recall, and attacked: run, combat
+            # off, starving or not (only resting is futile then). With no
+            # step that gains distance the defence below stands.
+            if not self._escaping:
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("navigation-critical-escape",
+                             f"hp={hp}/{maxhp}: no usable heal, no ready "
+                             "recall")
+            self._escaping = True
+            self._defending = True
+            self._last_pull_target = 0
+            if getattr(client.state, "combat", False):
+                await client.set_combat(False)
+            return True
         player_level = int(client.state.stats.get("level", 0) or 0)
         resolver = getattr(self.navigation.graph, "monster_level", None)
         dangerous = []
@@ -4878,7 +4987,11 @@ class NavigateThenTask(BotTask):
             return True
         # Safety's own hold (low health, a heal she cannot cast) is futile
         # too when she is starving with nothing to eat: only food helps.
-        if ((not safe and not starving_without_food(client)) or
+        # A critical escape that found no step gaining distance skips it too:
+        # its equal-distance steps shuffled her beside a troll, combat off,
+        # and the cornered defence below fights instead.
+        if not escape_due and (
+                (not safe and not starving_without_food(client)) or
                 (overwhelmed and not hold_fire)):
             if safety_action_issued:
                 # FIRE/APPLY was just sent by SafetyPolicy. Clearing in this
@@ -4980,7 +5093,14 @@ class NavigateThenTask(BotTask):
             return True
         # Only close a short gap. Chasing a merely visible target across the
         # viewport was what repeatedly pulled the character into larger packs.
-        if nearest is not None and nearest[0] <= 4:
+        # After a critical escape she closes no gap until she has recovered;
+        # one within two tiles that she cannot step away from is fought.
+        if self._escaping and nearby:
+            # Cornered in an escape: the closest attacker, not a committed
+            # one farther off.
+            nearest = min(nearby, key=lambda value: value[0])
+        if (nearest is not None and nearest[0] <= 4 and
+                not (self._escaping and nearest[0] > 2)):
             self._defending = True
             if (isinstance(self.task, FarmTask) and
                     self.task._engaged_target is not None and
@@ -5143,7 +5263,7 @@ class NavigateThenTask(BotTask):
                     if await self._combat_step_toward(
                             client, view_x, view_y):
                         return
-        if await self._defend_while_navigating(client):
+        if await self._defend_while_navigating(client, own_walk=True):
             return
         if (isinstance(self.task, FarmTask) and
                 await self.task.loot_nearby(client)):
