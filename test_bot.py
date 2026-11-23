@@ -29809,13 +29809,12 @@ class OwnerWatchTests(unittest.TestCase):
         # No player's name is stored, the operator character's included.
         self.assertNotIn("zoey", repr(self.stored()).casefold())
         # The next pull, still in view, knows how long the owner rested.
-        # A name in a player colour (her party's green) is never stored as
-        # a kind, even an authored one.
+        # A hostile green or red creature keeps its kind outside PvP.
         self.put(client, 5, "orc", "00ff00", 9)
         self.animate(client, 5, c.ANIM_DAMAGE, 3)
         observe_owner(client)
         self.assertIsNotNone(client.owner_watch.engagement.gap_seconds)
-        self.assertEqual(client.owner_watch.engagement.kinds, [["unknown", "green"]])
+        self.assertEqual(client.owner_watch.engagement.kinds, [["orc", "green"]])
         # Her map changes: the engagement is dropped, and the rest after it
         # is not measured across maps.
         client.state.map.path = "/elsewhere"
@@ -29873,6 +29872,20 @@ class OwnerWatchTests(unittest.TestCase):
             observe_owner(client)
         self.assertEqual((client.owner_watch.shared_dropped, self.stored()), (3, []))
         client.state.map.level_tiles.pop(1)
+        # A green friend or, in PvP, a red name may be a player with an
+        # authored name: shared too.
+        for color, friend, pvp in (("00ff00", True, False), ("ff3030", False, True)):
+            client.world_graph.nodes["/t"].pvp = pvp
+            self.put(client, 1, "orc", color, 13)
+            client.state.map.tile(6, 8).objects[5].is_friend = friend
+            self.animate(client, 5, c.ANIM_DAMAGE, 12)
+            observe_owner(client)
+            self.assertTrue(client.owner_watch.engagement.shared, color)
+            with patch.object(owner_watch, "QUIET_SECONDS", -1.0):
+                observe_owner(client)
+        self.remove(client, 1)
+        client.world_graph.nodes["/t"].pvp = False
+        self.assertEqual((client.owner_watch.shared_dropped, self.stored()), (5, []))
         # Her own fight: nothing is watched.
         client.state.combat = True
         self.animate(client, 5, c.ANIM_DAMAGE, 12)

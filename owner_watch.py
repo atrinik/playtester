@@ -30,9 +30,11 @@ name, less the server's bracketed tags (" [AFK]", permission tags;
 ``generate_quick_name``), must equal the configured name and carry a
 player's name colour. Other players are only ever positions: while one is
 in her view (any distance, any level she sees) the engagement is shared
-and is dropped whole. A player she cannot see is not detected. No name is
-stored: a row belongs to her own character, and a monster kind is stored
-only when it is an authored creature name not in a player colour.
+and is dropped whole; so is a green friend or, in a PvP area, a red name,
+even with an authored name, since those colours are players' too. A
+player she cannot see is not detected. No name is stored: a row belongs
+to her own character, and a monster kind is stored only when it is an
+authored creature name.
 
 The recorder is fed once an engine step (``observe_owner``), reads only
 new tile animations and, while the operator character might be in view,
@@ -50,7 +52,7 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from . import constants as c
-from .observations import PLAYER_NAME_COLORS, is_player, plain
+from .observations import is_player, plain
 from .terrain import CELL_SIZE, Terrain, features
 
 log = logging.getLogger(__name__)
@@ -299,6 +301,22 @@ class OwnerWatchRecorder:
         return [engagement.row(ended)]
 
 
+GREEN, RED = "00ff00", "ff3030"
+
+
+def _maybe_player(obj: Any, names: Any, pvp: bool) -> bool:
+    """Whether a living object with an authored name could be a player
+    anyway. Green and red are player colours (her party, a PvP area) as
+    well as creature level bands (request.c). Outside PvP every player is
+    her friend (``is_friend_of``, types/monster.c), so a green name that
+    is her friend may be a party member; a red name may be a player only
+    in a PvP area (or on a map she does not know)."""
+    if names is None or plain(obj.name) not in names:
+        return False  # is_player decides
+    color = str(obj.name_color).casefold()
+    return (color == GREEN and bool(obj.is_friend)) or (color == RED and pvp)
+
+
 def owner_view(client: Any, recorder: OwnerWatchRecorder) -> OwnerView | None:
     """What this step shows the recorder, or None while she is not playing.
     Living objects are read only while the operator character might be in
@@ -329,12 +347,17 @@ def owner_view(client: Any, recorder: OwnerWatchRecorder) -> OwnerView | None:
     owner: list[tuple[int, int]] = []
     creatures: list[Creature] = []
     others: list[tuple[int, int]] = []
+    pvp = node is None or bool(getattr(node, "pvp", False))
     for depth, x, y, obj in m.depth_targets():
         square = (m.world_x + x - cx, m.world_y + y - cy)
         if depth != 0:
             # Another level: only whether a player is there matters.
-            if is_player(obj, own, content):
+            if is_player(obj, own, content) or _maybe_player(obj, names, pvp):
                 others.append(square)
+            continue
+        if _maybe_player(obj, names, pvp):
+            # Perhaps a player with an authored name: counted as one.
+            others.append(square)
             continue
         if is_player(obj, own, content):
             if map_player_name(obj.name) == operator:
@@ -345,12 +368,7 @@ def owner_view(client: Any, recorder: OwnerWatchRecorder) -> OwnerView | None:
         name = plain(obj.name)
         if obj.is_friend or not name or name == own:
             continue
-        # Green and red are player colours too (her party, PvP): a player
-        # with an authored name looks like a creature, so such a kind is
-        # never stored.
-        authored = names is not None and name in names and \
-            str(obj.name_color).casefold() not in PLAYER_NAME_COLORS
-        creatures.append(Creature(*square, name if authored else "",
+        creatures.append(Creature(*square, name if names is not None and name in names else "",
                                   LEVEL_BANDS.get(str(obj.name_color).casefold(), "")))
     if len(owner) != 1:
         return view

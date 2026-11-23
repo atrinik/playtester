@@ -1412,9 +1412,12 @@ owner's own square with no monster next to it is taken as ranged.
   whole: an archer or caster hits from afar. A player she cannot see (out
   of her view, in fog, invisible) is not detected; an engagement with one
   could count that player's hits as the owner's, but stores no trace of
-  who they were. A creature kind is never stored for a name in a player
-  colour (green or red are also her party's and PvP colours), so a player
-  with an authored name never lands in a row by name. Of the party packets the
+  who they were. Green and red are both player colours (her party, a PvP
+  area) and creature level bands, so an authored name in them counts as a
+  player too when it could be one: green when the server marks it her
+  friend (outside PvP every player is, `is_friend_of`), red on a PvP map
+  or one she does not know. A hostile green or red creature keeps its
+  kind. Of the party packets the
   client keeps only the operator character's vitals and discards every
   other member's name and numbers as they are parsed.
 - No name is stored. A row belongs to her own character. A monster kind
