@@ -1268,27 +1268,40 @@ Now (`SafetyPolicy.enforce`, `_heal`):
 - **Casts wait for the timer.** A healing spell, rod or wand (all sent as
   FIRE) first turns combat off, repeated on each tick of the wait since a
   hit turns it back on server side, and is sent only once her action
-  timer has run out (`effective_action_time`), as the emergency recall
-  does. The wait is at most one swing; it counts as the heal's tick
-  (`_heal_action`), so callers neither step nor stand in it, as on the
-  tick of a sent heal before. A rod or wand not yet readied is applied
-  once (it readies it; applying it again would unready it), then fired by
-  its tag. A potion or scroll is applied at once, with combat left as it
-  is.
+  timer has run out (`effective_action_time`), plus one server tick
+  (`HEAL_TIMER_MARGIN`, 125 ms) since the client's countdown can end
+  just before the server's, as the emergency recall does. The wait is at
+  most one swing. It is not the heal's tick (`_heal_action` marks only a
+  tick that sent a heal or readied its device): callers retreat and step
+  away meanwhile, which no timer gates, but while `heal_waiting` holds,
+  `low_health_retreat` makes no stand, cornered breakout or pursued cast,
+  since each would restart the timer. A rod or wand not yet readied is
+  applied once (it readies it; applying it again would unready it), then
+  fired by its tag. A potion or scroll is applied at once, with combat
+  left as it is.
 - **Combat comes back with the cast.** Right after the fire, combat goes
   back on as it was (with its force flag): the fire set her timer before
   the combat packet arrives, so the next swing follows the cast's
   recovery and she fights back between heals as before. A heal no longer
   needed or usable during the wait (her health over the threshold, no SP)
   also turns it back on; a recall waiting for the timer (`combat_allowed`)
-  keeps it off.
+  keeps it off. What to restore is kept on the client, so whichever safety
+  policy runs next restores it, the engine's idle one after a task ended
+  mid-wait among them.
 - **A heal counts once it lands** (`heal_landed`). The server answers
   every heal it runs, spell, potion, scroll, rod or wand, with "The spell
   heals you for N hp!" (or "The healing spell fails!", `cast_heal`); a
   potion or scroll is also counted when its quantity falls. Only then
   does the cooldown, and the out-healed heal gap, count from it
   (`_last_heal`). A refusal with a word (no mana, a blocked square, a
-  device that cannot fire now) waits out the cooldown. A cast unanswered
+  device that cannot fire now) waits out the cooldown.
+- **Refused devices give way.** A healing rod or wand that "whines for a
+  while, but nothing happens" or "is impossible to handle for you" is
+  backed off for `RECALL_DEVICE_RETRY_SECONDS` (20 s, the recall's own
+  back-off, shared with it), and a wand that "says poof" is known empty
+  (`wand_known_empty`). Neither counts as a usable heal meanwhile, so the
+  next heal in her pack, her spell among them, heals instead of the
+  combat-off wait repeating on a device that cannot fire. A cast unanswered
   for `heal_confirm_seconds` (1 s) was dropped: it is recorded as
   `heal-unconfirmed` and sent again at the next allowed moment, without
   waiting out a cooldown.

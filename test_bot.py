@@ -34003,20 +34003,29 @@ class HealsLandInMeleeTests(unittest.TestCase):
         self.assertIn(policy._last_heal, server.landed)
 
     def test_combat_comes_back_on_with_each_cast(self):
+        from .tasks import heal_waiting
         client, server = self.melee(self.spell())
         policy = SafetyPolicy()
         asyncio.run(policy.enforce(client))
-        # Timer running: combat off, nothing sent, the tick is the heal's.
+        # Timer running: combat off, nothing sent, and the tick is not the
+        # heal's: callers may step away meanwhile, but not fight.
         self.assertEqual(client.combat, [False])
         self.assertEqual(server.fires, [])
-        self.assertEqual(policy._heal_action, self.clock.now)
+        self.assertEqual(policy._heal_action, 0.0)
+        self.assertTrue(heal_waiting(client))
+        # One server tick of margin past the client's countdown.
         self.clock.now += self.WEAPON_SPEED
         asyncio.run(policy.enforce(client))
+        self.assertEqual(server.fires, [])
+        self.clock.now += 0.2
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(heal_waiting(client))
+        self.assertEqual(policy._heal_action, self.clock.now)
         self.assertEqual(len(server.landed), 1)
         # The fire went first, then combat came back on.
         self.assertEqual(client.combat, [False, True])
         self.assertTrue(server.combat)
-        self.assertIsNone(policy._heal_combat_force)
+        self.assertIsNone(getattr(client, "heal_combat_force", None))
 
     def test_no_combat_off_outlives_a_heal_no_longer_needed(self):
         client, server = self.melee(self.spell())
@@ -34048,7 +34057,7 @@ class HealsLandInMeleeTests(unittest.TestCase):
         client.recall_waiting_until = self.clock.now + 1.0
         asyncio.run(policy.enforce(client))
         self.assertFalse(server.combat)
-        self.assertIsNone(policy._heal_combat_force)
+        self.assertIsNone(getattr(client, "heal_combat_force", None))
 
     def test_a_dropped_cast_is_retried_and_not_counted(self):
         client, server = self.melee(self.spell())
@@ -34121,7 +34130,7 @@ class HealsLandInMeleeTests(unittest.TestCase):
         self.assertEqual(client.applied, [26])
         self.assertEqual(server.fires, [])
         self.assertFalse(server.combat)
-        self.clock.now += self.WEAPON_SPEED
+        self.clock.now += self.WEAPON_SPEED + 0.2
         asyncio.run(policy.enforce(client))
         self.assertEqual(len(server.landed), 1)
         self.assertTrue(server.combat)
@@ -34137,6 +34146,94 @@ class HealsLandInMeleeTests(unittest.TestCase):
         asyncio.run(task.safety.enforce(client))
         self.assertFalse(task.safety.heal_in_flight())
         self.assertLess(task.safety._last_heal, self.clock.now - 3.0)
+
+
+    def device_refused(self, item, answer):
+        client, server = self.melee(item, self.spell())
+
+        async def fire(direction, tag=0):
+            server.fires.append(self.clock.now)
+            client.state.add_message(0, "white", answer)
+
+        client.fire = fire
+        server.action_until = 0.0
+        client.state.stats["action_time"] = 0
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 1)
+        self.clock.now += 0.2
+        # The answer settles it; a refusal waits out the cooldown.
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 1)
+        return client, server, policy
+
+    def test_a_refusing_rod_backs_off_and_the_spell_heals(self):
+        rod = Item(26, item_type=c.TYPE_ROD, quality=100,
+                   name="rod of minor healing", flags=c.ITEM_APPLIED)
+        client, server, policy = self.device_refused(
+            rod, "The rod of minor healing whines for a while, but "
+                 "nothing happens.")
+        # Backed off like a recall device: not usable, so the spell after
+        # it in her inventory heals, at once.
+        self.assertGreater(client.recall_device_retry_at[26], self.clock.now)
+        self.assertEqual(policy._usable_heal(client).tag, 24)
+        self.clock.now += policy.heal_cooldown
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 2)
+        self.clock.now += 20.0
+        self.assertEqual(policy._usable_heal(client).tag, 26)
+
+    def test_an_empty_healing_wand_is_not_retried(self):
+        from .tasks import wand_known_empty
+        wand = Item(28, item_type=c.TYPE_WAND, quality=100,
+                    name="wand of minor healing", flags=c.ITEM_APPLIED)
+        client, server, policy = self.device_refused(
+            wand, "The wand of minor healing says poof.")
+        self.assertTrue(wand_known_empty(client, wand))
+        self.assertNotIn("heal-unconfirmed",
+                         [action for action, _ in client.decisions])
+        self.assertEqual(policy._usable_heal(client).tag, 24)
+
+    def test_she_steps_away_but_never_fights_while_a_heal_waits(self):
+        from .tasks import heal_waiting
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        self.assertTrue(heal_waiting(client))
+        task = FarmTask(zone="/test")
+        task._cornered_breakout_target = 100
+        task._stand_latch = True
+        client.state.map = MapState(path="/test", width=17, height=17)
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="orc warrior", target_id=100, target_hp=100)
+        moves = []
+
+        async def move(direction, run=False):
+            moves.append(direction)
+
+        async def target(x, y, target_id=0):
+            pass
+
+        client.move = move
+        client.move_to_view = move
+        client.target = target
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        client.state.map.world_x = client.state.map.world_y = 12
+        asyncio.run(task.low_health_retreat(client))
+        # A step, combat still off: no breakout swing.
+        self.assertTrue(moves)
+        self.assertNotIn(True, client.combat)
+
+    def test_another_policy_restores_a_heal_combat_off(self):
+        client, server = self.melee(self.spell())
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertFalse(server.combat)
+        # The task ended mid-wait; the engine's idle policy runs next.
+        client.state.stats["hp"] = 300
+        self.assertTrue(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertTrue(server.combat)
 
 
 if __name__ == "__main__":

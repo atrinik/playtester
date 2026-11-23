@@ -478,6 +478,21 @@ def recall_waiting(client: AtrinikClient) -> bool:
     return float(getattr(client, "recall_waiting_until", 0.0) or 0.0) > time.monotonic()
 
 
+def heal_waiting(client: AtrinikClient) -> bool:
+    """Whether a healing cast waits, combat off, for her action timer
+    (SafetyPolicy._heal). Like recall mode, nothing that swings or casts
+    runs meanwhile, since it would restart that timer (low_health_retreat
+    makes no stand, breakout or cast); steps and potions still run."""
+    return float(getattr(client, "heal_waiting_until", 0.0) or 0.0) > time.monotonic()
+
+
+def _set_client(client: AtrinikClient, name: str, value) -> None:
+    try:
+        setattr(client, name, value)
+    except AttributeError:
+        pass
+
+
 def out_of_heals_and_recall(client: AtrinikClient,
                             safety: "SafetyPolicy") -> bool:
     """Neither a usable heal (SafetyPolicy._usable_heal: an item, or a
@@ -763,6 +778,9 @@ def safe_food(item: Item) -> bool:
 # What the server answers a heal that it ran but that healed nothing
 # (cast_heal, server/spell_effect.c): the cast still landed.
 HEAL_FAILED_MESSAGE = re.compile(r"^The healing spell fails!", re.I)
+# One server tick (max_time, 125 ms): a healing cast waits this long past
+# the end of her action timer as the client counts it down.
+HEAL_TIMER_MARGIN = 0.125
 
 
 def heal_landed(client: AtrinikClient,
@@ -773,7 +791,8 @@ def heal_landed(client: AtrinikClient,
     or that it healed nothing, or once the potion or scroll it applied is
     used up (its quantity fell, or it is gone); the refusal's text when
     the server refused it with a word (no mana, a blocked square, a device
-    that cannot fire now); None while unanswered. A FIRE the server drops
+    that cannot fire now, an empty wand's "says poof"); None while
+    unanswered. A FIRE the server drops
     because her action timer still runs gets no answer at all.
     """
     _, position, tag, item_type, quantity = pending
@@ -786,7 +805,8 @@ def heal_landed(client: AtrinikClient,
         text = str(entry[-1]).strip()
         if HEALED_MESSAGE.match(text) or HEAL_FAILED_MESSAGE.match(text):
             return True
-        if RECALL_REFUSED_MESSAGE.match(text):
+        if (RECALL_REFUSED_MESSAGE.match(text) or
+                item_type == c.TYPE_WAND and WAND_EMPTY_MESSAGE.match(text)):
             return text
     if item_type not in (c.TYPE_SPELL, c.TYPE_ROD, c.TYPE_WAND):
         item = next((item for item in getattr(state, "inventory", ())
@@ -835,9 +855,9 @@ class SafetyPolicy:
     # When the last heal that landed was sent (heal_landed): the cooldown
     # and the out-healed heal gap count from it, never from a dropped cast.
     _last_heal: float = field(default=0.0, init=False, repr=False)
-    # When enforce last spent a tick on a heal: sent one, readied a heal
-    # device, or held, combat off, for her action timer. Callers compare
-    # it before and after enforce to tell whether the tick was a heal's.
+    # When enforce last spent a tick on a heal: sent one, or readied a heal
+    # device. Callers compare it before and after enforce to tell whether
+    # the tick was a heal's.
     _heal_action: float = field(default=0.0, init=False, repr=False)
     # The heal awaiting the server's answer: (sent at, message position,
     # item tag, item type, quantity before).
@@ -847,10 +867,6 @@ class SafetyPolicy:
     _heal_retry_at: float = field(default=0.0, init=False, repr=False)
     # A heal device being readied: (tag, applied at).
     _heal_readied: tuple[int, float] | None = field(
-        default=None, init=False, repr=False)
-    # The combat force flag to restore once the heal is sent, when a heal
-    # turned combat mode off for her action timer; None when it did not.
-    _heal_combat_force: bool | None = field(
         default=None, init=False, repr=False)
     _last_food: float = field(default=0.0, init=False, repr=False)
     _food_attempt_level: int = field(default=-1, init=False, repr=False)
@@ -900,10 +916,16 @@ class SafetyPolicy:
 
         No spell, scroll, rod or wand on a square where the server blocks
         spellcasting, nor while a recall waits for her action timer
-        (recall_waiting). Only a heal she can use (usable_heal_item).
+        (recall_waiting). Only a heal she can use (usable_heal_item); no
+        wand known empty, and no device that said it cannot fire now
+        within RECALL_DEVICE_RETRY_SECONDS (the recall's back-off, shared).
         """
+        retry = getattr(client, "recall_device_retry_at", None) or {}
+        now = time.monotonic()
         items = [item for item in client.state.inventory
-                 if usable_heal_item(client, item, self.healing_patterns)]
+                 if usable_heal_item(client, item, self.healing_patterns) and
+                 not wand_known_empty(client, item) and
+                 retry.get(item.tag, 0.0) <= now]
         if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items):
             other = [item for item in items
                      if item.item_type not in MAGIC_BLOCKED_TYPES]
@@ -953,6 +975,14 @@ class SafetyPolicy:
         self._heal_pending = None
         if answer is not None:
             self._heal_retry_at = now + self.heal_cooldown
+            if WAND_EMPTY_MESSAGE.match(answer):
+                wand_charges(client)[pending[2]] = 0
+            elif RECALL_DEVICE_REFUSED_MESSAGE.match(answer):
+                retry = getattr(client, "recall_device_retry_at", None)
+                if retry is None:
+                    retry = {}
+                    _set_client(client, "recall_device_retry_at", retry)
+                retry[pending[2]] = now + RECALL_DEVICE_RETRY_SECONDS
             return
         items = getattr(client.state, "items", None) or {}
         item = items.get(pending[2])
@@ -967,18 +997,22 @@ class SafetyPolicy:
         """Turn combat back on if a heal turned it off for her action timer.
 
         Never while a recall waits for that timer (combat_allowed), and
-        only once: between heals she fights back as before.
+        only once: between heals she fights back as before. The flag lives
+        on the client, so whichever safety policy runs next (a task's, or
+        the engine's idle one after the task ends) restores it.
         """
-        force = self._heal_combat_force
+        _set_client(client, "heal_waiting_until", 0.0)
+        force = getattr(client, "heal_combat_force", None)
         if force is None:
             return
-        self._heal_combat_force = None
+        _set_client(client, "heal_combat_force", None)
         if combat_allowed(client):
             await client.set_combat(True, force=force)
 
     async def _heal(self, client: AtrinikClient, heal: Item | None = None,
                     now: float | None = None) -> bool:
-        """Use ``heal`` (by default her usable heal); True once it is sent.
+        """Use ``heal`` (by default her usable heal); True once it is sent
+        (or its device readied): only then is the tick the heal's.
 
         A spell, rod or wand goes through FIRE, which the server drops
         without a word while her action timer runs (socket_command_fire's
@@ -1003,16 +1037,21 @@ class SafetyPolicy:
                 await client.clear_actions()
                 await client.apply(heal.tag)
                 self._heal_readied = (heal.tag, now)
+                return True
             return False
         if device or heal.item_type == c.TYPE_SPELL:
             if getattr(client.state, "combat", False):
                 # A hit turns combat mode back on (attack_player_retarget),
                 # so this repeats on each tick of the wait.
-                if self._heal_combat_force is None:
-                    self._heal_combat_force = bool(
-                        getattr(client.state, "combat_force", False))
+                if getattr(client, "heal_combat_force", None) is None:
+                    _set_client(client, "heal_combat_force", bool(
+                        getattr(client.state, "combat_force", False)))
                 await client.set_combat(False)
-            if effective_action_time(client, now):
+            # One server tick of margin on a running timer: the client's
+            # countdown can run out just before the server's.
+            if (float(client.state.stats.get("action_time", 0) or 0) > 0 and
+                    effective_action_time(client, now - HEAL_TIMER_MARGIN)):
+                _set_client(client, "heal_waiting_until", now + 1.0)
                 return False
         # Cancel navigation before firing, so Clear Actions cannot cancel
         # the heal which follows it in the same tick, and a queued
@@ -1050,10 +1089,12 @@ class SafetyPolicy:
         if heal is not None:
             if (self._heal_pending is None and now >= self._heal_retry_at and
                     now - self._last_heal >= self.heal_cooldown):
-                # Sent, readying its device, or holding, combat off, for
-                # her action timer: this tick is the heal's either way.
-                await self._heal(client, heal, now)
-                self._heal_action = now
+                # Sent, or its device readied: this tick is the heal's.
+                # Holding, combat off, for her action timer is not: callers
+                # step away meanwhile (heal_waiting keeps them from
+                # fighting).
+                if await self._heal(client, heal, now):
+                    self._heal_action = now
             else:
                 # Between heals she fights back as before: combat off
                 # without a real retreat left surrounded characters
@@ -4833,7 +4874,7 @@ class FarmTask(BotTask):
                 any(name in (
                     map_object_semantic(client, obj)
                 ).casefold() for name in proven_attackers))]
-        fight = combat_allowed(client)
+        fight = combat_allowed(client) and not heal_waiting(client)
         breakout = None if gain_only else next((
             (x, y, obj) for x, y, obj in visible_threats
             if fight and obj.target_id == self._cornered_breakout_target and
@@ -5037,7 +5078,7 @@ class FarmTask(BotTask):
         ] if (spell is not None and ratio > cast_floor and
               self.offensive_spell_affordable(client, spell)) else []
         caster_stand = bool(castable)
-        if (caster_stand and not (gain_only or out_healed) and
+        if (caster_stand and fight and not (gain_only or out_healed) and
                 self._pursued_retreats >= self.PURSUIT_CAST_STEPS and
                 self.spell_ready(client, spell)):
             (x, y, obj), cast_direction = min(castable, key=lambda item: (
