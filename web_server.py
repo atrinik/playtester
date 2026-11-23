@@ -1198,6 +1198,13 @@ class WebControlServer:
             # Counts only: no attacker's or other player's name is stored.
             await self._reply(writer, 200, _json_bytes(self._terrain(parse_qs(query))))
             return
+        if method == "GET" and path == "/api/owner-watch":
+            # The operator character's fights she watched (owner_watch.py),
+            # read-only: the newest ?limit=N (up to 200). Counts and
+            # authored monster kinds only; no player's name, the operator
+            # character's included, is stored or sent.
+            await self._reply(writer, 200, _json_bytes(self._owner_watch(parse_qs(query))))
+            return
         if method == "GET" and path == "/api/feedback":
             # Her feedback queue (feedback.py), read-only:
             # ?kind=KIND&repo=OWNER/NAME&status=STATUS&limit=N. Drafts hold
@@ -1357,6 +1364,37 @@ class WebControlServer:
         return {"fights": fights, "total": total, "rates": terrain.rates(buckets),
                 "busy": busy,
                 "terrain_known": getattr(self.client, "world_graph", None) is not None}
+
+    def _owner_watch(self, params: dict[str, list[str]]) -> dict[str, Any]:
+        """The Watching panel: whether the flag is on, whether the operator
+        character is in view now, and the recent watched engagements."""
+        config = self.client.config
+        recorder = getattr(self.client, "owner_watch", None)
+        character = getattr(self.client, "_memory_character", "")
+        rows: list[dict[str, Any]] = []
+        total, busy = 0, False
+        try:
+            limit = max(1, min(200, int((params.get("limit") or ["20"])[0])))
+        except ValueError:
+            limit = 20
+        if character:
+            memory = self.client._memory_store()
+            try:
+                rows = memory.owner_observations(character, limit=limit,
+                                                 timeout=KNOWLEDGE_READ_TIMEOUT)
+                total = memory.owner_observation_count(character,
+                                                       timeout=KNOWLEDGE_READ_TIMEOUT)
+            except sqlite3.OperationalError:
+                rows, busy = [], True
+        seen_at = getattr(recorder, "seen_at", None)
+        return {
+            "enabled": bool(getattr(config, "watch_owner", False)),
+            "operator_configured": bool(str(getattr(config, "operator_character", "")).strip()),
+            "in_view": seen_at is not None and time.time() - seen_at < 5.0,
+            "engaged": bool(getattr(recorder, "active", False)),
+            "shared_dropped": int(getattr(recorder, "shared_dropped", 0)),
+            "observations": rows, "total": total, "busy": busy,
+        }
 
     def _route_block_write(self, data: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Add or remove one owner block; (HTTP status, reply)."""

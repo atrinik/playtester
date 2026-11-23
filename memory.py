@@ -48,6 +48,18 @@ FIGHT_COLUMNS = ("id", "started", "ended", "map", "x", "y", "cell", "feature",
                  "reach", "peak_attackers", "ranged_attackers", "ranged_covered",
                  "hostiles_in_view", "players_in_view", "kills", "damage_taken",
                  "seconds", "outcome")
+# The owner's fights she watched (4.14, phase W1, owner_watch.py): at most
+# this many rows a character and none older than the retention, checked
+# every OWNER_OBSERVATION_PRUNE_EVERY new rows; best effort like fights.
+OWNER_OBSERVATION_ROW_LIMIT = 5_000
+OWNER_OBSERVATION_RETENTION_SECONDS = 90 * 24 * 3600
+OWNER_OBSERVATION_PRUNE_EVERY = 50
+OWNER_OBSERVATION_SAVE_TIMEOUT = OBSERVATION_SAVE_TIMEOUT
+OWNER_OBSERVATION_COLUMNS = (
+    "id", "started", "ended", "map", "x", "y", "cell", "feature", "reach",
+    "kinds_json", "peak_adjacent", "hits_dealt", "damage_dealt", "hits_taken",
+    "damage_taken", "ranged_hits", "stepped_after_ranged", "hp_before", "hp_low",
+    "hp_after", "gap_seconds", "kills", "seconds")
 # Route events (docs/ROUTING.md 4.4, route_events.py): the longest a write
 # waits for a locked database (seconds).
 ROUTE_EVENT_SAVE_TIMEOUT = 0.25
@@ -254,6 +266,38 @@ class BotMemory:
             db.execute(
                 """CREATE INDEX IF NOT EXISTS fight_positions_by_age
                    ON fight_positions (server, account, character, ended)""")
+            # The operator character's engagements she watched
+            # (owner_watch.py): counts and authored monster kinds only; the
+            # character column is hers, and no player's name is stored.
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS owner_observations (
+                       id INTEGER PRIMARY KEY,
+                       server TEXT NOT NULL,
+                       account TEXT NOT NULL,
+                       character TEXT NOT NULL,
+                       started REAL NOT NULL,
+                       ended REAL NOT NULL,
+                       map TEXT NOT NULL,
+                       x INTEGER, y INTEGER,
+                       cell TEXT NOT NULL,
+                       feature TEXT NOT NULL,
+                       reach INTEGER,
+                       kinds_json TEXT NOT NULL DEFAULT '[]',
+                       peak_adjacent INTEGER NOT NULL,
+                       hits_dealt INTEGER NOT NULL,
+                       damage_dealt INTEGER NOT NULL,
+                       hits_taken INTEGER NOT NULL,
+                       damage_taken INTEGER NOT NULL,
+                       ranged_hits INTEGER NOT NULL,
+                       stepped_after_ranged INTEGER NOT NULL,
+                       hp_before INTEGER, hp_low INTEGER, hp_after INTEGER,
+                       gap_seconds REAL,
+                       kills INTEGER NOT NULL,
+                       seconds REAL NOT NULL
+                   )""")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS owner_observations_by_age
+                   ON owner_observations (server, account, character, ended)""")
             # The owner's route and map blocks (docs/ROUTING.md 4.7): each a
             # transit wall until ``until`` (wall clock), set and removed only
             # from the loopback dashboard (route_blocks.py).
@@ -403,6 +447,7 @@ class BotMemory:
         self._observation_inserts = 0
         self._fact_inserts = 0
         self._fight_inserts = 0
+        self._owner_observation_inserts = 0
 
     @classmethod
     def open_read_only(cls, path: Path, *, server: str, account: str) -> "BotMemory":
@@ -853,6 +898,65 @@ class BotMemory:
                    WHERE server = ? AND account = ? AND character = ?""",
                 (self.server, self.account, character.casefold())).fetchone()
         return int(count)
+    def record_owner_observation(self, character: str, row: dict[str, Any], *,
+                                 timeout: float = OWNER_OBSERVATION_SAVE_TIMEOUT) -> int:
+        """Store one watched engagement (``owner_watch.Engagement.row()``)
+        under her own ``character``; returns its id."""
+        folded = character.casefold()
+        values = tuple(row[column] for column in OWNER_OBSERVATION_COLUMNS[1:])
+        with self._connect(timeout) as db:
+            cursor = db.execute(
+                f"""INSERT INTO owner_observations
+                        (server, account, character,
+                         {", ".join(OWNER_OBSERVATION_COLUMNS[1:])})
+                    VALUES (?, ?, ?, {", ".join("?" * (len(OWNER_OBSERVATION_COLUMNS) - 1))})""",
+                (self.server, self.account, folded, *values))
+            self._owner_observation_inserts += 1
+            if self._owner_observation_inserts % OWNER_OBSERVATION_PRUNE_EVERY == 0:
+                db.execute(
+                    """DELETE FROM owner_observations
+                       WHERE server = ? AND account = ? AND character = ? AND ended < ?""",
+                    (self.server, self.account, folded,
+                     float(row["ended"]) - OWNER_OBSERVATION_RETENTION_SECONDS))
+                db.execute(
+                    """DELETE FROM owner_observations WHERE id IN (
+                           SELECT id FROM owner_observations
+                           WHERE server = ? AND account = ? AND character = ?
+                           ORDER BY ended DESC, id DESC LIMIT -1 OFFSET ?)""",
+                    (self.server, self.account, folded, OWNER_OBSERVATION_ROW_LIMIT))
+        return int(cursor.lastrowid)
+
+    def owner_observations(self, character: str, *, limit: int = 50,
+                           timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Her most recent watched engagements, newest first; ``kinds`` is
+        the decoded list of [kind, level band]."""
+        with self._connect(timeout) as db:
+            rows = db.execute(
+                f"""SELECT {", ".join(OWNER_OBSERVATION_COLUMNS)} FROM owner_observations
+                    WHERE server = ? AND account = ? AND character = ?
+                    ORDER BY ended DESC, id DESC LIMIT ?""",
+                (self.server, self.account, character.casefold(),
+                 max(1, min(int(limit), OWNER_OBSERVATION_ROW_LIMIT)))).fetchall()
+        result = []
+        for values in rows:
+            row = dict(zip(OWNER_OBSERVATION_COLUMNS, values))
+            try:
+                kinds = json.loads(row.pop("kinds_json") or "[]")
+            except ValueError:
+                kinds = []
+            row["kinds"] = kinds if isinstance(kinds, list) else []
+            result.append(row)
+        return result
+
+    def owner_observation_count(self, character: str, *, timeout: float = 10.0) -> int:
+        """Stored watched engagements."""
+        with self._connect(timeout) as db:
+            (count,) = db.execute(
+                """SELECT count(*) FROM owner_observations
+                   WHERE server = ? AND account = ? AND character = ?""",
+                (self.server, self.account, character.casefold())).fetchone()
+        return int(count)
+
     def record_feedback(self, character: str, *, fingerprint: str, repo: str, kind: str,
                         subject: str, at: float, occurrence: str,
                         build: Callable[..., dict[str, Any]],

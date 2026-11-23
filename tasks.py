@@ -28,6 +28,7 @@ from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      update_bank_balance)
 from .equipment import gear_examine_pending, gear_examiner
 from . import route_shadow, terrain
+from . import owner_watch
 from .observations import is_player, plain
 from .model import STARTER_APARTMENT, Item, MapObject
 from .pathfinding import grid_search
@@ -8451,6 +8452,8 @@ class TaskEngine:
         while self.running:
             # Her fight records (terrain.py): read-only, never raises.
             observe_fight(self.client)
+            # The owner's fights, behind watch_owner (owner_watch.py): the same.
+            owner_watch.observe_owner(self.client)
             try:
                 await self._step()
             except ConnectionError as exc:

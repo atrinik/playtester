@@ -929,6 +929,22 @@ exits. The design for alternative routes, unlocks such as keys, quests and
 NPC voyages, and costs learned from her own experience is in
 [docs/ROUTING.md](docs/ROUTING.md).
 
+She can watch the owner play, behind the `watch_owner` flag
+(`--watch-owner` or `ATRINIK_BOT_WATCH_OWNER=1`), off by default; with it
+off nothing is read or recorded. With it on, and only while the operator
+character (`ATRINIK_BOT_OPERATOR_CHARACTER`, exact name) is on her map and
+she is not fighting herself, each of its fights becomes one
+`owner_observations` row in her memory: where it stood and the square's
+terrain feature, the monster kinds it hit in order, the most monsters next
+to it at once, the damage numbers on its square and its targets, whether
+it stepped after a ranged hit, and its health before and after (only while
+it shares her party). A fight with another player within 6 squares is
+dropped whole, and no player's name is stored. The Farming tab's
+**Watching the owner** section lists them, read-only; nothing she does
+depends on them yet. The design, including the later following and rule
+phases, is section 4.14 of
+[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md).
+
 ## Dependency and content boundaries
 
 The playtester source is independent of its external protocol, pathfinding,
