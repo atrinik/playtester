@@ -1821,6 +1821,9 @@ class FarmTask(BotTask):
     # none sent for this long, lets the heal go first.
     OUT_HEALED_ACK_WAIT_SECONDS = 0.75
     OUT_HEALED_HEAL_GAP_SECONDS = 2.5
+    # The disengage keeps every retreat from standing only while she has a
+    # usable heal and found a gaining step this recently (out_healed_running).
+    OUT_HEALED_GAIN_SECONDS = 2.0
     # Casts from one square that did nothing before that line is futile,
     # and seconds without any shot before a target is set aside.
     FUTILE_CAST_LIMIT = 2
@@ -1967,8 +1970,10 @@ class FarmTask(BotTask):
         self._wand_examined: set[int] = set()
         # Until when healing that cannot keep up makes her disengage.
         self._outpaced_until = 0.0
-        # Until when heals losing the fight keep her disengaging (monotonic).
+        # Until when heals losing the fight keep her disengaging, and when a
+        # gain-only retreat last found a step that gains (monotonic).
         self._out_healed_until = 0.0
+        self._out_healed_gain_at = 0.0
         # The finisher's last cast (line key, wall-clock time), casts that
         # did nothing per line, lines given up on, and since when the
         # current target has had no shot (see _observe_cast_effect and
@@ -4620,6 +4625,15 @@ class FarmTask(BotTask):
         return not any(self._kind_key(name) in names
                        for name in recent_hostile_attackers(client))
 
+    def out_healed_running(self, client: AtrinikClient, now: float) -> bool:
+        """Whether she is running from losing heals (out_healed): the
+        disengage holds, she has a usable heal, and a gain-only retreat
+        found a gaining step within OUT_HEALED_GAIN_SECONDS. Without a heal
+        or a way out, standing is her defence, as before."""
+        return (self._out_healed_until > now and
+                now - self._out_healed_gain_at <= self.OUT_HEALED_GAIN_SECONDS
+                and self.safety._usable_heal(client) is not None)
+
     async def low_health_retreat(self, client: AtrinikClient,
                                  gain_only: bool = False) -> bool:
         """Run one tile away from the visible pack, learning blocked steps.
@@ -4632,9 +4646,10 @@ class FarmTask(BotTask):
         decide. It also returns False, letting a heal go first, while a
         step has gone unanswered for OUT_HEALED_ACK_WAIT_SECONDS, and when
         a heal is ready with none sent for OUT_HEALED_HEAL_GAP_SECONDS.
-        Gain-only steps leave the pursuit count alone. While heals lose
-        (out_healed), no call makes a pursued stand or cast, and a stand
-        already latched ends.
+        Gain-only steps leave the pursuit count alone. While she is running
+        from losing heals (out_healed_running), no call makes a pursued
+        stand or cast, and a stand already latched ends; otherwise the
+        ordinary retreat, stands among them, is unchanged.
         """
         m = client.state.map
         now = time.monotonic()
@@ -4659,7 +4674,7 @@ class FarmTask(BotTask):
             max(abs(x - cx), abs(y - cy)) <= 1), None)
         ratio = (int(client.state.stats.get("hp", 0) or 0) /
                  max(1, int(client.state.stats.get("maxhp", 1) or 1)))
-        out_healed = self._out_healed_until > now
+        out_healed = self.out_healed_running(client, now)
         if (breakout is not None and self._stand_latch and
                 (ratio <= self.STAND_HEALTH_FLOOR or out_healed)):
             # A stand chosen over a failing retreat ends at the critical
@@ -4777,6 +4792,7 @@ class FarmTask(BotTask):
             choices = [choice for choice in choices if choice[1] > nearest]
             if not choices:
                 return False
+            self._out_healed_gain_at = now
             # Running ends a stand; combat goes off with the step below.
             self._cornered_breakout_target = 0
             self._stand_latch = False
@@ -4850,7 +4866,7 @@ class FarmTask(BotTask):
         ] if (spell is not None and ratio > cast_floor and
               self.offensive_spell_affordable(client, spell)) else []
         caster_stand = bool(castable)
-        if (caster_stand and not out_healed and
+        if (caster_stand and not (gain_only or out_healed) and
                 self._pursued_retreats >= self.PURSUIT_CAST_STEPS and
                 self.spell_ready(client, spell)):
             (x, y, obj), cast_direction = min(castable, key=lambda item: (
@@ -4870,7 +4886,7 @@ class FarmTask(BotTask):
                              f"hp={ratio:.0%}")
                 return True
         if (stand_candidates and not caster_stand and fight and
-                not out_healed and
+                not (gain_only or out_healed) and
                 self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
                 ratio > self.STAND_HEALTH_FLOOR):
             x, y, obj = min(stand_candidates, key=lambda entry: (
@@ -4921,7 +4937,7 @@ class FarmTask(BotTask):
             hp / maxhp <= self.safety.flee_below or
             (next_heal > 0 and sp < next_heal) or
             self._outpaced_until > now or
-            out_healed
+            gain_only or out_healed
         )
         if emergency_disengage and recorder is not None:
             recorder(
@@ -5791,7 +5807,8 @@ class FarmTask(BotTask):
             ratio > dynamic_flee)
         finish_before_healing = self.should_finish_before_healing(
             client, initial_threats, nearby_count, ratio)
-        if (out_healed and not finish_before_healing and any(
+        if (out_healed and not finish_before_healing and
+                self.safety._usable_heal(client) is not None and any(
                 entry[0] <= 2 and active_threat(entry)
                 for entry in initial_threats)):
             # Heals are losing (out_healed): with an attacker within reach,

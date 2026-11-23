@@ -10510,6 +10510,8 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
                                  (13, 12): 1, (13, 13): 1}
         task.safety._last_heal = time.monotonic() - 0.5
+        # Her last gain-only step, half a second ago, still counts.
+        task._out_healed_gain_at = time.monotonic() - 0.5
         task._pursued_retreats = 5
         task._pursuit_ids = {100, 101}
         task._pursuit_last_at = time.monotonic()
@@ -10519,6 +10521,30 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertNotIn("pursued-stand", actions)
         self.assertNotIn("pursued-cast", actions)
         self.assertNotIn(True, client.combat)
+
+    def _out_healed_without_sp(self, corridor):
+        client = self._combat_client()
+        task = self._out_healed_fight(client, hp=150, flee=0.55, heal=0.70)
+        client.state.stats["sp"] = 0
+        if corridor:
+            # The only steps stay beside the treant.
+            task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
+                                     (13, 12): 1}
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100}
+        task._pursuit_last_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("out-healed-disengage", actions)
+        # No heal to buy time with: the ordinary retreat's stand defends her.
+        self.assertIn("pursued-stand", actions)
+        self.assertIn(True, client.combat)
+
+    def test_out_healed_without_sp_still_stands_in_the_open(self):
+        self._out_healed_without_sp(corridor=False)
+
+    def test_out_healed_without_sp_still_stands_in_a_corridor(self):
+        self._out_healed_without_sp(corridor=True)
 
     def test_out_of_league_matches_the_exact_kind(self):
         client = self._combat_client()

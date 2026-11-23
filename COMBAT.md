@@ -1068,10 +1068,15 @@ Now, on the farm map:
   unanswered for `OUT_HEALED_ACK_WAIT_SECONDS` (0.75 s), or a usable heal
   with none sent for `OUT_HEALED_HEAL_GAP_SECONDS` (2.5 s), lets that
   tick's heal go first, whatever the attacker's distance.
-- **No stand while it holds.** Every retreat on the farm map, not only
-  the gain-only one, makes no pursued stand or pursued cast while the
-  disengage holds, and a stand already latched ends (combat off). Combat
-  stays off on every retreat step meanwhile (`emergency-disengage`).
+- **No stand while she runs.** The gain-only retreat runs only while she
+  has a usable heal (an item, or the SP for the spell). While the
+  disengage holds, she has a usable heal and a gain-only retreat found a
+  gaining step within `OUT_HEALED_GAIN_SECONDS` (2 s;
+  `out_healed_running`), every retreat on the farm map makes no pursued
+  stand or pursued cast, a stand already latched ends, and combat stays
+  off on each retreat step (`emergency-disengage`). Otherwise (no heal,
+  or no way out) the ordinary retreat, its pursued stand and cornered
+  breakout among them, defends her as before.
 - **Out of her league** (`OUT_OF_LEAGUE_SECONDS`, 10 minutes, kept on the
   client so a rebuilt farm task still knows, and cleared for another
   character): those kinds are neither pulled nor engaged, even within the
@@ -1080,7 +1085,9 @@ Now, on the farm map:
   kind is hitting her (hostile contact, its name in the hits) is fought.
   A kind matches exactly, by name or visual name, ignoring case,
   underscores and word order: a mark for "rat" is not one for "pirate"
-  or "giant rat".
+  or "giant rat". Hits are matched by the name in their message: a
+  ranged or spell hit may name its missile instead, so a marked ranged
+  caster may never count as hitting her and is then not fought.
 
 Accepted limits:
 
