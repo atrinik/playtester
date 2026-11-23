@@ -272,6 +272,12 @@ class GameState:
     cure_funding_farm_counted_at: float = 0.0
     cure_funding_farm_funded_at: float = 0.0
     cure_funding_farm_retry_until: float = 0.0
+    # In memory only: when the cure-funding farm last went home because a
+    # strict town trip could not start from its spot
+    # (navigation.send_cure_funding_farm_home), and whether recovery has
+    # resumed it since.
+    cure_funding_farm_home_at: float = 0.0
+    cure_funding_farm_home_resumed: bool = False
     # Maps where a route death took combat damage, by wall-clock time until
     # which navigation avoids them.
     route_hazards: dict[str, float] = field(default_factory=dict)

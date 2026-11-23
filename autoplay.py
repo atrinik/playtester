@@ -12,6 +12,7 @@ from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
 from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          NavigateThenTask, RecoveryTask,
                          cure_funding_farm, cure_funding_farm_alerts,
+                         cure_funding_farm_home,
                          has_working_recall, heal_restock_alerts,
                          recall_alerts, settle_cure_funding_farm,
                          WorldGraph, analyzer_farm_selection,
@@ -194,7 +195,7 @@ class AutoplayTask(BotTask):
         # Nor while she farms to fund her cure (cure_funding_farm): the
         # cure comes first, and a detour is no place for a depleted
         # character.
-        if cure_funding_farm(client):
+        if cure_funding_farm(client) or cure_funding_farm_home(client):
             return False
         if self._needs_mana_crystal_start(client):
             await self._start_mana_crystal_detour(client)

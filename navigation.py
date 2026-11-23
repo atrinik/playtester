@@ -5816,7 +5816,9 @@ def farming_unsafe_reason(client: AtrinikClient) -> str:
     state = client.state
     if depleted_for_temple(state) and not cure_funding_farm(client):
         return (f"depletion {int(state.depletion_points)} at or above "
-                f"{FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD}")
+                f"{FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD}" +
+                ("; home for errands from the cure-funding farm"
+                 if cure_funding_farm_home(client) else ""))
     return ""
 
 
@@ -5923,6 +5925,63 @@ def _end_cure_funding_farm(client: AtrinikClient, **changes) -> None:
     _set_cure_funding_farm(client, **{
         "since": 0.0, "deaths": 0, "counted_at": 0.0, "funded_at": 0.0,
         **changes})
+    client.state.cure_funding_farm_home_at = 0.0
+    client.state.cure_funding_farm_home_resumed = False
+
+
+# A strict town trip (bank, junk sale, identify-all, the apartment chest, a
+# heal restock) that cannot start from the cure-funding farm's spot sends
+# her home: autoplay hands over to RecoveryTask, which walks her to her
+# savebed, runs the funding errands from there and resumes the same farm,
+# deaths kept. Live, on 2026-11-23, every town service failed strictly from
+# every eastern candidate (content pack-hazard maps on every way back), so
+# from the farm she could never sell, bank or restock heals. A break lasts
+# at most this long, and another starts no sooner than this after one
+# began: no tight loop between the farm and home.
+CURE_FUNDING_FARM_HOME_SECONDS = 1800.0
+CURE_FUNDING_FARM_HOME = "cure-funding-farm-home"
+CURE_FUNDING_FARM_RESUMED = "cure-funding-farm-resumed"
+
+
+def cure_funding_farm_home(client: AtrinikClient) -> bool:
+    """Whether a running cure-funding farm is on its break home
+    (send_cure_funding_farm_home); cure_funding_farm is False meanwhile."""
+    state = client.state
+    at = float(getattr(state, "cure_funding_farm_home_at", 0.0) or 0.0)
+    return bool(at and float(getattr(state, "cure_funding_farm_since", 0.0)
+                             or 0.0) > 0.0 and
+                not getattr(state, "cure_funding_farm_home_resumed", False) and
+                time.time() - at < CURE_FUNDING_FARM_HOME_SECONDS)
+
+
+def send_cure_funding_farm_home(client: AtrinikClient, detail: str) -> bool:
+    """Start a break home for the cure-funding farm, unless none runs or
+    one began less than CURE_FUNDING_FARM_HOME_SECONDS ago; recorded."""
+    if not cure_funding_farm(client):
+        return False
+    state = client.state
+    at = float(getattr(state, "cure_funding_farm_home_at", 0.0) or 0.0)
+    if at and time.time() - at < CURE_FUNDING_FARM_HOME_SECONDS:
+        return False
+    state.cure_funding_farm_home_at = time.time()
+    state.cure_funding_farm_home_resumed = False
+    log.warning("cure-funding farm: home for errands: %s", detail)
+    recorder = getattr(client, "record_action", None)
+    if recorder is not None:
+        recorder(CURE_FUNDING_FARM_HOME, detail)
+    return True
+
+
+def resume_cure_funding_farm(client: AtrinikClient) -> bool:
+    """End the break home (RecoveryTask, at her savebed with no errand
+    left); recorded. False when none is on."""
+    if not cure_funding_farm_home(client):
+        return False
+    client.state.cure_funding_farm_home_resumed = True
+    recorder = getattr(client, "record_action", None)
+    if recorder is not None:
+        recorder(CURE_FUNDING_FARM_RESUMED, "errands done at her savebed")
+    return True
 
 
 def start_cure_funding_farm(client: AtrinikClient, detail: str) -> None:
@@ -5954,7 +6013,8 @@ def cure_funding_farm(client: AtrinikClient) -> bool:
     return (funding.state == "farming" and
             funding.deaths < CURE_FUNDING_FARM_DEATHS and
             not cure_affordable(client) and
-            not _funded_bank_unknown(client))
+            not _funded_bank_unknown(client) and
+            not cure_funding_farm_home(client))
 
 
 def _funded_bank_unknown(client: AtrinikClient) -> bool:
@@ -6537,14 +6597,19 @@ def _analyzer_farm_choice(
         # 2026-11-23, with the safety view 250 deep, a replay walked down
         # to a 118.3 spot with a risky approach; the circuits that killed
         # and out-damaged her rated 103.5 and 125.8. Single failures only
-        # order the rest (recent_kit_failures).
+        # order the rest (recent_kit_failures). A hazardous spot caps
+        # whether or not it is quarantined or behind a route death: the
+        # spot her kit just failed on still says what is too much.
         stats = getattr(client.state, "stats", {}) or {}
         profile = current_combat_kit(client)
         health = float(getattr(profile, "max_health", 0) or
                         stats.get("maxhp", 0) or 0)
-        cap = min([FUNDING_FARM_DANGER_SHARE * health if health > 0
-                   else float("inf")] +
-                  [_spot_danger(entry[2]) for entry in hazardous])
+        cap = FUNDING_FARM_DANGER_SHARE * health if health > 0 else float("inf")
+        for spot in analyzer.ranking("safety"):
+            legs = analyzer_spot_legs(spot, graph)
+            if (legs and _spot_danger(spot) < cap and
+                    kit_hazardous_spot(client, spot, legs)):
+                cap = _spot_danger(spot)
         usable = [entry for entry in usable
                   if not plan.risky_approach(entry[2]) and
                   _spot_danger(entry[2]) < cap]
@@ -6581,7 +6646,8 @@ def _analyzer_farm_choice(
         # The funding farm skips the strict town check: east of her
         # savebed every candidate fails it statically (the content pack
         # hazard maps on every way back), so it only walked her down the
-        # list a spot per tick. Its trips to town start from her savebed.
+        # list a spot per tick. A strict town trip refused from the farm
+        # sends her home for it instead (send_cure_funding_farm_home).
         return usable[0] if usable else None
     budget = [1 if search else 0]
     for objective, legs, spot in usable:
@@ -8583,6 +8649,14 @@ class FarmCircuitTask(BotTask):
     # sellable stock back out and sold it; do not walk back every half hour.
     STORAGE_FULL_RETRY_SECONDS = 6 * 3600.0
 
+    def _strict_trip_refused(self, client: AtrinikClient, what: str,
+                             error: str) -> None:
+        """A strict town trip found no strictly safe route: on the
+        cure-funding farm, go home for it (send_cure_funding_farm_home)."""
+        if (self.failure_backoff(error, 0.0) ==
+                self.STRICT_ROUTE_RETRY_SECONDS):
+            send_cure_funding_farm_home(client, f"{what}: {error}")
+
     @classmethod
     def failure_backoff(cls, error: str, default: float) -> float:
         if ("avoiding every known hazard" in error or
@@ -10022,6 +10096,8 @@ class FarmCircuitTask(BotTask):
                 log.warning("bank deposit failed: %s", self._banking.error)
                 self._banking_retry_at = self.clock() + self.failure_backoff(
                     self._banking.error, 1800.0)
+                self._strict_trip_refused(
+                    client, "bank deposit", self._banking.error)
                 self._banking = None
             elif self._banking.status == TaskStatus.COMPLETE:
                 log.info("all carried cash banked; returning to farm")
@@ -10041,6 +10117,8 @@ class FarmCircuitTask(BotTask):
                             self._selling.error)
                 self._selling_retry_at = self.clock() + self.failure_backoff(
                     self._selling.error, 1800.0)
+                self._strict_trip_refused(
+                    client, "junk sale", self._selling.error)
                 self._selling = None
             elif self._selling.status == TaskStatus.COMPLETE:
                 log.info("identified junk sale complete; returning to farm")
@@ -10063,6 +10141,8 @@ class FarmCircuitTask(BotTask):
                             self._identification.error)
                 self._identification_retry_at = self.clock() + self.failure_backoff(
                     self._identification.error, 1800.0)
+                self._strict_trip_refused(
+                    client, "identify-all", self._identification.error)
                 self._identification = None
             elif self._identification.status == TaskStatus.COMPLETE:
                 # Evaluate the newly revealed batch before returning to a
@@ -10089,6 +10169,8 @@ class FarmCircuitTask(BotTask):
                             self._storage.error)
                 self._storage_retry_at = self.clock() + self.failure_backoff(
                     self._storage.error, 1800.0)
+                self._strict_trip_refused(
+                    client, "apartment storage", self._storage.error)
                 self._storage = None
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
@@ -10369,6 +10451,10 @@ class FarmCircuitTask(BotTask):
                              "no strict route to a healing merchant while "
                              + ("unprepared" if unprepared
                                 else "on the cure-funding farm"))
+                if funding:
+                    send_cure_funding_farm_home(
+                        client, "heal restock: no strict route to a healing "
+                                "merchant from the farm")
             elif trip is None:
                 self._heal_restock_full_since = None
                 farm.rest_for_departure = False
@@ -10739,6 +10825,13 @@ class RecoveryTask(BotTask):
                 if self._funding_running():
                     return []
                 cost = s._depletion_service_cost(client)
+                if cure_funding_farm_home(client):
+                    return [{"id": "cure-unfunded", "level": "warn",
+                             "text": "Cure unfunded: remove depletion costs "
+                                     f"{format_money(cost)}, she has "
+                                     f"{format_money(wallet)}; home for "
+                                     "errands from the cure-funding farm, "
+                                     "which resumes after them" + assist}]
                 return [{"id": "cure-unfunded", "level": "critical",
                          "text": "Cure unfunded: remove depletion costs "
                                  f"{format_money(cost)}, "
@@ -11069,8 +11162,13 @@ class RecoveryTask(BotTask):
         # next walk home.
         if self.at_home(client):
             self._home_failures, self._home_error = 0, ""
-            if (not await self._start_errand(client, reason) and
-                    self._cure_funding_farm_due(client)):
+            if await self._start_errand(client, reason):
+                return
+            if not self.busy() and resume_cure_funding_farm(client):
+                # Home from the cure-funding farm for its errands: the
+                # same farm resumes, deaths kept.
+                self._resume(client, "back to the cure-funding farm")
+            elif self._cure_funding_farm_due(client):
                 self._start_cure_funding_farm(client)
 
     def _resume(self, client: AtrinikClient, note: str = "") -> None:

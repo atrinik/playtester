@@ -9,7 +9,7 @@ import types
 import shutil
 import sqlite3
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
@@ -23206,6 +23206,85 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIn("1 of 3", autoplay.recovery_alerts(client)[0][0]["text"])
         self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_STARTED), 1)
 
+    def test_a_strict_trip_refused_on_the_funding_farm_goes_home_and_resumes(self):
+        # Live, on 2026-11-23, no town service was strictly reachable from
+        # any eastern farm spot: from the farm she could never sell, bank
+        # or restock heals. She goes home for them instead, and the same
+        # farm resumes from her savebed, deaths kept.
+        from .navigation import (CURE_FUNDING_FARM_HOME,
+                                 CURE_FUNDING_FARM_HOME_SECONDS,
+                                 CURE_FUNDING_FARM_RESUMED,
+                                 CURE_FUNDING_FARM_STARTED, RecoveryTask,
+                                 cure_funding_farm, cure_funding_farm_home,
+                                 cure_funding_farm_state,
+                                 farming_unsafe_reason)
+
+        client, _, autoplay = self.parked_unfunded()
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        circuit = autoplay.child
+        self.assertIsInstance(circuit, FarmCircuitTask)
+        client.record_action("death", "killed")
+        asyncio.run(autoplay.tick(client))
+        since = client.state.cure_funding_farm_since
+        refusal = "no route to /shattered_islands/world_0_67 avoiding every known hazard"
+        # Any other failure keeps the ordinary retry.
+        circuit._strict_trip_refused(client, "junk sale", "merchant gone")
+        self.assertTrue(cure_funding_farm(client))
+        circuit._strict_trip_refused(client, "junk sale", refusal)
+        self.assertTrue(cure_funding_farm_home(client))
+        self.assertFalse(cure_funding_farm(client))
+        self.assertIn("home for errands", farming_unsafe_reason(client))
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_HOME), 1)
+        # Autoplay hands over to recovery (its usual handover, once the
+        # circuit's trips settle), which runs the errands from her savebed
+        # (the chest trip, here) and then resumes the same farm.
+        circuit.ready_for_handover = lambda client: True
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
+        recovery = autoplay.child
+        self.assertIsInstance(recovery, RecoveryTask)
+        alerts, _ = autoplay.recovery_alerts(client)
+        unfunded = [alert for alert in alerts if alert["id"] == "cure-unfunded"]
+        self.assertEqual([alert["level"] for alert in unfunded], ["warn"])
+        self.assertIn("home for errands", unfunded[0]["text"])
+        # While an errand is left to start, she stays home for it.
+        errands = []
+        real_errand = recovery._start_errand
+
+        async def errand(client, reason):
+            errands.append(reason)
+            return len(errands) == 1 or await real_errand(client, reason)
+
+        recovery._start_errand = errand
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(len(errands), 1)
+        self.assertTrue(cure_funding_farm_home(client))
+        self.assertNotIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        recovery.services._cure_funding_retry_at = (
+            recovery.clock() + FarmCircuitTask.CURE_FUNDING_RETRY_SECONDS)
+        asyncio.run(autoplay.tick(client))
+        self.assertIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        self.assertTrue(cure_funding_farm(client))
+        self.assertEqual(client.state.cure_funding_farm_since, since)
+        self.assertEqual(cure_funding_farm_state(client).deaths, 1)
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_STARTED), 1)
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        # No tight loop: another refusal within the interval keeps the
+        # ordinary retry; after it, she may go home again.
+        autoplay.child._strict_trip_refused(client, "junk sale", refusal)
+        self.assertTrue(cure_funding_farm(client))
+        later = time.time() + CURE_FUNDING_FARM_HOME_SECONDS + 1
+        with patch("atrinik_bot.navigation.time.time", return_value=later):
+            autoplay.child._strict_trip_refused(client, "junk sale", refusal)
+            self.assertTrue(cure_funding_farm_home(client))
+        # A break that never reaches home ends by itself.
+        with patch("atrinik_bot.navigation.time.time",
+                   return_value=later + CURE_FUNDING_FARM_HOME_SECONDS):
+            self.assertFalse(cure_funding_farm_home(client))
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_HOME), 2)
+
     def test_no_funding_farm_while_a_funding_trip_is_left_or_the_bank_unknown(self):
         from .navigation import CURE_FUNDING_FARM_STARTED, cure_funding_farm
 
@@ -23603,6 +23682,11 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
                     if record["action"] == "heal-restock-deferred"]
         self.assertEqual(len(deferred), 1)
         self.assertIn("on the cure-funding farm", deferred[0])
+        # From the farm, that sends her home: the restock starts there.
+        from .navigation import cure_funding_farm, cure_funding_farm_home
+
+        self.assertTrue(cure_funding_farm_home(client))
+        self.assertFalse(cure_funding_farm(client))
 
     def test_a_funded_farm_with_an_unknown_bank_never_resumes(self):
         from .navigation import (CURE_FUNDING_FARM_FUNDED, cure_funding_farm,
@@ -23763,6 +23847,22 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # a spot her kit could not hold is farmed, so she waits.
         record["kit_failures"] = [failure(time.time(), "pack", "/elsewhere")] * 3
         self.assertIsNone(choice())
+        # Quarantined (paused after those failures), it still caps.
+        client.state.farm_zone_quarantine = {
+            hemlock["map_paths"][0].removeprefix("maps"): time.time() + 3600}
+        self.assertIsNone(choice())
+        client.state.farm_zone_quarantine = {}
+        client.state.farm_adaptations = {}
+        # The funding farm skips the strict town check, which every eastern
+        # spot fails statically; depleted otherwise, it is still asked.
+        town = Mock(return_value=False)
+        with patch("atrinik_bot.navigation.town_safely_reachable", town):
+            picked = analyzer_farm_choice(client, graph, search=True)
+            self.assertEqual(picked[2]["name"], "Hemlock")
+            town.assert_not_called()
+            client.set_cure_funding_farm(since=0.0)
+            analyzer_farm_choice(client, graph, search=True)
+            town.assert_called()
 
 
 class RouteFailureTests(unittest.TestCase):
