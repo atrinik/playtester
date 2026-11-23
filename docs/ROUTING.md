@@ -958,7 +958,8 @@ it, planning returns `RouteDeclined(cost, budget, worst subjects)` instead of
 a route. This closes G2 for errands, and it is the only way learned danger
 can stop a trip (owner decision). Farm trips use selection instead (below).
 
-- **Optional errands** (upgrade sweeps, utility shopping, junk sale) and
+- **Optional errands** (upgrade sweeps, utility shopping, the heal
+  restock, junk sale) and
   **quest steps** get a budget of one expected death, 1800 s (owner
   decision). Above it, the trip is declined and retried later.
 - **One recent death counts fully** (owner decision, 2026-11-19). For the

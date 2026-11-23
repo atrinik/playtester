@@ -11,7 +11,8 @@ from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
 from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          NavigateThenTask, RecoveryTask,
-                         has_working_recall, recall_alerts,
+                         has_working_recall, heal_restock_alerts,
+                         recall_alerts,
                          WorldGraph, analyzer_farm_selection,
                          farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
@@ -329,14 +330,15 @@ class AutoplayTask(BotTask):
         """Dashboard alerts while farming is unsafe, from live state, and
         whether she is waiting at her savebed on an alerted blocker (then
         the stuck alert would say nothing new). Also, in any phase, the
-        recall note (recall_alerts), which never blocks farming.
+        recall note (recall_alerts) and the heal-restock note
+        (heal_restock_alerts), neither of which blocks farming.
 
         The farming-suspended warning follows the live reason in any phase;
         the specific blockers come from the recovery phase.
         """
         if self.status != TaskStatus.RUNNING:
             return [], False
-        recall = recall_alerts(client)
+        recall = recall_alerts(client) + heal_restock_alerts(client)
         reason = farming_unsafe_reason(client)
         if not reason:
             # A farm resting for want of a heal or a recall (at most

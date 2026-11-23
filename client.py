@@ -530,6 +530,15 @@ class AtrinikClient:
             except (TypeError, ValueError):
                 self.state.last_utility_shop_check_at = 0.0
             try:
+                self.state.heal_restock_note = str(
+                    record.get("heal_restock_note", "") or "")[:500]
+                self.state.heal_restock_retry_until = max(
+                    0.0, float(record.get(
+                        "heal_restock_retry_until", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                self.state.heal_restock_note = ""
+                self.state.heal_restock_retry_until = 0.0
+            try:
                 self.state.paid_restoration_retry_until = max(
                     0.0, float(record.get(
                         "paid_restoration_retry_until", 0.0)))
@@ -638,6 +647,8 @@ class AtrinikClient:
             self.state.recall_unavailable = ""
             self.state.recall_unavailable_at = 0.0
             self.state.last_utility_shop_check_at = 0.0
+            self.state.heal_restock_note = ""
+            self.state.heal_restock_retry_until = 0.0
             self.state.paid_restoration_retry_until = 0.0
             self.state.route_hazards = {}
             self.state.vendor_quotes = {}
@@ -936,6 +947,20 @@ class AtrinikClient:
         self._runtime_memory.setdefault(character, {})[
             "last_utility_shop_check_at"] = (
                 self.state.last_utility_shop_check_at)
+        self._persist_character_memory()
+
+    def set_heal_restock_backoff(self, note: str, until: float) -> None:
+        """Persist why the heal restock came to nothing and the wall-clock
+        time before which it is not tried again ("" and 0 once it worked)."""
+        self.state.heal_restock_note = str(note or "")[:500]
+        self.state.heal_restock_retry_until = max(0.0, float(until))
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        memory = self._runtime_memory.setdefault(character, {})
+        memory["heal_restock_note"] = self.state.heal_restock_note
+        memory["heal_restock_retry_until"] = (
+            self.state.heal_restock_retry_until)
         self._persist_character_memory()
 
     def defer_paid_restoration(self, until: float) -> None:
