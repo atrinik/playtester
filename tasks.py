@@ -2313,14 +2313,23 @@ class FarmTask(BotTask):
     def cover_allowed(self, client: AtrinikClient, ratio: float,
                       flee: float) -> bool:
         """Whether a cover step may take this tick: above the flee
-        threshold, with no heal in flight (within the safety's cooldown
-        of the last) and none due (a usable heal at the heal threshold).
-        A cover step never pre-empts a heal."""
+        threshold, with no heal in flight and none due (a usable heal at
+        the heal threshold, its retry time reached). A cover step never
+        pre-empts a heal. A safety that tracks its sent heal
+        (heal_in_flight) answers for one in flight; otherwise one sent
+        within the heal cooldown counts."""
         safety = self.safety
+        now = time.monotonic()
+        in_flight = getattr(safety, "heal_in_flight", None)
+        if in_flight is not None:
+            busy = bool(in_flight())
+            ready = now >= float(getattr(safety, "_heal_retry_at", 0.0))
+        else:
+            busy = now - safety._last_heal < safety.heal_cooldown
+            ready = True
         return bool(
-            ratio > flee and
-            time.monotonic() - safety._last_heal >= safety.heal_cooldown and
-            not (ratio <= safety.heal_below and
+            ratio > flee and not busy and
+            not (ready and ratio <= safety.heal_below and
                  safety._usable_heal(client) is not None))
 
     async def break_caster_sight(self, client: AtrinikClient) -> bool:
@@ -6248,7 +6257,10 @@ class FarmTask(BotTask):
             # below decide, as before.
             if await self.low_health_retreat(client, gain_only=True):
                 return
-        if (not out_healed and
+        # With two threats near (the pack-split retreat's count), that
+        # retreat decides: a cover step between its steps only
+        # alternates with them.
+        if (not out_healed and nearby_count <= 1 and
                 self.cover_allowed(client, ratio, dynamic_flee) and
                 await self.break_caster_sight(client)):
             # Shot at by a caster she is not going for: out of its line.
@@ -6612,9 +6624,11 @@ class FarmTask(BotTask):
             stationary_caster = bool(
                 isolated_caster and
                 self.stationary_caster(client, x, y, obj))
-            # Just behind cover: every target comes to her rather than
-            # she steps back into a caster's line.
-            covering = self._cover_hold_until > time.monotonic()
+            # Just behind cover: a melee target comes to her rather than
+            # she steps back into a caster's line. A caster she is going
+            # for she goes for (break_caster_sight never covers from it).
+            covering = bool(self._cover_hold_until > time.monotonic() and
+                            not self.authored_caster(client, obj))
             if not spell_alignment_pending and not covering:
                 if (stationary_caster and
                         await self.caster_orbit(client, x, y, obj)):

@@ -16953,6 +16953,8 @@ class CasterFirstTests(unittest.TestCase):
         task.map_node.blocked.update({(10, 11), (10, 13), (11, 11), (11, 13)})
         self._say(client,
                   "magic bullet hit you for 65 (0) weapon magic damage.")
+        # A hold left from an earlier cover step does not stop her either.
+        task._cover_hold_until = time.monotonic() + 60.0
         trail = self._run(client, task, [((7, 12), "orc sorcerer", 300)])
         self.assertNotIn("caster-cover",
                          [action for action, _ in client.recorded])
@@ -16967,10 +16969,15 @@ class CasterFirstTests(unittest.TestCase):
         self._put(client, 3, 8, "orc sorcerer", 300)
         self.assertFalse(task.cover_allowed(client, 0.50, 0.55))
         self.assertTrue(task.cover_allowed(client, 0.60, 0.55))
-        # A heal just sent is in flight.
-        task.safety._last_heal = time.monotonic()
-        self.assertFalse(task.cover_allowed(client, 0.90, 0.55))
-        task.safety._last_heal = 0.0
+        # A heal sent and not yet answered is in flight.
+        with patch.object(SafetyPolicy, "heal_in_flight",
+                          lambda safety: True, create=True):
+            self.assertFalse(task.cover_allowed(client, 0.90, 0.55))
+        if not hasattr(SafetyPolicy, "heal_in_flight"):
+            # Without that tracking, one sent within the cooldown is.
+            task.safety._last_heal = time.monotonic()
+            self.assertFalse(task.cover_allowed(client, 0.90, 0.55))
+            task.safety._last_heal = 0.0
         # A usable heal at the heal threshold is due.
         client.state.stats.update(sp=20)
         client.state.inventory.append(Item(
@@ -16984,6 +16991,35 @@ class CasterFirstTests(unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertNotIn("caster-cover",
                          [action for action, _ in client.recorded])
+
+    def test_no_cover_steps_between_pack_retreat_steps(self):
+        # The delta review's alternation: two orc warriors near and a
+        # sorcerer shooting through the gap. The pack-split retreat steps
+        # her out of cover, a cover step brings her back, and so on at
+        # the caster's fire rate. With two threats near, the retreat
+        # alone decides.
+        client, task = self._cover_fight()
+        creatures = [((7, 12), "orc sorcerer", 300),
+                     ((15, 12), "orc warrior", 100),
+                     ((14, 15), "orc warrior", 101)]
+        for _ in range(10):
+            self._say(client,
+                      "magic bullet hit you for 2 (0) weapon magic damage.",
+                      "orc warrior hit you for 1 (0) impact damage.",
+                      ago=0.01)
+            time.sleep(0.02)
+            self._run(client, task, creatures, ticks=1)
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("farm-pack-split", actions)
+        # No cover step while the pack retreat runs. Once she has outrun
+        # both (the retreat's cadence is wall-clock), one may follow, but
+        # never a second one between retreat steps.
+        first = actions.index("farm-pack-split")
+        if "caster-cover" in actions:
+            self.assertEqual(actions.count("caster-cover"), 1, actions)
+            self.assertNotIn("farm-pack-split",
+                             actions[actions.index("caster-cover"):], actions)
+        self.assertNotIn("caster-cover", actions[first:first + 6], actions)
 
     def test_a_cover_step_never_opens_another_casters_line(self):
         client, task = self._seam_fight()

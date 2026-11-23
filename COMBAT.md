@@ -1285,7 +1285,7 @@ Now, on the farm map:
   seam too, where it then counts as a threat). It is also fought first
   when it stands within `CASTER_FIRST_REACH` (2) on the farm map and its
   name is in a recent hit or miss, provided the step toward it puts no
-  more other attackers beside her than she has now. A missile's hit
+  more other hostiles beside her than she has now. A missile's hit
   ("magic bullet hit you") names no caster and switches no target, so
   she does not leave the orc beside her for a caster past the pack. The
   same rank comes first when she picks one attacker among several: the
@@ -1307,10 +1307,15 @@ Now, on the farm map:
     is going for it, she goes for it. Cover from her own target alternated
     with the approach to it, step by step (review of
     [pull request 131](https://github.com/atrinik/playtester/pull/131));
-  - above the tick's flee threshold, with no heal in flight (within the
-    safety's heal cooldown of the last) and none due (a usable heal at or
-    below the heal threshold), so it never pre-empts a heal
-    (`cover_allowed`), and not while she runs from losing heals.
+  - at most one threat near her (the pack-split retreat's count, within
+    4 tiles): with two, that retreat decides, since cover steps between
+    its steps only alternated with them;
+  - above the tick's flee threshold, with no heal in flight and none due
+    (a usable heal at or below the heal threshold), so it never pre-empts
+    a heal (`cover_allowed`), and not while she runs from losing heals.
+    A safety that tracks its sent heal (`heal_in_flight`, its retry time)
+    answers for that; otherwise a heal sent within the heal cooldown is
+    in flight.
 
   The square must have strictly fewer clear lines from the visible
   casters than hers, and no more attackers beside it. Among those squares
@@ -1318,8 +1323,9 @@ Now, on the farm map:
   attackers can reach (`terrain.features`), then the one farthest from
   the nearest other hostile. The step is recorded as `caster-cover`, and
   its square is learned as blocked if it never lands. For
-  `COVER_HOLD_SECONDS` (4 s) afterwards she approaches and kites no
-  target at all: they come to her. In the incident pocket she steps
+  `COVER_HOLD_SECONDS` (4 s) afterwards she approaches and kites no melee
+  target: it comes to her. A caster she is going for she still
+  approaches, orbits or kites. In the incident pocket she steps
   through the doorway (8, 1) to the corridor side, which neither sorcerer
   can see.
 
