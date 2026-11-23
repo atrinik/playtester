@@ -4821,9 +4821,10 @@ class NavigateThenTask(BotTask):
         safety_action_issued = (
             self.safety._last_heal != last_heal or
             self.safety._last_food != last_food)
-        if (own_walk and not isinstance(self.task, FarmTask) and
-                not safety_action_issued and
-                self._critical_escape_due(client, ratio, nearby) and
+        escape_due = (own_walk and not isinstance(self.task, FarmTask) and
+                      not safety_action_issued and
+                      self._critical_escape_due(client, ratio, nearby))
+        if (escape_due and
                 await self._retreat_step(
                     client, nearby, avoid_backtrack=True, gain_only=True)):
             # Critical with no heal and no recall, and attacked: run, combat
@@ -4986,7 +4987,11 @@ class NavigateThenTask(BotTask):
             return True
         # Safety's own hold (low health, a heal she cannot cast) is futile
         # too when she is starving with nothing to eat: only food helps.
-        if ((not safe and not starving_without_food(client)) or
+        # A critical escape that found no step gaining distance skips it too:
+        # its equal-distance steps shuffled her beside a troll, combat off,
+        # and the cornered defence below fights instead.
+        if not escape_due and (
+                (not safe and not starving_without_food(client)) or
                 (overwhelmed and not hold_fire)):
             if safety_action_issued:
                 # FIRE/APPLY was just sent by SafetyPolicy. Clearing in this

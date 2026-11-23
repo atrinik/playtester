@@ -874,9 +874,11 @@ Now, on a defended walk:
   ends when the walk starts again. Until then she keeps running from an
   attacker on her, and closes no gap to a creature more than 2 tiles off.
 - **Cornered keeps its defence.** With no step that gains distance the
-  escape does not act, and the walk's defence decides as before (the
-  cornered fight among them), against the closest attacker rather than a
-  committed one farther off.
+  escape does not act, and the walk's defence decides (the cornered fight
+  among them), against the closest attacker rather than a committed one
+  farther off. The safety's low-health hold, whose equal-distance steps
+  would shuffle her beside the attacker with combat off, stands aside
+  meanwhile.
 
 Accepted limits:
 

@@ -11266,8 +11266,14 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
 
     def test_critical_escape_in_a_pocket_fights_rather_than_shuffles(self):
         """Every step beside her stays next to the troll: no step gains
-        distance, so she fights it instead of shuffling with combat off."""
-        client, node, task = self._outpost_escape()
+        distance, so she fights it instead of shuffling with combat off,
+        starving or not (fed, the safety's low-health hold applies)."""
+        for food in (0, 999):
+            with self.subTest(food=food):
+                self._pocket_fight(food)
+
+    def _pocket_fight(self, food):
+        client, node, task = self._outpost_escape(food=food)
         node.terrain = {(10, 10): 1, (10, 11): 1, (11, 10): 1, (12, 10): 1,
                         (13, 10): 1}
         self._corner(task, client)
