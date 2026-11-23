@@ -11,13 +11,14 @@ from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
 from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          NavigateThenTask, RecoveryTask,
-                         emergency_recall_unusable,
+                         has_working_recall, recall_alerts,
                          WorldGraph, analyzer_farm_selection,
                          farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
 from .alerts import HUNGRY_FOOD
 from .quest_tasks import EscapingDesertedIslandTask
-from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
+from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus,
+                    unprepared_for_trips)
 
 log = logging.getLogger(__name__)
 
@@ -172,6 +173,33 @@ class AutoplayTask(BotTask):
             time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
         return False
 
+    async def _start_mana_crystal_detours(self, client: AtrinikClient) -> bool:
+        """Start the mana crystal's start, recovery or upgrade when due.
+
+        Every path that starts one comes here. None starts while she has
+        neither a usable heal nor a ready recall below UNPREPARED_HEALTH
+        (unprepared_for_trips): it is postponed, and she farms (or rests on
+        the farm) meanwhile. Live, on 2026-11-22, the mana-crystal-upgrade
+        errand took her into the Old Outpost with no heals and no recall,
+        and she died there.
+        """
+        # Its own safety policy reads the same heal as a farm's would:
+        # SafetyPolicy._usable_heal depends only on her inventory, SP and
+        # the healing patterns, which no farm changes (farms tune only the
+        # heal and flee thresholds).
+        if unprepared_for_trips(client, self.safety):
+            return False
+        if self._needs_mana_crystal_start(client):
+            await self._start_mana_crystal_detour(client)
+            return True
+        if self._needs_mana_crystal_recovery(client):
+            await self._start_mana_crystal_recovery(client)
+            return True
+        if self._needs_mana_crystal_upgrade(client):
+            await self._start_mana_crystal_upgrade(client)
+            return True
+        return False
+
     def _needs_mana_crystal_start(self, client: AtrinikClient) -> bool:
         """Collect Gandyld's safe 50-SP opening reward exactly once."""
         return bool(
@@ -288,8 +316,7 @@ class AutoplayTask(BotTask):
         priority does not clear it: the recall is still missing."""
         level = int(client.state.stats.get("level", 0) or 0)
         if (getattr(client.state, "recall_unavailable", "") and
-                (level < RECALL_REQUIRED_LEVEL or
-                 not emergency_recall_unusable(client))):
+                (level < RECALL_REQUIRED_LEVEL or has_working_recall(client))):
             setter = getattr(client, "set_recall_unavailable", None)
             if setter is not None:
                 setter("")
@@ -301,16 +328,24 @@ class AutoplayTask(BotTask):
                         ) -> tuple[list[dict[str, str]], bool]:
         """Dashboard alerts while farming is unsafe, from live state, and
         whether she is waiting at her savebed on an alerted blocker (then
-        the stuck alert would say nothing new).
+        the stuck alert would say nothing new). Also, in any phase, the
+        recall note (recall_alerts), which never blocks farming.
 
         The farming-suspended warning follows the live reason in any phase;
         the specific blockers come from the recovery phase.
         """
-        reason = farming_unsafe_reason(client)
-        if not reason or self.status != TaskStatus.RUNNING:
+        if self.status != TaskStatus.RUNNING:
             return [], False
+        recall = recall_alerts(client)
+        reason = farming_unsafe_reason(client)
+        if not reason:
+            # A farm resting for want of a heal or a recall (at most
+            # UNPREPARED_REST_LIMIT_SECONDS) is waiting, not stuck.
+            resting = (isinstance(self.child, FarmCircuitTask) and
+                       self.child.unprepared_resting())
+            return recall, resting
         alerts = [{"id": "farming-suspended", "level": "warn",
-                   "text": f"Farming suspended: {reason}"}]
+                   "text": f"Farming suspended: {reason}"}] + recall
         waiting = False
         if isinstance(self.child, RecoveryTask):
             blockers = self.child.alerts(client)
@@ -395,16 +430,9 @@ class AutoplayTask(BotTask):
                     self.child.hold_new_pulls(False)
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
-                    self.child.safe_for_progression_detour(client)):
-                if self._needs_mana_crystal_start(client):
-                    await self._start_mana_crystal_detour(client)
-                    return
-                if self._needs_mana_crystal_recovery(client):
-                    await self._start_mana_crystal_recovery(client)
-                    return
-                if self._needs_mana_crystal_upgrade(client):
-                    await self._start_mana_crystal_upgrade(client)
-                    return
+                    self.child.safe_for_progression_detour(client) and
+                    await self._start_mana_crystal_detours(client)):
+                return
             try:
                 await self.child.tick(client)
                 if isinstance(self.child, (FarmCircuitTask, RecoveryTask)):
@@ -476,14 +504,7 @@ class AutoplayTask(BotTask):
         if farming_unsafe_reason(client):
             await self._start_recovery(client)
             return
-        if self._needs_mana_crystal_start(client):
-            await self._start_mana_crystal_detour(client)
-            return
-        if self._needs_mana_crystal_recovery(client):
-            await self._start_mana_crystal_recovery(client)
-            return
-        if self._needs_mana_crystal_upgrade(client):
-            await self._start_mana_crystal_upgrade(client)
+        if await self._start_mana_crystal_detours(client):
             return
 
         # The farming analyzer is the only source of farm spots. Until its

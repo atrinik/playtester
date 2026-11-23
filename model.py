@@ -250,7 +250,7 @@ class GameState:
     last_recall_shop_check_at: float = 0.0
     # Why the last attempt to replace her recall source came to nothing
     # (a failed or fruitless recall shop, a failed ship key), and when:
-    # the recovery phase's recall-unavailable alert, kept across restarts.
+    # recall_alerts' recall-unavailable note, kept across restarts.
     recall_unavailable: str = ""
     recall_unavailable_at: float = 0.0
     last_utility_shop_check_at: float = 0.0
