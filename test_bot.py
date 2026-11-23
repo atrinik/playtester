@@ -140,6 +140,27 @@ class TempleTrip(BotTask):
         pass
 
 
+def item_packet(location, items, *, clear=None):
+    """An ITEM packet as server/src/socket/item.c writes it.
+
+    ``items`` None is esrv_close_container: only the inventory to delete.
+    """
+    packet = Packet(0)
+    if clear is not None:
+        packet.u8(1).u32(clear)
+    else:
+        packet.u8(0)
+    if items is None:
+        return packet
+    packet.u32(location).u8(1)
+    for tag, name in items:
+        packet.u32(tag).u32(0).u32(1000).u16(1).u8(0)
+        if location > 0:
+            packet.u8(0).u8(0).u8(255)  # type, subtype, unidentified
+        packet.string(name).u16(0).u8(0).u32(1).string("").u8(0)
+    return packet
+
+
 class ProtocolTests(unittest.TestCase):
     def test_full_player_inventory_packet_releases_replay_barrier(self):
         async def scenario():
@@ -5979,6 +6000,82 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task._opened_at -= 1.0
         asyncio.run(task.tick(client))
         self.assertEqual(client.moves, [(7, 91, 1)])
+
+    def test_ground_redraw_after_opening_keeps_the_chests_contents(self):
+        """Live: 'storage container contents did not load' for her
+        apartment's spruce chest, on every visit.
+
+        Opening a chest changes its face (types/container.c container_open
+        calls object_update(UP_OBJ_FACE)), so in the same server tick its
+        contents (esrv_send_inventory) are followed by a ground redraw
+        (esrv_draw_look, socket/server.c). That redraw used to drop the
+        chest's contents along with the chest it replaces.
+        """
+        class FakeClient:
+            def __init__(self):
+                self.protocol = AtrinikClient(ClientConfig())
+                self.state = self.protocol.state
+                self.state.player_tag = 7
+                self.applied = []
+                self.moves = []
+
+            async def feed(self, packet):
+                await self.protocol._handle_item(
+                    Cursor(bytes(packet.data)), bytes(packet.data))
+
+            async def apply(self, tag):
+                self.applied.append(tag)
+                # The server answers the apply in one tick.
+                await self.feed(item_packet(
+                    90, [(91, "compass"), (92, "rare trophy")], clear=90))
+                await self.feed(item_packet(
+                    0, [(90, "spruce chest")], clear=0))
+
+            async def move_item(self, destination, tag, quantity=0):
+                self.moves.append((destination, tag, quantity))
+
+        async def scenario():
+            client = FakeClient()
+            await client.feed(item_packet(0, [(90, "spruce chest")], clear=0))
+            task = RetrieveItemsTask("chest", (r"^compass$",))
+            await task.tick(client)
+            self.assertEqual(client.applied, [90])
+            self.assertEqual(client.state.inventories[90], [91, 92])
+            task._opened_at -= 1.0
+            await task.tick(client)
+            self.assertEqual(client.moves, [(7, 91, 1)])
+            # Closing it (walking off, esrv_close_container) hides the
+            # contents: they are unknown again, not an empty chest.
+            await client.feed(item_packet(0, None, clear=90))
+            self.assertNotIn(90, client.state.inventories)
+            self.assertNotIn(91, client.state.items)
+            # A ground redraw without the chest drops what it held.
+            await client.apply(90)
+            await client.feed(item_packet(0, [], clear=0))
+            self.assertNotIn(90, client.state.inventories)
+            self.assertNotIn(92, client.state.items)
+            self.assertEqual(client.state.ground, [])
+
+        asyncio.run(scenario())
+
+    def test_retrieve_reopens_a_named_chest_it_closed(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.place_item(Item(90, name="spruce chest"), 0)
+                self.state.messages = []
+                self.applied = []
+
+            async def apply(self, tag):
+                self.applied.append(tag)
+
+        client = FakeClient()
+        task = RetrieveItemsTask("chest", (r"^compass$",))
+        asyncio.run(task.tick(client))
+        # The server names the chest in full (types/container.c).
+        client.state.messages.append((0, 0, 0, "You close spruce chest."))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.applied, [90, 90])
 
     def test_money_is_written_in_the_games_coins(self):
         from .client import format_money

@@ -2620,14 +2620,34 @@ class AtrinikClient:
     async def _handle_item(self, cur: Cursor, raw: bytes) -> None:
         delete_env = bool(cur.u8())
         completes_player_replay = False
+        # Listed contents of the items being replaced, kept for those the
+        # packet sends again.
+        nested: dict[int, list[int]] = {}
         if delete_env:
             location_to_clear = cur.u32()
             completes_player_replay = (
                 location_to_clear == self.state.player_tag)
-            for tag in list(self.state.inventories.get(location_to_clear, [])):
+            if not cur.remaining and location_to_clear not in (
+                    0, self.state.player_tag):
+                # esrv_close_container (server/src/socket/item.c): the
+                # contents are no longer shown, which is not an empty
+                # container. Forget them, so a later visit opens it again.
+                for tag in list(self.state.inventories.pop(
+                        location_to_clear, [])):
+                    self.state.remove_item(tag)
+                return
+            replaced = list(self.state.inventories.get(location_to_clear, []))
+            # Opening an underfoot chest changes its face, so the server
+            # redraws the ground (esrv_draw_look) right after sending the
+            # chest's contents (esrv_send_inventory). That redraw replaces
+            # the chest itself, not what it holds: keep its contents.
+            nested = {tag: self.state.inventories.pop(tag)
+                      for tag in replaced if tag in self.state.inventories}
+            for tag in replaced:
                 self.state.remove_item(tag)
             self.state.inventories[location_to_clear] = []
             if not cur.remaining:
+                self._drop_nested(nested)
                 if completes_player_replay:
                     self.state.inventory_replay_complete = True
                     self._forget_cured_depletion()
@@ -2650,10 +2670,19 @@ class AtrinikClient:
             self._decode_item_fields(cur, flags, item)
             self.state.place_item(item, location, append)
             changed.append(item)
+        for tag in [tag for tag in nested if tag in self.state.items]:
+            self.state.inventories[tag] = nested.pop(tag)
+        self._drop_nested(nested)
         if completes_player_replay:
             self.state.inventory_replay_complete = True
             self._forget_cured_depletion()
         await self.emit("items", changed)
+
+    def _drop_nested(self, nested: dict[int, list[int]]) -> None:
+        """Forget the contents of replaced items the server did not resend."""
+        for children in nested.values():
+            for child in children:
+                self.state.remove_item(child)
 
     async def _handle_item_update(self, cur: Cursor, raw: bytes) -> None:
         flags, tag = cur.u16(), cur.u32()

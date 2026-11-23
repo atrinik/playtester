@@ -7680,8 +7680,10 @@ class RetrieveItemsTask(BotTask):
                 client.state.messages_since(self._feedback_start)
                 if len(entry) > 3)
             if (not self._reopen_attempted and
-                    re.search(r"\byou (?:close|leave) (?:the )?chest\b",
-                              feedback)):
+                    re.search(r"\byou (?:close|leave) [^.\n]*"
+                              + re.escape(self.container_name), feedback)):
+                # The server names the chest in full ("You close spruce
+                # chest.", types/container.c apply_func).
                 # This process really did already have the chest selected;
                 # the first application closed it. Apply once more to open it
                 # and establish a fresh response window.
