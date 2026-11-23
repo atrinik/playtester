@@ -105,6 +105,23 @@ def automatic_training_plan(state) -> tuple[str, str, int]:
     return "", "", 0
 
 
+# The largest likely simultaneous aggro (the analyzer's --max-aggro-pack)
+# a spot may have for her ordinary kit. She fights one target at a time and
+# casts no area spell, so a pack larger than two outlasts her heals. Live,
+# on 2026-11-23 (level 37, 330 health), the analyzer allowed any pack
+# (0), and she died at an Underground City circuit of pack 3. The analyzer
+# rejects such a map before it forms circuits.
+SINGLE_TARGET_MAX_AGGRO_PACK = 2
+# Seam exposure (seam_adjusted, WorldGraph.seam_exposure): a caster on a
+# map tiled to a spot's map, outside the spot, within this many tiles of
+# where she pulls (a spawn's detection radius from it) joins her fights
+# there, as does a melee spawn within its own detection radius. The
+# analyzer models only the spot's own maps, each alone. An orc sorcerer's
+# magic bullet flies until something blocks its line of sight.
+SEAM_REACH_TILES = 10
+# Danger added per seam caster, the analyzer's own caster bonus.
+SEAM_CASTER_DANGER = 20.0
+
 # Fields copied from each ranked result into the dashboard snapshot.
 SUMMARY_FIELDS = (
     "path", "name", "region", "location", "map_paths", "monsters", "xp_hour",
@@ -115,6 +132,8 @@ SUMMARY_FIELDS = (
     "spot_safety_score", "approach_status", "approach_origin", "approach_maps",
     "approach_danger", "approach_safety_score", "approach_worst_map",
     "approach_danger_flags", "approach_unknown",
+    # The bot's seam exposure (seam_adjusted).
+    "seam_aggressive_spawns", "seam_casters", "seam_maps",
 )
 # The approach safety an unreachable spot is capped at. The analyzer's walk
 # follows exits and tiled seams only (no ships, scripts or keys), so
@@ -152,6 +171,97 @@ def risky_approach(spot: dict) -> bool:
     score = spot.get("approach_safety_score")
     return (isinstance(score, (int, float)) and not isinstance(score, bool) and
             score < APPROACH_SAFETY_FLOOR)
+
+
+def _number(value) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value:
+        return float(value)
+    return None
+
+
+def spot_safety(spot: dict) -> float:
+    """A ranked spot's own safety, without its approach: the analyzer's
+    spot_safety_score (v3.10.0), else its safety_score, else 1."""
+    for key in ("spot_safety_score", "safety_score"):
+        value = _number(spot.get(key))
+        if value is not None:
+            return value
+    return 1.0
+
+
+def risky_spot(spot: dict) -> bool:
+    """Whether one encounter at a ranked spot is expected to cost more than
+    her whole health bar (its own safety below APPROACH_SAFETY_FLOOR).
+
+    Autoplay prefers spots that are neither this nor risky_approach. Live,
+    on 2026-11-23, she farmed the XP view's first spot, an Underground City
+    circuit of spot safety 0.95, and died there to three attackers at once.
+    """
+    return spot_safety(spot) < APPROACH_SAFETY_FLOOR
+
+
+@dataclass(frozen=True)
+class SeamExposure:
+    """What a spot's seam neighbours add (navigation.WorldGraph.seam_exposure).
+
+    ``pack``: the most aggressive spawns at once at any of the spot's
+    spawns where a seam adds to it, a neighbour's or one between the
+    spot's own maps (0 where none does): all within
+    their detection radius, and the neighbours' casters within
+    SEAM_REACH_TILES of her pull square. ``aggressive`` and ``casters``:
+    the neighbours' aggressive spawns, and casters among them, within
+    SEAM_REACH_TILES of a pull square; ``maps``: those neighbours' maps.
+    """
+
+    pack: int = 0
+    aggressive: int = 0
+    casters: int = 0
+    maps: tuple[str, ...] = ()
+
+
+def seam_adjusted(spot: dict, exposure: SeamExposure,
+                  profile: "CombatProfile | None") -> dict | None:
+    """A ranked spot with its seam exposure folded in, or None when its
+    pack, the exposed one included, exceeds the profile's max_aggro_pack.
+
+    The analyzer scores a circuit from its own maps alone, and judges its
+    pack per map. Live, on 2026-11-23, it rated the Underground City circuit
+    of 1_3, 2_2, 2_3 and 3_2 at pack 3 with casters only from 3_2, while
+    three orc sorcerers on 1_2, seamlessly north of 1_3, stood about seven
+    tiles from where she fought; they did 259 of the 565 damage that killed
+    her. This keeps the analyzer's order and changes only what it missed:
+    ``max_aggro_pack`` becomes the larger of the two packs, seam casters
+    join ``danger_flags``, and the spot's own safety becomes at most her
+    maximum health over the exposed encounter (the spot's danger per
+    monster times the pack, plus SEAM_CASTER_DANGER per seam caster);
+    ``safety_score`` is at most that. A spot nothing reaches is returned
+    as it is.
+    """
+    ranked_pack = _number(spot.get("max_aggro_pack")) or 0.0
+    pack = max(ranked_pack, float(exposure.pack))
+    cap = int(getattr(profile, "max_aggro_pack", 0) or 0)
+    if cap and pack > cap:
+        return None
+    if exposure.aggressive <= 0 and exposure.pack <= 0:
+        return spot
+    adjusted = dict(spot)
+    adjusted.update(
+        max_aggro_pack=pack, analyzer_max_aggro_pack=ranked_pack,
+        seam_aggressive_spawns=exposure.aggressive,
+        seam_casters=exposure.casters, seam_maps=list(exposure.maps))
+    if exposure.casters:
+        adjusted["danger_flags"] = [
+            *(spot.get("danger_flags") or ()), f"seam caster×{exposure.casters}"]
+    danger = _number(spot.get("danger"))
+    health = float(getattr(profile, "max_health", 0) or 0)
+    if danger is not None and health > 0 and (
+            pack > ranked_pack or exposure.casters):
+        encounter = danger * max(pack, 1.0) + SEAM_CASTER_DANGER * exposure.casters
+        own = min(spot_safety(spot), min(1.0, health / max(encounter, 0.001)))
+        adjusted["spot_safety_score"] = own
+        overall = _number(spot.get("safety_score"))
+        adjusted["safety_score"] = own if overall is None else min(overall, own)
+    return adjusted
 
 
 def survivability_unchanged(now: dict, earlier: dict) -> bool:
@@ -200,7 +310,8 @@ class CombatProfile:
     armour_class: int
     protections: tuple[tuple[str, int], ...]
     # Largest likely simultaneous aggro a spot may have; 0 allows any. While
-    # a secondary skill trains one target at a time, spots must not pack.
+    # a secondary skill trains one target at a time, spots must not pack;
+    # otherwise her single-target kit holds SINGLE_TARGET_MAX_AGGRO_PACK.
     max_aggro_pack: int = 0
     # Spell-only training: raw damage per cast (0 simulates the weapon),
     # seconds per cast, mana per cast, mana regenerated per second, the mana
@@ -372,8 +483,10 @@ def combat_profile(client, spell_damage: float = 0.0,
     # Training Wizardry, every hit is the spell (kill XP is split by damage
     # share), so it is ranked at that skill's level on spots that send one
     # monster at a time, killing with the spell's damage and mana. Until a
-    # cast has been observed, the weapon stands in.
-    max_aggro_pack = 0
+    # cast has been observed, the weapon stands in. Otherwise she fights one
+    # target at a time (she casts no area spell), so spots are capped at
+    # SINGLE_TARGET_MAX_AGGRO_PACK.
+    max_aggro_pack = SINGLE_TARGET_MAX_AGGRO_PACK
     caster: dict[str, Any] = {}
     training, spell_name, _ = automatic_training_plan(state)
     trained_level = owned_skill_level(state, training) if training else 0
@@ -705,8 +818,12 @@ class FarmAnalyzer:
         ranked = self.ranking(objective)
         return ranked[0] if ranked else None
 
-    def snapshot(self, objective: str) -> dict[str, Any]:
+    def snapshot(self, objective: str,
+                 ranked: list[dict] | None = None) -> dict[str, Any]:
+        """The dashboard's view; ``ranked`` replaces the raw ranking (the
+        seam-adjusted one, navigation.seam_ranking)."""
         objective = objective if objective in OBJECTIVES else DEFAULT_OBJECTIVE
+        ranked = self.ranking(objective) if ranked is None else ranked
         return {
             "status": self.status,
             "error": self.error,
@@ -722,8 +839,9 @@ class FarmAnalyzer:
             "rejected_origins": sorted(self.rejected_origins),
             "ranking": [
                 {**{key: item.get(key) for key in SUMMARY_FIELDS},
-                 "approach_risky": risky_approach(item)}
-                for item in self.ranking(objective)[:5]
+                 "approach_risky": risky_approach(item),
+                 "spot_risky": risky_spot(item)}
+                for item in ranked[:5]
             ],
         }
 

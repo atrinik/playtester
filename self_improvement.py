@@ -38,8 +38,9 @@ HEAL_STEP, HEAL_CAP = 0.02, 0.98
 PAUSE_FAILURES, PAUSE_WINDOW_SECONDS = 3, 3600.0
 PAUSE_SECONDS = 3600.0
 KEEP_REVIEWS = 10
-# An area where this many pack or out-damaged failures, or deaths on the
-# way to it, happened with one combat kit, within the window, is hazardous
+# An area where this many pack or out-damaged failures, deaths on the way
+# to it, or pack recalls on the way to it (ROUTE_PACK_ATTACKERS or more
+# attackers at once), happened with one combat kit, within the window, is hazardous
 # for that kit: the analyzer ranks it, but her kit cannot hold it. Tighter
 # margins did not help: live, ten deaths in about 90 minutes on the treant
 # and underground-city maps. The analyzer ranks several overlapping circuits
@@ -47,6 +48,14 @@ KEEP_REVIEWS = 10
 KIT_HAZARD_FAILURES = 3
 KIT_HAZARD_WINDOW_SECONDS = 24 * 3600.0
 KIT_HAZARD_CAUSES = frozenset({"pack", "out-damaged"})
+# An emergency recall on the way to a spot counts toward its kit hazard
+# when this many attackers hit her at once (peak_individuals: three orc
+# warriors count three, though one name): an approach pack that large is
+# the area's own pack, not a stray. Live, on 2026-11-23, three orcs forced
+# a recall at the Underground City entrance at 02:43 on the way to the
+# circuit whose casters and orcs killed her at 19:13; counted, the two
+# failures were one short of the hazard.
+ROUTE_PACK_ATTACKERS = 3
 # A map she died on while travelling to a farm spot stays a farm-selection
 # hazard this long (route_death_maps): every spot routed through it is
 # skipped, as long as navigation avoids a map where a route death took
@@ -76,12 +85,16 @@ class FailureReview:
     peak_attackers: int = 0
     damage_by_type: dict[str, int] = field(default_factory=dict)
     damage_taken: int = 0
+    # Estimated individual attackers at once (peak_individuals): three
+    # orc warriors are one name but three attackers.
+    peak_individuals: int = 0
 
     def summary(self) -> dict[str, Any]:
         return {
             "time": self.time, "kind": self.kind, "map": self.map,
             "cause": self.cause, "detail": self.detail,
             "attackers": dict(self.attackers), "peak_attackers": self.peak_attackers,
+            "peak_individuals": self.peak_individuals,
             "damage_by_type": dict(self.damage_by_type),
             "damage_taken": self.damage_taken,
         }
@@ -130,9 +143,83 @@ def peak_attackers(hits: Iterable[tuple[float, str]]) -> int:
     return peak
 
 
+# Hits of one name this close together are from different attackers. The
+# hit text names no individual, and one monster swings far less often: an
+# orc's weapon_speed of 0.035 per tick at 8 ticks a second is a swing about
+# every 3.6 seconds (server/src/types/monster.c, weapon_speed_left).
+BURST_SECONDS = 1.0
+# One swing sends one "<who> hit you for N <type> damage" line per attack
+# type it has (server/src/server/attack.c, the NROFATTACKS loop), all in
+# one server tick (8 a second): lines of one name this close together are
+# one swing, unless two name the same type.
+SWING_SECONDS = 0.125
+def _swings(hits: list[tuple[float, str]]) -> list[tuple[float, int]]:
+    """(time, attackers) of one name's swings from its (time, type) hits:
+    lines within SWING_SECONDS of a swing's first are that swing; as many
+    attackers as the most lines of one type in it."""
+    swings: list[tuple[float, int]] = []
+    group: list[tuple[float, str]] = []
+    for stamp, kind in sorted(hits):
+        if group and stamp - group[0][0] > SWING_SECONDS:
+            kinds = [entry[1] for entry in group]
+            swings.append((group[0][0], max(kinds.count(each) for each in kinds)))
+            group = []
+        group.append((stamp, kind))
+    if group:
+        kinds = [entry[1] for entry in group]
+        swings.append((group[0][0], max(kinds.count(each) for each in kinds)))
+    return swings
+
+
+def _burst(swings: list[tuple[float, int]]) -> int:
+    """The most attackers among swings starting less than BURST_SECONDS
+    apart, at least one."""
+    best = 1
+    for index, (start, _) in enumerate(swings):
+        best = max(best, sum(count for stamp, count in swings[index:]
+                             if stamp - start < BURST_SECONDS))
+    return best
+
+
+def peak_individuals(hits: Iterable[tuple],
+                     monster: Callable[[str], bool] | None = None) -> int:
+    """Estimated individual attackers at once among (time, attacker[,
+    damage type]) hits.
+
+    Only names ``monster`` accepts count (an authored monster kind,
+    navigation's world graph): a hit named for a spell projectile ("magic
+    bullet", "fire"), an effect or a trap is its caster's or nobody's, and
+    one cone caster sends a "fire" line every tick its cone lives. Without
+    ``monster`` every name counts. Within any PACK_WINDOW_SECONDS, one
+    name's lines within SWING_SECONDS are one swing (one line per attack
+    type), and the name counts as many attackers as its most swings less
+    than BURST_SECONDS apart, at least one. The names are summed. An
+    estimate: same-named attackers that never hit within a second of each
+    other, or that swing in the same tick with the same attack types,
+    count as one.
+    """
+    ordered = sorted(((float(hit[0]), str(hit[1]),
+                       str(hit[2]) if len(hit) > 2 else "") for hit in hits
+                      if monster is None or monster(str(hit[1]))),
+                     key=lambda hit: hit[0])
+    peak = 0
+    for index, (start, _, _) in enumerate(ordered):
+        window: dict[str, list[tuple[float, str]]] = {}
+        for stamp, who, kind in ordered[index:]:
+            if stamp - start > PACK_WINDOW_SECONDS:
+                break
+            window.setdefault(who, []).append((stamp, kind))
+        peak = max(peak, sum(_burst(_swings(lines)) for lines in window.values()))
+    return peak
+
+
 def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
-                   failure: dict, spot_paths: Iterable[str]) -> FailureReview:
-    """Classify a failure from the combat messages and decisions before it."""
+                   failure: dict, spot_paths: Iterable[str], *,
+                   monster: Callable[[str], bool] | None = None) -> FailureReview:
+    """Classify a failure from the combat messages and decisions before it.
+
+    ``monster`` says which hit names are authored monster kinds, for
+    peak_individuals."""
     when = float(failure.get("time", 0.0) or 0.0)
     start = when - REVIEW_WINDOW_SECONDS
     # Scanned twice (hits, then starvation): a one-shot iterable must not
@@ -152,6 +239,8 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
         attackers[who] = attackers.get(who, 0) + 1
         damage_by_type[kind] = damage_by_type.get(kind, 0) + amount
     peak = peak_attackers((stamp, who) for stamp, who, _, _ in hits)
+    individuals = peak_individuals(
+        ((stamp, who, kind) for stamp, who, _, kind in hits), monster)
     damage = sum(damage_by_type.values())
     starved = any(
         record.get("action") == "emergency-disengage" and
@@ -184,6 +273,7 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
     return FailureReview(
         time=when, kind=str(failure.get("action", "")), map=failure_map,
         cause=cause, detail=detail, attackers=attackers, peak_attackers=peak,
+        peak_individuals=individuals,
         damage_by_type=damage_by_type, damage_taken=damage)
 
 
@@ -265,6 +355,7 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
                     KIT_HAZARD_WINDOW_SECONDS]
     failure = {"time": review.time, "cause": review.cause,
                "kind": review.kind, "map": review.map,
+               "peak_individuals": int(review.peak_individuals),
                "kit": dict(kit or {})}
     if map_damage is not None:
         failure["map_damage"] = int(map_damage)
@@ -278,15 +369,45 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
     return record, pause
 
 
-def hazard_failure(entry: dict) -> bool:
+def hazard_failure(entry: dict, record: dict | None = None) -> bool:
     """Whether a kit failure counts toward a kit hazard.
 
     Pack and out-damaged failures on the spot count, and so does a death on
-    the way to it ("route"); an emergency recall on the way does not.
+    the way to it ("route"). An emergency recall on the way counts only
+    with ROUTE_PACK_ATTACKERS or more individual attackers at once
+    (peak_individuals). A failure stored before that was kept takes it
+    from the review of the same time and kind in its ``record``.
     """
     cause = entry.get("cause")
-    return cause in KIT_HAZARD_CAUSES or (
-        cause == "route" and entry.get("kind") == "death")
+    if cause in KIT_HAZARD_CAUSES:
+        return True
+    if cause != "route":
+        return False
+    if entry.get("kind") == "death":
+        return True
+    return (entry.get("kind") == "emergency-recall" and
+            _peak_individuals(entry, record) >= ROUTE_PACK_ATTACKERS)
+
+
+def _peak_individuals(entry: dict, record: dict | None) -> int:
+    """A kit failure's estimated individual attackers at once
+    (peak_individuals), from its own entry, else from the review of the
+    same time and kind: its peak_individuals, or for a review stored
+    before that, its distinct names (peak_attackers, a lower bound)."""
+    def number(value) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if "peak_individuals" in entry:
+        return number(entry.get("peak_individuals"))
+    for review in (record or {}).get("reviews", ()) or ():
+        if (isinstance(review, dict) and review.get("time") == entry.get("time") and
+                review.get("kind") == entry.get("kind")):
+            return number(review.get("peak_individuals",
+                                     review.get("peak_attackers")))
+    return 0
 
 
 def route_death_times(adaptations: dict | None,
@@ -295,16 +416,16 @@ def route_death_times(adaptations: dict | None,
     """Maps she recently died on, or fled by recall from, on the way to a
     farm, each with the time of its newest such failure.
 
-    Each route death (hazard_failure with cause "route") keeps the map she
-    actually died on, the transit map, in its kit failure. That map is a
+    Each route death (a kit failure of kind "death", cause "route") keeps
+    the map she actually died on, the transit map, in its kit failure. That map is a
     farm-selection hazard for ROUTE_DEATH_HAZARD_SECONDS, for every spot
     whose route enters it, whichever spot she was heading to. ``applies``
     judges the kit the death happened with (a genuinely improved kit clears
     it). A route emergency recall counts the same way when that map hurt
     her (map_damage above 0): live, three recalls on the underground city
     entrance did not stop the circuit routing through it, and then she
-    died there. Recalls still do not count toward kit
-    hazards (hazard_failure). Neither counts on a map that did not hurt her
+    died there. Only pack recalls count toward kit hazards
+    (hazard_failure). Neither counts on a map that did not hurt her
     (map_damage 0: she died of earlier hits after crossing onto it), as for
     the navigation's learned route hazards; a death stored before
     map_damage was kept counts, a recall stored without it does not.
@@ -318,7 +439,7 @@ def route_death_times(adaptations: dict | None,
             if not (isinstance(entry, dict) and entry.get("cause") == "route" and
                     entry.get("map")):
                 continue
-            if hazard_failure(entry):
+            if entry.get("kind") == "death":
                 hurt = int(entry.get("map_damage", 1) or 0) > 0
             elif entry.get("kind") == "emergency-recall":
                 hurt = int(entry.get("map_damage", 0) or 0) > 0
@@ -363,7 +484,8 @@ def kit_hazard(adaptations: dict | None, key: str, maps: Iterable[str],
                now: float | None = None) -> bool:
     """Whether the area of spot ``key`` on ``maps`` is hazardous for a kit.
 
-    True after KIT_HAZARD_FAILURES qualifying failures (hazard_failure)
+    True after KIT_HAZARD_FAILURES qualifying failures (hazard_failure:
+    pack recalls on the way included)
     within the window, each with a kit ``same_kit`` judges the same as hers
     now, summed over the spot's own record and every record whose spot
     shares a map with ``maps``. The analyzer ranks overlapping circuits for
@@ -382,7 +504,7 @@ def kit_hazard(adaptations: dict | None, key: str, maps: Iterable[str],
             continue
         count += sum(
             1 for entry in record.get("kit_failures", ())
-            if isinstance(entry, dict) and hazard_failure(entry) and
+            if isinstance(entry, dict) and hazard_failure(entry, record) and
             now - float(entry.get("time", 0.0) or 0.0) <= KIT_HAZARD_WINDOW_SECONDS and
             same_kit(entry.get("kit") or {}))
     return count >= KIT_HAZARD_FAILURES
