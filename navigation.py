@@ -7082,10 +7082,6 @@ class FarmCircuitTask(BotTask):
         for name, until in (backoffs or {}).items():
             if name in self.BACKOFF_ATTRIBUTES:
                 setattr(self, name, max(getattr(self, name), float(until)))
-            elif name == "_heal_restock_full_since":
-                # A wait under way, not a deadline: kept as it is, so a
-                # rebuilt circuit does not restart its ten minutes.
-                self._heal_restock_full_since = float(until)
 
     # Maintenance retry deadlines (on ``clock``) a replacement circuit
     # inherits. Live: autoplay rebuilt the circuit after every temple food
@@ -7104,12 +7100,8 @@ class FarmCircuitTask(BotTask):
     def backoffs(self) -> dict[str, float]:
         """The maintenance retry deadlines still pending, for a successor."""
         now = self.clock()
-        pending = {name: getattr(self, name)
-                   for name in self.BACKOFF_ATTRIBUTES
-                   if getattr(self, name) > now}
-        if self._heal_restock_full_since is not None:
-            pending["_heal_restock_full_since"] = self._heal_restock_full_since
-        return pending
+        return {name: getattr(self, name) for name in self.BACKOFF_ATTRIBUTES
+                if getattr(self, name) > now}
 
     def _observe_farm_death(self, client: AtrinikClient) -> bool:
         """Quarantine an analyzer pick after a death or an emergency recall."""

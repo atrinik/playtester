@@ -860,9 +860,11 @@ so she is rarely without a heal:
   (`FarmTask.rest_for_departure`, combat off once per rest; whatever is
   beside her or coming at her is still fought), the trip is re-planned
   every 30 s, and after 10 minutes without getting full she backs off for
-  two hours. The wait survives a rebuilt circuit, ends without a backoff
-  once the restock is no longer due, and is an explained wait for the
-  dashboard's stuck alert.
+  two hours. A rebuilt circuit keeps the 30 s re-plan pause but starts
+  the ten-minute wait afresh (a recovery phase in between would otherwise
+  count against it). The wait ends without a backoff once the restock is
+  no longer due, and is an explained wait for the dashboard's stuck
+  alert. After a fight during the rest, combat off is sent once more.
   The walk keeps the trip's safety policy (heal at 85 %, flee at 70 %).
 - **What.** `BuyHealingStockTask` asks the price of every healing choice
   she can use and buys up to `HEAL_RESTOCK_TARGET` (5) of the one with

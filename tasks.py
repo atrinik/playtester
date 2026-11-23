@@ -5817,7 +5817,8 @@ class FarmTask(BotTask):
                       self._unprepared_hold.active(client, self.safety))
         if not unprepared:
             self._unprepared_resting = False
-        if not self.rest_for_departure:
+        if not self.rest_for_departure or engaged is not None:
+            # A fight in between: combat off is sent again after it.
             self._departure_resting = False
         if ((self.hold_new_pulls or unprepared or self.rest_for_departure)
                 and engaged is None):

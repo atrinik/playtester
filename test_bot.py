@@ -6752,6 +6752,26 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             task._last_action = 0
             asyncio.run(task.tick(client))
         self.assertEqual(client.combat.count(False), 2)
+        # A fight during the rest: combat off is sent once more after it.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        task = FarmTask(zone="/test", target="kobold chief")
+        task.rest_for_departure = True
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.combat, [False])
+        chief = MapObject(3, 1, 0, 0, name="kobold chief", target_id=100,
+                          target_hp=100)
+        client.state.map.tile(9, 8).objects[3] = chief
+        for _ in range(2):
+            task._last_action = 0
+            asyncio.run(task.tick(client))
+        self.assertEqual(client.targets[0], (9, 8, 100))
+        self.assertFalse(task._departure_resting)
+        client.state.map.tiles.clear()
+        for _ in range(3):
+            task._last_action = 0
+            asyncio.run(task.tick(client))
+        self.assertEqual(client.combat.count(False), 2)
         # A kobold six tiles off is not pulled; one beside her is fought.
         def run(x):
             client = self._combat_client()
@@ -22132,14 +22152,14 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         autoplay.status = TaskStatus.RUNNING
         autoplay.child = circuit
         self.assertTrue(autoplay.recovery_alerts(client)[1])
-        # A rebuilt circuit keeps the wait under way, not a new ten minutes.
+        # A rebuilt circuit (after a recovery phase, say) keeps the re-plan
+        # pause but starts the bounded wait afresh: an old start would back
+        # off at once without waiting.
         backoffs = circuit.backoffs()
-        self.assertEqual(backoffs["_heal_restock_full_since"],
-                         circuit._heal_restock_full_since)
+        self.assertNotIn("_heal_restock_full_since", backoffs)
         rebuilt = FarmCircuitTask(built_graph(), [(self.TREES, "")],
                                   backoffs=backoffs)
-        self.assertEqual(rebuilt._heal_restock_full_since,
-                         circuit._heal_restock_full_since)
+        self.assertIsNone(rebuilt._heal_restock_full_since)
         self.assertGreater(rebuilt._heal_restock_retry_at, rebuilt.clock())
         # The money gone below the reserve: the wait ends, the farm farms,
         # and no backoff is written for it.
