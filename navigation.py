@@ -5953,7 +5953,17 @@ def cure_funding_farm(client: AtrinikClient) -> bool:
     funding = cure_funding_farm_state(client)
     return (funding.state == "farming" and
             funding.deaths < CURE_FUNDING_FARM_DEATHS and
-            not cure_affordable(client))
+            not cure_affordable(client) and
+            not _funded_bank_unknown(client))
+
+
+def _funded_bank_unknown(client: AtrinikClient) -> bool:
+    """Funded once, and her bank balance unknown since (a restart, or a
+    purchase that lost its connection): the fee may still be in the bank,
+    so she does not farm; recovery observes the bank again."""
+    state = client.state
+    return bool(float(getattr(state, "cure_funding_farm_funded_at", 0.0) or 0.0)
+                and not state.bank_balance_known)
 
 
 def settle_cure_funding_farm(client: AtrinikClient) -> str:
@@ -6001,8 +6011,10 @@ def settle_cure_funding_farm(client: AtrinikClient) -> str:
                   f"for the {format_money(cost)} cure")
         _set_cure_funding_farm(client, funded_at=now)
     else:
-        if funded_at and not cure_affordable(client):
-            # Short again before the temple: farming resumes, deaths kept.
+        if (funded_at and state.bank_balance_known and
+                not cure_affordable(client)):
+            # Short again before the temple, by the funding path's own
+            # measure (a known bank balance): farming resumes, deaths kept.
             log.info("cure-funding farm: short of the cure again")
             _set_cure_funding_farm(client, funded_at=0.0)
         counted_at = float(getattr(state, "cure_funding_farm_counted_at", 0.0)
@@ -10267,7 +10279,8 @@ class FarmCircuitTask(BotTask):
                 if recorder is not None:
                     recorder("heal-restock-deferred",
                              "no strict route to a healing merchant while "
-                             "unprepared")
+                             + ("unprepared" if unprepared
+                                else "on the cure-funding farm"))
             elif trip is None:
                 self._heal_restock_full_since = None
                 farm.rest_for_departure = False

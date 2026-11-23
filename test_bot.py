@@ -22975,8 +22975,8 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             autoplay._start_mana_crystal_detours(client)))
         self.assertEqual(started, [True])
 
-    def test_the_funding_farm_may_restock_heals_strictly_and_sparingly(self):
-        from .navigation import analyzer_spot_legs, start_cure_funding_farm
+    def test_the_funding_farm_may_restock_heals_sparingly(self):
+        from .navigation import start_cure_funding_farm
 
         client, trees = self.client(depletion=7, bank=2_245)
         circuit = FarmCircuitTask(built_graph(), [("/recovery", "")])
@@ -22993,7 +22993,11 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client.set_cure_funding_farm(since=0.0)
         trip = circuit._new_heal_restock(client, strict=False)
         self.assertEqual(trip.task.quantity, FarmCircuitTask.HEAL_RESTOCK_TARGET)
-        # Prepared or not, the funding farm's restock plans strictly.
+
+    def test_the_funding_farm_restock_plans_strictly_when_prepared(self):
+        from .navigation import analyzer_spot_legs, start_cure_funding_farm
+
+        client, trees = self.client(depletion=7, bank=2_245)
         start_cure_funding_farm(client, "short")
         circuit = FarmCircuitTask(built_graph(), list(analyzer_spot_legs(
             trees, built_graph())), analyzer_driven=True, spot=trees)
@@ -23024,6 +23028,36 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             client, circuit.child.task.safety))
         asyncio.run(circuit.tick(client))
         self.assertEqual(stricts, [True])
+        # With no strict route it is deferred, for the farm's reason.
+        deferred = [record["detail"] for record in client.decision_history
+                    if record["action"] == "heal-restock-deferred"]
+        self.assertEqual(len(deferred), 1)
+        self.assertIn("on the cure-funding farm", deferred[0])
+
+    def test_a_funded_farm_with_an_unknown_bank_never_resumes(self):
+        from .navigation import (CURE_FUNDING_FARM_FUNDED, cure_funding_farm,
+                                 farming_unsafe_reason,
+                                 settle_cure_funding_farm,
+                                 start_cure_funding_farm)
+
+        client, _ = self.client(depletion=7, bank=2_865)
+        start_cure_funding_farm(client, "short")
+        self.assertEqual(settle_cure_funding_farm(client),
+                         CURE_FUNDING_FARM_FUNDED)
+        funded_at = client.state.cure_funding_farm_funded_at
+        # A purchase lost its connection: the fee may still be banked.
+        client.forget_bank_balance()
+        self.assertFalse(client.state.bank_balance_known)
+        self.assertFalse(cure_funding_farm(client))
+        self.assertTrue(farming_unsafe_reason(client))
+        self.assertEqual(settle_cure_funding_farm(client), "")
+        self.assertEqual(client.state.cure_funding_farm_funded_at, funded_at)
+        # Recovery observes the bank: truly short, she farms on.
+        client.state.bank_balance = 2_245
+        client.state.bank_balance_known = True
+        self.assertTrue(cure_funding_farm(client))
+        settle_cure_funding_farm(client)
+        self.assertEqual(client.state.cure_funding_farm_funded_at, 0.0)
 
     def test_the_funding_farm_never_takes_the_hazardous_fallback(self):
         from .navigation import analyzer_farm_choice, start_cure_funding_farm
