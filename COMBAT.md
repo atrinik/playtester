@@ -677,10 +677,15 @@ recovery phase:
   hazard maps when no hazard-free route exists
   (`navigation-threat-fallback`): pack-hazard maps, and with them learned
   ranged and over-level maps; only `KNOWN_LETHAL_TRANSIT` stays closed.
-  Such a crossing waits where she stands for full HP and SP first (the
-  `CARE_BOUNDED` care rule, at most `CARE_WAIT_SECONDS`, then holding
-  fire), and the walk heals below 85% and flees below 70%, as the recall
-  shopping and cure trips do.
+  Once, when such a walk is created, its plan is checked: if it takes
+  that fallback, the walk heals below 85% and, below 70%, stops and steps
+  away from what hits her, as the recall shopping and cure trips do. If
+  she stands on a map without hostile spawns she first rests there, with
+  her usual healing and defence, until her HP and SP are full, for at
+  most `HAZARD_REST_SECONDS` (600 s), and records
+  `recovery-home-hazard-rest`. On a map with hostile spawns she goes at
+  once, since staying is worse. A replan during the walk never rests
+  again; the next walk, after `HOME_RETRY_SECONDS`, is checked afresh.
   The cure trip never crosses a known hazard while she is depleted, and
   waits instead. The walk home cannot: errands, the cure among them,
   start only from her savebed, so waiting off it would leave her uncured

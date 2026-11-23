@@ -20814,10 +20814,10 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertFalse(walk.navigation.strict_safety)
         self.assertEqual(walk.navigation.destination, self.HOME[0])
         self.assertNotEqual(self.moves, [])
-        # A hazard-free ordinary route needs no care wait and keeps the
+        # A hazard-free ordinary route needs no rest and keeps the
         # ordinary safety policy.
-        self.assertFalse(walk.navigation._route_threat_maps)
-        self.assertIsNone(walk.navigation.care)
+        self.assertFalse(walk.navigation.hazard_fallback_taken)
+        self.assertIsNone(recovery._hazard_rest_until)
         self.assertLess(walk.safety.heal_below, recovery.HAZARD_HEAL_BELOW)
         # The cure stays strict and starts only from her savebed.
         self.assertIsNone(recovery.services._restoration)
@@ -20836,31 +20836,35 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         recovery, now = self.recovery(client)
         return client, recovery, now
 
+    # A pack-hazard map on that road, with hostile spawns of its own.
+    PACK_ROAD = ("/shattered_islands/world_6_50", (12, 12))
+
+    def assert_careful(self, recovery, walk):
+        self.assertEqual(walk.safety.heal_below, recovery.HAZARD_HEAL_BELOW)
+        self.assertEqual(walk.safety.flee_below, recovery.HAZARD_FLEE_BELOW)
+
     def test_her_walk_home_clears_the_pack_road_her_trip_out_took(self):
         # 3,052 walks home failed, about every two minutes: every way back
         # crosses pack-hazard maps, which the ordinary walk home never
         # entered although the farm circuit's own return does from level 18.
         from .navigation import NavigateTask
 
-        from .navigation import CARE_BOUNDED
-
         client, recovery, _ = self.stranded_at_the_sage(36)
         packs = NavigateTask(built_graph(), self.CLEARHAVEN_BED[0]) \
             ._known_pack_hazard_maps(self.SAGE[0])
-        # Depleted, she crosses a hazard road only at full HP and SP: at
-        # 75% she waits where she stands.
+        # Depleted, on a map without hostile spawns, she rests for full HP
+        # and SP before crossing: at 75% she stays.
         client.state.stats["hp"] = 100
         for _ in range(3):
             asyncio.run(recovery.tick(client))
         walk = recovery._home_walk
         self.assertIsNotNone(walk)
-        care = walk.navigation.care
-        self.assertIsNotNone(care)
-        self.assertEqual(care.mode, CARE_BOUNDED)
-        self.assertIn("full HP", care.missing)
+        self.assertIsNotNone(recovery._hazard_rest_until)
         self.assertEqual(self.moves, [])
-        self.assertEqual(walk.safety.heal_below, recovery.HAZARD_HEAL_BELOW)
-        self.assertEqual(walk.safety.flee_below, recovery.HAZARD_FLEE_BELOW)
+        self.assertEqual(walk.navigation.status, TaskStatus.READY)
+        self.assert_careful(recovery, walk)
+        self.assertEqual(
+            self.actions(client).count("recovery-home-hazard-rest"), 1)
         # Rested, she departs.
         client.state.stats["hp"] = 134
         for _ in range(3):
@@ -20868,21 +20872,57 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         actions = self.actions(client)
         self.assertIn("recovery-home-unsafe-route", actions)
         self.assertIn("navigation-threat-fallback", actions)
-        walk = recovery._home_walk
-        self.assertIsNotNone(walk)
+        self.assertIs(recovery._home_walk, walk)
+        self.assertIsNone(recovery._hazard_rest_until)
         self.assertFalse(walk.navigation.strict_safety)
         self.assertTrue(walk.navigation.allow_ranged_hazard_fallback)
-        self.assertNotEqual(walk.navigation.status, TaskStatus.FAILED)
+        self.assertEqual(walk.navigation.status, TaskStatus.RUNNING)
         route = walk.navigation.route
         self.assertEqual(route[-1].destination, self.CLEARHAVEN_BED[0])
         self.assertTrue({edge.destination for edge in route} & packs)
         self.assertNotEqual(self.moves, [])
         self.assertEqual(self.ids(recovery.alerts(client)), [])
+        # A replan within the walk, hurt again, never rests again.
+        client.state.stats["hp"] = 100
+        walk.navigation.route = []
+        moved = len(self.moves)
+        asyncio.run(recovery.tick(client))
+        self.assertIsNone(recovery._hazard_rest_until)
+        self.assertTrue(walk.navigation.route)
+        self.assertGreater(len(self.moves), moved)
+        self.assertEqual(
+            self.actions(client).count("recovery-home-hazard-rest"), 1)
         # The strict walk never takes that road: only the ordinary one.
         strict = recovery._new_home_walk(
             client, self.CLEARHAVEN_BED, strict=True)
         self.assertFalse(strict.navigation.allow_ranged_hazard_fallback)
-        self.assertFalse(strict.navigation.care_on_threat_fallback)
+
+    def test_on_a_hostile_map_she_crosses_home_without_resting(self):
+        # Staying on a map with hostile spawns is worse than going.
+        client, recovery, _ = self.stranded_at_the_sage(36)
+        self.place(client, self.PACK_ROAD)
+        client.state.stats["hp"] = 100
+        asyncio.run(recovery.tick(client))
+        walk = recovery._home_walk
+        self.assertIsNotNone(walk)
+        self.assertIsNone(recovery._hazard_rest_until)
+        self.assertTrue(walk.navigation.hazard_fallback_taken)
+        self.assert_careful(recovery, walk)
+        self.assertNotEqual(self.moves, [])
+        self.assertNotIn("recovery-home-hazard-rest", self.actions(client))
+
+    def test_her_rest_before_a_hazard_crossing_home_is_bounded(self):
+        client, recovery, now = self.stranded_at_the_sage(36)
+        client.state.stats["hp"] = 100
+        asyncio.run(recovery.tick(client))
+        self.assertIsNotNone(recovery._hazard_rest_until)
+        now[0] += recovery.HAZARD_REST_SECONDS - 1
+        asyncio.run(recovery.tick(client))
+        self.assertEqual(self.moves, [])
+        now[0] += 1
+        asyncio.run(recovery.tick(client))
+        self.assertIsNone(recovery._hazard_rest_until)
+        self.assertNotEqual(self.moves, [])
 
     def test_a_savebed_she_cannot_reach_is_alerted_once_and_retried(self):
         # Below the level the careful route clear starts at, no walk home

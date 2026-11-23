@@ -2396,10 +2396,10 @@ class NavigateTask(BotTask):
         self._route_threat_maps: set[str] = set()
         self._threat_fallback = False
         self.allow_ranged_hazard_fallback = False
-        # A route that takes that fallback crosses its threat maps with
-        # CARE_BOUNDED care (full HP and SP first): the recovery phase's
-        # walk home, where she is depleted.
-        self.care_on_threat_fallback = False
+        # The last _plan_avoiding took a fallback tier that enters hazard
+        # maps (navigation-threat-fallback): not the tunnel retry, not a
+        # learned-cost plan.
+        self.hazard_fallback_taken = False
         # Avoid every known hazard, the maps that killed her included, with
         # no fallback tier: no safe route means no trip (the task fails and
         # is retried later), never a dangerous one.
@@ -2635,10 +2635,6 @@ class NavigateTask(BotTask):
             self._plan_client = None
         if not learned:
             self._shadow(client, origin, route, "")
-        if self.care_on_threat_fallback and self._route_threat_maps:
-            self._bounded = tuple(dict.fromkeys((*self._bounded, *(
-                route_blocks.map_subject(path)
-                for path in sorted(self._route_threat_maps)))))
         if self._crossed or self._bounded:
             # Both may hold at once (a blocked and over-budget route): the
             # crossing waits as an owner block and keeps the bounded
@@ -3217,6 +3213,7 @@ class NavigateTask(BotTask):
         }
         previous_fallback = self._threat_fallback
         self._threat_fallback = False
+        self.hazard_fallback_taken = False
 
         def relaxed(avoided: set[str]) -> dict:
             # A hazard a fallback tier stops avoiding is still a known threat:
@@ -3273,7 +3270,7 @@ class NavigateTask(BotTask):
                         fallback_kwargs = relaxed(set(self.KNOWN_LETHAL_TRANSIT))
                         route = self._route_points(
                             *args, **fallback_kwargs)
-                    self._threat_fallback = True
+                    self._threat_fallback = self.hazard_fallback_taken = True
                     if not previous_fallback:
                         recorder = getattr(client, "record_action", None)
                         if recorder is not None:
@@ -3285,7 +3282,7 @@ class NavigateTask(BotTask):
                     fallback_kwargs = relaxed(set(self.KNOWN_LETHAL_TRANSIT))
                     route = self._route_points(
                         *args, **fallback_kwargs)
-                    self._threat_fallback = True
+                    self._threat_fallback = self.hazard_fallback_taken = True
                     if not previous_fallback:
                         recorder = getattr(client, "record_action", None)
                         if recorder is not None:
@@ -9775,7 +9772,7 @@ class RecoveryTask(BotTask):
     - off her savebed with nothing running: a walk home, strictly safe
       where such a route exists and otherwise by the ordinary route
       (recovery-home-unsafe-route), which from level 18 may cross hazard
-      maps as the farm return does, after waiting for full HP and SP.
+      maps as the farm return does, resting first on a safe map.
       Three failed walks in a row raise home-unreachable. Every errand
       starts from her savebed;
     - depleted: the temple cure when she can pay (a depletion potion
@@ -9819,6 +9816,8 @@ class RecoveryTask(BotTask):
                                          combat_approach=True)
         self._home_walk: NavigateThenTask | None = None
         self._home_retry_at = 0.0
+        # The rest before a hazard crossing home ends by this clock time.
+        self._hazard_rest_until: float | None = None
         # Walks home failed in a row, and the latest failure.
         self._home_failures = 0
         self._home_error = ""
@@ -10034,20 +10033,76 @@ class RecoveryTask(BotTask):
         # began at the sage, and every way back to her Clearhaven savebed
         # crossed pack-hazard maps: 3,052 walks home failed. The hazard-free
         # route is still preferred; the planner falls back only when none
-        # exists (navigation-threat-fallback). Such a crossing waits for
-        # full HP and SP first (care_on_threat_fallback), and the walk then
-        # heals and flees early (_tick_home_walk).
+        # exists (navigation-threat-fallback). Such a walk rests first
+        # where that is safe and heals early (_start_ordinary_home_walk).
         walk.navigation.allow_ranged_hazard_fallback = (
             not strict and FarmCircuitTask._combat_progression_level(client) >=
             FarmCircuitTask.SWAMP_TRANSIT_LEVEL)
-        walk.navigation.care_on_threat_fallback = (
-            walk.navigation.allow_ranged_hazard_fallback)
         return walk
 
-    # The walk home's safety policy once its route crosses a threat map:
-    # the recall shopping and cure trips' early healing and flight.
+    # The walk home's safety policy once its route crosses hazard maps:
+    # the recall shopping and cure trips' early healing and step-away.
     HAZARD_HEAL_BELOW = 0.85
     HAZARD_FLEE_BELOW = 0.70
+    # Before such a walk departs from a map without hostile spawns she
+    # rests there for full HP and SP, at most this long.
+    HAZARD_REST_SECONDS = CARE_WAIT_SECONDS
+
+    def _careful(self, walk: NavigateThenTask) -> None:
+        if walk.safety.heal_below < self.HAZARD_HEAL_BELOW:
+            walk.safety = SafetyPolicy(heal_below=self.HAZARD_HEAL_BELOW,
+                                       flee_below=self.HAZARD_FLEE_BELOW)
+
+    def _start_ordinary_home_walk(self, client: AtrinikClient,
+                                  home: tuple[str, tuple[int, int]]
+                                  ) -> NavigateThenTask:
+        """The ordinary walk home, and once, before it departs, whether its
+        route takes the hazard fallback. If so it heals and steps away
+        early, and where she stands has no hostile spawns she rests first
+        (_hazard_rest_until): depleted, she crosses rested. On a map with
+        hostile spawns she goes at once, since staying is worse. Replans
+        within the walk never rest again."""
+        walk = self._new_home_walk(client, home, strict=False)
+        self._hazard_rest_until = None
+        navigation = walk.navigation
+        if not navigation.allow_ranged_hazard_fallback:
+            return walk
+        try:
+            # A planning probe: the walk has not started.
+            navigation._plan(client)
+        except ValueError:
+            return walk
+        if not navigation.hazard_fallback_taken:
+            return walk
+        self._careful(walk)
+        here = client.state.map.path
+        if not navigation._hostile_map(here):
+            self._hazard_rest_until = self.clock() + self.HAZARD_REST_SECONDS
+            self._record(client, "recovery-home-hazard-rest",
+                         f"resting on {here} before crossing "
+                         f"{', '.join(sorted(navigation._route_threat_maps))}")
+        return walk
+
+    @staticmethod
+    def _rested(client: AtrinikClient) -> bool:
+        stats = client.state.stats
+        hp, maxhp = int(stats.get("hp", 0) or 0), int(stats.get("maxhp", 0) or 0)
+        sp, maxsp = int(stats.get("sp", 0) or 0), int(stats.get("maxsp", 0) or 0)
+        return maxhp > 0 and hp >= maxhp and sp >= maxsp
+
+    async def _hazard_rest(self, client: AtrinikClient) -> bool:
+        """True while she rests before a hazard crossing home."""
+        until = self._hazard_rest_until
+        if until is None:
+            return False
+        if self._rested(client) or self.clock() >= until:
+            self._hazard_rest_until = None
+            return False
+        if _contact_this_life(client):
+            await self._defend(client)
+        else:
+            await self.safety.enforce(client)
+        return True
 
     async def _tick_home_walk(self, client: AtrinikClient) -> None:
         """One step of the walk home: strictly safe, and when no such route
@@ -10060,6 +10115,8 @@ class RecoveryTask(BotTask):
         """
         walk = self._home_walk
         assert walk is not None
+        if await self._hazard_rest(client):
+            return
         await walk.tick(client)
         if (walk.status == TaskStatus.FAILED and
                 walk.navigation.strict_safety and
@@ -10072,13 +10129,14 @@ class RecoveryTask(BotTask):
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
                 recorder("recovery-home-unsafe-route", walk.error)
-            walk = self._home_walk = self._new_home_walk(
-                client, home, strict=False)
+            walk = self._home_walk = self._start_ordinary_home_walk(
+                client, home)
+            if await self._hazard_rest(client):
+                return
             await walk.tick(client)
-        if (walk.navigation._route_threat_maps and
-                walk.safety.heal_below < self.HAZARD_HEAL_BELOW):
-            walk.safety = SafetyPolicy(heal_below=self.HAZARD_HEAL_BELOW,
-                                       flee_below=self.HAZARD_FLEE_BELOW)
+        if walk.navigation.hazard_fallback_taken:
+            # A replan that took the fallback mid-walk: careful, no rest.
+            self._careful(walk)
         if walk.status == TaskStatus.FAILED:
             log.warning("recovery: walk to her savebed failed: %s", walk.error)
             self._home_retry_at = self.clock() + self.HOME_RETRY_SECONDS
@@ -10151,6 +10209,7 @@ class RecoveryTask(BotTask):
             await client.clear_actions()
             await client.set_combat(False)
             self._home_walk = self._new_home_walk(client, home, strict=True)
+            self._hazard_rest_until = None
             await self._tick_home_walk(client)
             return
         # Every errand starts from her savebed; off it, she waits for the
