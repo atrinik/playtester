@@ -25436,7 +25436,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=37", page)
+        self.assertIn(b"/app.js?v=39", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -30025,6 +30025,24 @@ class OwnerWatchTests(unittest.TestCase):
             recorder.note(Frame(40.3, "Sera", "/t", node, (4, 3), [orc]))
         recorder.observe(40.4, "Sera")
         self.assertTrue(recorder.engagement.shared)
+        # Lost frames with no engagement at the step's start: one begun in
+        # them (a player may have been there) is shared too, until a frame
+        # without one.
+        recorder.reset()
+        with patch.object(owner_watch, "MAX_FRAMES", 2):
+            recorder.note(Frame(50.0, "Sera", "/t", node, (4, 3), [orc], True,
+                                [(5, 3, c.ANIM_DAMAGE, 1)]))
+            for at in (50.1, 50.2):
+                recorder.note(Frame(at, "Sera", "/t", node, (4, 3), [orc], False,
+                                    [(5, 3, c.ANIM_DAMAGE, 1)]))
+        recorder.observe(50.3, "Sera")
+        self.assertTrue(recorder.engagement.shared)
+        self.assertEqual(recorder.observe(70.0, "Sera"), [])
+        recorder.note(Frame(80.0, "Sera", "/t", node, (4, 3), [orc]))
+        recorder.note(Frame(80.1, "Sera", "/t", node, (4, 3), [orc], False,
+                            [(5, 3, c.ANIM_DAMAGE, 1)]))
+        recorder.observe(80.2, "Sera")
+        self.assertFalse(recorder.engagement.shared)
 
     def test_frames_are_taken_as_the_client_publishes_a_generation(self):
         client = self.client()

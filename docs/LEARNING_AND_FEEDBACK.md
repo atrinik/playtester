@@ -2352,8 +2352,10 @@ the Farming tab's **Watching the owner** section):
   step in order, each animation against its own frame. So a player who
   walks in, strikes and leaves between two steps still makes the
   engagement shared, and an owner who moved between generations is
-  credited on the square it stood on then. More than 256 frames between
-  steps also make the engagement shared.
+  credited on the square it stood on then. If more than 256 frames
+  arrive between steps, the oldest are lost. Every engagement from then
+  until a frame with none is then shared, including one that began in
+  the lost frames.
 - **An engagement** starts at the first damage number on the operator
   character's square, damage number on a monster next to it, or kill
   marker next to it. A kill marker counts only where a monster stood

@@ -223,6 +223,9 @@ class OwnerWatchRecorder:
         self.engagement: Engagement | None = None
         self.frames: collections.deque[Frame] = collections.deque()
         self.frames_lost = False
+        # Frames were lost: every engagement until a frame without one is
+        # shared, as a lost frame may have held a player.
+        self.tainted = False
         # When the operator character was last in view (wall clock), and
         # when its last engagement ended while it stayed in view since: the
         # rest before the next pull.
@@ -244,7 +247,7 @@ class OwnerWatchRecorder:
     def reset(self) -> None:
         self.engagement = None
         self.frames.clear()
-        self.frames_lost = False
+        self.frames_lost = self.tainted = False
         self.seen_at = self.last_end = self.last_hp = None
         self.previous_adjacent = {}
 
@@ -260,8 +263,8 @@ class OwnerWatchRecorder:
         as the engine sees it now."""
         rows: list[dict[str, Any]] = []
         frames, self.frames = list(self.frames), collections.deque()
-        if self.frames_lost and self.engagement is not None:
-            self.engagement.shared = True
+        if self.frames_lost:
+            self.tainted = True
         self.frames_lost = False
         for frame in frames:
             rows.extend(self._frame(frame))
@@ -340,8 +343,9 @@ class OwnerWatchRecorder:
         engagement = self.engagement
         if engagement is None:
             self.last_hp = frame.hp
+            self.tainted = False
             return rows
-        engagement.shared = engagement.shared or frame.others
+        engagement.shared = engagement.shared or frame.others or self.tainted
         engagement.peak_adjacent = max(engagement.peak_adjacent, len(adjacent))
         if frame.hp is not None:
             engagement.hp_low = frame.hp if engagement.hp_low is None else \
