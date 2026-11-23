@@ -593,6 +593,8 @@ def route_shadow_command(args: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
         return 0
     print(f"{report['rows']} comparisons in the last {args.hours:g} h")
+    if report["zero_length"]:
+        print(f"  ({report['zero_length']} zero-length trips ignored)")
     for kind, trips in sorted(report["counts"].items()):
         for trip, results in sorted(trips.items()):
             total = sum(results.values())
