@@ -4400,9 +4400,6 @@ class NavigateThenTask(BotTask):
             self._retreat_blocked_at[(path, x, y)] = now
             self._retreat_attempt = None
             return False
-        if m.path != path:
-            self._retreat_attempt = None
-            return False
         return True
 
     def _send_retreat_step(self, client: AtrinikClient, x: int, y: int,
@@ -4412,11 +4409,14 @@ class NavigateThenTask(BotTask):
         self._retreat_from = (m.path, m.world_x, m.world_y)
 
     async def _retreat_step(self, client: AtrinikClient, threats,
-                            *, avoid_backtrack: bool = False) -> bool:
+                            *, avoid_backtrack: bool = False,
+                            gain_only: bool = False) -> bool:
         """Take one authored-walkable step away from the visible pack.
 
         While a step is in flight it waits for it (_retreat_step_pending)
-        and answers True.
+        and answers True. ``gain_only`` takes only a step that increases
+        her separation from the nearest threat: an equal-distance step can
+        shuffle between two squares beside a creature that stands still.
         """
         m = client.state.map
         now = time.monotonic()
@@ -4451,7 +4451,8 @@ class NavigateThenTask(BotTask):
             distances = [max(abs(point[0] - x), abs(point[1] - y))
                          for x, y in threat_world]
             minimum = min(distances)
-            if minimum < current_min:
+            if minimum < current_min or (
+                    gain_only and minimum == current_min):
                 continue
             backtrack = int(previous == (m.path, *point))
             trail_score = -backtrack if avoid_backtrack else backtrack
@@ -4801,7 +4802,7 @@ class NavigateThenTask(BotTask):
                        m.path == self.navigation.destination and
                        self.task.spell_only_training(client))
         if (ratio > self.safety.flee_below and nearest is not None and
-                not hold_fire and not spells_only and not self._escaping and
+                not hold_fire and not spells_only and
                 isinstance(self.task, FarmTask) and
                 self.task.should_training_finish(client, nearest[3])):
             _, x, y, obj = nearest
@@ -4824,10 +4825,10 @@ class NavigateThenTask(BotTask):
                 not safety_action_issued and
                 self._critical_escape_due(client, ratio, nearby) and
                 await self._retreat_step(
-                    client, nearby, avoid_backtrack=True)):
+                    client, nearby, avoid_backtrack=True, gain_only=True)):
             # Critical with no heal and no recall, and attacked: run, combat
             # off, starving or not (only resting is futile then). With no
-            # step away the defence below stands.
+            # step that gains distance the defence below stands.
             if not self._escaping:
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
@@ -4953,7 +4954,6 @@ class NavigateThenTask(BotTask):
                 return False
         if (safe and nearest is not None and nearest[0] > 2 and
                 len(pull_pack) >= 2 and not hold_fire and
-                not self._escaping and
                 time.monotonic() - self._last_pull_at >= 2.5):
             offensive = pack_offensive
             if (offensive is not None and

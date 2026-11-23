@@ -11264,6 +11264,25 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertFalse(task._escaping)
         self.assertEqual(client.combat[-1], True)
 
+    def test_critical_escape_in_a_pocket_fights_rather_than_shuffles(self):
+        """Every step beside her stays next to the troll: no step gains
+        distance, so she fights it instead of shuffling with combat off."""
+        client, node, task = self._outpost_escape()
+        node.terrain = {(10, 10): 1, (10, 11): 1, (11, 10): 1, (12, 10): 1,
+                        (13, 10): 1}
+        self._corner(task, client)
+        for _ in range(8):
+            client.state.messages = [(
+                time.time(), 2, "cc66ff",
+                "troll guard hit you for 17 damage.")]
+            self._troll_at(client, 11, 10)
+            task._last_defense_action = 0.0
+            asyncio.run(task._defend_while_navigating(client, own_walk=True))
+        self.assertEqual(client.direct_moves, [])
+        self.assertFalse(task._escaping)
+        self.assertIn(True, client.combat)
+        self.assertEqual(client.targets[-1][2], 700)
+
     def test_critical_escape_cornered_fights_the_adjacent_attacker(self):
         client, node, task = self._outpost_escape(hp=250)
         task._escaping = True

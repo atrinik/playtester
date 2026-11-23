@@ -863,20 +863,20 @@ Now, on a defended walk:
   3 s, or one within 2 tiles), she runs, starving or not: combat off, no
   pull, recorded once per escape as `navigation-critical-escape`. Before
   it come only the safety's heal and food (`SafetyPolicy.enforce`; a heal
-  or meal just sent holds the escape for that tick), the training finisher
-  above the flee threshold, the weapon restore, the transit hold-fire
-  release of an engagement and the stalled-target abandon. The step is the usual retreat ranking: never closer to an
-  attacker, open continuation and separation first, and no immediate
-  step back.
+  or meal just sent holds the escape for that tick) and the transit
+  hold-fire release of an engagement. The step must take her farther
+  from the nearest attacker (`gain_only`); among those, the usual retreat
+  ranking chooses, open continuation first. An equal-distance step does
+  not count: in a pocket it shuffled her between two squares beside a
+  troll that stood still, combat off, never fighting.
 - **No re-engaging until recovered.** The escape holds until she is above
   the safety's heal threshold, or has a heal or a ready recall again, and
   ends when the walk starts again. Until then she keeps running from an
-  attacker on her, and closes no gap to a creature more than 2 tiles off:
-  no training finisher, no pack cast.
-- **Cornered keeps its defence.** With no step away the escape does not
-  act, and the walk's defence decides as before (the cornered fight among
-  them), against the closest attacker rather than a committed one farther
-  off.
+  attacker on her, and closes no gap to a creature more than 2 tiles off.
+- **Cornered keeps its defence.** With no step that gains distance the
+  escape does not act, and the walk's defence decides as before (the
+  cornered fight among them), against the closest attacker rather than a
+  committed one farther off.
 
 Accepted limits:
 
