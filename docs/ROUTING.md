@@ -326,6 +326,10 @@ G9.
 - **Level-18 fallback.** `FarmCircuitTask._retry_unavoidable_return_route`
   (`navigation.py:5172-5197`) retries a failed farm trip once with
   `allow_ranged_hazard_fallback` when the combat level is 18 or more.
+  The recovery phase's ordinary walk home (`RecoveryTask._new_home_walk`)
+  sets it from the same level, so a trip out that cleared a pack road can
+  come back the same way; its strict walk never does
+  ([COMBAT.md](../COMBAT.md), recovery phase).
 
 The pack estimate (`transit_max_aggro_pack`) only rates `world_*` maps.
 Dungeon maps are never pack hazards, however dense: Underground City

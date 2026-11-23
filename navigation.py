@@ -9766,7 +9766,9 @@ class RecoveryTask(BotTask):
       covers hunger with nothing to eat);
     - off her savebed with nothing running: a walk home, strictly safe
       where such a route exists and otherwise by the ordinary route
-      (recovery-home-unsafe-route). Every errand starts from her savebed;
+      (recovery-home-unsafe-route), which from level 18 may clear a pack
+      road as the farm return does. Three failed walks in a row raise
+      home-unreachable. Every errand starts from her savebed;
     - depleted: the temple cure when she can pay (a depletion potion
       first), otherwise the cure-funding path: identify-all, junk sale,
       deposit, the apartment chest. No recall is bought with the cure's
@@ -9789,6 +9791,8 @@ class RecoveryTask(BotTask):
     HOME_RETRY_SECONDS = FarmCircuitTask.STRICT_ROUTE_RETRY_SECONDS
     # Within this many tiles of her savebed she is home.
     HOME_TOLERANCE = 2
+    # This many walks home failing in a row raise home-unreachable.
+    HOME_ROUTE_ATTEMPTS = 3
 
     def __init__(self, graph: WorldGraph, *,
                  backoffs: dict[str, float] | None = None,
@@ -9806,6 +9810,9 @@ class RecoveryTask(BotTask):
                                          combat_approach=True)
         self._home_walk: NavigateThenTask | None = None
         self._home_retry_at = 0.0
+        # Walks home failed in a row, and the latest failure.
+        self._home_failures = 0
+        self._home_error = ""
         # Strict-route refusals of the cure are recorded decisions
         # (cure_route_refusals): they outlive a temple food trip, Stop and
         # restarts.
@@ -9874,6 +9881,19 @@ class RecoveryTask(BotTask):
     def alerts(self, client: AtrinikClient) -> list[dict[str, str]]:
         """What blocks her way out, from live state: each clears as soon
         as its condition does."""
+        alerts = self._cure_alerts(client)
+        if self._home_failures >= self.HOME_ROUTE_ATTEMPTS:
+            home = self._home(client)
+            alerts.append({
+                "id": "home-unreachable", "level": "critical",
+                "text": f"Savebed unreachable: {self._home_failures} walks "
+                        f"home to {home[0] if home else '?'} failed in a "
+                        f"row; she retries every "
+                        f"{int(self.HOME_RETRY_SECONDS)} s: "
+                        f"{self._home_error}"})
+        return alerts
+
+    def _cure_alerts(self, client: AtrinikClient) -> list[dict[str, str]]:
         s = self.services
         wallet = BuyShopUpgradeTask.wallet_value(client)
         assist = "; the owner can give her gold with the operator assist"
@@ -9988,13 +10008,25 @@ class RecoveryTask(BotTask):
                     client, "_cure_funding", s._new_cure_funding(client))
         return False
 
-    def _new_home_walk(self, home: tuple[str, tuple[int, int]], *,
+    def _new_home_walk(self, client: AtrinikClient,
+                       home: tuple[str, tuple[int, int]], *,
                        strict: bool) -> NavigateThenTask:
         walk = NavigateThenTask(self.graph, home[0], _ArriveTask("savebed"),
                                 destination_xy=home[1], combat_approach=True)
         walk.navigation.tolerance = 1
         walk.navigation.strict_safety = strict
         walk.navigation.essential = "home"
+        # The ordinary walk home may clear its way through pack-hazard maps
+        # from the level the farm circuit's own return does
+        # (_retry_unavoidable_return_route). Live, from 2026-11-18, the
+        # Asteria sage's recall trip took that careful route out, recovery
+        # began at the sage, and every way back to her Clearhaven savebed
+        # crossed the crocodile road's pack maps: 3,052 walks home failed.
+        # The pack-free route is still preferred; the planner falls back
+        # only when none exists (navigation-threat-fallback).
+        walk.navigation.allow_ranged_hazard_fallback = (
+            not strict and FarmCircuitTask._combat_progression_level(client) >=
+            FarmCircuitTask.SWAMP_TRANSIT_LEVEL)
         return walk
 
     async def _tick_home_walk(self, client: AtrinikClient) -> None:
@@ -10020,14 +10052,22 @@ class RecoveryTask(BotTask):
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
                 recorder("recovery-home-unsafe-route", walk.error)
-            walk = self._home_walk = self._new_home_walk(home, strict=False)
+            walk = self._home_walk = self._new_home_walk(
+                client, home, strict=False)
             await walk.tick(client)
         if walk.status == TaskStatus.FAILED:
             log.warning("recovery: walk to her savebed failed: %s", walk.error)
             self._home_retry_at = self.clock() + self.HOME_RETRY_SECONDS
             self._home_walk = None
+            self._home_failures += 1
+            self._home_error = walk.error
+            if self._home_failures == self.HOME_ROUTE_ATTEMPTS:
+                # Once per streak: the retries go on (learned hazards
+                # expire), the dashboard alert says why she is not home.
+                self._record(client, "recovery-home-unreachable", walk.error)
         elif walk.status == TaskStatus.COMPLETE:
             self._home_walk = None
+            self._home_failures, self._home_error = 0, ""
 
     async def _defend(self, client: AtrinikClient) -> None:
         """Hit with nothing under way: heal, flee or fight back here."""
@@ -10085,10 +10125,11 @@ class RecoveryTask(BotTask):
                 self.clock() >= self._home_retry_at):
             await client.clear_actions()
             await client.set_combat(False)
-            self._home_walk = self._new_home_walk(home, strict=True)
+            self._home_walk = self._new_home_walk(client, home, strict=True)
             await self._tick_home_walk(client)
             return
         # Every errand starts from her savebed; off it, she waits for the
         # next walk home.
         if self.at_home(client):
+            self._home_failures, self._home_error = 0, ""
             await self._start_errand(client, reason)

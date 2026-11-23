@@ -20817,6 +20817,71 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # The cure stays strict and starts only from her savebed.
         self.assertIsNone(recovery.services._restoration)
 
+    # Live, from 2026-11-18 (v1.81-v1.87): recovery began at the Asteria
+    # sage, where her recall trip had taken the careful route through the
+    # crocodile road's pack maps, and her savebed was a Clearhaven bed.
+    SAGE = ("/shattered_islands/world_4_47", (13, 11))
+    CLEARHAVEN_BED = ("/shattered_islands/world_7_79", (16, 3))
+
+    def stranded_at_the_sage(self, level):
+        client, _ = self.client(depletion=92, level=level)
+        client.state.savebed_map, client.state.savebed_xy = self.CLEARHAVEN_BED
+        self.place(client, self.SAGE)
+        recovery, now = self.recovery(client)
+        return client, recovery, now
+
+    def test_her_walk_home_clears_the_pack_road_her_trip_out_took(self):
+        # 3,052 walks home failed, about every two minutes: every way back
+        # crosses pack-hazard maps, which the ordinary walk home never
+        # entered although the farm circuit's own return does from level 18.
+        from .navigation import NavigateTask
+
+        client, recovery, _ = self.stranded_at_the_sage(36)
+        packs = NavigateTask(built_graph(), self.CLEARHAVEN_BED[0]) \
+            ._known_pack_hazard_maps(self.SAGE[0])
+        for _ in range(3):
+            asyncio.run(recovery.tick(client))
+        actions = self.actions(client)
+        self.assertIn("recovery-home-unsafe-route", actions)
+        self.assertIn("navigation-threat-fallback", actions)
+        walk = recovery._home_walk
+        self.assertIsNotNone(walk)
+        self.assertFalse(walk.navigation.strict_safety)
+        self.assertTrue(walk.navigation.allow_ranged_hazard_fallback)
+        self.assertNotEqual(walk.navigation.status, TaskStatus.FAILED)
+        route = walk.navigation.route
+        self.assertEqual(route[-1].destination, self.CLEARHAVEN_BED[0])
+        self.assertTrue({edge.destination for edge in route} & packs)
+        self.assertNotEqual(self.moves, [])
+        self.assertEqual(self.ids(recovery.alerts(client)), [])
+        # The strict walk never takes that road: only the ordinary one.
+        self.assertFalse(recovery._new_home_walk(
+            client, self.CLEARHAVEN_BED, strict=True)
+            .navigation.allow_ranged_hazard_fallback)
+
+    def test_a_savebed_she_cannot_reach_is_alerted_once_and_retried(self):
+        # Below the level the careful route clear starts at, no walk home
+        # exists: she keeps retrying, but the dashboard says why.
+        client, recovery, now = self.stranded_at_the_sage(12)
+        for attempt in range(1, recovery.HOME_ROUTE_ATTEMPTS + 2):
+            asyncio.run(recovery.tick(client))
+            self.assertIsNone(recovery._home_walk)
+            self.assertEqual(recovery._home_failures, attempt)
+            now[0] += recovery.HOME_RETRY_SECONDS
+        alerts = recovery.alerts(client)
+        self.assertIn("home-unreachable", self.ids(alerts))
+        alert = next(a for a in alerts if a["id"] == "home-unreachable")
+        self.assertEqual(alert["level"], "critical")
+        self.assertIn(self.CLEARHAVEN_BED[0], alert["text"])
+        self.assertIn("no component route", alert["text"])
+        self.assertEqual(
+            self.actions(client).count("recovery-home-unreachable"), 1)
+        # Home again (a respawn, say): the streak and the alert clear.
+        self.place(client, self.CLEARHAVEN_BED)
+        asyncio.run(recovery.tick(client))
+        self.assertEqual(recovery._home_failures, 0)
+        self.assertNotIn("home-unreachable", self.ids(recovery.alerts(client)))
+
     def test_hit_with_nothing_under_way_she_defends_instead_of_errands(self):
         client, _ = self.client(depletion=92)
         recovery, _ = self.recovery(client)
@@ -26282,7 +26347,8 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         shopping = circuit._new_recall_shopping(self.client)
         self.assertEqual(shopping.navigation.essential, "")
         self.assertFalse(shopping.navigation.is_essential(self.client))
-        self.assertEqual(recovery._new_home_walk(("/home", (2, 0)), strict=True)
+        self.assertEqual(recovery._new_home_walk(
+            self.client, ("/home", (2, 0)), strict=True)
                          .navigation.essential, "home")
         # Food is essential only while she is hungry or starving.
         self.assertFalse(self.trip("food").is_essential(self.client))

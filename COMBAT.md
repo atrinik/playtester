@@ -671,8 +671,19 @@ recovery phase:
   Where none exists it takes the ordinary route, which only costs learned
   hazards more, and records `recovery-home-unsafe-route`. Recovery
   usually starts on the farm, and live no strictly safe route led home
-  from any Burnt Forest map. Errands start only from her savebed, and the
-  cure and funding trips stay strict;
+  from any Burnt Forest map. From combat level 18
+  (`SWAMP_TRANSIT_LEVEL`), the level the farm circuit's own return does
+  (`farm-return-threat-fallback`), that ordinary walk may also clear its
+  way through pack-hazard maps when no pack-free route exists
+  (`navigation-threat-fallback`). Live, from 2026-11-18 (v1.81 to
+  v1.87), recovery began at the Asteria sage (`world_4_47`), where her
+  recall trip had taken that careful route out, and every way back to her
+  Clearhaven savebed (`world_7_79`) crossed the crocodile road's pack
+  maps (`world_6_50`, `world_5_51`): 3,052 walks home failed, one every
+  two minutes, until v1.88.0 stopped suspending farming for recall. A
+  failed walk retries after `HOME_RETRY_SECONDS`; the third in a row
+  records `recovery-home-unreachable` once. Errands start only from her
+  savebed, and the cure and funding trips stay strict;
 - depleted: the strict temple cure when she can pay (a depletion potion
   first); otherwise the cure-funding path (identify-all, junk sale,
   deposit, the apartment chest);
@@ -699,6 +710,9 @@ clears as soon as its condition does:
   of a safe route from her savebed. Each refusal is a recorded decision
   (`cure-route-refused`, reset by `cure-route-cleared` or
   `farming-resumed`), so the count survives Stop and restarts;
+- `home-unreachable`: three walks home in a row failed, with the latest
+  error. She keeps retrying, since learned hazards expire; reaching her
+  savebed (a respawn, say) or a completed walk clears it;
 The recall alerts are no longer recovery blockers; see the
 [owner decision of 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22).
 
