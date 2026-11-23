@@ -6864,6 +6864,42 @@ class BuyShopUpgradeTask(BotTask):
         self._move_at = now
 
 
+@lru_cache(maxsize=1)
+def authored_plurals() -> dict[str, frozenset[str]]:
+    """Folded archetype names mapped to their folded authored plurals
+    (``name_pl``) in the locked content. The server names a stack of more
+    than one by its plural (object_get_display_name in item.c), so "buy 25
+    free-range chicken leg" arrives as "free-range chicken legs". Loaded
+    once; without content, none."""
+    try:
+        records = load_archetypes()
+    except Exception as error:
+        log.warning("authored plurals unavailable: %s", error)
+        return {}
+    plurals: dict[str, set[str]] = {}
+    for arch, record in records.items():
+        attrs = record.get("attrs", {}) or {}
+        name = str(attrs.get("name") or arch).strip().casefold()
+        plural = str(attrs.get("name_pl") or "").strip().casefold()
+        if name and plural:
+            plurals.setdefault(name, set()).add(plural)
+    return {name: frozenset(values) for name, values in plurals.items()}
+
+
+def stock_names(name: str) -> frozenset[str]:
+    """The folded names stock bought under ``name`` can carry in her
+    inventory: the name itself and, for a stack, its authored plural.
+    Without an authored plural the server keeps the singular; when the
+    content is unavailable a regular "s"/"es" plural is also accepted."""
+    folded = name.strip().casefold()
+    if not folded:
+        return frozenset()
+    plurals = authored_plurals()
+    if plurals:
+        return frozenset({folded, *plurals.get(folded, ())})
+    return frozenset({folded, f"{folded}s", f"{folded}es"})
+
+
 class BuyDialogueStockTask(BotTask):
     """Inspect an identified dialogue merchant and buy matching stock.
 
@@ -6905,8 +6941,8 @@ class BuyDialogueStockTask(BotTask):
         self._sent_at = 0.0
         self._item_name = ""
         self._cost = 0
-        self._inventory_before: set[int] = set()
-        self._inventory_quantity_before = 0
+        # Her inventory just before paying: quantity by tag.
+        self._inventory_before: dict[int, int] = {}
 
     @classmethod
     def _destinations(cls, client: AtrinikClient) -> list[str]:
@@ -6992,8 +7028,6 @@ class BuyDialogueStockTask(BotTask):
             await self.start(client)
         now = time.monotonic()
         if not self._stage:
-            self._inventory_before = {
-                item.tag for item in client.state.inventory}
             client.state.interface = None
             await client.talk("hello", self.merchant)
             self._stage = "stock"
@@ -7068,9 +7102,9 @@ class BuyDialogueStockTask(BotTask):
             if quote_recorder is not None and self.observation_key:
                 quote_recorder(
                     self.observation_key, self._item_name, int(cost))
-            self._inventory_quantity_before = sum(
-                item.quantity for item in client.state.inventory
-                if item.name.casefold() == self._item_name.casefold())
+            self._inventory_before = {
+                item.tag: max(1, int(item.quantity or 1))
+                for item in client.state.inventory}
             client.state.interface = None
             await BuyShopUpgradeTask.send_purchase(
                 client, total_cost, lambda: client.talk(quantity, self.merchant))
@@ -7078,16 +7112,17 @@ class BuyDialogueStockTask(BotTask):
             self._sent_at = now
             return
         if self._stage == "buy":
+            # What she bought is a new item or a grown stack, named like
+            # the pattern or like the stock: a stack of more than one
+            # carries its plural (stock_names), which an exact singular
+            # pattern does not match.
+            names = stock_names(self._item_name)
             arrived = next((
                 item for item in client.state.inventory
-                if self.item_pattern.search(item.name) and (
-                    item.tag not in self._inventory_before or
-                    item.name.casefold() == self._item_name.casefold() and
-                    sum(candidate.quantity
-                        for candidate in client.state.inventory
-                        if candidate.name.casefold() ==
-                        self._item_name.casefold()) >
-                    self._inventory_quantity_before)), None)
+                if (self.item_pattern.search(item.name) or
+                    item.name.casefold() in names) and
+                max(1, int(item.quantity or 1)) >
+                self._inventory_before.get(item.tag, 0)), None)
             if arrived is not None:
                 self.purchased = True
                 self.purchase_count += 1
@@ -7220,9 +7255,10 @@ class BuyHealingStockTask(BotTask):
         self._reserved = 0
 
     def _same_name(self, client: AtrinikClient) -> int:
+        names = stock_names(self.bought_name)
         return sum(max(1, int(item.quantity or 1))
                    for item in client.state.inventory
-                   if item.name.casefold() == self.bought_name.casefold())
+                   if item.name.casefold() in names)
 
     async def _ask(self, client: AtrinikClient, now: float) -> None:
         self._asking = self._pending.pop(0)
