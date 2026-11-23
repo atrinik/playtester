@@ -19,7 +19,8 @@ from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                   POLICIES, RECOMMENDED_QUEST_ORDER)
 from .autoplay import AutoplayTask
 from .build_info import build_info
-from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_approach
+from .farm_analyzer import (DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_approach,
+                            risky_spot)
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .equipment import equipment_report
@@ -29,6 +30,7 @@ from .face_images import FaceImages
 from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from .alerts import active as active_alerts
 from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_farm_objective,
+                         seam_ranking,
                          CARE_OWNER_BLOCK, CARE_WAIT_SECONDS,
                          FarmCircuitTask, NavigateTask, NavigateThenTask,
                          ShopUpgradeSweepTask, WorldGraph)
@@ -913,7 +915,9 @@ class DashboardState:
             return []
         objective = self._farmed_objective()
         spots = []
-        for rank, spot in enumerate(analyzer.ranking(objective), 1):
+        # The ranking autoplay chooses from: seam exposure folded in, and
+        # spots it leaves out not offered.
+        for rank, spot in enumerate(seam_ranking(self.client, self.graph, objective), 1):
             legs = analyzer_spot_legs(spot, self.graph)
             if legs:
                 spots.append({
@@ -950,17 +954,20 @@ class DashboardState:
             snapshot = {"status": "unavailable", "objective": objective,
                         "objectives": OBJECTIVES, "ranking": []}
         else:
-            snapshot = dict(analyzer.snapshot(objective))
+            snapshot = dict(analyzer.snapshot(
+                objective, seam_ranking(self.client, self.graph, objective)))
         # The ranking follows what she farms now; the toggle shows the choice.
         snapshot["selected_objective"] = chosen
         # The spot autoplay farms, with its rank in that objective's ranking.
         snapshot["farmed_spot"] = None
         if choice is not None:
             spot = choice[2]
-            ranked = [item.get("path") for item in analyzer.ranking(choice[0])]
+            ranked = [item.get("path")
+                      for item in seam_ranking(self.client, self.graph, choice[0])]
             snapshot["farmed_spot"] = {
                 **{key: spot.get(key) for key in SUMMARY_FIELDS},
                 "approach_risky": risky_approach(spot),
+                "spot_risky": risky_spot(spot),
                 "rank": (ranked.index(spot.get("path")) + 1
                          if spot.get("path") in ranked else None)}
         snapshot["objective_override"] = (
@@ -1451,11 +1458,12 @@ class WebControlServer:
         return {"ok": True, "task": task.name}
 
     def _ranked_spot(self, spot_id: str) -> dict[str, Any]:
-        """A spot from the analyzer's current ranking, for any objective."""
+        """A spot from the analyzer's current ranking, for any objective,
+        with seam exposure folded in (spots it leaves out are not ranked)."""
         analyzer = getattr(self.client, "farm_analyzer", None)
         if analyzer is not None:
             for objective in OBJECTIVES:
-                for spot in analyzer.ranking(objective):
+                for spot in seam_ranking(self.client, self.graph, objective):
                     if str(spot.get("path")) == spot_id and analyzer_spot_legs(
                             spot, self.graph):
                         return spot

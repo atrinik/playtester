@@ -498,6 +498,8 @@ class WorldGraph:
             tuple[str, bool, tuple[int, int]], frozenset[tuple[int, int]]
         ] = {}
         self._aggro_pack_cache: dict[tuple[str, int, bool], int] = {}
+        self._seam_exposure_cache: dict[
+            frozenset[str], farm_analyzer_plan.SeamExposure] = {}
         self._world_search_snapshot: tuple[
             tuple[str, ...], dict[str, int], tuple[int, ...],
             tuple[int, ...], tuple[MapEdge, ...]
@@ -1090,6 +1092,12 @@ class WorldGraph:
             for identity in normalized
         ), default=0)
 
+    def is_monster(self, name: str) -> bool:
+        """Whether a name (as in "<name> hit you") is an authored monster
+        kind: a monster archetype, or a monster placed on a map, by name,
+        animation or face. A spell projectile, an effect or a trap is not."""
+        return self._semantic_name(str(name)) in self.monster_levels
+
     def farm_priorities(self, map_path: str,
                         target_pattern: str) -> list[NamedSpawn]:
         if not target_pattern:
@@ -1137,6 +1145,102 @@ class WorldGraph:
                     include_peaceful_target and target.peaceful))
         self._aggro_pack_cache[cache_key] = maximum
         return maximum
+
+    def _seam_neighbours(self, map_path: str
+                         ) -> list[tuple[str, int, int]]:
+        """(map, x offset, y offset) of each map tiled to ``map_path`` on
+        one of its eight sides, in ``map_path``'s coordinates. Vertical
+        links (inside the map's bounds) are not neighbours."""
+        node = self.nodes.get(map_path)
+        if node is None:
+            return []
+        neighbours: dict[str, tuple[int, int]] = {}
+        for edge in node.edges:
+            other = self.nodes.get(edge.destination)
+            if edge.kind != "tile" or other is None or edge.destination == map_path:
+                continue
+            dx = (-other.width if edge.x < 0 else
+                  node.width if edge.x >= node.width else 0)
+            dy = (-other.height if edge.y < 0 else
+                  node.height if edge.y >= node.height else 0)
+            if dx or dy:
+                neighbours.setdefault(edge.destination, (dx, dy))
+        return [(path, dx, dy) for path, (dx, dy) in sorted(neighbours.items())]
+
+    def seam_exposure(self, map_paths: Iterable[str]
+                      ) -> "farm_analyzer_plan.SeamExposure":
+        """What maps tiled to a farm spot's maps add to its fights.
+
+        The analyzer judges a spot's pack per map, from its own maps alone.
+        A farm spot is pulled at its maps' authored spawns, from a square
+        at the spawn's detection radius. A neighbour is a map tiled to one
+        of the spot's maps, side or diagonal, outside the spot; the circuit
+        never clears it. Its aggressive spawns join the pack at a spawn
+        the analyzer's way, within their own detection radius of it, now
+        across the seam; its casters within farm_analyzer.SEAM_REACH_TILES
+        of the pull square, since a bolt flies as far as there is line of
+        sight. Counting every melee spawn that near would put the open
+        Burnt Forest at a pack of three to eight. The pack at each spawn
+        adds them to its own map's and the spot's other maps' spawns within
+        their detection radius, as for the analyzer, and is reported only
+        where a seam adds to it (else 0): a neighbour's spawns, or the
+        spot's other maps' within detection radius across its own seams,
+        which the analyzer, judging each map alone, misses too. ``aggressive`` counts every
+        neighbour spawn within SEAM_REACH_TILES. Distances are Chebyshev,
+        ignoring walls, as in the analyzer's own estimate.
+        """
+        spot = frozenset(path for path in map_paths if path in self.nodes)
+        cached = self._seam_exposure_cache.get(spot)
+        if cached is not None:
+            return cached
+        reach = farm_analyzer_plan.SEAM_REACH_TILES
+        pack = 0
+        near: set[tuple[str, int, int]] = set()
+        casters: set[tuple[str, int, int]] = set()
+        maps: set[str] = set()
+        for path in sorted(spot):
+            farm = self.named_spawns.get(path, ())
+            if not farm:
+                continue
+            around = []
+            for other, dx, dy in self._seam_neighbours(path):
+                node = self.nodes[other]
+                for spawn in self.named_spawns.get(other, ()):
+                    if not spawn.peaceful:
+                        caster = any(
+                            self._semantic_name(name) in node.caster_identities
+                            for name in (spawn.named, *spawn.candidates))
+                        around.append((spawn, dx, dy, other in spot, caster))
+            own = [spawn for spawn in farm if not spawn.peaceful]
+            for target in farm:
+                ring = max(1, target.aggro_radius)
+                local = int(target.peaceful) + sum(
+                    max(abs(target.x - spawn.x), abs(target.y - spawn.y)) <=
+                    spawn.aggro_radius for spawn in own)
+                seam = 0
+                for spawn, dx, dy, inside, caster in around:
+                    distance = max(abs(target.x - spawn.x - dx),
+                                   abs(target.y - spawn.y - dy))
+                    detects = distance <= spawn.aggro_radius
+                    if inside:
+                        # The spot's other map, across its own seam: the
+                        # analyzer, judging each map alone, misses it too.
+                        seam += detects
+                        continue
+                    key = (spawn.map_path, spawn.x, spawn.y)
+                    if distance - ring <= reach:
+                        near.add(key)
+                        maps.add(spawn.map_path)
+                        if caster:
+                            casters.add(key)
+                    if detects or (caster and distance - ring <= reach):
+                        seam += 1
+                if seam:
+                    pack = max(pack, local + seam)
+        exposure = farm_analyzer_plan.SeamExposure(
+            pack, len(near), len(casters), tuple(sorted(maps)))
+        self._seam_exposure_cache[spot] = exposure
+        return exposure
 
     def farm_max_aggro_pack(self, map_path: str, *, radius: int = 8) -> int:
         """Estimate the maximum pack when a peaceful farm target is pulled."""
@@ -6266,6 +6370,29 @@ def current_combat_kit(client: AtrinikClient):
     return getattr(getattr(client, "farm_analyzer", None), "profile", None)
 
 
+def seam_ranking(client: AtrinikClient, graph: "WorldGraph",
+                 objective: str) -> list[dict]:
+    """The analyzer's ranking for an objective, each spot with its seam
+    exposure folded in (farm_analyzer.seam_adjusted), in the analyzer's
+    order. A spot whose exposed pack exceeds the ranked profile's
+    max_aggro_pack is left out, as the analyzer leaves out its own; a spot
+    with a map the graph lacks is kept as ranked (analyzer_spot_legs skips
+    it anyway)."""
+    analyzer = getattr(client, "farm_analyzer", None)
+    if analyzer is None:
+        return []
+    profile = getattr(analyzer, "profile", None)
+    ranked = []
+    for spot in analyzer.ranking(objective):
+        paths = ["/" + str(raw).removeprefix("maps/").lstrip("/")
+                 for raw in spot.get("map_paths") or ()]
+        adjusted = farm_analyzer_plan.seam_adjusted(
+            spot, graph.seam_exposure(paths), profile)
+        if adjusted is not None:
+            ranked.append(adjusted)
+    return ranked
+
+
 def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
                        legs) -> bool:
     """Whether live failures rate this spot hazardous for her current kit.
@@ -6618,7 +6745,7 @@ def _analyzer_farm_choice(
                   tuple(dict.fromkeys(
                       (effective_farm_objective(client.state), chosen))))
     for position, objective in enumerate(objectives):
-        for rank, spot in enumerate(analyzer.ranking(objective)):
+        for rank, spot in enumerate(seam_ranking(client, graph, objective)):
             legs = analyzer_spot_legs(spot, graph)
             if (legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
                              for path, _ in legs) and
@@ -6630,22 +6757,28 @@ def _analyzer_farm_choice(
     if not usable and hazardous and not funding:
         # Every usable spot is hazardous for her kit: farm the least
         # dangerous one rather than idle until the hazard ages out, the
-        # one with the safer approach on a tie. Never on the cure-funding
+        # one with the safer approach on a tie; a spot whose own
+        # encounters stay under her health (not risky_spot, seam exposure
+        # included) before any that do not. Never on the cure-funding
         # farm: depleted, she waits for a spot that is not (the 2026-11-17
         # death spiral farmed exactly that fallback).
         usable = [min(hazardous, key=lambda entry: (
+            plan.risky_spot(entry[2]),
             float(entry[2].get("danger", 0.0) or 0.0),
             -plan.approach_safety(entry[2]), order[id(entry)]))]
     if funding:
-        # The cure-funding farm takes only a spot with a safe approach whose
-        # danger is under half her health and under every spot rated
-        # hazardous for her kit, and waits when none is left. Live, on
+        # The cure-funding farm takes only a spot with a safe approach and
+        # a safe spot (neither risky_approach nor risky_spot, seam exposure
+        # included) whose danger is under half her health and under every
+        # spot rated hazardous for her kit, and waits when none is left. Live, on
         # 2026-11-23, with the safety view 250 deep, a replay walked down
         # to a 118.3 spot with a risky approach; the circuits that killed
         # and out-damaged her rated 103.5 and 125.8. Single failures only
         # order the rest (recent_kit_failures). A hazardous spot caps
         # whether or not it is quarantined or behind a route death: the
-        # spot her kit just failed on still says what is too much.
+        # spot her kit just failed on still says what is too much, and so
+        # does one seam exposure leaves out (the raw ranking caps: the
+        # exposure never changes a spot's danger).
         stats = getattr(client.state, "stats", {}) or {}
         profile = current_combat_kit(client)
         health = float(getattr(profile, "max_health", 0) or
@@ -6658,6 +6791,7 @@ def _analyzer_farm_choice(
                 cap = _spot_danger(spot)
         usable = [entry for entry in usable
                   if not plan.risky_approach(entry[2]) and
+                  not plan.risky_spot(entry[2]) and
                   _spot_danger(entry[2]) < cap]
         failures = recent_kit_failures(client)
         recent = {id(entry): sum(1 for maps in failures
@@ -6667,13 +6801,15 @@ def _analyzer_farm_choice(
     def preference(entry) -> tuple:
         # Within each objective's ranking (the effective one first, so the
         # depletion safety rule holds): spots with a known, safe approach
-        # from her savebed in rank order, then the risky ones from the
+        # from her savebed whose own encounters stay under her health
+        # (neither risky_approach nor risky_spot, seam exposure included)
+        # in rank order, then the risky ones from the
         # safest down by the analyzer's safety_score (the lower of spot and
         # approach safety), or by approach safety (unreachable counts as
         # UNREACHABLE_APPROACH_SAFETY) without one, in rank order on ties.
         position, rank = order[id(entry)]
         spot = entry[2]
-        risky = plan.risky_approach(spot)
+        risky = plan.risky_approach(spot) or plan.risky_spot(spot)
         overall = spot.get("safety_score")
         safety = (float(overall) if isinstance(overall, (int, float)) and
                   not isinstance(overall, bool) else plan.approach_safety(spot))
@@ -6685,7 +6821,10 @@ def _analyzer_farm_choice(
             # safest, and among equally safe spots the least dangerous.
             return (position, recent[id(entry)], -safety,
                     _spot_danger(spot), rank)
-        return (position, risky, -safety if risky else 0.0, rank)
+        # Risky spots tied on safety (one approach caps them all) go by
+        # their own safety, seam exposure included, then by rank.
+        own = plan.spot_safety(spot) if risky else 0.0
+        return (position, risky, -safety if risky else 0.0, -own, rank)
 
     usable.sort(key=preference)
     if funding or not depleted_for_temple(client.state):
@@ -6757,7 +6896,8 @@ def farm_shadow_snapshot(client: AtrinikClient, graph: "WorldGraph",
     usable, hazardous = [], []
     for position, objective in enumerate(dict.fromkeys(
             (effective_farm_objective(client.state), chosen))):
-        for rank, spot in enumerate(analyzer.ranking(objective)[:SHADOW_FARM_CANDIDATES]):
+        for rank, spot in enumerate(
+                seam_ranking(client, graph, objective)[:SHADOW_FARM_CANDIDATES]):
             legs = analyzer_spot_legs(spot, graph)
             if not legs or any(float(quarantine.get(path, 0.0) or 0.0) > now
                                for path, _ in legs):
@@ -6769,6 +6909,7 @@ def farm_shadow_snapshot(client: AtrinikClient, graph: "WorldGraph",
             (hazardous if kit_hazardous_spot(client, spot, legs) else usable).append(entry)
     if not usable and hazardous:
         usable = [min(hazardous, key=lambda entry: (
+            farm_analyzer_plan.risky_spot(entry[2]),
             float(entry[2].get("danger", 0.0) or 0.0),
             -farm_analyzer_plan.approach_safety(entry[2]),
             entry[0].position, entry[0].rank))]
@@ -7662,7 +7803,8 @@ class FarmCircuitTask(BotTask):
         this_life = [record for record in decisions if isinstance(record, dict) and
                      float(record.get("time", 0.0) or 0.0) > previous_death]
         review = self_improvement.review_failure(
-            messages, this_life, failure, [leg for leg, _ in self.legs])
+            messages, this_life, failure, [leg for leg, _ in self.legs],
+            monster=self.graph.is_monster)
         # Hits stamped before she entered the death map were taken elsewhere:
         # only damage taken on it makes that map the hazard.
         entered = self._entered_map_at(client, review.map, review.time)

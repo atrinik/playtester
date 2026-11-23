@@ -160,6 +160,13 @@ function approachLine(r, fromBed) {
     : `Approach ${pct(r.approach_safety_score)} safe${worst ? ` · worst ${esc(worst)} (danger ${Math.round(+r.approach_danger || 0)})` : ""} · ${(r.approach_maps || []).length} maps`;
   return `<small class="${r.approach_risky ? "warn-text" : "muted"}" title="Spot safety ${pct(r.spot_safety_score)} · overall ${pct(r.safety_score)}${r.approach_risky ? " · farmed only when no spot with a safe approach is usable" : ""}">${text}</small>`;
 }
+// The spot's own safety, seam exposure included (farm_analyzer.seam_adjusted).
+function spotLine(r) {
+  const seam = +r.seam_casters || +r.seam_aggressive_spawns
+    ? ` · seam ${+r.seam_aggressive_spawns || 0} aggressive, ${+r.seam_casters || 0} casters` : "";
+  if (!r.spot_risky && !seam) return "";
+  return `<small class="${r.spot_risky ? "warn-text" : "muted"}" title="${r.spot_risky ? "One encounter is expected to cost more than her health bar: farmed only when no safe spot is usable" : "Neighbouring maps across a seam"}">Spot ${pct(r.spot_safety_score)} safe · pack ${Math.round(+r.max_aggro_pack || 0)}${seam}</small>`;
+}
 function renderFarming() {
   const fa = slow.farming_analysis;
   if (!fa) return;
@@ -193,6 +200,7 @@ function renderFarming() {
       <small>${esc(r.location || (r.map_paths || []).join(", "))}</small>
       <div class="spot-metrics"><span title="Estimated XP per hour">XP ${rate(r.xp_hour)}/h</span><span title="Estimated money per hour">${coins(r.money_hour, 2)}/h</span><span title="Estimated loot drops per hour">Loot ${rate(r.loot_hour)}/h</span><span title="Estimated incoming damage per clear">Danger ${Math.round(+r.danger || 0)}</span></div>
       ${approachLine(r, !!fa.approach_origin)}
+      ${spotLine(r)}
       <small class="muted">${esc((r.monsters || []).slice(0, 5).join(", "))}${(r.monsters || []).length > 5 ? " …" : ""}</small>
     </div>`).join("") || '<span class="muted">No ranking yet.</span>';
   const learning = fa.self_improvement || {};
