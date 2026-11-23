@@ -760,6 +760,42 @@ def safe_food(item: Item) -> bool:
             InventoryPolicy().identified(item))
 
 
+# What the server answers a heal that it ran but that healed nothing
+# (cast_heal, server/spell_effect.c): the cast still landed.
+HEAL_FAILED_MESSAGE = re.compile(r"^The healing spell fails!", re.I)
+
+
+def heal_landed(client: AtrinikClient,
+                pending: tuple[float, int, int, int, int]) -> bool | str | None:
+    """Whether the heal sent as ``pending`` (SafetyPolicy._heal_pending)
+    landed: True once the server says it healed her (HEALED_MESSAGE, which
+    spells, potions, scrolls, rods and wands all answer through cast_heal)
+    or that it healed nothing, or once the potion or scroll it applied is
+    used up (its quantity fell, or it is gone); the refusal's text when
+    the server refused it with a word (no mana, a blocked square, a device
+    that cannot fire now); None while unanswered. A FIRE the server drops
+    because her action timer still runs gets no answer at all.
+    """
+    _, position, tag, item_type, quantity = pending
+    state = client.state
+    messages = list(getattr(state, "messages", ()) or ())
+    offset = int(getattr(state, "message_offset", 0) or 0)
+    for entry in messages[max(0, position - offset):]:
+        if not self_improvement.from_server(entry):
+            continue
+        text = str(entry[-1]).strip()
+        if HEALED_MESSAGE.match(text) or HEAL_FAILED_MESSAGE.match(text):
+            return True
+        if RECALL_REFUSED_MESSAGE.match(text):
+            return text
+    if item_type not in (c.TYPE_SPELL, c.TYPE_ROD, c.TYPE_WAND):
+        item = next((item for item in getattr(state, "inventory", ())
+                     if item.tag == tag), None)
+        if item is None or int(item.quantity or 1) < quantity:
+            return True
+    return None
+
+
 def usable_heal_item(client: AtrinikClient, item: Item,
                      patterns: tuple[str, ...]) -> bool:
     """Whether a carried item is a heal she can use: named like one
@@ -793,7 +829,29 @@ class SafetyPolicy:
     # keeps applying it; only the engine's idle policy sets it.
     fruitless_meal_limit: int = 0
     fruitless_retry_seconds: float = 60.0
+    # How long a sent heal waits for the server's answer (heal_landed)
+    # before it counts as dropped and is sent again.
+    heal_confirm_seconds: float = 1.0
+    # When the last heal that landed was sent (heal_landed): the cooldown
+    # and the out-healed heal gap count from it, never from a dropped cast.
     _last_heal: float = field(default=0.0, init=False, repr=False)
+    # When enforce last spent a tick on a heal: sent one, readied a heal
+    # device, or held, combat off, for her action timer. Callers compare
+    # it before and after enforce to tell whether the tick was a heal's.
+    _heal_action: float = field(default=0.0, init=False, repr=False)
+    # The heal awaiting the server's answer: (sent at, message position,
+    # item tag, item type, quantity before).
+    _heal_pending: tuple[float, int, int, int, int] | None = field(
+        default=None, init=False, repr=False)
+    # No heal before this: the server refused the last one with a word.
+    _heal_retry_at: float = field(default=0.0, init=False, repr=False)
+    # A heal device being readied: (tag, applied at).
+    _heal_readied: tuple[int, float] | None = field(
+        default=None, init=False, repr=False)
+    # The combat force flag to restore once the heal is sent, when a heal
+    # turned combat mode off for her action timer; None when it did not.
+    _heal_combat_force: bool | None = field(
+        default=None, init=False, repr=False)
     _last_food: float = field(default=0.0, init=False, repr=False)
     _food_attempt_level: int = field(default=-1, init=False, repr=False)
     # Food applications in a row that did not raise her food stat.
@@ -870,17 +928,110 @@ class SafetyPolicy:
                 return None
         return heal
 
-    async def _heal(self, client: AtrinikClient) -> bool:
-        heal = self._usable_heal(client)
+    def heal_in_flight(self) -> bool:
+        """Whether a sent heal still awaits the server's answer."""
+        return self._heal_pending is not None
+
+    def _settle_heal(self, client: AtrinikClient, now: float) -> None:
+        """Settle the pending heal (heal_landed).
+
+        Landed: the cooldown counts from it (_last_heal). Refused with a
+        word: the next waits out the cooldown. Unanswered for
+        heal_confirm_seconds: the server dropped it, and the next allowed
+        tick sends another without waiting out the cooldown.
+        """
+        pending = self._heal_pending
+        if pending is None:
+            return
+        answer = heal_landed(client, pending)
+        if answer is True:
+            self._last_heal = pending[0]
+            self._heal_pending = None
+            return
+        if answer is None and now - pending[0] < self.heal_confirm_seconds:
+            return
+        self._heal_pending = None
+        if answer is not None:
+            self._heal_retry_at = now + self.heal_cooldown
+            return
+        items = getattr(client.state, "items", None) or {}
+        item = items.get(pending[2])
+        name = item.name if item is not None else str(pending[2])
+        log.warning("heal via %s got no answer from the server; retrying",
+                    name)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("heal-unconfirmed", f"via {name}")
+
+    async def _restore_heal_combat(self, client: AtrinikClient) -> None:
+        """Turn combat back on if a heal turned it off for her action timer.
+
+        Never while a recall waits for that timer (combat_allowed), and
+        only once: between heals she fights back as before.
+        """
+        force = self._heal_combat_force
+        if force is None:
+            return
+        self._heal_combat_force = None
+        if combat_allowed(client):
+            await client.set_combat(True, force=force)
+
+    async def _heal(self, client: AtrinikClient, heal: Item | None = None,
+                    now: float | None = None) -> bool:
+        """Use ``heal`` (by default her usable heal); True once it is sent.
+
+        A spell, rod or wand goes through FIRE, which the server drops
+        without a word while her action timer runs (socket_command_fire's
+        action_attack check), and each auto-swing restarts that timer for
+        her weapon speed. So combat goes off first and the cast waits for
+        the timer to run out, as emergency_recall does; once the cast is
+        sent, combat comes back on. A potion or scroll is applied, which
+        no timer gates: it goes at once and combat stays as it is. A rod or
+        wand not yet readied is applied (readied) first.
+        """
+        heal = heal or self._usable_heal(client)
         if heal is None:
             return False
-        if heal.item_type == c.TYPE_SPELL:
+        now = time.monotonic() if now is None else now
+        device = heal.item_type in (c.TYPE_ROD, c.TYPE_WAND)
+        if device and not heal.flags & c.ITEM_APPLIED:
+            # Applying a device only readies it, and applying it again
+            # unreadies it: once per heal_confirm_seconds, then the fire.
+            readied = self._heal_readied
+            if (readied is None or readied[0] != heal.tag or
+                    now - readied[1] >= self.heal_confirm_seconds):
+                await client.clear_actions()
+                await client.apply(heal.tag)
+                self._heal_readied = (heal.tag, now)
+            return False
+        if device or heal.item_type == c.TYPE_SPELL:
+            if getattr(client.state, "combat", False):
+                # A hit turns combat mode back on (attack_player_retarget),
+                # so this repeats on each tick of the wait.
+                if self._heal_combat_force is None:
+                    self._heal_combat_force = bool(
+                        getattr(client.state, "combat_force", False))
+                await client.set_combat(False)
+            if effective_action_time(client, now):
+                return False
+        # Cancel navigation before firing, so Clear Actions cannot cancel
+        # the heal which follows it in the same tick, and a queued
+        # click-to-move path cannot carry a low-health character deeper
+        # into the same hostile pack.
+        await client.clear_actions()
+        self._heal_pending = (now, _message_position(client), heal.tag,
+                              heal.item_type, int(heal.quantity or 1))
+        if heal.item_type == c.TYPE_SPELL or device:
             # The official client's `/cast <spell>` sends FIRE direction 0
             # with the spell object's tag. Applying a spell merely readies or
             # unreadies it and was the reason Sera never recovered health.
+            # A readied rod or wand is fired by its tag the same way.
             await client.fire(0, heal.tag)
         else:
             await client.apply(heal.tag)
+        # The fire set her action timer before this combat packet arrives,
+        # so the next swing waits for the cast's recovery.
+        await self._restore_heal_combat(client)
         return True
 
     async def enforce(self, client: AtrinikClient) -> bool:
@@ -893,24 +1044,28 @@ class SafetyPolicy:
         if maxhp <= 0:
             return True
         ratio = hp / maxhp
+        now = time.monotonic()
+        self._settle_heal(client, now)
         heal = self._usable_heal(client) if ratio <= self.heal_below else None
         if heal is not None:
-            now = time.monotonic()
-            if now - self._last_heal >= self.heal_cooldown:
-                # Cancel navigation before firing, so Clear Actions cannot
-                # cancel the heal which follows it in the same tick, and a
-                # queued click-to-move path cannot carry a low-health
-                # character deeper into the same hostile pack.
-                await client.clear_actions()
-                if await self._heal(client):
-                    self._last_heal = now
-            # Keep combat enabled while healing. Turning it off without a
-            # real retreat left surrounded characters defenseless between
-            # spell cooldowns.
+            if (self._heal_pending is None and now >= self._heal_retry_at and
+                    now - self._last_heal >= self.heal_cooldown):
+                # Sent, readying its device, or holding, combat off, for
+                # her action timer: this tick is the heal's either way.
+                await self._heal(client, heal, now)
+                self._heal_action = now
+            else:
+                # Between heals she fights back as before: combat off
+                # without a real retreat left surrounded characters
+                # defenseless between spell cooldowns.
+                await self._restore_heal_combat(client)
             if ratio <= self.flee_below and now - self._last_warning >= 2.0:
                 log.warning("safety heal: health %.0f%%", ratio * 100)
                 self._last_warning = now
             return False
+        # Nothing to heal with or for any more: a heal's combat-off must
+        # not outlive it.
+        await self._restore_heal_combat(client)
         # No heal she can use. Never clear: that only wipes the move that
         # might save her (live: a starving Sera had every step towards food
         # cleared), and food may still help. She is not safe while critical,
@@ -4797,8 +4952,11 @@ class FarmTask(BotTask):
             # Only a step that sheds the nearest threat; an equal-distance
             # one shuffles her beside it with her heals still losing.
             nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
+            # The gap counts from the last heal that landed (a dropped
+            # cast heals nothing); one in flight is not due.
             last_heal = self.safety._last_heal
             if (now - last_heal >= self.OUT_HEALED_HEAL_GAP_SECONDS and
+                    not self.safety.heal_in_flight() and
                     self.safety._usable_heal(client) is not None):
                 # Running never shuts healing out: a heal due goes first.
                 return False
@@ -5232,9 +5390,9 @@ class FarmTask(BotTask):
             return False
         if getattr(client.state, "combat", False):
             await client.set_combat(False)
-        last_heal = self.safety._last_heal
+        heal_action = self.safety._heal_action
         await self.safety.enforce(client)
-        if self.safety._last_heal == last_heal:
+        if self.safety._heal_action == heal_action:
             await self.low_health_retreat(client)
         self._last_action = time.monotonic()
         return True
@@ -5775,9 +5933,9 @@ class FarmTask(BotTask):
             # step toward a set-aside monster it does not account for.
             # On a neutral farm it may see no threat at all; then fall back
             # to the unseen-contact retreat rather than stand under fire.
-            last_heal = self.safety._last_heal
+            heal_action = self.safety._heal_action
             await self.safety.enforce(client)
-            if (self.safety._last_heal == last_heal and
+            if (self.safety._heal_action == heal_action and
                     not await self.low_health_retreat(client)):
                 await self.invisible_contact_retreat(client)
             self._last_action = time.monotonic()
@@ -5787,9 +5945,9 @@ class FarmTask(BotTask):
             # An off-screen first contact can occur just after a map seam.
             # A position recorded moments before the hit is not necessarily
             # safe: once we start escaping, never navigate back toward it.
-            last_heal = self.safety._last_heal
+            heal_action = self.safety._heal_action
             await self.safety.enforce(client)
-            if self.safety._last_heal != last_heal:
+            if self.safety._heal_action != heal_action:
                 self._last_action = time.monotonic()
                 return
             now = time.monotonic()
@@ -5845,9 +6003,9 @@ class FarmTask(BotTask):
             if await self.low_health_retreat(client):
                 return
         if ratio <= dynamic_flee and not finish_before_healing:
-            last_heal = self.safety._last_heal
+            heal_action = self.safety._heal_action
             await self.safety.enforce(client)
-            if self.safety._last_heal != last_heal:
+            if self.safety._heal_action != heal_action:
                 self._last_action = time.monotonic()
                 return
             if await self.low_health_retreat(client):

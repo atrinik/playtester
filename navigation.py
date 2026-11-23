@@ -4820,11 +4820,11 @@ class NavigateThenTask(BotTask):
                 self._defending = True
                 self._last_defense_action = time.monotonic()
                 return True
-        last_heal = self.safety._last_heal
+        heal_action = self.safety._heal_action
         last_food = self.safety._last_food
         safe = await self.safety.enforce(client)
         safety_action_issued = (
-            self.safety._last_heal != last_heal or
+            self.safety._heal_action != heal_action or
             self.safety._last_food != last_food)
         escape_due = (own_walk and not isinstance(self.task, FarmTask) and
                       not safety_action_issued and
@@ -10567,9 +10567,9 @@ class FarmCircuitTask(BotTask):
             hp = int(client.state.stats.get("hp", 0) or 0)
             maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
             if hp / maxhp <= self.child.safety.flee_below:
-                last_heal = self.child.safety._last_heal
+                heal_action = self.child.safety._heal_action
                 await self.child.safety.enforce(client)
-                if self.child.safety._last_heal != last_heal:
+                if self.child.safety._heal_action != heal_action:
                     return
                 farm = self.child.task
                 if (isinstance(farm, FarmTask) and
@@ -11158,9 +11158,9 @@ class RecoveryTask(BotTask):
         """Hit with nothing under way: heal, flee or fight back here."""
         hp = int(client.state.stats.get("hp", 0) or 0)
         maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
-        last_heal = self.safety._last_heal
+        heal_action = self.safety._heal_action
         await self.safety.enforce(client)
-        if self.safety._last_heal != last_heal:
+        if self.safety._heal_action != heal_action:
             return
         if (hp / maxhp <= self.safety.flee_below and
                 await self.guard.low_health_retreat(client)):

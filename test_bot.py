@@ -8154,7 +8154,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
 
         async def heal(safety, client):
-            safety._last_heal = time.monotonic()
+            safety._heal_action = time.monotonic()
             return False
 
         with patch.object(type(task.safety), "enforce", heal):
@@ -10758,8 +10758,10 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertIn((0, 43), client.fired)
         self.assertEqual(len(client.direct_moves), 1)
-        # A step unanswered past the wait lets the heal go first too.
+        # A step unanswered past the wait lets the heal go first too (the
+        # heal above long settled).
         task.safety._last_heal = 0.0
+        task.safety._heal_pending = None
         client.fired.clear()
         task._last_action = 0.0
         task._retreat_attempt = ("/test", 12, 12, 12, 11,
@@ -25951,9 +25953,11 @@ class IdleSurvivalTests(unittest.TestCase):
         # A blocked spell is no reason to hold still waiting for mana.
         client.state.stats["hp"] = 65
         self.assertTrue(asyncio.run(policy.enforce(client)))
-        # Off the square, healing casts resume.
+        # Off the square, healing casts resume (once the refused cast's
+        # cooldown is over).
         client.state.map.world_x = 17
         engine.idle_safety._last_heal = 0.0
+        engine.idle_safety._heal_retry_at = 0.0
         asyncio.run(engine._protect_idle())
         self.assertEqual(fired, [24, 24])
 
@@ -33853,6 +33857,286 @@ class RouteShadowContentTests(RouteDeathReachIsolation, unittest.TestCase):
                 if live is not None:
                     avoided = task._trip_snapshot(client).strict_avoided
                     self.assertFalse({edge.destination for edge in plan.route[:-1]} & avoided)
+
+
+class HealsLandInMeleeTests(unittest.TestCase):
+    """The 2026-11-23 Underground City death: in melee, each auto-swing set
+    her action timer for her weapon speed (2.25 s, server types/player.c),
+    socket_command_fire dropped every cast sent while it ran, and her
+    safety policy, healing every 1.15 s with combat on, counted each
+    dropped cast as a heal (about 8 of 25 landed; her SP stayed at 82)."""
+
+    WEAPON_SPEED = 2.25
+    CAST_TIME = 1.0
+    TICK = 0.1
+
+    class Clock:
+        def __init__(self):
+            self.now = 1000.0
+
+        def __call__(self):
+            return self.now
+
+    class Server:
+        """A melee the client sees: auto-swings while combat is on, FIRE
+        dropped without a word while the action timer runs, applies never
+        gated, and a hit 3 HP every tick so she stays under the heal
+        threshold."""
+
+        def __init__(self, test, client, clock, hit=3):
+            self.test, self.client, self.clock, self.hit = (
+                test, client, clock, hit)
+            self.action_until = 0.0
+            self.combat = True
+            self.swings = 0
+            self.fires = []
+            self.landed = []
+            client.state.combat = True
+
+        def set_timer(self, seconds):
+            now = self.clock.now
+            self.action_until = now + seconds
+            self.client.state.stats["action_time"] = seconds
+            self.client.state.stat_observed_at["action_time"] = now
+
+        def tick(self):
+            now = self.clock.now
+            if self.combat and now >= self.action_until:
+                self.swings += 1
+                self.set_timer(HealsLandInMeleeTests.WEAPON_SPEED)
+            stats = self.client.state.stats
+            stats["hp"] = max(1, stats["hp"] - self.hit)
+
+        def heal(self, amount=15):
+            stats = self.client.state.stats
+            stats["hp"] = min(stats["maxhp"], stats["hp"] + amount)
+            self.client.state.add_message(
+                0, "white", f"The spell heals you for {amount} hp!")
+            self.landed.append(self.clock.now)
+
+        async def fire(self, direction, tag=0):
+            self.fires.append(self.clock.now)
+            if self.clock.now < self.action_until:
+                return  # socket_command_fire: action_attack still running
+            item = self.client.state.items.get(tag)
+            if item is not None and item.item_type == c.TYPE_SPELL:
+                self.client.state.stats["sp"] -= 4
+            self.heal()
+            self.set_timer(HealsLandInMeleeTests.CAST_TIME)
+
+        async def apply(self, tag):
+            state = self.client.state
+            item = state.items.get(tag)
+            self.client.applied.append(tag)
+            if item is None:
+                return
+            if item.item_type in (c.TYPE_ROD, c.TYPE_WAND):
+                item.flags ^= c.ITEM_APPLIED
+                return
+            item.quantity -= 1
+            if not item.quantity:
+                state.remove_item(tag)
+            self.heal(30)
+
+        async def set_combat(self, enabled, force=False):
+            self.combat = bool(enabled or force)
+            self.client.combat.append(enabled)
+            # The server answers with its target packet.
+            self.client.state.combat = self.combat
+
+    def setUp(self):
+        self.clock = self.Clock()
+        patcher = patch("time.monotonic", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def melee(self, *heals, hp=150, sp=82, hit=3):
+        client = types.SimpleNamespace()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats.update(hp=hp, maxhp=330, sp=sp, food=999,
+                                  level=36)
+        for item in heals:
+            client.state.place_item(item, 7)
+        client.applied = []
+        client.combat = []
+        client.decisions = []
+        server = self.Server(self, client, self.clock, hit=hit)
+        client.fire = server.fire
+        client.apply = server.apply
+        client.set_combat = server.set_combat
+
+        async def clear_actions():
+            pass
+
+        client.clear_actions = clear_actions
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        # The melee is under way: her last swing just went.
+        server.set_timer(self.WEAPON_SPEED)
+        return client, server
+
+    def run_for(self, client, server, policy, seconds):
+        for _ in range(int(round(seconds / self.TICK))):
+            server.tick()
+            asyncio.run(policy.enforce(client))
+            self.clock.now += self.TICK
+
+    @staticmethod
+    def spell():
+        spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+        spell.extra["cost"] = 4
+        return spell
+
+    def test_heals_land_through_the_swing_timer(self):
+        client, server = self.melee(self.spell(), hit=1)
+        policy = SafetyPolicy()
+        self.run_for(client, server, policy, 30.0)
+        # Every cast she sent landed: none went out while the timer ran.
+        self.assertEqual(len(server.fires), len(server.landed))
+        self.assertGreaterEqual(len(server.landed), 9)
+        self.assertEqual(client.state.stats["sp"], 82 - 4 * len(server.landed))
+        self.assertNotIn("heal-unconfirmed",
+                         [action for action, _ in client.decisions])
+        # She fought back between heals: swings went on.
+        self.assertGreaterEqual(server.swings, 5)
+        # The cooldown counts from a heal that landed.
+        self.assertIn(policy._last_heal, server.landed)
+
+    def test_combat_comes_back_on_with_each_cast(self):
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        # Timer running: combat off, nothing sent, the tick is the heal's.
+        self.assertEqual(client.combat, [False])
+        self.assertEqual(server.fires, [])
+        self.assertEqual(policy._heal_action, self.clock.now)
+        self.clock.now += self.WEAPON_SPEED
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.landed), 1)
+        # The fire went first, then combat came back on.
+        self.assertEqual(client.combat, [False, True])
+        self.assertTrue(server.combat)
+        self.assertIsNone(policy._heal_combat_force)
+
+    def test_no_combat_off_outlives_a_heal_no_longer_needed(self):
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(server.combat)
+        # A potion from elsewhere (or regeneration) lifted her over the
+        # threshold before the timer ran out: no cast, combat back on.
+        client.state.stats["hp"] = 300
+        self.clock.now += 0.5
+        self.assertTrue(asyncio.run(policy.enforce(client)))
+        self.assertEqual(server.fires, [])
+        self.assertTrue(server.combat)
+        # Out of mana mid-wait: the same.
+        client.state.stats.update(hp=150, sp=82)
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(server.combat)
+        client.state.stats["sp"] = 0
+        asyncio.run(policy.enforce(client))
+        self.assertTrue(server.combat)
+
+    def test_a_recall_waiting_keeps_combat_off(self):
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(server.combat)
+        # The recall took over (recall_waiting): healing spells wait, and
+        # the heal's combat-off is not undone.
+        client.recall_waiting_until = self.clock.now + 1.0
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(server.combat)
+        self.assertIsNone(policy._heal_combat_force)
+
+    def test_a_dropped_cast_is_retried_and_not_counted(self):
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        # The client's timer ran out, but the server's has not: dropped.
+        client.state.stats["action_time"] = 0
+        server.combat = client.state.combat = False
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 1)
+        self.assertEqual(server.landed, [])
+        self.assertEqual(policy._last_heal, 0.0)
+        self.assertTrue(policy.heal_in_flight())
+        # Not before the answer is due ...
+        self.clock.now += 0.5
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 1)
+        # ... then again at once, without a full cooldown from the answer.
+        self.clock.now += 0.6
+        server.action_until = 0.0
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 2)
+        self.assertEqual(len(server.landed), 1)
+        self.assertIn(("heal-unconfirmed", "via minor healing"),
+                      client.decisions)
+        self.clock.now += 0.2
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(policy._last_heal, server.landed[0])
+        self.assertFalse(policy.heal_in_flight())
+
+    def test_a_potion_goes_at_once_with_combat_on(self):
+        potion = Item(27, item_type=c.TYPE_POTION, quality=100,
+                      name="potion of minor healing", quantity=3)
+        client, server = self.melee(potion)
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        # No timer gates an apply: drunk at once, combat left on.
+        self.assertEqual(client.applied, [27])
+        self.assertEqual(client.combat, [])
+        self.assertTrue(server.combat)
+        self.clock.now += 0.1
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(policy._last_heal, server.landed[0])
+        self.run_for(client, server, policy, 3.0)
+        self.assertEqual(client.combat, [])
+        self.assertEqual(client.applied, [27, 27, 27])
+        self.assertEqual(len(server.landed), 3)
+
+    def test_a_used_up_potion_counts_without_a_message(self):
+        from .tasks import heal_landed
+        potion = Item(27, item_type=c.TYPE_POTION, quality=100,
+                      name="potion of minor healing", quantity=2)
+        client, _ = self.melee(potion)
+        pending = (self.clock.now, client.state.message_count, 27,
+                   c.TYPE_POTION, 2)
+        self.assertIsNone(heal_landed(client, pending))
+        potion.quantity = 1
+        self.assertIs(heal_landed(client, pending), True)
+
+    def test_a_healing_rod_is_readied_then_fired_after_the_timer(self):
+        rod = Item(26, item_type=c.TYPE_ROD, quality=100,
+                   name="rod of minor healing")
+        client, server = self.melee(rod)
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        # Readied, once: applying it again would unready it.
+        self.assertEqual(client.applied, [26])
+        self.assertTrue(rod.flags & c.ITEM_APPLIED)
+        self.clock.now += 0.1
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(client.applied, [26])
+        self.assertEqual(server.fires, [])
+        self.assertFalse(server.combat)
+        self.clock.now += self.WEAPON_SPEED
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.landed), 1)
+        self.assertTrue(server.combat)
+
+    def test_out_healed_gap_counts_from_landed_heals(self):
+        client, server = self.melee(self.spell())
+        task = FarmTask(zone="/test")
+        task.safety._last_heal = self.clock.now - 3.0
+        # A heal in flight is not due; a dropped one leaves the gap open.
+        task.safety._heal_pending = (self.clock.now, 0, 24, c.TYPE_SPELL, 1)
+        self.assertTrue(task.safety.heal_in_flight())
+        self.clock.now += 1.1
+        asyncio.run(task.safety.enforce(client))
+        self.assertFalse(task.safety.heal_in_flight())
+        self.assertLess(task.safety._last_heal, self.clock.now - 3.0)
 
 
 if __name__ == "__main__":
