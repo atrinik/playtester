@@ -20911,6 +20911,35 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertNotEqual(self.moves, [])
         self.assertNotIn("recovery-home-hazard-rest", self.actions(client))
 
+    def test_a_death_during_the_rest_ends_it_at_her_savebed(self):
+        client, recovery, _ = self.stranded_at_the_sage(36)
+        client.state.stats["hp"] = 100
+        asyncio.run(recovery.tick(client))
+        self.assertIsNotNone(recovery._hazard_rest_until)
+        # Killed while resting, she respawns on her savebed, still hurt.
+        self.place(client, self.CLEARHAVEN_BED)
+        asyncio.run(recovery.tick(client))
+        self.assertIsNone(recovery._hazard_rest_until)
+        # The walk ran (and, with her home, ended) instead of waiting.
+        walk = recovery._home_walk
+        self.assertTrue(walk is None or
+                        walk.navigation.status != TaskStatus.READY)
+
+    def test_each_plan_says_afresh_whether_it_took_the_hazard_fallback(self):
+        from .navigation import NavigateTask
+
+        client, _, _ = self.stranded_at_the_sage(36)
+        navigation = NavigateTask(built_graph(), self.CLEARHAVEN_BED[0],
+                                  self.CLEARHAVEN_BED[1])
+        navigation.tolerance = 1
+        navigation.allow_ranged_hazard_fallback = True
+        navigation._plan(client)
+        self.assertTrue(navigation.hazard_fallback_taken)
+        # Past the pack road, a replan needs no fallback.
+        self.place(client, ("/shattered_islands/world_7_78", (12, 12)))
+        navigation._plan(client)
+        self.assertFalse(navigation.hazard_fallback_taken)
+
     def test_her_rest_before_a_hazard_crossing_home_is_bounded(self):
         client, recovery, now = self.stranded_at_the_sage(36)
         client.state.stats["hp"] = 100

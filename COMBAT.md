@@ -686,6 +686,11 @@ recovery phase:
   `recovery-home-hazard-rest`. On a map with hostile spawns she goes at
   once, since staying is worse. A replan during the walk never rests
   again; the next walk, after `HOME_RETRY_SECONDS`, is checked afresh.
+  Already home (a death during the rest respawns her there), she does
+  not rest. The rest, its record and the home-unreachable streak are the
+  recovery task's own memory: a rebuilt task (autoplay's handover, Stop
+  and Start, a restart) may rest and record again, and starts a new
+  streak.
   The cure trip never crosses a known hazard while she is depleted, and
   waits instead. The walk home cannot: errands, the cure among them,
   start only from her savebed, so waiting off it would leave her uncured

@@ -10095,7 +10095,10 @@ class RecoveryTask(BotTask):
         until = self._hazard_rest_until
         if until is None:
             return False
-        if self._rested(client) or self.clock() >= until:
+        # Home already (a death during the rest respawned her there): the
+        # walk completes, nothing is left to rest for.
+        if (self._rested(client) or self.clock() >= until or
+                self.at_home(client)):
             self._hazard_rest_until = None
             return False
         if _contact_this_life(client):
