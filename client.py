@@ -2744,6 +2744,12 @@ class AtrinikClient:
                 for item in self.state.inventory):
             self.set_depletion_points(0)
             self.record_action("depletion", "cleared: the depletion force is gone")
+            if self.state.cure_funding_farm_since:
+                # Cured: a cure-funding farm belongs to the depletion just
+                # removed, never to the next one (navigation.cure_funding_farm).
+                self.set_cure_funding_farm(since=0.0)
+                self.record_action("cure-funding-farm-ended",
+                                   "depletion cured")
 
     async def _handle_mapstats(self, cur: Cursor, raw: bytes) -> None:
         # Publish metadata and time together only after the complete payload

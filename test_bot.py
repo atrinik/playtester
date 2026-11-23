@@ -22747,6 +22747,13 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(settle_cure_funding_farm(client),
                          CURE_FUNDING_FARM_ENDED)
         self.assertEqual(client.state.cure_funding_farm_since, 0.0)
+        # The client clearing a cured depletion ends a farm at once, so
+        # dying back up to its starting points cannot revive it.
+        start_cure_funding_farm(client, "short")
+        client.state.remove_item(502)
+        client._forget_cured_depletion()
+        self.assertEqual(client.state.cure_funding_farm_since, 0.0)
+        self.assertEqual(self.actions(client)[-1], CURE_FUNDING_FARM_ENDED)
 
     def test_the_funding_farm_survives_a_restart_and_a_trimmed_history(self):
         from .navigation import (CURE_FUNDING_FARM_DEATHS, cure_funding_farm,
