@@ -63,7 +63,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     healing_outpaced, recent_hostile_attackers,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
-                    combat_allowed, out_of_heals_and_recall, wand_known_empty)
+                    combat_allowed, unprepared_for_trips, wand_known_empty)
 from .tasks import RECALL_REQUIRED_LEVEL
 log = logging.getLogger(__name__)
 
@@ -4229,9 +4229,6 @@ class NavigateThenTask(BotTask):
         self._halo_yield: set[int] = set()
         # Since when held-fire halos alone have closed the local route.
         self._halo_closed_since = 0.0
-        # The adjacent attacker a cornered last-resort fight is on
-        # (_cornered_last_resort).
-        self._cornered_fight_target = 0
         self._halo_closed_for: frozenset[int] = frozenset()
         self._last_danger_target = 0
         self._last_pack_signature: tuple[int, ...] = ()
@@ -4425,35 +4422,6 @@ class NavigateThenTask(BotTask):
         self.navigation._issued_goal = None
         self.navigation._issued_click = None
         self.navigation._last_progress = time.monotonic()
-        self._last_defense_action = time.monotonic()
-        return True
-
-    async def _cornered_last_resort(self, client: AtrinikClient,
-                                    nearby) -> bool:
-        """Critical, with no heal and no recall, and no step away
-        (_retreat_step found none): fight the weakest adjacent attacker
-        rather than stand with combat off while it hits her. Only the last
-        resort: every later tick looks for a step away first. Live
-        (2026-11-22, the mana-crystal-upgrade errand) she stood at 15 %
-        among troll guards until she died."""
-        adjacent = [threat for threat in nearby if threat[0] <= 1]
-        if not adjacent:
-            return False
-        _, x, y, obj = min(adjacent, key=lambda threat: (
-            int(getattr(threat[3], "target_hp", 0) or 100),
-            threat[3].target_id))
-        if not await select_target(client, x, y, obj.target_id):
-            return False
-        if isinstance(self.task, FarmTask):
-            self.task.remember_engagement(client, x, y, obj.target_id)
-        await client.set_combat(True, force=True)
-        if self._cornered_fight_target != obj.target_id:
-            recorder = getattr(client, "record_action", None)
-            if recorder is not None:
-                recorder("navigation-cornered-fight",
-                         f"target={obj.target_id}: no step away, no heal, "
-                         "no recall")
-        self._cornered_fight_target = obj.target_id
         self._last_defense_action = time.monotonic()
         return True
 
@@ -4918,24 +4886,13 @@ class NavigateThenTask(BotTask):
                 return True
             self._defending = True
             await client.clear_actions()
-            critical = (ratio <= self.safety.flee_below and
-                        out_of_heals_and_recall(client, self.safety))
+            await client.set_combat(False)
             if nearby and time.monotonic() - self._last_defense_action >= 0.30:
                 # A pack-splitting step must not immediately reverse on an
                 # equal-distance plateau. Route following and the next safety
                 # tick otherwise alternate forever between the same squares.
-                if (not await self._retreat_step(
-                        client, nearby, avoid_backtrack=True) and critical and
-                        await self._cornered_last_resort(client, nearby)):
-                    return True
-            elif critical and any(
-                    threat[0] <= 1 and
-                    threat[3].target_id == self._cornered_fight_target
-                    for threat in nearby):
-                # Between steps the last-resort fight goes on.
-                return True
-            self._cornered_fight_target = 0
-            await client.set_combat(False)
+                await self._retreat_step(
+                    client, nearby, avoid_backtrack=True)
             return True
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.
@@ -9573,8 +9530,12 @@ class FarmCircuitTask(BotTask):
             self._banking = self._new_bank_deposit(client)
             await self._banking.tick(client)
             return
+        # Optional trips wait while she has neither a usable heal nor a
+        # ready recall below UNPREPARED_HEALTH (unprepared_for_trips); the
+        # farm rests meanwhile (FarmTask.unprepared_for_pulls).
+        unprepared = unprepared_for_trips(client)
         if (isinstance(farm, FarmTask) and
-                self._needs_ship_key(client) and
+                self._needs_ship_key(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9582,7 +9543,7 @@ class FarmCircuitTask(BotTask):
             await self._ship_key.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_spell_purchase(client) and
+                self._needs_spell_purchase(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9590,7 +9551,7 @@ class FarmCircuitTask(BotTask):
             await self._spell_purchase.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_recall_shopping(client) and
+                self._needs_recall_shopping(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9598,7 +9559,7 @@ class FarmCircuitTask(BotTask):
             await self._recall_shopping.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_utility_shopping(client) and
+                self._needs_utility_shopping(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9606,7 +9567,7 @@ class FarmCircuitTask(BotTask):
             await self._utility_shopping.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_upgrade_shopping(client) and
+                self._needs_upgrade_shopping(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)

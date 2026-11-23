@@ -438,10 +438,32 @@ def out_of_heals_and_recall(client: AtrinikClient,
     """Neither a usable heal (SafetyPolicy._usable_heal: an item, or a
     healing spell she has the SP for) nor a ready recall
     (FarmTask.emergency_recall_candidates). Without a recall to rely on
-    (owner decision, 2026-11-22), this is when she must not engage, and
-    when at critical health she always tries to get away."""
+    (owner decision, 2026-11-22), this is when she must not engage or
+    start an optional trip below UNPREPARED_HEALTH (unprepared_for_trips)."""
     return (safety._usable_heal(client) is None and
             not FarmTask.emergency_recall_candidates(client))
+
+
+# Without a usable heal or a ready recall she starts no new pull, and no
+# optional trip, below this share of her health (owner decision,
+# 2026-11-22: a recall is not relied on; FarmTask.unprepared_for_pulls,
+# unprepared_for_trips).
+UNPREPARED_HEALTH = 0.90
+
+
+def unprepared_for_trips(client: AtrinikClient,
+                         safety: "SafetyPolicy | None" = None) -> bool:
+    """Whether to rest before a new pull or optional trip: from
+    RECALL_REQUIRED_LEVEL, below UNPREPARED_HEALTH, and
+    out_of_heals_and_recall. Health regenerates passively, so the rest
+    ends by itself once she is back to UNPREPARED_HEALTH."""
+    stats = client.state.stats
+    maxhp = int(stats.get("maxhp", 0) or 0)
+    if (maxhp <= 0 or
+            int(stats.get("level", 0) or 0) < RECALL_REQUIRED_LEVEL or
+            int(stats.get("hp", 0) or 0) / maxhp >= UNPREPARED_HEALTH):
+        return False
+    return out_of_heals_and_recall(client, safety or SafetyPolicy())
 
 
 def combat_allowed(client: AtrinikClient) -> bool:
@@ -2317,21 +2339,14 @@ class FarmTask(BotTask):
     # Without a usable heal or a ready recall, she pulls only from this
     # share of her health up (owner decision, 2026-11-22: a recall is not
     # relied on, so not engaging while out of heals is what keeps her safe).
-    UNPREPARED_PULL_HEALTH = 0.90
+    UNPREPARED_PULL_HEALTH = UNPREPARED_HEALTH
 
     def unprepared_for_pulls(self, client: AtrinikClient) -> bool:
         """Whether a new pull must wait: from RECALL_REQUIRED_LEVEL, below
         UNPREPARED_PULL_HEALTH, with neither a usable heal (an item, or a
         healing spell she has the SP for: SafetyPolicy._usable_heal) nor a
-        ready recall (emergency_recall_candidates)."""
-        stats = client.state.stats
-        maxhp = int(stats.get("maxhp", 0) or 0)
-        if (maxhp <= 0 or
-                int(stats.get("level", 0) or 0) < RECALL_REQUIRED_LEVEL or
-                int(stats.get("hp", 0) or 0) / maxhp >=
-                self.UNPREPARED_PULL_HEALTH):
-            return False
-        return out_of_heals_and_recall(client, self.safety)
+        ready recall (emergency_recall_candidates): unprepared_for_trips."""
+        return unprepared_for_trips(client, self.safety)
 
     async def _unprepared_rest(self, client: AtrinikClient,
                                ratio: float) -> None:
@@ -4407,8 +4422,6 @@ class FarmTask(BotTask):
             max(abs(x - cx), abs(y - cy)) <= 1), None)
         ratio = (int(client.state.stats.get("hp", 0) or 0) /
                  max(1, int(client.state.stats.get("maxhp", 1) or 1)))
-        # The blocker a cornered breakout was fighting, re-checked below.
-        rechecked = 0
         if (breakout is not None and self._stand_latch and
                 ratio <= self.STAND_HEALTH_FLOOR):
             # A stand chosen over a failing retreat ends at the critical
@@ -4418,14 +4431,6 @@ class FarmTask(BotTask):
             breakout = None
             self._cornered_breakout_target = 0
             self._stand_latch = False
-        elif breakout is not None and ratio <= self.STAND_HEALTH_FLOOR:
-            # At the critical floor a cornered breakout is the last resort
-            # only: look for a step away again on every tick, and fight the
-            # blocker on only while none exists (the no-choice branch
-            # below picks it again).
-            rechecked = self._cornered_breakout_target
-            breakout = None
-            self._cornered_breakout_target = 0
         if breakout is not None:
             # With no walkable escape square, repeatedly alternating one
             # forced swing with combat-off retreat ticks makes neither
@@ -4541,7 +4546,7 @@ class FarmTask(BotTask):
                     return False
                 await client.set_combat(True, force=True)
                 recorder = getattr(client, "record_action", None)
-                if recorder is not None and obj.target_id != rechecked:
+                if recorder is not None:
                     recorder("cornered-breakout",
                              f"blocking_target={obj.target_id}")
                 self._last_action = now
@@ -5549,17 +5554,6 @@ class FarmTask(BotTask):
                 return
             if await self.low_health_retreat(client):
                 return
-            if out_of_heals_and_recall(client, self.safety):
-                # Nothing to heal with and no recall: never stand here with
-                # combat on. Back away from an attacker she cannot see, and
-                # otherwise keep combat off (the cornered breakout above
-                # fights an adjacent blocker when no step away exists).
-                if (hostile_contact and
-                        await self.invisible_contact_retreat(client)):
-                    self._last_action = time.monotonic()
-                    return
-                if getattr(client.state, "combat", False):
-                    await client.set_combat(False)
             self._last_action = time.monotonic()
             return
         if (not finish_before_healing and not isolated_kite and

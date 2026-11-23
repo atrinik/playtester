@@ -6481,55 +6481,6 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client.record_action = (
             lambda action, detail="": client.decisions.append(action))
 
-    def test_a_cornered_breakout_at_the_floor_steps_away_once_it_can(self):
-        # The cornered breakout used to fight its blocker at any health. At
-        # the critical floor it is the last resort only: a step away, once
-        # one opens, comes first.
-        client = self._combat_client()
-        self._no_heal_no_recall(client, 32)
-        client.state.map.tiles.clear()
-        client.state.map.world_x, client.state.map.world_y = 22, 11
-        client.state.map.tile(7, 9).objects[3] = MapObject(
-            3, 1, 0, 0, name="wolf", target_id=100)
-        client.state.map.tile(6, 8).objects[3] = MapObject(
-            3, 1, 0, 0, name="grey bear", target_id=200)
-        node = MapNode(path="/test", width=25, height=25)
-        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
-        walls = {(21, 10), (22, 10), (23, 10), (21, 11), (23, 11), (22, 12),
-                 (23, 12)}
-        node.blocked.update(walls)
-        task = FarmTask(zone="/test")
-        task.map_node, task.map_bounds = node, (25, 25)
-        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
-        self.assertEqual(task._cornered_breakout_target, 100)
-        # Pinned at 15 % and still cornered: she fights on, recorded once.
-        client.state.stats["hp"] = 5
-        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
-        self.assertEqual(client.targets[-1], (7, 9, 100))
-        self.assertIs(client.combat[-1], True)
-        self.assertEqual(client.direct_moves, [])
-        self.assertEqual(client.decisions.count("cornered-breakout"), 1)
-        # A square opens: she steps away, combat off, the latch dropped.
-        node.blocked.discard((23, 10))
-        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
-        self.assertEqual(task._cornered_breakout_target, 0)
-        self.assertEqual(len(client.direct_moves), 1)
-        self.assertIs(client.combat[-1], False)
-        # Above the floor the breakout keeps its latch, as before.
-        client = self._combat_client()
-        client.state.map.tiles.clear()
-        client.state.map.world_x, client.state.map.world_y = 22, 11
-        client.state.map.tile(7, 9).objects[3] = MapObject(
-            3, 1, 0, 0, name="wolf", target_id=100)
-        node.blocked.update(walls)
-        task = FarmTask(zone="/test")
-        task.map_node, task.map_bounds = node, (25, 25)
-        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
-        node.blocked.discard((23, 10))
-        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
-        self.assertEqual(client.direct_moves, [])
-        self.assertEqual(task._cornered_breakout_target, 100)
-
     def test_without_heal_or_recall_she_pulls_nothing_below_90_percent(self):
         def farm(hp, *, level=36, potion=False):
             client = self._combat_client()
@@ -6574,97 +6525,6 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             62, item_type=c.TYPE_ROD, quality=80, condition=80,
             name="rod of word of recall"))
         self.assertFalse(task.unprepared_for_pulls(client))
-
-    def test_critical_with_no_heal_and_no_recall_never_stands_with_combat_on(self):
-        # Hit, with nothing to heal with and no recall, and the low-health
-        # retreat finds nothing to do: she backs away towards safe ground,
-        # else turns combat off.
-        client = self._combat_client()
-        self._no_heal_no_recall(client, 5)
-        client.state.map.tiles.clear()
-        client.state.map.tile(11, 8).objects[3] = MapObject(
-            3, 1, 0, 0, name="troll guard", target_id=300, target_hp=60)
-        client.state.map.world_x, client.state.map.world_y = 5, 5
-        client.state.messages = [
-            (time.time(), 2, "ff0000", "troll guard hit you for 30 damage.")]
-        node = MapNode(path="/test", width=12, height=12)
-        node.terrain = {(x, y): 1 for x in range(12) for y in range(12)}
-        task = FarmTask(zone="/test")
-        task.map_node, task.map_bounds = node, (12, 12)
-        retreats = []
-
-        async def back_away(client):
-            retreats.append(1)
-            return True
-
-        async def no_retreat(client):
-            return False
-
-        task.low_health_retreat = no_retreat
-        task.invisible_contact_retreat = back_away
-        asyncio.run(task.tick(client))
-        self.assertEqual(retreats, [1])
-
-        async def stuck(client):
-            return False
-
-        task.invisible_contact_retreat = stuck
-        client.state.combat = True
-        task._last_action = 0
-        asyncio.run(task.tick(client))
-        self.assertIs(client.combat[-1], False)
-
-    def test_navigation_cornered_without_heal_or_recall_fights_as_last_resort(self):
-        # Live, 2026-11-22: on the mana-crystal-upgrade errand, at 15 % with
-        # no heal and no recall, she stood among troll guards until she died.
-        client = self._combat_client()
-        self._no_heal_no_recall(client, 5)
-        client.state.map.tiles.clear()
-        guard = MapObject(3, 1, 0, 0, name="troll guard", target_id=300,
-                          target_hp=60)
-        client.state.map.tile(9, 8).objects[3] = guard
-        client.state.messages = [
-            (time.time(), 2, "ff0000", "troll guard hit you for 30 damage.")]
-        client.state.map.world_x, client.state.map.world_y = 12, 12
-        node = MapNode(path="/test", width=25, height=25)
-        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
-        walls = {(12 + dx, 12 + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
-                 if (dx, dy) not in ((0, 0), (1, 0))}
-        node.blocked.update(walls)
-        graph = WorldGraph()
-        graph.nodes = {"/test": node}
-        task = NavigateThenTask(graph, "/elsewhere", BotTask("crystal"),
-                                combat_approach=True)
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertEqual(client.targets[-1], (9, 8, 300))
-        self.assertIs(client.combat[-1], True)
-        self.assertEqual(client.direct_moves, [])
-        self.assertEqual(client.decisions.count("navigation-cornered-fight"), 1)
-        # Between steps the fight goes on; combat is not turned off.
-        combat = len(client.combat)
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertEqual(len(client.combat), combat)
-        # A square opens: the next step goes there, combat off.
-        node.blocked.discard((11, 11))
-        task._last_defense_action = 0
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertEqual(len(client.direct_moves), 1)
-        self.assertIs(client.combat[-1], False)
-        # With a healing potion she is not in that last resort: no fight.
-        client = self._combat_client()
-        self._no_heal_no_recall(client, 5)
-        client.state.map.tiles.clear()
-        client.state.map.tile(9, 8).objects[3] = guard
-        client.state.messages = [
-            (time.time(), 2, "ff0000", "troll guard hit you for 30 damage.")]
-        client.state.map.world_x, client.state.map.world_y = 12, 12
-        client.state.inventory.append(Item(
-            60, item_type=c.TYPE_POTION, name="potion of healing"))
-        node.blocked.update(walls)
-        task = NavigateThenTask(graph, "/elsewhere", BotTask("crystal"),
-                                combat_approach=True)
-        asyncio.run(task._defend_while_navigating(client))
-        self.assertNotIn("navigation-cornered-fight", client.decisions)
 
     def _pursued_stand_task(self, client):
         client.state.stats.update(hp=100, maxhp=176)
@@ -21271,6 +21131,100 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             name="pine wand of word of recall (lvl 17)"),
             client.state.player_tag)
         self.assertEqual(recall_alerts(client), [])
+
+    def test_no_optional_errand_starts_without_heals_or_recall_below_90_percent(self):
+        # Live, 2026-11-22: with no heals and no recall she took the
+        # mana-crystal-upgrade errand into the Old Outpost and died there.
+        def autoplay_for(client):
+            autoplay = AutoplayTask(built_graph(), target_level=115)
+            started = []
+
+            async def start_upgrade(client):
+                started.append("mana-crystal-upgrade")
+
+            autoplay._needs_mana_crystal_upgrade = lambda client: True
+            autoplay._start_mana_crystal_upgrade = start_upgrade
+            return autoplay, started
+
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        autoplay, started = autoplay_for(client)
+        for _ in range(3):
+            asyncio.run(autoplay.tick(client))
+        self.assertEqual(started, [])
+        self.assertIsNone(autoplay.child)
+        self.assertEqual(self.actions(client).count("unprepared-errand-rest"), 1)
+        # Back to 90 %: the errand starts.
+        client.state.stats["hp"] = 121
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(started, ["mana-crystal-upgrade"])
+        # A healing potion, a ready recall or level 17: no wait at 50 %.
+        for setup in (
+                lambda client: client.state.place_item(Item(
+                    95, item_type=c.TYPE_POTION, name="potion of healing"),
+                    client.state.player_tag),
+                lambda client: client.state.place_item(Item(
+                    96, item_type=c.TYPE_ROD, quality=80, condition=80,
+                    name="rod of word of recall"), client.state.player_tag),
+                lambda client: client.state.stats.update(level=17)):
+            client, _ = self.client(recall=False)
+            client.state.stats.update(hp=67, maxhp=134, sp=0)
+            setup(client)
+            autoplay, started = autoplay_for(client)
+            asyncio.run(autoplay.tick(client))
+            asyncio.run(autoplay.tick(client))
+            self.assertEqual(started, ["mana-crystal-upgrade"])
+            self.assertNotIn("unprepared-errand-rest", self.actions(client))
+        # Essential trips are not delayed: hungry, the temple food trip goes.
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        autoplay, started = autoplay_for(client)
+        food = []
+
+        async def temple_food(client):
+            food.append(1)
+            return True
+
+        autoplay._needs_temple_food = lambda client: True
+        autoplay._start_temple_food = temple_food
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(food, [1])
+        # Depleted: the recovery phase (the cure) is not delayed either.
+        client, _ = self.client(recall=False, depletion=92)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        autoplay, started = autoplay_for(client)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
+        self.assertNotIn("unprepared-errand-rest", self.actions(client))
+
+    def test_the_circuit_starts_no_optional_trip_without_heals_or_recall(self):
+        from .tasks import unprepared_for_trips
+
+        # 80 %: above every heal and flee threshold, below 90 %.
+        client, _ = self.client(recall=False, bank=20_000)
+        client.state.stats.update(hp=107, maxhp=134)
+        self.assertTrue(unprepared_for_trips(client))
+        circuit = FarmCircuitTask(built_graph(), [(self.TREES, "")])
+        asked = []
+        circuit._needs_spell_purchase = lambda client: asked.append(1) or True
+        circuit._busy_finishing_fight_or_loot = lambda client, farm: False
+        client.state.inventory_replay_complete = True
+        circuit.server_clock.anchor_minute = 12 * 60
+        circuit.server_clock.anchor_at = circuit.server_clock.clock()
+        circuit.server_clock.last_request_at = circuit.server_clock.clock()
+        for name in ("_needs_bank_sync", "_needs_progress_checkpoint",
+                     "_needs_bank_deposit", "_needs_ship_key",
+                     "_needs_food_resupply", "_needs_savebed"):
+            setattr(circuit, name, lambda *args: False)
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        self.assertIsNone(circuit._spell_purchase)
+        client.state.stats["hp"] = 121
+        self.assertFalse(unprepared_for_trips(client))
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        self.assertIsNotNone(circuit._spell_purchase)
 
     def test_recovery_never_shops_for_recall(self):
         client, _ = self.client(bank=50_000, recall=False)

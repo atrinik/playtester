@@ -17,7 +17,8 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          temple_food_trip)
 from .alerts import HUNGRY_FOOD
 from .quest_tasks import EscapingDesertedIslandTask
-from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus)
+from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus,
+                    unprepared_for_trips)
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +76,9 @@ class AutoplayTask(BotTask):
         # circuit (AutoplayTask.HANDOVER_SECONDS).
         self._handover_since: float | None = None
         self.safety = SafetyPolicy()
+        # Resting before an optional errand (unprepared_for_trips),
+        # recorded once per rest.
+        self._unprepared_errand_rest = False
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
         """Starving where nothing else will feed her.
@@ -479,6 +483,26 @@ class AutoplayTask(BotTask):
         if farming_unsafe_reason(client):
             await self._start_recovery(client)
             return
+        # No optional errand (the mana crystal detours, a farm circuit and
+        # its walk out) starts while she has neither a usable heal nor a
+        # ready recall below UNPREPARED_HEALTH: she rests where she is
+        # first (owner decision, 2026-11-22; live, a mana-crystal errand
+        # into the Old Outpost with no heals killed her).
+        if unprepared_for_trips(client, self.safety):
+            if not self._unprepared_errand_rest:
+                self._unprepared_errand_rest = True
+                hp = int(client.state.stats.get("hp", 0) or 0)
+                maxhp = int(client.state.stats.get("maxhp", 0) or 0)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("unprepared-errand-rest",
+                             f"hp={hp}/{maxhp}: no usable heal and no ready "
+                             "recall")
+                await client.clear_actions()
+                await client.set_combat(False)
+            await self.safety.enforce(client)
+            return
+        self._unprepared_errand_rest = False
         if self._needs_mana_crystal_start(client):
             await self._start_mana_crystal_detour(client)
             return
