@@ -778,8 +778,10 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
   - **No new pull.** The farm fights only what is beside her or already
     coming at her, with its defence as ever. Otherwise she rests where she
     stands, combat off, recorded once as `unprepared-rest`
-    (`FarmTask._unprepared_rest`). The circuit does not switch legs
-    meanwhile, so she makes no unprepared walk to another map.
+    (`FarmTask._unprepared_rest`). The circuit's dwell and empty-sweep
+    leg switches wait meanwhile, so she makes no such unprepared walk to
+    another map; a leg that stops being available on its schedule (at
+    nightfall, say) still moves her.
   - **No optional trip.** The farm circuit starts no ship-key trip, spell
     purchase, or recall, utility or upgrade shopping (checked with the
     farm's own safety policy), and autoplay starts no mana-crystal detour

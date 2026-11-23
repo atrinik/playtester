@@ -453,8 +453,11 @@ UNPREPARED_HEALTH = 0.90
 # (damage over time can outpace regeneration) and records
 # unprepared-rest-timeout once (UnpreparedHold).
 UNPREPARED_REST_LIMIT_SECONDS = 600.0
-# A hold not checked for this long (an essential trip, a fight) starts
-# afresh when checked again: the gap is not waiting.
+# A hold not checked for this long starts afresh when checked again: the
+# gap is not waiting. Within a farm circuit that is an essential trip (the
+# circuit keeps checking through fights); for a standalone FarmTask a fight
+# is one too, since it checks only between fights, and restarting the cap
+# after a long fight is accepted.
 UNPREPARED_GAP_SECONDS = 10.0
 # A hold checked within this long is under way (UnpreparedHold.holding).
 UNPREPARED_FRESH_SECONDS = 3.0

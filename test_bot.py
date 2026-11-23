@@ -21289,6 +21289,11 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         circuit._banking = _DoneErrand(status=TaskStatus.RUNNING)
         self.assertFalse(autoplay.recovery_alerts(client)[1])
         circuit._banking = None
+        # Nor while a food resupply trip runs.
+        circuit._resupply = _DoneErrand(status=TaskStatus.RUNNING)
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+        circuit._resupply = None
+        self.assertTrue(autoplay.recovery_alerts(client)[1])
         # Nor does a rest nobody has checked for a while (the farm returned
         # early before its rest branch), nor one past its cap.
         hold.last_poll -= 5.0
@@ -21339,8 +21344,12 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             now[0] += 4.0
             asyncio.run(circuit.tick(client))
         self.assertEqual(self.actions(client).count("unprepared-rest-timeout"), 1)
-        # Past the cap the hold no longer keeps her on this leg.
+        # Past the cap the hold no longer keeps her on this leg: the dwell
+        # switch moves her on.
         self.assertFalse(circuit._unprepared_hold.holding())
+        now[0] += 4.0
+        asyncio.run(circuit.tick(client))
+        self.assertEqual(circuit.leg_index, 1)
 
     def test_recovery_never_shops_for_recall(self):
         client, _ = self.client(bank=50_000, recall=False)
