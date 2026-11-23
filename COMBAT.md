@@ -883,20 +883,96 @@ not block her either.
   `farming_unsafe_reason` lets her farm. An unknown bank balance never
   starts it: the bank visit comes first.
 - **A careful farm.** It follows the analyzer's safety ranking alone,
-  never the chosen objective: its easiest usable spot, by the ordinary
-  rules (quarantine, route deaths, kit hazard, strict town reach), except
-  that when every usable spot is hazardous for her kit it does not farm
-  the least dangerous one but waits (the 2026-11-17 spiral farmed exactly
-  that fallback). It makes no optional trip (savebed rebinding, upgrade, spell, utility and
-  recall shopping, the ship key) and no mana-crystal detour. The one
+  never the chosen objective, by the ordinary rules (quarantine, route
+  deaths, kit hazard), except that when every usable spot is hazardous for
+  her kit it does not farm the least dangerous one but waits (the
+  2026-11-17 spiral farmed exactly that fallback). It takes only a spot
+  with a safe approach (never `risky_approach`) whose analyzer danger is
+  under half her maximum health (`FUNDING_FARM_DANGER_SHARE`) and under
+  every ranked spot rated hazardous for her kit (the kit hazard's own
+  three-failure rule), whether or not that spot is quarantined or behind
+  a route death: the spot her kit just failed on still says what is too
+  much. With none left, it waits. Single failures never cap anything;
+  they only order the rest: the spot with the fewest recent failures
+  comes first (`recent_kit_failures`: her failures in the kit window,
+  24 h, with the kit hazard's kit matching, any cause, emergency recalls
+  on the way included, each counted for the maps of its spot's record and
+  for the map it happened on). Then the safest, then the least dangerous
+  by the analyzer's own danger, not the safety view's order. That score
+  is her maximum health over a spot's danger, capped at 1, so every spot
+  under her health ties, and the analyzer orders the ties by its balanced
+  score. The safety view is therefore kept 250 deep
+  (`FarmAnalyzer.SAFETY_TOP`; the other views keep 40).
+
+  The funding farm skips the depleted strict town check
+  (`town_safely_reachable`), which is statically unsatisfiable in the
+  east: every way back from the eastern candidate maps crosses a content
+  pack-hazard map (`_known_pack_hazard_maps`), so the check only walked
+  her down the list one spot per tick before falling back to the first.
+  Her strict town trips from the farm fail for the same reason; she goes
+  home for them (below).
+
+  Live, on 2026-11-23 (v1.96.0, level 36, 322 health), 126 of the 199
+  ranked spots tied at 1, and the first 40 were all Burnt Forest
+  permutations (danger 71 to 126). Each shared a map with the circuits
+  where she had three or more pack and out-damaged failures that night,
+  so the kit hazard rejected all 40 (the 04:08 death quarantine and the
+  route deaths had expired), and she waited for a spot ("no farm spot is
+  usable yet"). Equally safe spots with far lower danger, the Underground
+  City's outer maps, Hemlock Cave and Eld Woods Island (danger 36 to 66),
+  ranked 60th to 125th. In a replay of that state with her keys, the cap
+  is 49.1 (the least dangerous hazardous Burnt Forest circuit); the orc
+  pack recall at the Underground City entrance at 02:43 puts Hemlock Cave
+  (35.8) ahead of the entrance (35.7), and four route recalls on
+  `world_15_74` put it (31.2) behind both, so she farms
+  `hemlock_cave_0102` (danger 35.8, monsters level 29 to 32). Every other
+  rule still applies, so a spot that just killed her, or one hazardous
+  for her kit, is never taken. The deeper view also reaches the depleted
+  fallback outside the funding farm (parked, or farming by hand): safety
+  spots ranked 41st to 250th are tried, in rank order and with the strict
+  town check, before the chosen objective. The analyzer should break
+  those ties by danger itself; until it does, this keeps the funding farm
+  off the deadliest tied spots.
+
+  It makes no optional trip (savebed rebinding, upgrade, spell, utility
+  and recall shopping, the ship key) and no mana-crystal detour. The one
   exception is the [healing-potion restock](#healing-potion-restock),
   which otherwise waits while depletion is due: a depleted farm without
   heals is the 2026-11-17 death spiral. On the funding farm it buys only
   up to `HEAL_RESTOCK_LOW` (2), the least that makes her prepared, and
-  takes only a strict route, deferred (`heal-restock-deferred`) when there
-  is none. The unprepared hold and the
-  circuit's maintenance trips (food, bank, identify, storage, junk sale,
-  the chest) run as ever.
+  takes only a strict route, deferred (`heal-restock-deferred`) when
+  there is none. The unprepared hold and the circuit's maintenance trips
+  (food, bank, identify, storage, junk sale, the chest) run as ever.
+- **Home for errands.** A strict town trip that cannot start from the
+  funding farm's spot (a bank deposit, junk sale, identify-all or the
+  apartment chest refused for want of a strict route, or a deferred heal
+  restock) sends her home (`cure-funding-farm-home`,
+  `send_cure_funding_farm_home`). Meanwhile `cure_funding_farm` is false,
+  so farming is unsafe ("home for errands from the cure-funding farm"):
+  autoplay hands over to recovery as usual, which walks her home and runs
+  its funding errands (identify-all, junk sale, deposit, the chest's
+  funding trip) from her savebed. With none left to start and no trip
+  under way, the same farm resumes (`cure-funding-farm-resumed`), its
+  start and deaths kept. The heal restock and the apartment storage trip
+  are not recovery errands, so on resuming the strict-route retries of
+  the trips a break is for (heal restock, sale, deposit, identify-all,
+  storage; `CURE_FUNDING_FARM_HOME_TRIPS`) are cleared: the circuit's
+  first maintenance ticks run them from her savebed, where strict routes
+  exist, before she walks out. Longer backoffs, such as a full chest's
+  6 h or a failed trip's, are kept. A break lasts at most
+  `CURE_FUNDING_FARM_HOME_SECONDS` (30 min), and another starts no sooner
+  than that after one began: a refusal meanwhile keeps the trip's own
+  retry. A break that completed no town errand (sale, deposit,
+  identify-all, storage, or a heal restock that bought something) since
+  the break before is
+  fruitless; after `CURE_FUNDING_FARM_HOME_FRUITLESS` (2) fruitless
+  breaks in a row she stops going home for the rest of that funding farm
+  (`cure-funding-farm-home-given-up`) and farms on, with the warning
+  `funding-farm-town-unreachable`. A new funding farm starts afresh. The
+  break state is in memory only. Its `cure-unfunded` alert is a warning.
+  Live, on 2026-11-23, no town service was strictly reachable from
+  `hemlock_cave_0102`: from the farm she could never sell, bank or
+  restock heals.
 - **Until she can pay.** Affordability is read live on every tick: as
   soon as the coins she carries, or they and her known bank balance, pay
   for the cure, farming is unsafe again,

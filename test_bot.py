@@ -9,7 +9,7 @@ import types
 import shutil
 import sqlite3
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
@@ -19917,6 +19917,29 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertEqual(command[command.index("--ranking") + 1], "all")
         self.assertIn("--json", command)
 
+    def test_only_the_safety_view_is_kept_deeper(self):
+        from .farm_analyzer import OBJECTIVES, FarmAnalyzer, combat_profile
+
+        analyzer = self.analyzer()
+        command = analyzer.command(combat_profile(self.client()))
+        self.assertGreater(FarmAnalyzer.SAFETY_TOP, FarmAnalyzer.TOP)
+        self.assertEqual(command[command.index("--top") + 1],
+                         str(FarmAnalyzer.SAFETY_TOP))
+        many = [{"path": f"/{index}"} for index in range(FarmAnalyzer.SAFETY_TOP)]
+        rankings = {name: list(many) for name in (*OBJECTIVES, "maneuverability")}
+        report = analyzer._bounded({"rankings": rankings, "results": list(many),
+                                    "groups": list(many), "args": ["kept"]})
+        for name, ranked in report["rankings"].items():
+            self.assertEqual(len(ranked), FarmAnalyzer.SAFETY_TOP if name == "safety"
+                             else FarmAnalyzer.TOP, name)
+        self.assertEqual(len(report["results"]), FarmAnalyzer.TOP)
+        self.assertEqual(len(report["groups"]), FarmAnalyzer.TOP)
+        self.assertEqual(report["args"], ["kept"])
+        # A finished run keeps the bounded report.
+        analyzer.report = report
+        self.assertEqual(len(analyzer.ranking("safety")), FarmAnalyzer.SAFETY_TOP)
+        self.assertEqual(len(analyzer.ranking("xp")), FarmAnalyzer.TOP)
+
 
 class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
     TREES = "/shattered_islands/world_14_79"
@@ -23183,6 +23206,254 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIn("1 of 3", autoplay.recovery_alerts(client)[0][0]["text"])
         self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_STARTED), 1)
 
+    def test_a_strict_trip_refused_on_the_funding_farm_goes_home_and_resumes(self):
+        # Live, on 2026-11-23, no town service was strictly reachable from
+        # any eastern farm spot: from the farm she could never sell, bank
+        # or restock heals. She goes home for them instead, and the same
+        # farm resumes from her savebed, deaths kept.
+        from .navigation import (CURE_FUNDING_FARM_HOME,
+                                 CURE_FUNDING_FARM_HOME_SECONDS,
+                                 CURE_FUNDING_FARM_RESUMED,
+                                 CURE_FUNDING_FARM_STARTED, RecoveryTask,
+                                 cure_funding_farm, cure_funding_farm_home,
+                                 cure_funding_farm_state,
+                                 farming_unsafe_reason)
+
+        client, _, autoplay = self.parked_unfunded()
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        circuit = autoplay.child
+        self.assertIsInstance(circuit, FarmCircuitTask)
+        client.record_action("death", "killed")
+        asyncio.run(autoplay.tick(client))
+        since = client.state.cure_funding_farm_since
+        refusal = "no route to /shattered_islands/world_0_67 avoiding every known hazard"
+        # Any other failure keeps the ordinary retry.
+        circuit._strict_trip_refused(client, "junk sale", "merchant gone")
+        self.assertTrue(cure_funding_farm(client))
+        circuit._strict_trip_refused(client, "junk sale", refusal)
+        self.assertTrue(cure_funding_farm_home(client))
+        self.assertFalse(cure_funding_farm(client))
+        self.assertIn("home for errands", farming_unsafe_reason(client))
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_HOME), 1)
+        # Autoplay hands over to recovery (its usual handover, once the
+        # circuit's trips settle), which runs the errands from her savebed
+        # (the chest trip, here) and then resumes the same farm.
+        circuit.ready_for_handover = lambda client: True
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
+        recovery = autoplay.child
+        self.assertIsInstance(recovery, RecoveryTask)
+        alerts, _ = autoplay.recovery_alerts(client)
+        unfunded = [alert for alert in alerts if alert["id"] == "cure-unfunded"]
+        self.assertEqual([alert["level"] for alert in unfunded], ["warn"])
+        self.assertIn("home for errands", unfunded[0]["text"])
+        # While an errand is left to start, she stays home for it.
+        errands = []
+        real_errand = recovery._start_errand
+
+        async def errand(client, reason):
+            errands.append(reason)
+            return len(errands) == 1 or await real_errand(client, reason)
+
+        recovery._start_errand = errand
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(len(errands), 1)
+        self.assertTrue(cure_funding_farm_home(client))
+        self.assertNotIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        recovery.services._cure_funding_retry_at = (
+            recovery.clock() + FarmCircuitTask.CURE_FUNDING_RETRY_SECONDS)
+        asyncio.run(autoplay.tick(client))
+        self.assertIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        self.assertTrue(cure_funding_farm(client))
+        self.assertEqual(client.state.cure_funding_farm_since, since)
+        self.assertEqual(cure_funding_farm_state(client).deaths, 1)
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_STARTED), 1)
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        # No tight loop: another refusal within the interval keeps the
+        # ordinary retry; after it, she may go home again.
+        autoplay.child._strict_trip_refused(client, "junk sale", refusal)
+        self.assertTrue(cure_funding_farm(client))
+        later = time.time() + CURE_FUNDING_FARM_HOME_SECONDS + 1
+        with patch("atrinik_bot.navigation.time.time", return_value=later):
+            autoplay.child._strict_trip_refused(client, "junk sale", refusal)
+            self.assertTrue(cure_funding_farm_home(client))
+        # A break that never reaches home ends by itself.
+        with patch("atrinik_bot.navigation.time.time",
+                   return_value=later + CURE_FUNDING_FARM_HOME_SECONDS):
+            self.assertFalse(cure_funding_farm_home(client))
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_HOME), 2)
+
+    def home_break(self):
+        """Autoplay on the cure-funding farm, sent home by a refused heal
+        restock (its 600 s deferral set) and handed over to recovery, with
+        no recovery errand left to start."""
+        from .navigation import RecoveryTask, send_cure_funding_farm_home
+
+        client, _, autoplay = self.parked_unfunded()
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        circuit = autoplay.child
+        self.assertIsInstance(circuit, FarmCircuitTask)
+        circuit._heal_restock_retry_at = (
+            circuit.clock() + FarmCircuitTask.HEAL_RESTOCK_STRICT_RETRY_SECONDS)
+        self.assertTrue(send_cure_funding_farm_home(client, "heal restock"))
+        circuit.ready_for_handover = lambda client: True
+        asyncio.run(autoplay.tick(client))
+        recovery = autoplay.child
+        self.assertIsInstance(recovery, RecoveryTask)
+        self.assertGreater(recovery.services._heal_restock_retry_at, 0.0)
+        recovery.services._cure_funding_retry_at = (
+            recovery.clock() + FarmCircuitTask.CURE_FUNDING_RETRY_SECONDS)
+        return client, autoplay, recovery
+
+    def test_a_break_home_runs_the_refused_trip_from_her_savebed(self):
+        # The deferral that sent her home must not travel back with her:
+        # live, the restock stayed deferred at her savebed, she walked out
+        # without heals, and the next deferral sent her home again.
+        from .navigation import CURE_FUNDING_FARM_RESUMED, cure_funding_farm
+
+        client, autoplay, recovery = self.home_break()
+        # A strict-route retry is cleared; a full chest's backoff is kept.
+        services = recovery.services
+        services._selling_retry_at = (
+            services.clock() + services.STRICT_ROUTE_RETRY_SECONDS)
+        services._storage_retry_at = (
+            services.clock() + services.STORAGE_FULL_RETRY_SECONDS)
+        asyncio.run(autoplay.tick(client))
+        self.assertIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        self.assertTrue(cure_funding_farm(client))
+        self.assertNotIn("_heal_restock_retry_at", autoplay._circuit_backoffs)
+        self.assertNotIn("_selling_retry_at", autoplay._circuit_backoffs)
+        self.assertIn("_storage_retry_at", autoplay._circuit_backoffs)
+        asyncio.run(autoplay.tick(client))
+        circuit = autoplay.child
+        self.assertIsInstance(circuit, FarmCircuitTask)
+        self.assertEqual(circuit._heal_restock_retry_at, 0.0)
+        # Its maintenance tick, at her savebed, plans the restock there
+        # (the other trips stubbed out, as in the restock tests).
+        circuit._heal_restock_funds = lambda client: 500
+        self.assertTrue(circuit._needs_heal_restock(client))
+        if circuit.child is None:
+            circuit.child = circuit._new_child()
+        circuit.status = TaskStatus.RUNNING
+
+        async def idle(*args, **kwargs):
+            return False
+
+        circuit.server_clock.sync = idle
+        for name in dir(circuit):
+            if name.startswith("_needs_") and name != "_needs_heal_restock":
+                setattr(circuit, name, lambda *args, **kwargs: False)
+        circuit._queue_inventory_capability = lambda *args: False
+        circuit._apply_disease_cure = idle
+        circuit._queue_depletion_service = lambda client: False
+        circuit._heal_restock_may_leave = lambda *args: True
+        circuit._heal_restock_waiting = lambda *args: False
+        planned = []
+
+        def restock(client, *, strict):
+            planned.append(client.state.map.path)
+            trip = _DoneErrand(status=TaskStatus.RUNNING,
+                               task=types.SimpleNamespace(merchant="Healer"))
+            trip.navigation = types.SimpleNamespace(destination=self.SHOP[0])
+            return trip
+
+        circuit._new_heal_restock = restock
+        asyncio.run(circuit.tick(client))
+        self.assertEqual(planned, [self.HOME[0]])
+        self.assertIsNotNone(circuit._heal_restock)
+
+    def test_completed_town_errands_count_for_a_break_home(self):
+        client, _ = self.client(depletion=7, bank=2_245)
+        services = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        client.state.cure_funding_farm_errand_at = 0.0
+        # A heal restock that bought nothing achieved nothing.
+        restock = _DoneErrand(task=types.SimpleNamespace(
+            purchased=False, merchant="Healer"))
+        restock.navigation = types.SimpleNamespace(destination=self.SHOP[0])
+        services._heal_restock = restock
+        asyncio.run(services._tick_running_service(client))
+        self.assertIsNone(services._heal_restock)
+        self.assertEqual(client.state.cure_funding_farm_errand_at, 0.0)
+        # A completed junk sale did.
+        services._selling = _DoneErrand()
+        asyncio.run(services._tick_running_service(client))
+        self.assertIsNone(services._selling)
+        self.assertGreater(client.state.cure_funding_farm_errand_at, 0.0)
+
+    def test_fruitless_breaks_home_stop_after_two(self):
+        from .navigation import (CURE_FUNDING_FARM_HOME,
+                                 CURE_FUNDING_FARM_HOME_GIVEN_UP,
+                                 CURE_FUNDING_FARM_HOME_SECONDS,
+                                 cure_funding_farm, cure_funding_farm_alerts,
+                                 note_cure_funding_errand,
+                                 resume_cure_funding_farm,
+                                 send_cure_funding_farm_home,
+                                 start_cure_funding_farm)
+
+        client, _ = self.client(depletion=7, bank=2_245)
+        start_cure_funding_farm(client, "short")
+        now = [time.time()]
+
+        def cycle():
+            now[0] += CURE_FUNDING_FARM_HOME_SECONDS + 1
+            with patch("atrinik_bot.navigation.time.time",
+                       side_effect=lambda: now[0]):
+                sent = send_cure_funding_farm_home(client, "junk sale")
+                if sent:
+                    self.assertTrue(resume_cure_funding_farm(client))
+                return sent
+
+        self.assertTrue(cycle())
+        # A sale at home: that break achieved something.
+        with patch("atrinik_bot.navigation.time.time", return_value=now[0] + 5):
+            note_cure_funding_errand(client)
+        self.assertTrue(cycle())
+        self.assertTrue(cycle())
+        self.assertEqual(client.state.cure_funding_farm_home_fruitless, 1)
+        # Two in a row achieved nothing: no third, she farms on, alerted.
+        self.assertFalse(cycle())
+        self.assertFalse(cycle())
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_HOME), 3)
+        self.assertEqual(
+            self.actions(client).count(CURE_FUNDING_FARM_HOME_GIVEN_UP), 1)
+        self.assertTrue(cure_funding_farm(client))
+        alerts = cure_funding_farm_alerts(client)
+        self.assertEqual(self.ids(alerts),
+                         ["cure-unfunded", "funding-farm-town-unreachable"])
+        self.assertEqual(alerts[1]["level"], "warn")
+        # A new funding farm starts afresh.
+        start_cure_funding_farm(client, "short")
+        self.assertEqual(self.ids(cure_funding_farm_alerts(client)),
+                         ["cure-unfunded"])
+
+    def test_a_break_home_waits_for_a_trip_under_way_and_survives_a_failed_one(self):
+        from .navigation import CURE_FUNDING_FARM_RESUMED, cure_funding_farm_home
+
+        client, autoplay, recovery = self.home_break()
+        # A trip under way at her savebed: no resume until it settles.
+        idle = recovery._tick_services
+
+        async def no_services(client):
+            return False
+
+        recovery._tick_services = no_services
+        recovery.services._selling = _DoneErrand(status=TaskStatus.RUNNING)
+        asyncio.run(autoplay.tick(client))
+        self.assertNotIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        self.assertTrue(cure_funding_farm_home(client))
+        recovery._tick_services = idle
+        # That funding errand fails at home: she still resumes the farm.
+        recovery.services._selling = _DoneErrand(
+            status=TaskStatus.FAILED, error="merchant gone")
+        asyncio.run(autoplay.tick(client))
+        self.assertIsNone(recovery.services._selling)
+        self.assertNotIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+
     def test_no_funding_farm_while_a_funding_trip_is_left_or_the_bank_unknown(self):
         from .navigation import CURE_FUNDING_FARM_STARTED, cure_funding_farm
 
@@ -23580,6 +23851,11 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
                     if record["action"] == "heal-restock-deferred"]
         self.assertEqual(len(deferred), 1)
         self.assertIn("on the cure-funding farm", deferred[0])
+        # From the farm, that sends her home: the restock starts there.
+        from .navigation import cure_funding_farm, cure_funding_farm_home
+
+        self.assertTrue(cure_funding_farm_home(client))
+        self.assertFalse(cure_funding_farm(client))
 
     def test_a_funded_farm_with_an_unknown_bank_never_resumes(self):
         from .navigation import (CURE_FUNDING_FARM_FUNDED, cure_funding_farm,
@@ -23618,6 +23894,144 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             start_cure_funding_farm(client, "short")
             self.assertIsNone(
                 analyzer_farm_choice(client, built_graph(), search=False))
+
+    def test_the_funding_farm_reaches_past_a_saturated_safety_view(self):
+        # Live, 2026-11-23: the safety score is capped at 1, so every spot
+        # under her health tied, and the analyzer ordered the ties by its
+        # balanced score. Its first 40 were all Burnt Forest permutations,
+        # every one hazardous for her kit, and the cure-funding farm waited
+        # for a spot for good ("no farm spot is usable yet"). The safer
+        # spots (the Underground City's outer maps, Hemlock Cave, Eld Woods
+        # Island) ranked 60th to 125th.
+        from .farm_analyzer import OBJECTIVES, CombatProfile, FarmAnalyzer
+        from .navigation import analyzer_farm_choice, start_cure_funding_farm
+
+        def spot(name, path, danger, *, safety=1.0, approach=1.0):
+            result = analyzer_spot(name, [path], ["monster L35"])
+            result.update(path=f"{name}:{path}", danger=danger,
+                          safety_score=safety, approach_status="path",
+                          approach_safety_score=approach)
+            return result
+
+        burnt = [spot(f"Burnt {index}", "/shattered_islands/world_18_73",
+                      126.0 - index) for index in range(FarmAnalyzer.TOP)]
+        # A risky approach is never preferred for its low danger alone.
+        risky = spot("Risky", "/shattered_islands/world_15_74", 10.0,
+                     safety=0.5, approach=0.5)
+        eld = spot("Eld", "/shattered_islands/world_18_76", 43.4)
+        hemlock = spot("Hemlock", "/shattered_islands/world_17_75", 35.8)
+        ranked = burnt + [risky, eld, hemlock]
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        analyzer = FarmAnalyzer(directory, directory, directory)
+        analyzer.report = analyzer._bounded({"rankings": {
+            name: list(ranked) for name in OBJECTIVES}})
+        # Her real kit, as the analyzer ranked for it.
+        analyzer.profile = CombatProfile(
+            skill="slash weapons", skill_level=35, attack="slash", damage=66,
+            weapon_class=47, weapon_speed=2.25, character_level=36,
+            max_health=134, speed=0.8, armour_class=59,
+            protections=(("impact", 42), ("slash", 57)))
+
+        def failure(at, cause, where):
+            return {"time": at - 60, "cause": cause, "kind": "emergency-recall",
+                    "map": where, "kit": analyzer.profile.describe()}
+        self.assertEqual(len(analyzer.ranking("xp")), FarmAnalyzer.TOP)
+        self.assertEqual(len(analyzer.ranking("safety")), len(ranked))
+        client, _ = self.client(depletion=7, bank=2_245)
+        client.farm_analyzer = analyzer
+        start_cure_funding_farm(client, "short")
+        graph = built_graph()
+
+        def choice():
+            picked = analyzer_farm_choice(client, graph, search=False)
+            return picked and picked[2]["name"]
+
+        with patch("atrinik_bot.navigation.kit_hazardous_spot",
+                   lambda client, spot, legs: spot["name"].startswith("Burnt")):
+            # Cut at TOP, as before: every ranked spot rejected, she waits.
+            analyzer.report["rankings"]["safety"] = ranked[:FarmAnalyzer.TOP]
+            self.assertIsNone(choice())
+            # The deeper view: the least dangerous of the equally safe spots,
+            # though the analyzer ranks it last.
+            analyzer.report["rankings"]["safety"] = list(ranked)
+            self.assertEqual(choice(), "Hemlock")
+            # A failure there today, an emergency recall on the way
+            # included, puts the spot without one first.
+            now = time.time()
+            client.state.farm_adaptations = {"elsewhere": {"maps": [], "kit_failures": [
+                failure(now, "route", hemlock["map_paths"][0].removeprefix("maps"))]}}
+            self.assertEqual(choice(), "Eld")
+            # A failure without a kit is not hers to count.
+            client.state.farm_adaptations["elsewhere"]["kit_failures"][0]["kit"] = {}
+            self.assertEqual(choice(), "Hemlock")
+            # A spot rated hazardous caps the danger: Eld (43.4) is not
+            # under it, so the failed Hemlock (35.8) is still farmed.
+            client.state.farm_adaptations = {"elsewhere": {"maps": [], "kit_failures": [
+                failure(now, "route", hemlock["map_paths"][0].removeprefix("maps"))]}}
+            analyzer.report["rankings"]["safety"] = list(ranked) + [
+                spot("Burnt low", "/shattered_islands/world_18_74", 40.0)]
+            self.assertEqual(choice(), "Hemlock")
+            client.state.farm_adaptations = {}
+            # Only a risky approach left: never taken, she waits.
+            analyzer.report["rankings"]["safety"] = burnt + [risky]
+            self.assertIsNone(choice())
+            analyzer.report["rankings"]["safety"] = list(ranked)
+            # Not funding (depleted and parked, or by hand): rank order.
+            client.set_cure_funding_farm(since=0.0)
+            self.assertEqual(choice(), "Eld")
+        # Without a hazard, the funding farm still takes the least dangerous,
+        # and never one at half her health or more (134 here).
+        start_cure_funding_farm(client, "short")
+        self.assertEqual(choice(), "Hemlock")
+        analyzer.report["rankings"]["safety"] = burnt
+        self.assertEqual(choice(), None)
+        analyzer.report["rankings"]["safety"] = burnt + [
+            spot("Light", "/shattered_islands/world_18_76", 66.0)]
+        self.assertEqual(choice(), "Light")
+        # Single recalls only reorder: with the real kit hazard, a pack
+        # recall at each spot she moves to never leaves her waiting while
+        # an unfailed safe spot remains, and three at one spot make it
+        # hazardous for her kit.
+        analyzer.report["rankings"]["safety"] = list(ranked) + [
+            spot("Light", "/shattered_islands/world_19_76", 66.0)]
+        client.state.farm_adaptations = {}
+        visited = []
+        for _ in range(3):
+            name = choice()
+            self.assertIsNotNone(name)
+            self.assertNotIn(name, visited)
+            visited.append(name)
+            picked = next(item for item in analyzer.ranking("safety")
+                          if item["name"] == name)
+            client.state.farm_adaptations[picked["path"]] = {
+                "maps": [path.removeprefix("maps") for path in picked["map_paths"]],
+                "kit_failures": [failure(time.time(), "pack", "/elsewhere")]}
+        self.assertEqual(visited, ["Hemlock", "Eld", "Light"])
+        # Every spot failed once: still farmed, the least dangerous first.
+        self.assertEqual(choice(), "Hemlock")
+        record = client.state.farm_adaptations[hemlock["path"]]
+        # Three there make it hazardous for her kit (the kit hazard's own
+        # rule), and its danger caps the rest: nothing more dangerous than
+        # a spot her kit could not hold is farmed, so she waits.
+        record["kit_failures"] = [failure(time.time(), "pack", "/elsewhere")] * 3
+        self.assertIsNone(choice())
+        # Quarantined (paused after those failures), it still caps.
+        client.state.farm_zone_quarantine = {
+            hemlock["map_paths"][0].removeprefix("maps"): time.time() + 3600}
+        self.assertIsNone(choice())
+        client.state.farm_zone_quarantine = {}
+        client.state.farm_adaptations = {}
+        # The funding farm skips the strict town check, which every eastern
+        # spot fails statically; depleted otherwise, it is still asked.
+        town = Mock(return_value=False)
+        with patch("atrinik_bot.navigation.town_safely_reachable", town):
+            picked = analyzer_farm_choice(client, graph, search=True)
+            self.assertEqual(picked[2]["name"], "Hemlock")
+            town.assert_not_called()
+            client.set_cure_funding_farm(since=0.0)
+            analyzer_farm_choice(client, graph, search=True)
+            town.assert_called()
 
 
 class RouteFailureTests(unittest.TestCase):

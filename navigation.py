@@ -5816,7 +5816,9 @@ def farming_unsafe_reason(client: AtrinikClient) -> str:
     state = client.state
     if depleted_for_temple(state) and not cure_funding_farm(client):
         return (f"depletion {int(state.depletion_points)} at or above "
-                f"{FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD}")
+                f"{FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD}" +
+                ("; home for errands from the cure-funding farm"
+                 if cure_funding_farm_home(client) else ""))
     return ""
 
 
@@ -5923,6 +5925,99 @@ def _end_cure_funding_farm(client: AtrinikClient, **changes) -> None:
     _set_cure_funding_farm(client, **{
         "since": 0.0, "deaths": 0, "counted_at": 0.0, "funded_at": 0.0,
         **changes})
+    client.state.cure_funding_farm_home_at = 0.0
+    client.state.cure_funding_farm_home_resumed = False
+    client.state.cure_funding_farm_home_fruitless = 0
+    client.state.cure_funding_farm_home_given_up = False
+
+
+# A strict town trip (bank, junk sale, identify-all, the apartment chest, a
+# heal restock) that cannot start from the cure-funding farm's spot sends
+# her home: autoplay hands over to RecoveryTask, which walks her to her
+# savebed, runs the funding errands from there and resumes the same farm,
+# deaths kept. Live, on 2026-11-23, every town service failed strictly from
+# every eastern candidate (content pack-hazard maps on every way back), so
+# from the farm she could never sell, bank or restock heals. A break lasts
+# at most this long, and another starts no sooner than this after one
+# began: no tight loop between the farm and home. After
+# CURE_FUNDING_FARM_HOME_FRUITLESS breaks in a row with no town errand
+# completed since the break before, she stops going home for the rest of
+# that funding farm and farms on (cure_funding_farm_alerts says so).
+CURE_FUNDING_FARM_HOME_SECONDS = 1800.0
+CURE_FUNDING_FARM_HOME_FRUITLESS = 2
+CURE_FUNDING_FARM_HOME = "cure-funding-farm-home"
+CURE_FUNDING_FARM_RESUMED = "cure-funding-farm-resumed"
+CURE_FUNDING_FARM_HOME_GIVEN_UP = "cure-funding-farm-home-given-up"
+# The strict town trips a break home is for: their strict-route retry
+# deadlines are cleared when the farm resumes, so they run from her savebed
+# at once; longer backoffs (a full chest, a failed trip) are kept.
+CURE_FUNDING_FARM_HOME_TRIPS = (
+    "_heal_restock_retry_at", "_selling_retry_at", "_banking_retry_at",
+    "_identification_retry_at", "_storage_retry_at")
+
+
+def note_cure_funding_errand(client: AtrinikClient) -> None:
+    """A town errand (bank deposit, junk sale, identify-all, the apartment
+    chest, a heal restock) completed: a break home achieved something."""
+    client.state.cure_funding_farm_errand_at = time.time()
+
+
+def cure_funding_farm_home(client: AtrinikClient) -> bool:
+    """Whether a running cure-funding farm is on its break home
+    (send_cure_funding_farm_home); cure_funding_farm is False meanwhile."""
+    state = client.state
+    at = float(getattr(state, "cure_funding_farm_home_at", 0.0) or 0.0)
+    return bool(at and float(getattr(state, "cure_funding_farm_since", 0.0)
+                             or 0.0) > 0.0 and
+                not getattr(state, "cure_funding_farm_home_resumed", False) and
+                time.time() - at < CURE_FUNDING_FARM_HOME_SECONDS)
+
+
+def send_cure_funding_farm_home(client: AtrinikClient, detail: str) -> bool:
+    """Start a break home for the cure-funding farm, unless none runs or
+    one began less than CURE_FUNDING_FARM_HOME_SECONDS ago; recorded."""
+    if not cure_funding_farm(client):
+        return False
+    state = client.state
+    if getattr(state, "cure_funding_farm_home_given_up", False):
+        return False
+    at = float(getattr(state, "cure_funding_farm_home_at", 0.0) or 0.0)
+    if at and time.time() - at < CURE_FUNDING_FARM_HOME_SECONDS:
+        return False
+    recorder = getattr(client, "record_action", None)
+    if at:
+        errand = float(getattr(state, "cure_funding_farm_errand_at", 0.0) or 0.0)
+        state.cure_funding_farm_home_fruitless = (
+            0 if errand >= at else
+            int(getattr(state, "cure_funding_farm_home_fruitless", 0) or 0) + 1)
+        if state.cure_funding_farm_home_fruitless >= CURE_FUNDING_FARM_HOME_FRUITLESS:
+            state.cure_funding_farm_home_given_up = True
+            log.warning("cure-funding farm: %d breaks home achieved nothing; "
+                        "farming on: %s",
+                        state.cure_funding_farm_home_fruitless, detail)
+            if recorder is not None:
+                recorder(CURE_FUNDING_FARM_HOME_GIVEN_UP,
+                         f"{state.cure_funding_farm_home_fruitless} breaks "
+                         f"home achieved nothing; {detail}")
+            return False
+    state.cure_funding_farm_home_at = time.time()
+    state.cure_funding_farm_home_resumed = False
+    log.warning("cure-funding farm: home for errands: %s", detail)
+    if recorder is not None:
+        recorder(CURE_FUNDING_FARM_HOME, detail)
+    return True
+
+
+def resume_cure_funding_farm(client: AtrinikClient) -> bool:
+    """End the break home (RecoveryTask, at her savebed with no errand
+    left); recorded. False when none is on."""
+    if not cure_funding_farm_home(client):
+        return False
+    client.state.cure_funding_farm_home_resumed = True
+    recorder = getattr(client, "record_action", None)
+    if recorder is not None:
+        recorder(CURE_FUNDING_FARM_RESUMED, "errands done at her savebed")
+    return True
 
 
 def start_cure_funding_farm(client: AtrinikClient, detail: str) -> None:
@@ -5954,7 +6049,8 @@ def cure_funding_farm(client: AtrinikClient) -> bool:
     return (funding.state == "farming" and
             funding.deaths < CURE_FUNDING_FARM_DEATHS and
             not cure_affordable(client) and
-            not _funded_bank_unknown(client))
+            not _funded_bank_unknown(client) and
+            not cure_funding_farm_home(client))
 
 
 def _funded_bank_unknown(client: AtrinikClient) -> bool:
@@ -6043,13 +6139,20 @@ def cure_funding_farm_alerts(client: AtrinikClient) -> list[dict[str, str]]:
     funding = cure_funding_farm_state(client)
     cost = FarmCircuitTask._depletion_service_cost(client)
     wallet = BuyShopUpgradeTask.wallet_value(client)
-    return [{"id": "cure-unfunded", "level": "warn",
-             "text": "Cure unfunded: remove depletion costs "
-                     f"{format_money(cost)}, she has {format_money(wallet)} "
-                     "and nothing left to sell, so she farms the safest "
-                     "spot to fund it (deaths while funding: "
-                     f"{funding.deaths} of {CURE_FUNDING_FARM_DEATHS}); "
-                     "the owner can give her gold with the operator assist"}]
+    alerts = [{"id": "cure-unfunded", "level": "warn",
+               "text": "Cure unfunded: remove depletion costs "
+                       f"{format_money(cost)}, she has {format_money(wallet)} "
+                       "and nothing left to sell, so she farms the safest "
+                       "spot to fund it (deaths while funding: "
+                       f"{funding.deaths} of {CURE_FUNDING_FARM_DEATHS}); "
+                       "the owner can give her gold with the operator assist"}]
+    if getattr(client.state, "cure_funding_farm_home_given_up", False):
+        alerts.append({
+            "id": "funding-farm-town-unreachable", "level": "warn",
+            "text": "Funding farm: town trips unreachable from the farm "
+                    f"spot, and {CURE_FUNDING_FARM_HOME_FRUITLESS} breaks "
+                    "home achieved nothing; she farms on without them"})
+    return alerts
 
 
 # Services a depleted character must reach for her cure and its funding, all
@@ -6181,6 +6284,54 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
     return self_improvement.kit_hazard(
         adaptations, self_improvement.spot_key(spot, legs),
         (path for path, _ in legs), same_kit)
+
+
+# The cure-funding farm never takes a spot whose analyzer danger is this
+# share of her maximum health or more: at most half, so she survives two
+# such encounters back to back (_analyzer_farm_choice).
+FUNDING_FARM_DANGER_SHARE = 0.5
+
+
+def _spot_danger(spot: dict) -> float:
+    """The analyzer's danger for a ranked spot; infinite when unknown."""
+    danger = spot.get("danger")
+    if (isinstance(danger, (int, float)) and not isinstance(danger, bool) and
+            danger == danger):
+        return float(danger)
+    return float("inf")
+
+
+def recent_kit_failures(client: AtrinikClient) -> list[frozenset[str]]:
+    """Her failures within the kit window, one entry of maps each.
+
+    Any cause counts, emergency recalls on the way included, with the kit
+    matching of kit_hazardous_spot (a failure without a kit, or with one
+    she has since genuinely improved on, does not). Each counts for the
+    maps of its spot's record and for the map it happened on. The
+    cure-funding farm prefers spots with the fewest of them: live, on
+    2026-11-23, an orc pack forced a recall at the Underground City
+    entrance at 02:43, and that entrance (danger 35.7) still outranked
+    Hemlock Cave (35.8).
+    """
+    profile = current_combat_kit(client)
+    if profile is None:
+        return []
+    now = time.time()
+    failures = []
+    for key, record in (getattr(client.state, "farm_adaptations", {}) or {}).items():
+        if not isinstance(record, dict):
+            continue
+        maps = frozenset(self_improvement.record_maps(key, record))
+        for entry in record.get("kit_failures", ()):
+            if not isinstance(entry, dict) or (
+                    now - float(entry.get("time", 0.0) or 0.0) >
+                    self_improvement.KIT_HAZARD_WINDOW_SECONDS):
+                continue
+            old = farm_analyzer_plan.CombatProfile.from_description(
+                entry.get("kit") or {})
+            if old is not None and profile.no_survivability_gain(old):
+                failures.append(maps | {str(entry.get("map") or "")})
+    return failures
 
 
 def route_death_maps(client: AtrinikClient) -> set[str]:
@@ -6436,7 +6587,12 @@ def _analyzer_farm_choice(
     (farming_unsafe_reason, RecoveryTask): it removes depletion first, funds
     the fee from what she owns, and only once nothing is left to sell
     farms for it (cure_funding_farm). That farm follows the safety ranking
-    alone, never the chosen objective: its easiest usable spot.
+    alone, never the chosen objective, from the deeper safety view
+    (FarmAnalyzer.SAFETY_TOP): only spots with a safe approach whose danger
+    is under half her health and under every spot rated hazardous for her
+    kit; those with the fewest recent failures (recent_kit_failures) first,
+    then the safest, then the least dangerous (the analyzer's danger). With
+    none left, it waits. It skips the strict town check above.
     """
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
@@ -6454,7 +6610,8 @@ def _analyzer_farm_choice(
         return None
     plan = farm_analyzer_plan
     order: dict[int, tuple[int, int]] = {}
-    objectives = (("safety",) if cure_funding_farm(client) else
+    funding = cure_funding_farm(client)
+    objectives = (("safety",) if funding else
                   tuple(dict.fromkeys(
                       (effective_farm_objective(client.state), chosen))))
     for position, objective in enumerate(objectives):
@@ -6467,7 +6624,7 @@ def _analyzer_farm_choice(
                 order[id(entry)] = (position, rank)
                 (hazardous if kit_hazardous_spot(client, spot, legs)
                  else usable).append(entry)
-    if not usable and hazardous and not cure_funding_farm(client):
+    if not usable and hazardous and not funding:
         # Every usable spot is hazardous for her kit: farm the least
         # dangerous one rather than idle until the hazard ages out, the
         # one with the safer approach on a tie. Never on the cure-funding
@@ -6476,6 +6633,33 @@ def _analyzer_farm_choice(
         usable = [min(hazardous, key=lambda entry: (
             float(entry[2].get("danger", 0.0) or 0.0),
             -plan.approach_safety(entry[2]), order[id(entry)]))]
+    if funding:
+        # The cure-funding farm takes only a spot with a safe approach whose
+        # danger is under half her health and under every spot rated
+        # hazardous for her kit, and waits when none is left. Live, on
+        # 2026-11-23, with the safety view 250 deep, a replay walked down
+        # to a 118.3 spot with a risky approach; the circuits that killed
+        # and out-damaged her rated 103.5 and 125.8. Single failures only
+        # order the rest (recent_kit_failures). A hazardous spot caps
+        # whether or not it is quarantined or behind a route death: the
+        # spot her kit just failed on still says what is too much.
+        stats = getattr(client.state, "stats", {}) or {}
+        profile = current_combat_kit(client)
+        health = float(getattr(profile, "max_health", 0) or
+                        stats.get("maxhp", 0) or 0)
+        cap = FUNDING_FARM_DANGER_SHARE * health if health > 0 else float("inf")
+        for spot in analyzer.ranking("safety"):
+            legs = analyzer_spot_legs(spot, graph)
+            if (legs and _spot_danger(spot) < cap and
+                    kit_hazardous_spot(client, spot, legs)):
+                cap = _spot_danger(spot)
+        usable = [entry for entry in usable
+                  if not plan.risky_approach(entry[2]) and
+                  _spot_danger(entry[2]) < cap]
+        failures = recent_kit_failures(client)
+        recent = {id(entry): sum(1 for maps in failures
+                                 if maps & {path for path, _ in entry[1]})
+                  for entry in usable}
 
     def preference(entry) -> tuple:
         # Within each objective's ranking (the effective one first, so the
@@ -6490,10 +6674,23 @@ def _analyzer_farm_choice(
         overall = spot.get("safety_score")
         safety = (float(overall) if isinstance(overall, (int, float)) and
                   not isinstance(overall, bool) else plan.approach_safety(spot))
+        if funding:
+            # The cure-funding farm wants the easiest spot, not the safety
+            # view's order: its score is capped at 1, and the analyzer
+            # orders those ties by its balanced score (FarmAnalyzer.
+            # SAFETY_TOP). So the fewest recent failures first, then the
+            # safest, and among equally safe spots the least dangerous.
+            return (position, recent[id(entry)], -safety,
+                    _spot_danger(spot), rank)
         return (position, risky, -safety if risky else 0.0, rank)
 
     usable.sort(key=preference)
-    if not depleted_for_temple(client.state):
+    if funding or not depleted_for_temple(client.state):
+        # The funding farm skips the strict town check: east of her
+        # savebed every candidate fails it statically (the content pack
+        # hazard maps on every way back), so it only walked her down the
+        # list a spot per tick. A strict town trip refused from the farm
+        # sends her home for it instead (send_cure_funding_farm_home).
         return usable[0] if usable else None
     budget = [1 if search else 0]
     for objective, legs, spot in usable:
@@ -8495,6 +8692,14 @@ class FarmCircuitTask(BotTask):
     # sellable stock back out and sold it; do not walk back every half hour.
     STORAGE_FULL_RETRY_SECONDS = 6 * 3600.0
 
+    def _strict_trip_refused(self, client: AtrinikClient, what: str,
+                             error: str) -> None:
+        """A strict town trip found no strictly safe route: on the
+        cure-funding farm, go home for it (send_cure_funding_farm_home)."""
+        if (self.failure_backoff(error, 0.0) ==
+                self.STRICT_ROUTE_RETRY_SECONDS):
+            send_cure_funding_farm_home(client, f"{what}: {error}")
+
     @classmethod
     def failure_backoff(cls, error: str, default: float) -> float:
         if ("avoiding every known hazard" in error or
@@ -9832,6 +10037,11 @@ class FarmCircuitTask(BotTask):
             await self._heal_restock.tick(client)
             if self._heal_restock.status in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
+                shopper = self._heal_restock.task
+                if (self._heal_restock.status == TaskStatus.COMPLETE and
+                        isinstance(shopper, BuyHealingStockTask) and
+                        shopper.purchased):
+                    note_cure_funding_errand(client)
                 self._settle_heal_restock(client)
             return True
         if self._utility_shopping is not None:
@@ -9934,9 +10144,12 @@ class FarmCircuitTask(BotTask):
                 log.warning("bank deposit failed: %s", self._banking.error)
                 self._banking_retry_at = self.clock() + self.failure_backoff(
                     self._banking.error, 1800.0)
+                self._strict_trip_refused(
+                    client, "bank deposit", self._banking.error)
                 self._banking = None
             elif self._banking.status == TaskStatus.COMPLETE:
                 log.info("all carried cash banked; returning to farm")
+                note_cure_funding_errand(client)
                 setter = getattr(client, "set_last_bank_deposit", None)
                 if setter is not None:
                     setter(time.time())
@@ -9953,9 +10166,12 @@ class FarmCircuitTask(BotTask):
                             self._selling.error)
                 self._selling_retry_at = self.clock() + self.failure_backoff(
                     self._selling.error, 1800.0)
+                self._strict_trip_refused(
+                    client, "junk sale", self._selling.error)
                 self._selling = None
             elif self._selling.status == TaskStatus.COMPLETE:
                 log.info("identified junk sale complete; returning to farm")
+                note_cure_funding_errand(client)
                 # Sale proceeds can be far larger than routine corpse coins.
                 # Invalidate travel batching so the next safe maintenance tick
                 # deposits the entire payment immediately.
@@ -9975,6 +10191,8 @@ class FarmCircuitTask(BotTask):
                             self._identification.error)
                 self._identification_retry_at = self.clock() + self.failure_backoff(
                     self._identification.error, 1800.0)
+                self._strict_trip_refused(
+                    client, "identify-all", self._identification.error)
                 self._identification = None
             elif self._identification.status == TaskStatus.COMPLETE:
                 # Evaluate the newly revealed batch before returning to a
@@ -9985,6 +10203,7 @@ class FarmCircuitTask(BotTask):
                         await farm.maintain_inventory(client)):
                     return True
                 log.info("mass identification complete; returning to farm")
+                note_cure_funding_errand(client)
                 self._identification_retry_at = self.clock() + 3600.0
                 self._identification = None
             return True
@@ -10001,9 +10220,12 @@ class FarmCircuitTask(BotTask):
                             self._storage.error)
                 self._storage_retry_at = self.clock() + self.failure_backoff(
                     self._storage.error, 1800.0)
+                self._strict_trip_refused(
+                    client, "apartment storage", self._storage.error)
                 self._storage = None
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
+                note_cure_funding_errand(client)
                 self._storage = None
             return True
         if self._bed_binding is not None:
@@ -10281,6 +10503,10 @@ class FarmCircuitTask(BotTask):
                              "no strict route to a healing merchant while "
                              + ("unprepared" if unprepared
                                 else "on the cure-funding farm"))
+                if funding:
+                    send_cure_funding_farm_home(
+                        client, "heal restock: no strict route to a healing "
+                                "merchant from the farm")
             elif trip is None:
                 self._heal_restock_full_since = None
                 farm.rest_for_departure = False
@@ -10651,6 +10877,13 @@ class RecoveryTask(BotTask):
                 if self._funding_running():
                     return []
                 cost = s._depletion_service_cost(client)
+                if cure_funding_farm_home(client):
+                    return [{"id": "cure-unfunded", "level": "warn",
+                             "text": "Cure unfunded: remove depletion costs "
+                                     f"{format_money(cost)}, she has "
+                                     f"{format_money(wallet)}; home for "
+                                     "errands from the cure-funding farm, "
+                                     "which resumes after them" + assist}]
                 return [{"id": "cure-unfunded", "level": "critical",
                          "text": "Cure unfunded: remove depletion costs "
                                  f"{format_money(cost)}, "
@@ -10981,8 +11214,25 @@ class RecoveryTask(BotTask):
         # next walk home.
         if self.at_home(client):
             self._home_failures, self._home_error = 0, ""
-            if (not await self._start_errand(client, reason) and
-                    self._cure_funding_farm_due(client)):
+            if await self._start_errand(client, reason):
+                return
+            if not self.busy() and resume_cure_funding_farm(client):
+                # Home from the cure-funding farm for its errands: the
+                # same farm resumes, deaths kept, and the town trips it
+                # came home for (the heal restock and the storage chest
+                # are not recovery errands) run from here first. Only
+                # their strict-route retries are cleared: a longer backoff
+                # (a full chest, a failed trip) still holds.
+                services = self.services
+                now = services.clock()
+                for name in CURE_FUNDING_FARM_HOME_TRIPS:
+                    window = (services.HEAL_RESTOCK_STRICT_RETRY_SECONDS
+                              if name == "_heal_restock_retry_at"
+                              else services.STRICT_ROUTE_RETRY_SECONDS)
+                    if getattr(services, name) - now <= window:
+                        setattr(services, name, 0.0)
+                self._resume(client, "back to the cure-funding farm")
+            elif self._cure_funding_farm_due(client):
                 self._start_cure_funding_farm(client)
 
     def _resume(self, client: AtrinikClient, note: str = "") -> None:
