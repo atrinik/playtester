@@ -372,6 +372,51 @@ def healing_outpaced(client: AtrinikClient, seconds: float = 8.0) -> bool:
     return damage >= sum(amount for _, amount in heals[1:])
 
 
+def heals_losing(client: AtrinikClient, ceiling: float,
+                 seconds: float = 12.0, losing_heals: int = 3,
+                 stalled_heals: int = 4) -> bool:
+    """Whether her heals are losing a fight she is still in.
+
+    Live, on 2026-11-23, charred treants held her between 19% and 39%
+    for half a minute while she cast minor healing every 2 s, until one
+    burst killed her. Two signs, from the first heal in the window on:
+
+    - losing: at least ``losing_heals`` heals, and the hits taken since
+      the first are at least what the later heals restored
+      (healing_outpaced over a longer window and more heals);
+    - stalled: at least ``stalled_heals`` heals, and her health never
+      rose above ``ceiling`` in between (her vitals samples, and her
+      health now; no samples, no stall). Heals that only hold her that
+      low are a stalemate a burst ends.
+    """
+    now = time.time()
+    messages = [entry for entry in getattr(client.state, "messages", ())
+                if float(entry[0]) >= now - seconds and
+                self_improvement.from_server(entry)]
+    heals = [(float(entry[0]), int(match.group(1))) for entry in messages
+             if (match := HEALED_MESSAGE.match(str(entry[-1]).strip()))]
+    if len(heals) < min(losing_heals, stalled_heals):
+        return False
+    first = heals[0][0]
+    if len(heals) >= losing_heals:
+        damage = sum(self_improvement.hits_between(
+            [entry for entry in messages if float(entry[0]) > first],
+            first, now + 1.0).values())
+        if damage >= sum(amount for _, amount in heals[1:]):
+            return True
+    if len(heals) < stalled_heals:
+        return False
+    stats = client.state.stats
+    ratios = [int(stats.get("hp", 0) or 0) /
+              max(1, int(stats.get("maxhp", 1) or 1))]
+    ratios.extend(
+        float(row[1]) / max(1.0, float(row[2]))
+        for row in getattr(client, "vitals", ())
+        if len(row) >= 3 and float(row[0]) >= first)
+    # Without samples since the first heal, her health now proves nothing.
+    return len(ratios) > 1 and max(ratios) <= ceiling
+
+
 def carried_gear_score(client: AtrinikClient, policy: "InventoryPolicy"
                        ) -> Callable[[Item], int]:
     """The score the equip loop (maintain_inventory) ranks carried gear by:
@@ -1763,6 +1808,15 @@ class FarmTask(BotTask):
     PURSUIT_CAST_STEPS = 1
     # Seconds a "healing outpaced" disengage lasts once detected.
     OUTPACED_DISENGAGE_SECONDS = 4.0
+    # Heals losing the fight (heals_losing, judged over this window): from
+    # the flee threshold down, heals that never lift her above this share
+    # are a stalemate. The disengage then holds this long after her last
+    # hit, and the creature kinds that hit her are not pulled again for
+    # OUT_OF_LEAGUE_SECONDS.
+    OUT_HEALED_CEILING = 0.50
+    OUT_HEALED_WINDOW_SECONDS = 12.0
+    OUT_HEALED_HOLD_SECONDS = 8.0
+    OUT_OF_LEAGUE_SECONDS = 600.0
     # Casts from one square that did nothing before that line is futile,
     # and seconds without any shot before a target is set aside.
     FUTILE_CAST_LIMIT = 2
@@ -1909,6 +1963,8 @@ class FarmTask(BotTask):
         self._wand_examined: set[int] = set()
         # Until when healing that cannot keep up makes her disengage.
         self._outpaced_until = 0.0
+        # Until when heals losing the fight keep her disengaging (monotonic).
+        self._out_healed_until = 0.0
         # The finisher's last cast (line key, wall-clock time), casts that
         # did nothing per line, lines given up on, and since when the
         # current target has had no shot (see _observe_cast_effect and
@@ -4483,8 +4539,69 @@ class FarmTask(BotTask):
     # Retreat steps further apart than this are not one pursuit.
     PURSUIT_WINDOW_SECONDS = 6.0
 
-    async def low_health_retreat(self, client: AtrinikClient) -> bool:
-        """Run one tile away from the visible pack, learning blocked steps."""
+    def out_healed(self, client: AtrinikClient, ratio: float,
+                   hostile_contact: bool) -> bool:
+        """Whether heals losing the fight keep her disengaging.
+
+        It starts, from the flee threshold down and under hostile contact,
+        when heals_losing says so, and is recorded once
+        (``out-healed-disengage``). The kinds that hit her in its window
+        are then out of her league (out_of_league). It lasts
+        OUT_HEALED_HOLD_SECONDS past her last hit, and ends at once above
+        the heal threshold.
+        """
+        now = time.monotonic()
+        if self._out_healed_until > now:
+            if ratio > self.safety.heal_below:
+                self._out_healed_until = 0.0
+                return False
+            if hostile_contact:
+                self._out_healed_until = now + self.OUT_HEALED_HOLD_SECONDS
+            return True
+        if (not hostile_contact or ratio > self.safety.flee_below or
+                not heals_losing(client, self.OUT_HEALED_CEILING,
+                                 self.OUT_HEALED_WINDOW_SECONDS)):
+            return False
+        self._out_healed_until = now + self.OUT_HEALED_HOLD_SECONDS
+        kinds = sorted(recent_hostile_attackers(
+            client, seconds=self.OUT_HEALED_WINDOW_SECONDS))
+        store = getattr(client, "out_of_league_kinds", None)
+        if store is None:
+            store = client.out_of_league_kinds = {}
+        for kind in kinds:
+            store[kind] = now + self.OUT_OF_LEAGUE_SECONDS
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("out-healed-disengage",
+                     f"hp={ratio:.0%} kinds={','.join(kinds) or 'unknown'}")
+        return True
+
+    def out_of_league(self, client: AtrinikClient, semantic: str) -> bool:
+        """Whether this creature kind out-healed her lately (out_healed).
+
+        Kept on the client, so a rebuilt farm task (a failure review)
+        still knows; expired kinds are forgotten.
+        """
+        store = getattr(client, "out_of_league_kinds", None)
+        if not store:
+            return False
+        now = time.monotonic()
+        for kind, until in list(store.items()):
+            if until <= now:
+                store.pop(kind, None)
+        return any(_same_semantic_identity(kind, semantic) for kind in store)
+
+    async def low_health_retreat(self, client: AtrinikClient,
+                                 gain_only: bool = False) -> bool:
+        """Run one tile away from the visible pack, learning blocked steps.
+
+        With ``gain_only`` (heals losing, see out_healed) only a step that
+        takes her farther from the nearest threat counts, at once rather
+        than at the fighting retreat's cadence, and with no stand or cast
+        on the way. Without one it does nothing and returns False, before
+        touching any latch, so the caller's healing and the usual retreat
+        decide.
+        """
         m = client.state.map
         now = time.monotonic()
         if self.retreat_ack_pending(client, now):
@@ -4500,7 +4617,7 @@ class FarmTask(BotTask):
                     map_object_semantic(client, obj)
                 ).casefold() for name in proven_attackers))]
         fight = combat_allowed(client)
-        breakout = next((
+        breakout = None if gain_only else next((
             (x, y, obj) for x, y, obj in visible_threats
             if fight and obj.target_id == self._cornered_breakout_target and
             max(abs(x - cx), abs(y - cy)) <= 1), None)
@@ -4532,7 +4649,7 @@ class FarmTask(BotTask):
             # The blocker cannot be selected: fall back to retreating.
             self.release_engagement(obj.target_id)
             await client.set_combat(False)
-        if self._cornered_breakout_target:
+        if self._cornered_breakout_target and not gain_only:
             self._cornered_breakout_target = 0
             self._stand_latch = False
         threats = [(x, y) for x, y, _ in visible_threats]
@@ -4568,7 +4685,8 @@ class FarmTask(BotTask):
                     threats = [(cx - grid_dx, cy - grid_dy)]
         if not threats:
             return False
-        if (len(threats) == 1 and self._last_retreat_step_at and
+        if (not gain_only and len(threats) == 1 and
+                self._last_retreat_step_at and
                 now - self._last_retreat_step_at < max(
                     2.0, movement_ack_timeout(client))):
             # A fighting retreat needs a dodge cadence, not continuous
@@ -4610,6 +4728,16 @@ class FarmTask(BotTask):
             choices.append((int(escape_depth >= 2), separation,
                             escape_depth, escape_area, -anchor_distance,
                             random.random(), direction, world_x, world_y))
+        if gain_only:
+            # Only a step that sheds the nearest threat; an equal-distance
+            # one shuffles her beside it with her heals still losing.
+            nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
+            choices = [choice for choice in choices if choice[1] > nearest]
+            if not choices:
+                return False
+            # Running ends a stand; combat goes off with the step below.
+            self._cornered_breakout_target = 0
+            self._stand_latch = False
         if not choices:
             # If every legal exit is occupied, continued flee commands can
             # never succeed. Fight the adjacent blocker to open one escape
@@ -4680,7 +4808,7 @@ class FarmTask(BotTask):
         ] if (spell is not None and ratio > cast_floor and
               self.offensive_spell_affordable(client, spell)) else []
         caster_stand = bool(castable)
-        if (caster_stand and
+        if (caster_stand and not gain_only and
                 self._pursued_retreats >= self.PURSUIT_CAST_STEPS and
                 self.spell_ready(client, spell)):
             (x, y, obj), cast_direction = min(castable, key=lambda item: (
@@ -4700,6 +4828,7 @@ class FarmTask(BotTask):
                              f"hp={ratio:.0%}")
                 return True
         if (stand_candidates and not caster_stand and fight and
+                not gain_only and
                 self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
                 ratio > self.STAND_HEALTH_FLOOR):
             x, y, obj = min(stand_candidates, key=lambda entry: (
@@ -4747,7 +4876,8 @@ class FarmTask(BotTask):
         emergency_disengage = (
             hp / maxhp <= self.safety.flee_below or
             (next_heal > 0 and sp < next_heal) or
-            self._outpaced_until > now
+            self._outpaced_until > now or
+            self._out_healed_until > now
         )
         if emergency_disengage and recorder is not None:
             recorder(
@@ -5557,6 +5687,7 @@ class FarmTask(BotTask):
             entry[0] <= 4 and active_threat(entry)
             for entry in initial_threats)
         outpaced = hostile_contact and healing_outpaced(client)
+        out_healed = self.out_healed(client, ratio, hostile_contact)
         if await self.emergency_recall(
                 client, ratio=ratio, nearby_count=nearby_count,
                 hostile_contact=hostile_contact, healing_outpaced=outpaced):
@@ -5616,6 +5747,15 @@ class FarmTask(BotTask):
             ratio > dynamic_flee)
         finish_before_healing = self.should_finish_before_healing(
             client, initial_threats, nearby_count, ratio)
+        if (out_healed and not finish_before_healing and any(
+                entry[0] <= 2 and active_threat(entry)
+                for entry in initial_threats)):
+            # Heals are losing (out_healed): with an attacker within reach,
+            # a step that sheds it comes before the next heal, and no stand
+            # turns her back. Without one, healing and the usual retreat
+            # below decide, as before.
+            if await self.low_health_retreat(client, gain_only=True):
+                return
         if (outpaced and
                 self.safety.flee_below < ratio <= self.safety.heal_below):
             # Heals no longer keep up with the damage (healing_outpaced):
@@ -5697,7 +5837,24 @@ class FarmTask(BotTask):
                     not self.target_pattern.search(semantic) and
                     priority_rank is None):
                 continue
+            # A kind whose hits outpaced her heals is not pulled again for
+            # a while (out_of_league); one still engaged is still fought.
+            if (self.out_of_league(client, semantic) and
+                    (self._engaged_target is None or
+                     obj.target_id != self._engaged_target[0])):
+                continue
             targets.append((distance, x, y, obj))
+        if self._engaged_target is not None and not hostile_contact:
+            # Once it has stopped hitting her, an engagement with such a
+            # kind is dropped rather than walked back to.
+            engaged_entry = next((
+                entry for entry in threats
+                if entry[3].target_id == self._engaged_target[0]), None)
+            if engaged_entry is not None and self.out_of_league(
+                    client, map_object_semantic(client, engaged_entry[3])):
+                self.release_engagement(engaged_entry[3].target_id)
+                targets = [entry for entry in targets
+                           if entry[3].target_id != engaged_entry[3].target_id]
         self._visible_target_count = len(targets)
         self.observe_engaged_target(
             client, threats, preserve_transient=True)
