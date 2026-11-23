@@ -34,7 +34,7 @@
 - Watching the owner (docs/LEARNING_AND_FEEDBACK.md 4.14, `owner_watch.py`)
   records only the exact operator character, behind the off-by-default
   `watch_owner` flag, and only while she is not fighting. Other players
-  are positions only and a fight near one is dropped; no player's name is
+  are positions only and a fight with one in view is dropped; no player's name is
   stored. Following the owner and rules from what she saw (W2, W3) need a
   new owner decision.
 - Source modules remain at repository root and CMake assembles the installable

@@ -29,10 +29,10 @@ on its square with no monster next to it is a ranged hit.
 name, less the server's bracketed tags (" [AFK]", permission tags;
 ``generate_quick_name``), must equal the configured name and carry a
 player's name colour. Other players are only ever positions: while one is
-within ``SHARED_RADIUS`` squares of the operator character the engagement
-is shared and is dropped whole, so no other player's actions are ever
-recorded. No name is stored: a row belongs to her own character, and a
-monster kind is stored only when it is an authored creature name.
+in her view (any distance, any level she sees) the engagement is shared
+and is dropped whole. A player she cannot see is not detected. No name is
+stored: a row belongs to her own character, and a monster kind is stored
+only when it is an authored creature name not in a player colour.
 
 The recorder is fed once an engine step (``observe_owner``), reads only
 new tile animations and, while the operator character might be in view,
@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from . import constants as c
-from .observations import is_player, plain
+from .observations import PLAYER_NAME_COLORS, is_player, plain
 from .terrain import CELL_SIZE, Terrain, features
 
 log = logging.getLogger(__name__)
@@ -60,9 +60,6 @@ log = logging.getLogger(__name__)
 QUIET_SECONDS = 10.0
 # The longest engagement kept as one row.
 MAX_ENGAGEMENT_SECONDS = 900.0
-# Another player this close (squares, either axis) to the operator
-# character makes the engagement shared: it is dropped whole.
-SHARED_RADIUS = 6
 # A step within this long after a ranged hit counts as stepping away.
 STEP_AFTER_RANGED_SECONDS = 3.0
 # Monster kinds kept per engagement, in order of first hit.
@@ -215,6 +212,7 @@ class OwnerWatchRecorder:
             # alone. Dropped, not kept.
             self.engagement = None
             engagement = None
+            self.last_end = None
         if view.busy or view.owner is None:
             if engagement is not None:
                 rows.extend(self._end(engagement.last_contact))
@@ -223,7 +221,9 @@ class OwnerWatchRecorder:
             return rows
         owner = view.owner
         self.seen_at = view.now
-        shared = any(chebyshev(owner, other) <= SHARED_RADIUS for other in view.others)
+        # Any other player she can see, near or not (an archer or caster
+        # hits from afar), makes the fight shared.
+        shared = bool(view.others)
         adjacent = [creature for creature in view.creatures
                     if chebyshev(owner, (creature.x, creature.y)) == 1]
         by_square = {(creature.x, creature.y): creature for creature in adjacent}
@@ -272,6 +272,8 @@ class OwnerWatchRecorder:
             rows.extend(self._end(engagement.last_contact))
         elif view.now - engagement.started >= MAX_ENGAGEMENT_SECONDS:
             rows.extend(self._end(view.now))
+            # A cut fight's successor had no rest before it.
+            self.last_end = None
         return rows
 
     def _contact(self, view: OwnerView, stamp: float) -> Engagement:
@@ -327,8 +329,13 @@ def owner_view(client: Any, recorder: OwnerWatchRecorder) -> OwnerView | None:
     owner: list[tuple[int, int]] = []
     creatures: list[Creature] = []
     others: list[tuple[int, int]] = []
-    for x, y, obj in m.targets():
+    for depth, x, y, obj in m.depth_targets():
         square = (m.world_x + x - cx, m.world_y + y - cy)
+        if depth != 0:
+            # Another level: only whether a player is there matters.
+            if is_player(obj, own, content):
+                others.append(square)
+            continue
         if is_player(obj, own, content):
             if map_player_name(obj.name) == operator:
                 owner.append(square)
@@ -338,7 +345,12 @@ def owner_view(client: Any, recorder: OwnerWatchRecorder) -> OwnerView | None:
         name = plain(obj.name)
         if obj.is_friend or not name or name == own:
             continue
-        creatures.append(Creature(*square, name if names is not None and name in names else "",
+        # Green and red are player colours too (her party, PvP): a player
+        # with an authored name looks like a creature, so such a kind is
+        # never stored.
+        authored = names is not None and name in names and \
+            str(obj.name_color).casefold() not in PLAYER_NAME_COLORS
+        creatures.append(Creature(*square, name if authored else "",
                                   LEVEL_BANDS.get(str(obj.name_color).casefold(), "")))
     if len(owner) != 1:
         return view

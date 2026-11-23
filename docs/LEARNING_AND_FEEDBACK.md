@@ -1373,12 +1373,12 @@ lacks.
   visible whenever the owner is in view.
 - **Damage numbers and kill markers on tiles** (`MAP_EXT_ANIM`). A living
   object hit this round carries `ANIM_DAMAGE` with the damage dealt
-  (`last_damage`, `request.c:2759-2771`). A square where something died
+  (`last_damage`, `request.c:2764-2771`). A square where something died
   carries `ANIM_KILL` (the map's damage round tag, `request.c:3093-3104`).
   The client used to parse these and drop them. They do not say who struck
-  the blow, only where it landed. The server also skips repeating an
-  unchanged animation count on a tile (`mp->anim_num`), so a fast flurry
-  can undercount.
+  the blow, only where it landed. One animation per sub-layer and round
+  is sent: a kill marker replaces the killing blow's damage number on its
+  square, so the last blow's damage is not seen.
 - **Spell projectiles as objects.** A magic bullet is an effect-layer
   object (`arch/magic/bullet`: layer 7, animated, turnable) that moves
   square by square with a face and a facing. It carries no name.
@@ -1407,9 +1407,14 @@ owner's own square with no monster next to it is taken as ranged.
   A creature of the same name, a longer name or a different case is not
   the owner.
 - No other player is ever recorded, followed or stored. Other players are
-  read only as squares. While any of them is within 6 squares of the
-  owner, the engagement is *shared* and is dropped whole, so another
-  player's hits can never become part of a row. Of the party packets the
+  read only as squares. While any of them is in her view, at any distance
+  and on any level she sees, the engagement is *shared* and is dropped
+  whole: an archer or caster hits from afar. A player she cannot see (out
+  of her view, in fog, invisible) is not detected; an engagement with one
+  could count that player's hits as the owner's, but stores no trace of
+  who they were. A creature kind is never stored for a name in a player
+  colour (green or red are also her party's and PvP colours), so a player
+  with an authored name never lands in a row by name. Of the party packets the
   client keeps only the operator character's vitals and discards every
   other member's name and numbers as they are parsed.
 - No name is stored. A row belongs to her own character. A monster kind
@@ -1418,8 +1423,9 @@ owner's own square with no monster next to it is taken as ranged.
   operator character's name is never written to a row or sent by the
   dashboard.
 - The flag `watch_owner` (`--watch-owner`, `ATRINIK_BOT_WATCH_OWNER=1`)
-  is off by default. With it off, nothing is read and nothing is
-  recorded.
+  is off by default. With it off the recorder reads and records nothing.
+  The client still parses the tile animations and keeps the operator
+  character's party vitals in memory, whatever the flag.
 
 **Phases.**
 
@@ -2308,7 +2314,8 @@ change.
 map; only the operator character's party vitals are kept; an owner
 engagement next to an orc becomes one row with counts and the authored
 kind; another player's fight, a shared fight and her own fight are never
-recorded; with the flag off nothing is read; rows are capped and expire.
+recorded; with the flag off the recorder reads nothing; rows are capped
+and expire.
 
 *W1 as built* (`owner_watch.py`, `client.py`, `model.py`, `memory.py`,
 the Farming tab's **Watching the owner** section):
@@ -2321,23 +2328,25 @@ the Farming tab's **Watching the owner** section):
   parse into name, health and mana. Only the operator character's entry
   is kept, as `GameState.operator_vitals`, and only while it is not her
   own name. A roster without it, `CMD_PARTY_REMOVE_MEMBER` for it, her
-  leaving the party or a new login clears it. A truncated record is a
-  protocol error, like the other party commands.
+  leaving the party or a new login clears it. A truncated record or
+  trailing bytes are a protocol error, like the other party commands.
 - **An engagement** starts at the first damage number on the operator
   character's square, damage number on a monster next to it, or kill
   marker next to it. It ends 10 seconds after the last one, when the
   operator character leaves her view or her map's bounds (the row is
   kept), or after 15 minutes. It is dropped, never kept, when she starts
   fighting herself (her combat mode or an active fight record), when she
-  changes map, or when it was shared.
+  changes map, or when another player was in view during it.
 - **Columns:** `map`, `x`, `y`, `cell`, `feature` and `reach` (the owner's
   square at the start, `terrain.features`), `kinds_json` (up to 12
   `[kind, level band]` pairs in order of the first hit), `peak_adjacent`,
   `hits_dealt`, `damage_dealt`, `hits_taken`, `damage_taken`,
   `ranged_hits`, `stepped_after_ranged`, `hp_before` (the operator
   character's health at the step before the first contact), `hp_low`,
-  `hp_after`, `gap_seconds` (since the previous engagement ended, only
-  while the owner stayed in view, so a rest is measured), `kills`,
+  `hp_after` (at the end, so 10 quiet seconds of regeneration included),
+  `gap_seconds` (since the previous engagement ended, only while the
+  owner stayed in view on the same map and that one was not cut at 15
+  minutes, so a rest is measured), `kills`,
   `seconds`. `character` is hers.
 - **Bounds:** the engine feeds the recorder once a step, after the fight
   recorder. With the flag off, or without an operator character, it reads

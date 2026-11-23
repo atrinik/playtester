@@ -29715,6 +29715,8 @@ class OwnerWatchParserTests(unittest.TestCase):
         for malformed in (b"Zoey\0" + bytes((50,)), b"Zoey", b"Zoey\0" + bytes((1, 2, 3))):
             with self.assertRaises(ProtocolError):
                 party(c.CMD_PARTY_UPDATE, malformed)
+        with self.assertRaises(ProtocolError):
+            party(c.CMD_PARTY_REMOVE_MEMBER, b"Zoey\0x")
         # Without an operator character nobody's vitals are kept.
         client.config.operator_character = ""
         party(c.CMD_PARTY_UPDATE, b"Zoey\0" + bytes((50, 50)))
@@ -29807,10 +29809,20 @@ class OwnerWatchTests(unittest.TestCase):
         # No player's name is stored, the operator character's included.
         self.assertNotIn("zoey", repr(self.stored()).casefold())
         # The next pull, still in view, knows how long the owner rested.
-        self.put(client, 5, "orc", "ffff33", 9)
+        # A name in a player colour (her party's green) is never stored as
+        # a kind, even an authored one.
+        self.put(client, 5, "orc", "00ff00", 9)
         self.animate(client, 5, c.ANIM_DAMAGE, 3)
         observe_owner(client)
         self.assertIsNotNone(client.owner_watch.engagement.gap_seconds)
+        self.assertEqual(client.owner_watch.engagement.kinds, [["unknown", "green"]])
+        # Her map changes: the engagement is dropped, and the rest after it
+        # is not measured across maps.
+        client.state.map.path = "/elsewhere"
+        self.assertEqual(observe_owner(client), 0)
+        self.assertFalse(client.owner_watch.active)
+        self.assertIsNone(client.owner_watch.last_end)
+        self.assertEqual(len(self.stored()), 1)
 
     def test_another_players_actions_are_never_recorded(self):
         from . import owner_watch
@@ -29842,8 +29854,26 @@ class OwnerWatchTests(unittest.TestCase):
             self.assertEqual(observe_owner(client), 0)
         self.assertEqual(client.owner_watch.shared_dropped, 1)
         self.assertEqual(self.stored(), [])
-        # Her own fight: nothing is watched.
+        # Any other player in view shares it, far off (an archer) or on
+        # another level she sees.
         self.remove(client, 1)
+        far = client.state.map.tile(16, 16)
+        far.objects[5] = MapObject(5, 1, 0, 0, name="Mallory", name_color="ffffff",
+                                   target_id=11)
+        self.animate(client, 5, c.ANIM_DAMAGE, 12)
+        observe_owner(client)
+        with patch.object(owner_watch, "QUIET_SECONDS", -1.0):
+            observe_owner(client)
+        far.objects.pop(5)
+        client.state.map.tile(8, 8, depth=1).objects[5] = MapObject(
+            5, 1, 0, 0, name="Mallory", name_color="ffffff", target_id=12)
+        self.animate(client, 5, c.ANIM_DAMAGE, 12)
+        observe_owner(client)
+        with patch.object(owner_watch, "QUIET_SECONDS", -1.0):
+            observe_owner(client)
+        self.assertEqual((client.owner_watch.shared_dropped, self.stored()), (3, []))
+        client.state.map.level_tiles.pop(1)
+        # Her own fight: nothing is watched.
         client.state.combat = True
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
         observe_owner(client)
@@ -29899,6 +29929,28 @@ class OwnerWatchTests(unittest.TestCase):
         row, = recorder.observe(OwnerView(now=110.0, **base))
         self.assertEqual((row["seconds"], row["peak_adjacent"]), (3.0, 1))
         self.assertIsNone(recorder.last_end)
+        # A fight cut at the limit is kept, and its successor measures no rest.
+        from . import owner_watch
+        with patch.object(owner_watch, "MAX_ENGAGEMENT_SECONDS", 2.0):
+            recorder.observe(OwnerView(now=200.0, owner=(3, 3),
+                                       animations=[(199.5, 3, 3, c.ANIM_DAMAGE, 1)], **base))
+            row, = recorder.observe(OwnerView(
+                now=202.0, owner=(3, 3), animations=[(201.5, 3, 3, c.ANIM_DAMAGE, 1)], **base))
+        self.assertEqual(row["seconds"], 2.5)
+        recorder.observe(OwnerView(now=203.0, owner=(3, 3),
+                                   animations=[(202.5, 3, 3, c.ANIM_DAMAGE, 1)], **base))
+        self.assertIsNone(recorder.engagement.gap_seconds)
+
+    def test_off_her_maps_bounds_the_owner_is_not_watched(self):
+        from .owner_watch import owner_view
+        client = self.client()
+        recorder = client.owner_watch
+        self.put(client, 4, "Zoey", "ffffff", 7)
+        self.assertEqual(owner_view(client, recorder).owner, (4, 3))
+        self.remove(client, 4)
+        # World x 7 is past the 7-wide map: on a map tiled to hers.
+        self.put(client, 7, "Zoey", "ffffff", 7)
+        self.assertIsNone(owner_view(client, recorder).owner)
 
     def test_rows_are_capped_and_old_ones_expire(self):
         from . import memory

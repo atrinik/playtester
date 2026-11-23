@@ -1877,7 +1877,10 @@ class AtrinikClient:
             await self.emit("party_packet", (command, size))
         elif command == c.CMD_PARTY_REMOVE_MEMBER:
             size = cur.remaining
-            if cur.cstring() == self.config.operator_character.strip():
+            name = cur.cstring()
+            if cur.remaining:
+                raise ProtocolError("party member removal trailing bytes")
+            if name == self.config.operator_character.strip():
                 self.state.operator_vitals = None
             await self.emit("party_packet", (command, size))
         else:
