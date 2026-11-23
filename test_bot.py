@@ -24654,16 +24654,31 @@ class SelfImprovementTests(unittest.TestCase):
             [], {"time": 1000.0, "action": "emergency-recall",
                  "map": "/road"}, [self.SPOT])
         self.assertEqual(ghoul.peak_individuals, 1)
-        # A sorcerer's bolt is named for the spell: one sorcerer, not two;
-        # three bolts at once beside it are three casters.
+        # Only authored monster kinds count: a hit named for a spell
+        # projectile ("magic bullet", a firestorm's "fire") is its
+        # caster's. One sorcerer and its bolt are one; one balrog's cone,
+        # a "fire" line every tick, adds nothing to its own swings.
+        monster = built_graph().is_monster
         self.assertEqual(si.peak_individuals(
-            [(0.0, "orc sorcerer"), (0.5, "magic bullet", "weapon magic")]), 1)
+            [(0.0, "orc sorcerer"), (0.5, "magic bullet", "weapon magic")],
+            monster), 1)
         self.assertEqual(si.peak_individuals(
-            [(0.0, "orc sorcerer"), (0.5, "magic bullet"), (0.7, "magic bullet"),
-             (0.9, "magic bullet")]), 3)
+            [(0.0, "balrog", "slash"), (0.0, "balrog", "fire"),
+             *((0.13 * tick, "fire", "fire") for tick in range(4))], monster), 1)
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "ghoul", "slash"), (0.01, "ghoul", "drain")], monster), 1)
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "orc warrior"), (0.3, "orc warrior"), (0.6, "orc warrior")],
+            monster), 3)
+        self.assertEqual(si.peak_individuals([(0.0, "magic bullet")], monster), 0)
+        # Without the graph, every name counts.
         self.assertEqual(si.peak_individuals([(0.0, "magic bullet")]), 1)
-        self.assertEqual(si.peak_individuals(
-            [(0.0, "orc warrior"), (0.5, "magic bullet")]), 2)
+        sorcerer = si.review_failure(
+            [(990.0, 2, "ff0000", "orc sorcerer hit you for 9 (-9) slash damage."),
+             (990.5, 2, "ff0000", "magic bullet hit you for 40 (-40) weapon magic damage.")],
+            [], {"time": 1000.0, "action": "emergency-recall", "map": "/road"},
+            [self.SPOT], monster=monster)
+        self.assertEqual((sorcerer.peak_attackers, sorcerer.peak_individuals), (2, 1))
         self.assertEqual(si.peak_individuals(
             [(0.0, "orc"), (0.5, "orc"), (0.2, "sorcerer")]), 3)
         self.assertGreaterEqual(si.peak_individuals(
@@ -25708,7 +25723,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=37", page)
+        self.assertIn(b"/app.js?v=38", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)

@@ -1349,15 +1349,16 @@ counted toward the spot's kit hazard. Three changes:
     `BURST_SECONDS` (1 s) apart, at least one. One monster swings far less
     often: an orc's `weapon_speed` 0.035 a tick at 8 ticks a second is a
     swing about every 3.6 s;
-  - a spell projectile (`SPELL_PROJECTILES`, such as "magic bullet", the
-    name the hit text gives a sorcerer's bolt) counts only beyond the
-    caster kinds hitting in the window (names with `CASTER_MARKERS`, such
-    as "sorcerer" or "shaman"): one sorcerer and its bullet are one;
+  - only names of authored monster kinds count (`WorldGraph.is_monster`:
+    a monster archetype, or a monster placed on a map). A hit named for a
+    spell projectile ("magic bullet", or a firestorm's "fire", which a
+    cone sends every tick it lives), an effect or a trap is its caster's
+    or nobody's: one sorcerer and its bullet are one;
   - the names are summed.
 
   It is an estimate: same-named attackers that never hit within a second
   of each other, or that swing in one tick with the same attack types,
-  count as one, and a caster is known by its name only. Each
+  count as one, and a caster seen only through its spell does not count. Each
   kit failure now keeps it; one stored before reads it from the review of
   the same time, or that review's distinct names when it predates this. The 02:43 recall and the 19:13 death make two;
   `KIT_HAZARD_FAILURES` stays 3. Route deaths counted already. Recalls

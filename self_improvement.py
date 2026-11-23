@@ -153,22 +153,6 @@ BURST_SECONDS = 1.0
 # one server tick (8 a second): lines of one name this close together are
 # one swing, unless two name the same type.
 SWING_SECONDS = 0.125
-# Damage spells whose projectile the hit text names instead of its caster
-# (server/src/include/spellist.h). With a caster kind hitting in the same
-# window, its projectile is that caster, not another attacker.
-SPELL_PROJECTILES = frozenset({
-    "asteroid", "bullet storm", "bullet swarm", "cause light wounds",
-    "destruction", "finger of death", "firebolt", "firestorm",
-    "forked lightning", "frost nova", "frostbolt", "holy word", "icestorm",
-    "lightning", "magic bullet", "magic missile", "meteor", "meteor swarm",
-    "negative energy bolt", "poison fog"})
-# Words in a monster's name that mark a spell caster (orc sorcerer, kobold
-# shaman, ...). The hit text carries no archetype, so this is by name.
-CASTER_MARKERS = ("sorcerer", "shaman", "mage", "magician", "wizard", "priest",
-                  "witch", "warlock", "necromancer", "lich", "druid", "cleric",
-                  "conjurer", "enchanter", "illusionist", "summoner")
-
-
 def _swings(hits: list[tuple[float, str]]) -> list[tuple[float, int]]:
     """(time, attackers) of one name's swings from its (time, type) hits:
     lines within SWING_SECONDS of a swing's first are that swing; as many
@@ -197,21 +181,26 @@ def _burst(swings: list[tuple[float, int]]) -> int:
     return best
 
 
-def peak_individuals(hits: Iterable[tuple]) -> int:
+def peak_individuals(hits: Iterable[tuple],
+                     monster: Callable[[str], bool] | None = None) -> int:
     """Estimated individual attackers at once among (time, attacker[,
     damage type]) hits.
 
-    Within any PACK_WINDOW_SECONDS, one name's lines within SWING_SECONDS
-    are one swing (one line per attack type), and the name counts as many
-    attackers as its most swings less than BURST_SECONDS apart, at least
-    one. A spell projectile (SPELL_PROJECTILES) counts only beyond the
-    caster kinds (CASTER_MARKERS) hitting in that window. The names are
-    summed. An estimate: same-named attackers that never hit within a
-    second of each other, or that swing in the same tick with the same
-    attack types, count as one.
+    Only names ``monster`` accepts count (an authored monster kind,
+    navigation's world graph): a hit named for a spell projectile ("magic
+    bullet", "fire"), an effect or a trap is its caster's or nobody's, and
+    one cone caster sends a "fire" line every tick its cone lives. Without
+    ``monster`` every name counts. Within any PACK_WINDOW_SECONDS, one
+    name's lines within SWING_SECONDS are one swing (one line per attack
+    type), and the name counts as many attackers as its most swings less
+    than BURST_SECONDS apart, at least one. The names are summed. An
+    estimate: same-named attackers that never hit within a second of each
+    other, or that swing in the same tick with the same attack types,
+    count as one.
     """
     ordered = sorted(((float(hit[0]), str(hit[1]),
-                       str(hit[2]) if len(hit) > 2 else "") for hit in hits),
+                       str(hit[2]) if len(hit) > 2 else "") for hit in hits
+                      if monster is None or monster(str(hit[1]))),
                      key=lambda hit: hit[0])
     peak = 0
     for index, (start, _, _) in enumerate(ordered):
@@ -220,21 +209,17 @@ def peak_individuals(hits: Iterable[tuple]) -> int:
             if stamp - start > PACK_WINDOW_SECONDS:
                 break
             window.setdefault(who, []).append((stamp, kind))
-        counts = {who: _burst(_swings(lines)) for who, lines in window.items()}
-        projectiles = sum(count for who, count in counts.items()
-                          if who.casefold() in SPELL_PROJECTILES)
-        casters = sum(count for who, count in counts.items()
-                      if who.casefold() not in SPELL_PROJECTILES and
-                      any(marker in who.casefold() for marker in CASTER_MARKERS))
-        others = sum(counts.values()) - projectiles
-        total = others + (max(0, projectiles - casters) if casters else projectiles)
-        peak = max(peak, total)
+        peak = max(peak, sum(_burst(_swings(lines)) for lines in window.values()))
     return peak
 
 
 def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
-                   failure: dict, spot_paths: Iterable[str]) -> FailureReview:
-    """Classify a failure from the combat messages and decisions before it."""
+                   failure: dict, spot_paths: Iterable[str], *,
+                   monster: Callable[[str], bool] | None = None) -> FailureReview:
+    """Classify a failure from the combat messages and decisions before it.
+
+    ``monster`` says which hit names are authored monster kinds, for
+    peak_individuals."""
     when = float(failure.get("time", 0.0) or 0.0)
     start = when - REVIEW_WINDOW_SECONDS
     # Scanned twice (hits, then starvation): a one-shot iterable must not
@@ -254,7 +239,8 @@ def review_failure(messages: Iterable[tuple], decisions: Iterable[dict],
         attackers[who] = attackers.get(who, 0) + 1
         damage_by_type[kind] = damage_by_type.get(kind, 0) + amount
     peak = peak_attackers((stamp, who) for stamp, who, _, _ in hits)
-    individuals = peak_individuals((stamp, who, kind) for stamp, who, _, kind in hits)
+    individuals = peak_individuals(
+        ((stamp, who, kind) for stamp, who, _, kind in hits), monster)
     damage = sum(damage_by_type.values())
     starved = any(
         record.get("action") == "emergency-disengage" and

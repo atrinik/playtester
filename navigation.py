@@ -1092,6 +1092,12 @@ class WorldGraph:
             for identity in normalized
         ), default=0)
 
+    def is_monster(self, name: str) -> bool:
+        """Whether a name (as in "<name> hit you") is an authored monster
+        kind: a monster archetype, or a monster placed on a map, by name,
+        animation or face. A spell projectile, an effect or a trap is not."""
+        return self._semantic_name(str(name)) in self.monster_levels
+
     def farm_priorities(self, map_path: str,
                         target_pattern: str) -> list[NamedSpawn]:
         if not target_pattern:
@@ -7794,7 +7800,8 @@ class FarmCircuitTask(BotTask):
         this_life = [record for record in decisions if isinstance(record, dict) and
                      float(record.get("time", 0.0) or 0.0) > previous_death]
         review = self_improvement.review_failure(
-            messages, this_life, failure, [leg for leg, _ in self.legs])
+            messages, this_life, failure, [leg for leg, _ in self.legs],
+            monster=self.graph.is_monster)
         # Hits stamped before she entered the death map were taken elsewhere:
         # only damage taken on it makes that map the hazard.
         entered = self._entered_map_at(client, review.map, review.time)
