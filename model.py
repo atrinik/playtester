@@ -262,6 +262,16 @@ class GameState:
     # Wall-clock time before which a paid-but-ineffective temple restoration
     # is not attempted again.
     paid_restoration_retry_until: float = 0.0
+    # The cure-funding farm (navigation.cure_funding_farm): the wall-clock
+    # time it started (0 while none runs), the deaths counted since and
+    # the time up to which they are counted, when the cure first became
+    # affordable (0 while it is not), and the time before which, after
+    # its death backoff, no new one starts.
+    cure_funding_farm_since: float = 0.0
+    cure_funding_farm_deaths: int = 0
+    cure_funding_farm_counted_at: float = 0.0
+    cure_funding_farm_funded_at: float = 0.0
+    cure_funding_farm_retry_until: float = 0.0
     # Maps where a route death took combat damage, by wall-clock time until
     # which navigation avoids them.
     route_hazards: dict[str, float] = field(default_factory=dict)

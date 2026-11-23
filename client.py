@@ -544,6 +544,29 @@ class AtrinikClient:
                         "paid_restoration_retry_until", 0.0)))
             except (TypeError, ValueError):
                 self.state.paid_restoration_retry_until = 0.0
+            try:
+                self.state.cure_funding_farm_since = max(0.0, float(
+                    record.get("cure_funding_farm_since", 0.0) or 0.0))
+                self.state.cure_funding_farm_deaths = max(0, int(
+                    record.get("cure_funding_farm_deaths", 0) or 0))
+                self.state.cure_funding_farm_counted_at = max(0.0, float(
+                    record.get("cure_funding_farm_counted_at", 0.0) or 0.0))
+                self.state.cure_funding_farm_funded_at = max(0.0, float(
+                    record.get("cure_funding_farm_funded_at", 0.0) or 0.0))
+                self.state.cure_funding_farm_retry_until = max(0.0, float(
+                    record.get("cure_funding_farm_retry_until", 0.0) or 0.0))
+                if not all(math.isfinite(value) for value in (
+                        self.state.cure_funding_farm_since,
+                        self.state.cure_funding_farm_counted_at,
+                        self.state.cure_funding_farm_funded_at,
+                        self.state.cure_funding_farm_retry_until)):
+                    raise ValueError("not finite")
+            except (TypeError, ValueError, OverflowError):
+                self.state.cure_funding_farm_since = 0.0
+                self.state.cure_funding_farm_deaths = 0
+                self.state.cure_funding_farm_counted_at = 0.0
+                self.state.cure_funding_farm_funded_at = 0.0
+                self.state.cure_funding_farm_retry_until = 0.0
             hazards = record.get("route_hazards", {})
             self.state.route_hazards = {
                 str(path): float(until)
@@ -650,6 +673,11 @@ class AtrinikClient:
             self.state.heal_restock_note = ""
             self.state.heal_restock_retry_until = 0.0
             self.state.paid_restoration_retry_until = 0.0
+            self.state.cure_funding_farm_since = 0.0
+            self.state.cure_funding_farm_deaths = 0
+            self.state.cure_funding_farm_counted_at = 0.0
+            self.state.cure_funding_farm_funded_at = 0.0
+            self.state.cure_funding_farm_retry_until = 0.0
             self.state.route_hazards = {}
             self.state.vendor_quotes = {}
             self.state.farm_zone_quarantine = {}
@@ -973,6 +1001,27 @@ class AtrinikClient:
         self._runtime_memory.setdefault(character, {})[
             "paid_restoration_retry_until"] = (
                 self.state.paid_restoration_retry_until)
+        self._persist_character_memory()
+
+    def set_cure_funding_farm(self, *, since: float, deaths: int = 0,
+                              counted_at: float = 0.0, funded_at: float = 0.0,
+                              retry_until: float = 0.0) -> None:
+        """Persist the cure-funding farm's state (navigation.
+        cure_funding_farm_state) across restarts: its decision records
+        alone would scroll out of the bounded decision history."""
+        self.state.cure_funding_farm_since = max(0.0, float(since))
+        self.state.cure_funding_farm_deaths = max(0, int(deaths))
+        self.state.cure_funding_farm_counted_at = max(0.0, float(counted_at))
+        self.state.cure_funding_farm_funded_at = max(0.0, float(funded_at))
+        self.state.cure_funding_farm_retry_until = max(0.0, float(retry_until))
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        memory = self._runtime_memory.setdefault(character, {})
+        for key in ("cure_funding_farm_since", "cure_funding_farm_deaths",
+                    "cure_funding_farm_counted_at", "cure_funding_farm_funded_at",
+                    "cure_funding_farm_retry_until"):
+            memory[key] = getattr(self.state, key)
         self._persist_character_memory()
 
     def remember_route_hazard(self, path: str, until: float) -> None:
@@ -2740,6 +2789,12 @@ class AtrinikClient:
                 for item in self.state.inventory):
             self.set_depletion_points(0)
             self.record_action("depletion", "cleared: the depletion force is gone")
+            if self.state.cure_funding_farm_since:
+                # Cured: a cure-funding farm belongs to the depletion just
+                # removed, never to the next one (navigation.cure_funding_farm).
+                self.set_cure_funding_farm(since=0.0)
+                self.record_action("cure-funding-farm-ended",
+                                   "depletion cured")
 
     async def _handle_mapstats(self, cur: Cursor, raw: bytes) -> None:
         # Publish metadata and time together only after the complete payload
