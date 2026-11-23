@@ -1952,8 +1952,14 @@ the live plans. Notes against the text above:
   comparison still running after 3 minutes is dropped. Every hook catches
   its own errors. A whole-world search takes about 0.4 s, so a comparison
   completes over roughly 20 to 40 engine steps. A shadow without a route
-  where the live plan has none either is an agreement. The snapshot copies
-  the trip's goals and runtime exclusions.
+  where the live plan has none either is an agreement. A zero-length trip
+  (a live plan made with no edges, as she is already there, and a shadow
+  route of no edges, planned or overridden rather than failed) is no
+  comparison: it is neither logged nor stored, and the `route-shadow`
+  report ignores such rows stored earlier (from a map to itself, no edges
+  on either side, no live error, the shadow routed), printing only how
+  many it ignored. A failed plan on either side is always compared. The snapshot copies the trip's goals
+  and runtime exclusions.
 - **Logs.** `route-shadow-diverge` (another route, a route where the live
   plan has none, another spot) and `route-shadow-decline` (declined, no
   route, blocked, an essential override, farming paused), each at most
