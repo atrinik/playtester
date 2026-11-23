@@ -671,8 +671,40 @@ recovery phase:
   Where none exists it takes the ordinary route, which only costs learned
   hazards more, and records `recovery-home-unsafe-route`. Recovery
   usually starts on the farm, and live no strictly safe route led home
-  from any Burnt Forest map. Errands start only from her savebed, and the
-  cure and funding trips stay strict;
+  from any Burnt Forest map. From combat level 18
+  (`SWAMP_TRANSIT_LEVEL`), the level the farm circuit's own return does
+  (`farm-return-threat-fallback`), that ordinary walk may also cross
+  hazard maps when no hazard-free route exists
+  (`navigation-threat-fallback`): pack-hazard maps, and with them learned
+  ranged and over-level maps; only `KNOWN_LETHAL_TRANSIT` stays closed.
+  Once, when such a walk is created, its plan is checked: if it takes
+  that fallback, the walk heals below 85% and, below 70%, stops and steps
+  away from what hits her, as the recall shopping and cure trips do. If
+  she stands on a map without hostile spawns she first rests there, with
+  her usual healing and defence, until her HP and SP are full, for at
+  most `HAZARD_REST_SECONDS` (600 s), and records
+  `recovery-home-hazard-rest`. On a map with hostile spawns she goes at
+  once, since staying is worse. A replan during the walk never rests
+  again; the next walk, after `HOME_RETRY_SECONDS`, is checked afresh.
+  Already home (a death during the rest respawns her there), she does
+  not rest. The rest, its record and the home-unreachable streak are the
+  recovery task's own memory: a rebuilt task (autoplay's handover, Stop
+  and Start, a restart) may rest and record again, and starts a new
+  streak.
+  The cure trip never crosses a known hazard while she is depleted, and
+  waits instead. The walk home cannot: errands, the cure among them,
+  start only from her savebed, so waiting off it would leave her uncured
+  and unrested forever.
+  Live, from 2026-11-18 (v1.81 to v1.87), recovery began at the Asteria
+  sage (`world_4_47`), where her recall trip had taken a careful route
+  out, and every way back to her Clearhaven savebed (`world_7_79`)
+  crossed pack-hazard maps (`world_0_50` and `world_0_51` from the sage,
+  `world_5_50` and `world_5_51` from `world_6_44_1`, then the Brynknot
+  ship): 3,052 walks home failed, one every two minutes, until v1.88.0
+  stopped suspending farming for recall. A failed walk retries after
+  `HOME_RETRY_SECONDS`; the third in a row records
+  `recovery-home-unreachable` once. Errands start only from her savebed,
+  and the cure and funding trips stay strict;
 - depleted: the strict temple cure when she can pay (a depletion potion
   first); otherwise the cure-funding path (identify-all, junk sale,
   deposit, the apartment chest);
@@ -699,6 +731,11 @@ clears as soon as its condition does:
   of a safe route from her savebed. Each refusal is a recorded decision
   (`cure-route-refused`, reset by `cure-route-cleared` or
   `farming-resumed`), so the count survives Stop and restarts;
+- `home-unreachable`: three walks home in a row failed, with the latest
+  error, while she is off her savebed. She keeps retrying, which is
+  harmless: a learned hazard expires, but a content hazard such as a pack
+  map lifts only when her level changes (below level 18 the walk never
+  crosses one). Reaching her savebed (a respawn, say) clears it at once;
 The recall alerts are no longer recovery blockers; see the
 [owner decision of 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22).
 

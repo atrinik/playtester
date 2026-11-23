@@ -326,6 +326,13 @@ G9.
 - **Level-18 fallback.** `FarmCircuitTask._retry_unavoidable_return_route`
   (`navigation.py:5172-5197`) retries a failed farm trip once with
   `allow_ranged_hazard_fallback` when the combat level is 18 or more.
+  The recovery phase's ordinary walk home (`RecoveryTask._new_home_walk`)
+  sets it from the same level, so she is not stranded where every way to
+  her savebed crosses pack-hazard maps. When a new walk's plan takes a
+  fallback tier (`NavigateTask.hazard_fallback_taken`: not the tunnel
+  retry, not a learned-cost plan), she rests first on a map without
+  hostile spawns. Her strict walk never takes it
+  ([COMBAT.md](../COMBAT.md), recovery phase).
 
 The pack estimate (`transit_max_aggro_pack`) only rates `world_*` maps.
 Dungeon maps are never pack hazards, however dense: Underground City
