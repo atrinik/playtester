@@ -735,7 +735,10 @@ within their detection radius, and its casters within 10 tiles, of where
 she pulls raise the spot's pack, as do the circuit's own maps' spawns
 across their shared seams; it flags `seam caster×N` and lowers the spot's
 own safety, and a spot whose pack then exceeds the cap is left out. The
-Farming tab, the farm picker and manual farm tasks use that same ranking.
+Farming tab, the farm picker and manual farm tasks use that same ranking:
+a spot seam exposure leaves out is not offered in the picker (an explicit
+`farm_circuit` task with its own legs still works), and the Farming tab
+marks a risky spot and its seam exposure under its approach.
 
 A spot is only as safe as the way there. Once her savebed is known and exists
 in the locked content, each run passes it as `--approach-origin MAP

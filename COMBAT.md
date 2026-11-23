@@ -1339,12 +1339,25 @@ counted toward the spot's kit hazard. Three changes:
   (`hazard_failure`): an emergency recall on the way with
   `ROUTE_PACK_ATTACKERS` (3) or more individual attackers at once
   (`peak_individuals`). The hit text names no individual, so three orc
-  warriors are one name: within any 8 s, each name counts as many
-  attackers as its most hits less than `BURST_SECONDS` (1 s) apart, at
-  least one, and the names are summed. One monster swings far less often
-  (an orc's `weapon_speed` 0.035 a tick at 8 ticks a second is a swing
-  about every 3.6 s), but same-named attackers that never hit within a
-  second of each other still count as one, so it is an estimate. Each
+  warriors are one name. Within any 8 s:
+  - one name's lines within one server tick (`SWING_SECONDS`, 0.125 s)
+    are one swing, since the server sends a line per attack type of a
+    swing (`server/src/server/attack.c`, the `NROFATTACKS` loop; a ghoul,
+    wraith or lost soul has two or three types), unless two lines name the
+    same type;
+  - each name counts as many attackers as its most swings less than
+    `BURST_SECONDS` (1 s) apart, at least one. One monster swings far less
+    often: an orc's `weapon_speed` 0.035 a tick at 8 ticks a second is a
+    swing about every 3.6 s;
+  - a spell projectile (`SPELL_PROJECTILES`, such as "magic bullet", the
+    name the hit text gives a sorcerer's bolt) counts only beyond the
+    caster kinds hitting in the window (names with `CASTER_MARKERS`, such
+    as "sorcerer" or "shaman"): one sorcerer and its bullet are one;
+  - the names are summed.
+
+  It is an estimate: same-named attackers that never hit within a second
+  of each other, or that swing in one tick with the same attack types,
+  count as one, and a caster is known by its name only. Each
   kit failure now keeps it; one stored before reads it from the review of
   the same time, or that review's distinct names when it predates this. The 02:43 recall and the 19:13 death make two;
   `KIT_HAZARD_FAILURES` stays 3. Route deaths counted already. Recalls

@@ -20382,6 +20382,10 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual([(spot["name"], spot["spot_risky"]) for spot in shown],
                          [("Trees", True)])
         self.assertFalse(analyzer.snapshot("xp")["ranking"][0]["spot_risky"])
+        # The Farming tab renders it beside the approach.
+        script = (Path(__file__).parent / "web_static" / "app.js").read_text()
+        self.assertIn("${spotLine(r)}", script)
+        self.assertIn("r.spot_risky", script)
         # Capped at her pack, it is neither shown nor offered.
         client.farm_analyzer.profile = self.kit(max_health=330, max_aggro_pack=2)
         self.assertEqual([spot["name"] for spot in dashboard.farming_analysis()["ranking"]],
@@ -24636,6 +24640,30 @@ class SelfImprovementTests(unittest.TestCase):
                          ("route", 1, 3))
         self.assertEqual(si.peak_individuals(
             [(0.0, "orc"), (3.6, "orc"), (7.2, "orc")]), 1)
+        # One swing sends a line per attack type in one server tick: a
+        # ghoul's two types are one ghoul, two lines of one type two.
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "ghoul", "slash"), (0.01, "ghoul", "drain")]), 1)
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "ghoul", "slash"), (0.01, "ghoul", "slash")]), 2)
+        ghoul = si.review_failure(
+            [(990.0, 2, "ff0000", "ghoul hit you for 20 (-20) slash damage."),
+             (990.0, 2, "ff0000", "ghoul hit you for 5 (-5) drain damage."),
+             (993.6, 2, "ff0000", "ghoul hit you for 20 (-20) slash damage."),
+             (993.6, 2, "ff0000", "ghoul hit you for 5 (-5) drain damage.")],
+            [], {"time": 1000.0, "action": "emergency-recall",
+                 "map": "/road"}, [self.SPOT])
+        self.assertEqual(ghoul.peak_individuals, 1)
+        # A sorcerer's bolt is named for the spell: one sorcerer, not two;
+        # three bolts at once beside it are three casters.
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "orc sorcerer"), (0.5, "magic bullet", "weapon magic")]), 1)
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "orc sorcerer"), (0.5, "magic bullet"), (0.7, "magic bullet"),
+             (0.9, "magic bullet")]), 3)
+        self.assertEqual(si.peak_individuals([(0.0, "magic bullet")]), 1)
+        self.assertEqual(si.peak_individuals(
+            [(0.0, "orc warrior"), (0.5, "magic bullet")]), 2)
         self.assertEqual(si.peak_individuals(
             [(0.0, "orc"), (0.5, "orc"), (0.2, "sorcerer")]), 3)
         self.assertGreaterEqual(si.peak_individuals(
@@ -25680,7 +25708,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=36", page)
+        self.assertIn(b"/app.js?v=37", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
