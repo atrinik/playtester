@@ -20814,6 +20814,11 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertFalse(walk.navigation.strict_safety)
         self.assertEqual(walk.navigation.destination, self.HOME[0])
         self.assertNotEqual(self.moves, [])
+        # A hazard-free ordinary route needs no care wait and keeps the
+        # ordinary safety policy.
+        self.assertFalse(walk.navigation._route_threat_maps)
+        self.assertIsNone(walk.navigation.care)
+        self.assertLess(walk.safety.heal_below, recovery.HAZARD_HEAL_BELOW)
         # The cure stays strict and starts only from her savebed.
         self.assertIsNone(recovery.services._restoration)
 
@@ -20824,7 +20829,8 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
     CLEARHAVEN_BED = ("/shattered_islands/world_7_79", (16, 3))
 
     def stranded_at_the_sage(self, level):
-        client, _ = self.client(depletion=92, level=level)
+        # Live, both her recall wands were empty: no recall to wait for.
+        client, _ = self.client(depletion=92, level=level, recall=False)
         client.state.savebed_map, client.state.savebed_xy = self.CLEARHAVEN_BED
         self.place(client, self.SAGE)
         recovery, now = self.recovery(client)
@@ -20836,9 +20842,27 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # entered although the farm circuit's own return does from level 18.
         from .navigation import NavigateTask
 
+        from .navigation import CARE_BOUNDED
+
         client, recovery, _ = self.stranded_at_the_sage(36)
         packs = NavigateTask(built_graph(), self.CLEARHAVEN_BED[0]) \
             ._known_pack_hazard_maps(self.SAGE[0])
+        # Depleted, she crosses a hazard road only at full HP and SP: at
+        # 75% she waits where she stands.
+        client.state.stats["hp"] = 100
+        for _ in range(3):
+            asyncio.run(recovery.tick(client))
+        walk = recovery._home_walk
+        self.assertIsNotNone(walk)
+        care = walk.navigation.care
+        self.assertIsNotNone(care)
+        self.assertEqual(care.mode, CARE_BOUNDED)
+        self.assertIn("full HP", care.missing)
+        self.assertEqual(self.moves, [])
+        self.assertEqual(walk.safety.heal_below, recovery.HAZARD_HEAL_BELOW)
+        self.assertEqual(walk.safety.flee_below, recovery.HAZARD_FLEE_BELOW)
+        # Rested, she departs.
+        client.state.stats["hp"] = 134
         for _ in range(3):
             asyncio.run(recovery.tick(client))
         actions = self.actions(client)
@@ -20855,9 +20879,10 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertNotEqual(self.moves, [])
         self.assertEqual(self.ids(recovery.alerts(client)), [])
         # The strict walk never takes that road: only the ordinary one.
-        self.assertFalse(recovery._new_home_walk(
+        strict = recovery._new_home_walk(
             client, self.CLEARHAVEN_BED, strict=True)
-            .navigation.allow_ranged_hazard_fallback)
+        self.assertFalse(strict.navigation.allow_ranged_hazard_fallback)
+        self.assertFalse(strict.navigation.care_on_threat_fallback)
 
     def test_a_savebed_she_cannot_reach_is_alerted_once_and_retried(self):
         # Below the level the careful route clear starts at, no walk home
@@ -20876,8 +20901,10 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIn("no component route", alert["text"])
         self.assertEqual(
             self.actions(client).count("recovery-home-unreachable"), 1)
-        # Home again (a respawn, say): the streak and the alert clear.
+        # Home again (a respawn, say): the alert goes at once, even while
+        # she is too hurt for the tick to reach her errands.
         self.place(client, self.CLEARHAVEN_BED)
+        self.assertNotIn("home-unreachable", self.ids(recovery.alerts(client)))
         asyncio.run(recovery.tick(client))
         self.assertEqual(recovery._home_failures, 0)
         self.assertNotIn("home-unreachable", self.ids(recovery.alerts(client)))

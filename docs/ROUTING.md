@@ -327,8 +327,10 @@ G9.
   (`navigation.py:5172-5197`) retries a failed farm trip once with
   `allow_ranged_hazard_fallback` when the combat level is 18 or more.
   The recovery phase's ordinary walk home (`RecoveryTask._new_home_walk`)
-  sets it from the same level, so a trip out that cleared a pack road can
-  come back the same way; its strict walk never does
+  sets it from the same level, so she is not stranded where every way to
+  her savebed crosses pack-hazard maps. A route that takes the fallback
+  crosses its threat maps with `CARE_BOUNDED` care
+  (`NavigateTask.care_on_threat_fallback`). Her strict walk never takes it
   ([COMBAT.md](../COMBAT.md), recovery phase).
 
 The pack estimate (`transit_max_aggro_pack`) only rates `world_*` maps.

@@ -2396,6 +2396,10 @@ class NavigateTask(BotTask):
         self._route_threat_maps: set[str] = set()
         self._threat_fallback = False
         self.allow_ranged_hazard_fallback = False
+        # A route that takes that fallback crosses its threat maps with
+        # CARE_BOUNDED care (full HP and SP first): the recovery phase's
+        # walk home, where she is depleted.
+        self.care_on_threat_fallback = False
         # Avoid every known hazard, the maps that killed her included, with
         # no fallback tier: no safe route means no trip (the task fails and
         # is retried later), never a dangerous one.
@@ -2631,6 +2635,10 @@ class NavigateTask(BotTask):
             self._plan_client = None
         if not learned:
             self._shadow(client, origin, route, "")
+        if self.care_on_threat_fallback and self._route_threat_maps:
+            self._bounded = tuple(dict.fromkeys((*self._bounded, *(
+                route_blocks.map_subject(path)
+                for path in sorted(self._route_threat_maps)))))
         if self._crossed or self._bounded:
             # Both may hold at once (a blocked and over-budget route): the
             # crossing waits as an owner block and keeps the bounded
@@ -9766,9 +9774,10 @@ class RecoveryTask(BotTask):
       covers hunger with nothing to eat);
     - off her savebed with nothing running: a walk home, strictly safe
       where such a route exists and otherwise by the ordinary route
-      (recovery-home-unsafe-route), which from level 18 may clear a pack
-      road as the farm return does. Three failed walks in a row raise
-      home-unreachable. Every errand starts from her savebed;
+      (recovery-home-unsafe-route), which from level 18 may cross hazard
+      maps as the farm return does, after waiting for full HP and SP.
+      Three failed walks in a row raise home-unreachable. Every errand
+      starts from her savebed;
     - depleted: the temple cure when she can pay (a depletion potion
       first), otherwise the cure-funding path: identify-all, junk sale,
       deposit, the apartment chest. No recall is bought with the cure's
@@ -9882,14 +9891,16 @@ class RecoveryTask(BotTask):
         """What blocks her way out, from live state: each clears as soon
         as its condition does."""
         alerts = self._cure_alerts(client)
-        if self._home_failures >= self.HOME_ROUTE_ATTEMPTS:
+        if (self._home_failures >= self.HOME_ROUTE_ATTEMPTS and
+                not self.at_home(client)):
             home = self._home(client)
             alerts.append({
                 "id": "home-unreachable", "level": "critical",
                 "text": f"Savebed unreachable: {self._home_failures} walks "
                         f"home to {home[0] if home else '?'} failed in a "
-                        f"row; she retries every "
-                        f"{int(self.HOME_RETRY_SECONDS)} s: "
+                        f"row (she retries every "
+                        f"{int(self.HOME_RETRY_SECONDS)} s; content hazards "
+                        f"such as pack maps stay until her level changes): "
                         f"{self._home_error}"})
         return alerts
 
@@ -10016,18 +10027,27 @@ class RecoveryTask(BotTask):
         walk.navigation.tolerance = 1
         walk.navigation.strict_safety = strict
         walk.navigation.essential = "home"
-        # The ordinary walk home may clear its way through pack-hazard maps
+        # The ordinary walk home may clear its way through hazard maps
         # from the level the farm circuit's own return does
         # (_retry_unavoidable_return_route). Live, from 2026-11-18, the
         # Asteria sage's recall trip took that careful route out, recovery
         # began at the sage, and every way back to her Clearhaven savebed
-        # crossed the crocodile road's pack maps: 3,052 walks home failed.
-        # The pack-free route is still preferred; the planner falls back
-        # only when none exists (navigation-threat-fallback).
+        # crossed pack-hazard maps: 3,052 walks home failed. The hazard-free
+        # route is still preferred; the planner falls back only when none
+        # exists (navigation-threat-fallback). Such a crossing waits for
+        # full HP and SP first (care_on_threat_fallback), and the walk then
+        # heals and flees early (_tick_home_walk).
         walk.navigation.allow_ranged_hazard_fallback = (
             not strict and FarmCircuitTask._combat_progression_level(client) >=
             FarmCircuitTask.SWAMP_TRANSIT_LEVEL)
+        walk.navigation.care_on_threat_fallback = (
+            walk.navigation.allow_ranged_hazard_fallback)
         return walk
+
+    # The walk home's safety policy once its route crosses a threat map:
+    # the recall shopping and cure trips' early healing and flight.
+    HAZARD_HEAL_BELOW = 0.85
+    HAZARD_FLEE_BELOW = 0.70
 
     async def _tick_home_walk(self, client: AtrinikClient) -> None:
         """One step of the walk home: strictly safe, and when no such route
@@ -10055,6 +10075,10 @@ class RecoveryTask(BotTask):
             walk = self._home_walk = self._new_home_walk(
                 client, home, strict=False)
             await walk.tick(client)
+        if (walk.navigation._route_threat_maps and
+                walk.safety.heal_below < self.HAZARD_HEAL_BELOW):
+            walk.safety = SafetyPolicy(heal_below=self.HAZARD_HEAL_BELOW,
+                                       flee_below=self.HAZARD_FLEE_BELOW)
         if walk.status == TaskStatus.FAILED:
             log.warning("recovery: walk to her savebed failed: %s", walk.error)
             self._home_retry_at = self.clock() + self.HOME_RETRY_SECONDS
@@ -10062,8 +10086,9 @@ class RecoveryTask(BotTask):
             self._home_failures += 1
             self._home_error = walk.error
             if self._home_failures == self.HOME_ROUTE_ATTEMPTS:
-                # Once per streak: the retries go on (learned hazards
-                # expire), the dashboard alert says why she is not home.
+                # Once per streak. The retries go on, harmlessly: a learned
+                # hazard expires, a content one (a pack map) lifts only at
+                # a new level. The dashboard alert says why she is not home.
                 self._record(client, "recovery-home-unreachable", walk.error)
         elif walk.status == TaskStatus.COMPLETE:
             self._home_walk = None
