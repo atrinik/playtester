@@ -446,13 +446,18 @@ def out_of_heals_and_recall(client: AtrinikClient,
 
 # Without a usable heal or a ready recall she starts no new pull, and no
 # optional trip, below this share of her health (owner decision,
-# 2026-11-22: a recall is not relied on; FarmTask.unprepared_for_pulls,
-# unprepared_for_trips).
+# 2026-11-22: a recall is not relied on; unprepared_for_trips).
 UNPREPARED_HEALTH = 0.90
-# An unprepared rest or errand hold lasts at most this long in a row; then
-# she goes on as before (damage over time can outpace regeneration) and
-# records unprepared-rest-timeout once (UnpreparedHold).
+# An unprepared hold (the farm's rest and the circuit's optional trips)
+# lasts at most this long without a gap; then she goes on as before
+# (damage over time can outpace regeneration) and records
+# unprepared-rest-timeout once (UnpreparedHold).
 UNPREPARED_REST_LIMIT_SECONDS = 600.0
+# A hold not checked for this long (an essential trip, a fight) starts
+# afresh when checked again: the gap is not waiting.
+UNPREPARED_GAP_SECONDS = 10.0
+# A hold checked within this long is under way (UnpreparedHold.holding).
+UNPREPARED_FRESH_SECONDS = 3.0
 
 
 def unprepared_for_trips(client: AtrinikClient,
@@ -472,25 +477,29 @@ def unprepared_for_trips(client: AtrinikClient,
 
 class UnpreparedHold:
     """unprepared_for_trips, capped at UNPREPARED_REST_LIMIT_SECONDS of
-    continuous holding. ``what`` names the hold in its timeout record."""
+    holding without a gap. A farm circuit owns one, shared with each farm
+    it creates, so a leg change or a rebuilt farm does not reset it."""
 
-    def __init__(self, what: str,
-                 clock: Callable[[], float] = time.monotonic):
-        self.what = what
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
         self.since: float | None = None
+        self.last_poll: float | None = None
         self.timed_out = False
 
     def active(self, client: AtrinikClient,
                safety: "SafetyPolicy | None" = None) -> bool:
         """Whether to hold now; False once the cap ran out, until she is
-        prepared again (then the next hold starts afresh)."""
+        prepared again or a gap of UNPREPARED_GAP_SECONDS passes (then the
+        next hold starts afresh)."""
+        now = self.clock()
+        gap = (self.last_poll is not None and
+               now - self.last_poll > UNPREPARED_GAP_SECONDS)
+        self.last_poll = now
         if not unprepared_for_trips(client, safety):
             self.since, self.timed_out = None, False
             return False
-        now = self.clock()
-        if self.since is None:
-            self.since = now
+        if self.since is None or gap:
+            self.since, self.timed_out = now, False
         if now - self.since < UNPREPARED_REST_LIMIT_SECONDS:
             return True
         if not self.timed_out:
@@ -498,13 +507,18 @@ class UnpreparedHold:
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
                 recorder("unprepared-rest-timeout",
-                         f"{self.what}: held {now - self.since:.0f} s without "
-                         "a usable heal or a ready recall; going on")
+                         f"held {now - self.since:.0f} s without a usable "
+                         "heal or a ready recall; going on")
         return False
 
     def holding(self) -> bool:
-        """Whether a hold is under way and not timed out."""
-        return self.since is not None and not self.timed_out
+        """Whether a hold is under way: checked just now, and neither timed
+        out nor past its cap."""
+        if self.since is None or self.last_poll is None or self.timed_out:
+            return False
+        now = self.clock()
+        return (now - self.last_poll <= UNPREPARED_FRESH_SECONDS and
+                now - self.since < UNPREPARED_REST_LIMIT_SECONDS)
 
 
 def combat_allowed(client: AtrinikClient) -> bool:
@@ -586,7 +600,7 @@ RECALL_DEVICE_RETRY_SECONDS = 20.0
 # From this level recall shopping buys a recall source when she can afford
 # one (navigation.FarmCircuitTask._needs_recall_shopping), and a farm with
 # neither a usable heal nor a ready recall rests before pulling
-# (FarmTask.unprepared_for_pulls).
+# (unprepared_for_trips).
 RECALL_REQUIRED_LEVEL = 18
 
 
@@ -1898,9 +1912,10 @@ class FarmTask(BotTask):
         self._training_resting = False
         self._training_rest_at = 0.0
         # Resting for want of a usable heal or a ready recall
-        # (unprepared_for_pulls), recorded once per rest, and its cap.
+        # (unprepared_for_trips), recorded once per rest, and its cap: its
+        # own standalone, its circuit's within one (FarmCircuitTask).
         self._unprepared_resting = False
-        self._unprepared_hold = UnpreparedHold("farm pulls")
+        self._unprepared_hold = UnpreparedHold()
         self._melee_cycle_anchor = 0.0
         self._melee_anchor_message_at = 0.0
         self._finish_race_targets: set[int] = set()
@@ -2382,13 +2397,6 @@ class FarmTask(BotTask):
     # share of her health up (owner decision, 2026-11-22: a recall is not
     # relied on, so not engaging while out of heals is what keeps her safe).
     UNPREPARED_PULL_HEALTH = UNPREPARED_HEALTH
-
-    def unprepared_for_pulls(self, client: AtrinikClient) -> bool:
-        """Whether a new pull must wait: from RECALL_REQUIRED_LEVEL, below
-        UNPREPARED_PULL_HEALTH, with neither a usable heal (an item, or a
-        healing spell she has the SP for: SafetyPolicy._usable_heal) nor a
-        ready recall (emergency_recall_candidates): unprepared_for_trips."""
-        return unprepared_for_trips(client, self.safety)
 
     async def _unprepared_rest(self, client: AtrinikClient,
                                ratio: float) -> None:

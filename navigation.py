@@ -6775,8 +6775,9 @@ class FarmCircuitTask(BotTask):
         self.clear_hostile_route = bool(clear_hostile_route)
         self.clock = clock
         self.server_clock = ServerGameClock(clock=clock)
-        # Optional trips held without a usable heal or a ready recall.
-        self._unprepared_hold = UnpreparedHold("optional trips", clock=clock)
+        # The hold without a usable heal or a ready recall: its optional
+        # trips, and its farms' pulls (each farm shares it).
+        self._unprepared_hold = UnpreparedHold(clock=clock)
         self.leg_index = 0
         self.child: NavigateThenTask | None = None
         self._farm_started_at = 0.0
@@ -7592,6 +7593,7 @@ class FarmCircuitTask(BotTask):
         farm._lore_book_attempts = self._lore_book_attempts
         farm._spellbook_attempts = self._spellbook_attempts
         farm._unreachable_targets = self._unreachable_targets
+        farm._unprepared_hold = self._unprepared_hold
         if self._analyzer_safety:
             flee, heal = (self.AGGRESSIVE_SAFETY if aggressive else
                           self.PASSIVE_SAFETY)
@@ -8403,7 +8405,11 @@ class FarmCircuitTask(BotTask):
 
     def unprepared_resting(self) -> bool:
         """Whether its farm rests for want of a heal or a recall
-        (FarmTask.unprepared_resting): an explained wait, not being stuck."""
+        (FarmTask.unprepared_resting): an explained wait, not being stuck.
+        Never while a trip of its own runs."""
+        if self._resupply is not None or any(
+                service is not None for service in self._maintenance_services()):
+            return False
         farm = self.child.task if self.child is not None else None
         return isinstance(farm, FarmTask) and farm.unprepared_resting()
 
@@ -9541,7 +9547,7 @@ class FarmCircuitTask(BotTask):
         # Optional trips wait while she has neither a usable heal nor a
         # ready recall below UNPREPARED_HEALTH (unprepared_for_trips), for
         # at most UNPREPARED_REST_LIMIT_SECONDS; the farm rests meanwhile
-        # (FarmTask.unprepared_for_pulls).
+        # on the same hold (FarmTask._unprepared_rest).
         unprepared = (isinstance(farm, FarmTask) and
                       self._unprepared_hold.active(client, farm.safety))
         if (isinstance(farm, FarmTask) and
@@ -9678,7 +9684,8 @@ class FarmCircuitTask(BotTask):
                 (named_spawn_empty or patrol_swept_empty) and
                 live_targets == 0 and elapsed >= 15.0 and
                 not self._busy_finishing_fight_or_loot(client, farm) and
-                not farm.training_rest_active()):
+                not farm.training_rest_active() and
+                not self._unprepared_hold.holding()):
             if not self._empty_spawn_since:
                 self._empty_spawn_since = now
                 return
@@ -9712,6 +9719,10 @@ class FarmCircuitTask(BotTask):
         # Nor mid-rest for mana, or she sets off with a partial bar. Services
         # may still detour during a rest.
         if isinstance(farm, FarmTask) and farm.training_rest_active():
+            return
+        # Nor while she rests without a heal or a recall: no unprepared
+        # walk to another map; the hold's cap still runs.
+        if self._unprepared_hold.holding():
             return
         next_leg = self._next_ready_leg(self.leg_index + 1, level)
         if next_leg == self.leg_index:

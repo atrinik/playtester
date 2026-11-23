@@ -6482,6 +6482,8 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             lambda action, detail="": client.decisions.append(action))
 
     def test_without_heal_or_recall_she_pulls_nothing_below_90_percent(self):
+        from .tasks import unprepared_for_trips
+
         def farm(hp, *, level=36, potion=False):
             client = self._combat_client()
             self._no_heal_no_recall(client, hp)
@@ -6525,15 +6527,15 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.inventory.append(Item(
             61, item_type=c.TYPE_SPELL, name="minor healing", extra={"cost": 5}))
         task = FarmTask(zone="/test")
-        self.assertTrue(task.unprepared_for_pulls(client))
+        self.assertTrue(unprepared_for_trips(client, task.safety))
         client.state.stats["sp"] = 5
-        self.assertFalse(task.unprepared_for_pulls(client))
+        self.assertFalse(unprepared_for_trips(client, task.safety))
         # A ready recall counts too.
         client.state.stats["sp"] = 0
         client.state.inventory.append(Item(
             62, item_type=c.TYPE_ROD, quality=80, condition=80,
             name="rod of word of recall"))
-        self.assertFalse(task.unprepared_for_pulls(client))
+        self.assertFalse(unprepared_for_trips(client, task.safety))
 
     def _pursued_stand_task(self, client):
         client.state.stats.update(hp=100, maxhp=176)
@@ -21188,16 +21190,42 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             asyncio.run(autoplay.tick(client))
             asyncio.run(autoplay.tick(client))
             self.assertEqual(started, ["mana-crystal-upgrade"])
+        # Essential trips start first, unprepared or not: hungry, the temple
+        # food trip goes...
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        autoplay, started = autoplay_for(client)
+        food = []
 
-    def unprepared_circuit(self, client, needs):
+        async def temple_food(client):
+            food.append(1)
+            return True
+
+        autoplay._needs_temple_food = lambda client: True
+        autoplay._start_temple_food = temple_food
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual((food, started), ([1], []))
+        # ...and depleted, the recovery phase (the cure) starts.
+        client, _ = self.client(recall=False, depletion=92)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        autoplay, started = autoplay_for(client)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
+        self.assertEqual(started, [])
+
+    def unprepared_circuit(self, client, needs, *, legs=None, clock=None):
         """A circuit at the point where it starts optional trips, with
         only ``needs`` due."""
-        circuit = FarmCircuitTask(built_graph(), [(self.TREES, "")])
+        circuit = FarmCircuitTask(
+            built_graph(), legs or [(self.TREES, "")],
+            **({"clock": clock} if clock is not None else {}))
         circuit._busy_finishing_fight_or_loot = lambda client, farm: False
         client.state.inventory_replay_complete = True
         circuit.server_clock.anchor_minute = 12 * 60
         circuit.server_clock.anchor_at = circuit.server_clock.clock()
         circuit.server_clock.last_request_at = circuit.server_clock.clock()
+        circuit.server_clock.resync_seconds = float("inf")
         for name in ("_needs_bank_sync", "_needs_progress_checkpoint",
                      "_needs_bank_deposit", "_needs_ship_key",
                      "_needs_food_resupply", "_needs_savebed",
@@ -21239,7 +21267,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIsNotNone(circuit._spell_purchase)
         self.assertEqual(self.actions(client).count("unprepared-rest-timeout"), 1)
 
-    def test_an_unprepared_farm_rest_is_no_stuck_wait(self):
+    def test_an_unprepared_farm_rest_is_no_stuck_wait_and_only_that(self):
         from .tasks import UNPREPARED_REST_LIMIT_SECONDS
 
         client, _ = self.client(recall=False)
@@ -21249,13 +21277,70 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         circuit.child = circuit._new_child()
         autoplay.child = circuit
         farm = circuit.child.task
+        # The farm shares its circuit's hold.
+        self.assertIs(farm._unprepared_hold, circuit._unprepared_hold)
+        hold = circuit._unprepared_hold
         self.assertFalse(autoplay.recovery_alerts(client)[1])
         farm._unprepared_resting = True
-        farm._unprepared_hold.since = time.monotonic()
+        hold.since = hold.last_poll = time.monotonic()
         self.assertTrue(autoplay.recovery_alerts(client)[1])
-        farm._unprepared_hold.since -= UNPREPARED_REST_LIMIT_SECONDS
-        farm._unprepared_hold.timed_out = True
+        # An essential trip (a bank deposit) runs after the rest started:
+        # the stale rest flags no longer explain anything.
+        circuit._banking = _DoneErrand(status=TaskStatus.RUNNING)
         self.assertFalse(autoplay.recovery_alerts(client)[1])
+        circuit._banking = None
+        # Nor does a rest nobody has checked for a while (the farm returned
+        # early before its rest branch), nor one past its cap.
+        hold.last_poll -= 5.0
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+        hold.last_poll = time.monotonic()
+        hold.since -= UNPREPARED_REST_LIMIT_SECONDS
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+
+    def test_a_gap_in_the_hold_starts_it_afresh(self):
+        # Four minutes of rest, then a seven-minute essential trip: she
+        # rests again rather than timing out at once.
+        from .tasks import UnpreparedHold
+
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        now = [1_000.0]
+        hold = UnpreparedHold(clock=lambda: now[0])
+        for _ in range(48):
+            self.assertTrue(hold.active(client))
+            now[0] += 5.0
+        now[0] += 7 * 60
+        self.assertTrue(hold.active(client))
+        self.assertEqual(hold.since, now[0])
+        self.assertNotIn("unprepared-rest-timeout", self.actions(client))
+
+    def test_no_leg_switch_mid_rest_and_the_cap_still_fires_at_600_s(self):
+        from .tasks import UNPREPARED_REST_LIMIT_SECONDS
+
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=107, maxhp=134)
+        node = built_graph().nodes[self.TREES]
+        start = next((x, y) for x in range(node.width // 2, node.width)
+                     for y in range(node.height // 2, node.height)
+                     if node.walkable(x, y))
+        self.place(client, (self.TREES, start))
+        now = [1_000.0]
+        circuit = self.unprepared_circuit(
+            client, "", clock=lambda: now[0],
+            legs=[(self.TREES, ""), ("/shattered_islands/world_14_78", "")])
+        while now[0] - 1_000.0 < UNPREPARED_REST_LIMIT_SECONDS - 4:
+            asyncio.run(circuit.tick(client))
+            self.assertEqual(circuit.leg_index, 0, now[0] - 1_000.0)
+            now[0] += 4.0
+        self.assertGreater(now[0] - circuit._farm_started_at, circuit.dwell_seconds)
+        self.assertIn("unprepared-rest", self.actions(client))
+        self.assertNotIn("unprepared-rest-timeout", self.actions(client))
+        for _ in range(3):
+            now[0] += 4.0
+            asyncio.run(circuit.tick(client))
+        self.assertEqual(self.actions(client).count("unprepared-rest-timeout"), 1)
+        # Past the cap the hold no longer keeps her on this leg.
+        self.assertFalse(circuit._unprepared_hold.holding())
 
     def test_recovery_never_shops_for_recall(self):
         client, _ = self.client(bank=50_000, recall=False)

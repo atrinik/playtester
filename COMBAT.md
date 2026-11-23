@@ -778,7 +778,8 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
   - **No new pull.** The farm fights only what is beside her or already
     coming at her, with its defence as ever. Otherwise she rests where she
     stands, combat off, recorded once as `unprepared-rest`
-    (`FarmTask.unprepared_for_pulls`).
+    (`FarmTask._unprepared_rest`). The circuit does not switch legs
+    meanwhile, so she makes no unprepared walk to another map.
   - **No optional trip.** The farm circuit starts no ship-key trip, spell
     purchase, or recall, utility or upgrade shopping (checked with the
     farm's own safety policy), and autoplay starts no mana-crystal detour
@@ -788,12 +789,17 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
     defence. Essential trips are not delayed: temple food, the recovery
     phase and its cure, and the circuit's food, bank, identify, storage
     and savebed trips.
-  - **At most ten minutes.** A rest or hold lasts at most
-    `UNPREPARED_REST_LIMIT_SECONDS` (600 s) in a row (`UnpreparedHold`):
-    then she goes on as before, recorded once as `unprepared-rest-timeout`,
-    since damage over time can outpace regeneration. The next hold starts
-    once she is prepared again. A farm rest under way is an explained
-    wait, so the dashboard's stuck alert stays quiet meanwhile.
+  - **At most ten minutes.** The farm's rest and the circuit's optional
+    trips share one hold, owned by the circuit (`UnpreparedHold`), so a
+    rebuilt farm does not restart it. It lasts at most
+    `UNPREPARED_REST_LIMIT_SECONDS` (600 s) of checks without a gap: then
+    she goes on as before, recorded once as `unprepared-rest-timeout`,
+    since damage over time can outpace regeneration. A gap of more than
+    `UNPREPARED_GAP_SECONDS` (10 s) without a check, such as an essential
+    trip, starts the hold afresh, and so does being prepared again. A
+    farm rest checked within the last 3 s, with no circuit trip running,
+    is an explained wait, so the dashboard's stuck alert stays quiet
+    meanwhile, and only then.
 
   Each rest otherwise ends by itself: health regenerates passively, her
   SP buys a heal again, or a recall becomes ready. Below level 18, and

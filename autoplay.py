@@ -183,6 +183,10 @@ class AutoplayTask(BotTask):
         errand took her into the Old Outpost with no heals and no recall,
         and she died there.
         """
+        # Its own safety policy reads the same heal as a farm's would:
+        # SafetyPolicy._usable_heal depends only on her inventory, SP and
+        # the healing patterns, which no farm changes (farms tune only the
+        # heal and flee thresholds).
         if unprepared_for_trips(client, self.safety):
             return False
         if self._needs_mana_crystal_start(client):
