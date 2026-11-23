@@ -6072,12 +6072,28 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client = FakeClient()
         task = RetrieveItemsTask("chest", (r"^compass$",))
         asyncio.run(task.tick(client))
-        # Another container's close is not this chest's.
-        client.state.messages.append((0, 0, 0, "You close iron chest."))
-        asyncio.run(task.tick(client))
-        self.assertEqual(client.applied, [90])
         # The server names the chest in full (types/container.c).
         client.state.messages.append((0, 0, 0, "You close spruce chest."))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.applied, [90, 90])
+
+    def test_retrieve_reopens_after_closing_another_container(self):
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.place_item(Item(90, name="spruce chest"), 0)
+                self.state.messages = []
+                self.applied = []
+
+            async def apply(self, tag):
+                self.applied.append(tag)
+
+        client = FakeClient()
+        task = RetrieveItemsTask("chest", (r"^compass$",))
+        asyncio.run(task.tick(client))
+        # Another container was open: her apply closed it instead of opening
+        # this chest (types/container.c apply_func), so apply again.
+        client.state.messages.append((0, 0, 0, "You close iron chest."))
         asyncio.run(task.tick(client))
         self.assertEqual(client.applied, [90, 90])
 
@@ -12479,6 +12495,17 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(client.commands, ["/take all"])
         self.assertEqual(client.applied, [80])
         self.assertFalse(results[-1])
+        # She steps off: the server closes the corpse and the ground redraw
+        # no longer lists the boulder. Coming back must not reopen or keep
+        # drawing her to it.
+        self.assertIn(("", 0, 0), task._ignored_corpse_tiles)
+        client.state.remove_item(81)
+        for _ in range(3):
+            task._last_action = 0
+            self.assertFalse(asyncio.run(task.loot_nearby(client)))
+        self.assertIn(("", 0, 0), task._ignored_corpse_tiles)
+        self.assertEqual(client.applied, [80])
+        self.assertEqual(client.commands, ["/take all"])
 
     def test_farm_skips_server_confirmed_searched_empty_corpse(self):
         client = type("Client", (), {})()

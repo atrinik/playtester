@@ -3862,11 +3862,15 @@ class FarmTask(BotTask):
                 if take_phase == 0 or (
                         take_phase == 1 and now - take_at < 0.80):
                     return True
-                if not contents:
-                    self._ignored_corpse_tiles.add(
-                        (client.state.map.path,
-                         client.state.map.world_x,
-                         client.state.map.world_y))
+                # Done with this corpse, even with an untakeable leftover:
+                # once she steps off, the server closes it and its contents
+                # are no longer listed, so without the ignore she would walk
+                # back onto it until it decays. A newer corpse tag on the
+                # tile clears the ignore.
+                self._ignored_corpse_tiles.add(
+                    (client.state.map.path,
+                     client.state.map.world_x,
+                     client.state.map.world_y))
                 # Completed phases must not keep service detours (food,
                 # banking, selling) or the skill-cap review marked busy for
                 # the rest of a farm, even when /take all left something
@@ -7692,11 +7696,11 @@ class RetrieveItemsTask(BotTask):
                 client.state.messages_since(self._feedback_start)
                 if len(entry) > 3)
             if (not self._reopen_attempted and
-                    re.search(r"\byou (?:close|leave) (?:the )?"
-                              + re.escape(container.name.casefold())
-                              + r"\b", feedback)):
-                # The server names the chest in full ("You close spruce
-                # chest.", types/container.c apply_func): only this one.
+                    re.search(r"\byou (?:close|leave) ", feedback)):
+                # Any close since her own apply counts: the server names the
+                # chest by its base name ("You close spruce chest."), and an
+                # apply while another container is open closes that one
+                # without opening this chest (types/container.c apply_func).
                 # This process really did already have the chest selected;
                 # the first application closed it. Apply once more to open it
                 # and establish a fresh response window.
