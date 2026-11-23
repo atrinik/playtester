@@ -843,31 +843,49 @@ through the Old Outpost from 69 % to 1 %, hit about every 15 s. Two gaps:
 Now, on a defended walk:
 
 - **A retreat step waits for its answer.** While one is in flight,
-  `_retreat_step` waits for it, as the farm's `retreat_ack_pending` does.
-  A step that has not landed by the acknowledgement timeout is learned as
-  blocked, and the next choice is another square.
-- **Critical escape.** While she has neither a usable heal nor a ready
-  recall (`out_of_heals_and_recall`), from the safety's flee threshold,
-  with an attacker on her (a hit in the last 3 s, or one within 2 tiles)
-  she runs before anything else on the walk decides, starving or not:
-  combat off, no pull, recorded once per escape as
-  `navigation-critical-escape`. The step prefers the way she came in: a
-  square on or beside the trail she walked on this map, earlier on it than
-  where she stands (`toward_way_out`; walked ground, and since each such
-  step lowers that rank, the steps cannot cycle). Otherwise the usual
-  retreat ranking applies, never closer to an attacker.
+  `NavigateThenTask._retreat_step` (and `_unseen_attacker_retreat`, which
+  shares its bookkeeping) waits for it, as the farm's
+  `retreat_ack_pending` does. A step still where she sent it at the
+  acknowledgement timeout is learned as blocked, and the next choice is
+  another square. Once she stands anywhere else (pushed, teleported, a
+  map change) the step is forgotten, not learned. A learned square is
+  tried again after `RETREAT_BLOCKED_SECONDS` (30 s), and forgotten on
+  another map. This is a fix for every caller of the walk's retreat: its
+  own defence (`_defend_while_navigating`, on its own walk and as the farm
+  circuit's transit legs, route-death hold and failed-route escape, and the
+  recovery phase's defence call it) and the circuit's failed-route escape,
+  which calls `_retreat_step` directly.
+- **Critical escape.** Only on a walk's own tick (`own_walk`), and not on
+  a farm circuit's transit leg (a walk whose task is a `FarmTask`), which
+  keeps its defence unchanged. While she has neither a usable heal nor a
+  ready recall (`out_of_heals_and_recall`), from the safety's flee
+  threshold, with an attacker within 4 tiles on her (a hit in the last
+  3 s, or one within 2 tiles), she runs, starving or not: combat off, no
+  pull, recorded once per escape as `navigation-critical-escape`. Before
+  it come only the safety's heal and food (`SafetyPolicy.enforce`; a heal
+  or meal just sent holds the escape for that tick), the training finisher
+  above the flee threshold, the weapon restore, the transit hold-fire
+  release of an engagement and the stalled-target abandon. The step is the usual retreat ranking: never closer to an
+  attacker, open continuation and separation first, and no immediate
+  step back.
 - **No re-engaging until recovered.** The escape holds until she is above
-  the safety's heal threshold, or has a heal or a ready recall again. Until
-  then she keeps running from an attacker on her, and closes no gap to a
-  creature more than 2 tiles off: no training finisher, no pack cast.
+  the safety's heal threshold, or has a heal or a ready recall again, and
+  ends when the walk starts again. Until then she keeps running from an
+  attacker on her, and closes no gap to a creature more than 2 tiles off:
+  no training finisher, no pack cast.
 - **Cornered keeps its defence.** With no step away the escape does not
   act, and the walk's defence decides as before (the cornered fight among
-  them).
+  them), against the closest attacker rather than a committed one farther
+  off.
 
-Accepted limit: once no attacker is on her, the walk's hold and route go on
-as before. Starving with nothing to eat she does not rest, so the route
-can lead her back past the attacker she escaped; giving up an errand to go
-for food is not part of this change.
+Accepted limits:
+
+- once no attacker is on her, the walk's hold and route go on as before.
+  Starving with nothing to eat she does not rest, so the route can lead
+  her back past the attacker she escaped; giving up an errand to go for
+  food is not part of this change;
+- the escape sees only creatures within 4 tiles: a ranged attacker
+  farther off, or one she cannot see, does not start it.
 
 The farm map's own retreat (`FarmTask.low_health_retreat`, the cornered
 breakout and the pursued stand) is unchanged; an earlier attempt to change

@@ -11104,8 +11104,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
 
     def _outpost_escape(self, *, hp=200, food=0, inventory=()):
         """Live shape (2026-11-22, the Old Outpost): an errand walk, no heal,
-        no recall, starving, a troll on her from the east, the way she came
-        in to the west."""
+        no recall, starving, a troll on her from the east."""
         client = self._combat_client()
         client.state.map.tiles.clear()
         client.state.map.world_x = 10
@@ -11135,72 +11134,122 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                        ("/test", 8, 10), ("/test", 9, 10), ("/test", 10, 10)]
         return client, node, task
 
-    def test_critical_escape_runs_back_the_way_she_came_in(self):
+    @staticmethod
+    def _troll_at(client, world_x, world_y):
+        """Put the troll at a world square, in her current view."""
+        m = client.state.map
+        m.tiles.clear()
+        m.tile(8 + world_x - m.world_x, 8 + world_y - m.world_y).objects[3] = (
+            MapObject(3, 1, 0, 0, name="troll guard", target_id=700,
+                      target_hp=100))
+
+    def _land(self, client, task):
+        """Her retreat step lands."""
+        _, x, y, _ = task._retreat_attempt
+        client.state.map.world_x, client.state.map.world_y = x, y
+        task._record_trail(client)
+
+    def test_critical_escape_runs_from_the_attacker(self):
         client, _, task = self._outpost_escape()
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        # West, back along her trail, with combat off; starving did not
-        # make her walk on into the troll.
-        self.assertEqual(client.direct_moves, [(7, False)])
+        self.assertTrue(asyncio.run(
+            task._defend_while_navigating(client, own_walk=True)))
+        # Away from the troll, with combat off; starving did not make her
+        # walk on into it.
+        self.assertEqual(len(client.direct_moves), 1)
         self.assertNotIn(True, client.combat)
         self.assertTrue(task._escaping)
-        self.assertIn("navigation-critical-escape",
-                      [action for action, _ in client.decisions])
+        self.assertIn(("navigation-critical-escape",
+                       "hp=200/322: no usable heal, no ready recall"),
+                      client.decisions)
         choice = next(detail for action, detail in client.decisions
                       if action == "navigation-retreat-choice")
-        self.assertTrue(choice.startswith("direction=7 separation=2 "))
-        self.assertTrue(choice.endswith(" way_out=1"))
-        # The step lands; she keeps running along the trail, now away from
-        # it diagonally, and records the escape only once.
-        client.state.map.world_x = 9
-        task._record_trail(client)
-        client.state.map.tiles.clear()
-        client.state.map.tile(9, 8).objects[3] = MapObject(
-            3, 1, 0, 0, name="troll guard", target_id=700, target_hp=100)
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertIn(client.direct_moves[-1][0], (7, 8))
+        self.assertIn(" separation=2 ", choice)
+        # The step lands and the troll follows: she runs on, and records
+        # the escape only once.
+        self._land(client, task)
+        self._troll_at(client, client.state.map.world_x + 1,
+                       client.state.map.world_y)
+        self.assertTrue(asyncio.run(
+            task._defend_while_navigating(client, own_walk=True)))
+        self.assertEqual(len(client.direct_moves), 2)
         self.assertEqual([action for action, _ in client.decisions].count(
             "navigation-critical-escape"), 1)
 
+    def test_critical_escape_gains_distance_from_a_chaser_on_her_trail(self):
+        client, _, task = self._outpost_escape()
+        # The troll came after her along the way she came in.
+        task._trail = [("/test", 7, 7), ("/test", 8, 8), ("/test", 9, 9),
+                       ("/test", 10, 10)]
+        self._troll_at(client, 9, 9)
+        self.assertTrue(asyncio.run(
+            task._defend_while_navigating(client, own_walk=True)))
+        _, x, y, _ = task._retreat_attempt
+        self.assertEqual(max(abs(x - 9), abs(y - 9)), 2)
+        self.assertNotIn(True, client.combat)
+
+    def test_critical_escape_is_not_for_a_farm_circuit_transit_leg(self):
+        client, node, _ = self._outpost_escape()
+        graph = WorldGraph()
+        graph.nodes = {"/test": node,
+                       "/pool": MapNode(path="/pool", width=24, height=24)}
+        leg = NavigateThenTask(
+            graph, "/pool", FarmTask(zone="/pool"), combat_approach=True,
+            safety=SafetyPolicy(heal_below=0.85, flee_below=0.70))
+        asyncio.run(leg._defend_while_navigating(client, own_walk=True))
+        self.assertFalse(leg._escaping)
+        self.assertNotIn("navigation-critical-escape",
+                         [action for action, _ in client.decisions])
+        # Nor for a caller other than the walk's own tick.
+        client, _, task = self._outpost_escape()
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertFalse(task._escaping)
+        self.assertNotIn("navigation-critical-escape",
+                         [action for action, _ in client.decisions])
+
+    def test_critical_escape_ends_when_the_walk_starts_again(self):
+        client, _, task = self._outpost_escape()
+        asyncio.run(task._defend_while_navigating(client, own_walk=True))
+        self.assertTrue(task._escaping)
+        asyncio.run(task.start(client))
+        self.assertFalse(task._escaping)
+
     def test_critical_escape_holds_until_she_recovers(self):
         client, _, task = self._outpost_escape(food=999)
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client, own_walk=True)))
         self.assertTrue(task._escaping)
         # Above the flee threshold but below the heal threshold, with the
         # troll still on her: she goes on running rather than turn on it.
         client.state.stats["hp"] = 250
-        client.state.map.world_x = 9
-        task._record_trail(client)
-        client.state.map.tiles.clear()
-        client.state.map.tile(9, 8).objects[3] = MapObject(
-            3, 1, 0, 0, name="troll guard", target_id=700, target_hp=100)
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self._land(client, task)
+        self._troll_at(client, client.state.map.world_x + 1,
+                       client.state.map.world_y)
+        self.assertTrue(asyncio.run(
+            task._defend_while_navigating(client, own_walk=True)))
         self.assertEqual(len(client.direct_moves), 2)
         self.assertNotIn(True, client.combat)
         # A creature three tiles off that is not on her: she closes no gap.
         client.state.messages = []
-        client.state.map.world_x = 8
-        task._record_trail(client)
-        client.state.map.tiles.clear()
-        client.state.map.tile(11, 8).objects[3] = MapObject(
-            3, 1, 0, 0, name="troll guard", target_id=700, target_hp=100)
-        asyncio.run(task._defend_while_navigating(client))
+        self._land(client, task)
+        self._troll_at(client, client.state.map.world_x + 3,
+                       client.state.map.world_y)
+        asyncio.run(task._defend_while_navigating(client, own_walk=True))
         self.assertEqual(client.targets, [])
         self.assertNotIn(True, client.combat)
         # Back above the heal threshold the escape is over.
         client.state.stats["hp"] = 280
-        asyncio.run(task._defend_while_navigating(client))
+        asyncio.run(task._defend_while_navigating(client, own_walk=True))
         self.assertFalse(task._escaping)
 
     def test_critical_escape_needs_no_heal_and_no_recall(self):
         potion = Item(8, name="potion of healing", item_type=c.TYPE_POTION)
         client, _, task = self._outpost_escape(inventory=(potion,))
-        asyncio.run(task._defend_while_navigating(client))
+        asyncio.run(task._defend_while_navigating(client, own_walk=True))
         self.assertFalse(task._escaping)
         self.assertNotIn("navigation-critical-escape",
                          [action for action, _ in client.decisions])
         # Above the flee threshold nothing starts either.
         client, _, task = self._outpost_escape(hp=240)
-        asyncio.run(task._defend_while_navigating(client))
+        asyncio.run(task._defend_while_navigating(client, own_walk=True))
         self.assertFalse(task._escaping)
         self.assertEqual(client.direct_moves, [])
 
@@ -11210,10 +11259,52 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # the cornered defence always has.
         node.terrain = {(10, 10): 1, (11, 10): 1}
         self._corner(task, client)
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client, own_walk=True)))
         self.assertEqual(client.direct_moves, [])
         self.assertFalse(task._escaping)
         self.assertEqual(client.combat[-1], True)
+
+    def test_critical_escape_cornered_fights_the_adjacent_attacker(self):
+        client, node, task = self._outpost_escape(hp=250)
+        task._escaping = True
+        # Committed to a troll seven tiles off; another stands beside her
+        # and she has no step away.
+        client.state.map.tile(15, 8).objects[3] = MapObject(
+            3, 2, 0, 0, name="troll cave soldier", target_id=701,
+            target_hp=100)
+        task._last_pull_target = 701
+        node.terrain = {(10, 10): 1, (11, 10): 1, (17, 10): 1}
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(
+            task._defend_while_navigating(client, own_walk=True)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.targets[-1][2], 700)
+        self.assertEqual(client.combat[-1], True)
+
+    def test_navigation_retreat_forgets_a_step_when_she_moves_elsewhere(self):
+        client, _, task = self._outpost_escape(food=999)
+        threats = [(1, 9, 8, client.state.map.tile(9, 8).objects[3])]
+        self.assertTrue(asyncio.run(task._retreat_step(client, threats)))
+        path, x, y, sent_at = task._retreat_attempt
+        # Pushed to another square, past the timeout: the step's square is
+        # not learned as blocked, and she chooses afresh.
+        client.state.map.world_y = 11
+        task._retreat_attempt = (path, x, y, time.monotonic() - 60)
+        self.assertTrue(asyncio.run(task._retreat_step(client, threats)))
+        self.assertEqual(task._retreat_blocked, set())
+        self.assertEqual(len(client.direct_moves), 2)
+
+    def test_navigation_retreat_blocked_squares_expire(self):
+        client, _, task = self._outpost_escape(food=999)
+        now = time.monotonic()
+        task._retreat_blocked = {("/test", 9, 10), ("/other", 1, 1),
+                                 ("/test", 9, 11)}
+        task._retreat_blocked_at = {
+            ("/test", 9, 10): now - task.RETREAT_BLOCKED_SECONDS - 1,
+            ("/other", 1, 1): now, ("/test", 9, 11): now}
+        task._prune_retreat_blocked("/test", now)
+        self.assertEqual(task._retreat_blocked, {("/test", 9, 11)})
+        self.assertEqual(set(task._retreat_blocked_at), {("/test", 9, 11)})
 
     def test_navigation_retreat_waits_for_its_step_then_learns_it_blocked(self):
         """Live (2026-11-22): in an Old Outpost doorway two retreat steps
