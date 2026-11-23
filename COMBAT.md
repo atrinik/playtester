@@ -950,15 +950,26 @@ not block her either.
   `send_cure_funding_farm_home`). Meanwhile `cure_funding_farm` is false,
   so farming is unsafe ("home for errands from the cure-funding farm"):
   autoplay hands over to recovery as usual, which walks her home and runs
-  the funding errands from her savebed. With none left to start, the same
-  farm resumes (`cure-funding-farm-resumed`), its start and deaths kept,
-  and the circuit's trips (a heal restock among them) start from her
-  savebed, where strict routes exist. A break lasts at most
+  its funding errands (identify-all, junk sale, deposit, the chest's
+  funding trip) from her savebed. With none left to start and no trip
+  under way, the same farm resumes (`cure-funding-farm-resumed`), its
+  start and deaths kept. The heal restock and the apartment storage trip
+  are not recovery errands, so on resuming the retry deadlines of the
+  trips a break is for (heal restock, sale, deposit, identify-all,
+  storage; `CURE_FUNDING_FARM_HOME_TRIPS`) are cleared: the circuit's
+  first maintenance ticks run them from her savebed, where strict routes
+  exist, before she walks out. A break lasts at most
   `CURE_FUNDING_FARM_HOME_SECONDS` (30 min), and another starts no sooner
   than that after one began: a refusal meanwhile keeps the trip's own
-  retry. The break is in memory only. Its `cure-unfunded` alert is a
-  warning. Live, on 2026-11-23, no town service was strictly reachable
-  from `hemlock_cave_0102`: from the farm she could never sell, bank or
+  retry. A break that completed no town errand (sale, deposit,
+  identify-all, storage or heal restock) since the break before is
+  fruitless; after `CURE_FUNDING_FARM_HOME_FRUITLESS` (2) fruitless
+  breaks in a row she stops going home for the rest of that funding farm
+  (`cure-funding-farm-home-given-up`) and farms on, with the warning
+  `funding-farm-town-unreachable`. A new funding farm starts afresh. The
+  break state is in memory only. Its `cure-unfunded` alert is a warning.
+  Live, on 2026-11-23, no town service was strictly reachable from
+  `hemlock_cave_0102`: from the farm she could never sell, bank or
   restock heals.
 - **Until she can pay.** Affordability is read live on every tick: as
   soon as the coins she carries, or they and her known bank balance, pay

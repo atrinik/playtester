@@ -23285,6 +23285,149 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             self.assertFalse(cure_funding_farm_home(client))
         self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_HOME), 2)
 
+    def home_break(self):
+        """Autoplay on the cure-funding farm, sent home by a refused heal
+        restock (its 600 s deferral set) and handed over to recovery, with
+        no recovery errand left to start."""
+        from .navigation import RecoveryTask, send_cure_funding_farm_home
+
+        client, _, autoplay = self.parked_unfunded()
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        circuit = autoplay.child
+        self.assertIsInstance(circuit, FarmCircuitTask)
+        circuit._heal_restock_retry_at = (
+            circuit.clock() + FarmCircuitTask.HEAL_RESTOCK_STRICT_RETRY_SECONDS)
+        self.assertTrue(send_cure_funding_farm_home(client, "heal restock"))
+        circuit.ready_for_handover = lambda client: True
+        asyncio.run(autoplay.tick(client))
+        recovery = autoplay.child
+        self.assertIsInstance(recovery, RecoveryTask)
+        self.assertGreater(recovery.services._heal_restock_retry_at, 0.0)
+        recovery.services._cure_funding_retry_at = (
+            recovery.clock() + FarmCircuitTask.CURE_FUNDING_RETRY_SECONDS)
+        return client, autoplay, recovery
+
+    def test_a_break_home_runs_the_refused_trip_from_her_savebed(self):
+        # The deferral that sent her home must not travel back with her:
+        # live, the restock stayed deferred at her savebed, she walked out
+        # without heals, and the next deferral sent her home again.
+        from .navigation import CURE_FUNDING_FARM_RESUMED, cure_funding_farm
+
+        client, autoplay, recovery = self.home_break()
+        asyncio.run(autoplay.tick(client))
+        self.assertIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        self.assertTrue(cure_funding_farm(client))
+        self.assertNotIn("_heal_restock_retry_at", autoplay._circuit_backoffs)
+        asyncio.run(autoplay.tick(client))
+        circuit = autoplay.child
+        self.assertIsInstance(circuit, FarmCircuitTask)
+        self.assertEqual(circuit._heal_restock_retry_at, 0.0)
+        # Its maintenance tick, at her savebed, plans the restock there
+        # (the other trips stubbed out, as in the restock tests).
+        circuit._heal_restock_funds = lambda client: 500
+        self.assertTrue(circuit._needs_heal_restock(client))
+        if circuit.child is None:
+            circuit.child = circuit._new_child()
+        circuit.status = TaskStatus.RUNNING
+
+        async def idle(*args, **kwargs):
+            return False
+
+        circuit.server_clock.sync = idle
+        for name in dir(circuit):
+            if name.startswith("_needs_") and name != "_needs_heal_restock":
+                setattr(circuit, name, lambda *args, **kwargs: False)
+        circuit._queue_inventory_capability = lambda *args: False
+        circuit._apply_disease_cure = idle
+        circuit._queue_depletion_service = lambda client: False
+        circuit._heal_restock_may_leave = lambda *args: True
+        circuit._heal_restock_waiting = lambda *args: False
+        planned = []
+
+        def restock(client, *, strict):
+            planned.append(client.state.map.path)
+            trip = _DoneErrand(status=TaskStatus.RUNNING,
+                               task=types.SimpleNamespace(merchant="Healer"))
+            trip.navigation = types.SimpleNamespace(destination=self.SHOP[0])
+            return trip
+
+        circuit._new_heal_restock = restock
+        asyncio.run(circuit.tick(client))
+        self.assertEqual(planned, [self.HOME[0]])
+        self.assertIsNotNone(circuit._heal_restock)
+
+    def test_fruitless_breaks_home_stop_after_two(self):
+        from .navigation import (CURE_FUNDING_FARM_HOME,
+                                 CURE_FUNDING_FARM_HOME_GIVEN_UP,
+                                 CURE_FUNDING_FARM_HOME_SECONDS,
+                                 cure_funding_farm, cure_funding_farm_alerts,
+                                 note_cure_funding_errand,
+                                 resume_cure_funding_farm,
+                                 send_cure_funding_farm_home,
+                                 start_cure_funding_farm)
+
+        client, _ = self.client(depletion=7, bank=2_245)
+        start_cure_funding_farm(client, "short")
+        now = [time.time()]
+
+        def cycle():
+            now[0] += CURE_FUNDING_FARM_HOME_SECONDS + 1
+            with patch("atrinik_bot.navigation.time.time",
+                       side_effect=lambda: now[0]):
+                sent = send_cure_funding_farm_home(client, "junk sale")
+                if sent:
+                    self.assertTrue(resume_cure_funding_farm(client))
+                return sent
+
+        self.assertTrue(cycle())
+        # A sale at home: that break achieved something.
+        with patch("atrinik_bot.navigation.time.time", return_value=now[0] + 5):
+            note_cure_funding_errand(client)
+        self.assertTrue(cycle())
+        self.assertTrue(cycle())
+        self.assertEqual(client.state.cure_funding_farm_home_fruitless, 1)
+        # Two in a row achieved nothing: no third, she farms on, alerted.
+        self.assertFalse(cycle())
+        self.assertFalse(cycle())
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_HOME), 3)
+        self.assertEqual(
+            self.actions(client).count(CURE_FUNDING_FARM_HOME_GIVEN_UP), 1)
+        self.assertTrue(cure_funding_farm(client))
+        alerts = cure_funding_farm_alerts(client)
+        self.assertEqual(self.ids(alerts),
+                         ["cure-unfunded", "funding-farm-town-unreachable"])
+        self.assertEqual(alerts[1]["level"], "warn")
+        # A new funding farm starts afresh.
+        start_cure_funding_farm(client, "short")
+        self.assertEqual(self.ids(cure_funding_farm_alerts(client)),
+                         ["cure-unfunded"])
+
+    def test_a_break_home_waits_for_a_trip_under_way_and_survives_a_failed_one(self):
+        from .navigation import CURE_FUNDING_FARM_RESUMED, cure_funding_farm_home
+
+        client, autoplay, recovery = self.home_break()
+        # A trip under way at her savebed: no resume until it settles.
+        idle = recovery._tick_services
+
+        async def no_services(client):
+            return False
+
+        recovery._tick_services = no_services
+        recovery.services._selling = _DoneErrand(status=TaskStatus.RUNNING)
+        asyncio.run(autoplay.tick(client))
+        self.assertNotIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        self.assertTrue(cure_funding_farm_home(client))
+        recovery._tick_services = idle
+        # That funding errand fails at home: she still resumes the farm.
+        recovery.services._selling = _DoneErrand(
+            status=TaskStatus.FAILED, error="merchant gone")
+        asyncio.run(autoplay.tick(client))
+        self.assertIsNone(recovery.services._selling)
+        self.assertNotIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
+
     def test_no_funding_farm_while_a_funding_trip_is_left_or_the_bank_unknown(self):
         from .navigation import CURE_FUNDING_FARM_STARTED, cure_funding_farm
 

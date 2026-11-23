@@ -5927,6 +5927,8 @@ def _end_cure_funding_farm(client: AtrinikClient, **changes) -> None:
         **changes})
     client.state.cure_funding_farm_home_at = 0.0
     client.state.cure_funding_farm_home_resumed = False
+    client.state.cure_funding_farm_home_fruitless = 0
+    client.state.cure_funding_farm_home_given_up = False
 
 
 # A strict town trip (bank, junk sale, identify-all, the apartment chest, a
@@ -5937,10 +5939,26 @@ def _end_cure_funding_farm(client: AtrinikClient, **changes) -> None:
 # every eastern candidate (content pack-hazard maps on every way back), so
 # from the farm she could never sell, bank or restock heals. A break lasts
 # at most this long, and another starts no sooner than this after one
-# began: no tight loop between the farm and home.
+# began: no tight loop between the farm and home. After
+# CURE_FUNDING_FARM_HOME_FRUITLESS breaks in a row with no town errand
+# completed since the break before, she stops going home for the rest of
+# that funding farm and farms on (cure_funding_farm_alerts says so).
 CURE_FUNDING_FARM_HOME_SECONDS = 1800.0
+CURE_FUNDING_FARM_HOME_FRUITLESS = 2
 CURE_FUNDING_FARM_HOME = "cure-funding-farm-home"
 CURE_FUNDING_FARM_RESUMED = "cure-funding-farm-resumed"
+CURE_FUNDING_FARM_HOME_GIVEN_UP = "cure-funding-farm-home-given-up"
+# The strict town trips a break home is for: their retry deadlines are
+# cleared when the farm resumes, so they run from her savebed at once.
+CURE_FUNDING_FARM_HOME_TRIPS = (
+    "_heal_restock_retry_at", "_selling_retry_at", "_banking_retry_at",
+    "_identification_retry_at", "_storage_retry_at")
+
+
+def note_cure_funding_errand(client: AtrinikClient) -> None:
+    """A town errand (bank deposit, junk sale, identify-all, the apartment
+    chest, a heal restock) completed: a break home achieved something."""
+    client.state.cure_funding_farm_errand_at = time.time()
 
 
 def cure_funding_farm_home(client: AtrinikClient) -> bool:
@@ -5960,13 +5978,30 @@ def send_cure_funding_farm_home(client: AtrinikClient, detail: str) -> bool:
     if not cure_funding_farm(client):
         return False
     state = client.state
+    if getattr(state, "cure_funding_farm_home_given_up", False):
+        return False
     at = float(getattr(state, "cure_funding_farm_home_at", 0.0) or 0.0)
     if at and time.time() - at < CURE_FUNDING_FARM_HOME_SECONDS:
         return False
+    recorder = getattr(client, "record_action", None)
+    if at:
+        errand = float(getattr(state, "cure_funding_farm_errand_at", 0.0) or 0.0)
+        state.cure_funding_farm_home_fruitless = (
+            0 if errand >= at else
+            int(getattr(state, "cure_funding_farm_home_fruitless", 0) or 0) + 1)
+        if state.cure_funding_farm_home_fruitless >= CURE_FUNDING_FARM_HOME_FRUITLESS:
+            state.cure_funding_farm_home_given_up = True
+            log.warning("cure-funding farm: %d breaks home achieved nothing; "
+                        "farming on: %s",
+                        state.cure_funding_farm_home_fruitless, detail)
+            if recorder is not None:
+                recorder(CURE_FUNDING_FARM_HOME_GIVEN_UP,
+                         f"{state.cure_funding_farm_home_fruitless} breaks "
+                         f"home achieved nothing; {detail}")
+            return False
     state.cure_funding_farm_home_at = time.time()
     state.cure_funding_farm_home_resumed = False
     log.warning("cure-funding farm: home for errands: %s", detail)
-    recorder = getattr(client, "record_action", None)
     if recorder is not None:
         recorder(CURE_FUNDING_FARM_HOME, detail)
     return True
@@ -6103,13 +6138,20 @@ def cure_funding_farm_alerts(client: AtrinikClient) -> list[dict[str, str]]:
     funding = cure_funding_farm_state(client)
     cost = FarmCircuitTask._depletion_service_cost(client)
     wallet = BuyShopUpgradeTask.wallet_value(client)
-    return [{"id": "cure-unfunded", "level": "warn",
-             "text": "Cure unfunded: remove depletion costs "
-                     f"{format_money(cost)}, she has {format_money(wallet)} "
-                     "and nothing left to sell, so she farms the safest "
-                     "spot to fund it (deaths while funding: "
-                     f"{funding.deaths} of {CURE_FUNDING_FARM_DEATHS}); "
-                     "the owner can give her gold with the operator assist"}]
+    alerts = [{"id": "cure-unfunded", "level": "warn",
+               "text": "Cure unfunded: remove depletion costs "
+                       f"{format_money(cost)}, she has {format_money(wallet)} "
+                       "and nothing left to sell, so she farms the safest "
+                       "spot to fund it (deaths while funding: "
+                       f"{funding.deaths} of {CURE_FUNDING_FARM_DEATHS}); "
+                       "the owner can give her gold with the operator assist"}]
+    if getattr(client.state, "cure_funding_farm_home_given_up", False):
+        alerts.append({
+            "id": "funding-farm-town-unreachable", "level": "warn",
+            "text": "Funding farm: town trips unreachable from the farm "
+                    f"spot, and {CURE_FUNDING_FARM_HOME_FRUITLESS} breaks "
+                    "home achieved nothing; she farms on without them"})
+    return alerts
 
 
 # Services a depleted character must reach for her cure and its funding, all
@@ -9994,6 +10036,8 @@ class FarmCircuitTask(BotTask):
             await self._heal_restock.tick(client)
             if self._heal_restock.status in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
+                if self._heal_restock.status == TaskStatus.COMPLETE:
+                    note_cure_funding_errand(client)
                 self._settle_heal_restock(client)
             return True
         if self._utility_shopping is not None:
@@ -10101,6 +10145,7 @@ class FarmCircuitTask(BotTask):
                 self._banking = None
             elif self._banking.status == TaskStatus.COMPLETE:
                 log.info("all carried cash banked; returning to farm")
+                note_cure_funding_errand(client)
                 setter = getattr(client, "set_last_bank_deposit", None)
                 if setter is not None:
                     setter(time.time())
@@ -10122,6 +10167,7 @@ class FarmCircuitTask(BotTask):
                 self._selling = None
             elif self._selling.status == TaskStatus.COMPLETE:
                 log.info("identified junk sale complete; returning to farm")
+                note_cure_funding_errand(client)
                 # Sale proceeds can be far larger than routine corpse coins.
                 # Invalidate travel batching so the next safe maintenance tick
                 # deposits the entire payment immediately.
@@ -10153,6 +10199,7 @@ class FarmCircuitTask(BotTask):
                         await farm.maintain_inventory(client)):
                     return True
                 log.info("mass identification complete; returning to farm")
+                note_cure_funding_errand(client)
                 self._identification_retry_at = self.clock() + 3600.0
                 self._identification = None
             return True
@@ -10174,6 +10221,7 @@ class FarmCircuitTask(BotTask):
                 self._storage = None
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
+                note_cure_funding_errand(client)
                 self._storage = None
             return True
         if self._bed_binding is not None:
@@ -11166,7 +11214,11 @@ class RecoveryTask(BotTask):
                 return
             if not self.busy() and resume_cure_funding_farm(client):
                 # Home from the cure-funding farm for its errands: the
-                # same farm resumes, deaths kept.
+                # same farm resumes, deaths kept, and the town trips it
+                # came home for (the heal restock and the storage chest
+                # are not recovery errands) run from here first.
+                for name in CURE_FUNDING_FARM_HOME_TRIPS:
+                    setattr(self.services, name, 0.0)
                 self._resume(client, "back to the cure-funding farm")
             elif self._cure_funding_farm_due(client):
                 self._start_cure_funding_farm(client)
