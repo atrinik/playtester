@@ -11,8 +11,9 @@ from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
 from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          NavigateThenTask, RecoveryTask,
+                         cure_funding_farm, cure_funding_farm_alerts,
                          has_working_recall, heal_restock_alerts,
-                         recall_alerts,
+                         recall_alerts, settle_cure_funding_farm,
                          WorldGraph, analyzer_farm_selection,
                          farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
@@ -190,6 +191,11 @@ class AutoplayTask(BotTask):
         # heal and flee thresholds).
         if unprepared_for_trips(client, self.safety):
             return False
+        # Nor while she farms to fund her cure (cure_funding_farm): the
+        # cure comes first, and a detour is no place for a depleted
+        # character.
+        if cure_funding_farm(client):
+            return False
         if self._needs_mana_crystal_start(client):
             await self._start_mana_crystal_detour(client)
             return True
@@ -331,7 +337,9 @@ class AutoplayTask(BotTask):
         whether she is waiting at her savebed on an alerted blocker (then
         the stuck alert would say nothing new). Also, in any phase, the
         recall note (recall_alerts) and the heal-restock note
-        (heal_restock_alerts), neither of which blocks farming.
+        (heal_restock_alerts), neither of which blocks farming, and while
+        she farms to fund her cure, its cure-unfunded warning
+        (cure_funding_farm_alerts).
 
         The farming-suspended warning follows the live reason in any phase;
         the specific blockers come from the recovery phase.
@@ -341,6 +349,15 @@ class AutoplayTask(BotTask):
         recall = recall_alerts(client) + heal_restock_alerts(client)
         reason = farming_unsafe_reason(client)
         if not reason:
+            # Farming to fund the cure: its cure-unfunded warning, critical
+            # while no safety spot is usable and she waits for one.
+            funding = cure_funding_farm_alerts(client)
+            if funding and self.child is None and self._awaiting_ranking_recorded:
+                funding = [dict(alert, level="critical",
+                                text=alert["text"] + "; no safety spot is "
+                                     "usable, so she waits for one")
+                           for alert in funding]
+            recall = funding + recall
             # A farm resting for want of a heal or a recall (at most
             # UNPREPARED_REST_LIMIT_SECONDS) is waiting, not stuck.
             resting = (isinstance(self.child, FarmCircuitTask) and
@@ -388,6 +405,7 @@ class AutoplayTask(BotTask):
             return
 
         self._forget_stale_recall_note(client)
+        settle_cure_funding_farm(client)
         if (self._needs_temple_food(client) and
                 await self._start_temple_food(client)):
             return

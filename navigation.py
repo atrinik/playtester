@@ -5807,12 +5807,143 @@ def farming_unsafe_reason(client: AtrinikClient) -> str:
     more than she had, and with farming suspended she could not earn it.
     She farms without one; recall shopping buys one when she can afford it
     (FarmCircuitTask._needs_recall_shopping), and recall_alerts says so.
+
+    An unaffordable cure is not a blocker either (owner decision,
+    2026-11-23): once the cure-funding path has nothing left to sell,
+    RecoveryTask starts a cure-funding farm (cure_funding_farm), and while
+    it runs this returns "".
     """
     state = client.state
-    if depleted_for_temple(state):
+    if depleted_for_temple(state) and not cure_funding_farm(client):
         return (f"depletion {int(state.depletion_points)} at or above "
                 f"{FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD}")
     return ""
+
+
+# The cure-funding farm (owner decision, 2026-11-23: an unaffordable cure
+# must never block her). Live, on 2026-11-23 (v1.92.0), depletion 7 held
+# farming, the cure cost 2,865 copper against her 2,245, the chest trip that
+# would have funded it failed, and she parked at her savebed for good.
+# RecoveryTask starts it when depletion is due, the cure is short and the
+# funding path (identify-all, junk sale, deposit, the apartment chest) has
+# nothing left to start. It is a recorded decision, so it survives Stop and
+# restarts. It ends when the cure is affordable or done (ended), or after
+# CURE_FUNDING_FARM_DEATHS deaths (backoff): she parks and alerts again,
+# and may start another only after CURE_FUNDING_FARM_BACKOFF_SECONDS.
+CURE_FUNDING_FARM_STARTED = "cure-funding-farm"
+CURE_FUNDING_FARM_ENDED = "cure-funding-farm-ended"
+CURE_FUNDING_FARM_BACKOFF = "cure-funding-farm-backoff"
+CURE_FUNDING_FARM_DEATHS = 3
+CURE_FUNDING_FARM_BACKOFF_SECONDS = 24 * 3600.0
+
+
+@dataclass(frozen=True, slots=True)
+class CureFundingFarm:
+    """The cure-funding farm's recorded state (cure_funding_farm_state).
+
+    ``state`` is "farming" (since ``since``, with ``deaths`` recorded since
+    then), "backoff" (no new start before ``retry_at``, wall-clock) or ""."""
+
+    state: str = ""
+    since: float = 0.0
+    deaths: int = 0
+    retry_at: float = 0.0
+
+
+def cure_funding_farm_state(client: AtrinikClient) -> CureFundingFarm:
+    """The latest cure-funding farm decision, and the deaths since."""
+    deaths = 0
+    for record in reversed(getattr(client, "decision_history", ()) or ()):
+        if not isinstance(record, dict):
+            continue
+        action = record.get("action")
+        if action == "death":
+            deaths += max(1, int(record.get("count", 1) or 1))
+            continue
+        if action not in (CURE_FUNDING_FARM_STARTED, CURE_FUNDING_FARM_ENDED,
+                          CURE_FUNDING_FARM_BACKOFF):
+            continue
+        at = float(record.get("time", 0.0) or 0.0)
+        if action == CURE_FUNDING_FARM_STARTED:
+            return CureFundingFarm("farming", at, deaths)
+        retry_at = at + CURE_FUNDING_FARM_BACKOFF_SECONDS
+        if action == CURE_FUNDING_FARM_BACKOFF and retry_at > time.time():
+            return CureFundingFarm("backoff", at, 0, retry_at)
+        return CureFundingFarm()
+    return CureFundingFarm()
+
+
+def cure_affordable(client: AtrinikClient) -> bool:
+    """Whether her wallet and known bank balance pay for the cure, by the
+    funding path's own measure (FarmCircuitTask._cure_shortfall)."""
+    return bool(client.state.bank_balance_known and
+                BuyShopUpgradeTask.wallet_value(client) >=
+                FarmCircuitTask._depletion_service_cost(client))
+
+
+def cure_funding_farm(client: AtrinikClient) -> bool:
+    """Whether she farms to fund her cure now: started, depletion still
+    due, fewer than CURE_FUNDING_FARM_DEATHS deaths since, and the cure
+    not yet affordable (an unknown bank balance does not prove it is)."""
+    if not depleted_for_temple(client.state):
+        return False
+    funding = cure_funding_farm_state(client)
+    return (funding.state == "farming" and
+            funding.deaths < CURE_FUNDING_FARM_DEATHS and
+            not cure_affordable(client))
+
+
+def settle_cure_funding_farm(client: AtrinikClient) -> str:
+    """Record how a running cure-funding farm ended, if it did: the backoff
+    after CURE_FUNDING_FARM_DEATHS deaths, or its end once the cure is
+    affordable or done. Returns the action recorded, or "". Bookkeeping
+    only: cure_funding_farm reads the same conditions live."""
+    funding = cure_funding_farm_state(client)
+    if funding.state != "farming":
+        return ""
+    state = client.state
+    if funding.deaths >= CURE_FUNDING_FARM_DEATHS:
+        action = CURE_FUNDING_FARM_BACKOFF
+        detail = (f"{funding.deaths} deaths while farming to fund the cure; "
+                  "parked for "
+                  f"{int(CURE_FUNDING_FARM_BACKOFF_SECONDS // 3600)} h")
+    elif cure_affordable(client):
+        cost = FarmCircuitTask._depletion_service_cost(client)
+        action = CURE_FUNDING_FARM_ENDED
+        detail = (f"funded: she has "
+                  f"{format_money(BuyShopUpgradeTask.wallet_value(client))} "
+                  f"for the {format_money(cost)} cure")
+    elif (getattr(state, "inventory_replay_complete", False) and
+          not depleted_for_temple(state) and
+          (not FarmCircuitTask._has_depletion(client) or
+           getattr(state, "depletion_points_known", False))):
+        # Only a replayed inventory proves the force gone; the force with
+        # an unknown counter proves nothing.
+        action, detail = CURE_FUNDING_FARM_ENDED, "depletion no longer due"
+    else:
+        return ""
+    log.info("cure-funding farm: %s", detail)
+    recorder = getattr(client, "record_action", None)
+    if recorder is not None:
+        recorder(action, detail)
+    return action
+
+
+def cure_funding_farm_alerts(client: AtrinikClient) -> list[dict[str, str]]:
+    """While the cure-funding farm runs: the cure-unfunded alert, as a
+    warning that says she farms to fund it."""
+    if not cure_funding_farm(client):
+        return []
+    funding = cure_funding_farm_state(client)
+    cost = FarmCircuitTask._depletion_service_cost(client)
+    wallet = BuyShopUpgradeTask.wallet_value(client)
+    return [{"id": "cure-unfunded", "level": "warn",
+             "text": "Cure unfunded: remove depletion costs "
+                     f"{format_money(cost)}, she has {format_money(wallet)} "
+                     "and nothing left to sell, so she farms the safest "
+                     "spot to fund it (deaths while funding: "
+                     f"{funding.deaths} of {CURE_FUNDING_FARM_DEATHS}); "
+                     "the owner can give her gold with the operator assist"}]
 
 
 # Services a depleted character must reach for her cure and its funding, all
@@ -6195,10 +6326,11 @@ def _analyzer_farm_choice(
 
     If depletion prefers safety but no safety spot qualifies, the chosen
     objective's spot applies, and failing that the best usable safety spot.
-    While she is depleted that far, autoplay does not farm at all
+    While she is depleted that far, autoplay farms only to fund the cure
     (farming_unsafe_reason, RecoveryTask): it removes depletion first, funds
-    the fee from what she owns, and otherwise waits for money rather than
-    farm for it, so this pick matters only to a circuit started by hand.
+    the fee from what she owns, and only once nothing is left to sell
+    farms for it (cure_funding_farm). That farm follows the safety ranking
+    alone, never the chosen objective: its easiest usable spot.
     """
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
@@ -6216,8 +6348,10 @@ def _analyzer_farm_choice(
         return None
     plan = farm_analyzer_plan
     order: dict[int, tuple[int, int]] = {}
-    for position, objective in enumerate(dict.fromkeys(
-            (effective_farm_objective(client.state), chosen))):
+    objectives = (("safety",) if cure_funding_farm(client) else
+                  tuple(dict.fromkeys(
+                      (effective_farm_objective(client.state), chosen))))
+    for position, objective in enumerate(objectives):
         for rank, spot in enumerate(analyzer.ranking(objective)):
             legs = analyzer_spot_legs(spot, graph)
             if (legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
@@ -9932,7 +10066,11 @@ class FarmCircuitTask(BotTask):
                 keep_unknown=self._cure_identify_due(client))
             await self._storage.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        # The cure-funding farm (cure_funding_farm) makes no optional trip:
+        # no savebed rebinding, shopping, ship key or spell purchase spends
+        # the cure's money or time.
+        funding = cure_funding_farm(client)
+        if (isinstance(farm, FarmTask) and not funding and
                 not self._busy_finishing_fight_or_loot(client, farm) and
                 self._needs_savebed(client)):
             await client.clear_actions()
@@ -9970,6 +10108,7 @@ class FarmCircuitTask(BotTask):
         # on the same hold (FarmTask._unprepared_rest).
         unprepared = (isinstance(farm, FarmTask) and
                       self._unprepared_hold.active(client, farm.safety))
+        held = unprepared or funding
         # The heal restock is the one optional trip the hold leaves alone:
         # it is the cure for being unprepared. While the hold holds it goes
         # only by a strict route, and not below its flee threshold
@@ -10031,7 +10170,7 @@ class FarmCircuitTask(BotTask):
                     client, "no reachable merchant sells healing potions",
                     self.HEAL_RESTOCK_INTERVAL)
         if (isinstance(farm, FarmTask) and
-                self._needs_ship_key(client) and not unprepared and
+                self._needs_ship_key(client) and not held and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -10039,7 +10178,7 @@ class FarmCircuitTask(BotTask):
             await self._ship_key.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_spell_purchase(client) and not unprepared and
+                self._needs_spell_purchase(client) and not held and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -10047,7 +10186,7 @@ class FarmCircuitTask(BotTask):
             await self._spell_purchase.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_recall_shopping(client) and not unprepared and
+                self._needs_recall_shopping(client) and not held and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -10055,7 +10194,7 @@ class FarmCircuitTask(BotTask):
             await self._recall_shopping.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_utility_shopping(client) and not unprepared and
+                self._needs_utility_shopping(client) and not held and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -10063,7 +10202,7 @@ class FarmCircuitTask(BotTask):
             await self._utility_shopping.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_upgrade_shopping(client) and not unprepared and
+                self._needs_upgrade_shopping(client) and not held and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -10255,6 +10394,13 @@ class RecoveryTask(BotTask):
       deposit, the apartment chest. No recall is bought with the cure's
       money: recall shopping is the farm circuit's, never recovery's
       (owner decision, 2026-11-22);
+    - depleted, short of the cure, and with none of those trips left to
+      start (each found nothing or failed and waits its retry): the
+      cure-funding farm (cure_funding_farm, owner decision, 2026-11-23).
+      It records cure-funding-farm and completes, and autoplay farms the
+      safest spot until the cure is affordable; then recovery takes her
+      to the temple. After CURE_FUNDING_FARM_DEATHS deaths while funding
+      she waits here again, for CURE_FUNDING_FARM_BACKOFF_SECONDS;
     - otherwise she waits at her savebed. No farm walk, savebed rebinding
       or discretionary purchase runs.
 
@@ -10391,7 +10537,8 @@ class RecoveryTask(BotTask):
                          "text": "Cure unfunded: remove depletion costs "
                                  f"{format_money(cost)}, "
                                  f"she has {format_money(wallet)} and nothing "
-                                 "left to sell" + assist}]
+                                 "left to sell" +
+                                 self._funding_farm_note(client) + assist}]
             failures, error = self.cure_route_refusals(client)
             if failures >= self.CURE_ROUTE_ATTEMPTS:
                 return [{"id": "cure-unreachable", "level": "critical",
@@ -10399,6 +10546,32 @@ class RecoveryTask(BotTask):
                                  f"the temple from her savebed after {failures} "
                                  f"attempts: {error}"}]
         return []
+
+    @staticmethod
+    def _funding_farm_note(client: AtrinikClient) -> str:
+        """Why she parks rather than farms for the cure, when the
+        cure-funding farm backs off after its deaths."""
+        funding = cure_funding_farm_state(client)
+        if funding.state == "backoff":
+            minutes = max(1, int((funding.retry_at - time.time()) // 60))
+            return (f"; farming to fund it stopped after "
+                    f"{CURE_FUNDING_FARM_DEATHS} deaths, next try in "
+                    f"{minutes // 60}h {minutes % 60:02d}m")
+        if (funding.state == "farming" and
+                funding.deaths >= CURE_FUNDING_FARM_DEATHS):
+            return (f"; farming to fund it stopped after "
+                    f"{funding.deaths} deaths")
+        return ""
+
+    def _cure_funding_farm_due(self, client: AtrinikClient) -> bool:
+        """Whether to farm for the cure: depleted, short of the fee with the
+        bank balance known, no funding trip under way or left to start (the
+        caller found no errand), and no cure-funding farm running or
+        backing off (cure_funding_farm_state)."""
+        return (depleted_for_temple(client.state) and
+                self.services._cure_shortfall(client) and
+                not self.busy() and
+                cure_funding_farm_state(client).state == "")
 
     # Refusals older than this no longer count toward cure-unreachable.
     CURE_ROUTE_WINDOW_SECONDS = 24 * 3600.0
@@ -10674,11 +10847,7 @@ class RecoveryTask(BotTask):
         await self.guard.check_recall_wand(client)
         reason = farming_unsafe_reason(client)
         if not reason:
-            log.info("farming resumed (was suspended: %s)", self.reason)
-            recorder = getattr(client, "record_action", None)
-            if recorder is not None:
-                recorder("farming-resumed", f"was suspended: {self.reason}")
-            self.complete()
+            self._resume(client)
             return
         self.reason = reason
         home = self._home(client)
@@ -10694,4 +10863,26 @@ class RecoveryTask(BotTask):
         # next walk home.
         if self.at_home(client):
             self._home_failures, self._home_error = 0, ""
-            await self._start_errand(client, reason)
+            if (not await self._start_errand(client, reason) and
+                    self._cure_funding_farm_due(client)):
+                self._start_cure_funding_farm(client)
+
+    def _resume(self, client: AtrinikClient, note: str = "") -> None:
+        log.info("farming resumed (was suspended: %s)%s", self.reason,
+                 f": {note}" if note else "")
+        self._record(client, "farming-resumed",
+                     f"was suspended: {self.reason}" +
+                     (f"; {note}" if note else ""))
+        self.complete()
+
+    def _start_cure_funding_farm(self, client: AtrinikClient) -> None:
+        """Nothing left to sell for the cure: farm for it (owner decision,
+        2026-11-23), recorded so it outlives Stop and restarts."""
+        s = self.services
+        cost = s._depletion_service_cost(client)
+        wallet = BuyShopUpgradeTask.wallet_value(client)
+        detail = (f"remove depletion costs {format_money(cost)}, she has "
+                  f"{format_money(wallet)} and nothing left to sell")
+        log.warning("cure-funding farm: %s", detail)
+        self._record(client, CURE_FUNDING_FARM_STARTED, detail)
+        self._resume(client, "farming to fund the cure")
