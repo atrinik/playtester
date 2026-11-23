@@ -12,6 +12,11 @@ two differ:
   budget, no route, behind an owner block), would override it as an
   essential trip with care, or would pause farming at a cap.
 
+A zero-length trip (a live plan made with no edges, because she is
+already there, and a shadow route of no edges, not a failure) is no
+comparison: it is not recorded, and the report ignores such rows stored
+earlier. A failed plan on either side is always compared.
+
 Each comparison, agreements included, is also a row in her memory's
 ``route_shadow`` table (7 days, capped), which the ``route-shadow`` command
 summarises per trip kind for the owner's divergence report (the P7 and P8
@@ -112,6 +117,10 @@ class RouteShadow:
     def request_trip(self, client: Any, task: Any, origin: Any, route: list | None,
                      error: str) -> None:
         """A live plan was made (or failed): compare it later."""
+        source = origin[0] if origin else client.state.map.path
+        if route is not None and not route and not error and source == task.destination:
+            # A zero-length trip: nothing to compare (and nothing skipped).
+            return
         if "trip" in self.jobs:
             self.skipped += 1
             return
@@ -120,7 +129,6 @@ class RouteShadow:
             self.skipped += 1
             return
         trip = task.trip_kind(client)
-        source = origin[0] if origin else client.state.map.path
         live = tuple(route_costs.edge_subject(edge) for edge in route or ())
         key = (trip, source, task.destination, bool(task.strict_safety), live, error[:80])
         if now - self._trips_seen.get(key, -math.inf) < SHADOW_TRIP_REPEAT_SECONDS:
@@ -134,6 +142,7 @@ class RouteShadow:
         context = {"trip": trip, "source": source, "destination": task.destination,
                    "strict": bool(task.strict_safety), "live": live,
                    "live_route": list(route or ()), "error": error,
+                   "live_failed": route is None or bool(error),
                    "snapshot": snapshot}
         self.jobs["trip"] = _Job("trip", learned_route(snapshot),
                                  lambda client_, plan: self._finish_trip(client_, context, plan),
@@ -243,6 +252,9 @@ class RouteShadow:
                                   lambda edge: _edge_arrival(snapshot.graph, edge))
                      if live_route else None)
         shadow = plan.subjects()
+        if _zero_length(context.get("live_failed", True), live_route, plan):
+            # Already there by both plans: no comparison, no row.
+            return
         if (plan.route is None and not live_route and
                 plan.outcome in (route_costs.NO_ROUTE, route_costs.BLOCKED)):
             # Neither plan found a way: they agree.
@@ -403,6 +415,35 @@ def _decide(client: Any, action: str, detail: str) -> None:
         recorder(action, detail)
 
 
+# Shadow outcomes that come with a route (an empty one only when she is
+# already there); the others are failures, whatever their edge count.
+_ROUTED = (route_costs.PLANNED, route_costs.OVERRIDE)
+
+
+def _zero_length(live_failed: bool, live_route: list,
+                 plan: route_costs.LearnedPlan) -> bool:
+    """Whether both plans are empty: the live one made (not failed), and the
+    shadow's a route of no edges (not a failure)."""
+    return (not live_failed and not live_route and plan.route is not None and
+            not plan.route and plan.outcome in _ROUTED)
+
+
+def _zero_length_row(row: dict[str, Any]) -> bool:
+    """A stored trip row of a zero-length trip (recorded before such trips
+    were skipped): from a map to itself, both sides with no edges, the live
+    plan without an error and the shadow's routed (a failure stays counted)."""
+    detail = row.get("detail") or {}
+    if row.get("kind") != "trip" or detail.get("outcome") not in _ROUTED:
+        return False
+    if not detail.get("source") or detail.get("source") != detail.get("destination"):
+        return False
+    live, shadow = detail.get("live"), detail.get("shadow")
+    if not isinstance(live, dict) or not isinstance(shadow, dict):
+        return False
+    return (live.get("edges") == 0 and shadow.get("edges") == 0 and
+            not live.get("error"))
+
+
 def _maps(route: list) -> list[str]:
     return [edge.destination for edge in route]
 
@@ -557,11 +598,13 @@ def note_live_plan(client: Any, plan: route_costs.LearnedPlan) -> None:
 def summarise_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """The divergence report from ``route_shadow`` rows: counts per kind,
     trip and result, the subjects that most often decide a difference, and
-    the newest differences (route-shadow command)."""
+    the newest differences (route-shadow command). Rows of zero-length trips
+    are no comparisons: they are only counted as ``zero_length``."""
     counts: dict[str, dict[str, dict[str, int]]] = {}
     reasons: collections.Counter = collections.Counter()
     differences = []
-    for row in rows:
+    compared = [row for row in rows if not _zero_length_row(row)]
+    for row in compared:
         detail = row.get("detail") or {}
         kind, trip, result = row.get("kind", ""), row.get("trip", ""), row.get("result", "")
         bucket = counts.setdefault(kind, {}).setdefault(trip, {})
@@ -578,6 +621,7 @@ def summarise_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if kind == "farm":
             for path in (live.get("chokepoint_danger") or {}):
                 reasons[map_subject(path)] += 1
-    return {"rows": len(rows), "counts": counts,
+    return {"rows": len(compared), "zero_length": len(rows) - len(compared),
+            "counts": counts,
             "subjects": reasons.most_common(15),
             "differences": differences[-SHADOW_SHOWN:]}
