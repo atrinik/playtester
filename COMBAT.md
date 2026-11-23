@@ -884,24 +884,31 @@ not block her either.
   starts it: the bank visit comes first.
 - **A careful farm.** It follows the analyzer's safety ranking alone,
   never the chosen objective: its easiest usable spot, by the ordinary
-  rules (quarantine, route deaths, kit hazard, strict town reach), except
+  rules (quarantine, route deaths, kit hazard), except
   that when every usable spot is hazardous for her kit it does not farm
   the least dangerous one but waits (the 2026-11-17 spiral farmed exactly
   that fallback). It takes only a spot with a safe approach (never
-  `risky_approach`) whose analyzer danger is under a cap
-  (`FundingFarmLimits`): under half her maximum health
-  (`FUNDING_FARM_DANGER_SHARE`), and under the danger of every ranked spot
-  whose own record has a kit-hazard failure with her kit in the kit window
-  (24 h). With none left, it waits. Among those, the spot with the fewest
-  recent failures comes first: her failures in that window with her kit,
-  any cause, emergency recalls on the way included, each counted for the
-  maps of its spot's record and for the map it happened on. Then the
-  safest, then the least dangerous by the analyzer's own danger, not the
-  safety view's order. That score is her maximum health over a spot's
-  danger, capped at 1, so every spot under her health ties, and the
-  analyzer orders the ties by its balanced score. The safety view is
-  therefore kept 250 deep (`FarmAnalyzer.SAFETY_TOP`; the other views keep
-  40). Live, on 2026-11-23 (v1.96.0, level 36, 322 health), 126 of the 199
+  `risky_approach`) whose analyzer danger is under half her maximum
+  health (`FUNDING_FARM_DANGER_SHARE`) and under every ranked spot rated
+  hazardous for her kit (the kit hazard's own three-failure rule). With
+  none left, it waits. Single failures never cap anything; they only
+  order the rest: the spot with the fewest recent failures comes first
+  (`recent_kit_failures`: her failures in the kit window, 24 h, with the
+  kit hazard's kit matching, any cause, emergency recalls on the way
+  included, each counted for the maps of its spot's record and for the
+  map it happened on). Then the safest, then the least dangerous by the
+  analyzer's own danger, not the safety view's order. That score is her
+  maximum health over a spot's danger, capped at 1, so every spot under
+  her health ties, and the analyzer orders the ties by its balanced
+  score. The safety view is therefore kept 250 deep
+  (`FarmAnalyzer.SAFETY_TOP`; the other views keep 40). The funding farm
+  skips the depleted strict town check (`town_safely_reachable`): east of her savebed it
+  is statically unreachable, since every way back from the candidate
+  maps crosses a content pack-hazard map (`_known_pack_hazard_maps`), so
+  it only walked her down the list one spot per tick before falling back
+  to the first. Her trips to town start from her savebed, where strict
+  routes exist.
+  Live, on 2026-11-23 (v1.96.0, level 36, 322 health), 126 of the 199
   ranked spots tied at 1, and the first 40 were all Burnt Forest
   permutations (danger 71 to 126). Each shared a map with the circuits
   where she had three or more pack and out-damaged failures that night, so
@@ -909,21 +916,19 @@ not block her either.
   deaths had expired), and she waited for a spot ("no farm spot is usable
   yet"). Equally safe spots with far lower danger, the Underground City's
   outer maps, Hemlock Cave and Eld Woods Island (danger 36 to 66), ranked
-  60th to 125th. The cap is 103.5 there (the circuit she was out-damaged
-  on); without it, the strict town check walked a replay of that state
-  down the deeper list to a 118.3 spot with a risky approach. The orc pack
+  60th to 125th. In a replay of that state with her keys, the cap is
+  49.1 (the least dangerous hazardous Burnt Forest circuit); the orc pack
   recall at the Underground City entrance at 02:43 puts Hemlock Cave
   (35.8) ahead of the entrance (35.7), and four route recalls on
-  `world_15_74` that night put it (31.2) behind both. In a replay of that
-  state with her keys, every candidate then failed the strict town check
-  one tick at a time, and she settled on the first by this order,
-  `hemlock_cave_0102` (danger 35.8, monsters level 29 to 32). Every other rule still applies, so
-  a spot that just killed her, or one hazardous for her kit, is never
-  taken. The deeper view also reaches the depleted fallback outside the
-  funding farm (parked, or farming by hand): safety spots ranked 41st to
-  250th are tried, in rank order, before the chosen objective. The
-  analyzer should break those ties by danger itself; until it does, this
-  keeps the funding farm off the deadliest tied spots. It makes no
+  `world_15_74` put it (31.2) behind both, so she farms
+  `hemlock_cave_0102` (danger 35.8, monsters level 29 to 32). Every other
+  rule still applies, so a spot that just killed her, or one hazardous
+  for her kit, is never taken. The deeper view also reaches the depleted
+  fallback outside the funding farm (parked, or farming by hand): safety
+  spots ranked 41st to 250th are tried, in rank order and with the strict
+  town check, before the chosen objective. The analyzer should break
+  those ties by danger itself; until it does, this keeps the funding farm
+  off the deadliest tied spots. It makes no
   optional trip (savebed rebinding, upgrade, spell, utility and
   recall shopping, the ship key) and no mana-crystal detour. The one
   exception is the [healing-potion restock](#healing-potion-restock),

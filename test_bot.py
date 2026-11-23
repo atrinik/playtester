@@ -23650,7 +23650,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # for a spot for good ("no farm spot is usable yet"). The safer
         # spots (the Underground City's outer maps, Hemlock Cave, Eld Woods
         # Island) ranked 60th to 125th.
-        from .farm_analyzer import OBJECTIVES, FarmAnalyzer
+        from .farm_analyzer import OBJECTIVES, CombatProfile, FarmAnalyzer
         from .navigation import analyzer_farm_choice, start_cure_funding_farm
 
         def spot(name, path, danger, *, safety=1.0, approach=1.0):
@@ -23673,6 +23673,16 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         analyzer = FarmAnalyzer(directory, directory, directory)
         analyzer.report = analyzer._bounded({"rankings": {
             name: list(ranked) for name in OBJECTIVES}})
+        # Her real kit, as the analyzer ranked for it.
+        analyzer.profile = CombatProfile(
+            skill="slash weapons", skill_level=35, attack="slash", damage=66,
+            weapon_class=47, weapon_speed=2.25, character_level=36,
+            max_health=134, speed=0.8, armour_class=59,
+            protections=(("impact", 42), ("slash", 57)))
+
+        def failure(at, cause, where):
+            return {"time": at - 60, "cause": cause, "kind": "emergency-recall",
+                    "map": where, "kit": analyzer.profile.describe()}
         self.assertEqual(len(analyzer.ranking("xp")), FarmAnalyzer.TOP)
         self.assertEqual(len(analyzer.ranking("safety")), len(ranked))
         client, _ = self.client(depletion=7, bank=2_245)
@@ -23697,15 +23707,18 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             # included, puts the spot without one first.
             now = time.time()
             client.state.farm_adaptations = {"elsewhere": {"maps": [], "kit_failures": [
-                {"time": now - 60, "cause": "route", "kind": "emergency-recall",
-                 "map": hemlock["map_paths"][0].removeprefix("maps"), "kit": {}}]}}
+                failure(now, "route", hemlock["map_paths"][0].removeprefix("maps"))]}}
             self.assertEqual(choice(), "Eld")
-            # A kit-hazard failure on a spot's own record caps the danger
-            # below it: nothing under the cap is left, so she waits.
-            client.state.farm_adaptations = {hemlock["path"]: {"kit_failures": [
-                {"time": now - 60, "cause": "pack", "kind": "emergency-recall",
-                 "map": "/elsewhere", "kit": {}}]}}
-            self.assertIsNone(choice())
+            # A failure without a kit is not hers to count.
+            client.state.farm_adaptations["elsewhere"]["kit_failures"][0]["kit"] = {}
+            self.assertEqual(choice(), "Hemlock")
+            # A spot rated hazardous caps the danger: Eld (43.4) is not
+            # under it, so the failed Hemlock (35.8) is still farmed.
+            client.state.farm_adaptations = {"elsewhere": {"maps": [], "kit_failures": [
+                failure(now, "route", hemlock["map_paths"][0].removeprefix("maps"))]}}
+            analyzer.report["rankings"]["safety"] = list(ranked) + [
+                spot("Burnt low", "/shattered_islands/world_18_74", 40.0)]
+            self.assertEqual(choice(), "Hemlock")
             client.state.farm_adaptations = {}
             # Only a risky approach left: never taken, she waits.
             analyzer.report["rankings"]["safety"] = burnt + [risky]
@@ -23723,6 +23736,33 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         analyzer.report["rankings"]["safety"] = burnt + [
             spot("Light", "/shattered_islands/world_18_76", 66.0)]
         self.assertEqual(choice(), "Light")
+        # Single recalls only reorder: with the real kit hazard, a pack
+        # recall at each spot she moves to never leaves her waiting while
+        # an unfailed safe spot remains, and three at one spot make it
+        # hazardous for her kit.
+        analyzer.report["rankings"]["safety"] = list(ranked) + [
+            spot("Light", "/shattered_islands/world_19_76", 66.0)]
+        client.state.farm_adaptations = {}
+        visited = []
+        for _ in range(3):
+            name = choice()
+            self.assertIsNotNone(name)
+            self.assertNotIn(name, visited)
+            visited.append(name)
+            picked = next(item for item in analyzer.ranking("safety")
+                          if item["name"] == name)
+            client.state.farm_adaptations[picked["path"]] = {
+                "maps": [path.removeprefix("maps") for path in picked["map_paths"]],
+                "kit_failures": [failure(time.time(), "pack", "/elsewhere")]}
+        self.assertEqual(visited, ["Hemlock", "Eld", "Light"])
+        # Every spot failed once: still farmed, the least dangerous first.
+        self.assertEqual(choice(), "Hemlock")
+        record = client.state.farm_adaptations[hemlock["path"]]
+        # Three there make it hazardous for her kit (the kit hazard's own
+        # rule), and its danger caps the rest: nothing more dangerous than
+        # a spot her kit could not hold is farmed, so she waits.
+        record["kit_failures"] = [failure(time.time(), "pack", "/elsewhere")] * 3
+        self.assertIsNone(choice())
 
 
 class RouteFailureTests(unittest.TestCase):
