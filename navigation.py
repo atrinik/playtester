@@ -6436,7 +6436,9 @@ def _analyzer_farm_choice(
     (farming_unsafe_reason, RecoveryTask): it removes depletion first, funds
     the fee from what she owns, and only once nothing is left to sell
     farms for it (cure_funding_farm). That farm follows the safety ranking
-    alone, never the chosen objective: its easiest usable spot.
+    alone, never the chosen objective: its easiest usable spot, the safest
+    first and, among equally safe spots, the least dangerous (the analyzer's
+    danger), from the deeper safety view (FarmAnalyzer.SAFETY_TOP).
     """
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
@@ -6454,7 +6456,8 @@ def _analyzer_farm_choice(
         return None
     plan = farm_analyzer_plan
     order: dict[int, tuple[int, int]] = {}
-    objectives = (("safety",) if cure_funding_farm(client) else
+    funding = cure_funding_farm(client)
+    objectives = (("safety",) if funding else
                   tuple(dict.fromkeys(
                       (effective_farm_objective(client.state), chosen))))
     for position, objective in enumerate(objectives):
@@ -6467,7 +6470,7 @@ def _analyzer_farm_choice(
                 order[id(entry)] = (position, rank)
                 (hazardous if kit_hazardous_spot(client, spot, legs)
                  else usable).append(entry)
-    if not usable and hazardous and not cure_funding_farm(client):
+    if not usable and hazardous and not funding:
         # Every usable spot is hazardous for her kit: farm the least
         # dangerous one rather than idle until the hazard ages out, the
         # one with the safer approach on a tie. Never on the cure-funding
@@ -6490,6 +6493,17 @@ def _analyzer_farm_choice(
         overall = spot.get("safety_score")
         safety = (float(overall) if isinstance(overall, (int, float)) and
                   not isinstance(overall, bool) else plan.approach_safety(spot))
+        if funding:
+            # The cure-funding farm wants the easiest spot, not the safety
+            # view's order: its score is capped at 1, and the analyzer
+            # orders those ties by its balanced score (FarmAnalyzer.
+            # SAFETY_TOP). So the safest first, and among equally safe
+            # spots the least dangerous.
+            danger = spot.get("danger")
+            danger = (float(danger) if isinstance(danger, (int, float)) and
+                      not isinstance(danger, bool) and danger == danger
+                      else float("inf"))
+            return (position, risky, -safety, danger, rank)
         return (position, risky, -safety if risky else 0.0, rank)
 
     usable.sort(key=preference)

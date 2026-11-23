@@ -19917,6 +19917,29 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertEqual(command[command.index("--ranking") + 1], "all")
         self.assertIn("--json", command)
 
+    def test_only_the_safety_view_is_kept_deeper(self):
+        from .farm_analyzer import OBJECTIVES, FarmAnalyzer, combat_profile
+
+        analyzer = self.analyzer()
+        command = analyzer.command(combat_profile(self.client()))
+        self.assertGreater(FarmAnalyzer.SAFETY_TOP, FarmAnalyzer.TOP)
+        self.assertEqual(command[command.index("--top") + 1],
+                         str(FarmAnalyzer.SAFETY_TOP))
+        many = [{"path": f"/{index}"} for index in range(FarmAnalyzer.SAFETY_TOP)]
+        rankings = {name: list(many) for name in (*OBJECTIVES, "maneuverability")}
+        report = analyzer._bounded({"rankings": rankings, "results": list(many),
+                                    "groups": list(many), "args": ["kept"]})
+        for name, ranked in report["rankings"].items():
+            self.assertEqual(len(ranked), FarmAnalyzer.SAFETY_TOP if name == "safety"
+                             else FarmAnalyzer.TOP, name)
+        self.assertEqual(len(report["results"]), FarmAnalyzer.TOP)
+        self.assertEqual(len(report["groups"]), FarmAnalyzer.TOP)
+        self.assertEqual(report["args"], ["kept"])
+        # A finished run keeps the bounded report.
+        analyzer.report = report
+        self.assertEqual(len(analyzer.ranking("safety")), FarmAnalyzer.SAFETY_TOP)
+        self.assertEqual(len(analyzer.ranking("xp")), FarmAnalyzer.TOP)
+
 
 class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
     TREES = "/shattered_islands/world_14_79"
@@ -23618,6 +23641,64 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             start_cure_funding_farm(client, "short")
             self.assertIsNone(
                 analyzer_farm_choice(client, built_graph(), search=False))
+
+    def test_the_funding_farm_reaches_past_a_saturated_safety_view(self):
+        # Live, 2026-11-23: the safety score is capped at 1, so every spot
+        # under her health tied, and the analyzer ordered the ties by its
+        # balanced score. Its first 40 were all Burnt Forest permutations,
+        # every one hazardous for her kit, and the cure-funding farm waited
+        # for a spot for good ("no farm spot is usable yet"). The safer
+        # spots (the Underground City's outer maps, Hemlock Cave, Eld Woods
+        # Island) ranked 60th to 125th.
+        from .farm_analyzer import OBJECTIVES, FarmAnalyzer
+        from .navigation import analyzer_farm_choice, start_cure_funding_farm
+
+        def spot(name, path, danger, *, safety=1.0, approach=1.0):
+            result = analyzer_spot(name, [path], ["monster L35"])
+            result.update(path=f"{name}:{path}", danger=danger,
+                          safety_score=safety, approach_status="path",
+                          approach_safety_score=approach)
+            return result
+
+        burnt = [spot(f"Burnt {index}", "/shattered_islands/world_18_73",
+                      126.0 - index) for index in range(FarmAnalyzer.TOP)]
+        # A risky approach is never preferred for its low danger alone.
+        risky = spot("Risky", "/shattered_islands/world_15_74", 10.0,
+                     safety=0.5, approach=0.5)
+        eld = spot("Eld", "/shattered_islands/world_18_76", 43.4)
+        hemlock = spot("Hemlock", "/shattered_islands/world_17_75", 35.8)
+        ranked = burnt + [risky, eld, hemlock]
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        analyzer = FarmAnalyzer(directory, directory, directory)
+        analyzer.report = analyzer._bounded({"rankings": {
+            name: list(ranked) for name in OBJECTIVES}})
+        self.assertEqual(len(analyzer.ranking("xp")), FarmAnalyzer.TOP)
+        self.assertEqual(len(analyzer.ranking("safety")), len(ranked))
+        client, _ = self.client(depletion=7, bank=2_245)
+        client.farm_analyzer = analyzer
+        start_cure_funding_farm(client, "short")
+        graph = built_graph()
+
+        def choice():
+            picked = analyzer_farm_choice(client, graph, search=False)
+            return picked and picked[2]["name"]
+
+        with patch("atrinik_bot.navigation.kit_hazardous_spot",
+                   lambda client, spot, legs: spot["name"].startswith("Burnt")):
+            # Cut at TOP, as before: every ranked spot rejected, she waits.
+            analyzer.report["rankings"]["safety"] = ranked[:FarmAnalyzer.TOP]
+            self.assertIsNone(choice())
+            # The deeper view: the least dangerous of the equally safe spots,
+            # though the analyzer ranks it last.
+            analyzer.report["rankings"]["safety"] = list(ranked)
+            self.assertEqual(choice(), "Hemlock")
+            # Not funding (depleted and parked, or by hand): rank order.
+            client.set_cure_funding_farm(since=0.0)
+            self.assertEqual(choice(), "Eld")
+        # Without a hazard, the funding farm still takes the least dangerous.
+        start_cure_funding_farm(client, "short")
+        self.assertEqual(choice(), "Hemlock")
 
 
 class RouteFailureTests(unittest.TestCase):

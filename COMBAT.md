@@ -887,7 +887,25 @@ not block her either.
   rules (quarantine, route deaths, kit hazard, strict town reach), except
   that when every usable spot is hazardous for her kit it does not farm
   the least dangerous one but waits (the 2026-11-17 spiral farmed exactly
-  that fallback). It makes no optional trip (savebed rebinding, upgrade, spell, utility and
+  that fallback). Among the usable spots it takes the safest, and among
+  equally safe spots the least dangerous by the analyzer's own danger, not
+  the safety view's order: that score is her maximum health over a spot's
+  danger, capped at 1, so every spot under her health ties, and the
+  analyzer orders the ties by its balanced score. The safety view is
+  therefore kept 250 deep (`FarmAnalyzer.SAFETY_TOP`; the other views keep
+  40). Live, on 2026-11-23 (v1.96.0, level 36, 322 health), 126 of the 199
+  ranked spots tied at 1, and the first 40 were all Burnt Forest
+  permutations (danger 71 to 126). Each shared a map with the circuits
+  where she had three or more pack and out-damaged failures that night, so
+  the kit hazard rejected all 40 (the 04:08 death quarantine and the route
+  deaths had expired), and she waited for a spot ("no farm spot is usable
+  yet"). Equally safe spots with far lower danger, the Underground City's
+  outer maps, Hemlock Cave and Eld Woods Island (danger 36 to 66), ranked
+  60th to 125th. Every other rule still applies to the deeper spots, so a
+  spot that just killed her, or one hazardous for her kit, is never taken.
+  The analyzer should break those ties by danger itself; until it does,
+  this keeps the funding farm off the deadliest tied spots. It makes no
+  optional trip (savebed rebinding, upgrade, spell, utility and
   recall shopping, the ship key) and no mana-crystal detour. The one
   exception is the [healing-potion restock](#healing-potion-restock),
   which otherwise waits while depletion is due: a depleted farm without
