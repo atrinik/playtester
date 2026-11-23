@@ -1170,8 +1170,9 @@ breakout and the pursued stand) is unchanged here; an earlier attempt to
 change them, during the review of
 [pull request 117](https://github.com/atrinik/playtester/pull/117), spawned
 edge cases and was reverted. Only the narrow
-[heals-losing disengage](#heals-losing-on-the-farm-2026-11-23) below
-touches it.
+[heals-losing disengage](#heals-losing-on-the-farm-2026-11-23) and the
+[caster and pocket rules](#casters-across-a-seam-2026-11-23) below touch
+it.
 
 ## Heals losing on the farm (2026-11-23)
 
@@ -1215,7 +1216,8 @@ Now, on the farm map:
   decide, the cornered breakout among them. With no attacker within
   2 tiles she heals as usual. Running never shuts healing out: a step
   unanswered for `OUT_HEALED_ACK_WAIT_SECONDS` (0.75 s), or a usable heal
-  with none sent for `OUT_HEALED_HEAL_GAP_SECONDS` (2.5 s), lets that
+  with none landed for `OUT_HEALED_HEAL_GAP_SECONDS` (2.5 s) and none in
+  flight ([heals in melee](#heals-in-melee-2026-11-23)), lets that
   tick's heal go first, whatever the attacker's distance.
 - **No stand while she runs.** The gain-only retreat runs only while she
   has a usable heal (an item, or the SP for the spell). While the
@@ -1247,6 +1249,204 @@ Accepted limits:
   for those 10 minutes;
 - a burst from full health that ends the fight before three heals is not
   seen; the existing flee threshold and recall handle it.
+
+## Casters across a seam (2026-11-23)
+
+Read from her post-mortem, decisions and journal (v1.98.0, the
+Underground City circuit, `underground_city_1_3`): she died at (7, 1) to
+three attackers at once, with 565 damage taken in about a minute. The orc
+sorcerer did 69% of it (magic bullet 259, its own cleave 132), and she has
+no protection against magic. She never fought it: she swung at the orcs
+beside it. The facts:
+
+- Orc sorcerers spawn on `underground_city_1_2`, tiled to the north of
+  1_3. The room at 1_3 (0-7, 0-1) runs on into 1_2's room at (0-6,
+  16-23), where they stand. The farm read caster kinds only from its own
+  map's authored list, and 1_3 has none. It also left every creature off
+  its own map out of its threats and targets.
+- The sorcerer's magic bullet is an aimed projectile. Its hits name the
+  missile ("magic bullet hit you"), not the caster. The fight record
+  counted no ranged attacker (`ranged_attackers` 0).
+- She fought on the room side of the doorway at (8, 1), in the
+  sorcerers' line. The corridor side is behind the wall.
+- Her retreat steps were clamped to 1_3, so the pocket by the seam was a
+  dead end. A pursued stand turned her on three adjacent attackers while
+  she was disengaging (`emergency-disengage`, `out-healed-disengage`
+  soon after).
+
+Now, on the farm map:
+
+- **Casters across a seam count.** A caster kind is an authored caster
+  (`can_cast_spell`) of the farm map or of any map tiled to its sides or
+  corners (`area_caster_identities`, through `terrain.tile_directions`).
+  This is used for target choice, the stationary-caster orbit and the
+  fight record's ranged count (`fight_positions.ranged_attackers`).
+- **Caster first** (`caster_first`). A caster is fought before any melee
+  attacker, the engaged one included, when it is beside her (across a
+  seam too, where it then counts as a threat). It is also fought first
+  when it stands within `CASTER_FIRST_REACH` (2) on the farm map and its
+  name is in a recent hit or miss, provided the step toward it puts no
+  more other hostiles beside her than she has now. A missile's hit
+  ("magic bullet hit you") names no caster and switches no target, so
+  she does not leave the orc beside her for a caster past the pack. The
+  same rank comes first when she picks one attacker among several: the
+  first contact she commits to, the pursued stand, the cornered
+  breakout's blocker. A breakout or stand latched on a melee attacker
+  switches to a caster that comes beside her.
+- **Breaking a caster's line** (`break_caster_sight`). One step that
+  puts an authored wall between her and the casters she is not going
+  for (`wall_covers`). The line is the server's projectile flight
+  (`cover_cells`, from the caster), across seams. A wall there also takes
+  away the sight a monster needs to cast at all (`monster_cast_spell`,
+  `server/src/types/monster.c`). Doors do not count, because orcs open
+  them. Its gates:
+  - an aimed spell hit in the last `COVER_HIT_SECONDS` (12 s) that is
+    newer than the one her last cover step answered, so an old hit never
+    starts another;
+  - `caster_first` has no caster for her;
+  - her engaged or selected target is no caster she covers from: if she
+    is going for it, she goes for it. Cover from her own target alternated
+    with the approach to it, step by step (review of
+    [pull request 131](https://github.com/atrinik/playtester/pull/131));
+  - at most one threat near her (the pack-split retreat's count, within
+    4 tiles): with two, that retreat decides, since cover steps between
+    its steps only alternated with them;
+  - above the tick's flee threshold, with no heal in flight and none due
+    (a usable heal at or below the heal threshold), so it never pre-empts
+    a heal (`cover_allowed`), and not while she runs from losing heals.
+    A safety that tracks its sent heal (`heal_in_flight`, its retry time)
+    answers for that; otherwise a heal sent within the heal cooldown is
+    in flight.
+
+  The square must have strictly fewer clear lines from the visible
+  casters than hers, and no more attackers beside it. Among those squares
+  she takes first the one with the fewest lines, then the one fewer melee
+  attackers can reach (`terrain.features`), then the one farthest from
+  the nearest other hostile. The step is recorded as `caster-cover`, and
+  its square is learned as blocked if it never lands. For
+  `COVER_HOLD_SECONDS` (4 s) afterwards she approaches and kites no melee
+  target: it comes to her. A caster she is going for she still
+  approaches, orbits or kites. In the incident pocket she steps
+  through the doorway (8, 1) to the corridor side, which neither sorcerer
+  can see.
+
+  Bolts that reflect off walls (lightning, negative energy bolt) do not
+  follow the straight line past a wall. For them cover rests on the sight
+  check alone, which the same wall takes away.
+- **A seam pocket is no dead end.** The low-health retreat may step onto
+  a map tiled to the farm map, but only when every step on the farm map
+  is a dead end (an escape depth under 2) or there is none. The rules:
+  - The square must be walkable and unoccupied on that map.
+  - From it she must be able to get at least 2 squares away from the
+    seam edge (`seam_escape`), since running along the seam is no escape.
+  - The step must gain distance from the nearest threat.
+  - The square must have no more hostiles within 4 tiles than hers.
+  - No second seam step follows within `SEAM_STEP_COOLDOWN_SECONDS`
+    (20 s): off the farm map the circuit's walk brings her straight back.
+  - The decision is `retreat-choice ... seam=1`.
+- **No stand into a losing pack.** A pursued stand that is due, against
+  two or more attackers beside her while she is losing, gives way to a
+  step that sheds the nearest of them (`pursued-stand-declined`). Losing
+  means the retreat's own emergency disengage (at or below the flee
+  threshold, short of mana for a heal, or healing outpaced) or heals
+  that no longer keep up (`healing_outpaced`). This is the gain-only rule
+  of [pull request 120](https://github.com/atrinik/playtester/pull/120)
+  and [pull request 124](https://github.com/atrinik/playtester/pull/124):
+  an equal-distance step does not count, since it
+  shuffled her between two squares beside the attackers. With no gaining
+  step she stands as before, caster first, so the declined stand cannot
+  ping-pong. The pursuit count goes on, and the stand floor, the
+  out-healed rules and the emergency recall are unchanged.
+
+Accepted limits:
+
+- after a seam step she is off the farm map. The circuit's walk
+  (`NavigateThenTask`) then takes her back to it, and its own defence,
+  not the farm's, handles the attackers that follow;
+- cover is judged from the authored walls and the casters in view. A
+  caster out of view, a summoned or unauthored one, or a door an orc has
+  closed again is not modelled. A spell hit with no caster in view
+  starts no cover step;
+- the failure review still counts a missile name ("magic bullet") as an
+  attacker of its own. Out-of-league marks still match only the hits'
+  names, as noted above;
+- the farm still neither pulls nor walks to creatures across a seam. Only
+  an adjacent caster there is fought. One two squares across a seam is
+  not, and the cover step treats it like any other caster in view;
+- cover steps are judged at their square. She does not plan a path to
+  cover, and two casters may leave no square with fewer lines.
+
+## Heals in melee (2026-11-23)
+
+Read from her post-mortem and journal (Underground City circuit,
+`underground_city_1_3`, 19:13:27 UTC): in melee with three orcs, about
+8 of some 25 minor-healing casts landed and her SP stayed at 82. Each
+auto-swing sets her action timer to her weapon speed (2.25 s;
+`pl->action_attack`, `server/src/types/player.c`), and
+`socket_command_fire` (`server/src/socket/request.c`) returns without a
+word while that timer runs. The safety policy healed every
+`heal_cooldown` (1.15 s) with combat on, so most casts arrived while the
+timer ran, and it counted each one as a heal. Applying an item
+(`socket_command_item_apply`, `player_apply`) checks no such timer:
+potions and scrolls always went through.
+
+Now (`SafetyPolicy.enforce`, `_heal`):
+
+- **Casts wait for the timer.** A healing spell, rod or wand (all sent as
+  FIRE) first turns combat off, repeated on each tick of the wait since a
+  hit turns it back on server side, and is sent only once her action
+  timer has run out (`effective_action_time`), plus one server tick
+  (`HEAL_TIMER_MARGIN`, 125 ms) since the client's countdown can end
+  just before the server's, as the emergency recall does. The wait is at
+  most one swing. It is not the heal's tick (`_heal_action` marks only a
+  tick that sent a heal or readied its device): callers retreat and step
+  away meanwhile, which no timer gates, but while `heal_waiting` holds,
+  `low_health_retreat` makes no stand, cornered breakout or pursued cast,
+  and the walk's defence holds even when she is starving with nothing to
+  eat (which otherwise skips the safety hold), since each fight would
+  restart the timer. A rod or wand not yet readied is
+  applied once (it readies it; applying it again would unready it), then
+  fired by its tag. A potion or scroll is applied at once, with combat
+  left as it is.
+- **Combat comes back with the cast.** Right after the fire, combat goes
+  back on as it was (with its force flag): the fire set her timer before
+  the combat packet arrives, so the next swing follows the cast's
+  recovery and she fights back between heals as before. A heal no longer
+  needed or usable during the wait (her health over the threshold, no SP)
+  also turns it back on; a recall waiting for the timer (`combat_allowed`)
+  keeps it off. What to restore is kept on the client, so whichever safety
+  policy runs next restores it, the engine's idle one after a task ended
+  mid-wait among them. Any other combat-off (a Stop, an operator's task
+  change, an autoplay handover, a retreat) drops it: whoever turned combat
+  off owns it (the farm turns it on again whenever it fights), and a new
+  login starts without one.
+- **A heal counts once it lands** (`heal_landed`). The server answers
+  every heal it runs, spell, potion, scroll, rod or wand, with "The spell
+  heals you for N hp!" (or "The healing spell fails!", `cast_heal`); a
+  potion or scroll is also counted when its quantity falls. Only then
+  does the cooldown, and the out-healed heal gap, count from it
+  (`_last_heal`). A refusal with a word (no mana, a blocked square, a
+  device that cannot fire now) waits out the cooldown.
+- **Refused devices give way.** A healing rod or wand that "whines for a
+  while, but nothing happens" or "is impossible to handle for you" is
+  backed off for `RECALL_DEVICE_RETRY_SECONDS` (20 s, the recall's own
+  back-off, shared with it), and a wand that "says poof" is known empty
+  (`wand_known_empty`; the name in the message must be the wand's). Neither counts as a usable heal meanwhile, so the
+  next heal in her pack, her spell among them, heals instead of the
+  combat-off wait repeating on a device that cannot fire. A cast unanswered
+  for `heal_confirm_seconds` (1 s) was dropped: it is recorded as
+  `heal-unconfirmed` and sent again at the next allowed moment, without
+  waiting out a cooldown.
+
+`healing_outpaced` and `heals_losing` (the
+[heals-losing disengage](#heals-losing-on-the-farm-2026-11-23)) already
+count only the server's heal messages, that is landed heals. The walk's
+[critical escape](#critical-escape-on-a-walk-2026-11-22) runs only with
+no usable heal, and reads `_heal_action` only to leave the tick of a heal
+to it. Accepted limit: casts and swings alternate, so in melee a heal
+lands about every swing plus one cast (about 3.3 s with a 2.25 s weapon),
+not every 1.15 s; a fight that needs more is for the disengage and the
+recall.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 

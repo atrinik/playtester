@@ -6904,6 +6904,29 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(task._cornered_breakout_target, 200)
         self.assertEqual(len(client.direct_moves), task.PURSUIT_STAND_STEPS)
 
+    def test_no_pursued_stand_while_a_heal_waits(self):
+        # The stand above, with a heal waiting for her action timer
+        # (heal_waiting): a swing would restart that timer, so she steps.
+        client = self._combat_client()
+        client.state.stats.update(hp=100, maxhp=176)
+        task = FarmTask(zone="/test")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        for _ in range(task.PURSUIT_STAND_STEPS):
+            asyncio.run(task.low_health_retreat(client))
+            task._retreat_attempt = None
+            task._last_retreat_step_at = 0.0
+        client.heal_waiting_until = time.monotonic() + 5.0
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(client.targets, [])
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(task._cornered_breakout_target, 0)
+        self.assertEqual(len(client.direct_moves),
+                         task.PURSUIT_STAND_STEPS + 1)
+
     def test_pursued_stand_ends_at_the_health_floor(self):
         client = self._combat_client()
         client.state.stats.update(hp=100, maxhp=176)
@@ -8154,7 +8177,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             (time.time(), 0, 0, "orc hit you for 3 (-3) impact damage.")]
 
         async def heal(safety, client):
-            safety._last_heal = time.monotonic()
+            safety._heal_action = time.monotonic()
             return False
 
         with patch.object(type(task.safety), "enforce", heal):
@@ -10286,6 +10309,18 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(len(client.fired), 1)
         self.assertNotIn(True, client.combat)
 
+    def test_no_pursued_cast_while_a_heal_waits(self):
+        client, task = self._spell_pursuit_client()
+        self.assertTrue(self._retreat_once(client, task))
+        # The cast above would restart the timer a heal waits for.
+        client.heal_waiting_until = time.monotonic() + 5.0
+        self.assertTrue(self._retreat_once(client, task))
+        self.assertEqual(client.fired, [])
+        self.assertNotIn("pursued-cast",
+                         [action for action, _ in client.recorded])
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(len(client.direct_moves), 2)
+
     def test_spell_training_pursuer_melee_when_she_cannot_afford_a_cast(self):
         client, task = self._spell_pursuit_client()
         client.state.stats["sp"] = 0
@@ -10758,8 +10793,10 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertIn((0, 43), client.fired)
         self.assertEqual(len(client.direct_moves), 1)
-        # A step unanswered past the wait lets the heal go first too.
+        # A step unanswered past the wait lets the heal go first too (the
+        # heal above long settled).
         task.safety._last_heal = 0.0
+        task.safety._heal_pending = None
         client.fired.clear()
         task._last_action = 0.0
         task._retreat_attempt = ("/test", 12, 12, 12, 11,
@@ -11972,6 +12009,38 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         _, x, y, _ = task._retreat_attempt
         client.state.map.world_x, client.state.map.world_y = x, y
         task._record_trail(client)
+
+    def test_starving_she_never_fights_while_a_heal_waits(self):
+        # Starving with nothing to eat skips the safety hold, but a heal
+        # waiting for her action timer (heal_waiting) still holds: she
+        # steps away with combat off rather than walk on or fight, which
+        # would restart the timer.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="orc warrior", target_id=700, target_hp=100)
+        client.state.stats.update(hp=150, maxhp=330, sp=40, maxsp=47, food=0)
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        client.state.messages = [
+            (time.time(), 2, "cc66ff", "orc warrior hit you for 17 damage.")]
+        client.state.combat = True
+        client.state.stats["action_time"] = 2.0
+        client.state.stat_observed_at["action_time"] = time.monotonic()
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node}
+        farm = FarmTask(zone="/farm", target="orc warrior")
+        task = NavigateThenTask(graph, "/farm", farm, combat_approach=True,
+                                safety=farm.safety)
+        for _ in range(3):
+            self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+            task._last_defense_action = 0.0
+        self.assertTrue(client.direct_moves)
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(client.targets, [])
 
     def test_critical_escape_runs_from_the_attacker(self):
         client, _, task = self._outpost_escape()
@@ -16661,6 +16730,433 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(client.chosen, [0])
         self.assertEqual(task.status, TaskStatus.RUNNING)
+
+
+class CasterFirstTests(unittest.TestCase):
+    """Caster first, breaking a caster's line, retreats across a seam and
+    the losing-pack stand (COMBAT.md, the 2026-11-23 Underground City
+    death)."""
+
+    UC = "/shattered_islands/strakewood_island/underground_city/underground_city_1_"
+
+    @staticmethod
+    def _say(client, *texts, ago=1.0):
+        client.state.messages = [
+            (time.time() - ago, 2, "ff0000", text) for text in texts]
+
+    def _seam_fight(self, her=(12, 12)):
+        """An open /test farm with /north tiled above it, whose authored
+        orc sorcerers the farm map itself does not list."""
+        client = QuestTests._combat_client()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        QuestTests._record_actions(client)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        node.edges.append(MapEdge("/test", "/north", 12, -1, kind="tile"))
+        north = MapNode(path="/north", width=25, height=25)
+        north.terrain = dict(node.terrain)
+        north.caster_identities.add("orc sorcerer")
+        client.world_graph = types.SimpleNamespace(
+            nodes={"/test": node, "/north": north})
+        task = FarmTask(zone="/test")
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x, client.state.map.world_y = her
+        return client, task
+
+    @staticmethod
+    def _put(client, x, y, name, target_id, hp=100):
+        obj = MapObject(3, 1, 0, 0, name=name, target_id=target_id,
+                        target_hp=hp)
+        client.state.map.tile(x, y).objects[3] = obj
+        return obj
+
+    def test_a_caster_spawned_across_a_seam_is_an_authored_caster(self):
+        client, task = self._seam_fight()
+        sorcerer = self._put(client, 6, 8, "orc sorcerer", 300)
+        warrior = self._put(client, 9, 8, "orc warrior", 100)
+        self.assertTrue(task.authored_caster(client, sorcerer))
+        self.assertFalse(task.authored_caster(client, warrior))
+        # Against the farm map's own list only, as before.
+        self.assertFalse(task.authored_caster(client, sorcerer, task.map_node))
+
+    def test_an_adjacent_caster_across_the_seam_is_fought(self):
+        client, task = self._seam_fight(her=(12, 0))
+        # Beside her, one square over the seam on /north.
+        self._put(client, 8, 7, "orc sorcerer", 300)
+        self._say(client, "orc sorcerer hit you for 27 (-22) cleave damage.")
+        asyncio.run(task.tick(client))
+        self.assertIn((8, 7, 300), client.targets)
+        self.assertEqual(task._engaged_target[0], 300)
+        self.assertIn(True, client.combat)
+
+    def test_a_caster_named_in_a_hit_within_reach_comes_before_the_orc(self):
+        client, task = self._seam_fight()
+        self._put(client, 13, 8, "orc warrior", 100)
+        self._put(client, 6, 8, "orc sorcerer", 300)
+        task.remember_engagement(client, 13, 8, 100)
+        self._say(client, "orc sorcerer misses you!")
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.targets[-1], (6, 8, 300))
+        self.assertEqual(task._engaged_target[0], 300)
+
+    def test_a_missile_hit_switches_no_target(self):
+        client, task = self._seam_fight()
+        # The orc she fights beside her, a sorcerer two squares off.
+        self._put(client, 9, 8, "orc warrior", 100)
+        self._put(client, 6, 8, "orc sorcerer", 300)
+        task.remember_engagement(client, 9, 8, 100)
+        # A missile names no caster: she keeps the orc beside her.
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        self.assertIsNone(task.caster_first(client))
+        # Named, the sorcerer is hers, unless the step toward it puts
+        # another attacker beside her.
+        self._say(client, "orc sorcerer misses you!")
+        self.assertEqual(task.caster_first(client)[3].target_id, 300)
+        self._put(client, 6, 7, "orc outlaw", 101)
+        self._put(client, 6, 9, "orc outlaw", 102)
+        self.assertIsNone(task.caster_first(client))
+
+
+    def _pack(self, hp=32, terrain=None):
+        client, task = self._seam_fight()
+        # East of her and north of her: a step south-west sheds both.
+        self._put(client, 9, 8, "orc warrior", 100)
+        self._put(client, 8, 7, "orc sorcerer", 300)
+        task.remember_engagement(client, 9, 8, 100)
+        client.state.stats.update(hp=hp, maxhp=32)
+        if terrain is not None:
+            task.map_node.terrain = terrain
+        # Both have stayed beside her through several retreat steps.
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100, 300}
+        task._pursuit_last_at = time.monotonic()
+        return client, task
+
+    def test_a_pursued_stand_turns_on_the_caster_first(self):
+        client, task = self._pack()
+        asyncio.run(task.tick(client))
+        stands = [detail for action, detail in client.recorded
+                  if action == "pursued-stand"]
+        self.assertEqual(len(stands), 1)
+        self.assertIn("target=300", stands[0])
+        self.assertEqual(client.targets[-1], (8, 7, 300))
+
+    def test_a_latched_stand_switches_to_a_caster_beside_her(self):
+        client, task = self._pack()
+        task._pursued_retreats = 0
+        task._cornered_breakout_target = 100
+        task._stand_latch = True
+        asyncio.run(task.low_health_retreat(client))
+        self.assertEqual(task._cornered_breakout_target, 300)
+        self.assertEqual(client.targets[-1], (8, 7, 300))
+
+    def test_losing_beside_two_takes_a_gaining_step_instead_of_a_stand(self):
+        client, task = self._pack(hp=25)
+        task.safety.flee_below = 0.90
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("pursued-stand-declined", actions)
+        self.assertNotIn("pursued-stand", actions)
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(len(client.direct_moves), 1)
+        dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        # Away from both, at (9, 8) and (8, 7) beside her (8, 8).
+        self.assertGreater(min(max(abs(8 + dx - 9), abs(8 + dy - 8)),
+                               max(abs(8 + dx - 8), abs(8 + dy - 7))), 1)
+
+    def test_losing_beside_two_with_no_gaining_step_still_stands(self):
+        # Only squares still beside one of the orcs are open: a step
+        # there sheds neither, and shuffling between them is the
+        # ping-pong the gain-only rule forbids. The stand defends her,
+        # caster first.
+        client, task = self._pack(
+            hp=25, terrain={(12, 12): 1, (13, 11): 1, (12, 13): 1})
+        task.safety.flee_below = 0.90
+        asyncio.run(task.tick(client))
+        stands = [detail for action, detail in client.recorded
+                  if action == "pursued-stand"]
+        self.assertEqual(len(stands), 1)
+        self.assertIn("target=300", stands[0])
+        self.assertNotIn("pursued-stand-declined",
+                         [action for action, _ in client.recorded])
+        self.assertEqual(client.direct_moves, [])
+
+    POCKET = ["#...#",
+              "##.##",
+              "##.##",
+              "##.##",
+              "#####"]
+
+    def _pocket(self):
+        """She at (2, 0) of a pocket on /t's top edge, an orc below her in
+        its only way out; /next_0_-1, tiled above, is open."""
+        client = QuestTests._combat_client()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        QuestTests._record_actions(client)
+        node = terrain_node(self.POCKET, tiled=((0, -1),))
+        north = MapNode("/next_0_-1", width=5, height=5)
+        north.terrain = {(x, y): 1 for x in range(5) for y in range(5)}
+        client.world_graph = types.SimpleNamespace(
+            nodes={"/t": node, "/next_0_-1": north})
+        client.state.map.path = "/t"
+        client.state.map.world_x, client.state.map.world_y = 2, 0
+        self._put(client, 8, 9, "orc warrior", 100)
+        task = FarmTask(zone="/t")
+        task.map_node = node
+        task.map_bounds = (5, 5)
+        return client, task
+
+    def test_a_seam_pocket_retreat_steps_onto_the_tiled_map(self):
+        client, task = self._pocket()
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]][1], -1)
+        choice = dict(client.recorded)["retreat-choice"]
+        self.assertIn("seam=1", choice)
+        self.assertIn("continuation=1", choice)
+
+    def test_a_seam_step_toward_more_hostiles_is_not_taken(self):
+        client, task = self._pocket()
+        # Another orc across the seam, four squares beyond the step.
+        self._put(client, 8, 3, "orc warrior", 101)
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+        # The old in-map choice: a dead end beside her, not over the seam.
+        self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]][1], 0)
+        self.assertNotIn("seam=1", dict(client.recorded)["retreat-choice"])
+
+    def test_a_seam_step_is_not_taken_again_within_the_cooldown(self):
+        client, task = self._pocket()
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertIn("seam=1", dict(client.recorded)["retreat-choice"])
+        # The walk brought her straight back into the pocket.
+        client.recorded.clear()
+        task._retreat_attempt = None
+        task._last_retreat_step_at = 0.0
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertNotIn("seam=1", dict(client.recorded)["retreat-choice"])
+        # Once it has passed, the seam serves again.
+        client.recorded.clear()
+        task._retreat_attempt = None
+        task._last_retreat_step_at = 0.0
+        task._seam_step_at -= task.SEAM_STEP_COOLDOWN_SECONDS
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertIn("seam=1", dict(client.recorded)["retreat-choice"])
+
+    def test_a_seam_step_needs_room_away_from_the_seam(self):
+        client, task = self._pocket()
+        # Only the two rows by the seam are open there: running along it
+        # is no escape.
+        north = client.world_graph.nodes["/next_0_-1"]
+        north.terrain = {(x, y): 1 for x in range(5) for y in (3, 4)}
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertNotIn("seam=1", dict(client.recorded)["retreat-choice"])
+
+    def _cover_fight(self):
+        """A sorcerer five squares west shooting through a gap in a wall,
+        while she fights an orc warrior three squares east."""
+        client, task = self._seam_fight()
+        task.map_node.blocked.update({(10, 11), (10, 13), (11, 11), (11, 13)})
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        self._put(client, 11, 8, "orc warrior", 100)
+        task.remember_engagement(client, 11, 8, 100)
+        return client, task
+
+    def _run(self, client, task, creatures, ticks=10):
+        """Tick, placing the creatures at their world squares and moving
+        her as each step (direct or towards a view square) would."""
+        m = client.state.map
+        trail = []
+        for _ in range(ticks):
+            m.tiles.clear()
+            for (x, y), name, target_id in creatures:
+                self._put(client, 8 + x - m.world_x, 8 + y - m.world_y,
+                          name, target_id)
+            task._last_action = 0.0
+            task._retreat_attempt = None
+            direct, moves = len(client.direct_moves), len(client.moves)
+            asyncio.run(task.tick(client))
+            if len(client.direct_moves) > direct:
+                dx, dy = c.DIRECTION_DELTAS[client.direct_moves[-1][0]]
+            elif len(client.moves) > moves:
+                vx, vy = client.moves[-1]
+                dx, dy = (vx > 8) - (vx < 8), (vy > 8) - (vy < 8)
+            else:
+                dx = dy = 0
+            m.world_x += dx
+            m.world_y += dy
+            trail.append((m.world_x, m.world_y))
+        return trail
+
+    def test_she_steps_behind_a_wall_and_holds_there(self):
+        from .tasks import wall_covers
+        client, task = self._cover_fight()
+        trail = self._run(client, task, [
+            ((7, 12), "orc sorcerer", 300), ((15, 12), "orc warrior", 100)])
+        actions = [action for action, _ in client.recorded]
+        self.assertEqual(actions.count("caster-cover"), 1)
+        self.assertEqual(len(client.direct_moves), 1)
+        # Holding, she walks to no target: the orc comes to her.
+        self.assertEqual(client.moves, [])
+        self.assertEqual(len(set(trail)), 1, trail)
+        self.assertTrue(wall_covers(task.map_node, {}, (7, 12), trail[-1]))
+        # Put back into the line, the same hit starts no second step.
+        m = client.state.map
+        m.world_x, m.world_y = 12, 12
+        m.tiles.clear()
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self.assertFalse(asyncio.run(task.break_caster_sight(client)))
+        self._say(client,
+                  "magic bullet hit you for 60 (0) weapon magic damage.")
+        self.assertTrue(asyncio.run(task.break_caster_sight(client)))
+
+    def test_no_cover_from_the_caster_she_is_going_for(self):
+        # The reviewer's oscillation: the sorcerer is her target; cover
+        # from it and the approach to it alternated.
+        client, task = self._seam_fight()
+        task.map_node.blocked.update({(10, 11), (10, 13), (11, 11), (11, 13)})
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        # A hold left from an earlier cover step does not stop her either.
+        task._cover_hold_until = time.monotonic() + 60.0
+        trail = self._run(client, task, [((7, 12), "orc sorcerer", 300)])
+        self.assertNotIn("caster-cover",
+                         [action for action, _ in client.recorded])
+        self.assertEqual(task._engaged_target[0], 300)
+        # She closes in, never stepping back out again.
+        distances = [max(abs(x - 7), abs(y - 12)) for x, y in trail]
+        self.assertEqual(distances, sorted(distances, reverse=True))
+        self.assertLess(distances[-1], 5)
+
+    def test_cover_waits_for_heals_and_the_flee_threshold(self):
+        client, task = self._cover_fight()
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self.assertFalse(task.cover_allowed(client, 0.50, 0.55))
+        self.assertTrue(task.cover_allowed(client, 0.60, 0.55))
+        # A heal sent and not yet answered is in flight.
+        with patch.object(SafetyPolicy, "heal_in_flight",
+                          lambda safety: True, create=True):
+            self.assertFalse(task.cover_allowed(client, 0.90, 0.55))
+        if not hasattr(SafetyPolicy, "heal_in_flight"):
+            # Without that tracking, one sent within the cooldown is.
+            task.safety._last_heal = time.monotonic()
+            self.assertFalse(task.cover_allowed(client, 0.90, 0.55))
+            task.safety._last_heal = 0.0
+        # A usable heal at the heal threshold is due.
+        client.state.stats.update(sp=20)
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        self.assertFalse(task.cover_allowed(client, 0.65, 0.55))
+        self.assertTrue(task.cover_allowed(client, 0.75, 0.55))
+        # Below the flee threshold the tick heals and retreats instead.
+        client.state.stats.update(hp=10, maxhp=32)
+        task.safety.flee_below = 0.55
+        asyncio.run(task.tick(client))
+        self.assertNotIn("caster-cover",
+                         [action for action, _ in client.recorded])
+
+    def test_no_cover_steps_between_pack_retreat_steps(self):
+        # The delta review's alternation: two orc warriors near and a
+        # sorcerer shooting through the gap. The pack-split retreat steps
+        # her out of cover, a cover step brings her back, and so on at
+        # the caster's fire rate. With two threats near, the retreat
+        # alone decides.
+        client, task = self._cover_fight()
+        creatures = [((7, 12), "orc sorcerer", 300),
+                     ((15, 12), "orc warrior", 100),
+                     ((14, 15), "orc warrior", 101)]
+        for _ in range(10):
+            self._say(client,
+                      "magic bullet hit you for 2 (0) weapon magic damage.",
+                      "orc warrior hit you for 1 (0) impact damage.",
+                      ago=0.01)
+            time.sleep(0.02)
+            self._run(client, task, creatures, ticks=1)
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("farm-pack-split", actions)
+        # No cover step while the pack retreat runs. Once she has outrun
+        # both (the retreat's cadence is wall-clock), one may follow, but
+        # never a second one between retreat steps.
+        first = actions.index("farm-pack-split")
+        if "caster-cover" in actions:
+            self.assertEqual(actions.count("caster-cover"), 1, actions)
+            self.assertNotIn("farm-pack-split",
+                             actions[actions.index("caster-cover"):], actions)
+        self.assertNotIn("caster-cover", actions[first:first + 6], actions)
+
+    def test_a_cover_step_never_opens_another_casters_line(self):
+        client, task = self._seam_fight()
+        node = task.map_node
+        # West caster A is walled off from her; north caster B is not.
+        # The one open square leaves B's line but enters A's.
+        node.blocked.update({(10, 12), (11, 10)})
+        node.terrain = {(12, 12): 1, (11, 11): 1}
+        from .tasks import wall_covers
+        self.assertTrue(wall_covers(node, {}, (7, 12), (12, 12)))
+        self.assertFalse(wall_covers(node, {}, (12, 7), (12, 12)))
+        self.assertTrue(wall_covers(node, {}, (12, 7), (11, 11)))
+        self.assertFalse(wall_covers(node, {}, (7, 12), (11, 11)))
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self._put(client, 8, 3, "orc sorcerer", 301)
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        self.assertFalse(asyncio.run(task.break_caster_sight(client)))
+        self.assertEqual(client.direct_moves, [])
+
+    def test_no_cover_step_without_a_spell_hit(self):
+        client, task = self._seam_fight()
+        task.map_node.blocked.update({(10, 11), (10, 13)})
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self.assertFalse(asyncio.run(task.break_caster_sight(client)))
+        self._say(client, "orc warrior hit you for 20 (-20) impact damage.")
+        self.assertFalse(asyncio.run(task.break_caster_sight(client)))
+        self.assertEqual(client.direct_moves, [])
+
+    def test_the_underground_city_pocket_from_the_incident(self):
+        """1_3 (7, 1), on the room side of the door at (8, 1), fighting
+        an orc warrior, with 1_2's orc sorcerers (spawns (4, 18) and
+        (0, 19)) in line across the seam: she steps through the doorway
+        to the corridor side, out of both lines."""
+        from .tasks import area_caster_identities, tiled_neighbours, wall_covers
+        graph = built_graph()
+        farm = graph.nodes[self.UC + "3"]
+        seams = tiled_neighbours(graph, farm)
+        self.assertNotIn("orc sorcerer", farm.caster_identities)
+        self.assertIn("orc sorcerer", area_caster_identities(farm, seams))
+        sorcerers = ((4, 18 - 24), (0, 19 - 24))
+        for sorcerer in sorcerers:
+            self.assertFalse(wall_covers(farm, seams, sorcerer, (7, 1)))
+            self.assertTrue(wall_covers(farm, seams, sorcerer, (9, 1)))
+        client = QuestTests._combat_client()
+        QuestTests._record_actions(client)
+        client.world_graph = graph
+        m = client.state.map
+        m.path = self.UC + "3"
+        m.world_x, m.world_y = 7, 1
+        task = FarmTask(zone=m.path)
+        task.map_node = farm
+        task.map_bounds = (farm.width, farm.height)
+        creatures = [(sorcerer, "orc sorcerer", 300 + index)
+                     for index, sorcerer in enumerate(sorcerers)]
+        creatures.append(((3, 1), "orc warrior", 100))
+        task.remember_engagement(client, 4, 8, 100)
+        trail = []
+        for _ in range(4):
+            # A fresh bullet each time she is still in a line.
+            self._say(client,
+                      "magic bullet hit you for 65 (0) weapon magic damage.")
+            trail += self._run(client, task, creatures, ticks=1)
+        here = trail[-1]
+        self.assertGreater(here[0], 8, trail)
+        self.assertTrue(all(wall_covers(farm, seams, sorcerer, here)
+                            for sorcerer in sorcerers), trail)
+        self.assertEqual(client.moves, [])
 
 
 class NavigationTests(unittest.TestCase):
@@ -25951,9 +26447,11 @@ class IdleSurvivalTests(unittest.TestCase):
         # A blocked spell is no reason to hold still waiting for mana.
         client.state.stats["hp"] = 65
         self.assertTrue(asyncio.run(policy.enforce(client)))
-        # Off the square, healing casts resume.
+        # Off the square, healing casts resume (once the refused cast's
+        # cooldown is over).
         client.state.map.world_x = 17
         engine.idle_safety._last_heal = 0.0
+        engine.idle_safety._heal_retry_at = 0.0
         asyncio.run(engine._protect_idle())
         self.assertEqual(fired, [24, 24])
 
@@ -29466,6 +29964,28 @@ class FightStorageTests(unittest.TestCase):
         self.assertNotIn("zoey", repr(stored).casefold())
         self.assertNotIn("orc", repr(stored).casefold())
         self.assertEqual(client._memory_store().fight_count("Sera"), 1)
+
+    def test_a_caster_spawned_across_a_seam_is_a_ranged_attacker(self):
+        from . import terrain
+        from .tasks import observe_fight
+        client = self.client()
+        m = client.state.map
+        # Sorcerers spawn only on the map tiled north of /t.
+        client.world_graph.nodes["/t"] = terrain_node(
+            TerrainTests.CORRIDOR, tiled=((0, -1),))
+        north = MapNode("/next_0_-1", width=7, height=7)
+        north.caster_identities.add("orc sorcerer")
+        client.world_graph.nodes["/next_0_-1"] = north
+        self.assertEqual(observe_fight(client), 0)
+        m.tile(8, 2).objects[3] = MapObject(3, 1, 0, 0, name="orc sorcerer",
+                                            name_color="ff0000", target_id=8)
+        self.say(client, "magic bullet hit you for 65 (0) weapon magic damage.")
+        self.assertEqual(observe_fight(client), 0)
+        self.say(client, "You have died.")
+        with patch.object(terrain, "DEATH_GRACE_SECONDS", -1.0):
+            self.assertEqual(observe_fight(client), 1)
+        row, = client._memory_store().fights("Sera")
+        self.assertEqual(row["ranged_attackers"], 1)
 
     def test_disease_symptoms_from_the_content_are_no_attackers(self):
         from .tasks import disease_names, observe_fight
@@ -34452,6 +34972,459 @@ class RouteShadowContentTests(RouteDeathReachIsolation, unittest.TestCase):
                 if live is not None:
                     avoided = task._trip_snapshot(client).strict_avoided
                     self.assertFalse({edge.destination for edge in plan.route[:-1]} & avoided)
+
+
+class HealsLandInMeleeTests(unittest.TestCase):
+    """The 2026-11-23 Underground City death: in melee, each auto-swing set
+    her action timer for her weapon speed (2.25 s, server types/player.c),
+    socket_command_fire dropped every cast sent while it ran, and her
+    safety policy, healing every 1.15 s with combat on, counted each
+    dropped cast as a heal (about 8 of 25 landed; her SP stayed at 82)."""
+
+    WEAPON_SPEED = 2.25
+    CAST_TIME = 1.0
+    TICK = 0.1
+
+    class Clock:
+        def __init__(self):
+            self.now = 1000.0
+
+        def __call__(self):
+            return self.now
+
+    class Server:
+        """A melee the client sees: auto-swings while combat is on, FIRE
+        dropped without a word while the action timer runs, applies never
+        gated, and a hit 3 HP every tick so she stays under the heal
+        threshold."""
+
+        def __init__(self, test, client, clock, hit=3):
+            self.test, self.client, self.clock, self.hit = (
+                test, client, clock, hit)
+            self.action_until = 0.0
+            self.combat = True
+            self.swings = 0
+            self.fires = []
+            self.landed = []
+            client.state.combat = True
+
+        def set_timer(self, seconds):
+            now = self.clock.now
+            self.action_until = now + seconds
+            self.client.state.stats["action_time"] = seconds
+            self.client.state.stat_observed_at["action_time"] = now
+
+        def tick(self):
+            now = self.clock.now
+            if self.combat and now >= self.action_until:
+                self.swings += 1
+                self.set_timer(HealsLandInMeleeTests.WEAPON_SPEED)
+            stats = self.client.state.stats
+            stats["hp"] = max(1, stats["hp"] - self.hit)
+
+        def heal(self, amount=15):
+            stats = self.client.state.stats
+            stats["hp"] = min(stats["maxhp"], stats["hp"] + amount)
+            self.client.state.add_message(
+                0, "white", f"The spell heals you for {amount} hp!")
+            self.landed.append(self.clock.now)
+
+        async def fire(self, direction, tag=0):
+            self.fires.append(self.clock.now)
+            if self.clock.now < self.action_until:
+                return  # socket_command_fire: action_attack still running
+            item = self.client.state.items.get(tag)
+            if item is not None and item.item_type == c.TYPE_SPELL:
+                self.client.state.stats["sp"] -= 4
+            self.heal()
+            self.set_timer(HealsLandInMeleeTests.CAST_TIME)
+
+        async def apply(self, tag):
+            state = self.client.state
+            item = state.items.get(tag)
+            self.client.applied.append(tag)
+            if item is None:
+                return
+            if item.item_type in (c.TYPE_ROD, c.TYPE_WAND):
+                item.flags ^= c.ITEM_APPLIED
+                return
+            item.quantity -= 1
+            if not item.quantity:
+                state.remove_item(tag)
+            self.heal(30)
+
+        async def set_combat(self, enabled, force=False):
+            self.combat = bool(enabled or force)
+            self.client.combat.append(enabled)
+            # The server answers with its target packet.
+            self.client.state.combat = self.combat
+
+    def setUp(self):
+        self.clock = self.Clock()
+        patcher = patch("time.monotonic", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def melee(self, *heals, hp=150, sp=82, hit=3):
+        client = types.SimpleNamespace()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats.update(hp=hp, maxhp=330, sp=sp, food=999,
+                                  level=36)
+        for item in heals:
+            client.state.place_item(item, 7)
+        client.applied = []
+        client.combat = []
+        client.decisions = []
+        server = self.Server(self, client, self.clock, hit=hit)
+        client.fire = server.fire
+        client.apply = server.apply
+        client.set_combat = server.set_combat
+
+        async def clear_actions():
+            pass
+
+        client.clear_actions = clear_actions
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        # The melee is under way: her last swing just went.
+        server.set_timer(self.WEAPON_SPEED)
+        return client, server
+
+    def run_for(self, client, server, policy, seconds):
+        for _ in range(int(round(seconds / self.TICK))):
+            server.tick()
+            asyncio.run(policy.enforce(client))
+            self.clock.now += self.TICK
+
+    @staticmethod
+    def spell():
+        spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+        spell.extra["cost"] = 4
+        return spell
+
+    def test_heals_land_through_the_swing_timer(self):
+        client, server = self.melee(self.spell(), hit=1)
+        policy = SafetyPolicy()
+        self.run_for(client, server, policy, 30.0)
+        # Every cast she sent landed: none went out while the timer ran.
+        self.assertEqual(len(server.fires), len(server.landed))
+        self.assertGreaterEqual(len(server.landed), 9)
+        self.assertEqual(client.state.stats["sp"], 82 - 4 * len(server.landed))
+        self.assertNotIn("heal-unconfirmed",
+                         [action for action, _ in client.decisions])
+        # She fought back between heals: swings went on.
+        self.assertGreaterEqual(server.swings, 5)
+        # The cooldown counts from a heal that landed.
+        self.assertIn(policy._last_heal, server.landed)
+
+    def test_combat_comes_back_on_with_each_cast(self):
+        from .tasks import heal_waiting
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        # Timer running: combat off, nothing sent, and the tick is not the
+        # heal's: callers may step away meanwhile, but not fight.
+        self.assertEqual(client.combat, [False])
+        self.assertEqual(server.fires, [])
+        self.assertEqual(policy._heal_action, 0.0)
+        self.assertTrue(heal_waiting(client))
+        # One server tick of margin past the client's countdown.
+        self.clock.now += self.WEAPON_SPEED
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(server.fires, [])
+        self.clock.now += 0.2
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(heal_waiting(client))
+        self.assertEqual(policy._heal_action, self.clock.now)
+        self.assertEqual(len(server.landed), 1)
+        # The fire went first, then combat came back on.
+        self.assertEqual(client.combat, [False, True])
+        self.assertTrue(server.combat)
+        self.assertIsNone(getattr(client, "heal_combat_force", None))
+
+    def test_no_combat_off_outlives_a_heal_no_longer_needed(self):
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(server.combat)
+        # A potion from elsewhere (or regeneration) lifted her over the
+        # threshold before the timer ran out: no cast, combat back on.
+        client.state.stats["hp"] = 300
+        self.clock.now += 0.5
+        self.assertTrue(asyncio.run(policy.enforce(client)))
+        self.assertEqual(server.fires, [])
+        self.assertTrue(server.combat)
+        # Out of mana mid-wait: the same.
+        client.state.stats.update(hp=150, sp=82)
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(server.combat)
+        client.state.stats["sp"] = 0
+        asyncio.run(policy.enforce(client))
+        self.assertTrue(server.combat)
+
+    def test_a_recall_waiting_keeps_combat_off(self):
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(server.combat)
+        # The recall took over (recall_waiting): healing spells wait, and
+        # the heal's combat-off is not undone.
+        client.recall_waiting_until = self.clock.now + 1.0
+        asyncio.run(policy.enforce(client))
+        self.assertFalse(server.combat)
+        self.assertIsNone(getattr(client, "heal_combat_force", None))
+
+    def test_a_dropped_cast_is_retried_and_not_counted(self):
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        # The client's timer ran out, but the server's has not: dropped.
+        client.state.stats["action_time"] = 0
+        server.combat = client.state.combat = False
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 1)
+        self.assertEqual(server.landed, [])
+        self.assertEqual(policy._last_heal, 0.0)
+        self.assertTrue(policy.heal_in_flight())
+        # Not before the answer is due ...
+        self.clock.now += 0.5
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 1)
+        # ... then again at once, without a full cooldown from the answer.
+        self.clock.now += 0.6
+        server.action_until = 0.0
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 2)
+        self.assertEqual(len(server.landed), 1)
+        self.assertIn(("heal-unconfirmed", "via minor healing"),
+                      client.decisions)
+        self.clock.now += 0.2
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(policy._last_heal, server.landed[0])
+        self.assertFalse(policy.heal_in_flight())
+
+    def test_a_potion_goes_at_once_with_combat_on(self):
+        potion = Item(27, item_type=c.TYPE_POTION, quality=100,
+                      name="potion of minor healing", quantity=3)
+        client, server = self.melee(potion)
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        # No timer gates an apply: drunk at once, combat left on.
+        self.assertEqual(client.applied, [27])
+        self.assertEqual(client.combat, [])
+        self.assertTrue(server.combat)
+        self.clock.now += 0.1
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(policy._last_heal, server.landed[0])
+        self.run_for(client, server, policy, 3.0)
+        self.assertEqual(client.combat, [])
+        self.assertEqual(client.applied, [27, 27, 27])
+        self.assertEqual(len(server.landed), 3)
+
+    def test_a_used_up_potion_counts_without_a_message(self):
+        from .tasks import heal_landed
+        potion = Item(27, item_type=c.TYPE_POTION, quality=100,
+                      name="potion of minor healing", quantity=2)
+        client, _ = self.melee(potion)
+        pending = (self.clock.now, client.state.message_count, 27,
+                   c.TYPE_POTION, 2)
+        self.assertIsNone(heal_landed(client, pending))
+        potion.quantity = 1
+        self.assertIs(heal_landed(client, pending), True)
+
+    def test_a_healing_rod_is_readied_then_fired_after_the_timer(self):
+        rod = Item(26, item_type=c.TYPE_ROD, quality=100,
+                   name="rod of minor healing")
+        client, server = self.melee(rod)
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        # Readied, once: applying it again would unready it.
+        self.assertEqual(client.applied, [26])
+        self.assertTrue(rod.flags & c.ITEM_APPLIED)
+        self.clock.now += 0.1
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(client.applied, [26])
+        self.assertEqual(server.fires, [])
+        self.assertFalse(server.combat)
+        self.clock.now += self.WEAPON_SPEED + 0.2
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.landed), 1)
+        self.assertTrue(server.combat)
+
+    def test_out_healed_gap_counts_from_landed_heals(self):
+        client, server = self.melee(self.spell())
+        task = FarmTask(zone="/test")
+        task.safety._last_heal = self.clock.now - 3.0
+        # A heal in flight is not due; a dropped one leaves the gap open.
+        task.safety._heal_pending = (self.clock.now, 0, 24, c.TYPE_SPELL, 1)
+        self.assertTrue(task.safety.heal_in_flight())
+        self.clock.now += 1.1
+        asyncio.run(task.safety.enforce(client))
+        self.assertFalse(task.safety.heal_in_flight())
+        self.assertLess(task.safety._last_heal, self.clock.now - 3.0)
+
+
+    def device_refused(self, item, answer):
+        client, server = self.melee(item, self.spell())
+
+        async def fire(direction, tag=0):
+            server.fires.append(self.clock.now)
+            client.state.add_message(0, "white", answer)
+
+        client.fire = fire
+        server.action_until = 0.0
+        client.state.stats["action_time"] = 0
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 1)
+        self.clock.now += 0.2
+        # The answer settles it; a refusal waits out the cooldown.
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 1)
+        return client, server, policy
+
+    def test_a_refusing_rod_backs_off_and_the_spell_heals(self):
+        rod = Item(26, item_type=c.TYPE_ROD, quality=100,
+                   name="rod of minor healing", flags=c.ITEM_APPLIED)
+        client, server, policy = self.device_refused(
+            rod, "The rod of minor healing whines for a while, but "
+                 "nothing happens.")
+        # Backed off like a recall device: not usable, so the spell after
+        # it in her inventory heals, at once.
+        self.assertGreater(client.recall_device_retry_at[26], self.clock.now)
+        self.assertEqual(policy._usable_heal(client).tag, 24)
+        self.clock.now += policy.heal_cooldown
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(len(server.fires), 2)
+        self.clock.now += 20.0
+        self.assertEqual(policy._usable_heal(client).tag, 26)
+
+    def test_an_empty_healing_wand_is_not_retried(self):
+        from .tasks import wand_known_empty
+        wand = Item(28, item_type=c.TYPE_WAND, quality=100,
+                    name="wand of minor healing", flags=c.ITEM_APPLIED)
+        client, server, policy = self.device_refused(
+            wand, "The wand of minor healing says poof.")
+        self.assertTrue(wand_known_empty(client, wand))
+        self.assertNotIn("heal-unconfirmed",
+                         [action for action, _ in client.decisions])
+        self.assertEqual(policy._usable_heal(client).tag, 24)
+
+    def test_she_steps_away_but_never_fights_while_a_heal_waits(self):
+        from .tasks import heal_waiting
+        client, server = self.melee(self.spell())
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        self.assertTrue(heal_waiting(client))
+        task = FarmTask(zone="/test")
+        task._cornered_breakout_target = 100
+        task._stand_latch = True
+        client.state.map = MapState(path="/test", width=17, height=17)
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="orc warrior", target_id=100, target_hp=100)
+        moves = []
+
+        async def move(direction, run=False):
+            moves.append(direction)
+
+        async def target(x, y, target_id=0):
+            pass
+
+        client.move = move
+        client.move_to_view = move
+        client.target = target
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        client.state.map.world_x = client.state.map.world_y = 12
+        asyncio.run(task.low_health_retreat(client))
+        # A step, combat still off: no breakout swing.
+        self.assertTrue(moves)
+        self.assertNotIn(True, client.combat)
+
+    def test_another_policy_restores_a_heal_combat_off(self):
+        client, server = self.melee(self.spell())
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertFalse(server.combat)
+        # The task ended mid-wait; the engine's idle policy runs next.
+        client.state.stats["hp"] = 300
+        self.assertTrue(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertTrue(server.combat)
+
+
+    def real_client(self):
+        """An AtrinikClient in a melee: combat on and forced, her swing
+        timer running."""
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.player_tag = 7
+        client.state.stats.update(hp=150, maxhp=330, sp=82, food=999)
+        client.state.place_item(self.spell(), 7)
+        client.state.combat = client.state.combat_force = True
+        client.state.stats["action_time"] = self.WEAPON_SPEED
+        client.state.stat_observed_at["action_time"] = self.clock.now
+        sent = []
+
+        async def send(packet):
+            data = bytes(packet.data)
+            if packet.packet_type == c.S_COMBAT:
+                sent.append((bool(data[0]), bool(data[1])))
+                # The server echoes its combat state.
+                client.state.combat = bool(data[0] or data[1])
+
+        client.send = send
+        return client, sent
+
+    def test_a_stop_during_the_wait_keeps_combat_off(self):
+        from .web_server import WebControlServer
+        client, sent = self.real_client()
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertEqual(sent, [(False, False)])
+        # The operator replaces the task (as Stop does): combat off.
+        engine = TaskEngine(client)
+        server = WebControlServer(client, engine, WorldGraph())
+
+        async def clear(*_args):
+            pass
+
+        client.clear_actions = client.clear_target = clear
+        asyncio.run(server._replace_task(BotTask("next")))
+        # Healthy, the next policy restores nothing.
+        client.state.stats["hp"] = 330
+        self.assertTrue(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertEqual(sent, [(False, False), (False, False)])
+
+    def test_a_handover_combat_off_wins_over_the_restore(self):
+        # Autoplay's handovers (recovery, temple food, a failed child)
+        # turn combat off; the heal must not turn it back on, forced.
+        client, sent = self.real_client()
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        asyncio.run(client.set_combat(False))
+        self.clock.now += self.WEAPON_SPEED + 0.2
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertNotIn(True, [enabled for enabled, _ in sent])
+        # Without one, the cast restores combat as it was, forced.
+        client, sent = self.real_client()
+        asyncio.run(policy.enforce(client))
+        self.clock.now += self.WEAPON_SPEED + 0.2
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertEqual(sent[-1], (True, True))
+
+    def test_another_wands_poof_is_not_hers(self):
+        from .tasks import heal_landed, observe_wand_feedback, wand_charges
+        wand = Item(28, item_type=c.TYPE_WAND, quality=100,
+                    name="wand of minor healing", flags=c.ITEM_APPLIED)
+        client, _ = self.melee(wand)
+        pending = (self.clock.now, client.state.message_count, 28,
+                   c.TYPE_WAND, 1)
+        since = time.time() - 1.0
+        client.state.add_message(0, "white", "The rod says poof.")
+        self.assertIsNone(heal_landed(client, pending))
+        self.assertFalse(observe_wand_feedback(client, 28, since))
+        self.assertNotIn(28, wand_charges(client))
+        client.state.add_message(0, "white", "The wand says poof.")
+        self.assertEqual(heal_landed(client, pending), "The wand says poof.")
+        self.assertTrue(observe_wand_feedback(client, 28, since))
 
 
 if __name__ == "__main__":
