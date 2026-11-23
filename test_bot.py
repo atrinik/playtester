@@ -4676,6 +4676,98 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertTrue(task.checked)
         self.assertFalse(task.purchased)
 
+    def test_recall_stock_falls_back_to_a_cheaper_choice_and_records_the_cheapest(self):
+        # Live, 2026-11-22: "merchant stock costs 95s 95c, wallet 24s 13c,
+        # reserve 10s". She now tries every recall choice, and the cheapest
+        # quote is what the dashboard and the next trip go by.
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance = 2_413
+                self.state.bank_balance_known = True
+                self.talks = []
+                self.quotes = []
+
+            async def talk(self, message, npc):
+                self.talks.append((message, npc))
+
+            def record_vendor_quote(self, key, item, unit_cost):
+                self.quotes.append((key, item, unit_cost))
+
+        def quote(client, name, price):
+            client.state.interface = InterfaceState(
+                title="sage", objects=[Item(
+                    20, name=name, extra={"message": f"{name} for {price}"})],
+                links=[f"[a=:buy 1 {name}]One[/a]"])
+
+        def run(wallet):
+            client = FakeClient()
+            client.state.bank_balance = wallet
+            task = BuyDialogueStockTask(
+                "sage", r"word of recall", observation_key="recall-source",
+                try_alternatives=True)
+            asyncio.run(task.tick(client))
+            client.state.interface = InterfaceState(title="sage", links=[
+                "[a=:buy rod of word of recall]Rod[/a]",
+                "[a=:buy wand of word of recall (lvl 12)]Wand[/a]",
+            ])
+            asyncio.run(task.tick(client))
+            self.assertEqual(client.talks[-1], ("buy rod of word of recall", "sage"))
+            quote(client, "rod of word of recall", "1 gold 50 silver")
+            asyncio.run(task.tick(client))
+            # The rod is over her means: the wand is asked for next.
+            self.assertEqual(task.status, TaskStatus.RUNNING)
+            self.assertEqual(client.talks[-1],
+                             ("buy wand of word of recall (lvl 12)", "sage"))
+            quote(client, "wand of word of recall (lvl 12)",
+                  "95 silver 95 copper")
+            asyncio.run(task.tick(client))
+            return client, task
+
+        client, task = run(2_413)
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("merchant stock costs 95s 95c", task.error)
+        self.assertEqual(client.quotes, [
+            ("recall-source", "wand of word of recall (lvl 12)", 9_595)])
+        self.assertFalse(task.purchased)
+        # With the wand's price plus the reserve she buys the wand.
+        client, task = run(10_595)
+        self.assertEqual(client.talks[-1],
+                         ("buy 1 wand of word of recall (lvl 12)", "sage"))
+        self.assertEqual(client.quotes, [
+            ("recall-source", "wand of word of recall (lvl 12)", 9_595)])
+        # The alternative's quote never arrives: the price she could not pay
+        # is still recorded.
+        client = FakeClient()
+        task = BuyDialogueStockTask(
+            "sage", r"word of recall", observation_key="recall-source",
+            try_alternatives=True)
+        asyncio.run(task.tick(client))
+        client.state.interface = InterfaceState(title="sage", links=[
+            "[a=:buy rod of word of recall]Rod[/a]",
+            "[a=:buy wand of word of recall (lvl 12)]Wand[/a]"])
+        asyncio.run(task.tick(client))
+        quote(client, "rod of word of recall", "1 gold 50 silver")
+        asyncio.run(task.tick(client))
+        client.state.interface = None
+        task._sent_at -= 6.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(client.quotes, [
+            ("recall-source", "rod of word of recall", 15_000)])
+        # Without the fallback the first choice's failure is unchanged.
+        client = FakeClient()
+        task = BuyDialogueStockTask("sage", r"word of recall")
+        asyncio.run(task.tick(client))
+        client.state.interface = InterfaceState(title="sage", links=[
+            "[a=:buy rod of word of recall]Rod[/a]",
+            "[a=:buy wand of word of recall (lvl 12)]Wand[/a]"])
+        asyncio.run(task.tick(client))
+        quote(client, "rod of word of recall", "1 gold 50 silver")
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(client.quotes, [])
+
     def test_dynamic_merchant_buys_distinct_utility_groups_in_one_visit(self):
         class FakeClient:
             def __init__(self):
@@ -6381,6 +6473,69 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(len(client.direct_moves), moves + 1)
         # The engagement with the proven attacker survives the release.
         self.assertEqual(task._engaged_target[0], 200)
+
+    def _no_heal_no_recall(self, client, hp):
+        """Live, 2026-11-22: level 36, no SP, no potions, no recall."""
+        client.state.stats.update(hp=hp, maxhp=32, level=36, sp=0, maxsp=40)
+        client.decisions = []
+        client.record_action = (
+            lambda action, detail="": client.decisions.append(action))
+
+    def test_without_heal_or_recall_she_pulls_nothing_below_90_percent(self):
+        from .tasks import unprepared_for_trips
+
+        def farm(hp, *, level=36, potion=False):
+            client = self._combat_client()
+            self._no_heal_no_recall(client, hp)
+            client.state.stats["level"] = level
+            client.state.map.tiles.clear()
+            client.state.map.world_x, client.state.map.world_y = 1, 11
+            if potion:
+                client.state.inventory.append(Item(
+                    60, item_type=c.TYPE_POTION, name="potion of healing"))
+            node = MapNode(path="/test", width=12, height=14)
+            node.terrain = {(x, y): 1 for x in range(12) for y in range(14)}
+            task = FarmTask(zone="/test", patrol=[(7, 9)])
+            task.map_node, task.map_bounds = node, (12, 14)
+            asyncio.run(task.tick(client))
+            return client, task
+
+        # 75 %, nothing to heal with, no recall: she rests, combat off.
+        client, task = farm(24)
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.decisions, ["unprepared-rest"])
+        self.assertEqual(client.combat, [False])
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.decisions, ["unprepared-rest"])
+        # Ten minutes in a row at most: then she patrols to pull again,
+        # recorded once.
+        from .tasks import UNPREPARED_REST_LIMIT_SECONDS
+        task._unprepared_hold.since -= UNPREPARED_REST_LIMIT_SECONDS
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertEqual(client.decisions,
+                         ["unprepared-rest", "unprepared-rest-timeout"])
+        # 90 % and up, a potion, or below level 18: she patrols to pull.
+        for client, _ in (farm(29), farm(24, potion=True), farm(24, level=17)):
+            self.assertEqual(len(client.direct_moves), 1)
+            self.assertNotIn("unprepared-rest", client.decisions)
+        # A healing spell she has the SP for counts; without the SP it does not.
+        client = self._combat_client()
+        self._no_heal_no_recall(client, 24)
+        client.state.inventory.append(Item(
+            61, item_type=c.TYPE_SPELL, name="minor healing", extra={"cost": 5}))
+        task = FarmTask(zone="/test")
+        self.assertTrue(unprepared_for_trips(client, task.safety))
+        client.state.stats["sp"] = 5
+        self.assertFalse(unprepared_for_trips(client, task.safety))
+        # A ready recall counts too.
+        client.state.stats["sp"] = 0
+        client.state.inventory.append(Item(
+            62, item_type=c.TYPE_ROD, quality=80, condition=80,
+            name="rod of word of recall"))
+        self.assertFalse(unprepared_for_trips(client, task.safety))
 
     def _pursued_stand_task(self, client):
         client.state.stats.update(hp=100, maxhp=176)
@@ -20389,7 +20544,8 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
     SHOP = ("/shattered_islands/world_0_69", (15, 7))
 
     def client(self, *, bank=5_000, depletion=0, level=36, ranked=True,
-               config=None):
+               config=None, recall=True):
+        """``recall``: a working recall rod (tag 76), so no recall note."""
         client = AtrinikClient(config or ClientConfig())
         client.state.phase = "playing"
         client.state.stats.update({"level": level, "exp": 1000, "hp": 134,
@@ -20400,6 +20556,10 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.bank_balance_observed_at = time.time()
         client.state.savebed_map, client.state.savebed_xy = self.HOME
         self.place(client, self.HOME)
+        if recall:
+            client.state.place_item(Item(
+                76, item_type=c.TYPE_ROD, quality=80, condition=80,
+                name="rod of word of recall"), client.state.player_tag)
         if depletion:
             client.state.depletion_points = depletion
             client.state.depletion_points_known = True
@@ -20458,46 +20618,126 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
     def ids(alerts):
         return [alert["id"] for alert in alerts]
 
-    def test_unsafe_reasons_follow_the_depletion_threshold_and_recall(self):
-        from .navigation import NO_RECALL_REASON, farming_unsafe_reason
+    def test_unsafe_reasons_follow_the_depletion_threshold_only(self):
+        from .navigation import farming_unsafe_reason, has_working_recall
         from .tasks import wand_charges
 
-        client, _ = self.client()
-        # No recall source ever owned: nothing to replace, farming is safe.
+        client, _ = self.client(recall=False)
+        # No recall source ever owned: farming is safe.
         self.assertEqual(farming_unsafe_reason(client), "")
-        # Two empty wands, as live: no working source.
+        self.assertFalse(has_working_recall(client))
+        # Two empty wands, as live (2026-11-22): no working source, and
+        # still no blocker (owner decision, 2026-11-22).
         self.empty_wands(client, 77, 78)
-        self.assertEqual(farming_unsafe_reason(client), NO_RECALL_REASON)
+        self.assertFalse(has_working_recall(client))
+        self.assertEqual(farming_unsafe_reason(client), "")
         # A wand of unknown charge counts until its examine says otherwise.
         wand_charges(client).pop(78)
-        self.assertEqual(farming_unsafe_reason(client), "")
+        self.assertTrue(has_working_recall(client))
         wand_charges(client)[78] = 0
         # A rod that just said it cannot fire is not ready meanwhile.
         client.state.place_item(Item(
             79, item_type=c.TYPE_ROD, quality=80, condition=80,
             name="rod of word of recall"), client.state.player_tag)
-        self.assertEqual(farming_unsafe_reason(client), "")
+        self.assertTrue(has_working_recall(client))
         client.recall_device_retry_at = {79: time.monotonic() + 20.0}
-        self.assertEqual(farming_unsafe_reason(client), NO_RECALL_REASON)
-        # A known spell is a source whatever her mana.
+        self.assertFalse(has_working_recall(client))
+        self.assertEqual(farming_unsafe_reason(client), "")
+        # A known spell costing more than her whole mana bar (20) is none.
         client.state.stats["sp"] = 0
         client.state.place_item(Item(
             71, item_type=c.TYPE_SPELL, name="word of recall",
             extra={"cost": 24}), client.state.player_tag)
-        self.assertEqual(farming_unsafe_reason(client), "")
-        # Below recall shopping's level nothing could replace a source.
-        client, _ = self.client(level=17)
-        self.empty_wands(client, 77)
-        self.assertEqual(farming_unsafe_reason(client), "")
+        self.assertFalse(has_working_recall(client))
+        # Within it, it is a source whatever her mana now.
+        client.state.items[71].extra["cost"] = 20
+        self.assertTrue(has_working_recall(client))
         # Depleted at the temple threshold, whatever her recall.
         client, _ = self.client(
-            depletion=FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD - 1)
+            depletion=FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD - 1,
+            recall=False)
+        self.empty_wands(client, 77)
         self.assertEqual(farming_unsafe_reason(client), "")
         client.state.depletion_points += 1
         self.assertIn("depletion 3", farming_unsafe_reason(client))
         # The counter alone, without the live force, is no depletion.
         client.state.remove_item(502)
         self.assertEqual(farming_unsafe_reason(client), "")
+
+    def quote_recall(self, client, cost, *, age=0.0):
+        from .navigation import RECALL_QUOTE_KEY
+
+        client.state.vendor_quotes[RECALL_QUOTE_KEY] = {
+            "item": "wand of word of recall (lvl 12)", "unit_cost": cost,
+            "observed_at": time.time() - age}
+
+    def test_empty_recall_wands_and_an_unaffordable_recall_never_stop_farming(self):
+        # Live, 2026-11-22 (v1.87.0): both wands empty, the cheapest recall
+        # 9,595 copper, her wallet 2,413. Farming was suspended for recall
+        # she could not earn without farming: three days without XP.
+        from .client import format_money
+        from .navigation import RecoveryTask
+
+        client, _ = self.client(bank=2_413, level=36, recall=False)
+        self.empty_wands(client, 77, 78)
+        self.quote_recall(client, 9_595)
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        autoplay = self.autoplay_farming(client)
+        circuit = autoplay.child
+        self.assertIsInstance(circuit, FarmCircuitTask)
+        for _ in range(3):
+            asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        self.assertNotIsInstance(autoplay.child, RecoveryTask)
+        self.assertNotIn("farming-suspended", self.actions(client))
+        # No recall trip she cannot pay for.
+        self.assertFalse(circuit._needs_recall_shopping(client))
+        self.assertIsNone(circuit._recall_shopping)
+        # The dashboard says what a recall needs, from the real price,
+        # as a warning, not a blocker.
+        alerts, waiting = autoplay.recovery_alerts(client)
+        self.assertEqual(self.ids(alerts), ["recall-unfunded"])
+        self.assertEqual(alerts[0]["level"], "warn")
+        self.assertIn(format_money(9_595 + FarmCircuitTask.RECALL_SHOP_RESERVE),
+                      alerts[0]["text"])
+        self.assertIn(format_money(2_413), alerts[0]["text"])
+        self.assertIn("farms on without one", alerts[0]["text"])
+        self.assertFalse(waiting)
+
+    def test_recall_shopping_runs_once_she_can_afford_the_quoted_recall(self):
+        client, _ = self.client(bank=2_413, level=36, recall=False)
+        self.empty_wands(client, 77, 78)
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        circuit = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        # No quote yet: the old minimum decides whether to go and look.
+        self.assertTrue(circuit._needs_recall_shopping(client))
+        self.quote_recall(client, 9_595)
+        self.assertFalse(circuit._needs_recall_shopping(client))
+        # The price plus the reserve, and she goes.
+        client.state.bank_balance = 9_595 + FarmCircuitTask.RECALL_SHOP_RESERVE - 1
+        self.assertFalse(circuit._needs_recall_shopping(client))
+        client.state.bank_balance += 1
+        self.assertTrue(circuit._needs_recall_shopping(client))
+        alerts = AutoplayTask(built_graph(), target_level=115)
+        alerts.status = TaskStatus.RUNNING
+        self.assertEqual(self.ids(alerts.recovery_alerts(client)[0]),
+                         ["recall-missing"])
+        # A quote older than a day no longer holds her back: stock changes.
+        client.state.bank_balance = 2_413
+        self.assertEqual(self.ids(alerts.recovery_alerts(client)[0]),
+                         ["recall-unfunded"])
+        self.quote_recall(client, 9_595, age=FarmCircuitTask.RECALL_SHOP_INTERVAL)
+        self.assertTrue(circuit._needs_recall_shopping(client))
+        # Nor is it a price on the dashboard: no unfunded warning.
+        self.assertEqual(self.ids(alerts.recovery_alerts(client)[0]),
+                         ["recall-missing"])
+        # The trip buys with the same reserve and records the quote.
+        shopper = circuit._new_recall_shopping(client).task
+        self.assertEqual(shopper.cash_reserve, FarmCircuitTask.RECALL_SHOP_RESERVE)
+        self.assertEqual(shopper.observation_key, "recall-source")
+        self.assertTrue(shopper.try_alternatives)
 
     def test_a_fresh_run_without_a_ranking_starts_the_cure_while_depleted(self):
         from .alerts import STUCK_SECONDS, ProgressWatch, active
@@ -20686,7 +20926,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertNotIsInstance(autoplay.child, FarmCircuitTask)
 
     def test_the_recall_note_is_forgotten_once_recall_works(self):
-        client, _ = self.client()
+        client, _ = self.client(recall=False)
         self.empty_wands(client, 77)
         client.set_recall_unavailable("recall shopping found no recall source")
         autoplay = AutoplayTask(built_graph(), target_level=115)
@@ -20724,16 +20964,14 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.place(client, (self.TREES, start))
         client.state.messages.append((time.time(), 2, "ff0000",
                                       "evil treant hit you for 22 (-15) impact damage."))
-        # Her rod just said it cannot fire: no working recall for 20 s.
-        client.state.place_item(Item(
-            79, item_type=c.TYPE_ROD, quality=80, condition=80,
-            name="rod of word of recall"), client.state.player_tag)
-        client.recall_device_retry_at = {79: time.monotonic() + 20.0}
+        # Depleted at the threshold: the switch waits for the fight.
+        self.deplete(client)
         asyncio.run(autoplay.tick(client))
         self.assertIs(autoplay.child, circuit)
         self.assertTrue(circuit.child.task.hold_new_pulls)
-        # The retry ran out before the switch: she farms on, pulling again.
-        client.recall_device_retry_at = {}
+        # A depletion potion cured her before the switch: she farms on,
+        # pulling again.
+        client.state.remove_item(502)
         asyncio.run(autoplay.tick(client))
         self.assertIs(autoplay.child, circuit)
         self.assertFalse(circuit.child.task.hold_new_pulls)
@@ -20790,20 +21028,28 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIsInstance(autoplay.child.services._restoration.task,
                               TempleServiceTask)
 
-    def test_a_failed_ship_key_raises_recall_unavailable_across_a_restart(self):
-        client, _ = self.client()
+    def test_a_failed_ship_key_notes_recall_unavailable_across_a_restart(self):
+        from .navigation import recall_alerts
+
+        client, _ = self.client(recall=False)
         self.empty_wands(client, 77)
-        recovery, _ = self.recovery(client)
-        recovery.services._ship_key = _DoneErrand(
+        circuit = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        circuit._ship_key = _DoneErrand(
             status=TaskStatus.FAILED, error="Morg'eean did not answer")
-        asyncio.run(recovery.tick(client))
-        alerts = recovery.alerts(client)
+        self.assertTrue(asyncio.run(circuit._tick_running_service(client)))
+        alerts = recall_alerts(client)
         self.assertEqual(self.ids(alerts), ["recall-unavailable"])
+        self.assertEqual(alerts[0]["level"], "info")
         self.assertIn("ship key", alerts[0]["text"])
-        # Persisted: a new run (after Stop) still shows it.
-        fresh, _ = self.recovery(client)
-        self.assertEqual(self.ids(fresh.alerts(client)), ["recall-unavailable"])
+        # Persisted state: a new run (after Stop) still shows it.
         self.assertTrue(client.state.recall_unavailable_at)
+        # With a working recall a failed key is no recall note.
+        client, _ = self.client()
+        circuit._ship_key = _DoneErrand(
+            status=TaskStatus.FAILED, error="Morg'eean did not answer")
+        asyncio.run(circuit._tick_running_service(client))
+        self.assertEqual(client.state.recall_unavailable, "")
+        self.assertEqual(recall_alerts(client), [])
 
     def test_cure_unfunded_hides_only_while_a_funding_trip_runs(self):
         client, _ = self.client(depletion=92, bank=1_038)
@@ -20824,8 +21070,8 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(autoplay.tick(client))
         self.assertEqual(autoplay.phase, "adaptive-farming")
         circuit = autoplay.child
-        # Her last recall wand said poof, and something is hitting her.
-        self.empty_wands(client, 77)
+        # Depleted, and something is hitting her.
+        self.deplete(client)
         client.state.add_message(2, "ff0000",
                                  "singed deer hit you for 22 (-15) impact damage.")
         for _ in range(3):
@@ -20861,40 +21107,262 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.remove_item(502)
         self.assertEqual(recovery.alerts(client), [])
 
-    def test_recall_shopping_that_buys_nothing_raises_recall_unavailable(self):
-        client, _ = self.client(bank=1_038)
+    def test_recall_shopping_outcomes_are_noted_for_the_dashboard(self):
+        from .navigation import recall_alerts
+
+        client, _ = self.client(bank=1_038, recall=False)
         self.empty_wands(client, 77, 78)
-        recovery, now = self.recovery(client)
-        # Under the 1,250 recall shopping needs: unfunded, for the owner.
-        alerts = recovery.alerts(client)
-        self.assertEqual(self.ids(alerts), ["recall-unfunded"])
-        self.assertIn("operator assist", alerts[0]["text"])
-        client.state.bank_balance = 5_000
-        self.assertEqual(recovery.alerts(client), [])
-        client.state.place_item(Item(
-            90, name="Morg'eean's Ship Key"), client.state.player_tag)
-        shopped = []
-
-        def shop(client):
-            shopped.append(_DoneErrand(task=BotTask("stock")))
-            return shopped[-1]
-
-        recovery.services._new_recall_shopping = shop
-        asyncio.run(recovery.tick(client))
-        asyncio.run(recovery.tick(client))
-        self.assertEqual(len(shopped), 1)
-        alerts = recovery.alerts(client)
+        # No quote yet, and no failure: an informational note only.
+        self.assertEqual(self.ids(recall_alerts(client)), ["recall-missing"])
+        self.assertEqual(recall_alerts(client)[0]["level"], "info")
+        circuit = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        circuit._recall_shopping = _DoneErrand(task=BotTask("stock"))
+        asyncio.run(circuit._tick_running_service(client))
+        alerts = recall_alerts(client)
         self.assertEqual(self.ids(alerts), ["recall-unavailable"])
         self.assertIn("no recall source", alerts[0]["text"])
-        # A working wand: nothing is unsafe, no alert, and recovery ends.
+        # A failed trip whose quote she cannot pay: the real price wins.
+        circuit._recall_shopping = _DoneErrand(
+            status=TaskStatus.FAILED,
+            error="merchant stock costs 95s 95c, wallet 10s 38c, reserve 10s")
+        self.quote_recall(client, 9_595)
+        asyncio.run(circuit._tick_running_service(client))
+        self.assertIn("recall shopping failed", client.state.recall_unavailable)
+        self.assertEqual(self.ids(recall_alerts(client)), ["recall-unfunded"])
+        # Affordable now: the failure note again until the next trip.
+        client.state.bank_balance = 20_000
+        self.assertEqual(self.ids(recall_alerts(client)), ["recall-unavailable"])
+        # Below level 18 nothing would be bought: no note.
+        client.state.stats["level"] = 17
+        self.assertEqual(recall_alerts(client), [])
+        client.state.stats["level"] = 36
+        # A working wand: no note at all.
         client.state.place_item(Item(
             80, item_type=c.TYPE_WAND, quality=80, condition=80,
             name="pine wand of word of recall (lvl 17)"),
             client.state.player_tag)
-        self.assertEqual(recovery.alerts(client), [])
+        self.assertEqual(recall_alerts(client), [])
+
+    def test_no_mana_crystal_detour_starts_without_heals_or_recall_below_90_percent(self):
+        # Live, 2026-11-22: with no heals and no recall she took the
+        # mana-crystal-upgrade errand into the Old Outpost and died there.
+        def autoplay_for(client):
+            autoplay = AutoplayTask(built_graph(), target_level=115)
+            started = []
+
+            async def start_upgrade(client):
+                started.append("mana-crystal-upgrade")
+
+            autoplay._needs_mana_crystal_upgrade = lambda client: True
+            autoplay._start_mana_crystal_upgrade = start_upgrade
+            return autoplay, started
+
+        # With no child: postponed, and the farm circuit starts as before.
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        autoplay, started = autoplay_for(client)
+        for _ in range(2):
+            asyncio.run(autoplay.tick(client))
+        self.assertEqual(started, [])
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        self.assertIsInstance(autoplay.child, FarmCircuitTask)
+        # Mid-circuit, where a detour may start: still postponed.
+        autoplay.child.safe_for_progression_detour = lambda client: True
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(started, [])
+        # Back to 90 %: the mid-circuit detour starts.
+        client.state.stats["hp"] = 121
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(started, ["mana-crystal-upgrade"])
+        # A healing potion, a ready recall or level 17: no wait at 50 %.
+        for setup in (
+                lambda client: client.state.place_item(Item(
+                    95, item_type=c.TYPE_POTION, name="potion of healing"),
+                    client.state.player_tag),
+                lambda client: client.state.place_item(Item(
+                    96, item_type=c.TYPE_ROD, quality=80, condition=80,
+                    name="rod of word of recall"), client.state.player_tag),
+                lambda client: client.state.stats.update(level=17)):
+            client, _ = self.client(recall=False)
+            client.state.stats.update(hp=67, maxhp=134, sp=0)
+            setup(client)
+            autoplay, started = autoplay_for(client)
+            asyncio.run(autoplay.tick(client))
+            asyncio.run(autoplay.tick(client))
+            self.assertEqual(started, ["mana-crystal-upgrade"])
+        # Essential trips start first, unprepared or not: hungry, the temple
+        # food trip goes...
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        autoplay, started = autoplay_for(client)
+        food = []
+
+        async def temple_food(client):
+            food.append(1)
+            return True
+
+        autoplay._needs_temple_food = lambda client: True
+        autoplay._start_temple_food = temple_food
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual((food, started), ([1], []))
+        # ...and depleted, the recovery phase (the cure) starts.
+        client, _ = self.client(recall=False, depletion=92)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        autoplay, started = autoplay_for(client)
+        asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(autoplay.phase, "recovery")
+        self.assertEqual(started, [])
+
+    def unprepared_circuit(self, client, needs, *, legs=None, clock=None):
+        """A circuit at the point where it starts optional trips, with
+        only ``needs`` due."""
+        circuit = FarmCircuitTask(
+            built_graph(), legs or [(self.TREES, "")],
+            **({"clock": clock} if clock is not None else {}))
+        circuit._busy_finishing_fight_or_loot = lambda client, farm: False
+        client.state.inventory_replay_complete = True
+        circuit.server_clock.anchor_minute = 12 * 60
+        circuit.server_clock.anchor_at = circuit.server_clock.clock()
+        circuit.server_clock.last_request_at = circuit.server_clock.clock()
+        circuit.server_clock.resync_seconds = float("inf")
+        for name in ("_needs_bank_sync", "_needs_progress_checkpoint",
+                     "_needs_bank_deposit", "_needs_ship_key",
+                     "_needs_food_resupply", "_needs_savebed",
+                     "_needs_spell_purchase", "_needs_recall_shopping",
+                     "_needs_utility_shopping", "_needs_upgrade_shopping"):
+            setattr(circuit, name, lambda *args, due=(name == needs): due)
+        return circuit
+
+    def test_the_circuit_starts_no_optional_trip_without_heals_or_recall(self):
+        from .tasks import UNPREPARED_REST_LIMIT_SECONDS, unprepared_for_trips
+
+        for needs, trip in (("_needs_spell_purchase", "_spell_purchase"),
+                            ("_needs_ship_key", "_ship_key"),
+                            ("_needs_recall_shopping", "_recall_shopping"),
+                            ("_needs_utility_shopping", "_utility_shopping"),
+                            ("_needs_upgrade_shopping", "_shopping")):
+            # 80 %: above every heal and flee threshold, below 90 %.
+            client, _ = self.client(recall=False, bank=20_000)
+            client.state.place_item(Item(
+                90, name="Morg'eean's Ship Key"), client.state.player_tag)
+            client.state.stats.update(hp=107, maxhp=134)
+            self.assertTrue(unprepared_for_trips(client))
+            circuit = self.unprepared_circuit(client, needs)
+            for _ in range(3):
+                asyncio.run(circuit.tick(client))
+            self.assertIsNone(getattr(circuit, trip), needs)
+            client.state.stats["hp"] = 121
+            asyncio.run(circuit.tick(client))
+            self.assertIsNotNone(getattr(circuit, trip), needs)
+        # The hold lasts at most ten minutes in a row, then she goes.
+        client, _ = self.client(recall=False, bank=20_000)
+        client.state.stats.update(hp=107, maxhp=134)
+        circuit = self.unprepared_circuit(client, "_needs_spell_purchase")
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        self.assertIsNone(circuit._spell_purchase)
+        circuit._unprepared_hold.since -= UNPREPARED_REST_LIMIT_SECONDS
+        asyncio.run(circuit.tick(client))
+        self.assertIsNotNone(circuit._spell_purchase)
+        self.assertEqual(self.actions(client).count("unprepared-rest-timeout"), 1)
+
+    def test_an_unprepared_farm_rest_is_no_stuck_wait_and_only_that(self):
+        from .tasks import UNPREPARED_REST_LIMIT_SECONDS
+
+        client, _ = self.client(recall=False)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        circuit = FarmCircuitTask(built_graph(), [(self.TREES, "")])
+        circuit.child = circuit._new_child()
+        autoplay.child = circuit
+        farm = circuit.child.task
+        # The farm shares its circuit's hold.
+        self.assertIs(farm._unprepared_hold, circuit._unprepared_hold)
+        hold = circuit._unprepared_hold
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+        farm._unprepared_resting = True
+        hold.since = hold.last_poll = time.monotonic()
+        self.assertTrue(autoplay.recovery_alerts(client)[1])
+        # An essential trip (a bank deposit) runs after the rest started:
+        # the stale rest flags no longer explain anything.
+        circuit._banking = _DoneErrand(status=TaskStatus.RUNNING)
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+        circuit._banking = None
+        # Nor while a food resupply trip runs.
+        circuit._resupply = _DoneErrand(status=TaskStatus.RUNNING)
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+        circuit._resupply = None
+        self.assertTrue(autoplay.recovery_alerts(client)[1])
+        # Nor does a rest nobody has checked for a while (the farm returned
+        # early before its rest branch), nor one past its cap.
+        hold.last_poll -= 5.0
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+        hold.last_poll = time.monotonic()
+        hold.since -= UNPREPARED_REST_LIMIT_SECONDS
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+
+    def test_a_gap_in_the_hold_starts_it_afresh(self):
+        # Four minutes of rest, then a seven-minute essential trip: she
+        # rests again rather than timing out at once.
+        from .tasks import UnpreparedHold
+
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=67, maxhp=134, sp=0)
+        now = [1_000.0]
+        hold = UnpreparedHold(clock=lambda: now[0])
+        for _ in range(48):
+            self.assertTrue(hold.active(client))
+            now[0] += 5.0
+        now[0] += 7 * 60
+        self.assertTrue(hold.active(client))
+        self.assertEqual(hold.since, now[0])
+        self.assertNotIn("unprepared-rest-timeout", self.actions(client))
+
+    def test_no_leg_switch_mid_rest_and_the_cap_still_fires_at_600_s(self):
+        from .tasks import UNPREPARED_REST_LIMIT_SECONDS
+
+        client, _ = self.client(recall=False)
+        client.state.stats.update(hp=107, maxhp=134)
+        node = built_graph().nodes[self.TREES]
+        start = next((x, y) for x in range(node.width // 2, node.width)
+                     for y in range(node.height // 2, node.height)
+                     if node.walkable(x, y))
+        self.place(client, (self.TREES, start))
+        now = [1_000.0]
+        circuit = self.unprepared_circuit(
+            client, "", clock=lambda: now[0],
+            legs=[(self.TREES, ""), ("/shattered_islands/world_14_78", "")])
+        while now[0] - 1_000.0 < UNPREPARED_REST_LIMIT_SECONDS - 4:
+            asyncio.run(circuit.tick(client))
+            self.assertEqual(circuit.leg_index, 0, now[0] - 1_000.0)
+            now[0] += 4.0
+        self.assertGreater(now[0] - circuit._farm_started_at, circuit.dwell_seconds)
+        self.assertIn("unprepared-rest", self.actions(client))
+        self.assertNotIn("unprepared-rest-timeout", self.actions(client))
+        for _ in range(3):
+            now[0] += 4.0
+            asyncio.run(circuit.tick(client))
+        self.assertEqual(self.actions(client).count("unprepared-rest-timeout"), 1)
+        # Past the cap the hold no longer keeps her on this leg: the dwell
+        # switch moves her on.
+        self.assertFalse(circuit._unprepared_hold.holding())
+        now[0] += 4.0
+        asyncio.run(circuit.tick(client))
+        self.assertEqual(circuit.leg_index, 1)
+
+    def test_recovery_never_shops_for_recall(self):
+        client, _ = self.client(bank=50_000, recall=False)
+        self.empty_wands(client, 77)
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        recovery, _ = self.recovery(client)
+        recovery.services._new_recall_shopping = lambda client: self.fail(
+            "recovery shopped for recall")
         asyncio.run(recovery.tick(client))
+        # Not depleted: nothing is unsafe, so recovery just ends.
         self.assertEqual(recovery.status, TaskStatus.COMPLETE)
-        self.assertIn("farming-resumed", self.actions(client))
+        self.assertIsNone(recovery.services._recall_shopping)
 
     def test_depletion_wins_over_recall_shopping(self):
         client, _ = self.client(depletion=92)
@@ -22324,7 +22792,7 @@ class WebTests(RouteDeathReachIsolation, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Atrinik Observer", page)
         self.assertIn(b'data-tab="activity"', page)
-        self.assertIn(b"/app.js?v=35", page)
+        self.assertIn(b"/app.js?v=36", page)
         status, script = await self.request("GET", "/app.js")
         self.assertEqual(status, 200)
         self.assertIn(b"function renderGround", script)
@@ -25665,13 +26133,67 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.walking(task))
         self.assertEqual(self.client.actions(),
                          ["essential-route-override", "essential-care-food"])
-        self.assertIn("hungry: a ready recall and hold-fire only",
+        # No recall owned: hold-fire alone (owner decision, 2026-11-22).
+        self.assertIn("hungry: hold-fire only",
                       self.client.decision_history[0]["detail"])
         dashboard = DashboardState(self.client, types.SimpleNamespace(task=task, idle_survival=None),
                                    self.graph, {})
         alert, = dashboard.care_alerts()
         self.assertEqual((alert["id"], alert["level"]), ("essential-care-food", "critical"))
         self.assertIn(alert["text"].split(":")[0], "Hungry")
+        self.assertIn("with only hold-fire", alert["text"])
+        # With a ready wand both are named.
+        self.client.state.place_item(Item(54, name="wand of word of recall",
+                                          item_type=c.TYPE_WAND, quality=60), 7)
+        self.client.decision_history.clear()
+        task = self.trip("food")
+        self.assertTrue(await self.walking(task))
+        self.assertIn("hungry: a ready recall and hold-fire only",
+                      self.client.decision_history[0]["detail"])
+        dashboard = DashboardState(self.client, types.SimpleNamespace(task=task, idle_survival=None),
+                                   self.graph, {})
+        self.assertIn("with only a ready recall and hold-fire",
+                      dashboard.care_alerts()[0]["text"])
+
+    async def test_only_empty_or_unusable_recall_sources_never_hold_a_care_crossing(self):
+        # A working emergency recall is never a blocker (owner decision,
+        # 2026-11-22): live, both her recall wands were empty.
+        from .tasks import wand_charges
+
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        for tag in (55, 56):
+            self.client.state.place_item(Item(
+                tag, name="wand of word of recall", item_type=c.TYPE_WAND,
+                quality=60), 7)
+            wand_charges(self.client)[tag] = 0
+        # A recall spell costing more than her whole mana bar.
+        self.client.state.place_item(Item(57, name="word of recall", item_type=c.TYPE_SPELL,
+                                          extra={"cost": 60}), 7)
+        task = self.trip("cure")
+        self.assertTrue(await self.walking(task))
+        self.assertTrue(task.care.cleared)
+        self.assertFalse(task.care.recall_ready)
+        self.assertTrue(task.care_holds_fire("/start"))
+        self.assertEqual(self.client.actions(), ["essential-route-override"])
+        self.assertIn("full HP and SP, no working recall, holding fire",
+                      self.client.decision_history[-1]["detail"])
+        # A hungry food trip with the same kit crosses at once too.
+        self.client.state.stats.update(hp=20, sp=0, food=100)
+        self.client.decision_history.clear()
+        self.assertTrue(await self.walking(self.trip("food")))
+        self.assertEqual(self.client.actions(),
+                         ["essential-route-override", "essential-care-food"])
+        self.assertIn("hungry: hold-fire only", self.client.decision_history[0]["detail"])
+        # A spell she can ready (cost within her bar) is waited for, as before.
+        self.client.state.stats.update(hp=100, sp=10, food=900)
+        self.client.state.remove_item(57)
+        self.client.state.place_item(Item(58, name="word of recall", item_type=c.TYPE_SPELL,
+                                          extra={"cost": 20}), 7)
+        self.client.decision_history.clear()
+        task = self.trip("cure")
+        self.assertFalse(await self.walking(task))
+        self.assertIn("a ready recall", task.care.missing)
 
     def test_a_failed_read_is_retried_within_seconds(self):
         self.block("/blocked")
@@ -25748,10 +26270,18 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(circuit._new_bank_deposit(self.client).navigation.essential, "")
         self.graph.temple_priests.append(DialogueVendor("/goal", 3, 0, "Priest", ""))
         self.assertEqual(temple_food_trip(self.graph, self.client).navigation.essential, "food")
-        key = mark_essential(MorgeeanShipKeyTask(self.graph), "recall")
-        self.assertEqual((key.essential, key.navigation.essential), ("recall", "recall"))
+        key = mark_essential(MorgeeanShipKeyTask(self.graph), "funding")
+        self.assertEqual((key.essential, key.navigation.essential), ("funding", "funding"))
         recovery = RecoveryTask(self.graph)
-        self.assertEqual(RecoveryTask.ESSENTIAL_ERRANDS["_recall_shopping"], "recall")
+        # A working recall is never a blocker (owner decision, 2026-11-22):
+        # recall shopping is no essential trip and crosses no owner block.
+        from .navigation import ESSENTIAL_TRIPS
+        self.assertNotIn("recall", ESSENTIAL_TRIPS)
+        self.assertNotIn("_recall_shopping", RecoveryTask.ESSENTIAL_ERRANDS)
+        self.assertNotIn("_ship_key", RecoveryTask.ESSENTIAL_ERRANDS)
+        shopping = circuit._new_recall_shopping(self.client)
+        self.assertEqual(shopping.navigation.essential, "")
+        self.assertFalse(shopping.navigation.is_essential(self.client))
         self.assertEqual(recovery._new_home_walk(("/home", (2, 0)), strict=True)
                          .navigation.essential, "home")
         # Food is essential only while she is hungry or starving.

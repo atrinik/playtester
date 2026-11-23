@@ -63,7 +63,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     healing_outpaced, recent_hostile_attackers,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
-                    combat_allowed, wand_known_empty)
+                    combat_allowed, UnpreparedHold, wand_known_empty)
+from .tasks import RECALL_REQUIRED_LEVEL
 log = logging.getLogger(__name__)
 
 
@@ -2023,11 +2024,12 @@ class WorldGraph:
 
 # Essential trips (ROUTING 4.5): never declined into stranding. Food counts
 # only while she is hungry or starving (NavigateTask.is_essential); a
-# funding trip pays for a cure or the depletion service; "recall" is the
-# recovery phase's recall shopping, and "home" its walk to her savebed,
-# from which every recovery errand starts.
+# funding trip pays for a cure or the depletion service; "home" is the
+# recovery phase's walk to her savebed, from which every recovery errand
+# starts. Recall shopping is not one: a working recall is never a blocker
+# (owner decision, 2026-11-22), so it never crosses an owner block.
 ESSENTIAL_TRIPS = frozenset({"food", "cure", "depletion", "savebed", "funding",
-                             "recall", "home"})
+                             "home"})
 # The care rule's wait (ROUTING 4.5, P3). A budget or strict-plan override
 # (CARE_BOUNDED, from P6) waits at most this long, then goes anyway and
 # records essential-care-timeout. An owner-block crossing (CARE_OWNER_BLOCK)
@@ -2248,27 +2250,37 @@ class CareCrossing:
     # kept when an owner block makes the crossing CARE_OWNER_BLOCK, so its
     # destination hold-fire survives the merge.
     bounded: tuple[str, ...] = ()
+    # Whether a recall was ready when it cleared; without one she crossed
+    # with hold-fire (and, off a food trip, full HP and SP) only.
+    recall_ready: bool = False
 
 
 def care_recall_ready(client: AtrinikClient, *, starving: bool = False) -> bool:
     """The care rule's recall condition: a recall ready now, when she owns
-    one she could ready.
+    one she could ready. Without one she crosses with the rest of the care
+    rule alone: a working recall is never a blocker (owner decision,
+    2026-11-22), so owning only empty or unusable sources never makes her
+    wait.
 
     She owns one when she carries a source FarmTask.emergency_recall_candidates
     could fire once ready: the Word of Recall spell, or a paid, identified,
-    uncursed rod or wand not known to be empty. While starving, a spell she
-    lacks the SP for does not count: at food 0 the server regenerates no SP
-    (player_do_some_living), so waiting for it would only starve her.
+    uncursed rod or wand not known to be empty. A spell costing more SP
+    than her maximum could never be readied, so it does not count. While
+    starving, a spell she lacks the SP for does not count either: at food 0
+    the server regenerates no SP (player_do_some_living), so waiting for it
+    would only starve her.
     """
     policy = InventoryPolicy()
     sp = int(client.state.stats.get("sp", 0) or 0)
+    maxsp = int(client.state.stats.get("maxsp", 0) or 0)
     owned = False
     for item in client.state.inventory:
         if (not re.search(r"\bword of recall\b", item.name, re.I) or
                 item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)):
             continue
         if item.item_type == c.TYPE_SPELL:
-            if starving and int(item.extra.get("cost", 0) or 0) > sp:
+            cost = int(item.extra.get("cost", 0) or 0)
+            if cost > maxsp or starving and cost > sp:
                 continue
             owned = True
         elif (item.item_type in (c.TYPE_ROD, c.TYPE_WAND) and policy.identified(item)
@@ -2725,6 +2737,7 @@ class NavigateTask(BotTask):
                 "cleared": care.cleared, "starving": care.starving, "food": care.food,
                 "waiting_seconds": round(max(0.0, (care.cleared_at or now) - care.since), 1),
                 "alerted": care.alerted, "missing": list(care.missing),
+                "recall_ready": care.recall_ready,
                 "staging": self._care_staging is not None}
 
     def _hostile_map(self, path: str) -> bool:
@@ -2958,12 +2971,16 @@ class NavigateTask(BotTask):
         care.cleared, care.cleared_at = True, care.clock()
         _care_waits(client).pop(care.key, None)
         subjects = ", ".join(care.subjects)
-        how = ("starving: a ready recall and hold-fire only" if care.starving else
-               "hungry: a ready recall and hold-fire only" if care.food else
+        care.recall_ready = bool(FarmTask.emergency_recall_candidates(client))
+        recall = "a ready recall" if care.recall_ready else "no working recall"
+        how = (f"starving: {'a ready recall and ' if care.recall_ready else ''}"
+               "hold-fire only" if care.starving else
+               f"hungry: {'a ready recall and ' if care.recall_ready else ''}"
+               "hold-fire only" if care.food else
                "waited too long; going anyway, holding fire" if timeout else
-               "HP and SP full or no longer rising, a ready recall, holding fire"
+               f"HP and SP full or no longer rising, {recall}, holding fire"
                if care.plateaued else
-               "full HP and SP, a ready recall, holding fire")
+               f"full HP and SP, {recall}, holding fire")
         self._record(client, "essential-route-override",
                      f"{self.essential} trip to {self.destination} crosses {subjects} "
                      f"({care.mode}): {how}")
@@ -5482,68 +5499,134 @@ def effective_farm_objective(state) -> str:
     return "safety" if depleted_for_temple(state) else chosen
 
 
-# From this level recall shopping replaces a recall source
-# (FarmCircuitTask._needs_recall_shopping); below it nothing would.
-RECALL_REQUIRED_LEVEL = 18
-NO_RECALL_REASON = "no working emergency recall source"
+# RECALL_REQUIRED_LEVEL (tasks.py): from this level recall shopping buys a
+# recall source when she can afford one (FarmCircuitTask._needs_recall_shopping);
+# below it nothing would.
+# Where recall shopping keeps the latest recall quote she was given
+# (client.state.vendor_quotes): the cheapest one the merchant offered.
+RECALL_QUOTE_KEY = "recall-source"
 
 
-def emergency_recall_unusable(client: AtrinikClient) -> bool:
-    """Whether she owns a recall source but none of them works now.
+def _recall_sources(client: AtrinikClient) -> tuple[bool, bool]:
+    """Whether she owns a recall source, and whether one of them works now.
 
     A source is what FarmTask.emergency_recall_candidates fires, read
     without its mana check: a known Word of Recall spell, or a paid,
-    identified, uncursed rod or wand. It works unless it is a wand known to
-    be empty (observe_wand_feedback) or a device waiting out
+    identified, uncursed rod or wand. A spell costing more SP than her
+    maximum is none (as in care_recall_ready): she could never cast it. A
+    source works unless it is a wand known to be empty
+    (observe_wand_feedback) or a device waiting out
     RECALL_DEVICE_RETRY_SECONDS after it said it cannot fire. A wand of
-    unknown charge works until its examine text says otherwise. Owning
-    none at all is not this: that character never relied on one, and
-    recall shopping buys the first.
+    unknown charge works until its examine text says otherwise.
     """
     retry = getattr(client, "recall_device_retry_at", {}) or {}
     now = time.monotonic()
     policy = InventoryPolicy()
+    maxsp = int((getattr(client.state, "stats", {}) or {}).get("maxsp", 0) or 0)
     owned = False
     for item in getattr(client.state, "inventory", ()):
         if (not re.search(r"\bword of recall\b", item.name, re.I) or
                 item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)):
             continue
         if item.item_type == c.TYPE_SPELL:
-            return False
+            if int(item.extra.get("cost", 0) or 0) > maxsp:
+                continue
+            return True, True
         if (item.item_type in (c.TYPE_ROD, c.TYPE_WAND) and
                 policy.identified(item)):
             owned = True
             if (not wand_known_empty(client, item) and
                     float(retry.get(item.tag, 0.0)) <= now):
-                return False
-    return owned
+                return True, True
+    return owned, False
+
+
+def has_working_recall(client: AtrinikClient) -> bool:
+    """Whether a recall source of hers works now (_recall_sources)."""
+    return _recall_sources(client)[1]
+
+
+def recall_quote(client: AtrinikClient) -> tuple[str, int] | None:
+    """The recall source recall shopping was last quoted, and its price:
+    the cheapest stock the merchant offered (RECALL_QUOTE_KEY), while it is
+    younger than FarmCircuitTask.RECALL_SHOP_INTERVAL. An older quote is
+    no price: merchant stock changes, and the next trip finds out."""
+    quote = (getattr(client.state, "vendor_quotes", {}) or {}).get(
+        RECALL_QUOTE_KEY) or {}
+    cost = quote.get("unit_cost")
+    observed = float(quote.get("observed_at", 0.0) or 0.0)
+    if (not isinstance(cost, (int, float)) or cost <= 0 or
+            time.time() - observed >= FarmCircuitTask.RECALL_SHOP_INTERVAL):
+        return None
+    return str(quote.get("item", "") or "recall source"), int(cost)
+
+
+def recall_alerts(client: AtrinikClient) -> list[dict[str, str]]:
+    """The dashboard's recall note: from RECALL_REQUIRED_LEVEL, while no
+    recall source of hers works.
+
+    A working emergency recall is never a blocker (owner decision,
+    2026-11-22): she farms on without one, and recall shopping buys one
+    once she can afford it. So none of these is critical:
+
+    - recall-unfunded (warning): the recall she was quoted within a day
+      (recall_quote), plus the reserve recall shopping keeps, costs more
+      than she has;
+    - recall-unavailable (info): the last recall shopping failed or bought
+      nothing, or getting the ship key it needs failed, within a day
+      (GameState.recall_unavailable);
+    - recall-missing (info): otherwise.
+    """
+    level = int((getattr(client.state, "stats", {}) or {}).get("level", 0) or 0)
+    if level < RECALL_REQUIRED_LEVEL or has_working_recall(client):
+        return []
+    tail = "; she farms on without one"
+    wallet = BuyShopUpgradeTask.wallet_value(client)
+    reserve = FarmCircuitTask.RECALL_SHOP_RESERVE
+    quote = recall_quote(client)
+    if quote is not None and wallet < quote[1] + reserve:
+        item, cost = quote
+        return [{"id": "recall-unfunded", "level": "warn",
+                 "text": "No working recall: buying one needs "
+                         f"{format_money(cost + reserve)} ({item} at "
+                         f"{format_money(cost)} plus a {format_money(reserve)} "
+                         f"reserve), she has {format_money(wallet)}" + tail}]
+    note = getattr(client.state, "recall_unavailable", "") or ""
+    at = float(getattr(client.state, "recall_unavailable_at", 0.0) or 0.0)
+    if note and time.time() - at < FarmCircuitTask.RECALL_SHOP_INTERVAL:
+        return [{"id": "recall-unavailable", "level": "info",
+                 "text": f"No working recall: {note}" + tail}]
+    return [{"id": "recall-missing", "level": "info",
+             "text": "No working recall: recall shopping buys one when she "
+                     "can afford it" + tail}]
 
 
 def farming_unsafe_reason(client: AtrinikClient) -> str:
     """Why farming must wait, or "" while it is safe enough to farm.
 
-    Two conditions, each of which kept farming going into a death spiral
-    live (2026-11-17: ten deaths in under three hours, depletion 68 to 92):
+    One condition, which kept farming going into a death spiral live
+    (2026-11-17: ten deaths in under three hours, depletion 68 to 92):
+    depletion at the temple-service threshold (depleted_for_temple). That
+    is where the circuit already holds that the lowered stats make the
+    chosen spots deadly (effective_farm_objective). Every death adds a
+    point and the fee does not grow with them, so farming on to pay the
+    fee only adds deaths.
 
-    - depletion at the temple-service threshold (depleted_for_temple). That
-      is where the circuit already holds that the lowered stats make the
-      chosen spots deadly (effective_farm_objective). Every death adds a
-      point and the fee does not grow with them, so farming on to pay the
-      fee only adds deaths;
-    - from RECALL_REQUIRED_LEVEL, recall sources that no longer work
-      (emergency_recall_unusable): no charges left and none ready.
+    While it holds, autoplay runs its recovery phase (RecoveryTask)
+    instead of farming: only food, the bank, the cure and its funding,
+    and otherwise a wait at her savebed.
 
-    While either holds, autoplay runs its recovery phase (RecoveryTask)
-    instead of farming: only food, the bank, the cure, its funding and a
-    recall replacement, and otherwise a wait at her savebed.
+    A working emergency recall is not a condition (owner decision,
+    2026-11-22, superseding the recall half of 2026-11-17): live, on
+    2026-11-22, both her recall wands were empty, the cheapest recall cost
+    more than she had, and with farming suspended she could not earn it.
+    She farms without one; recall shopping buys one when she can afford it
+    (FarmCircuitTask._needs_recall_shopping), and recall_alerts says so.
     """
     state = client.state
     if depleted_for_temple(state):
         return (f"depletion {int(state.depletion_points)} at or above "
                 f"{FarmCircuitTask.DEPLETION_SERVICE_THRESHOLD}")
-    level = int((getattr(state, "stats", {}) or {}).get("level", 0) or 0)
-    if level >= RECALL_REQUIRED_LEVEL and emergency_recall_unusable(client):
-        return NO_RECALL_REASON
     return ""
 
 
@@ -6594,8 +6677,12 @@ class FarmCircuitTask(BotTask):
     PROGRESS_CHECKPOINT_INTERVAL = 5 * 60
     UPGRADE_SWEEP_INTERVAL = 24 * 60 * 60
     RECALL_SHOP_INTERVAL = 24 * 60 * 60
-    # Recall shopping starts only with this much money (wallet_value).
+    # Recall shopping starts only with this much money (wallet_value), and,
+    # while a recall quote from the last RECALL_SHOP_INTERVAL is known
+    # (recall_quote), only with that price plus RECALL_SHOP_RESERVE.
     RECALL_SHOP_MINIMUM_WALLET = 1_250
+    # What recall shopping keeps back after paying (BuyDialogueStockTask).
+    RECALL_SHOP_RESERVE = 1_000
     UTILITY_SHOP_INTERVAL = 24 * 60 * 60
     UPGRADE_SWEEP_WALLET_GROWTH = 5_000
     UPGRADE_SWEEP_POLICY = 8
@@ -6688,6 +6775,9 @@ class FarmCircuitTask(BotTask):
         self.clear_hostile_route = bool(clear_hostile_route)
         self.clock = clock
         self.server_clock = ServerGameClock(clock=clock)
+        # The hold without a usable heal or a ready recall: its optional
+        # trips, and its farms' pulls (each farm shares it).
+        self._unprepared_hold = UnpreparedHold(clock=clock)
         self.leg_index = 0
         self.child: NavigateThenTask | None = None
         self._farm_started_at = 0.0
@@ -7503,6 +7593,7 @@ class FarmCircuitTask(BotTask):
         farm._lore_book_attempts = self._lore_book_attempts
         farm._spellbook_attempts = self._spellbook_attempts
         farm._unreachable_targets = self._unreachable_targets
+        farm._unprepared_hold = self._unprepared_hold
         if self._analyzer_safety:
             flee, heal = (self.AGGRESSIVE_SAFETY if aggressive else
                           self.PASSIVE_SAFETY)
@@ -8270,8 +8361,8 @@ class FarmCircuitTask(BotTask):
         return bool(blocking) and self._expedition_return is None
 
     # Trips autoplay drops at once when farming turns unsafe: discretionary
-    # purchases, recall shopping (the recovery phase shops from her
-    # savebed itself) and savebed rebinding. Every other trip is an
+    # purchases, recall shopping (never bought with the cure's money) and
+    # savebed rebinding. Every other trip is an
     # essential (food, bank, identify, storage, the cure and its funding,
     # the ship key) and finishes first.
     DROPPED_AT_HANDOVER = ("_shopping", "_spell_purchase", "_utility_shopping",
@@ -8311,6 +8402,16 @@ class FarmCircuitTask(BotTask):
             getattr(self, name), "settlement", None) is not None), next((
                 name for name in ("_shopping", "_utility_shopping")
                 if name in running), ""))
+
+    def unprepared_resting(self) -> bool:
+        """Whether its farm rests for want of a heal or a recall
+        (FarmTask.unprepared_resting): an explained wait, not being stuck.
+        Never while a trip of its own runs."""
+        if self._resupply is not None or any(
+                service is not None for service in self._maintenance_services()):
+            return False
+        farm = self.child.task if self.child is not None else None
+        return isinstance(farm, FarmTask) and farm.unprepared_resting()
 
     def hold_new_pulls(self, hold: bool = True) -> None:
         """While the switch to recovery waits: the farm pulls no new target
@@ -8438,12 +8539,27 @@ class FarmCircuitTask(BotTask):
             "word of recall" in item.name.casefold()
             for item in client.state.inventory)
 
+    def _recall_shopping_funds(self, client: AtrinikClient) -> int:
+        """What recall shopping needs in her wallet before it starts: the
+        recall she was quoted within RECALL_SHOP_INTERVAL plus the reserve,
+        else RECALL_SHOP_MINIMUM_WALLET. An older quote no longer holds her
+        back: merchant stock changes, and a trip finds out the new price."""
+        quote = recall_quote(client)
+        if quote is None:
+            return self.RECALL_SHOP_MINIMUM_WALLET
+        return max(self.RECALL_SHOP_MINIMUM_WALLET,
+                   quote[1] + self.RECALL_SHOP_RESERVE)
+
     def _needs_recall_shopping(self, client: AtrinikClient) -> bool:
+        """Whether to buy a recall source now: an opportunity, never a
+        precondition for farming (owner decision, 2026-11-22). The circuit
+        runs it between fights like its other maintenance trips, only
+        while she can afford what she was last quoted."""
         if (int(client.state.stats.get("level", 0) or 0) <
                 RECALL_REQUIRED_LEVEL or
                 not self._has_ship_key(client) or
                 BuyShopUpgradeTask.wallet_value(client) <
-                self.RECALL_SHOP_MINIMUM_WALLET or
+                self._recall_shopping_funds(client) or
                 self.clock() < self._recall_shopping_retry_at):
             return False
         wizardry = self._skill_level(client, "wizardry spells")
@@ -8459,6 +8575,17 @@ class FarmCircuitTask(BotTask):
             client.state, "last_recall_shop_check_at", 0.0) or 0.0)
         return (not last_check or
                 time.time() - last_check >= self.RECALL_SHOP_INTERVAL)
+
+    @staticmethod
+    def note_recall_unavailable(client: AtrinikClient, detail: str) -> None:
+        """Persist why buying a recall source came to nothing ("" once it
+        worked), for recall_alerts (GameState.recall_unavailable)."""
+        setter = getattr(client, "set_recall_unavailable", None)
+        if setter is not None:
+            setter(detail)
+        else:
+            client.state.recall_unavailable = detail
+            client.state.recall_unavailable_at = time.time() if detail else 0.0
 
     def _new_recall_shopping(self, client: AtrinikClient) -> NavigateThenTask:
         vendors = {
@@ -8491,7 +8618,10 @@ class FarmCircuitTask(BotTask):
             "/python/generic/merchant.py"))
         task = NavigateThenTask(
             self.graph, vendor.map_path,
-            BuyDialogueStockTask(vendor.name, r"word of recall"),
+            BuyDialogueStockTask(
+                vendor.name, r"word of recall",
+                cash_reserve=self.RECALL_SHOP_RESERVE,
+                observation_key=RECALL_QUOTE_KEY, try_alternatives=True),
             destination_xy=(vendor.x, vendor.y), combat_approach=True)
         task.navigation.tolerance = 2
         task.navigation.allow_ranged_hazard_fallback = True
@@ -8872,8 +9002,9 @@ class FarmCircuitTask(BotTask):
         life brought new tags for her two empty wands (most likely her
         checkpoint relogs), the empty marks were lost with the old tags, and
         she walked back out to fight with no escape. An empty wand found here
-        makes farming unsafe (farming_unsafe_reason), and autoplay switches to
-        its recovery phase. Never while she is being hit.
+        is no longer an emergency candidate, and recall shopping may replace
+        it; she farms on without it (owner decision, 2026-11-22). Never
+        while she is being hit.
         """
         if getattr(client, "examine", None) is None or _contact_this_life(client):
             return False
@@ -8979,6 +9110,12 @@ class FarmCircuitTask(BotTask):
                     log.warning("ship key acquisition failed: %s",
                                 self._ship_key.error)
                     self._ship_key_retry_at = self.clock() + 1800.0
+                    if (int(client.state.stats.get("level", 0) or 0) >=
+                            RECALL_REQUIRED_LEVEL and
+                            not has_working_recall(client)):
+                        self.note_recall_unavailable(
+                            client, "recall shopping needs Morg'eean's ship "
+                            f"key, and getting it failed: {self._ship_key.error}")
                 else:
                     log.info("Morg'eean ship key acquired; shortcuts enabled")
                     self._ship_key_retry_at = self.clock() + 86400.0
@@ -9006,6 +9143,9 @@ class FarmCircuitTask(BotTask):
                     log.warning("recall shopping failed: %s",
                                 self._recall_shopping.error)
                     self._recall_shopping_retry_at = self.clock() + 7200.0
+                    self.note_recall_unavailable(
+                        client, "recall shopping failed: "
+                        f"{self._recall_shopping.error}")
                 else:
                     setter = getattr(
                         client, "set_last_recall_shop_check", None)
@@ -9019,6 +9159,9 @@ class FarmCircuitTask(BotTask):
                     log.info(
                         "recall stock check complete%s; returning to farm",
                         " with purchase" if purchased else "")
+                    self.note_recall_unavailable(client, "" if purchased else
+                                                 "recall shopping found no "
+                                                 "recall source to buy")
                     self._recall_shopping_retry_at = self.clock() + 60.0
                 self._recall_shopping = None
             return True
@@ -9401,8 +9544,14 @@ class FarmCircuitTask(BotTask):
             self._banking = self._new_bank_deposit(client)
             await self._banking.tick(client)
             return
+        # Optional trips wait while she has neither a usable heal nor a
+        # ready recall below UNPREPARED_HEALTH (unprepared_for_trips), for
+        # at most UNPREPARED_REST_LIMIT_SECONDS; the farm rests meanwhile
+        # on the same hold (FarmTask._unprepared_rest).
+        unprepared = (isinstance(farm, FarmTask) and
+                      self._unprepared_hold.active(client, farm.safety))
         if (isinstance(farm, FarmTask) and
-                self._needs_ship_key(client) and
+                self._needs_ship_key(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9410,7 +9559,7 @@ class FarmCircuitTask(BotTask):
             await self._ship_key.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_spell_purchase(client) and
+                self._needs_spell_purchase(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9418,7 +9567,7 @@ class FarmCircuitTask(BotTask):
             await self._spell_purchase.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_recall_shopping(client) and
+                self._needs_recall_shopping(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9426,7 +9575,7 @@ class FarmCircuitTask(BotTask):
             await self._recall_shopping.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_utility_shopping(client) and
+                self._needs_utility_shopping(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9434,7 +9583,7 @@ class FarmCircuitTask(BotTask):
             await self._utility_shopping.tick(client)
             return
         if (isinstance(farm, FarmTask) and
-                self._needs_upgrade_shopping(client) and
+                self._needs_upgrade_shopping(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
@@ -9535,7 +9684,8 @@ class FarmCircuitTask(BotTask):
                 (named_spawn_empty or patrol_swept_empty) and
                 live_targets == 0 and elapsed >= 15.0 and
                 not self._busy_finishing_fight_or_loot(client, farm) and
-                not farm.training_rest_active()):
+                not farm.training_rest_active() and
+                not self._unprepared_hold.holding()):
             if not self._empty_spawn_since:
                 self._empty_spawn_since = now
                 return
@@ -9569,6 +9719,10 @@ class FarmCircuitTask(BotTask):
         # Nor mid-rest for mana, or she sets off with a partial bar. Services
         # may still detour during a rest.
         if isinstance(farm, FarmTask) and farm.training_rest_active():
+            return
+        # Nor while she rests without a heal or a recall: no unprepared
+        # walk to another map; the hold's cap still runs.
+        if self._unprepared_hold.holding():
             return
         next_leg = self._next_ready_leg(self.leg_index + 1, level)
         if next_leg == self.leg_index:
@@ -9615,10 +9769,9 @@ class RecoveryTask(BotTask):
       (recovery-home-unsafe-route). Every errand starts from her savebed;
     - depleted: the temple cure when she can pay (a depletion potion
       first), otherwise the cure-funding path: identify-all, junk sale,
-      deposit, the apartment chest. Depletion comes first: no recall is
-      bought with the cure's money;
-    - not depleted, without a working recall: recall shopping, with the
-      free ship key it needs;
+      deposit, the apartment chest. No recall is bought with the cure's
+      money: recall shopping is the farm circuit's, never recovery's
+      (owner decision, 2026-11-22);
     - otherwise she waits at her savebed. No farm walk, savebed rebinding
       or discretionary purchase runs.
 
@@ -9654,9 +9807,8 @@ class RecoveryTask(BotTask):
         self._home_walk: NavigateThenTask | None = None
         self._home_retry_at = 0.0
         # Strict-route refusals of the cure are recorded decisions
-        # (cure_route_refusals), and why a recall replacement came to
-        # nothing is persisted state (GameState.recall_unavailable): both
-        # outlive a temple food trip, Stop and restarts.
+        # (cure_route_refusals): they outlive a temple food trip, Stop and
+        # restarts.
         self.reason = ""
 
     def backoffs(self) -> dict[str, float]:
@@ -9722,7 +9874,6 @@ class RecoveryTask(BotTask):
     def alerts(self, client: AtrinikClient) -> list[dict[str, str]]:
         """What blocks her way out, from live state: each clears as soon
         as its condition does."""
-        reason = farming_unsafe_reason(client)
         s = self.services
         wallet = BuyShopUpgradeTask.wallet_value(client)
         assist = "; the owner can give her gold with the operator assist"
@@ -9742,22 +9893,6 @@ class RecoveryTask(BotTask):
                          "text": "Cure unreachable: no strictly safe route to "
                                  f"the temple from her savebed after {failures} "
                                  f"attempts: {error}"}]
-            return []
-        if reason != NO_RECALL_REASON:
-            return []
-        if wallet < s.RECALL_SHOP_MINIMUM_WALLET:
-            return [{"id": "recall-unfunded", "level": "critical",
-                     "text": "Recall unfunded: recall shopping needs "
-                             f"{format_money(s.RECALL_SHOP_MINIMUM_WALLET)}, "
-                             f"she has {format_money(wallet)}" + assist}]
-        unavailable = getattr(client.state, "recall_unavailable", "") or ""
-        at = float(getattr(client.state, "recall_unavailable_at", 0.0) or 0.0)
-        # A note older than recall shopping's interval is stale: shopping
-        # is due again by then.
-        if (unavailable and s._recall_shopping is None and s._ship_key is None
-                and time.time() - at < s.RECALL_SHOP_INTERVAL):
-            return [{"id": "recall-unavailable", "level": "critical",
-                     "text": f"Recall unavailable: {unavailable}"}]
         return []
 
     # Refusals older than this no longer count toward cure-unreachable.
@@ -9794,7 +9929,7 @@ class RecoveryTask(BotTask):
     async def _tick_services(self, client: AtrinikClient) -> bool:
         """The circuit's trip under way, noting the outcomes alerts need."""
         s = self.services
-        restoration, shopping, key = s._restoration, s._recall_shopping, s._ship_key
+        restoration = s._restoration
         ran = await s._tick_running_service(client)
         if restoration is not None and s._restoration is not restoration:
             if restoration.status == TaskStatus.FAILED:
@@ -9805,40 +9940,14 @@ class RecoveryTask(BotTask):
             elif self.cure_route_refusals(client)[0]:
                 self._record(client, "cure-route-cleared",
                              f"temple trip {restoration.status.value}")
-        if shopping is not None and s._recall_shopping is None:
-            shopper = shopping.task
-            if shopping.status == TaskStatus.FAILED:
-                self._recall_unavailable(
-                    client, f"recall shopping failed: {shopping.error}")
-            elif not (isinstance(shopper, BuyDialogueStockTask) and
-                      shopper.purchased):
-                self._recall_unavailable(
-                    client, "recall shopping found no recall source to buy")
-            else:
-                self._recall_unavailable(client, "")
-        if (key is not None and s._ship_key is None and
-                key.status == TaskStatus.FAILED):
-            self._recall_unavailable(
-                client, "recall shopping needs Morg'eean's ship key, and "
-                f"getting it failed: {key.error}")
         return ran
 
-    @staticmethod
-    def _recall_unavailable(client: AtrinikClient, detail: str) -> None:
-        """Persist why replacing her recall source came to nothing."""
-        setter = getattr(client, "set_recall_unavailable", None)
-        if setter is not None:
-            setter(detail)
-        else:
-            client.state.recall_unavailable = detail
-            client.state.recall_unavailable_at = time.time() if detail else 0.0
-
-    # Recovery's errands are essential trips (ROUTING 4.5): the cure, what
-    # funds it, and the recall replacement with the ship key it needs.
+    # Recovery's errands are essential trips (ROUTING 4.5): the cure and
+    # what funds it.
     ESSENTIAL_ERRANDS = {
         "_restoration": "depletion", "_cure": "cure", "_bank_sync": "funding",
         "_identification": "funding", "_selling": "funding", "_banking": "funding",
-        "_cure_funding": "funding", "_recall_shopping": "recall", "_ship_key": "recall",
+        "_cure_funding": "funding",
     }
 
     async def _start(self, client: AtrinikClient, errand: str, task) -> bool:
@@ -9877,20 +9986,6 @@ class RecoveryTask(BotTask):
             if s._needs_cure_funding(client):
                 return await self._start(
                     client, "_cure_funding", s._new_cure_funding(client))
-            return False
-        if reason != NO_RECALL_REASON:
-            return False
-        if s._needs_bank_deposit(client):
-            return await self._start(
-                client, "_banking", s._new_bank_deposit(client))
-        if s._needs_ship_key(client):
-            self._recall_unavailable(client, "")
-            return await self._start(
-                client, "_ship_key", MorgeeanShipKeyTask(self.graph))
-        if s._needs_recall_shopping(client):
-            self._recall_unavailable(client, "")
-            return await self._start(
-                client, "_recall_shopping", s._new_recall_shopping(client))
         return False
 
     def _new_home_walk(self, home: tuple[str, tuple[int, int]], *,

@@ -433,6 +433,97 @@ def recall_waiting(client: AtrinikClient) -> bool:
     return float(getattr(client, "recall_waiting_until", 0.0) or 0.0) > time.monotonic()
 
 
+def out_of_heals_and_recall(client: AtrinikClient,
+                            safety: "SafetyPolicy") -> bool:
+    """Neither a usable heal (SafetyPolicy._usable_heal: an item, or a
+    healing spell she has the SP for) nor a ready recall
+    (FarmTask.emergency_recall_candidates). Without a recall to rely on
+    (owner decision, 2026-11-22), this is when she must not engage or
+    start an optional trip below UNPREPARED_HEALTH (unprepared_for_trips)."""
+    return (safety._usable_heal(client) is None and
+            not FarmTask.emergency_recall_candidates(client))
+
+
+# Without a usable heal or a ready recall she starts no new pull, and no
+# optional trip, below this share of her health (owner decision,
+# 2026-11-22: a recall is not relied on; unprepared_for_trips).
+UNPREPARED_HEALTH = 0.90
+# An unprepared hold (the farm's rest and the circuit's optional trips)
+# lasts at most this long without a gap; then she goes on as before
+# (damage over time can outpace regeneration) and records
+# unprepared-rest-timeout once (UnpreparedHold).
+UNPREPARED_REST_LIMIT_SECONDS = 600.0
+# A hold not checked for this long starts afresh when checked again: the
+# gap is not waiting. Within a farm circuit that is an essential trip (the
+# circuit keeps checking through fights); for a standalone FarmTask a fight
+# is one too, since it checks only between fights, and restarting the cap
+# after a long fight is accepted.
+UNPREPARED_GAP_SECONDS = 10.0
+# A hold checked within this long is under way (UnpreparedHold.holding).
+UNPREPARED_FRESH_SECONDS = 3.0
+
+
+def unprepared_for_trips(client: AtrinikClient,
+                         safety: "SafetyPolicy | None" = None) -> bool:
+    """Whether to rest before a new pull or optional trip: from
+    RECALL_REQUIRED_LEVEL, below UNPREPARED_HEALTH, and
+    out_of_heals_and_recall. Health regenerates passively, so the rest
+    ends by itself once she is back to UNPREPARED_HEALTH."""
+    stats = client.state.stats
+    maxhp = int(stats.get("maxhp", 0) or 0)
+    if (maxhp <= 0 or
+            int(stats.get("level", 0) or 0) < RECALL_REQUIRED_LEVEL or
+            int(stats.get("hp", 0) or 0) / maxhp >= UNPREPARED_HEALTH):
+        return False
+    return out_of_heals_and_recall(client, safety or SafetyPolicy())
+
+
+class UnpreparedHold:
+    """unprepared_for_trips, capped at UNPREPARED_REST_LIMIT_SECONDS of
+    holding without a gap. A farm circuit owns one, shared with each farm
+    it creates, so a leg change or a rebuilt farm does not reset it."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self.clock = clock
+        self.since: float | None = None
+        self.last_poll: float | None = None
+        self.timed_out = False
+
+    def active(self, client: AtrinikClient,
+               safety: "SafetyPolicy | None" = None) -> bool:
+        """Whether to hold now; False once the cap ran out, until she is
+        prepared again or a gap of UNPREPARED_GAP_SECONDS passes (then the
+        next hold starts afresh)."""
+        now = self.clock()
+        gap = (self.last_poll is not None and
+               now - self.last_poll > UNPREPARED_GAP_SECONDS)
+        self.last_poll = now
+        if not unprepared_for_trips(client, safety):
+            self.since, self.timed_out = None, False
+            return False
+        if self.since is None or gap:
+            self.since, self.timed_out = now, False
+        if now - self.since < UNPREPARED_REST_LIMIT_SECONDS:
+            return True
+        if not self.timed_out:
+            self.timed_out = True
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("unprepared-rest-timeout",
+                         f"held {now - self.since:.0f} s without a usable "
+                         "heal or a ready recall; going on")
+        return False
+
+    def holding(self) -> bool:
+        """Whether a hold is under way: checked just now, and neither timed
+        out nor past its cap."""
+        if self.since is None or self.last_poll is None or self.timed_out:
+            return False
+        now = self.clock()
+        return (now - self.last_poll <= UNPREPARED_FRESH_SECONDS and
+                now - self.since < UNPREPARED_REST_LIMIT_SECONDS)
+
+
 def combat_allowed(client: AtrinikClient) -> bool:
     """The one guard every combat entry point checks: not in recall mode."""
     return not recall_waiting(client)
@@ -509,6 +600,11 @@ RECALL_DEVICE_REFUSED_MESSAGE = re.compile(
     r"^The .+ (?:whines for a while, but nothing happens|"
     r"is impossible to handle for you)\.", re.I)
 RECALL_DEVICE_RETRY_SECONDS = 20.0
+# From this level recall shopping buys a recall source when she can afford
+# one (navigation.FarmCircuitTask._needs_recall_shopping), and a farm with
+# neither a usable heal nor a ready recall rests before pulling
+# (unprepared_for_trips).
+RECALL_REQUIRED_LEVEL = 18
 
 
 def _message_position(client: AtrinikClient) -> int:
@@ -1818,6 +1914,11 @@ class FarmTask(BotTask):
         # and when the rest was last confirmed (see training_rest_active).
         self._training_resting = False
         self._training_rest_at = 0.0
+        # Resting for want of a usable heal or a ready recall
+        # (unprepared_for_trips), recorded once per rest, and its cap: its
+        # own standalone, its circuit's within one (FarmCircuitTask).
+        self._unprepared_resting = False
+        self._unprepared_hold = UnpreparedHold()
         self._melee_cycle_anchor = 0.0
         self._melee_anchor_message_at = 0.0
         self._finish_race_targets: set[int] = set()
@@ -2294,6 +2395,32 @@ class FarmTask(BotTask):
         cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
         return spell is not None and (
             maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
+
+    # Without a usable heal or a ready recall, she pulls only from this
+    # share of her health up (owner decision, 2026-11-22: a recall is not
+    # relied on, so not engaging while out of heals is what keeps her safe).
+    UNPREPARED_PULL_HEALTH = UNPREPARED_HEALTH
+
+    async def _unprepared_rest(self, client: AtrinikClient,
+                               ratio: float) -> None:
+        """Rest where she stands, combat off, until a heal is usable again
+        (her SP regenerates), a recall is ready, or her health is back to
+        UNPREPARED_PULL_HEALTH, for at most UNPREPARED_REST_LIMIT_SECONDS
+        (UnpreparedHold). Recorded once per rest. Whatever comes at her
+        meanwhile is still fought."""
+        if self._unprepared_resting:
+            return
+        self._unprepared_resting = True
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("unprepared-rest",
+                     f"hp={ratio:.0%}: no usable heal and no ready recall")
+        await client.clear_actions()
+        await client.set_combat(False)
+
+    def unprepared_resting(self) -> bool:
+        """Whether an unprepared rest is under way (for the stuck alert)."""
+        return self._unprepared_resting and self._unprepared_hold.holding()
 
     def training_rest_active(self) -> bool:
         """Whether a mana rest was confirmed on the farm just now."""
@@ -5661,12 +5788,20 @@ class FarmTask(BotTask):
                 targets = threats
             targets = [entry for entry in targets
                        if entry[3].target_id not in pulled_aside_ids]
-        if self.hold_new_pulls and engaged is None:
-            # Farming is about to stop (hold_new_pulls): no new pull, only
-            # what is beside her or already coming at her.
+        unprepared = (engaged is None and
+                      self._unprepared_hold.active(client, self.safety))
+        if not unprepared:
+            self._unprepared_resting = False
+        if (self.hold_new_pulls or unprepared) and engaged is None:
+            # Farming is about to stop (hold_new_pulls), or she has neither
+            # a usable heal nor a ready recall below
+            # UNPREPARED_PULL_HEALTH: no new pull, only what is beside her
+            # or already coming at her.
             targets = [entry for entry in targets
                        if entry[0] <= 1 or active_threat(entry)]
             if not targets:
+                if unprepared:
+                    await self._unprepared_rest(client, ratio)
                 self._last_action = time.monotonic()
                 return
         if engaged is None and self.single_target_wizardry(client):
@@ -6466,14 +6601,22 @@ class BuyShopUpgradeTask(BotTask):
 
 
 class BuyDialogueStockTask(BotTask):
-    """Inspect an identified dialogue merchant and buy matching stock."""
+    """Inspect an identified dialogue merchant and buy matching stock.
+
+    With ``try_alternatives``, stock she cannot afford (beyond
+    ``cash_reserve``) is passed over for the next matching choice; when
+    none is affordable it fails naming the cheapest quote. A quote it
+    cannot pay is still recorded under ``observation_key`` (the cheapest
+    one), so later decisions know the real price.
+    """
 
     LINK = re.compile(r"\[a=([^:\]]*):([^\]]*)\]", re.I)
 
     def __init__(self, merchant: str, item_pattern: str, *, quantity: int = 1,
                  preferred: tuple[str, ...] = (), cash_reserve: int = 1_000,
                  observation_key: str = "", max_purchases: int = 1,
-                 distinct_patterns: tuple[str, ...] = ()):
+                 distinct_patterns: tuple[str, ...] = (),
+                 try_alternatives: bool = False):
         super().__init__(f"buy-dialogue-stock:{item_pattern}")
         self.merchant = merchant
         self.item_pattern = re.compile(item_pattern, re.I)
@@ -6484,6 +6627,11 @@ class BuyDialogueStockTask(BotTask):
         self.max_purchases = max(1, int(max_purchases))
         self.distinct_patterns = tuple(
             re.compile(value, re.I) for value in distinct_patterns)
+        self.try_alternatives = try_alternatives
+        # The cheapest quote she could not pay: (item, unit cost).
+        self.cheapest_unaffordable: tuple[str, int] | None = None
+        self._declined: set[str] = set()
+        self._stock: list[str] = []
         self.checked = False
         self.purchased = False
         self.purchase_count = 0
@@ -6547,6 +6695,7 @@ class BuyDialogueStockTask(BotTask):
             not re.match(r"buy\s+\d+\s", destination, re.I) and
             self.item_pattern.search(destination[4:]) and
             destination[4:].casefold() not in self._bought_names and
+            destination[4:].casefold() not in self._declined and
             not any(index in self._bought_groups and pattern.search(
                         destination[4:])
                     for index, pattern in enumerate(self.distinct_patterns))
@@ -6595,6 +6744,7 @@ class BuyDialogueStockTask(BotTask):
                           self._dialogue_diagnostic(client))
                 return
             self.checked = True
+            self._stock = list(destinations)
             self._item_name = self._select_stock(client, destinations)
             if not self._item_name:
                 self.complete()
@@ -6615,18 +6765,42 @@ class BuyDialogueStockTask(BotTask):
             if not quantity or cost is None:
                 if now - self._sent_at <= 5.0:
                     return
+                if (self.cheapest_unaffordable is not None and
+                        self.observation_key):
+                    # An alternative's quote never came: what she could
+                    # not pay is still the price to remember.
+                    recorder = getattr(client, "record_vendor_quote", None)
+                    if recorder is not None:
+                        recorder(self.observation_key,
+                                 *self.cheapest_unaffordable)
                 self.fail("merchant utility quote was incomplete")
                 return
             wallet = BuyShopUpgradeTask.wallet_value(client)
             total_cost = cost * self.quantity
+            quote_recorder = getattr(client, "record_vendor_quote", None)
             if total_cost > max(0, wallet - self.cash_reserve):
+                if (self.cheapest_unaffordable is None or
+                        cost < self.cheapest_unaffordable[1]):
+                    self.cheapest_unaffordable = (self._item_name, int(cost))
+                if self.try_alternatives:
+                    self._declined.add(self._item_name.casefold())
+                    alternative = self._select_stock(client, self._stock)
+                    if alternative:
+                        self._item_name = alternative
+                        client.state.interface = None
+                        await client.talk(f"buy {alternative}", self.merchant)
+                        self._sent_at = now
+                        return
+                item, unit = self.cheapest_unaffordable
+                if quote_recorder is not None and self.observation_key:
+                    quote_recorder(self.observation_key, item, unit)
                 self.fail(
-                    f"merchant stock costs {format_money(total_cost)}, wallet "
+                    f"merchant stock costs "
+                    f"{format_money(unit * self.quantity)}, wallet "
                     f"{format_money(wallet)}, reserve "
                     f"{format_money(self.cash_reserve)}")
                 return
             self._cost = total_cost
-            quote_recorder = getattr(client, "record_vendor_quote", None)
             if quote_recorder is not None and self.observation_key:
                 quote_recorder(
                     self.observation_key, self._item_name, int(cost))

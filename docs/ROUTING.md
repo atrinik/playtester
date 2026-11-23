@@ -85,6 +85,18 @@ And a sixth (2026-11-19):
   counts its whole 1800 s for budget and override comparisons until it is
   older than its 6 h half-life, then decays as before (4.5).
 
+And a seventh (2026-11-22):
+
+- **A working emergency recall is never a blocker.** "They should be used
+  when possible and needed but not relied on (eventually she can find a
+  reusable horn or rod etc)." This supersedes the recall parts of the
+  rules above: a care crossing, owner block or not, needs a ready recall
+  only when she owns one she could ready, and owning only empty or
+  unusable recall sources never makes her wait. A food trip, hungry or
+  starving, with no ready recall crosses with hold-fire only. Recall
+  shopping is no longer an essential trip (4.5;
+  [COMBAT](../COMBAT.md#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22)).
+
 This document first records what the navigator does today, then the gaps
 against that model, then the design and a plan of small pull requests.
 
@@ -963,9 +975,12 @@ can stop a trip (owner decision). Farm trips use selection instead (below).
   these. They are never declined into stranding. When their budget, their
   strict plan or an owner block would decline them, they take the cheapest
   route anyway, with care. They wait to be at full HP and SP (resting where
-  it is safe), need a ready recall when she owns one, and use transit
-  hold-fire. Each one records an `essential-route-override` decision, which
-  the dashboard shows. Crossing an owner block this way is the owner's
+  it is safe), need a ready recall when she owns one she could ready, and
+  use transit hold-fire. Without one they cross with the rest of the care
+  rule: a working recall is never a blocker (owner decision, 2026-11-22,
+  superseding the recall parts of the earlier rules here). Each one
+  records an `essential-route-override` decision, which the dashboard
+  shows. Crossing an owner block this way is the owner's
   decision; no other trip crosses a block.
   - **Bounded wait.** For a budget or strict-plan override, the wait for
     care is bounded by `CARE_WAIT_SECONDS = 600`. After it she goes anyway
@@ -977,7 +992,8 @@ can stop a trip (owner decision). Farm trips use selection instead (below).
   - **Food trips.** A food trip while starving cannot wait for full HP and
     SP, because she may not regenerate. Its care condition is a ready recall
     when she owns one, plus hold-fire, including when it crosses an owner
-    block. It records `essential-care-starving` and is alerted on the
+    block; with no ready recall to own, hold-fire alone (owner decision,
+    2026-11-22). It records `essential-care-starving` and is alerted on the
     dashboard (owner-approved). The owner extended this to hungry food
     trips (2026-11-18): regenerating burns food, so waiting would starve
     her. A hungry crossing records `essential-care-food`, alerted alike.
@@ -1486,9 +1502,13 @@ is set. Notes against the text above:
   food, food resupply; essential only while `hungry` or starving), `cure`,
   `depletion`, `savebed`, `funding` (the cure-funding chest trip, and the
   recovery phase's bank, identify, sale and deposit errands), and, from the
-  owner's P3 brief, the recovery phase's recall shopping and ship key
-  (`recall`) and its walk to her savebed (`home`). `mark_essential` also
-  reaches the walks a task starts later, as `MorgeeanShipKeyTask` does.
+  owner's P3 brief, the recovery phase's walk to her savebed (`home`).
+  `mark_essential` also reaches the walks a task starts later, as
+  `MorgeeanShipKeyTask` does. The recovery phase's recall shopping and
+  ship key (`recall`) were essential until the owner decision of
+  2026-11-22 (a working recall is never a blocker): recovery no longer
+  shops for recall, and the farm circuit's recall shopping is an ordinary
+  trip that never crosses a block.
 - **The care crossing** (`require_care`) is decided before the first step,
   in `NavigateTask.tick`. She waits for full HP and SP and a ready recall
   only at a safe place: no creature that is not authored peaceful within 8
@@ -1522,7 +1542,14 @@ is set. Notes against the text above:
   `FarmTask.emergency_recall_candidates` could fire once ready: the Word of
   Recall spell, or a paid, identified, uncursed rod or wand not known to be
   empty. Ready means that function returns it now (charge, SP, device
-  retry).
+  retry). A recall spell costing more SP than her maximum could never be
+  readied and does not count. Owning none, she crosses without one: the
+  owner decision of 2026-11-22 (a working recall is never a blocker)
+  supersedes the recall parts of the P3 brief and of the 2026-11-15 and
+  2026-11-18 food-trip rules. The override then says `no working recall`
+  (`hold-fire only` on a food trip), and the dashboard's food-crossing
+  alert names a ready recall only when there was one
+  (`care_status()["recall_ready"]`).
 - **Waits.** `CARE_WAIT_SECONDS = 600`. An owner-block crossing
   (`CARE_OWNER_BLOCK`) waits without limit, records `essential-care-alert`
   and raises a critical `essential-care-wait` dashboard alert after 600 s,
@@ -1540,8 +1567,9 @@ is set. Notes against the text above:
   repeated. A crossing that clears forgets it; planning probes, such as
   the temple ranking's, neither read nor write it.
 - **Food trips.** A food trip, hungry or starving (owner decisions of
-  2026-11-15 and 2026-11-18), needs only a ready recall, without the safe
-  place or a walk home, and holds fire. While she is starving
+  2026-11-15 and 2026-11-18), needs only a ready recall, if she owns one,
+  without the safe place or a walk home, and holds fire; with none, it
+  crosses with hold-fire only (2026-11-22). While she is starving
   (`starving_without_food`) a recall spell she lacks the SP for does not
   count as owned: at food 0 the server regenerates no SP, so she could
   never ready it. The crossing records `essential-care-starving` or, hungry,
@@ -2011,7 +2039,9 @@ the owner-approved starving exception (a starving food trip may cross an owner
 block with only a ready recall plus hold-fire, recorded as
 `essential-care-starving` and alerted on the dashboard), and the probe limits
 (3 a day, 300 s ceiling), and, on 2026-11-19, that one recent death counts
-in full against a trip's budget until it is older than its half-life.
+in full against a trip's budget until it is older than its half-life, and,
+on 2026-11-22, that a working recall is never a blocker: a ready recall is
+required only when she owns one she could ready.
 
 A separate learning-and-feedback design is coming in
 `docs/LEARNING_AND_FEEDBACK.md` (doors and hints, books and facts, terrain

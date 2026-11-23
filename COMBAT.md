@@ -401,9 +401,11 @@ steps away and keeps her distance.
   fire marks it empty, and the same emergency tries the next recall source
   at once. An empty wand is no longer an emergency candidate, and recall
   shopping treats it as no device. When the last recall source is known
-  empty, the recall shop check is reset so a replacement is bought without
-  waiting out its daily interval. Recharging needs the recharge spell,
-  which she does not have.
+  empty, the recall shop check is reset so a replacement is bought, once
+  she can afford it, without waiting out its daily interval. Recharging
+  needs the recharge spell, which she does not have. She farms on without
+  a working recall
+  ([owner decision, 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22)).
 - **Hazardous for her kit.** Each farm failure review now stores the
   analyzer's combat profile she failed with. A spot with three pack or
   out-damaged failures, or approach deaths, in 24 hours (`KIT_HAZARD_FAILURES`), each with the
@@ -624,7 +626,10 @@ she farmed the least dangerous one. Pauses quarantined one leg map at a
 time, so she moved to a sibling circuit. The temple threshold only changed
 which objective she farmed, because farming was what paid the fee.
 
-`farming_unsafe_reason` now holds farming in two cases:
+`farming_unsafe_reason` held farming in two cases. The second, a missing
+working recall, was removed by the
+[owner decision of 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22),
+which supersedes it; depletion is the only case left:
 
 - depletion at the temple-service threshold (`DEPLETION_SERVICE_THRESHOLD`,
   3 points, shown as `conditions.depletion_threshold`, with the live
@@ -635,13 +640,10 @@ which objective she farmed, because farming was what paid the fee.
   has no undepleted baseline, and level and gear move it too. The kit
   comparison is relative between failures, and its fallback is what kept
   her farming;
-- from level 18 (`RECALL_REQUIRED_LEVEL`, where recall shopping starts),
-  owning recall sources none of which works: every wand known empty, and
-  no rod ready or spell known (`emergency_recall_unusable`). A wand of
-  unknown charge counts until examined. A character who never owned a
-  recall source is not held; recall shopping buys her first one.
+- (superseded on 2026-11-22) from level 18, owning recall sources none of
+  which works.
 
-While either holds, autoplay runs a recovery phase (`RecoveryTask`)
+While it holds, autoplay runs a recovery phase (`RecoveryTask`)
 instead of a farm circuit, whether or not the analyzer ranks a spot.
 When the switch is due, the circuit's discretionary trips end at once
 (upgrade sweep, spell purchase, utility and recall shopping, savebed
@@ -674,10 +676,10 @@ recovery phase:
 - depleted: the strict temple cure when she can pay (a depletion potion
   first); otherwise the cure-funding path (identify-all, junk sale,
   deposit, the apartment chest);
-- not depleted, without a working recall: recall shopping, with the free
-  ship key it needs. Depletion wins: no recall is bought with the cure's
-  money;
 - otherwise waits at her savebed.
+
+Recovery never shops for recall: no recall is bought with the cure's
+money, and recall shopping is the farm circuit's opportunistic trip.
 
 It never walks a farm route, rebinds her savebed or makes a discretionary
 purchase. Its trips are the farm circuit's own, with their retry
@@ -697,14 +699,8 @@ clears as soon as its condition does:
   of a safe route from her savebed. Each refusal is a recorded decision
   (`cure-route-refused`, reset by `cure-route-cleared` or
   `farming-resumed`), so the count survives Stop and restarts;
-- `recall-unfunded`: under the 1,250 copper recall shopping needs.
-  Operator assist can give her the gold;
-- `recall-unavailable`: the last recall shopping failed or bought nothing,
-  or getting the ship key it needs failed. The reason is kept in her
-  persisted state (`recall_unavailable`) for a day, so it survives Stop
-  and restarts. It is cleared once recall works again (or below level
-  18), so a later recall loss never shows an old reason; depletion taking
-  priority does not clear it.
+The recall alerts are no longer recovery blockers; see the
+[owner decision of 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22).
 
 The `stuck` alert is left out only while she waits at her savebed on one
 of these blockers. A cure walk or other errand that stalls still raises
@@ -716,6 +712,112 @@ kept by item tag, and live, each life brought new tags for the same two
 wands (most likely her checkpoint relogs), so she walked back out and
 fired them again. Nobody sells recall charges: recharging needs the
 recharge spell, so an empty wand is replaced, never refilled.
+
+## A working recall is never a blocker (owner decision, 2026-11-22)
+
+Live, on 2026-11-22 (v1.87.0), both of Sera's recall wands were empty.
+From level 18 that suspended farming, and the recovery phase shopped for
+a replacement: the cheapest recall the merchant had cost 9,595 copper
+("recall shopping failed: merchant stock costs 95s 95c, wallet 24s 13c,
+reserve 10s"). With farming suspended she could not earn it, and she
+cycled errands for about three days without XP. The `recall-unfunded`
+alert never fired, because it compared her wallet with the fixed 1,250
+copper recall shopping needs to start, not with the real price.
+
+The owner's decision: "A working emergency recall should never be a
+blocker. They should be used when possible and needed but not relied on
+(eventually she can find a reusable horn or rod etc)." It supersedes the
+recall parts of the 2026-11-17 decision above and of the care-crossing
+rules ([ROUTING 4.5](docs/ROUTING.md)):
+
+- **Farming goes on without one.** A missing working recall is not a
+  reason in `farming_unsafe_reason`; depletion at the temple threshold
+  still is. The emergency recall is unchanged: when she owns a working
+  source and needs it, she fires it.
+- **Recall is bought opportunistically.** From level 18 the farm circuit's
+  recall shopping runs between fights, like its other maintenance trips,
+  only while she can afford it: with a recall quote from the last day
+  (`recall_quote`, the merchant's cheapest recall stock, kept in her
+  vendor quotes as `recall-source`), only with that price plus the 1,000
+  copper reserve the purchase keeps (`RECALL_SHOP_RESERVE`); without one,
+  with the 1,250 copper minimum to go and look. A quote older than a day
+  no longer holds her back, since merchant stock changes. At the merchant
+  she tries each recall choice in turn and buys the first she can pay for
+  (`BuyDialogueStockTask(try_alternatives=True)`); when none is
+  affordable the cheapest quote is recorded. The recovery phase never
+  shops for recall, and recall shopping is not an essential trip, so it
+  never crosses an owner block.
+- **Care crossings do not wait for a recall she cannot ready.** An
+  essential trip's owner-block crossing, and a food trip's, wait for a
+  ready recall only when she owns one she could ready
+  (`care_recall_ready`): known-empty wands, unidentified or cursed
+  devices, and a recall spell costing more than her whole mana bar do not
+  count. Without one she crosses with the rest of the care rule: full HP
+  and SP and hold-fire, or for a food trip hold-fire alone. The override
+  says which (`no working recall`, `hold-fire only`).
+- **Alerts.** In any autoplay phase, from level 18 and while no recall
+  source of hers works (`recall_alerts`), none of them critical:
+  - `recall-unfunded` (warning): the quoted recall plus the reserve costs
+    more than she has; the text names both amounts and says she farms on;
+  - `recall-unavailable` (info): the last recall shopping failed or bought
+    nothing, or getting the ship key it needs failed, within a day. The
+    reason is kept in her persisted state (`recall_unavailable`), so it
+    survives Stop and restarts, and is cleared once recall works again (or
+    below level 18);
+  - `recall-missing` (info): otherwise.
+- **Without a recall, safety comes from not engaging, or starting
+  optional trips, when out of heals.** The recall at 35 % used to pre-empt
+  the worst case from level 18. Live, on 2026-11-22, with no heals and no
+  recall, she took the mana-crystal-upgrade errand into the Old Outpost
+  and sat at "critical health 15% and no usable heal" for 45 s until she
+  died among troll guards, a stone giant master guard and a lava golem.
+  So, from level 18, while she has neither a usable heal (an item, or a
+  healing spell she has the SP for) nor a ready recall
+  (`out_of_heals_and_recall`) and is below `UNPREPARED_HEALTH` (90 %,
+  `unprepared_for_trips`):
+  - **No new pull.** The farm fights only what is beside her or already
+    coming at her, with its defence as ever. Otherwise she rests where she
+    stands, combat off, recorded once as `unprepared-rest`
+    (`FarmTask._unprepared_rest`). The circuit's dwell and empty-sweep
+    leg switches wait meanwhile, so she makes no such unprepared walk to
+    another map; a leg that stops being available on its schedule (at
+    nightfall, say) still moves her.
+  - **No optional trip.** The farm circuit starts no ship-key trip, spell
+    purchase, or recall, utility or upgrade shopping (checked with the
+    farm's own safety policy), and autoplay starts no mana-crystal detour
+    (its start, recovery or upgrade), whether a circuit runs or not: each
+    is postponed, not rested for (`_start_mana_crystal_detours`). Autoplay
+    still starts the farm circuit, where the farm's rest keeps its
+    defence. Essential trips are not delayed: temple food, the recovery
+    phase and its cure, and the circuit's food, bank, identify, storage
+    and savebed trips.
+  - **At most ten minutes.** The farm's rest and the circuit's optional
+    trips share one hold, owned by the circuit (`UnpreparedHold`), so a
+    rebuilt farm does not restart it. It lasts at most
+    `UNPREPARED_REST_LIMIT_SECONDS` (600 s) of checks without a gap: then
+    she goes on as before, recorded once as `unprepared-rest-timeout`,
+    since damage over time can outpace regeneration. A gap of more than
+    `UNPREPARED_GAP_SECONDS` (10 s) without a check, such as an essential
+    trip, starts the hold afresh, and so does being prepared again. A
+    farm rest checked within the last 3 s, with no circuit trip running,
+    is an explained wait, so the dashboard's stuck alert stays quiet
+    meanwhile, and only then.
+
+  Each rest otherwise ends by itself: health regenerates passively, her
+  SP buys a heal again, or a recall becomes ready. Below level 18, and
+  with a heal or a ready recall, nothing changes. The routing danger weight already
+  plans with the safety λ while she has no ready recall (ROUTING 4.5).
+  Follow-ups, not part of this change: a town trip to buy healing potions
+  (no existing trip buys them, and the sage's stock is random), better
+  flee logic at critical health with no heal and no recall, and
+  preferring the analyzer's safety objective while she has no working
+  recall (switching it re-ranks spots each time a wand's charge is
+  learned).
+- **Recall alerts use fresh quotes only.** A recall quote older than a
+  day (`RECALL_SHOP_INTERVAL`) is no price: it neither gates recall
+  shopping nor raises `recall-unfunded`. When an alternative's quote never
+  arrives, the cheapest price she could not pay is still recorded. A
+  recall spell costing more SP than her whole bar is not a recall source.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 

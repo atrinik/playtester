@@ -188,7 +188,7 @@
         </section>
         <section class="form">
           <h2>Owner blocks</h2>
-          <p class="muted small">A blocked map, exit or seam is a wall for her routes until it expires (a blocked map stays usable as a destination). Only an essential trip (food while hungry, a cure, the depletion service, a savebed move, what funds them, and the recovery phase's recall and walk home) crosses one, when every route does: at full HP and SP with a ready recall, holding fire. A food trip, hungry or starving, waits only for the recall. Each crossing is listed below.</p>
+          <p class="muted small">A blocked map, exit or seam is a wall for her routes until it expires (a blocked map stays usable as a destination). Only an essential trip (food while hungry, a cure, the depletion service, a savebed move, what funds them, and the recovery phase's walk home) crosses one, when every route does: at full HP and SP with a ready recall if she owns one, holding fire. A food trip, hungry or starving, waits only for a ready recall, and with none crosses with hold-fire alone. Each crossing is listed below.</p>
           <div class="row"><input id="block-subject" placeholder="/map/path, exit:/map:X,Y>/map, seam:/map>/map or talk:/map:NPC>/map" autocomplete="off" maxlength="512"><button id="block-here" class="secondary small" title="Fill in the map she stands on">Her map</button></div>
           <div class="row"><select id="block-duration" aria-label="Block duration"><option value="3600">1 hour</option><option value="10800">3 hours</option><option value="21600">6 hours</option><option value="43200">12 hours</option><option value="86400">1 day</option><option value="259200">3 days</option><option value="604800">7 days</option></select><input id="block-note" placeholder="Note (optional)" autocomplete="off" maxlength="200"><button id="block-add">Block</button></div>
           <div id="route-blocks" class="list"><span class="muted">Loading…</span></div>
@@ -218,6 +218,6 @@
     </section>
   </main>
   <div id="toast" role="status"></div>
-  <script src="/app.js?v=35"></script>
+  <script src="/app.js?v=36"></script>
 </body>
 </html>
