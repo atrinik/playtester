@@ -6724,6 +6724,51 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             name="rod of word of recall"))
         self.assertFalse(unprepared_for_trips(client, task.safety))
 
+    def test_a_departure_rest_turns_combat_off_once_and_still_defends(self):
+        client = self._combat_client()
+        client.clear_actions = types.MethodType(
+            lambda self: asyncio.sleep(0), client)
+        client.state.stats.update(level=36)
+        client.state.map.tiles.clear()
+        client.state.map.world_x, client.state.map.world_y = 1, 11
+        node = MapNode(path="/test", width=12, height=14)
+        node.terrain = {(x, y): 1 for x in range(12) for y in range(14)}
+        task = FarmTask(zone="/test", patrol=[(7, 9)])
+        task.map_node, task.map_bounds = node, (12, 14)
+        task.rest_for_departure = True
+        for _ in range(4):
+            task._last_action = 0
+            asyncio.run(task.tick(client))
+        # No pull, no patrol, and combat off sent once for the whole rest.
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.combat, [False])
+        # A new rest sends it again, once.
+        task.rest_for_departure = False
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        task.rest_for_departure = True
+        client.direct_moves.clear()
+        for _ in range(3):
+            task._last_action = 0
+            asyncio.run(task.tick(client))
+        self.assertEqual(client.combat.count(False), 2)
+        # A kobold six tiles off is not pulled; one beside her is fought.
+        def run(x):
+            client = self._combat_client()
+            client.state.map.tiles.clear()
+            client.state.map.tile(x, 8).objects[3] = MapObject(
+                3, 1, 0, 0, name="kobold chief", target_id=100,
+                target_hp=100)
+            task = FarmTask(zone="/test", target="kobold chief")
+            task.rest_for_departure = True
+            asyncio.run(task.tick(client))
+            return client
+
+        client = run(14)
+        self.assertEqual(client.targets + client.moves + client.direct_moves, [])
+        client = run(9)
+        self.assertEqual(client.targets, [(9, 8, 100)])
+
     def _pursued_stand_task(self, client):
         client.state.stats.update(hp=100, maxhp=176)
         task = FarmTask(zone="/test")
@@ -21812,6 +21857,59 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIsNone(circuit._heal_restock)
         self.assertIn("full HP and SP", client.state.heal_restock_note)
         self.assertFalse(farm(circuit).rest_for_departure)
+
+    def test_a_departure_wait_ends_with_its_need_and_survives_a_rebuild(self):
+        client, _ = self.client(recall=False, bank=20_000)
+        client.state.stats.update(hp=127, maxhp=134, sp=20, maxsp=20)
+        circuit = self.unprepared_circuit(client, "")
+        circuit._needs_heal_restock = (
+            FarmCircuitTask._needs_heal_restock.__get__(circuit))
+
+        def trip(client, *, strict):
+            errand = _DoneErrand(status=TaskStatus.RUNNING)
+            errand.task.merchant = "merchant"
+            errand.navigation = types.SimpleNamespace(
+                destination="/shattered_islands/world_4_47")
+            errand.hostile_transit = True
+            return errand
+
+        circuit._new_heal_restock = trip
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        self.assertIsNotNone(circuit._heal_restock_full_since)
+        # An explained wait for the stuck alert, like an unprepared rest.
+        self.assertTrue(circuit.unprepared_resting())
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay.child = circuit
+        self.assertTrue(autoplay.recovery_alerts(client)[1])
+        # A rebuilt circuit keeps the wait under way, not a new ten minutes.
+        backoffs = circuit.backoffs()
+        self.assertEqual(backoffs["_heal_restock_full_since"],
+                         circuit._heal_restock_full_since)
+        rebuilt = FarmCircuitTask(built_graph(), [(self.TREES, "")],
+                                  backoffs=backoffs)
+        self.assertEqual(rebuilt._heal_restock_full_since,
+                         circuit._heal_restock_full_since)
+        self.assertGreater(rebuilt._heal_restock_retry_at, rebuilt.clock())
+        # The money gone below the reserve: the wait ends, the farm farms,
+        # and no backoff is written for it.
+        client.state.bank_balance = 500
+        asyncio.run(circuit.tick(client))
+        self.assertIsNone(circuit._heal_restock_full_since)
+        self.assertFalse(circuit.child.task.rest_for_departure)
+        self.assertFalse(circuit.unprepared_resting())
+        self.assertEqual(client.state.heal_restock_note, "")
+        self.assertNotIn("heal-restock-backoff", self.actions(client))
+        # Likewise when a backoff comes into force while it waits.
+        client.state.bank_balance = 20_000
+        circuit._heal_restock_retry_at = 0.0
+        asyncio.run(circuit.tick(client))
+        self.assertIsNotNone(circuit._heal_restock_full_since)
+        client.state.heal_restock_retry_until = time.time() + 60
+        asyncio.run(circuit.tick(client))
+        self.assertIsNone(circuit._heal_restock_full_since)
+        self.assertFalse(circuit.child.task.rest_for_departure)
 
     def test_an_unusable_heal_is_no_heal_for_safety_or_restock(self):
         from .tasks import heal_consumables, unprepared_for_trips

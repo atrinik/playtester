@@ -6962,6 +6962,10 @@ class FarmCircuitTask(BotTask):
         for name, until in (backoffs or {}).items():
             if name in self.BACKOFF_ATTRIBUTES:
                 setattr(self, name, max(getattr(self, name), float(until)))
+            elif name == "_heal_restock_full_since":
+                # A wait under way, not a deadline: kept as it is, so a
+                # rebuilt circuit does not restart its ten minutes.
+                self._heal_restock_full_since = float(until)
 
     # Maintenance retry deadlines (on ``clock``) a replacement circuit
     # inherits. Live: autoplay rebuilt the circuit after every temple food
@@ -6980,8 +6984,12 @@ class FarmCircuitTask(BotTask):
     def backoffs(self) -> dict[str, float]:
         """The maintenance retry deadlines still pending, for a successor."""
         now = self.clock()
-        return {name: getattr(self, name) for name in self.BACKOFF_ATTRIBUTES
-                if getattr(self, name) > now}
+        pending = {name: getattr(self, name)
+                   for name in self.BACKOFF_ATTRIBUTES
+                   if getattr(self, name) > now}
+        if self._heal_restock_full_since is not None:
+            pending["_heal_restock_full_since"] = self._heal_restock_full_since
+        return pending
 
     def _observe_farm_death(self, client: AtrinikClient) -> bool:
         """Quarantine an analyzer pick after a death or an emergency recall."""
@@ -8507,7 +8515,12 @@ class FarmCircuitTask(BotTask):
                 service is not None for service in self._maintenance_services()):
             return False
         farm = self.child.task if self.child is not None else None
-        return isinstance(farm, FarmTask) and farm.unprepared_resting()
+        return isinstance(farm, FarmTask) and (
+            farm.unprepared_resting() or
+            # A heal restock waiting for full HP and SP to take the
+            # hostile road (_heal_restock_waiting) is a wait too.
+            (farm.rest_for_departure and
+             self._heal_restock_full_since is not None))
 
     def hold_new_pulls(self, hold: bool = True) -> None:
         """While the switch to recovery waits: the farm pulls no new target
@@ -8818,13 +8831,15 @@ class FarmCircuitTask(BotTask):
         return max(self.HEAL_RESTOCK_MINIMUM_WALLET,
                    quote[1] + self.HEAL_RESTOCK_RESERVE)
 
-    def _needs_heal_restock(self, client: AtrinikClient) -> bool:
+    def _needs_heal_restock(self, client: AtrinikClient, *,
+                            ignore_retry: bool = False) -> bool:
         """Whether to go and buy healing consumables now: from
         RECALL_REQUIRED_LEVEL (where being out of heals and recall makes
         her rest rather than pull), with fewer than HEAL_RESTOCK_LOW she
         can use, room to carry them, the money for one plus the reserve,
         no depletion due (the recovery phase comes first) and no backoff
-        in force (GameState.heal_restock_retry_until)."""
+        in force (GameState.heal_restock_retry_until). ``ignore_retry``
+        leaves out the in-memory re-plan pause (_heal_restock_retry_at)."""
         state = client.state
         if (int(state.stats.get("level", 0) or 0) < RECALL_REQUIRED_LEVEL or
                 not self._inventory_ready(client) or
@@ -8832,7 +8847,8 @@ class FarmCircuitTask(BotTask):
                 heal_consumables(client) >= self.HEAL_RESTOCK_LOW or
                 time.time() < float(getattr(
                     state, "heal_restock_retry_until", 0.0) or 0.0) or
-                self.clock() < self._heal_restock_retry_at):
+                (not ignore_retry and
+                 self.clock() < self._heal_restock_retry_at)):
             return False
         if InventoryPolicy().weight_ratio(client) >= self.FOOD_RESERVE_MAX_LOAD:
             return False
@@ -8944,6 +8960,11 @@ class FarmCircuitTask(BotTask):
         a heal or a ready recall again, the trip is re-planned at once."""
         since = self._heal_restock_full_since
         if since is None:
+            return False
+        if not self._needs_heal_restock(client, ignore_retry=True):
+            # No longer due (heals found, money spent, a backoff, too
+            # heavy): no wait, and no backoff of its own.
+            self._heal_restock_full_since = None
             return False
         if (self._full_hp_sp(client) or
                 not out_of_heals_and_recall(client, farm.safety)):
@@ -9878,6 +9899,8 @@ class FarmCircuitTask(BotTask):
                 await trip.tick(client)
                 return
             elif strict:
+                self._heal_restock_full_since = None
+                farm.rest_for_departure = False
                 self._heal_restock_retry_at = (
                     self.clock() + self.HEAL_RESTOCK_STRICT_RETRY_SECONDS)
                 if recorder is not None:
@@ -9885,6 +9908,8 @@ class FarmCircuitTask(BotTask):
                              "no strict route to a healing merchant while "
                              "unprepared")
             elif trip is None:
+                self._heal_restock_full_since = None
+                farm.rest_for_departure = False
                 self.back_off_heal_restock(
                     client, "no reachable merchant sells healing potions",
                     self.HEAL_RESTOCK_INTERVAL)

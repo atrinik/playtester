@@ -1826,6 +1826,9 @@ class FarmTask(BotTask):
         # full HP and SP (FarmCircuitTask._heal_restock_waiting): no new
         # pull, combat off, as in an unprepared rest.
         self.rest_for_departure = False
+        # Whether combat was turned off for the current departure rest
+        # (sent once per rest, as for an unprepared rest).
+        self._departure_resting = False
         # Peaceful creatures seen occupying a named spawn; attacked with force.
         self._spawn_blocker_ids: set[int] = set()
         self._visible_target_count = 0
@@ -5814,6 +5817,8 @@ class FarmTask(BotTask):
                       self._unprepared_hold.active(client, self.safety))
         if not unprepared:
             self._unprepared_resting = False
+        if not self.rest_for_departure:
+            self._departure_resting = False
         if ((self.hold_new_pulls or unprepared or self.rest_for_departure)
                 and engaged is None):
             # Farming is about to stop (hold_new_pulls), or she has neither
@@ -5825,7 +5830,9 @@ class FarmTask(BotTask):
             if not targets:
                 if unprepared:
                     await self._unprepared_rest(client, ratio)
-                elif self.rest_for_departure:
+                elif self.rest_for_departure and not self._departure_resting:
+                    self._departure_resting = True
+                    await client.clear_actions()
                     await client.set_combat(False)
                 self._last_action = time.monotonic()
                 return
