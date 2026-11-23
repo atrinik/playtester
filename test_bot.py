@@ -10500,7 +10500,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertIn((0, 43), client.fired)
 
-    def test_out_healed_never_stands_with_the_heal_on_cooldown(self):
+    def test_out_healed_never_stands_within_the_gain_window(self):
         client = self._combat_client()
         task = self._out_healed_fight(client, hp=125)
         # Hemmed in beside two treants: no step gains, and the heal sent
@@ -10539,6 +10539,32 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # No heal to buy time with: the ordinary retreat's stand defends her.
         self.assertIn("pursued-stand", actions)
         self.assertIn(True, client.combat)
+
+    def _cornered_out_healed(self, gain_age, sp):
+        client = self._combat_client()
+        task = self._out_healed_fight(client, hp=125)
+        task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
+                                 (13, 12): 1}
+        client.state.stats["sp"] = sp
+        task.safety._last_heal = time.monotonic() - 0.5
+        task._out_healed_gain_at = time.monotonic() - gain_age
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100}
+        task._pursuit_last_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("out-healed-disengage", actions)
+        self.assertIn("pursued-stand", actions)
+        self.assertIn(True, client.combat)
+
+    def test_out_healed_stands_once_the_gain_window_lapses(self):
+        # SP for a heal, but her last gaining step was 3 s ago and none
+        # gains now: the ordinary retreat stands.
+        self._cornered_out_healed(gain_age=3.0, sp=72)
+
+    def test_out_healed_stands_once_her_heal_is_gone(self):
+        # A gaining step half a second ago, but SP just ran out.
+        self._cornered_out_healed(gain_age=0.5, sp=0)
 
     def test_out_healed_without_sp_still_stands_in_the_open(self):
         self._out_healed_without_sp(corridor=False)

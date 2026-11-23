@@ -4675,6 +4675,8 @@ class FarmTask(BotTask):
         ratio = (int(client.state.stats.get("hp", 0) or 0) /
                  max(1, int(client.state.stats.get("maxhp", 1) or 1)))
         out_healed = self.out_healed_running(client, now)
+        # A gaining gain-only step normally clears the stand latch first;
+        # out_healed here only guards against one left over.
         if (breakout is not None and self._stand_latch and
                 (ratio <= self.STAND_HEALTH_FLOOR or out_healed)):
             # A stand chosen over a failing retreat ends at the critical
