@@ -346,6 +346,81 @@ def cover_cells(dx: int, dy: int) -> list[tuple[int, int]]:
     return ray_split(dx, dy, max(FarmTask.BULLET_RANGE, abs(dx), abs(dy)))[0]
 
 
+def tiled_neighbours(graph, node) -> dict[tuple[int, int], Any]:
+    """The maps seamlessly tiled to node's sides and corners, by direction
+    (terrain.tile_directions), as world-graph nodes."""
+    nodes = getattr(graph, "nodes", None) or {}
+    if node is None:
+        return {}
+    return {direction: nodes[path]
+            for direction, path in terrain.tile_directions(node).items()
+            if path in nodes}
+
+
+def seam_square(node, neighbours: dict, x: int, y: int):
+    """(map node, x, y) for square (x, y) in node's coordinates: node itself
+    inside it, else the map tiled on that side or corner, in its own
+    coordinates; None where no map continues."""
+    side_x = -1 if x < 0 else 1 if x >= node.width else 0
+    side_y = -1 if y < 0 else 1 if y >= node.height else 0
+    if not side_x and not side_y:
+        return node, x, y
+    other = neighbours.get((side_x, side_y))
+    if other is None:
+        return None
+    return (other,
+            x + other.width if side_x < 0 else
+            x - node.width if side_x > 0 else x,
+            y + other.height if side_y < 0 else
+            y - node.height if side_y > 0 else y)
+
+
+def area_caster_identities(node, neighbours: dict) -> frozenset[str]:
+    """Authored caster kinds of node and of the maps tiled to it: a caster
+    spawned across a seam (the Underground City's orc sorcerers on 1_2,
+    beside the 1_3 farm) shoots into her map as freely as one on it."""
+    identities = set(getattr(node, "caster_identities", ()) or ())
+    for other in neighbours.values():
+        identities.update(getattr(other, "caster_identities", ()) or ())
+    return frozenset(identities)
+
+
+def wall_covers(node, neighbours: dict, caster: tuple[int, int],
+                square: tuple[int, int]) -> bool:
+    """Whether an authored wall stops an aimed projectile from caster to
+    square (both in node's coordinates, across seams). The cells are the
+    server's projectile flight before the target (cover_cells, from the
+    caster); a monster also needs sight of her to cast at all
+    (monster_cast_spell, types/monster.c), which a wall on that line takes
+    away too. Doors do not count: monsters open them."""
+    dx, dy = square[0] - caster[0], square[1] - caster[1]
+    if not dx and not dy:
+        return False
+    for cell_x, cell_y in cover_cells(dx, dy):
+        found = seam_square(node, neighbours, caster[0] + cell_x,
+                            caster[1] + cell_y)
+        if found is not None and (found[1], found[2]) in found[0].blocked:
+            return True
+    return False
+
+
+def aimed_spell_hit(client: AtrinikClient, seconds: float) -> bool:
+    """Whether an aimed projectile spell (magic bullet and the like) hit
+    her this recently. The server names the missile, not its caster, in
+    the hit ("magic bullet hit you for 65 (0) weapon magic damage.")."""
+    cutoff = time.time() - seconds
+    for entry in reversed(getattr(client.state, "messages", ())):
+        if float(entry[0]) < cutoff:
+            break
+        if not self_improvement.from_server(entry):
+            continue
+        match = re.match(r"(.+?) hit you\b", str(entry[-1]).strip(), re.I)
+        if match and AIMED_PROJECTILE_SPELL.fullmatch(
+                match.group(1).strip()):
+            return True
+    return False
+
+
 def healing_outpaced(client: AtrinikClient, seconds: float = 8.0) -> bool:
     """Whether she lost health across at least two recent heals.
 
@@ -1804,6 +1879,15 @@ class FarmTask(BotTask):
     CASTER_MIN_RANGE = 4
     CASTER_MAX_RANGE = 8
     BULLET_RANGE = 12
+    # Caster first (caster_first): an authored caster hitting her this
+    # close is fought before melee attackers. Across a seam only an
+    # adjacent one is, since the farm does not walk onto another map.
+    CASTER_FIRST_REACH = 2
+    # Breaking sight (break_caster_sight): an aimed spell hit this recent,
+    # with no caster within reach, makes her step behind a wall; she then
+    # holds there this long rather than walk back out to a target.
+    COVER_HIT_SECONDS = 12.0
+    COVER_HOLD_SECONDS = 4.0
     # Retreat steps with an attacker still adjacent before she casts at it.
     PURSUIT_CAST_STEPS = 1
     # Seconds a "healing outpaced" disengage lasts once detected.
@@ -1973,6 +2057,10 @@ class FarmTask(BotTask):
         self._wand_examined: set[int] = set()
         # Until when healing that cannot keep up makes her disengage.
         self._outpaced_until = 0.0
+        # The farm map's seam neighbours (path, by direction), and until
+        # when a step behind cover holds her there (monotonic).
+        self._seam_cache: tuple[str, dict] | None = None
+        self._cover_hold_until = 0.0
         # Until when heals losing the fight keep her disengaging, and when a
         # gain-only retreat last found a step that gains (monotonic).
         self._out_healed_until = 0.0
@@ -2047,6 +2135,22 @@ class FarmTask(BotTask):
         return (0 <= world_x < self.map_bounds[0] and
                 0 <= world_y < self.map_bounds[1])
 
+    def seam_retreat_square(self, client: AtrinikClient, x: int, y: int):
+        """(map node, x, y) of farm-map square (x, y) off the farm map when
+        the map tiled there has a walkable, unoccupied square at it; None
+        otherwise (low_health_retreat's last resort from a seam pocket)."""
+        node = self._current_map_node(client)
+        if node is None:
+            return None
+        found = seam_square(node, self.seam_neighbours(client), x, y)
+        if found is None or found[0] is node:
+            return None
+        other, local_x, local_y = found
+        if (not other.terrain or not other.walkable(local_x, local_y) or
+                (local_x, local_y) in other.occupied):
+            return None
+        return found
+
     def corpse_tile_standable(self, path: str, x: int, y: int) -> bool:
         """Whether the character can stand on a corpse's tile to loot it.
 
@@ -2088,13 +2192,169 @@ class FarmTask(BotTask):
             authored.peaceful_identities for identity in identities))
 
     def authored_caster(self, client: AtrinikClient, obj, node=None) -> bool:
-        """Whether authored map/archetype data marks this monster as a caster."""
-        authored = node or self.map_node
-        if authored is None or not authored.caster_identities:
+        """Whether authored map/archetype data marks this monster as a caster.
+
+        Without ``node``, the farm map's casters and those of the maps tiled
+        to it count (area_caster_identities).
+        """
+        identities = (node.caster_identities if node is not None else
+                      area_caster_identities(
+                          self.map_node, self.seam_neighbours(client)))
+        if not identities:
             return False
         semantic = map_object_semantic(client, obj).casefold()
         return any(_same_semantic_identity(identity, semantic)
-                   for identity in authored.caster_identities)
+                   for identity in identities)
+
+    def seam_neighbours(self, client: AtrinikClient) -> dict:
+        """The world-graph maps tiled to the farm map, by direction."""
+        node = self.map_node
+        if node is None:
+            return {}
+        if self._seam_cache is None or self._seam_cache[0] != node.path:
+            self._seam_cache = (node.path, tiled_neighbours(
+                getattr(client, "world_graph", None), node))
+        return self._seam_cache[1]
+
+    def caster_hitting(self, client: AtrinikClient, distance: int, x: int,
+                       y: int, obj) -> bool:
+        """Whether a visible authored caster is the one hurting her: beside
+        her, named in a recent hit or miss, or with an aimed spell having
+        hit her lately while no wall stands between it and her (the hit
+        names the missile, not the caster)."""
+        if not self.authored_caster(client, obj):
+            return False
+        if distance <= 1:
+            return True
+        semantic = map_object_semantic(client, obj).casefold()
+        if any(_same_semantic_identity(name, semantic)
+               for name in recent_hostile_attackers(client)):
+            return True
+        node = self._current_map_node(client)
+        if node is None or not aimed_spell_hit(client, self.COVER_HIT_SECONDS):
+            return False
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        return not wall_covers(
+            node, self.seam_neighbours(client),
+            (m.world_x + x - cx, m.world_y + y - cy),
+            (m.world_x, m.world_y))
+
+    def caster_first(self, client: AtrinikClient):
+        """The authored caster hurting her within CASTER_FIRST_REACH (only
+        an adjacent one across a seam), nearest first, as (distance, x, y,
+        obj); None if there is none. It is fought before melee attackers:
+        live, an adjacent orc sorcerer did 69% of the damage that killed
+        her while she swung at the orcs beside it."""
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        candidates = []
+        for x, y, obj in m.targets(friendly=False):
+            distance = max(abs(x - cx), abs(y - cy))
+            if (distance > self.CASTER_FIRST_REACH or
+                    (distance > 1 and
+                     not self.within_farm_map(client, x, y)) or
+                    self.target_temporarily_unreachable(obj.target_id) or
+                    target_set_aside(client.state, obj.target_id) or
+                    self.ignore_unrequested_peaceful(client, obj) or
+                    not self.caster_hitting(client, distance, x, y, obj)):
+                continue
+            candidates.append((distance, x, y, obj))
+        return min(candidates, key=lambda entry: (
+            entry[0], int(getattr(entry[3], "target_hp", 0) or 100)),
+            default=None)
+
+    def caster_rank(self, client: AtrinikClient, obj) -> int:
+        """0 for an authored caster, 1 otherwise: the first key wherever
+        she picks one attacker to fight among several."""
+        return 0 if self.authored_caster(client, obj) else 1
+
+    async def break_caster_sight(self, client: AtrinikClient) -> bool:
+        """Step behind a wall from the casters shooting at her.
+
+        After an aimed spell hit (COVER_HIT_SECONDS), with every visible
+        authored caster that has a clear line to her out of reach
+        (caster_first fights one within it), she takes one step that puts
+        a wall between her and as many of them as possible (wall_covers),
+        never one with more attackers beside her than now. Among those,
+        the one most of the casters' lines stop at, then the square fewer
+        melee attackers can reach (terrain.features: the corridor side of
+        a doorway, or the doorway, rather than the room), then the one
+        farthest from the nearest other threat. She then holds there for
+        COVER_HOLD_SECONDS rather than walk back out to a target. Returns
+        whether she stepped; a step still in flight lets the rest of the
+        tick (healing first) go on.
+        """
+        node = self._current_map_node(client)
+        if node is None or not aimed_spell_hit(client, self.COVER_HIT_SECONDS):
+            return False
+        now = time.monotonic()
+        if self.retreat_ack_pending(client, now):
+            return False
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        neighbours = self.seam_neighbours(client)
+        here = (m.world_x, m.world_y)
+        casters, others = [], []
+        for x, y, obj in m.targets(friendly=False):
+            if self.ignore_unrequested_peaceful(client, obj):
+                continue
+            world = (m.world_x + x - cx, m.world_y + y - cy)
+            if (self.authored_caster(client, obj) and
+                    not wall_covers(node, neighbours, world, here)):
+                if max(abs(x - cx), abs(y - cy)) <= self.CASTER_FIRST_REACH:
+                    return False  # within reach: caster_first fights it
+                casters.append(world)
+            else:
+                others.append(world)
+        if not casters:
+            return False
+        hostiles = casters + others
+
+        def beside(square: tuple[int, int]) -> int:
+            return sum(max(abs(square[0] - hx), abs(square[1] - hy)) <= 1
+                       for hx, hy in hostiles)
+
+        now_beside = beside(here)
+        choices = []
+        for direction, (dx, dy) in c.DIRECTION_DELTAS.items():
+            if not direction:
+                continue
+            square = (here[0] + dx, here[1] + dy)
+            tile = m.tiles.get((cx + dx, cy + dy))
+            if ((m.path, *square) in self._retreat_blocked or
+                    not self.within_farm_map(client, cx + dx, cy + dy) or
+                    not self.retreat_tile_walkable(m.path, *square) or
+                    square in hostiles or
+                    (tile is not None and any(
+                        obj.target_id for obj in tile.objects.values())) or
+                    beside(square) > now_beside):
+                continue
+            covered = sum(wall_covers(node, neighbours, caster, square)
+                          for caster in casters)
+            if not covered:
+                continue
+            feature = terrain.features(node, *square)
+            separation = min((max(abs(square[0] - ox), abs(square[1] - oy))
+                              for ox, oy in others), default=99)
+            choices.append((covered, -(feature.reach or 0), separation,
+                            random.random(), direction, square,
+                            feature.feature))
+        if not choices:
+            return False
+        covered, _, _, _, direction, square, feature = max(choices)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("caster-cover",
+                     f"direction={direction} casters={len(casters)} "
+                     f"covered={covered} feature={feature}")
+        await client.clear_actions()
+        await client.move(direction, run=False)
+        self._retreat_attempt = (m.path, here[0], here[1], square[0],
+                                 square[1], now)
+        self._cover_hold_until = now + self.COVER_HOLD_SECONDS
+        self._last_action = now
+        return True
 
     def observe_engaged_target(self, client: AtrinikClient,
                                threats: list[tuple], *,
@@ -4697,6 +4957,17 @@ class FarmTask(BotTask):
             breakout = None
             self._cornered_breakout_target = 0
             self._stand_latch = False
+        if breakout is not None and self.caster_rank(client, breakout[2]):
+            # A caster beside her is fought first, latched fight or not.
+            caster = next((
+                (x, y, obj) for x, y, obj in visible_threats
+                if max(abs(x - cx), abs(y - cy)) <= 1 and
+                not target_set_aside(client.state, obj.target_id) and
+                not self.ignore_unrequested_peaceful(client, obj) and
+                not self.caster_rank(client, obj)), None)
+            if caster is not None:
+                breakout = caster
+                self._cornered_breakout_target = caster[2].target_id
         if breakout is not None:
             # With no walkable escape square, repeatedly alternating one
             # forced swing with combat-off retreat ticks makes neither
@@ -4769,15 +5040,22 @@ class FarmTask(BotTask):
         # Between otherwise equal steps, prefer the engaged pull's anchor.
         anchor = (self.target_anchor(client, engaged_id)
                   if engaged_id else None)
+        seam_choices = []
         for direction, (dx, dy) in c.DIRECTION_DELTAS.items():
             if not direction:
                 continue
             view_x, view_y = cx + dx, cy + dy
             world_x, world_y = m.world_x + dx, m.world_y + dy
-            if ((m.path, world_x, world_y) in self._retreat_blocked or
-                    not self.within_farm_map(client, view_x, view_y) or
-                    not self.retreat_tile_walkable(
-                        m.path, world_x, world_y)):
+            if (m.path, world_x, world_y) in self._retreat_blocked:
+                continue
+            seam = None
+            if not self.within_farm_map(client, view_x, view_y):
+                # Across a seam: only a walkable square of the map tiled
+                # there, kept apart below.
+                seam = self.seam_retreat_square(client, world_x, world_y)
+                if seam is None:
+                    continue
+            elif not self.retreat_tile_walkable(m.path, world_x, world_y):
                 continue
             tile = m.tiles.get((view_x, view_y))
             if tile is not None and any(
@@ -4785,14 +5063,42 @@ class FarmTask(BotTask):
                 continue
             separation = min(max(abs(view_x - x), abs(view_y - y))
                              for x, y in threats)
-            escape_depth, escape_area = retreat_mobility(
-                self.map_node, (world_x, world_y),
-                blocked=mobility_blocked)
+            if seam is None:
+                escape_depth, escape_area = retreat_mobility(
+                    self.map_node, (world_x, world_y),
+                    blocked=mobility_blocked)
+            else:
+                other, local_x, local_y = seam
+                escape_depth, escape_area = retreat_mobility(
+                    other, (local_x, local_y), blocked={
+                        (local_x - dx, local_y - dy)} | {
+                        (local_x + x - cx - dx, local_y + y - cy - dy)
+                        for x, y in threats})
             anchor_distance = 0 if anchor is None else max(
                 abs(anchor[0] - world_x), abs(anchor[1] - world_y))
-            choices.append((int(escape_depth >= 2), separation,
-                            escape_depth, escape_area, -anchor_distance,
-                            random.random(), direction, world_x, world_y))
+            (choices if seam is None else seam_choices).append((
+                int(escape_depth >= 2), separation, escape_depth,
+                escape_area, -anchor_distance, random.random(), direction,
+                world_x, world_y))
+        if seam_choices and not any(choice[0] for choice in choices):
+            # Every step on the farm map is a dead end (a seam pocket): a
+            # step onto the map tiled there may serve, provided it gains
+            # distance from the nearest threat and has no more hostiles
+            # around it than her square has.
+            nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
+            hostiles = [(x, y) for x, y, obj in m.targets(friendly=False)
+                        if not self.ignore_unrequested_peaceful(client, obj)]
+
+            def crowd(view: tuple[int, int]) -> int:
+                return sum(max(abs(view[0] - x), abs(view[1] - y)) <= 4
+                           for x, y in hostiles)
+
+            here_crowd = crowd((cx, cy))
+            choices.extend(
+                choice for choice in seam_choices
+                if choice[1] > nearest and crowd(
+                    (cx + choice[7] - m.world_x,
+                     cy + choice[8] - m.world_y)) <= here_crowd)
         if gain_only:
             # Only a step that sheds the nearest threat; an equal-distance
             # one shuffles her beside it with her heals still losing.
@@ -4818,7 +5124,8 @@ class FarmTask(BotTask):
                 for x, y, obj in visible_threats
                 if fight and max(abs(x - cx), abs(y - cy)) <= 1]
             if blockers:
-                _, x, y, obj = min(blockers, key=lambda entry: entry[0])
+                _, x, y, obj = min(blockers, key=lambda entry: (
+                    entry[0], self.caster_rank(client, entry[3])))
                 self._cornered_breakout_target = obj.target_id
                 self.remember_engagement(client, x, y, obj.target_id)
                 await client.clear_actions()
@@ -4838,6 +5145,23 @@ class FarmTask(BotTask):
         (viable, separation, escape_depth, escape_area, _, _, direction,
          world_x, world_y) = max(choices)
         recorder = getattr(client, "record_action", None)
+        hp = int(client.state.stats.get("hp", 0) or 0)
+        maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
+        healing_costs = [
+            int(item.extra.get("cost", 0) or 0)
+            for item in client.state.inventory
+            if item.item_type == c.TYPE_SPELL and
+            re.search(r"heal", item.name, re.I) and
+            int(item.extra.get("cost", 0) or 0) > 0
+        ]
+        next_heal = min(healing_costs, default=0)
+        sp = int(client.state.stats.get("sp", 0) or 0)
+        emergency_disengage = (
+            hp / maxhp <= self.safety.flee_below or
+            (next_heal > 0 and sp < next_heal) or
+            self._outpaced_until > now or
+            gain_only or out_healed
+        )
         # A retreat that sheds nobody is worse than standing: the pursuers
         # keep hitting while melee stays off, and the heals run dry. Once an
         # attacker has stayed adjacent through PURSUIT_STAND_STEPS retreat
@@ -4898,11 +5222,30 @@ class FarmTask(BotTask):
                              f"target={obj.target_id} adjacent={len(adjacent)} "
                              f"hp={ratio:.0%}")
                 return True
-        if (stand_candidates and not caster_stand and fight and
-                not (gain_only or out_healed) and
-                self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
-                ratio > self.STAND_HEALTH_FLOOR):
+        stand_due = bool(
+            stand_candidates and not caster_stand and fight and
+            not (gain_only or out_healed) and
+            self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
+            ratio > self.STAND_HEALTH_FLOOR)
+        if stand_due and len(adjacent) >= 2 and (
+                emergency_disengage or healing_outpaced(client)):
+            # Losing against two or more beside her (the disengage below,
+            # or heals that no longer keep up), a stand only trades blows
+            # with the whole pack: a step that sheds the nearest attacker
+            # comes first (the gain-only rule; an equal-distance step
+            # would shuffle her beside them). Without one she stands.
+            nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
+            gaining = [choice for choice in choices if choice[1] > nearest]
+            if gaining:
+                (viable, separation, escape_depth, escape_area, _, _,
+                 direction, world_x, world_y) = max(gaining)
+                if recorder is not None:
+                    recorder("pursued-stand-declined",
+                             f"adjacent={len(adjacent)} hp={ratio:.0%}")
+                stand_due = False
+        if stand_due:
             x, y, obj = min(stand_candidates, key=lambda entry: (
+                self.caster_rank(client, entry[2]),
                 int(getattr(entry[2], "target_hp", 0) or 100),
                 entry[2].target_id != engaged_id))
             self._pursued_retreats = 0
@@ -4932,26 +5275,12 @@ class FarmTask(BotTask):
                 "retreat-choice",
                 f"direction={direction} separation={separation} "
                 f"escape_depth={escape_depth} escape_area={escape_area} "
-                f"continuation={viable}")
+                f"continuation={viable}" + (
+                    "" if self.within_farm_map(
+                        client, cx + world_x - m.world_x,
+                        cy + world_y - m.world_y) else " seam=1"))
         await client.clear_actions()
         engaged_id = self._engaged_target[0] if self._engaged_target else 0
-        hp = int(client.state.stats.get("hp", 0) or 0)
-        maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
-        healing_costs = [
-            int(item.extra.get("cost", 0) or 0)
-            for item in client.state.inventory
-            if item.item_type == c.TYPE_SPELL and
-            re.search(r"heal", item.name, re.I) and
-            int(item.extra.get("cost", 0) or 0) > 0
-        ]
-        next_heal = min(healing_costs, default=0)
-        sp = int(client.state.stats.get("sp", 0) or 0)
-        emergency_disengage = (
-            hp / maxhp <= self.safety.flee_below or
-            (next_heal > 0 and sp < next_heal) or
-            self._outpaced_until > now or
-            gain_only or out_healed
-        )
         if emergency_disengage and recorder is not None:
             recorder(
                 "emergency-disengage",
@@ -5482,8 +5811,15 @@ class FarmTask(BotTask):
             return True
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
-        return self.map_node.walkable(
-            m.world_x + x - cx, m.world_y + y - cy)
+        # A caster beside her across a seam (caster_first) stands on the
+        # map tiled there.
+        found = seam_square(self.map_node, self.seam_neighbours(client),
+                            m.world_x + x - cx, m.world_y + y - cy)
+        if found is None:
+            return False
+        node, world_x, world_y = found
+        return ((node is not self.map_node and not node.terrain) or
+                node.walkable(world_x, world_y))
 
     def patrol_step_direction(
             self, start: tuple[int, int], goal: tuple[int, int],
@@ -5663,6 +5999,13 @@ class FarmTask(BotTask):
             not target_set_aside(client.state, obj.target_id) and
             not self.ignore_unrequested_peaceful(client, obj)
         ]
+        # A caster hurting her within reach (caster_first) is fought before
+        # melee attackers; one beside her across a seam is a threat too.
+        caster = self.caster_first(client)
+        if caster is not None and not any(
+                entry[3].target_id == caster[3].target_id
+                for entry in initial_threats):
+            initial_threats.append(caster)
         # A kill is terminal evidence for older contact. Keep the longer raw
         # contact window elsewhere for transient selected-target tracking, but
         # do not let a dead monster manufacture off-screen retreat steps before
@@ -5751,7 +6094,8 @@ class FarmTask(BotTask):
                 for aside in set_aside_threats)]
         if (hostile_contact and self._engaged_target is None and
                 contact_threats):
-            _, x, y, obj = min(contact_threats, key=lambda entry: entry[0])
+            _, x, y, obj = min(contact_threats, key=lambda entry: (
+                entry[0], self.caster_rank(client, entry[3])))
             # An aggressive monster can land its first hit before the normal
             # target scan. Commit it before emergency healing preempts combat.
             self.remember_engagement(client, x, y, obj.target_id)
@@ -5767,6 +6111,10 @@ class FarmTask(BotTask):
             self._last_action = time.monotonic()
             return
         if await self.recall_pending_step(client):
+            return
+        if (not self.out_healed_running(client, time.monotonic()) and
+                await self.break_caster_sight(client)):
+            # Shot at by a caster out of reach: a wall between them first.
             return
         if (hostile_contact and self._engaged_target is None and
                 not contact_threats and set_aside_threats):
@@ -5916,6 +6264,11 @@ class FarmTask(BotTask):
             if self.out_of_league_idle(client, obj, hostile_contact):
                 continue
             targets.append((distance, x, y, obj))
+        if caster is not None and not any(
+                entry[3].target_id == caster[3].target_id
+                for entry in threats):
+            # An adjacent caster across a seam is a threat she fights.
+            threats.append(caster)
         if self._engaged_target is not None:
             # Once it has stopped hitting her, an engagement with such a
             # kind is dropped rather than walked back to.
@@ -6026,7 +6379,11 @@ class FarmTask(BotTask):
                 self._last_action = time.monotonic()
                 return
         self._training_resting = False
-        if engaged is not None:
+        if caster is not None and caster[3].target_id not in pulled_aside_ids:
+            # A caster hurting her within reach comes before any melee
+            # attacker, the engaged one included (caster_first).
+            targets = [caster]
+        elif engaged is not None:
             # Finish the creature deliberately pulled/engaged instead of
             # switching to whichever add happens to step one tile closer.
             targets = [engaged]
@@ -6180,7 +6537,11 @@ class FarmTask(BotTask):
             stationary_caster = bool(
                 isolated_caster and
                 self.stationary_caster(client, x, y, obj))
-            if not spell_alignment_pending:
+            # Just behind cover from a caster out of reach: let this
+            # target come to her rather than step back into the line.
+            covering = bool(self._cover_hold_until > time.monotonic() and
+                            not self.authored_caster(client, obj))
+            if not spell_alignment_pending and not covering:
                 if (stationary_caster and
                         await self.caster_orbit(client, x, y, obj)):
                     self._last_action = time.monotonic()
@@ -6193,7 +6554,8 @@ class FarmTask(BotTask):
                 # Target + combat mode drives automatic melee. Movement is
                 # reserved for deliberate dodging and positional bonuses.
                 await self.melee_position(client, x, y, obj)
-            elif not await self.post_pull_wait(client, x, y, obj):
+            elif (not covering and
+                  not await self.post_pull_wait(client, x, y, obj)):
                 # One approach/alignment step per safety tick avoids a queued
                 # path traversing several unseen aggro radii.
                 await self.approach_target(client, x, y, obj)
@@ -8132,7 +8494,8 @@ def fight_view(client: AtrinikClient, recorder: terrain.FightRecorder
     def scan() -> tuple[list[terrain.Hostile], int]:
         content = getattr(client, "authored_content", None)
         own = plain(state.player_name)
-        casters = getattr(node, "caster_identities", ()) or ()
+        # Casters spawned across a seam shoot into her map too.
+        casters = area_caster_identities(node, tiled_neighbours(graph, node))
         cx, cy = m.width // 2, m.height // 2
         hostiles: list[terrain.Hostile] = []
         players = 0

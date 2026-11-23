@@ -1170,8 +1170,9 @@ breakout and the pursued stand) is unchanged here; an earlier attempt to
 change them, during the review of
 [pull request 117](https://github.com/atrinik/playtester/pull/117), spawned
 edge cases and was reverted. Only the narrow
-[heals-losing disengage](#heals-losing-on-the-farm-2026-11-23) below
-touches it.
+[heals-losing disengage](#heals-losing-on-the-farm-2026-11-23) and the
+[caster and pocket rules](#casters-across-a-seam-2026-11-23) below touch
+it.
 
 ## Heals losing on the farm (2026-11-23)
 
@@ -1247,6 +1248,107 @@ Accepted limits:
   for those 10 minutes;
 - a burst from full health that ends the fight before three heals is not
   seen; the existing flee threshold and recall handle it.
+
+## Casters across a seam (2026-11-23)
+
+Read from her post-mortem, decisions and journal (v1.98.0, the
+Underground City circuit, `underground_city_1_3`): she died at (7, 1) to
+three attackers at once, with 565 damage taken in about a minute. The orc
+sorcerer did 69% of it (magic bullet 259, its own cleave 132), and she has
+no protection against magic. She never fought it: she swung at the orcs
+beside it. The facts:
+
+- Orc sorcerers spawn on `underground_city_1_2`, tiled to the north of
+  1_3. The room at 1_3 (0-7, 0-1) runs on into 1_2's room at (0-6,
+  16-23), where they stand. The farm read caster kinds only from its own
+  map's authored list, and 1_3 has none. It also left every creature off
+  its own map out of its threats and targets.
+- The sorcerer's magic bullet is an aimed projectile. Its hits name the
+  missile ("magic bullet hit you"), not the caster. The fight record
+  counted no ranged attacker (`ranged_attackers` 0).
+- She fought on the room side of the doorway at (8, 1), in the
+  sorcerers' line. The corridor side is behind the wall.
+- Her retreat steps were clamped to 1_3, so the pocket by the seam was a
+  dead end. A pursued stand turned her on three adjacent attackers while
+  she was disengaging (`emergency-disengage`, `out-healed-disengage`
+  soon after).
+
+Now, on the farm map:
+
+- **Casters across a seam count.** A caster kind is an authored caster
+  (`can_cast_spell`) of the farm map or of any map tiled to its sides or
+  corners (`area_caster_identities`, through `terrain.tile_directions`).
+  This is used for target choice, the stationary-caster orbit and the
+  fight record's ranged count (`fight_positions.ranged_attackers`).
+- **Caster first** (`caster_first`). A caster within
+  `CASTER_FIRST_REACH` (2) is fought before any melee attacker, the
+  engaged one included, when it is hurting her: it is beside her, its
+  name is in a recent hit or miss, or an aimed spell hit her in the last
+  `COVER_HIT_SECONDS` (12 s) and no wall stands between it and her.
+  Across a seam only an adjacent caster counts, and it then counts as a
+  threat. The same rank comes first when she picks one attacker among
+  several: the first contact she commits to, the pursued stand, the
+  cornered breakout's blocker. A breakout or stand latched on a melee
+  attacker switches to a caster that comes beside her.
+- **Breaking a caster's line** (`break_caster_sight`). The rule applies
+  after an aimed spell hit in the last 12 s, while every visible caster
+  with a clear line to her is out of reach. She then takes one step that
+  puts an authored wall between her and as many of them as possible
+  (`wall_covers`). The line is the server's projectile flight
+  (`cover_cells`, from the caster), across seams. A wall there also takes
+  away the sight a monster needs to cast at all (`monster_cast_spell`,
+  `server/src/types/monster.c`). Doors do not count, because orcs open
+  them. Rules for the step:
+  - It never puts more attackers beside her than she has now.
+  - Among the steps, she takes first the one that covers the most
+    casters, then the square fewer melee attackers can reach
+    (`terrain.features`), then the one farthest from the nearest other
+    hostile.
+  - It is recorded as `caster-cover`, and its square is learned as
+    blocked if it never lands.
+  - It runs before healing and the retreats, but not while she runs from
+    losing heals (`out_healed_running`). A step in flight lets the rest
+    of the tick, healing first, go on.
+  - For `COVER_HOLD_SECONDS` (4 s) afterwards she neither approaches nor
+    kites a melee target. It comes to her. A caster target is still
+    approached.
+  - In the incident pocket she steps through the doorway (8, 1) to the
+    corridor side, which neither sorcerer can see.
+- **A seam pocket is no dead end.** The low-health retreat may step onto
+  a map tiled to the farm map, but only when every step on the farm map
+  is a dead end (an escape depth under 2) or there is none. The square
+  must be walkable and unoccupied on that map. The step must gain
+  distance from the nearest threat, and the square must have no more
+  hostiles within 4 tiles than hers. The decision is
+  `retreat-choice ... seam=1`.
+- **No stand into a losing pack.** A pursued stand that is due, against
+  two or more attackers beside her while she is losing, gives way to a
+  step that sheds the nearest of them (`pursued-stand-declined`). Losing
+  means the retreat's own emergency disengage (at or below the flee
+  threshold, short of mana for a heal, or healing outpaced) or heals
+  that no longer keep up (`healing_outpaced`). This is the gain-only rule
+  of [pull request 120](https://github.com/atrinik/playtester/pull/120)
+  and [pull request 124](https://github.com/atrinik/playtester/pull/124):
+  an equal-distance step does not count, since it
+  shuffled her between two squares beside the attackers. With no gaining
+  step she stands as before, caster first, so the declined stand cannot
+  ping-pong. The pursuit count goes on, and the stand floor, the
+  out-healed rules and the emergency recall are unchanged.
+
+Accepted limits:
+
+- after a seam step she is off the farm map. The circuit's walk
+  (`NavigateThenTask`) then takes her back to it, and its own defence,
+  not the farm's, handles the attackers that follow;
+- cover is judged from the authored walls and the casters in view. A
+  caster out of view, a summoned or unauthored one, or a door an orc has
+  closed again is not modelled. A spell hit with no caster in view
+  starts no cover step;
+- the failure review still counts a missile name ("magic bullet") as an
+  attacker of its own. Out-of-league marks still match only the hits'
+  names, as noted above;
+- the farm still neither pulls nor walks to creatures across a seam. Only
+  an adjacent caster there is fought.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 

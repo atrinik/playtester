@@ -16663,6 +16663,276 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(task.status, TaskStatus.RUNNING)
 
 
+class CasterFirstTests(unittest.TestCase):
+    """Caster first, breaking a caster's line, retreats across a seam and
+    the losing-pack stand (COMBAT.md, the 2026-11-23 Underground City
+    death)."""
+
+    UC = "/shattered_islands/strakewood_island/underground_city/underground_city_1_"
+
+    @staticmethod
+    def _say(client, *texts, ago=1.0):
+        client.state.messages = [
+            (time.time() - ago, 2, "ff0000", text) for text in texts]
+
+    def _seam_fight(self, her=(12, 12)):
+        """An open /test farm with /north tiled above it, whose authored
+        orc sorcerers the farm map itself does not list."""
+        client = QuestTests._combat_client()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        QuestTests._record_actions(client)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        node.edges.append(MapEdge("/test", "/north", 12, -1, kind="tile"))
+        north = MapNode(path="/north", width=25, height=25)
+        north.terrain = dict(node.terrain)
+        north.caster_identities.add("orc sorcerer")
+        client.world_graph = types.SimpleNamespace(
+            nodes={"/test": node, "/north": north})
+        task = FarmTask(zone="/test")
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x, client.state.map.world_y = her
+        return client, task
+
+    @staticmethod
+    def _put(client, x, y, name, target_id, hp=100):
+        obj = MapObject(3, 1, 0, 0, name=name, target_id=target_id,
+                        target_hp=hp)
+        client.state.map.tile(x, y).objects[3] = obj
+        return obj
+
+    def test_a_caster_spawned_across_a_seam_is_an_authored_caster(self):
+        client, task = self._seam_fight()
+        sorcerer = self._put(client, 6, 8, "orc sorcerer", 300)
+        warrior = self._put(client, 9, 8, "orc warrior", 100)
+        self.assertTrue(task.authored_caster(client, sorcerer))
+        self.assertFalse(task.authored_caster(client, warrior))
+        # Against the farm map's own list only, as before.
+        self.assertFalse(task.authored_caster(client, sorcerer, task.map_node))
+
+    def test_an_adjacent_caster_across_the_seam_is_fought(self):
+        client, task = self._seam_fight(her=(12, 0))
+        # Beside her, one square over the seam on /north.
+        self._put(client, 8, 7, "orc sorcerer", 300)
+        self._say(client, "orc sorcerer hit you for 27 (-22) cleave damage.")
+        asyncio.run(task.tick(client))
+        self.assertIn((8, 7, 300), client.targets)
+        self.assertEqual(task._engaged_target[0], 300)
+        self.assertIn(True, client.combat)
+
+    def test_a_caster_shooting_within_reach_comes_before_the_engaged_orc(self):
+        client, task = self._seam_fight()
+        self._put(client, 13, 8, "orc warrior", 100)
+        self._put(client, 6, 8, "orc sorcerer", 300)
+        task.remember_engagement(client, 13, 8, 100)
+        # The hit names the missile, not the caster two squares away.
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.targets[-1], (6, 8, 300))
+        self.assertEqual(task._engaged_target[0], 300)
+        self.assertNotIn("caster-cover",
+                         [action for action, _ in client.recorded])
+
+    def _pack(self, hp=32, terrain=None):
+        client, task = self._seam_fight()
+        # East of her and north of her: a step south-west sheds both.
+        self._put(client, 9, 8, "orc warrior", 100)
+        self._put(client, 8, 7, "orc sorcerer", 300)
+        task.remember_engagement(client, 9, 8, 100)
+        client.state.stats.update(hp=hp, maxhp=32)
+        if terrain is not None:
+            task.map_node.terrain = terrain
+        # Both have stayed beside her through several retreat steps.
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100, 300}
+        task._pursuit_last_at = time.monotonic()
+        return client, task
+
+    def test_a_pursued_stand_turns_on_the_caster_first(self):
+        client, task = self._pack()
+        asyncio.run(task.tick(client))
+        stands = [detail for action, detail in client.recorded
+                  if action == "pursued-stand"]
+        self.assertEqual(len(stands), 1)
+        self.assertIn("target=300", stands[0])
+        self.assertEqual(client.targets[-1], (8, 7, 300))
+
+    def test_a_latched_stand_switches_to_a_caster_beside_her(self):
+        client, task = self._pack()
+        task._pursued_retreats = 0
+        task._cornered_breakout_target = 100
+        task._stand_latch = True
+        asyncio.run(task.low_health_retreat(client))
+        self.assertEqual(task._cornered_breakout_target, 300)
+        self.assertEqual(client.targets[-1], (8, 7, 300))
+
+    def test_losing_beside_two_takes_a_gaining_step_instead_of_a_stand(self):
+        client, task = self._pack(hp=25)
+        task.safety.flee_below = 0.90
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("pursued-stand-declined", actions)
+        self.assertNotIn("pursued-stand", actions)
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(len(client.direct_moves), 1)
+        dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        # Away from both, at (9, 8) and (8, 7) beside her (8, 8).
+        self.assertGreater(min(max(abs(8 + dx - 9), abs(8 + dy - 8)),
+                               max(abs(8 + dx - 8), abs(8 + dy - 7))), 1)
+
+    def test_losing_beside_two_with_no_gaining_step_still_stands(self):
+        # Only squares still beside one of the orcs are open: a step
+        # there sheds neither, and shuffling between them is the
+        # ping-pong the gain-only rule forbids. The stand defends her,
+        # caster first.
+        client, task = self._pack(
+            hp=25, terrain={(12, 12): 1, (13, 11): 1, (12, 13): 1})
+        task.safety.flee_below = 0.90
+        asyncio.run(task.tick(client))
+        stands = [detail for action, detail in client.recorded
+                  if action == "pursued-stand"]
+        self.assertEqual(len(stands), 1)
+        self.assertIn("target=300", stands[0])
+        self.assertNotIn("pursued-stand-declined",
+                         [action for action, _ in client.recorded])
+        self.assertEqual(client.direct_moves, [])
+
+    POCKET = ["#...#",
+              "##.##",
+              "##.##",
+              "##.##",
+              "#####"]
+
+    def _pocket(self):
+        """She at (2, 0) of a pocket on /t's top edge, an orc below her in
+        its only way out; /next_0_-1, tiled above, is open."""
+        client = QuestTests._combat_client()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        QuestTests._record_actions(client)
+        node = terrain_node(self.POCKET, tiled=((0, -1),))
+        north = MapNode("/next_0_-1", width=5, height=5)
+        north.terrain = {(x, y): 1 for x in range(5) for y in range(5)}
+        client.world_graph = types.SimpleNamespace(
+            nodes={"/t": node, "/next_0_-1": north})
+        client.state.map.path = "/t"
+        client.state.map.world_x, client.state.map.world_y = 2, 0
+        self._put(client, 8, 9, "orc warrior", 100)
+        task = FarmTask(zone="/t")
+        task.map_node = node
+        task.map_bounds = (5, 5)
+        return client, task
+
+    def test_a_seam_pocket_retreat_steps_onto_the_tiled_map(self):
+        client, task = self._pocket()
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]][1], -1)
+        choice = dict(client.recorded)["retreat-choice"]
+        self.assertIn("seam=1", choice)
+        self.assertIn("continuation=1", choice)
+
+    def test_a_seam_step_toward_more_hostiles_is_not_taken(self):
+        client, task = self._pocket()
+        # Another orc across the seam, four squares beyond the step.
+        self._put(client, 8, 3, "orc warrior", 101)
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+        # The old in-map choice: a dead end beside her, not over the seam.
+        self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]][1], 0)
+        self.assertNotIn("seam=1", dict(client.recorded)["retreat-choice"])
+
+    def test_she_steps_behind_a_wall_from_a_caster_out_of_reach(self):
+        client, task = self._seam_fight()
+        node = task.map_node
+        # A wall with a gap: the sorcerer 5 west shoots along row 12.
+        node.blocked.update({(10, 11), (10, 13), (11, 11), (11, 13)})
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self._say(client,
+                  "magic bullet hit you for 65 (0) weapon magic damage.")
+        asyncio.run(task.tick(client))
+        self.assertIn("caster-cover",
+                      [action for action, _ in client.recorded])
+        self.assertEqual(len(client.direct_moves), 1)
+        dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        from .tasks import wall_covers
+        self.assertTrue(wall_covers(node, {}, (7, 12), (12 + dx, 12 + dy)))
+        # Covered, she holds rather than walk back out to a target, and
+        # takes no second cover step.
+        client.state.map.world_x += dx
+        client.state.map.world_y += dy
+        client.state.map.tiles.clear()
+        self._put(client, 3 - dx, 8 - dy, "orc sorcerer", 300)
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(
+            [action for action, _ in client.recorded].count("caster-cover"), 1)
+
+    def test_no_cover_step_without_a_spell_hit(self):
+        client, task = self._seam_fight()
+        task.map_node.blocked.update({(10, 11), (10, 13)})
+        self._put(client, 3, 8, "orc sorcerer", 300)
+        self.assertFalse(asyncio.run(task.break_caster_sight(client)))
+        self._say(client, "orc warrior hit you for 20 (-20) impact damage.")
+        self.assertFalse(asyncio.run(task.break_caster_sight(client)))
+        self.assertEqual(client.direct_moves, [])
+
+    def test_the_underground_city_pocket_from_the_incident(self):
+        """1_3 (7, 1), on the room side of the door at (8, 1), with 1_2's
+        orc sorcerers (spawns (4, 18) and (0, 19)) in line across the
+        seam: she steps through the doorway to the corridor side, out of
+        both lines."""
+        from .tasks import area_caster_identities, tiled_neighbours, wall_covers
+        graph = built_graph()
+        farm = graph.nodes[self.UC + "3"]
+        seams = tiled_neighbours(graph, farm)
+        self.assertNotIn("orc sorcerer", farm.caster_identities)
+        self.assertIn("orc sorcerer", area_caster_identities(farm, seams))
+        sorcerers = ((4, 18 - 24), (0, 19 - 24))
+        for sorcerer in sorcerers:
+            self.assertFalse(wall_covers(farm, seams, sorcerer, (7, 1)))
+            self.assertTrue(wall_covers(farm, seams, sorcerer, (9, 1)))
+        client = QuestTests._combat_client()
+        QuestTests._record_actions(client)
+        client.world_graph = graph
+        m = client.state.map
+        m.path = self.UC + "3"
+        m.world_x, m.world_y = 7, 1
+        task = FarmTask(zone=m.path)
+        task.map_node = farm
+        task.map_bounds = (farm.width, farm.height)
+
+        def place():
+            m.tiles.clear()
+            for index, (x, y) in enumerate(sorcerers):
+                self._put(client, 8 + x - m.world_x, 8 + y - m.world_y,
+                          "orc sorcerer", 300 + index)
+
+        steps = []
+        for _ in range(3):
+            place()
+            self._say(client,
+                      "magic bullet hit you for 65 (0) weapon magic damage.")
+            task._last_action = 0.0
+            task._retreat_attempt = None
+            moved = len(client.direct_moves)
+            asyncio.run(task.tick(client))
+            if len(client.direct_moves) == moved:
+                break
+            dx, dy = c.DIRECTION_DELTAS[client.direct_moves[-1][0]]
+            m.world_x += dx
+            m.world_y += dy
+            steps.append((m.world_x, m.world_y))
+        self.assertTrue(steps)
+        here = (m.world_x, m.world_y)
+        self.assertGreater(here[0], 8, steps)
+        self.assertTrue(all(wall_covers(farm, seams, sorcerer, here)
+                            for sorcerer in sorcerers), steps)
+
+
 class NavigationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -29466,6 +29736,28 @@ class FightStorageTests(unittest.TestCase):
         self.assertNotIn("zoey", repr(stored).casefold())
         self.assertNotIn("orc", repr(stored).casefold())
         self.assertEqual(client._memory_store().fight_count("Sera"), 1)
+
+    def test_a_caster_spawned_across_a_seam_is_a_ranged_attacker(self):
+        from . import terrain
+        from .tasks import observe_fight
+        client = self.client()
+        m = client.state.map
+        # Sorcerers spawn only on the map tiled north of /t.
+        client.world_graph.nodes["/t"] = terrain_node(
+            TerrainTests.CORRIDOR, tiled=((0, -1),))
+        north = MapNode("/next_0_-1", width=7, height=7)
+        north.caster_identities.add("orc sorcerer")
+        client.world_graph.nodes["/next_0_-1"] = north
+        self.assertEqual(observe_fight(client), 0)
+        m.tile(8, 2).objects[3] = MapObject(3, 1, 0, 0, name="orc sorcerer",
+                                            name_color="ff0000", target_id=8)
+        self.say(client, "magic bullet hit you for 65 (0) weapon magic damage.")
+        self.assertEqual(observe_fight(client), 0)
+        self.say(client, "You have died.")
+        with patch.object(terrain, "DEATH_GRACE_SECONDS", -1.0):
+            self.assertEqual(observe_fight(client), 1)
+        row, = client._memory_store().fights("Sera")
+        self.assertEqual(row["ranged_attackers"], 1)
 
     def test_disease_symptoms_from_the_content_are_no_attackers(self):
         from .tasks import disease_names, observe_fight
