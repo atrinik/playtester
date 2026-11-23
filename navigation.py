@@ -63,7 +63,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     healing_outpaced, recent_hostile_attackers,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
-                    combat_allowed, unprepared_for_trips, wand_known_empty)
+                    combat_allowed, UnpreparedHold, wand_known_empty)
 from .tasks import RECALL_REQUIRED_LEVEL
 log = logging.getLogger(__name__)
 
@@ -6775,6 +6775,8 @@ class FarmCircuitTask(BotTask):
         self.clear_hostile_route = bool(clear_hostile_route)
         self.clock = clock
         self.server_clock = ServerGameClock(clock=clock)
+        # Optional trips held without a usable heal or a ready recall.
+        self._unprepared_hold = UnpreparedHold("optional trips", clock=clock)
         self.leg_index = 0
         self.child: NavigateThenTask | None = None
         self._farm_started_at = 0.0
@@ -8399,6 +8401,12 @@ class FarmCircuitTask(BotTask):
                 name for name in ("_shopping", "_utility_shopping")
                 if name in running), ""))
 
+    def unprepared_resting(self) -> bool:
+        """Whether its farm rests for want of a heal or a recall
+        (FarmTask.unprepared_resting): an explained wait, not being stuck."""
+        farm = self.child.task if self.child is not None else None
+        return isinstance(farm, FarmTask) and farm.unprepared_resting()
+
     def hold_new_pulls(self, hold: bool = True) -> None:
         """While the switch to recovery waits: the farm pulls no new target
         (FarmTask.hold_new_pulls); a rebuilt farm child is held again.
@@ -9531,9 +9539,11 @@ class FarmCircuitTask(BotTask):
             await self._banking.tick(client)
             return
         # Optional trips wait while she has neither a usable heal nor a
-        # ready recall below UNPREPARED_HEALTH (unprepared_for_trips); the
-        # farm rests meanwhile (FarmTask.unprepared_for_pulls).
-        unprepared = unprepared_for_trips(client)
+        # ready recall below UNPREPARED_HEALTH (unprepared_for_trips), for
+        # at most UNPREPARED_REST_LIMIT_SECONDS; the farm rests meanwhile
+        # (FarmTask.unprepared_for_pulls).
+        unprepared = (isinstance(farm, FarmTask) and
+                      self._unprepared_hold.active(client, farm.safety))
         if (isinstance(farm, FarmTask) and
                 self._needs_ship_key(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):

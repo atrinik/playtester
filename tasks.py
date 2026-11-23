@@ -449,6 +449,10 @@ def out_of_heals_and_recall(client: AtrinikClient,
 # 2026-11-22: a recall is not relied on; FarmTask.unprepared_for_pulls,
 # unprepared_for_trips).
 UNPREPARED_HEALTH = 0.90
+# An unprepared rest or errand hold lasts at most this long in a row; then
+# she goes on as before (damage over time can outpace regeneration) and
+# records unprepared-rest-timeout once (UnpreparedHold).
+UNPREPARED_REST_LIMIT_SECONDS = 600.0
 
 
 def unprepared_for_trips(client: AtrinikClient,
@@ -464,6 +468,43 @@ def unprepared_for_trips(client: AtrinikClient,
             int(stats.get("hp", 0) or 0) / maxhp >= UNPREPARED_HEALTH):
         return False
     return out_of_heals_and_recall(client, safety or SafetyPolicy())
+
+
+class UnpreparedHold:
+    """unprepared_for_trips, capped at UNPREPARED_REST_LIMIT_SECONDS of
+    continuous holding. ``what`` names the hold in its timeout record."""
+
+    def __init__(self, what: str,
+                 clock: Callable[[], float] = time.monotonic):
+        self.what = what
+        self.clock = clock
+        self.since: float | None = None
+        self.timed_out = False
+
+    def active(self, client: AtrinikClient,
+               safety: "SafetyPolicy | None" = None) -> bool:
+        """Whether to hold now; False once the cap ran out, until she is
+        prepared again (then the next hold starts afresh)."""
+        if not unprepared_for_trips(client, safety):
+            self.since, self.timed_out = None, False
+            return False
+        now = self.clock()
+        if self.since is None:
+            self.since = now
+        if now - self.since < UNPREPARED_REST_LIMIT_SECONDS:
+            return True
+        if not self.timed_out:
+            self.timed_out = True
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("unprepared-rest-timeout",
+                         f"{self.what}: held {now - self.since:.0f} s without "
+                         "a usable heal or a ready recall; going on")
+        return False
+
+    def holding(self) -> bool:
+        """Whether a hold is under way and not timed out."""
+        return self.since is not None and not self.timed_out
 
 
 def combat_allowed(client: AtrinikClient) -> bool:
@@ -1857,8 +1898,9 @@ class FarmTask(BotTask):
         self._training_resting = False
         self._training_rest_at = 0.0
         # Resting for want of a usable heal or a ready recall
-        # (unprepared_for_pulls), recorded once per rest.
+        # (unprepared_for_pulls), recorded once per rest, and its cap.
         self._unprepared_resting = False
+        self._unprepared_hold = UnpreparedHold("farm pulls")
         self._melee_cycle_anchor = 0.0
         self._melee_anchor_message_at = 0.0
         self._finish_race_targets: set[int] = set()
@@ -2352,7 +2394,9 @@ class FarmTask(BotTask):
                                ratio: float) -> None:
         """Rest where she stands, combat off, until a heal is usable again
         (her SP regenerates), a recall is ready, or her health is back to
-        UNPREPARED_PULL_HEALTH. Recorded once per rest."""
+        UNPREPARED_PULL_HEALTH, for at most UNPREPARED_REST_LIMIT_SECONDS
+        (UnpreparedHold). Recorded once per rest. Whatever comes at her
+        meanwhile is still fought."""
         if self._unprepared_resting:
             return
         self._unprepared_resting = True
@@ -2362,6 +2406,10 @@ class FarmTask(BotTask):
                      f"hp={ratio:.0%}: no usable heal and no ready recall")
         await client.clear_actions()
         await client.set_combat(False)
+
+    def unprepared_resting(self) -> bool:
+        """Whether an unprepared rest is under way (for the stuck alert)."""
+        return self._unprepared_resting and self._unprepared_hold.holding()
 
     def training_rest_active(self) -> bool:
         """Whether a mana rest was confirmed on the farm just now."""
@@ -5729,7 +5777,8 @@ class FarmTask(BotTask):
                 targets = threats
             targets = [entry for entry in targets
                        if entry[3].target_id not in pulled_aside_ids]
-        unprepared = engaged is None and self.unprepared_for_pulls(client)
+        unprepared = (engaged is None and
+                      self._unprepared_hold.active(client, self.safety))
         if not unprepared:
             self._unprepared_resting = False
         if (self.hold_new_pulls or unprepared) and engaged is None:

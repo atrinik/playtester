@@ -76,9 +76,6 @@ class AutoplayTask(BotTask):
         # circuit (AutoplayTask.HANDOVER_SECONDS).
         self._handover_since: float | None = None
         self.safety = SafetyPolicy()
-        # Resting before an optional errand (unprepared_for_trips),
-        # recorded once per rest.
-        self._unprepared_errand_rest = False
 
     def _needs_temple_food(self, client: AtrinikClient) -> bool:
         """Starving where nothing else will feed her.
@@ -174,6 +171,29 @@ class AutoplayTask(BotTask):
                 return True
         self._temple_food_retry_at = (
             time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
+        return False
+
+    async def _start_mana_crystal_detours(self, client: AtrinikClient) -> bool:
+        """Start the mana crystal's start, recovery or upgrade when due.
+
+        Every path that starts one comes here. None starts while she has
+        neither a usable heal nor a ready recall below UNPREPARED_HEALTH
+        (unprepared_for_trips): it is postponed, and she farms (or rests on
+        the farm) meanwhile. Live, on 2026-11-22, the mana-crystal-upgrade
+        errand took her into the Old Outpost with no heals and no recall,
+        and she died there.
+        """
+        if unprepared_for_trips(client, self.safety):
+            return False
+        if self._needs_mana_crystal_start(client):
+            await self._start_mana_crystal_detour(client)
+            return True
+        if self._needs_mana_crystal_recovery(client):
+            await self._start_mana_crystal_recovery(client)
+            return True
+        if self._needs_mana_crystal_upgrade(client):
+            await self._start_mana_crystal_upgrade(client)
+            return True
         return False
 
     def _needs_mana_crystal_start(self, client: AtrinikClient) -> bool:
@@ -315,7 +335,11 @@ class AutoplayTask(BotTask):
         recall = recall_alerts(client)
         reason = farming_unsafe_reason(client)
         if not reason:
-            return recall, False
+            # A farm resting for want of a heal or a recall (at most
+            # UNPREPARED_REST_LIMIT_SECONDS) is waiting, not stuck.
+            resting = (isinstance(self.child, FarmCircuitTask) and
+                       self.child.unprepared_resting())
+            return recall, resting
         alerts = [{"id": "farming-suspended", "level": "warn",
                    "text": f"Farming suspended: {reason}"}] + recall
         waiting = False
@@ -402,16 +426,9 @@ class AutoplayTask(BotTask):
                     self.child.hold_new_pulls(False)
             if (self.phase == "adaptive-farming" and
                     isinstance(self.child, FarmCircuitTask) and
-                    self.child.safe_for_progression_detour(client)):
-                if self._needs_mana_crystal_start(client):
-                    await self._start_mana_crystal_detour(client)
-                    return
-                if self._needs_mana_crystal_recovery(client):
-                    await self._start_mana_crystal_recovery(client)
-                    return
-                if self._needs_mana_crystal_upgrade(client):
-                    await self._start_mana_crystal_upgrade(client)
-                    return
+                    self.child.safe_for_progression_detour(client) and
+                    await self._start_mana_crystal_detours(client)):
+                return
             try:
                 await self.child.tick(client)
                 if isinstance(self.child, (FarmCircuitTask, RecoveryTask)):
@@ -483,34 +500,7 @@ class AutoplayTask(BotTask):
         if farming_unsafe_reason(client):
             await self._start_recovery(client)
             return
-        # No optional errand (the mana crystal detours, a farm circuit and
-        # its walk out) starts while she has neither a usable heal nor a
-        # ready recall below UNPREPARED_HEALTH: she rests where she is
-        # first (owner decision, 2026-11-22; live, a mana-crystal errand
-        # into the Old Outpost with no heals killed her).
-        if unprepared_for_trips(client, self.safety):
-            if not self._unprepared_errand_rest:
-                self._unprepared_errand_rest = True
-                hp = int(client.state.stats.get("hp", 0) or 0)
-                maxhp = int(client.state.stats.get("maxhp", 0) or 0)
-                recorder = getattr(client, "record_action", None)
-                if recorder is not None:
-                    recorder("unprepared-errand-rest",
-                             f"hp={hp}/{maxhp}: no usable heal and no ready "
-                             "recall")
-                await client.clear_actions()
-                await client.set_combat(False)
-            await self.safety.enforce(client)
-            return
-        self._unprepared_errand_rest = False
-        if self._needs_mana_crystal_start(client):
-            await self._start_mana_crystal_detour(client)
-            return
-        if self._needs_mana_crystal_recovery(client):
-            await self._start_mana_crystal_recovery(client)
-            return
-        if self._needs_mana_crystal_upgrade(client):
-            await self._start_mana_crystal_upgrade(client)
+        if await self._start_mana_crystal_detours(client):
             return
 
         # The farming analyzer is the only source of farm spots. Until its

@@ -6506,6 +6506,15 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task._last_action = 0
         asyncio.run(task.tick(client))
         self.assertEqual(client.decisions, ["unprepared-rest"])
+        # Ten minutes in a row at most: then she patrols to pull again,
+        # recorded once.
+        from .tasks import UNPREPARED_REST_LIMIT_SECONDS
+        task._unprepared_hold.since -= UNPREPARED_REST_LIMIT_SECONDS
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertEqual(client.decisions,
+                         ["unprepared-rest", "unprepared-rest-timeout"])
         # 90 % and up, a potion, or below level 18: she patrols to pull.
         for client, _ in (farm(29), farm(24, potion=True), farm(24, level=17)):
             self.assertEqual(len(client.direct_moves), 1)
@@ -21132,7 +21141,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             client.state.player_tag)
         self.assertEqual(recall_alerts(client), [])
 
-    def test_no_optional_errand_starts_without_heals_or_recall_below_90_percent(self):
+    def test_no_mana_crystal_detour_starts_without_heals_or_recall_below_90_percent(self):
         # Live, 2026-11-22: with no heals and no recall she took the
         # mana-crystal-upgrade errand into the Old Outpost and died there.
         def autoplay_for(client):
@@ -21146,15 +21155,20 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             autoplay._start_mana_crystal_upgrade = start_upgrade
             return autoplay, started
 
+        # With no child: postponed, and the farm circuit starts as before.
         client, _ = self.client(recall=False)
         client.state.stats.update(hp=67, maxhp=134, sp=0)
         autoplay, started = autoplay_for(client)
-        for _ in range(3):
+        for _ in range(2):
             asyncio.run(autoplay.tick(client))
         self.assertEqual(started, [])
-        self.assertIsNone(autoplay.child)
-        self.assertEqual(self.actions(client).count("unprepared-errand-rest"), 1)
-        # Back to 90 %: the errand starts.
+        self.assertEqual(autoplay.phase, "adaptive-farming")
+        self.assertIsInstance(autoplay.child, FarmCircuitTask)
+        # Mid-circuit, where a detour may start: still postponed.
+        autoplay.child.safe_for_progression_detour = lambda client: True
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(started, [])
+        # Back to 90 %: the mid-circuit detour starts.
         client.state.stats["hp"] = 121
         asyncio.run(autoplay.tick(client))
         self.assertEqual(started, ["mana-crystal-upgrade"])
@@ -21174,40 +21188,11 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             asyncio.run(autoplay.tick(client))
             asyncio.run(autoplay.tick(client))
             self.assertEqual(started, ["mana-crystal-upgrade"])
-            self.assertNotIn("unprepared-errand-rest", self.actions(client))
-        # Essential trips are not delayed: hungry, the temple food trip goes.
-        client, _ = self.client(recall=False)
-        client.state.stats.update(hp=67, maxhp=134, sp=0)
-        autoplay, started = autoplay_for(client)
-        food = []
 
-        async def temple_food(client):
-            food.append(1)
-            return True
-
-        autoplay._needs_temple_food = lambda client: True
-        autoplay._start_temple_food = temple_food
-        asyncio.run(autoplay.tick(client))
-        self.assertEqual(food, [1])
-        # Depleted: the recovery phase (the cure) is not delayed either.
-        client, _ = self.client(recall=False, depletion=92)
-        client.state.stats.update(hp=67, maxhp=134, sp=0)
-        autoplay, started = autoplay_for(client)
-        asyncio.run(autoplay.tick(client))
-        asyncio.run(autoplay.tick(client))
-        self.assertEqual(autoplay.phase, "recovery")
-        self.assertNotIn("unprepared-errand-rest", self.actions(client))
-
-    def test_the_circuit_starts_no_optional_trip_without_heals_or_recall(self):
-        from .tasks import unprepared_for_trips
-
-        # 80 %: above every heal and flee threshold, below 90 %.
-        client, _ = self.client(recall=False, bank=20_000)
-        client.state.stats.update(hp=107, maxhp=134)
-        self.assertTrue(unprepared_for_trips(client))
+    def unprepared_circuit(self, client, needs):
+        """A circuit at the point where it starts optional trips, with
+        only ``needs`` due."""
         circuit = FarmCircuitTask(built_graph(), [(self.TREES, "")])
-        asked = []
-        circuit._needs_spell_purchase = lambda client: asked.append(1) or True
         circuit._busy_finishing_fight_or_loot = lambda client, farm: False
         client.state.inventory_replay_complete = True
         circuit.server_clock.anchor_minute = 12 * 60
@@ -21215,16 +21200,62 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         circuit.server_clock.last_request_at = circuit.server_clock.clock()
         for name in ("_needs_bank_sync", "_needs_progress_checkpoint",
                      "_needs_bank_deposit", "_needs_ship_key",
-                     "_needs_food_resupply", "_needs_savebed"):
-            setattr(circuit, name, lambda *args: False)
+                     "_needs_food_resupply", "_needs_savebed",
+                     "_needs_spell_purchase", "_needs_recall_shopping",
+                     "_needs_utility_shopping", "_needs_upgrade_shopping"):
+            setattr(circuit, name, lambda *args, due=(name == needs): due)
+        return circuit
+
+    def test_the_circuit_starts_no_optional_trip_without_heals_or_recall(self):
+        from .tasks import UNPREPARED_REST_LIMIT_SECONDS, unprepared_for_trips
+
+        for needs, trip in (("_needs_spell_purchase", "_spell_purchase"),
+                            ("_needs_ship_key", "_ship_key"),
+                            ("_needs_recall_shopping", "_recall_shopping"),
+                            ("_needs_utility_shopping", "_utility_shopping"),
+                            ("_needs_upgrade_shopping", "_shopping")):
+            # 80 %: above every heal and flee threshold, below 90 %.
+            client, _ = self.client(recall=False, bank=20_000)
+            client.state.place_item(Item(
+                90, name="Morg'eean's Ship Key"), client.state.player_tag)
+            client.state.stats.update(hp=107, maxhp=134)
+            self.assertTrue(unprepared_for_trips(client))
+            circuit = self.unprepared_circuit(client, needs)
+            for _ in range(3):
+                asyncio.run(circuit.tick(client))
+            self.assertIsNone(getattr(circuit, trip), needs)
+            client.state.stats["hp"] = 121
+            asyncio.run(circuit.tick(client))
+            self.assertIsNotNone(getattr(circuit, trip), needs)
+        # The hold lasts at most ten minutes in a row, then she goes.
+        client, _ = self.client(recall=False, bank=20_000)
+        client.state.stats.update(hp=107, maxhp=134)
+        circuit = self.unprepared_circuit(client, "_needs_spell_purchase")
         for _ in range(3):
             asyncio.run(circuit.tick(client))
         self.assertIsNone(circuit._spell_purchase)
-        client.state.stats["hp"] = 121
-        self.assertFalse(unprepared_for_trips(client))
-        for _ in range(3):
-            asyncio.run(circuit.tick(client))
+        circuit._unprepared_hold.since -= UNPREPARED_REST_LIMIT_SECONDS
+        asyncio.run(circuit.tick(client))
         self.assertIsNotNone(circuit._spell_purchase)
+        self.assertEqual(self.actions(client).count("unprepared-rest-timeout"), 1)
+
+    def test_an_unprepared_farm_rest_is_no_stuck_wait(self):
+        from .tasks import UNPREPARED_REST_LIMIT_SECONDS
+
+        client, _ = self.client(recall=False)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        circuit = FarmCircuitTask(built_graph(), [(self.TREES, "")])
+        circuit.child = circuit._new_child()
+        autoplay.child = circuit
+        farm = circuit.child.task
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
+        farm._unprepared_resting = True
+        farm._unprepared_hold.since = time.monotonic()
+        self.assertTrue(autoplay.recovery_alerts(client)[1])
+        farm._unprepared_hold.since -= UNPREPARED_REST_LIMIT_SECONDS
+        farm._unprepared_hold.timed_out = True
+        self.assertFalse(autoplay.recovery_alerts(client)[1])
 
     def test_recovery_never_shops_for_recall(self):
         client, _ = self.client(bank=50_000, recall=False)

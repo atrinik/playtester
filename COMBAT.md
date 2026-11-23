@@ -776,18 +776,28 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
   (`out_of_heals_and_recall`) and is below `UNPREPARED_HEALTH` (90 %,
   `unprepared_for_trips`):
   - **No new pull.** The farm fights only what is beside her or already
-    coming at her. Otherwise she rests where she stands, combat off,
-    recorded once as `unprepared-rest` (`FarmTask.unprepared_for_pulls`).
-  - **No optional trip.** Autoplay starts no mana-crystal detour or
-    upgrade and no farm circuit, and rests where she is first, recorded
-    once as `unprepared-errand-rest`; the farm circuit starts no ship-key
-    trip, spell purchase, recall, utility or upgrade shopping. Essential
-    trips are not delayed: temple food, the recovery phase and its cure,
-    and the circuit's food, bank, identify, storage and savebed trips.
+    coming at her, with its defence as ever. Otherwise she rests where she
+    stands, combat off, recorded once as `unprepared-rest`
+    (`FarmTask.unprepared_for_pulls`).
+  - **No optional trip.** The farm circuit starts no ship-key trip, spell
+    purchase, or recall, utility or upgrade shopping (checked with the
+    farm's own safety policy), and autoplay starts no mana-crystal detour
+    (its start, recovery or upgrade), whether a circuit runs or not: each
+    is postponed, not rested for (`_start_mana_crystal_detours`). Autoplay
+    still starts the farm circuit, where the farm's rest keeps its
+    defence. Essential trips are not delayed: temple food, the recovery
+    phase and its cure, and the circuit's food, bank, identify, storage
+    and savebed trips.
+  - **At most ten minutes.** A rest or hold lasts at most
+    `UNPREPARED_REST_LIMIT_SECONDS` (600 s) in a row (`UnpreparedHold`):
+    then she goes on as before, recorded once as `unprepared-rest-timeout`,
+    since damage over time can outpace regeneration. The next hold starts
+    once she is prepared again. A farm rest under way is an explained
+    wait, so the dashboard's stuck alert stays quiet meanwhile.
 
-  Each rest ends by itself: health regenerates passively, her SP buys a
-  heal again, or a recall becomes ready. Below level 18, and with a heal
-  or a ready recall, nothing changes. The routing danger weight already
+  Each rest otherwise ends by itself: health regenerates passively, her
+  SP buys a heal again, or a recall becomes ready. Below level 18, and
+  with a heal or a ready recall, nothing changes. The routing danger weight already
   plans with the safety λ while she has no ready recall (ROUTING 4.5).
   Follow-ups, not part of this change: a town trip to buy healing potions
   (no existing trip buys them, and the sage's stock is random), better
