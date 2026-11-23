@@ -374,6 +374,9 @@ class GameState:
     # they arrived (wall clock), while that character shares her party
     # (CMD_PARTY_UPDATE/WHO). No other member's vitals or name are kept.
     operator_vitals: tuple[int, int, float] | None = None
+    # Digests of her party members' names (owner_watch.name_digest), in
+    # memory only: a green creature name a member carries may be them.
+    party_member_digests: set[str] = field(default_factory=set)
     # MAP2 damage and kill tile animations, newest last (TileAnimation),
     # bounded like ``messages``; positions count from the first ever.
     tile_animations: list[TileAnimation] = field(default_factory=list)

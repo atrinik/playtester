@@ -1420,9 +1420,12 @@ owner's own square with no monster next to it is taken as ranged.
   and makes the engagement shared within 6 squares of the owner, so a
   friendly green NPC or pet farther off does not drop every fight; a
   certain player does anywhere in view. A hostile green or red creature
-  keeps its kind. Of the party packets the
-  client keeps only the operator character's vitals and discards every
-  other member's name and numbers as they are parsed.
+  keeps its kind. Of the party packets the client keeps only the
+  operator character's vitals. Other members' numbers are discarded as
+  they are parsed, and their names are kept only as in-memory SHA-256
+  digests, so that a green creature name a party member carries is
+  treated as a possible player even when the server does not mark it
+  her friend (she may be berserk). The digests are never stored.
 - No name is stored. A row belongs to her own character. A monster kind
   is kept only when it is an authored creature name from the content
   index (`unknown` otherwise, and always without the index). The
@@ -1445,7 +1448,8 @@ owner's own square with no monster next to it is taken as ranged.
   ranged hits and whether the owner stepped within 3 seconds after one,
   health before the pull, at its lowest and after (party only), seconds
   since the previous engagement while the owner stayed in view (the
-  rest), kills and duration. A read-only dashboard section lists them.
+  rest), kills, the owner's death and duration. A read-only dashboard
+  section lists them.
 - **W2, following at a safe distance** (later, owner decision). The
   owner starts it from the dashboard. Sera walks after the operator
   character on the same map and keeps 4 to 8 squares back, out of the
@@ -2334,11 +2338,29 @@ the Farming tab's **Watching the owner** section):
   parse into name, health and mana. Only the operator character's entry
   is kept, as `GameState.operator_vitals`, and only while it is not her
   own name. A roster without it, `CMD_PARTY_REMOVE_MEMBER` for it, her
-  leaving the party or a new login clears it. A truncated record or
+  leaving or joining a party or a new login clears it, and the watch
+  ignores a reading older than 30 seconds. A truncated record or
   trailing bytes are a protocol error, like the other party commands.
+- **Frames.** Each published MAP2 generation becomes one frame for the
+  watch, taken as the client publishes it (`owner_watch.capture`, only
+  behind the flag). A frame records the operator character's square,
+  the monsters in view, whether another (possible) player was in view,
+  whether she was fighting herself, and that generation's animations.
+  "Fighting herself" means her combat mode, an active fight record, an
+  animation on her own square, or one of her own contact lines in the
+  last 10 seconds. The engine step scores every frame since the last
+  step in order, each animation against its own frame. So a player who
+  walks in, strikes and leaves between two steps still makes the
+  engagement shared, and an owner who moved between generations is
+  credited on the square it stood on then. More than 256 frames between
+  steps also make the engagement shared.
 - **An engagement** starts at the first damage number on the operator
   character's square, damage number on a monster next to it, or kill
-  marker next to it. It ends 10 seconds after the last one, when the
+  marker next to it. A kill marker counts only where a monster stood
+  next to the owner in that frame or the one before: a kill by position
+  alone could be anyone's. The marker replaces the killing blow's damage
+  number, so it also counts as a dealt hit with its value. A kill marker
+  on the owner's own square is its death (`owner_died`). It ends 10 seconds after the last one, when the
   operator character leaves her view or her map's bounds (the row is
   kept), or after 15 minutes. It is dropped, never kept, when she starts
   fighting herself (her combat mode or an active fight record), when she
@@ -2352,12 +2374,13 @@ the Farming tab's **Watching the owner** section):
   `hp_after` (at the end, so 10 quiet seconds of regeneration included),
   `gap_seconds` (since the previous engagement ended, only while the
   owner stayed in view on the same map and that one was not cut at 15
-  minutes, so a rest is measured), `kills`,
-  `seconds`. `character` is hers.
-- **Bounds:** the engine feeds the recorder once a step, after the fight
-  recorder. With the flag off, or without an operator character, it reads
-  nothing. Otherwise it reads only new tile animations and, while she is
-  not fighting, one pass over the living objects in view. It never
+  minutes, so a rest is measured), `kills`, `owner_died`, `seconds`.
+  `character` is hers.
+- **Bounds:** with the flag off, or without an operator character, no
+  frame is taken and the step reads nothing. Otherwise each published
+  generation costs one pass over the living objects in view and at most
+  the 100 newest messages, and the engine scores the held frames once a
+  step, after the fight recorder. It never
   raises: an error forgets the engagement and is logged once, then
   counted every 10 minutes. A row waits at most 0.25 s for a locked
   database. Rows are capped at 5,000 a character, oldest evicted first,

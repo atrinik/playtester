@@ -988,7 +988,7 @@ async function pollOwnerWatch() {
   try {
     const r = await fetch("/api/owner-watch?limit=20", { cache: "no-store" });
     if (r.ok) renderOwnerWatch(await r.json());
-  } finally { ownerWatchBusy = false; }
+  } catch { /* offline: the next poll retries */ } finally { ownerWatchBusy = false; }
 }
 function renderOwnerWatch(w) {
   const sig = JSON.stringify(w);
@@ -1011,6 +1011,7 @@ function renderOwnerWatch(w) {
       `${o.damage_taken} taken in ${o.hits_taken}`, `${Math.round(o.seconds)} s`];
     if (o.ranged_hits) parts.push(`${o.ranged_hits} ranged hit${o.ranged_hits === 1 ? "" : "s"}, stepped after ${o.stepped_after_ranged}`);
     if (o.hp_before != null) parts.push(`HP ${o.hp_before}% before, ${o.hp_low}% lowest, ${o.hp_after}% after`);
+    if (o.owner_died) parts.push("it died");
     if (o.gap_seconds != null) parts.push(`${Math.round(o.gap_seconds)} s since the last fight`);
     row.append(node("p", "", parts.join(" · ")));
     if (kinds) row.append(node("p", "", kinds));

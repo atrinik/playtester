@@ -31,7 +31,8 @@ from . import feedback
 from . import feedback_producers
 from .observations import AuthoredContent, Observation, ObservationRecorder, text_hash
 from . import post_mortem
-from .owner_watch import OwnerWatchRecorder
+from .owner_watch import OwnerWatchRecorder, name_digest
+from .owner_watch import capture as owner_watch_capture
 from .terrain import FightRecorder
 from . import route_events, route_shadow
 from .self_improvement import PLAYER_CHANNELS, from_server
@@ -213,7 +214,8 @@ class ClientConfig:
     operator_character: str = ""
     # docs/LEARNING_AND_FEEDBACK.md 4.14, phase W1: record how the operator
     # character fights while she is not fighting herself (owner_watch.py).
-    # Off (the default) nothing is read or recorded.
+    # Off (the default) nothing is recorded; the client still decodes tile
+    # animations into a bounded ring and keeps the operator's vitals.
     watch_owner: bool = False
 
 
@@ -1825,6 +1827,7 @@ class AtrinikClient:
         self.state.player_name = cur.cstring()
         self.state.party_name = ""
         self.state.operator_vitals = None
+        self.state.party_member_digests = set()
         # PLAYER arrives before the full ITEM inventory packet. Preserve this
         # explicit barrier across reconnects even though the prior inventory
         # objects remain in memory for those few event-loop turns.
@@ -1857,6 +1860,9 @@ class AtrinikClient:
         command = cur.u8()
         if command == c.CMD_PARTY_JOIN:
             self.state.party_name = cur.cstring()
+            # A new party: its members' vitals and names arrive afresh.
+            self.state.operator_vitals = None
+            self.state.party_member_digests = set()
             self._party_setup_pending = ""
             self.record_action("party-ready", self.state.party_name)
             await self.emit("party", {
@@ -1865,6 +1871,7 @@ class AtrinikClient:
             old_name = self.state.party_name
             self.state.party_name = ""
             self.state.operator_vitals = None
+            self.state.party_member_digests = set()
             await self.emit("party", {"name": old_name, "joined": False})
         elif command == c.CMD_PARTY_PASSWORD:
             # Preserve defensive framing validation even though the bot does
@@ -1882,16 +1889,25 @@ class AtrinikClient:
                 raise ProtocolError("party member removal trailing bytes")
             if name == self.config.operator_character.strip():
                 self.state.operator_vitals = None
+            self.state.party_member_digests.discard(name_digest(name))
             await self.emit("party_packet", (command, size))
         else:
-            # LIST/WHO/UPDATE payloads belong to the graphical roster. The bot
-            # needs only authoritative join/leave membership state.
+            # The LIST payload belongs to the graphical party list. The bot
+            # needs only membership and the operator character's vitals.
             await self.emit("party_packet", (command, cur.remaining))
 
     def _note_operator_vitals(self, members: list[PartyVitals], *, roster: bool) -> None:
         """Keep the configured operator character's vitals, and only theirs:
-        every other member's name and vitals are dropped here. A roster
-        (``CMD_PARTY_WHO``) without them clears what was kept."""
+        every other member's vitals are dropped here, and their names kept
+        only as in-memory digests (``owner_watch.name_digest``), so the
+        owner watch can tell a party member from a monster of the same
+        name. A roster (``CMD_PARTY_WHO``) replaces both; one without the
+        operator character clears its vitals."""
+        digests = {name_digest(member.name) for member in members}
+        if roster:
+            self.state.party_member_digests = digests
+        else:
+            self.state.party_member_digests |= digests
         operator = self.config.operator_character.strip()
         if not operator or operator == self.state.player_name:
             self.state.operator_vitals = None
@@ -3122,6 +3138,9 @@ class AtrinikClient:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
         self._publish_tile_animations(m)
+        # The owner watch's frame of this generation (owner_watch.py):
+        # behind its flag, never raises.
+        owner_watch_capture(self, m)
         self._note_position(m)
         self._observe_map_change(old_path, m)
         self._observe(lambda recorder: recorder.note_position(self.state))

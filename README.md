@@ -931,7 +931,9 @@ NPC voyages, and costs learned from her own experience is in
 
 She can watch the owner play, behind the `watch_owner` flag
 (`--watch-owner` or `ATRINIK_BOT_WATCH_OWNER=1`), off by default; with it
-off nothing is recorded. With it on, and only while the operator
+off nothing is recorded (the client still decodes the map's damage
+numbers into a small in-memory ring and keeps the operator character's
+party health). With it on, and only while the operator
 character (`ATRINIK_BOT_OPERATOR_CHARACTER`, exact name) is on her map and
 she is not fighting herself, each of its fights becomes one
 `owner_observations` row in her memory: where it stood and the square's

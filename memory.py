@@ -59,7 +59,7 @@ OWNER_OBSERVATION_COLUMNS = (
     "id", "started", "ended", "map", "x", "y", "cell", "feature", "reach",
     "kinds_json", "peak_adjacent", "hits_dealt", "damage_dealt", "hits_taken",
     "damage_taken", "ranged_hits", "stepped_after_ranged", "hp_before", "hp_low",
-    "hp_after", "gap_seconds", "kills", "seconds")
+    "hp_after", "gap_seconds", "kills", "owner_died", "seconds")
 # Route events (docs/ROUTING.md 4.4, route_events.py): the longest a write
 # waits for a locked database (seconds).
 ROUTE_EVENT_SAVE_TIMEOUT = 0.25
@@ -293,6 +293,7 @@ class BotMemory:
                        hp_before INTEGER, hp_low INTEGER, hp_after INTEGER,
                        gap_seconds REAL,
                        kills INTEGER NOT NULL,
+                       owner_died INTEGER NOT NULL DEFAULT 0,
                        seconds REAL NOT NULL
                    )""")
             db.execute(

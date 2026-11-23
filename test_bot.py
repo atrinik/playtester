@@ -29764,9 +29764,22 @@ class OwnerWatchTests(unittest.TestCase):
 
     @staticmethod
     def animate(client, world_x, kind, value):
-        from .model import TileAnimation
-        client.state.add_tile_animation(
-            TileAnimation(time.time(), "/t", world_x, 3, 0, 0, kind, value))
+        """A tile animation in the generation being built, on the corridor
+        row at world (world_x, 3)."""
+        client.state.map.animations.append((world_x + 5, 8, 0, 0, kind, value))
+
+    @staticmethod
+    def publish(client):
+        """Publish the generation being built: the owner watch's frame."""
+        from . import owner_watch
+        owner_watch.capture(client, client.state.map)
+        client.state.map.animations = []
+
+    def step(self, client):
+        """One generation published, then one engine step."""
+        from .owner_watch import observe_owner
+        self.publish(client)
+        return observe_owner(client)
 
     def stored(self):
         with sqlite3.connect(self.path) as db:
@@ -29779,21 +29792,19 @@ class OwnerWatchTests(unittest.TestCase):
         self.put(client, 4, "Zoey [AFK]", "00ff00", 7)
         self.put(client, 5, "orc", "ffff33", 8)
         client.state.operator_vitals = (90, 50, time.time())
-        # Animations before the first step are history, not watched.
-        self.animate(client, 5, c.ANIM_DAMAGE, 99)
-        self.assertEqual(observe_owner(client), 0)
+        self.assertEqual(self.step(client), 0)
         self.assertFalse(client.owner_watch.active)
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
         self.animate(client, 4, c.ANIM_DAMAGE, 4)
         # Not next to her: another square's damage is not hers.
         self.animate(client, 0, c.ANIM_DAMAGE, 50)
         client.state.operator_vitals = (80, 50, time.time())
-        self.assertEqual(observe_owner(client), 0)
+        self.assertEqual(self.step(client), 0)
         self.assertTrue(client.owner_watch.active)
         self.remove(client, 5)
         self.animate(client, 5, c.ANIM_KILL, 0)
         client.state.operator_vitals = (85, 50, time.time())
-        observe_owner(client)
+        self.step(client)
         with patch.object(owner_watch, "QUIET_SECONDS", -1.0):
             self.assertEqual(observe_owner(client), 1)
         row, = client._memory_store().owner_observations("Sera")
@@ -29803,22 +29814,23 @@ class OwnerWatchTests(unittest.TestCase):
             "hp_before", "hp_low", "hp_after", "gap_seconds", "kills")},
             {"map": "/t", "x": 4, "y": 3, "cell": "cell:/t:0,0", "feature": "corridor",
              "reach": 2, "kinds": [["orc", "yellow"]], "peak_adjacent": 1,
-             "hits_dealt": 1, "damage_dealt": 12, "hits_taken": 1, "damage_taken": 4,
+             "hits_dealt": 2, "damage_dealt": 12, "hits_taken": 1, "damage_taken": 4,
              "ranged_hits": 0, "hp_before": 90, "hp_low": 80, "hp_after": 85,
              "gap_seconds": None, "kills": 1})
+        self.assertEqual(row["owner_died"], 0)
         # No player's name is stored, the operator character's included.
         self.assertNotIn("zoey", repr(self.stored()).casefold())
         # The next pull, still in view, knows how long the owner rested.
         # A hostile green or red creature keeps its kind outside PvP.
         self.put(client, 5, "orc", "00ff00", 9)
         self.animate(client, 5, c.ANIM_DAMAGE, 3)
-        observe_owner(client)
+        self.step(client)
         self.assertIsNotNone(client.owner_watch.engagement.gap_seconds)
         self.assertEqual(client.owner_watch.engagement.kinds, [["orc", "green"]])
         # Her map changes: the engagement is dropped, and the rest after it
         # is not measured across maps.
         client.state.map.path = "/elsewhere"
-        self.assertEqual(observe_owner(client), 0)
+        self.assertEqual(self.step(client), 0)
         self.assertFalse(client.owner_watch.active)
         self.assertIsNone(client.owner_watch.last_end)
         self.assertEqual(len(self.stored()), 1)
@@ -29827,27 +29839,27 @@ class OwnerWatchTests(unittest.TestCase):
         from . import owner_watch
         from .owner_watch import observe_owner
         client = self.client()
-        observe_owner(client)
+        self.step(client)
         # Another player fights an orc; the operator character is not in view.
         self.put(client, 4, "Mallory", "ffffff", 7)
         self.put(client, 5, "orc", "ffff33", 8)
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
         self.animate(client, 4, c.ANIM_DAMAGE, 4)
-        observe_owner(client)
+        self.step(client)
         self.assertFalse(client.owner_watch.active)
         # Neither a name that only starts the same, nor a creature of the
         # same name, is the operator character.
         for name, color in (("Zoeya", "ffffff"), ("Zoey", "999999")):
             self.put(client, 4, name, color, 7)
             self.animate(client, 5, c.ANIM_DAMAGE, 12)
-            observe_owner(client)
+            self.step(client)
             self.assertFalse(client.owner_watch.active, name)
         # The operator character fights with another player close by: shared,
         # dropped whole.
         self.put(client, 4, "Zoey", "ffffff", 7)
         self.put(client, 1, "Mallory", "ffffff", 10)
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
-        observe_owner(client)
+        self.step(client)
         self.assertTrue(client.owner_watch.active)
         with patch.object(owner_watch, "QUIET_SECONDS", -1.0):
             self.assertEqual(observe_owner(client), 0)
@@ -29860,16 +29872,16 @@ class OwnerWatchTests(unittest.TestCase):
         far.objects[5] = MapObject(5, 1, 0, 0, name="Mallory", name_color="ffffff",
                                    target_id=11)
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
-        observe_owner(client)
+        self.step(client)
         with patch.object(owner_watch, "QUIET_SECONDS", -1.0):
-            observe_owner(client)
+            self.step(client)
         far.objects.pop(5)
         client.state.map.tile(8, 8, depth=1).objects[5] = MapObject(
             5, 1, 0, 0, name="Mallory", name_color="ffffff", target_id=12)
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
-        observe_owner(client)
+        self.step(client)
         with patch.object(owner_watch, "QUIET_SECONDS", -1.0):
-            observe_owner(client)
+            self.step(client)
         self.assertEqual((client.owner_watch.shared_dropped, self.stored()), (3, []))
         client.state.map.level_tiles.pop(1)
         # A green friend or, in PvP, a red name may be a player with an
@@ -29879,10 +29891,10 @@ class OwnerWatchTests(unittest.TestCase):
             self.put(client, 1, "orc", color, 13)
             client.state.map.tile(6, 8).objects[5].is_friend = friend
             self.animate(client, 5, c.ANIM_DAMAGE, 12)
-            observe_owner(client)
+            self.step(client)
             self.assertTrue(client.owner_watch.engagement.shared, color)
             with patch.object(owner_watch, "QUIET_SECONDS", -1.0):
-                observe_owner(client)
+                self.step(client)
         self.remove(client, 1)
         client.world_graph.nodes["/t"].pvp = False
         self.assertEqual((client.owner_watch.shared_dropped, self.stored()), (5, []))
@@ -29891,88 +29903,187 @@ class OwnerWatchTests(unittest.TestCase):
         far.objects[5] = MapObject(5, 1, 0, 0, name="orc", name_color="00ff00",
                                    target_id=14, is_friend=True)
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
-        observe_owner(client)
+        self.step(client)
         self.assertFalse(client.owner_watch.engagement.shared)
         client.owner_watch.reset()
         far.objects.pop(5)
         # Her own fight: nothing is watched.
         client.state.combat = True
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
-        observe_owner(client)
+        self.step(client)
         self.assertFalse(client.owner_watch.active)
         client.state.combat = False
         client.fight_recorder.fight = object()
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
-        observe_owner(client)
+        self.step(client)
         self.assertFalse(client.owner_watch.active)
         self.assertEqual(self.stored(), [])
 
     def test_with_the_flag_off_nothing_is_read_or_recorded(self):
-        from .owner_watch import observe_owner
+        from . import owner_watch
         client = self.client(watch=False)
         self.put(client, 4, "Zoey", "ffffff", 7)
         self.put(client, 5, "orc", "ffff33", 8)
-        for _ in range(3):
+        with patch.object(owner_watch, "frame_of") as frame_of:
+            for _ in range(3):
+                self.animate(client, 5, c.ANIM_DAMAGE, 12)
+                self.assertEqual(self.step(client), 0)
+            # Nor without an operator character.
+            client.config.watch_owner, client.config.operator_character = True, ""
             self.animate(client, 5, c.ANIM_DAMAGE, 12)
-            self.assertEqual(observe_owner(client), 0)
-        self.assertIsNone(client.owner_watch.position)
+            self.assertEqual(self.step(client), 0)
+        frame_of.assert_not_called()
+        self.assertEqual(len(client.owner_watch.frames), 0)
         self.assertFalse(client.owner_watch.active)
         self.assertEqual(self.stored(), [])
-        # Nor without an operator character.
-        client.config.watch_owner, client.config.operator_character = True, ""
-        self.animate(client, 5, c.ANIM_DAMAGE, 12)
-        self.assertEqual(observe_owner(client), 0)
-        self.assertIsNone(client.owner_watch.position)
 
     def test_a_ranged_hit_and_the_step_after_it(self):
-        from .owner_watch import OwnerView, OwnerWatchRecorder
+        from . import owner_watch
+        from .owner_watch import Creature, Frame, OwnerWatchRecorder
         recorder = OwnerWatchRecorder()
-        base = dict(character="Sera", map="/t", node=terrain_node(TerrainTests.CORRIDOR))
-        recorder.observe(OwnerView(now=100.0, owner=(3, 3), **base))
+        node = terrain_node(TerrainTests.CORRIDOR)
+
+        def frame(at, owner=None, animations=(), creatures=()):
+            recorder.note(Frame(at, "Sera", "/t", node, owner, list(creatures), False,
+                                list(animations)))
+            return recorder.observe(at, "Sera")
+        frame(100.0, (3, 3))
         # A hit with no monster next to it is ranged.
-        recorder.observe(OwnerView(now=101.0, owner=(3, 3),
-                                   animations=[(100.5, 3, 3, c.ANIM_DAMAGE, 7)], **base))
+        frame(101.0, (3, 3), [(3, 3, c.ANIM_DAMAGE, 7)])
         engagement = recorder.engagement
         self.assertEqual((engagement.ranged_hits, engagement.stepped_after_ranged), (1, 0))
-        recorder.observe(OwnerView(now=102.0, owner=(2, 3), **base))
+        frame(102.0, (2, 3))
         self.assertEqual(engagement.stepped_after_ranged, 1)
         # A hit with a monster next to it is no ranged hit.
-        from .owner_watch import Creature
-        recorder.observe(OwnerView(now=103.0, owner=(2, 3), creatures=[Creature(1, 3, "orc", "")],
-                                   animations=[(102.5, 2, 3, c.ANIM_DAMAGE, 2)], **base))
+        frame(103.0, (2, 3), [(2, 3, c.ANIM_DAMAGE, 2)], [Creature(1, 3, "orc", "")])
         self.assertEqual((engagement.ranged_hits, engagement.hits_taken), (1, 2))
         # Standing still past the window is no step.
-        recorder.observe(OwnerView(now=104.0, owner=(2, 3),
-                                   animations=[(103.5, 2, 3, c.ANIM_DAMAGE, 2)], **base))
-        recorder.observe(OwnerView(now=108.0, owner=(2, 3), **base))
-        recorder.observe(OwnerView(now=109.0, owner=(3, 3), **base))
+        frame(104.0, (2, 3), [(2, 3, c.ANIM_DAMAGE, 2)])
+        frame(108.0, (2, 3))
+        frame(109.0, (3, 3))
         self.assertEqual((engagement.ranged_hits, engagement.stepped_after_ranged), (2, 1))
+        # A kill marker on its own square is its death.
+        frame(109.5, (3, 3), [(3, 3, c.ANIM_KILL, 0)])
+        self.assertTrue(engagement.owner_died)
         # Out of view, the engagement ends and is kept.
-        row, = recorder.observe(OwnerView(now=110.0, **base))
-        self.assertEqual((row["seconds"], row["peak_adjacent"]), (3.0, 1))
+        row, = frame(110.0)
+        self.assertEqual((row["seconds"], row["peak_adjacent"], row["owner_died"]), (8.5, 1, 1))
         self.assertIsNone(recorder.last_end)
         # A fight cut at the limit is kept, and its successor measures no rest.
-        from . import owner_watch
         with patch.object(owner_watch, "MAX_ENGAGEMENT_SECONDS", 2.0):
-            recorder.observe(OwnerView(now=200.0, owner=(3, 3),
-                                       animations=[(199.5, 3, 3, c.ANIM_DAMAGE, 1)], **base))
-            row, = recorder.observe(OwnerView(
-                now=202.0, owner=(3, 3), animations=[(201.5, 3, 3, c.ANIM_DAMAGE, 1)], **base))
+            frame(200.0, (3, 3), [(3, 3, c.ANIM_DAMAGE, 1)])
+            row, = frame(202.5, (3, 3), [(3, 3, c.ANIM_DAMAGE, 1)])
         self.assertEqual(row["seconds"], 2.5)
-        recorder.observe(OwnerView(now=203.0, owner=(3, 3),
-                                   animations=[(202.5, 3, 3, c.ANIM_DAMAGE, 1)], **base))
+        frame(203.0, (3, 3), [(3, 3, c.ANIM_DAMAGE, 1)])
         self.assertIsNone(recorder.engagement.gap_seconds)
 
-    def test_off_her_maps_bounds_the_owner_is_not_watched(self):
-        from .owner_watch import owner_view
+    def test_each_animation_is_scored_against_its_own_frame(self):
+        from . import owner_watch
+        from .owner_watch import Creature, Frame, OwnerWatchRecorder
+        recorder = OwnerWatchRecorder()
+        node = terrain_node(TerrainTests.CORRIDOR)
+        orc = Creature(5, 3, "orc", "")
+        # Three generations in one engine step: a player is in view only in
+        # the middle one, which strikes the orc beside the owner.
+        recorder.note(Frame(1.0, "Sera", "/t", node, (4, 3), [orc], False,
+                            [(5, 3, c.ANIM_DAMAGE, 3)]))
+        recorder.note(Frame(1.1, "Sera", "/t", node, (4, 3), [orc], True,
+                            [(5, 3, c.ANIM_DAMAGE, 40)]))
+        recorder.note(Frame(1.2, "Sera", "/t", node, (4, 3), [orc], False))
+        recorder.observe(1.3, "Sera")
+        self.assertTrue(recorder.engagement.shared)
+        self.assertEqual(recorder.observe(20.0, "Sera"), [])
+        self.assertEqual(recorder.shared_dropped, 1)
+        # The owner moved between generations: each hit is scored on the
+        # square it stood on then. A hit beside its old square is not its.
+        recorder.note(Frame(30.0, "Sera", "/t", node, (2, 3), [Creature(1, 3, "orc", "")],
+                            False, [(1, 3, c.ANIM_DAMAGE, 5)]))
+        recorder.note(Frame(30.1, "Sera", "/t", node, (4, 3),
+                            [Creature(1, 3, "orc", ""), orc], False,
+                            [(1, 3, c.ANIM_DAMAGE, 9), (5, 3, c.ANIM_DAMAGE, 6)]))
+        recorder.observe(30.2, "Sera")
+        self.assertEqual((recorder.engagement.hits_dealt, recorder.engagement.damage_dealt),
+                         (2, 11))
+        # A kill marker credits a kill only where a monster stood beside it,
+        # now or in the frame before; the killing blow counts as a hit.
+        recorder.note(Frame(30.3, "Sera", "/t", node, (4, 3), [], False,
+                            [(5, 3, c.ANIM_KILL, 8), (3, 3, c.ANIM_KILL, 0)]))
+        recorder.observe(30.4, "Sera")
+        engagement = recorder.engagement
+        self.assertEqual((engagement.kills, engagement.hits_dealt, engagement.damage_dealt),
+                         (1, 3, 19))
+        # Her own fight in any frame drops the engagement.
+        recorder.note(Frame(30.5, "Sera", "/t", node, (4, 3), busy=True))
+        recorder.observe(30.6, "Sera")
+        self.assertIsNone(recorder.engagement)
+        # Lost frames make an engagement shared.
+        recorder.note(Frame(40.0, "Sera", "/t", node, (4, 3), [orc], False,
+                            [(5, 3, c.ANIM_DAMAGE, 1)]))
+        recorder.observe(40.1, "Sera")
+        with patch.object(owner_watch, "MAX_FRAMES", 1):
+            recorder.note(Frame(40.2, "Sera", "/t", node, (4, 3), [orc]))
+            recorder.note(Frame(40.3, "Sera", "/t", node, (4, 3), [orc]))
+        recorder.observe(40.4, "Sera")
+        self.assertTrue(recorder.engagement.shared)
+
+    def test_frames_are_taken_as_the_client_publishes_a_generation(self):
         client = self.client()
-        recorder = client.owner_watch
         self.put(client, 4, "Zoey", "ffffff", 7)
-        self.assertEqual(owner_view(client, recorder).owner, (4, 3))
+        hit = OwnerWatchParserTests.animated_tile(10, 8, 8, [(0, c.ANIM_DAMAGE, 7)])
+        packet = ProtocolTests._map2_packet(c.MAP_SAME, [(0, hit)], world_x=3, world_y=3)
+        asyncio.run(client._handle_map(Cursor(packet), packet))
+        frame, = client.owner_watch.frames
+        self.assertEqual((frame.owner, frame.animations, frame.others, frame.busy),
+                         ((4, 3), [(5, 3, c.ANIM_DAMAGE, 7)], False, False))
+        # The flag off: no frame is taken.
+        client.config.watch_owner = False
+        asyncio.run(client._handle_map(Cursor(packet), packet))
+        self.assertEqual(len(client.owner_watch.frames), 1)
+
+    def test_her_own_contact_or_a_hit_on_her_square_makes_a_frame_hers(self):
+        client = self.client()
+        self.put(client, 4, "Zoey", "ffffff", 7)
+        self.put(client, 5, "orc", "ffff33", 8)
+        self.animate(client, 3, c.ANIM_DAMAGE, 2)
+        self.publish(client)
+        self.assertTrue(client.owner_watch.frames[-1].busy)
+        data = drawinfo(c.CHAT_TYPE_GAME, "ffffff", "You hit orc for 5 (-5) slash damage.")
+        asyncio.run(client._handle_drawinfo(Cursor(data), data))
+        self.animate(client, 5, c.ANIM_DAMAGE, 5)
+        self.publish(client)
+        self.assertTrue(client.owner_watch.frames[-1].busy)
+
+    def test_stale_vitals_and_party_member_names(self):
+        from .owner_watch import frame_of, name_digest
+        client = self.client()
+        self.put(client, 4, "Zoey", "ffffff", 7)
+        client.state.operator_vitals = (60, 50, time.time() - 31)
+        self.assertIsNone(frame_of(client, client.state.map).hp)
+        client.state.operator_vitals = (60, 50, time.time())
+        self.assertEqual(frame_of(client, client.state.map).hp, 60)
+        # A green creature name a party member carries is never a monster,
+        # even when not her friend (she may be berserk).
+        self.put(client, 5, "orc", "00ff00", 8)
+        self.assertEqual([cr.kind for cr in frame_of(client, client.state.map).creatures],
+                         ["orc"])
+        client.state.party_member_digests = {name_digest("Orc")}
+        frame = frame_of(client, client.state.map)
+        self.assertEqual((frame.creatures, frame.others), ([], True))
+        # Joining a party starts afresh.
+        raw = bytes((c.CMD_PARTY_JOIN,)) + b"Sera\0"
+        asyncio.run(client._handle_party(Cursor(raw), raw))
+        self.assertEqual((client.state.operator_vitals, client.state.party_member_digests),
+                         (None, set()))
+
+    def test_off_her_maps_bounds_the_owner_is_not_watched(self):
+        from .owner_watch import frame_of
+        client = self.client()
+        self.put(client, 4, "Zoey", "ffffff", 7)
+        self.assertEqual(frame_of(client, client.state.map).owner, (4, 3))
         self.remove(client, 4)
         # World x 7 is past the 7-wide map: on a map tiled to hers.
         self.put(client, 7, "Zoey", "ffffff", 7)
-        self.assertIsNone(owner_view(client, recorder).owner)
+        self.assertIsNone(frame_of(client, client.state.map).owner)
 
     def test_rows_are_capped_and_old_ones_expire(self):
         from . import memory
@@ -29982,7 +30093,7 @@ class OwnerWatchTests(unittest.TestCase):
                "hits_dealt": 1, "damage_dealt": 2, "hits_taken": 0, "damage_taken": 0,
                "ranged_hits": 0, "stepped_after_ranged": 0, "hp_before": None,
                "hp_low": None, "hp_after": None, "gap_seconds": None, "kills": 0,
-               "seconds": 1.0}
+               "owner_died": 0, "seconds": 1.0}
         with patch.object(memory, "OWNER_OBSERVATION_ROW_LIMIT", 5), \
                 patch.object(memory, "OWNER_OBSERVATION_PRUNE_EVERY", 3):
             for index in range(12):
@@ -30013,7 +30124,7 @@ class OwnerWatchTests(unittest.TestCase):
                "peak_adjacent": 0, "hits_dealt": 0, "damage_dealt": 0, "hits_taken": 0,
                "damage_taken": 0, "ranged_hits": 0, "stepped_after_ranged": 0,
                "hp_before": None, "hp_low": None, "hp_after": None, "gap_seconds": None,
-               "kills": 0, "seconds": 1.0}
+               "kills": 0, "owner_died": 0, "seconds": 1.0}
         with patch.object(BotMemory, "record_owner_observation",
                           side_effect=sqlite3.OperationalError("database is locked")):
             self.assertFalse(owner_watch.store(client, row))
@@ -30065,7 +30176,8 @@ class OwnerWatchRouteTests(unittest.IsolatedAsyncioTestCase):
                    "peak_adjacent": 2, "hits_dealt": 3, "damage_dealt": 30,
                    "hits_taken": 1, "damage_taken": 5, "ranged_hits": 0,
                    "stepped_after_ranged": 0, "hp_before": 95, "hp_low": 70,
-                   "hp_after": 72, "gap_seconds": 12.0, "kills": 2, "seconds": 9.0}
+                   "hp_after": 72, "gap_seconds": 12.0, "kills": 2, "owner_died": 0,
+                   "seconds": 9.0}
             store = self.client._memory_store()
             for index in range(3):
                 store.record_owner_observation("Sera", {**row, "ended": 10.0 + index})
