@@ -1215,7 +1215,8 @@ Now, on the farm map:
   decide, the cornered breakout among them. With no attacker within
   2 tiles she heals as usual. Running never shuts healing out: a step
   unanswered for `OUT_HEALED_ACK_WAIT_SECONDS` (0.75 s), or a usable heal
-  with none sent for `OUT_HEALED_HEAL_GAP_SECONDS` (2.5 s), lets that
+  with none landed for `OUT_HEALED_HEAL_GAP_SECONDS` (2.5 s) and none in
+  flight ([heals in melee](#heals-in-melee-2026-11-23)), lets that
   tick's heal go first, whatever the attacker's distance.
 - **No stand while she runs.** The gain-only retreat runs only while she
   has a usable heal (an item, or the SP for the spell). While the
@@ -1247,6 +1248,78 @@ Accepted limits:
   for those 10 minutes;
 - a burst from full health that ends the fight before three heals is not
   seen; the existing flee threshold and recall handle it.
+
+## Heals in melee (2026-11-23)
+
+Read from her post-mortem and journal (Underground City circuit,
+`underground_city_1_3`, 19:13:27 UTC): in melee with three orcs, about
+8 of some 25 minor-healing casts landed and her SP stayed at 82. Each
+auto-swing sets her action timer to her weapon speed (2.25 s;
+`pl->action_attack`, `server/src/types/player.c`), and
+`socket_command_fire` (`server/src/socket/request.c`) returns without a
+word while that timer runs. The safety policy healed every
+`heal_cooldown` (1.15 s) with combat on, so most casts arrived while the
+timer ran, and it counted each one as a heal. Applying an item
+(`socket_command_item_apply`, `player_apply`) checks no such timer:
+potions and scrolls always went through.
+
+Now (`SafetyPolicy.enforce`, `_heal`):
+
+- **Casts wait for the timer.** A healing spell, rod or wand (all sent as
+  FIRE) first turns combat off, repeated on each tick of the wait since a
+  hit turns it back on server side, and is sent only once her action
+  timer has run out (`effective_action_time`), plus one server tick
+  (`HEAL_TIMER_MARGIN`, 125 ms) since the client's countdown can end
+  just before the server's, as the emergency recall does. The wait is at
+  most one swing. It is not the heal's tick (`_heal_action` marks only a
+  tick that sent a heal or readied its device): callers retreat and step
+  away meanwhile, which no timer gates, but while `heal_waiting` holds,
+  `low_health_retreat` makes no stand, cornered breakout or pursued cast,
+  and the walk's defence holds even when she is starving with nothing to
+  eat (which otherwise skips the safety hold), since each fight would
+  restart the timer. A rod or wand not yet readied is
+  applied once (it readies it; applying it again would unready it), then
+  fired by its tag. A potion or scroll is applied at once, with combat
+  left as it is.
+- **Combat comes back with the cast.** Right after the fire, combat goes
+  back on as it was (with its force flag): the fire set her timer before
+  the combat packet arrives, so the next swing follows the cast's
+  recovery and she fights back between heals as before. A heal no longer
+  needed or usable during the wait (her health over the threshold, no SP)
+  also turns it back on; a recall waiting for the timer (`combat_allowed`)
+  keeps it off. What to restore is kept on the client, so whichever safety
+  policy runs next restores it, the engine's idle one after a task ended
+  mid-wait among them. Any other combat-off (a Stop, an operator's task
+  change, an autoplay handover, a retreat) drops it: whoever turned combat
+  off owns it (the farm turns it on again whenever it fights), and a new
+  login starts without one.
+- **A heal counts once it lands** (`heal_landed`). The server answers
+  every heal it runs, spell, potion, scroll, rod or wand, with "The spell
+  heals you for N hp!" (or "The healing spell fails!", `cast_heal`); a
+  potion or scroll is also counted when its quantity falls. Only then
+  does the cooldown, and the out-healed heal gap, count from it
+  (`_last_heal`). A refusal with a word (no mana, a blocked square, a
+  device that cannot fire now) waits out the cooldown.
+- **Refused devices give way.** A healing rod or wand that "whines for a
+  while, but nothing happens" or "is impossible to handle for you" is
+  backed off for `RECALL_DEVICE_RETRY_SECONDS` (20 s, the recall's own
+  back-off, shared with it), and a wand that "says poof" is known empty
+  (`wand_known_empty`; the name in the message must be the wand's). Neither counts as a usable heal meanwhile, so the
+  next heal in her pack, her spell among them, heals instead of the
+  combat-off wait repeating on a device that cannot fire. A cast unanswered
+  for `heal_confirm_seconds` (1 s) was dropped: it is recorded as
+  `heal-unconfirmed` and sent again at the next allowed moment, without
+  waiting out a cooldown.
+
+`healing_outpaced` and `heals_losing` (the
+[heals-losing disengage](#heals-losing-on-the-farm-2026-11-23)) already
+count only the server's heal messages, that is landed heals. The walk's
+[critical escape](#critical-escape-on-a-walk-2026-11-22) runs only with
+no usable heal, and reads `_heal_action` only to leave the tick of a heal
+to it. Accepted limit: casts and swings alternate, so in melee a heal
+lands about every swing plus one cast (about 3.3 s with a 2.25 s weapon),
+not every 1.15 s; a fight that needs more is for the disengage and the
+recall.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 
