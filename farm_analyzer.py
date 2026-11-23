@@ -444,11 +444,12 @@ class FarmAnalyzer:
     # 2026-11-23 (level 36, 322 health), 126 of 199 ranked spots tied at 1;
     # the first 40 were all Burnt Forest permutations at danger 71 to 126,
     # while the Underground City's outer maps, Hemlock Cave and Eld Woods
-    # Island (danger 32 to 53) ranked 60th to 125th. A kit hazard on the
+    # Island (danger 36 to 66) ranked 60th to 125th. A kit hazard on the
     # Burnt Forest rejected all 40, and she waited for a spot for good.
     # The analyzer scores every candidate in every run, so a deeper list
-    # costs only its JSON (about 20 MiB parsed at 199 spots, every view at
-    # that depth); the other views are cut back to TOP once it is read.
+    # costs only its JSON (about 14 MB at 199 spots, every view at that
+    # depth, parsed off the event loop); the other views are cut back to
+    # TOP once it is read.
     SAFETY_TOP = 250
 
     def __init__(self, analyzer_root: Path, content_root: Path, server_root: Path, *,
@@ -636,7 +637,7 @@ class FarmAnalyzer:
                      else RuntimeError)
             raise error(
                 f"exited with status {self._process.returncode}: {detail[0][:300]}")
-        report = json.loads(stdout)
+        report = await asyncio.to_thread(json.loads, stdout)
         rankings = report.get("rankings") if isinstance(report, dict) else None
         if not isinstance(rankings, dict) or not all(
                 isinstance(rankings.get(name), list) for name in OBJECTIVES):

@@ -6183,6 +6183,85 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
         (path for path, _ in legs), same_kit)
 
 
+# The cure-funding farm never takes a spot whose analyzer danger is this
+# share of her maximum health or more (FundingFarmLimits): at most half, so
+# she survives two such encounters back to back.
+FUNDING_FARM_DANGER_SHARE = 0.5
+
+
+def _spot_danger(spot: dict) -> float:
+    """The analyzer's danger for a ranked spot; infinite when unknown."""
+    danger = spot.get("danger")
+    if (isinstance(danger, (int, float)) and not isinstance(danger, bool) and
+            danger == danger):
+        return float(danger)
+    return float("inf")
+
+
+@dataclass(slots=True)
+class FundingFarmLimits:
+    """What the cure-funding farm may take (_analyzer_farm_choice).
+
+    ``cap``: spots must be less dangerous than this: below
+    FUNDING_FARM_DANGER_SHARE of her maximum health, and below every ranked
+    spot whose own record has a kit-hazard failure (hazard_failure) in the
+    kit window with her kit, whatever it is rejected for now. Live, on
+    2026-11-23, the circuits that killed and out-damaged her rated danger
+    103.5 and 125.8; with the safety view 250 deep, her strict town check
+    walked the funding farm down to a 118.3 spot with a risky approach.
+    ``failures``: per map, her failures within the kit window with her
+    kit, any cause, emergency recalls on the way included; each counts for
+    the maps of its spot's record and for the map it happened on. Live, an
+    orc pack forced a recall at the Underground City entrance at 02:43,
+    and that entrance (danger 35.7) still outranked Hemlock Cave (35.8).
+    """
+
+    cap: float
+    failures: list[tuple[frozenset[str], int]]
+
+    def recent_failures(self, legs) -> int:
+        maps = {path for path, _ in legs}
+        return sum(count for where, count in self.failures if where & maps)
+
+
+def funding_farm_limits(client: AtrinikClient,
+                        ranked: Iterable[dict]) -> FundingFarmLimits:
+    """FundingFarmLimits for her now, with ``ranked`` the safety view."""
+    profile = current_combat_kit(client)
+    stats = getattr(client.state, "stats", {}) or {}
+    health = float(getattr(profile, "max_health", 0) or
+                   stats.get("maxhp", 0) or 0)
+    cap = FUNDING_FARM_DANGER_SHARE * health if health > 0 else float("inf")
+
+    def same_kit(kit: dict) -> bool:
+        if profile is None:
+            return True
+        old = farm_analyzer_plan.CombatProfile.from_description(kit or {})
+        return old is None or profile.no_survivability_gain(old)
+
+    now = time.time()
+    adaptations = getattr(client.state, "farm_adaptations", {}) or {}
+    hazard_keys = set()
+    failures: list[tuple[frozenset[str], int]] = []
+    for key, record in adaptations.items():
+        if not isinstance(record, dict):
+            continue
+        maps = frozenset(self_improvement.record_maps(key, record))
+        for entry in record.get("kit_failures", ()):
+            if (not isinstance(entry, dict) or
+                    now - float(entry.get("time", 0.0) or 0.0) >
+                    self_improvement.KIT_HAZARD_WINDOW_SECONDS or
+                    not same_kit(entry.get("kit") or {})):
+                continue
+            failures.append((maps | {str(entry.get("map") or "")}, 1))
+            if self_improvement.hazard_failure(entry):
+                hazard_keys.add(str(key))
+    for spot in ranked:
+        if self_improvement.spot_key(spot, ()) in hazard_keys:
+            cap = min(cap, _spot_danger(spot))
+    return FundingFarmLimits(cap, failures)
+
+
 def route_death_maps(client: AtrinikClient) -> set[str]:
     """Maps where she recently died on the way to a farm spot.
 
@@ -6436,9 +6515,11 @@ def _analyzer_farm_choice(
     (farming_unsafe_reason, RecoveryTask): it removes depletion first, funds
     the fee from what she owns, and only once nothing is left to sell
     farms for it (cure_funding_farm). That farm follows the safety ranking
-    alone, never the chosen objective: its easiest usable spot, the safest
-    first and, among equally safe spots, the least dangerous (the analyzer's
-    danger), from the deeper safety view (FarmAnalyzer.SAFETY_TOP).
+    alone, never the chosen objective, from the deeper safety view
+    (FarmAnalyzer.SAFETY_TOP): only spots with a safe approach and under
+    the danger cap (FundingFarmLimits), those with the fewest recent
+    failures first, then the safest, then the least dangerous (the
+    analyzer's danger). With none left, it waits.
     """
     analyzer = getattr(client, "farm_analyzer", None)
     if analyzer is None:
@@ -6479,6 +6560,16 @@ def _analyzer_farm_choice(
         usable = [min(hazardous, key=lambda entry: (
             float(entry[2].get("danger", 0.0) or 0.0),
             -plan.approach_safety(entry[2]), order[id(entry)]))]
+    if funding:
+        # The cure-funding farm takes only a spot with a safe approach and
+        # under its danger cap, and waits when none is left
+        # (FundingFarmLimits).
+        limits = funding_farm_limits(client, analyzer.ranking("safety"))
+        usable = [entry for entry in usable
+                  if not plan.risky_approach(entry[2]) and
+                  _spot_danger(entry[2]) < limits.cap]
+        recent = {id(entry): limits.recent_failures(entry[1])
+                  for entry in usable}
 
     def preference(entry) -> tuple:
         # Within each objective's ranking (the effective one first, so the
@@ -6497,13 +6588,10 @@ def _analyzer_farm_choice(
             # The cure-funding farm wants the easiest spot, not the safety
             # view's order: its score is capped at 1, and the analyzer
             # orders those ties by its balanced score (FarmAnalyzer.
-            # SAFETY_TOP). So the safest first, and among equally safe
-            # spots the least dangerous.
-            danger = spot.get("danger")
-            danger = (float(danger) if isinstance(danger, (int, float)) and
-                      not isinstance(danger, bool) and danger == danger
-                      else float("inf"))
-            return (position, risky, -safety, danger, rank)
+            # SAFETY_TOP). So the fewest recent failures first, then the
+            # safest, and among equally safe spots the least dangerous.
+            return (position, recent[id(entry)], -safety,
+                    _spot_danger(spot), rank)
         return (position, risky, -safety if risky else 0.0, rank)
 
     usable.sort(key=preference)

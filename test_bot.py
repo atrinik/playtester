@@ -23693,12 +23693,36 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             # though the analyzer ranks it last.
             analyzer.report["rankings"]["safety"] = list(ranked)
             self.assertEqual(choice(), "Hemlock")
+            # A failure there today, an emergency recall on the way
+            # included, puts the spot without one first.
+            now = time.time()
+            client.state.farm_adaptations = {"elsewhere": {"maps": [], "kit_failures": [
+                {"time": now - 60, "cause": "route", "kind": "emergency-recall",
+                 "map": hemlock["map_paths"][0].removeprefix("maps"), "kit": {}}]}}
+            self.assertEqual(choice(), "Eld")
+            # A kit-hazard failure on a spot's own record caps the danger
+            # below it: nothing under the cap is left, so she waits.
+            client.state.farm_adaptations = {hemlock["path"]: {"kit_failures": [
+                {"time": now - 60, "cause": "pack", "kind": "emergency-recall",
+                 "map": "/elsewhere", "kit": {}}]}}
+            self.assertIsNone(choice())
+            client.state.farm_adaptations = {}
+            # Only a risky approach left: never taken, she waits.
+            analyzer.report["rankings"]["safety"] = burnt + [risky]
+            self.assertIsNone(choice())
+            analyzer.report["rankings"]["safety"] = list(ranked)
             # Not funding (depleted and parked, or by hand): rank order.
             client.set_cure_funding_farm(since=0.0)
             self.assertEqual(choice(), "Eld")
-        # Without a hazard, the funding farm still takes the least dangerous.
+        # Without a hazard, the funding farm still takes the least dangerous,
+        # and never one at half her health or more (134 here).
         start_cure_funding_farm(client, "short")
         self.assertEqual(choice(), "Hemlock")
+        analyzer.report["rankings"]["safety"] = burnt
+        self.assertEqual(choice(), None)
+        analyzer.report["rankings"]["safety"] = burnt + [
+            spot("Light", "/shattered_islands/world_18_76", 66.0)]
+        self.assertEqual(choice(), "Light")
 
 
 class RouteFailureTests(unittest.TestCase):
