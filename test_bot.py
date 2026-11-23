@@ -22488,7 +22488,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
     def test_money_arriving_mid_run_clears_cure_unfunded(self):
         from .alerts import STUCK_SECONDS, ProgressWatch, active
         from .client import format_money
-        from .navigation import CURE_FUNDING_FARM_BACKOFF
+        from .navigation import CURE_FUNDING_FARM_BACKOFF_SECONDS
 
         client, _ = self.client(depletion=92, bank=1_038)
         autoplay = AutoplayTask(built_graph(), target_level=115)
@@ -22500,7 +22500,9 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # parks.
         recovery.services._cure_funding_retry_at = (
             recovery.clock() + FarmCircuitTask.CURE_FUNDING_RETRY_SECONDS)
-        client.record_action(CURE_FUNDING_FARM_BACKOFF, "3 deaths")
+        client.set_cure_funding_farm(
+            since=0.0,
+            retry_until=time.time() + CURE_FUNDING_FARM_BACKOFF_SECONDS)
         for _ in range(3):
             asyncio.run(autoplay.tick(client))
         self.assertIs(autoplay.child, recovery)
@@ -22590,10 +22592,11 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
     # 2026-11-23 (v1.92.0): depletion 7, a 2,865 cure against her 2,245,
     # the chest trip failed, and she parked at her savebed for good.
 
-    def parked_unfunded(self, *, bank=2_245, depletion=7):
+    def parked_unfunded(self, *, bank=2_245, depletion=7, config=None):
         """Autoplay in recovery, depleted and short of the cure, with the
         chest trip failed (its retry pending) and nothing to sell."""
-        client, trees = self.client(depletion=depletion, bank=bank)
+        client, trees = self.client(depletion=depletion, bank=bank,
+                                    config=config)
         autoplay = AutoplayTask(built_graph(), target_level=115)
         asyncio.run(autoplay.tick(client))
         asyncio.run(autoplay.tick(client))
@@ -22631,6 +22634,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertTrue(cure_funding_farm(client))
         self.assertEqual(autoplay.phase, "adaptive-farming")
         self.assertIn("1 of 3", autoplay.recovery_alerts(client)[0][0]["text"])
+        self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_STARTED), 1)
 
     def test_no_funding_farm_while_a_funding_trip_is_left_or_the_bank_unknown(self):
         from .navigation import CURE_FUNDING_FARM_STARTED, cure_funding_farm
@@ -22681,27 +22685,40 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
                          "farming-suspended")
         for _ in range(3):
             asyncio.run(autoplay.tick(client))
-        self.assertIn(CURE_FUNDING_FARM_ENDED, self.actions(client))
-        self.assertIn("funded", client.decision_history[next(
-            index for index, record in enumerate(client.decision_history)
-            if record["action"] == CURE_FUNDING_FARM_ENDED)]["detail"])
+        ended = [record for record in client.decision_history
+                 if record["action"] == CURE_FUNDING_FARM_ENDED]
+        self.assertEqual(len(ended), 1)
+        self.assertIn("funded", ended[0]["detail"])
+        self.assertEqual(client.state.cure_funding_farm_since, 0.0)
         # Recovery takes her to be cured as usual.
         self.assertIsInstance(autoplay.child, RecoveryTask)
         asyncio.run(autoplay.tick(client))
         self.assertIsInstance(autoplay.child.services._restoration.task,
                               TempleServiceTask)
-        # Spending it again (or a later shortfall) is a fresh decision.
+        # A later shortfall is a fresh decision.
         client.state.bank_balance = 2_245
+        self.assertFalse(cure_funding_farm(client))
+
+    def test_carried_coins_that_pay_end_it_without_a_known_bank(self):
+        from .navigation import cure_funding_farm, start_cure_funding_farm
+
+        client, _ = self.client(depletion=7, bank=0)
+        start_cure_funding_farm(client, "short")
+        client.state.bank_balance_known = False
+        self.assertTrue(cure_funding_farm(client))
+        client.state.place_item(Item(
+            600, item_type=c.TYPE_MONEY, quality=0, name="gold coin"),
+            client.state.player_tag)
         self.assertFalse(cure_funding_farm(client))
 
     def test_the_funding_farm_ends_when_depletion_is_no_longer_due(self):
         from .navigation import (CURE_FUNDING_FARM_ENDED,
-                                 CURE_FUNDING_FARM_STARTED,
                                  cure_funding_farm_state,
-                                 settle_cure_funding_farm)
+                                 settle_cure_funding_farm,
+                                 start_cure_funding_farm)
 
         client, _ = self.client(depletion=7, bank=2_245)
-        client.record_action(CURE_FUNDING_FARM_STARTED, "short")
+        start_cure_funding_farm(client, "short")
         self.assertEqual(settle_cure_funding_farm(client), "")
         # The force with an unknown counter proves nothing.
         client.state.depletion_points_known = False
@@ -22710,10 +22727,62 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(settle_cure_funding_farm(client),
                          CURE_FUNDING_FARM_ENDED)
         self.assertEqual(cure_funding_farm_state(client).state, "")
+        self.assertEqual(settle_cure_funding_farm(client), "")
+
+    def test_a_farm_from_an_episode_cured_since_never_carries_over(self):
+        # Cured while autoplay was stopped, then depleted again: the old
+        # farm (started at 7 points) is no farm for the new episode at 4.
+        from .navigation import (CURE_FUNDING_FARM_ENDED, cure_funding_farm,
+                                 cure_funding_farm_state,
+                                 settle_cure_funding_farm,
+                                 start_cure_funding_farm)
+
+        client, _ = self.client(depletion=7, bank=2_245)
+        start_cure_funding_farm(client, "short")
+        for _ in range(2):
+            client.record_action("death", "killed")
+        client.state.depletion_points = 4
+        self.assertFalse(cure_funding_farm(client))
+        self.assertEqual(cure_funding_farm_state(client).state, "")
+        self.assertEqual(settle_cure_funding_farm(client),
+                         CURE_FUNDING_FARM_ENDED)
+        self.assertEqual(client.state.cure_funding_farm_since, 0.0)
+
+    def test_the_funding_farm_survives_a_restart_and_a_trimmed_history(self):
+        from .navigation import (CURE_FUNDING_FARM_DEATHS, cure_funding_farm,
+                                 cure_funding_farm_state,
+                                 settle_cure_funding_farm,
+                                 start_cure_funding_farm)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = ClientConfig(character="Sera", runtime_state_path=str(
+                Path(directory) / "memory.sqlite3"))
+            client, _ = self.client(depletion=7, bank=2_245, config=config)
+            client.load_character_memory("Sera")
+            client.set_depletion_points(7)
+            start_cure_funding_farm(client, "short")
+            for _ in range(CURE_FUNDING_FARM_DEATHS - 1):
+                client.record_action("death", "killed")
+            settle_cure_funding_farm(client)
+            self.assertEqual(client.state.cure_funding_farm_deaths,
+                             CURE_FUNDING_FARM_DEATHS - 1)
+            # A restart, and so many decisions since that the start and
+            # its deaths left the bounded history.
+            client, _ = self.client(depletion=7, bank=2_245, config=config)
+            client.load_character_memory("Sera")
+            self.assertEqual(client.state.depletion_points, 7)
+            client.decision_history = [
+                {"time": time.time(), "action": "heal", "detail": ""}
+                for _ in range(2_000)]
+            self.assertEqual(cure_funding_farm_state(client).deaths,
+                             CURE_FUNDING_FARM_DEATHS - 1)
+            self.assertTrue(cure_funding_farm(client))
+            # One more death reaches the cap.
+            client.record_action("death", "killed")
+            self.assertFalse(cure_funding_farm(client))
 
     def test_the_funding_farm_follows_the_safety_ranking_alone(self):
-        from .navigation import (CURE_FUNDING_FARM_STARTED,
-                                 analyzer_farm_choice)
+        from .navigation import analyzer_farm_choice, start_cure_funding_farm
 
         client, trees = self.client(depletion=7, bank=2_245)
         cave = analyzer_spot("Cave", ["/shattered_islands/world_0_70"],
@@ -22723,7 +22792,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client.farm_analyzer = StubAnalyzer({"xp": [trees], "safety": []})
         choice = analyzer_farm_choice(client, built_graph(), search=False)
         self.assertEqual(choice[0], "xp")
-        client.record_action(CURE_FUNDING_FARM_STARTED, "short")
+        start_cure_funding_farm(client, "short")
         self.assertIsNone(
             analyzer_farm_choice(client, built_graph(), search=False))
         # With a safety ranking, its easiest usable spot.
@@ -22731,21 +22800,21 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             {"xp": [trees], "safety": [cave, trees]})
         choice = analyzer_farm_choice(client, built_graph(), search=False)
         self.assertEqual((choice[0], choice[2]["name"]), ("safety", "Cave"))
-        # No usable safety spot: autoplay waits where she is, and the
-        # warning turns critical, since she is not farming.
+        # No usable spot: autoplay waits where she is, and the warning
+        # turns critical, an explained wait rather than being stuck.
         client.farm_analyzer = StubAnalyzer({"xp": [trees], "safety": []})
         autoplay = AutoplayTask(built_graph(), target_level=115)
         for _ in range(2):
             asyncio.run(autoplay.tick(client))
         self.assertIsNone(autoplay.child)
-        alerts, _ = autoplay.recovery_alerts(client)
+        alerts, waiting = autoplay.recovery_alerts(client)
         self.assertEqual(self.ids(alerts), ["cure-unfunded"])
         self.assertEqual(alerts[0]["level"], "critical")
-        self.assertIn("no safety spot is usable", alerts[0]["text"])
+        self.assertIn("no farm spot is usable yet", alerts[0]["text"])
+        self.assertTrue(waiting)
 
     def test_deaths_while_funding_back_off_to_parking(self):
         from .navigation import (CURE_FUNDING_FARM_BACKOFF,
-                                 CURE_FUNDING_FARM_BACKOFF_SECONDS,
                                  CURE_FUNDING_FARM_DEATHS,
                                  CURE_FUNDING_FARM_STARTED, RecoveryTask,
                                  cure_funding_farm, cure_funding_farm_state,
@@ -22778,53 +22847,108 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         alerts, waiting = autoplay.recovery_alerts(client)
         self.assertEqual(alerts[0]["id"], "cure-unfunded")
         self.assertEqual(alerts[0]["level"], "critical")
-        self.assertIn("stopped after 3 deaths", alerts[0]["text"])
+        self.assertIn("stopped after 3 deaths, next try in 23h",
+                      alerts[0]["text"])
         self.assertTrue(waiting)
         # Once the backoff has passed she may try again, deaths counted
         # afresh.
-        for record in client.decision_history:
-            if record["action"] == CURE_FUNDING_FARM_BACKOFF:
-                record["time"] -= CURE_FUNDING_FARM_BACKOFF_SECONDS + 1
+        client.state.cure_funding_farm_retry_until = time.time() - 1.0
         asyncio.run(autoplay.tick(client))
         self.assertEqual(self.actions(client).count(CURE_FUNDING_FARM_STARTED), 2)
         self.assertEqual(cure_funding_farm_state(client).deaths, 0)
         self.assertTrue(cure_funding_farm(client))
 
     def test_the_funding_farm_makes_no_optional_trip_or_detour(self):
-        from .navigation import CURE_FUNDING_FARM_STARTED, analyzer_spot_legs
+        from .navigation import analyzer_spot_legs, start_cure_funding_farm
 
-        client, trees = self.client(depletion=7, bank=2_245)
-        circuit = FarmCircuitTask(built_graph(), list(analyzer_spot_legs(
-            trees, built_graph())), analyzer_driven=True, spot=trees)
-        circuit.child = circuit._new_child()
-        circuit.status = TaskStatus.RUNNING
+        client, trees = self.client(depletion=7, bank=50_000)
+        client.state.bank_balance = 2_245
 
         async def idle(*args, **kwargs):
             return False
 
-        circuit.server_clock.sync = idle
-        for name in dir(circuit):
-            if name.startswith("_needs_"):
-                setattr(circuit, name, lambda *args, **kwargs: False)
-        circuit._queue_inventory_capability = lambda *args: False
-        circuit._apply_disease_cure = idle
-        circuit._queue_depletion_service = lambda client: False
-        circuit._needs_spell_purchase = lambda client: True
-        circuit._new_spell_purchase = lambda: _DoneErrand(
-            status=TaskStatus.RUNNING)
-        client.record_action(CURE_FUNDING_FARM_STARTED, "short")
-        asyncio.run(circuit.tick(client))
-        self.assertIsNone(circuit._spell_purchase)
-        # The same circuit, not funding: the trip goes.
-        client.record_action("cure-funding-farm-ended", "test")
-        asyncio.run(circuit.tick(client))
-        self.assertIsNotNone(circuit._spell_purchase)
-        # No mana-crystal detour while funding either.
-        client.record_action(CURE_FUNDING_FARM_STARTED, "short")
+        trips = {"_needs_savebed": ("_new_savebed", "_bed_binding"),
+                 "_needs_ship_key": (None, "_ship_key"),
+                 "_needs_spell_purchase": ("_new_spell_purchase",
+                                           "_spell_purchase"),
+                 "_needs_recall_shopping": ("_new_recall_shopping",
+                                            "_recall_shopping"),
+                 "_needs_utility_shopping": ("_new_utility_shopping",
+                                             "_utility_shopping"),
+                 "_needs_upgrade_shopping": ("_new_upgrade_shopping",
+                                             "_shopping")}
+
+        def circuit_wanting(needs):
+            circuit = FarmCircuitTask(built_graph(), list(analyzer_spot_legs(
+                trees, built_graph())), analyzer_driven=True, spot=trees)
+            circuit.child = circuit._new_child()
+            circuit.status = TaskStatus.RUNNING
+            circuit.server_clock.sync = idle
+            for name in dir(circuit):
+                if name.startswith("_needs_"):
+                    setattr(circuit, name, lambda *args, **kwargs: False)
+            circuit._queue_inventory_capability = lambda *args: False
+            circuit._apply_disease_cure = idle
+            circuit._queue_depletion_service = lambda client: False
+            setattr(circuit, needs, lambda *args, **kwargs: True)
+            factory, _ = trips[needs]
+            circuit._bed_target = ("/shattered_islands/world_0_67", (1, 1), 9)
+            circuit._savebed_search = lambda client: types.SimpleNamespace(
+                current_walk=None)
+            if factory is not None:
+                setattr(circuit, factory, lambda *args, **kwargs: _DoneErrand(
+                    status=TaskStatus.RUNNING))
+            return circuit
+
+        start_cure_funding_farm(client, "short")
+        for needs, (_, slot) in trips.items():
+            with self.subTest(needs):
+                circuit = circuit_wanting(needs)
+                if needs == "_needs_ship_key":
+                    with patch("atrinik_bot.navigation.MorgeeanShipKeyTask",
+                               lambda graph: _DoneErrand(
+                                   status=TaskStatus.RUNNING)):
+                        asyncio.run(circuit.tick(client))
+                else:
+                    asyncio.run(circuit.tick(client))
+                self.assertIsNone(getattr(circuit, slot))
+        # Not funding (ended): the same circuits make each trip.
+        client.set_cure_funding_farm(since=0.0)
+        for needs, (_, slot) in trips.items():
+            with self.subTest(needs, funding=False):
+                circuit = circuit_wanting(needs)
+                with patch("atrinik_bot.navigation.MorgeeanShipKeyTask",
+                           lambda graph: _DoneErrand(
+                               status=TaskStatus.RUNNING)):
+                    asyncio.run(circuit.tick(client))
+                self.assertIsNotNone(getattr(circuit, slot))
+        # No mana-crystal detour while funding either; without it, one goes.
         autoplay = AutoplayTask(built_graph(), target_level=115)
+        started = []
+
+        async def detour(client):
+            started.append(True)
+
         autoplay._needs_mana_crystal_start = lambda client: True
+        autoplay._start_mana_crystal_detour = detour
+        self.assertTrue(asyncio.run(
+            autoplay._start_mana_crystal_detours(client)))
+        start_cure_funding_farm(client, "short")
         self.assertFalse(asyncio.run(
             autoplay._start_mana_crystal_detours(client)))
+        self.assertEqual(started, [True])
+
+    def test_the_funding_farm_may_restock_heals(self):
+        from .navigation import start_cure_funding_farm
+
+        client, trees = self.client(depletion=7, bank=2_245)
+        circuit = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        circuit._heal_restock_funds = lambda client: 500
+        circuit._inventory_ready = lambda client: True
+        # Depleted and parked: recovery comes first, no restock.
+        self.assertFalse(circuit._needs_heal_restock(client))
+        start_cure_funding_farm(client, "short")
+        self.assertTrue(circuit._needs_heal_restock(client))
 
 class RouteFailureTests(unittest.TestCase):
     """Expiring, per-exit route exclusions."""

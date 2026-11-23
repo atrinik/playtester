@@ -350,19 +350,22 @@ class AutoplayTask(BotTask):
         reason = farming_unsafe_reason(client)
         if not reason:
             # Farming to fund the cure: its cure-unfunded warning, critical
-            # while no safety spot is usable and she waits for one.
+            # while no farm spot is usable and she waits for one (an
+            # explained wait, not being stuck).
             funding = cure_funding_farm_alerts(client)
-            if funding and self.child is None and self._awaiting_ranking_recorded:
+            awaiting = bool(funding and self.child is None and
+                            self._awaiting_ranking_recorded)
+            if awaiting:
                 funding = [dict(alert, level="critical",
-                                text=alert["text"] + "; no safety spot is "
-                                     "usable, so she waits for one")
+                                text=alert["text"] + "; no farm spot is "
+                                     "usable yet, so she waits for one")
                            for alert in funding]
             recall = funding + recall
             # A farm resting for want of a heal or a recall (at most
             # UNPREPARED_REST_LIMIT_SECONDS) is waiting, not stuck.
             resting = (isinstance(self.child, FarmCircuitTask) and
                        self.child.unprepared_resting())
-            return recall, resting
+            return recall, resting or awaiting
         alerts = [{"id": "farming-suspended", "level": "warn",
                    "text": f"Farming suspended: {reason}"}] + recall
         waiting = False

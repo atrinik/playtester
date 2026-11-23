@@ -884,16 +884,21 @@ not block her either.
   never the chosen objective: its easiest usable spot, by the ordinary
   rules (quarantine, route deaths, kit hazard, strict town reach). It
   makes no optional trip (savebed rebinding, upgrade, spell, utility and
-  recall shopping, the ship key) and no mana-crystal detour. The heal
-  restock already waits while depletion is due. The unprepared hold and
-  the circuit's maintenance trips (food, bank, identify, storage, junk
-  sale, the chest) run as ever.
+  recall shopping, the ship key) and no mana-crystal detour. The one
+  exception is the [healing-potion restock](#healing-potion-restock),
+  which otherwise waits while depletion is due: a depleted farm without
+  heals is the 2026-11-17 death spiral. The unprepared hold and the
+  circuit's maintenance trips (food, bank, identify, storage, junk sale,
+  the chest) run as ever.
 - **Until she can pay.** Affordability is read live on every tick: as
-  soon as wallet and bank pay for the cure, farming is unsafe again,
+  soon as the coins she carries, or they and her known bank balance, pay
+  for the cure, farming is unsafe again,
   autoplay hands over to recovery as usual (essential trips and a farm
   fight finish first) and recovery takes her to the temple. Autoplay
   records `cure-funding-farm-ended` (funded, or depletion no longer due).
-  A later shortfall is a fresh decision.
+  A later shortfall is a fresh decision, and so is a new episode: a farm
+  started at more depletion points than she has now (she was cured while
+  autoplay was not running) is no farm.
 - **No death loop.** A death while funding is no reason to stop: depletion
   is already due, and its fee does not grow with the points. After
   `CURE_FUNDING_FARM_DEATHS` (3) deaths since the start she stops,
@@ -901,13 +906,18 @@ not block her either.
   with the critical alert again. Only after
   `CURE_FUNDING_FARM_BACKOFF_SECONDS` (24 h) may another funding farm
   start, with its deaths counted afresh.
-- **Recorded, so it survives Stop and restarts.** Its state is read from
-  her persisted decisions: the latest `cure-funding-farm`,
-  `cure-funding-farm-ended` or `cure-funding-farm-backoff`, and the
-  deaths recorded since.
+- **Persisted, so it survives Stop and restarts.** Its state is her
+  character memory (`GameState.cure_funding_farm_*`: start, deaths
+  counted, starting depletion points, backoff end), not the bounded
+  decision history, from which a long farm's start and deaths would
+  scroll out. Deaths are counted from the `death` decisions and folded
+  into the persisted count every autoplay tick. The `cure-funding-farm`,
+  `cure-funding-farm-ended` and `cure-funding-farm-backoff` decisions are
+  its audit trail.
 - **Alerts.** While she farms for it, `cure-unfunded` is a warning naming
   both amounts and her deaths while funding; it is critical again while
-  no safety spot is usable and she waits for one, and while she parks
+  no farm spot is usable and she waits for one (an explained wait, so no
+  `stuck` alert), and while she parks
   after the backoff (with the time to the next try). Operator assist is
   unchanged and still offered in the text.
 
@@ -930,7 +940,7 @@ so she is rarely without a heal:
   unidentified potion or a spellbook is no heal to either. Healing spells,
   rods and wands are not counted, on purpose: the restock is the backup
   for when her SP or charges run out. Not with depletion due (the recovery phase
-  comes first), not above the food trips' load limit (80 % of her carry
+  comes first), except on the cure-funding farm, not above the food trips' load limit (80 % of her carry
   weight), and only with the money for one item plus the 1,000 copper
   reserve (`HEAL_RESTOCK_RESERVE`): with a healing quote from the last day
   (`heal_restock_quote`, vendor quote `heal-restock`), its price plus the
@@ -982,7 +992,8 @@ so she is rarely without a heal:
   (`heal-restock-deferred`), not a day. Once the hold's ten minutes run
   out, it goes like any optional trip, ahead of the others. Prepared (a
   ready recall, SP for a healing spell, or 90 % HP), it is an ordinary
-  optional trip. Never while depletion is due.
+  optional trip. Never while depletion is due, except on the
+  [cure-funding farm](#an-unaffordable-cure-is-never-a-blocker-owner-decision-2026-11-23).
 - **No loops.** A merchant with no healing stock she can use, stock that
   ran short of the low mark, or no merchant at all backs her off for a
   day; a failed trip (she could pay for none, a route declined, a
