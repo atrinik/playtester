@@ -12,6 +12,10 @@ two differ:
   budget, no route, behind an owner block), would override it as an
   essential trip with care, or would pause farming at a cap.
 
+A zero-length trip (the live plan has no edges and no error, because she
+is already there, and the shadow plans no edges either) is no comparison:
+it is not recorded, and the report ignores such rows stored earlier.
+
 Each comparison, agreements included, is also a row in her memory's
 ``route_shadow`` table (7 days, capped), which the ``route-shadow`` command
 summarises per trip kind for the owner's divergence report (the P7 and P8
@@ -121,6 +125,9 @@ class RouteShadow:
             return
         trip = task.trip_kind(client)
         source = origin[0] if origin else client.state.map.path
+        if not route and not error and source == task.destination:
+            # A zero-length trip: nothing to compare.
+            return
         live = tuple(route_costs.edge_subject(edge) for edge in route or ())
         key = (trip, source, task.destination, bool(task.strict_safety), live, error[:80])
         if now - self._trips_seen.get(key, -math.inf) < SHADOW_TRIP_REPEAT_SECONDS:
@@ -243,6 +250,9 @@ class RouteShadow:
                                   lambda edge: _edge_arrival(snapshot.graph, edge))
                      if live_route else None)
         shadow = plan.subjects()
+        if _zero_length(live_route, context["error"], plan.route):
+            # Already there by both plans: no comparison, no row.
+            return
         if (plan.route is None and not live_route and
                 plan.outcome in (route_costs.NO_ROUTE, route_costs.BLOCKED)):
             # Neither plan found a way: they agree.
@@ -403,6 +413,25 @@ def _decide(client: Any, action: str, detail: str) -> None:
         recorder(action, detail)
 
 
+def _zero_length(live_route: list | None, error: str, shadow_route: list | None) -> bool:
+    """Whether both plans are empty: the live one without an error, and the
+    shadow's a route of no edges (not a failure)."""
+    return not live_route and not error and shadow_route is not None and not shadow_route
+
+
+def _zero_length_row(row: dict[str, Any]) -> bool:
+    """A stored trip row of a zero-length trip (recorded before such trips
+    were skipped): both sides have no edges and the live plan no error."""
+    detail = row.get("detail") or {}
+    if row.get("kind") != "trip":
+        return False
+    live, shadow = detail.get("live"), detail.get("shadow")
+    if not isinstance(live, dict) or not isinstance(shadow, dict):
+        return False
+    return (live.get("edges") == 0 and shadow.get("edges") == 0 and
+            not live.get("error"))
+
+
 def _maps(route: list) -> list[str]:
     return [edge.destination for edge in route]
 
@@ -557,11 +586,13 @@ def note_live_plan(client: Any, plan: route_costs.LearnedPlan) -> None:
 def summarise_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """The divergence report from ``route_shadow`` rows: counts per kind,
     trip and result, the subjects that most often decide a difference, and
-    the newest differences (route-shadow command)."""
+    the newest differences (route-shadow command). Rows of zero-length trips
+    are no comparisons: they are only counted as ``zero_length``."""
     counts: dict[str, dict[str, dict[str, int]]] = {}
     reasons: collections.Counter = collections.Counter()
     differences = []
-    for row in rows:
+    compared = [row for row in rows if not _zero_length_row(row)]
+    for row in compared:
         detail = row.get("detail") or {}
         kind, trip, result = row.get("kind", ""), row.get("trip", ""), row.get("result", "")
         bucket = counts.setdefault(kind, {}).setdefault(trip, {})
@@ -578,6 +609,7 @@ def summarise_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if kind == "farm":
             for path in (live.get("chokepoint_danger") or {}):
                 reasons[map_subject(path)] += 1
-    return {"rows": len(rows), "counts": counts,
+    return {"rows": len(compared), "zero_length": len(rows) - len(compared),
+            "counts": counts,
             "subjects": reasons.most_common(15),
             "differences": differences[-SHADOW_SHOWN:]}

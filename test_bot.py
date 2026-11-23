@@ -32028,6 +32028,50 @@ class RouteShadowTests(unittest.TestCase):
         self.assertEqual([row["result"] for row in self.rows()], ["agreed"])
         self.assertEqual(self.client.actions(), [])
 
+    def test_a_zero_length_trip_is_no_comparison(self):
+        # Already on the destination map: no edges, no error, nothing compared.
+        _, live = self.plan(destination="/start")
+        self.assertEqual(live, [])
+        self.assertEqual(self.client.route_shadow.jobs, {})
+        self.client.route_shadow.run(self.client)
+        self.assertEqual((self.rows(), self.client.actions()), ([], []))
+
+    def test_both_plans_empty_is_not_a_divergence(self):
+        # Requested anyway (another destination name on this map): the
+        # shadow's empty route agrees and nothing is recorded.
+        shadow = self.client.route_shadow
+        task = NavigateTask(self.graph, "/goal")
+        task.status = TaskStatus.RUNNING
+        plan = self.route_costs.LearnedPlan(trip="errand", outcome="planned", route=[])
+        context = {"trip": "errand", "source": "/start", "destination": "/goal",
+                   "strict": False, "live": (), "live_route": [], "error": "",
+                   "snapshot": task._trip_snapshot(self.client, None)}
+        shadow._finish_trip(self.client, context, plan)
+        self.assertEqual((self.rows(), self.client.actions(), shadow.counts), ([], [], {}))
+        # A live failure beside it is still compared.
+        shadow._finish_trip(self.client, {**context, "error": "no route"}, plan)
+        self.assertEqual([row["result"] for row in self.rows()], ["diverged"])
+
+    def test_the_report_ignores_stored_zero_length_rows(self):
+        now = time.time()
+        zero = {"at": now, "kind": "trip", "trip": "errand", "result": "diverged",
+                "source": "/shattered_islands/world_0_83",
+                "destination": "/shattered_islands/world_0_83", "reason": "",
+                "outcome": "planned", "care": "", "budget": None,
+                "live": {"edges": 0, "maps": []},
+                "shadow": {"edges": 0, "maps": [], "time": 0, "prior": 0,
+                           "learned": 0, "total": 0}}
+        real = {**zero, "at": now + 1, "destination": "/goal",
+                "live": {"edges": 1, "maps": ["/goal"]},
+                "shadow": {"edges": 2, "maps": ["/detour_1", "/goal"]}}
+        failed = {**zero, "at": now + 2, "live": {"edges": 0, "maps": [], "error": "no route"}}
+        self.client.memory.record_route_shadow("Sera", [zero, real, failed])
+        report = self.route_shadow.summarise_rows(self.client.memory.route_shadow_rows("Sera"))
+        self.assertEqual((report["rows"], report["zero_length"]), (2, 1))
+        self.assertEqual(report["counts"], {"trip": {"errand": {"diverged": 2}}})
+        self.assertEqual([row["detail"]["destination"] for row in report["differences"]],
+                         ["/goal", "/shattered_islands/world_0_83"])
+
     def test_each_job_progresses_every_step(self):
         shadow = self.client.route_shadow
         progress = {"trip": 0, "farm": 0}
