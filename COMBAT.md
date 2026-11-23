@@ -845,16 +845,92 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
   with a heal or a ready recall, nothing changes. The routing danger weight already
   plans with the safety λ while she has no ready recall (ROUTING 4.5).
   Follow-ups, not part of this change: a town trip to buy healing potions
-  (no existing trip buys them, and the sage's stock is random), better
-  flee logic at critical health with no heal and no recall, and
+  (no existing trip buys them, and the sage's stock is random), and
   preferring the analyzer's safety objective while she has no working
   recall (switching it re-ranks spots each time a wand's charge is
-  learned).
+  learned). The in-fight escape on a walk is
+  [below](#critical-escape-on-a-walk-2026-11-22).
 - **Recall alerts use fresh quotes only.** A recall quote older than a
   day (`RECALL_SHOP_INTERVAL`) is no price: it neither gates recall
   shopping nor raises `recall-unfunded`. When an alternative's quote never
   arrives, the cheapest price she could not pay is still recorded. A
   recall spell costing more SP than her whole bar is not a recall source.
+
+## Critical escape on a walk (2026-11-22)
+
+The death that led to the unprepared rest above, read from her post-mortem
+and journal (v1.87.0): starving (food 0, nothing to eat, "no temple priest
+is reachable"), with 2 of 82 SP and no recall, she was on the
+mana-crystal-upgrade errand's defended walk (`NavigateThenTask`, safety
+thresholds 85 % heal and 70 % flee). From 23:30:37 UTC she logged
+"critical health ... and no usable heal" every 2 s while she went on
+through the Old Outpost from 69 % to 1 %, hit about every 15 s. Two gaps:
+
+- Starving with nothing to eat makes resting futile, so the walk's
+  low-health hold let her walk on (`starving_without_food`). That also
+  skipped its retreat: she walked on among the troll guards instead of
+  away from them.
+- Her last 12 s, at 7 % down to 1 %, she stood in a doorway of
+  `old_outpost_0202` (17, 9) choosing two diagonal retreat steps in turn
+  every half second (`navigation-retreat-choice`, directions 4 and 6),
+  neither of which landed. `_retreat_step` replaced a step in flight with
+  a new one before `movement_ack_timeout` (at least 1.5 s), so neither was
+  ever learned as blocked.
+
+Now, on a defended walk:
+
+- **A retreat step waits for its answer.** While one is in flight,
+  `NavigateThenTask._retreat_step` (and `_unseen_attacker_retreat`, which
+  shares its bookkeeping) waits for it, as the farm's
+  `retreat_ack_pending` does. A step still where she sent it at the
+  acknowledgement timeout is learned as blocked, and the next choice is
+  another square. Once she stands anywhere else (pushed, teleported, a
+  map change) the step is forgotten, not learned. A learned square is
+  tried again after `RETREAT_BLOCKED_SECONDS` (30 s), and forgotten on
+  another map. This is a fix for every caller of the walk's retreat: its
+  own defence (`_defend_while_navigating`, on its own walk and as the farm
+  circuit's transit legs, route-death hold and failed-route escape, and the
+  recovery phase's defence call it) and the circuit's failed-route escape,
+  which calls `_retreat_step` directly.
+- **Critical escape.** Only on a walk's own tick (`own_walk`), and not on
+  a farm circuit's transit leg (a walk whose task is a `FarmTask`), which
+  keeps its defence unchanged. While she has neither a usable heal nor a
+  ready recall (`out_of_heals_and_recall`), from the safety's flee
+  threshold, with an attacker within 4 tiles on her (a hit in the last
+  3 s, or one within 2 tiles), she runs, starving or not: combat off, no
+  pull, recorded once per escape as `navigation-critical-escape`. Before
+  it come only the safety's heal and food (`SafetyPolicy.enforce`; a heal
+  or meal just sent holds the escape for that tick) and the transit
+  hold-fire release of an engagement. The step must take her farther
+  from the nearest attacker (`gain_only`); among those, the usual retreat
+  ranking chooses, open continuation first. An equal-distance step does
+  not count: in a pocket it shuffled her between two squares beside a
+  troll that stood still, combat off, never fighting.
+- **No re-engaging until recovered.** The escape holds until she is above
+  the safety's heal threshold, or has a heal or a ready recall again, and
+  ends when the walk starts again. Until then she keeps running from an
+  attacker on her, and closes no gap to a creature more than 2 tiles off.
+- **Cornered keeps its defence.** With no step that gains distance the
+  escape does not act, and the walk's defence decides (the cornered fight
+  among them), against the closest attacker rather than a committed one
+  farther off. The safety's low-health hold, whose equal-distance steps
+  would shuffle her beside the attacker with combat off, stands aside
+  meanwhile.
+
+Accepted limits:
+
+- once no attacker is on her, the walk's hold and route go on as before.
+  Starving with nothing to eat she does not rest, so the route can lead
+  her back past the attacker she escaped; giving up an errand to go for
+  food is not part of this change;
+- the escape sees only creatures within 4 tiles: a ranged attacker
+  farther off, or one she cannot see, does not start it.
+
+The farm map's own retreat (`FarmTask.low_health_retreat`, the cornered
+breakout and the pursued stand) is unchanged; an earlier attempt to change
+them, during the review of
+[pull request 117](https://github.com/atrinik/playtester/pull/117), spawned
+edge cases and was reverted.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 
