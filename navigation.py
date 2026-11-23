@@ -64,7 +64,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
                     combat_allowed, UnpreparedHold, wand_known_empty)
-from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
+from .tasks import (RECALL_REQUIRED_LEVEL, heal_consumables,
+                    out_of_heals_and_recall, reads_scrolls)
 log = logging.getLogger(__name__)
 
 
@@ -6762,6 +6763,17 @@ class FarmCircuitTask(BotTask):
     HEAL_RESTOCK_RETRY_SECONDS = 2 * 60 * 60
     HEAL_RESTOCK_STRICT_RETRY_SECONDS = 600.0
     HEAL_RESTOCK_SAFETY = (0.85, 0.70)
+    # After a restock that reached the low mark, the next waits this long:
+    # at high level a fight can use all five, and restocking at once would
+    # empty the merchant's stock in back-to-back trips.
+    HEAL_RESTOCK_MIN_INTERVAL = 2 * 60 * 60
+    # Out of heals and recall, a trip whose route needs the hostile-transit
+    # fallback departs only at full HP and SP; meanwhile the farm rests
+    # (FarmTask.rest_for_departure), the trip is re-planned this often, and
+    # after HEAL_RESTOCK_FULL_WAIT_SECONDS she gives up for
+    # HEAL_RESTOCK_RETRY_SECONDS.
+    HEAL_RESTOCK_FULL_RECHECK_SECONDS = 30.0
+    HEAL_RESTOCK_FULL_WAIT_SECONDS = 600.0
     UPGRADE_SWEEP_WALLET_GROWTH = 5_000
     UPGRADE_SWEEP_POLICY = 8
     BANK_DEPOSIT_MINIMUM = 1_000
@@ -6910,6 +6922,8 @@ class FarmCircuitTask(BotTask):
         # Only for a strict (unprepared) plan that found no seller; every
         # other backoff is persisted (GameState.heal_restock_retry_until).
         self._heal_restock_retry_at = 0.0
+        # Since when a hostile-transit restock waits for full HP and SP.
+        self._heal_restock_full_since: float | None = None
         self._ship_key: MorgeeanShipKeyTask | None = None
         self._ship_key_retry_at = 0.0
         self._spell_purchase: NavigateThenTask | None = None
@@ -8843,8 +8857,8 @@ class FarmCircuitTask(BotTask):
                               seconds: float) -> None:
         """Persist why the heal restock came to nothing and wait
         ``seconds`` before the next (heal_restock_alerts shows the note);
-        "" and 0 clear it."""
-        until = time.time() + seconds if note else 0.0
+        a note of "" is a pause without an alert, and 0 seconds clears."""
+        until = time.time() + seconds if seconds > 0 else 0.0
         setter = getattr(client, "set_heal_restock_backoff", None)
         if setter is not None:
             setter(note, until)
@@ -8863,34 +8877,42 @@ class FarmCircuitTask(BotTask):
 
         Planned as recall shopping is: the nearest by a route without a
         threat fallback, authored healing stock before random potions, a
-        route over its budget after every other; when no such route
-        exists, the merchant with authored healing stock, whose own trip
-        may cross hostile transit as recall shopping does (Asteria is
-        reached by the crocodile road). ``strict`` (while unprepared):
-        only a strict route, never that fallback, else None.
+        route over its budget after every other. When no such route
+        exists, the same ranking over routes that need the hostile-transit
+        fallback (Asteria is reached by the crocodile road), as recall
+        shopping's own trip may take; the trip is then marked
+        ``hostile_transit``. ``strict`` (while unprepared): only a strict
+        route, never that fallback, else None.
         """
         vendors = heal_restock_vendors(self.graph, client)
-        ranked = []
-        for vendor, fixed in vendors:
-            navigation = NavigateTask(
-                self.graph, vendor.map_path, (vendor.x, vendor.y), tolerance=2)
-            navigation.strict_safety = strict
-            try:
-                route = navigation._plan(client)
-            except ValueError:
-                continue
-            if navigation._threat_fallback:
-                continue
-            ranked.append((navigation.over_budget, not fixed, len(route),
-                           vendor.name.casefold(), vendor.map_path, vendor))
-        if ranked:
-            vendor = min(ranked, key=lambda entry: entry[:-1])[-1]
-        elif vendors and not strict:
-            vendor = min(vendors, key=lambda entry: (
-                not entry[1], entry[0].level, entry[0].map_path,
-                entry[0].name.casefold()))[0]
-        else:
+        hostile = False
+
+        def ranking(fallback: bool) -> list:
+            ranked = []
+            for vendor, fixed in vendors:
+                navigation = NavigateTask(
+                    self.graph, vendor.map_path, (vendor.x, vendor.y),
+                    tolerance=2)
+                navigation.strict_safety = strict
+                navigation.allow_ranged_hazard_fallback = fallback
+                # A probe: no navigation-threat-fallback decision.
+                navigation._threat_fallback = fallback
+                try:
+                    route = navigation._plan(client)
+                except ValueError:
+                    continue
+                if navigation._threat_fallback and not fallback:
+                    continue
+                ranked.append((navigation.over_budget, not fixed, len(route),
+                               vendor.name.casefold(), vendor.map_path, vendor))
+            return ranked
+
+        ranked = ranking(False)
+        if not ranked and not strict:
+            ranked, hostile = ranking(True), True
+        if not ranked:
             return None
+        vendor = min(ranked, key=lambda entry: entry[:-1])[-1]
         heal_below, flee_below = self.HEAL_RESTOCK_SAFETY
         safety = SafetyPolicy(heal_below=heal_below, flee_below=flee_below)
         task = NavigateThenTask(
@@ -8905,7 +8927,37 @@ class FarmCircuitTask(BotTask):
         task.navigation.tolerance = 2
         task.navigation.strict_safety = strict
         task.navigation.allow_ranged_hazard_fallback = not strict
+        task.hostile_transit = hostile
         return task
+
+    @staticmethod
+    def _full_hp_sp(client: AtrinikClient) -> bool:
+        stats = client.state.stats
+        return (int(stats.get("hp", 0) or 0) >= int(stats.get("maxhp", 0) or 0)
+                and int(stats.get("sp", 0) or 0) >=
+                int(stats.get("maxsp", 0) or 0))
+
+    def _heal_restock_waiting(self, client: AtrinikClient,
+                              farm: FarmTask) -> bool:
+        """Whether a hostile-transit restock still waits for full HP and SP
+        (HEAL_RESTOCK_FULL_WAIT_SECONDS at most). Once she is full, or has
+        a heal or a ready recall again, the trip is re-planned at once."""
+        since = self._heal_restock_full_since
+        if since is None:
+            return False
+        if (self._full_hp_sp(client) or
+                not out_of_heals_and_recall(client, farm.safety)):
+            self._heal_restock_full_since = None
+            self._heal_restock_retry_at = 0.0
+            return False
+        if self.clock() - since >= self.HEAL_RESTOCK_FULL_WAIT_SECONDS:
+            self._heal_restock_full_since = None
+            self.back_off_heal_restock(
+                client, "no full HP and SP within 10 minutes for the "
+                "hostile road, without a heal or a ready recall",
+                self.HEAL_RESTOCK_RETRY_SECONDS)
+            return False
+        return True
 
     def _settle_heal_restock(self, client: AtrinikClient) -> None:
         """Record a finished heal restock and when the next may start."""
@@ -8931,7 +8983,9 @@ class FarmCircuitTask(BotTask):
         else:
             log.info("heal restock bought %d %s; returning to farm",
                      shopper.bought, shopper.bought_name)
-            self.back_off_heal_restock(client, "", 0.0)
+            # No alert, only the pause before the next.
+            self.back_off_heal_restock(client, "",
+                                       self.HEAL_RESTOCK_MIN_INTERVAL)
         self._heal_restock = None
 
     def _new_upgrade_shopping(
@@ -9783,6 +9837,11 @@ class FarmCircuitTask(BotTask):
         # only by a strict route, and not below its flee threshold
         # (_heal_restock_may_leave); once the hold's cap runs out, like
         # any optional trip.
+        # Out of heals and recall, a restock over the hostile road waits
+        # for full HP and SP, checked once, before it departs; the farm
+        # rests meanwhile.
+        if isinstance(farm, FarmTask):
+            farm.rest_for_departure = self._heal_restock_waiting(client, farm)
         if (isinstance(farm, FarmTask) and
                 self._needs_heal_restock(client) and
                 not self._busy_finishing_fight_or_loot(client, farm) and
@@ -9790,7 +9849,23 @@ class FarmCircuitTask(BotTask):
             strict = unprepared
             trip = self._new_heal_restock(client, strict=strict)
             recorder = getattr(client, "record_action", None)
-            if trip is not None:
+            if (trip is not None and getattr(trip, "hostile_transit", False)
+                    and out_of_heals_and_recall(client, farm.safety) and
+                    not self._full_hp_sp(client)):
+                self._heal_restock_retry_at = (
+                    self.clock() + self.HEAL_RESTOCK_FULL_RECHECK_SECONDS)
+                if self._heal_restock_full_since is None:
+                    self._heal_restock_full_since = self.clock()
+                    if recorder is not None:
+                        recorder("heal-restock-waits",
+                                 "no heal and no ready recall: the road to "
+                                 f"{trip.navigation.destination} crosses "
+                                 "hostile transit, so she waits for full "
+                                 "HP and SP")
+                farm.rest_for_departure = True
+            elif trip is not None:
+                self._heal_restock_full_since = None
+                farm.rest_for_departure = False
                 await client.clear_actions()
                 await client.set_combat(False)
                 self._heal_restock = trip
@@ -9802,14 +9877,14 @@ class FarmCircuitTask(BotTask):
                              f"{' by a strict route' if strict else ''}")
                 await trip.tick(client)
                 return
-            if strict:
+            elif strict:
                 self._heal_restock_retry_at = (
                     self.clock() + self.HEAL_RESTOCK_STRICT_RETRY_SECONDS)
                 if recorder is not None:
                     recorder("heal-restock-deferred",
                              "no strict route to a healing merchant while "
                              "unprepared")
-            else:
+            elif trip is None:
                 self.back_off_heal_restock(
                     client, "no reachable merchant sells healing potions",
                     self.HEAL_RESTOCK_INTERVAL)

@@ -715,6 +715,23 @@ def safe_food(item: Item) -> bool:
             InventoryPolicy().identified(item))
 
 
+def usable_heal_item(client: AtrinikClient, item: Item,
+                     patterns: tuple[str, ...]) -> bool:
+    """Whether a carried item is a heal she can use: named like one
+    (``patterns``), identified, paid, neither cursed nor damned, no
+    spellbook (applying one learns, it does not heal), and a scroll only
+    while she reads scrolls (reads_scrolls). The one test behind both her
+    safety policy's heals (SafetyPolicy._known_heal, so whether she is
+    unprepared) and the heal restock's count (heal_consumables)."""
+    folded = item.name.casefold()
+    if (not any(pattern in folded for pattern in patterns) or
+            item.item_type == c.TYPE_SPELLBOOK or
+            item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED) or
+            not InventoryPolicy().identified(item)):
+        return False
+    return item.item_type != c.TYPE_SCROLL or reads_scrolls(client)
+
+
 @dataclass(slots=True)
 class SafetyPolicy:
     heal_below: float = 0.70
@@ -780,9 +797,10 @@ class SafetyPolicy:
 
         No spell, scroll, rod or wand on a square where the server blocks
         spellcasting, nor while a recall waits for her action timer
-        (recall_waiting).
+        (recall_waiting). Only a heal she can use (usable_heal_item).
         """
-        items = client.state.inventory
+        items = [item for item in client.state.inventory
+                 if usable_heal_item(client, item, self.healing_patterns)]
         if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items):
             other = [item for item in items
                      if item.item_type not in MAGIC_BLOCKED_TYPES]
@@ -1804,6 +1822,10 @@ class FarmTask(BotTask):
         # phase waits for this fight: finish the engaged target and fight
         # what attacks her, but pull nothing new.
         self.hold_new_pulls = False
+        # Set by its farm circuit while a heal restock waits to depart at
+        # full HP and SP (FarmCircuitTask._heal_restock_waiting): no new
+        # pull, combat off, as in an unprepared rest.
+        self.rest_for_departure = False
         # Peaceful creatures seen occupying a named spawn; attacked with force.
         self._spawn_blocker_ids: set[int] = set()
         self._visible_target_count = 0
@@ -5792,7 +5814,8 @@ class FarmTask(BotTask):
                       self._unprepared_hold.active(client, self.safety))
         if not unprepared:
             self._unprepared_resting = False
-        if (self.hold_new_pulls or unprepared) and engaged is None:
+        if ((self.hold_new_pulls or unprepared or self.rest_for_departure)
+                and engaged is None):
             # Farming is about to stop (hold_new_pulls), or she has neither
             # a usable heal nor a ready recall below
             # UNPREPARED_PULL_HEALTH: no new pull, only what is beside her
@@ -5802,6 +5825,8 @@ class FarmTask(BotTask):
             if not targets:
                 if unprepared:
                     await self._unprepared_rest(client, ratio)
+                elif self.rest_for_departure:
+                    await client.set_combat(False)
                 self._last_action = time.monotonic()
                 return
         if engaged is None and self.single_target_wizardry(client):
@@ -6892,15 +6917,15 @@ def usable_heal_consumable(client: AtrinikClient, name: str,
 
 def heal_consumables(client: AtrinikClient,
                      safety: "SafetyPolicy | None" = None) -> int:
-    """How many usable healing consumables she carries: identified, paid,
-    neither cursed nor damned (usable_heal_consumable)."""
-    policy = InventoryPolicy()
+    """How many healing potions, balms and scrolls she carries that her
+    safety policy would use (usable_heal_item). Healing spells, rods and
+    wands are not counted: the restock is the backup for when her SP or
+    charges run out."""
+    patterns = (safety or SafetyPolicy()).healing_patterns
     return sum(
         max(1, int(item.quantity or 1)) for item in client.state.inventory
         if item.item_type in (c.TYPE_POTION, c.TYPE_SCROLL) and
-        not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED) and
-        policy.identified(item) and
-        usable_heal_consumable(client, item.name, safety))
+        usable_heal_item(client, item, patterns))
 
 
 def heal_estimate(name: str) -> float:
@@ -6953,6 +6978,7 @@ class BuyHealingStockTask(BotTask):
         self._sent_at = 0.0
         self._quantity_before = 0
         self._heals_before = 0
+        self._reserved = 0
 
     def _same_name(self, client: AtrinikClient) -> int:
         return sum(max(1, int(item.quantity or 1))
@@ -6994,10 +7020,14 @@ class BuyHealingStockTask(BotTask):
         self._heals_before = heal_consumables(client, self.safety)
         client.state.interface = None
         # The merchant's dialogue takes any count (Merchant.Seller.dialog)
-        # and sells at most what it has in stock.
+        # and sells at most what it has in stock: what arrives is counted
+        # on arrival.
+        balance = int(getattr(client.state, "bank_balance", 0) or 0)
         await BuyShopUpgradeTask.send_purchase(
             client, cost * count,
             lambda: client.talk(f"buy {count} {name}", self.merchant))
+        self._reserved = max(0, balance - int(
+            getattr(client.state, "bank_balance", 0) or 0))
         self._stage = "buy"
         self._sent_at = now
 
@@ -7051,9 +7081,21 @@ class BuyHealingStockTask(BotTask):
         if self._stage == "buy":
             # Its inventory name may differ from the stock name ("paper
             # scroll of ..."), so more usable heals count as arrival too.
-            if (self._same_name(client) > self._quantity_before or
-                    heal_consumables(client, self.safety) > self._heals_before):
+            arrived = max(self._same_name(client) - self._quantity_before,
+                          heal_consumables(client, self.safety) -
+                          self._heals_before)
+            if arrived > 0:
                 self.purchased = True
+                if arrived < self.bought:
+                    # The merchant had fewer: give back what the bank
+                    # funds reserved for the rest (account_purchase).
+                    refund = min(self._reserved, (self.bought - arrived) *
+                                 self.quotes[self.bought_name])
+                    if refund and getattr(client.state, "bank_balance_known",
+                                          False):
+                        BuyShopUpgradeTask._set_bank_balance(
+                            client, int(client.state.bank_balance) + refund)
+                    self.bought = arrived
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("heal-restock-buy",

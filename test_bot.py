@@ -4891,6 +4891,47 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(task.status, TaskStatus.FAILED)
         self.assertIn("cannot carry", task.error)
 
+    def test_healing_stock_counts_what_arrives_when_stock_runs_short(self):
+        from .tasks import BuyHealingStockTask
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance = 3_000
+                self.state.bank_balance_known = True
+                self.talks = []
+                self.decisions = []
+
+            async def talk(self, message, npc):
+                self.talks.append((message, npc))
+
+            def record_action(self, action, detail):
+                self.decisions.append((action, detail))
+
+        client = FakeClient()
+        task = BuyHealingStockTask("merchant", quantity=5)
+        asyncio.run(task.tick(client))
+        client.state.interface = InterfaceState(title="merchant", links=[
+            "[a=:buy balm of minor healing]Minor[/a]"])
+        asyncio.run(task.tick(client))
+        name = "balm of minor healing"
+        client.state.interface = InterfaceState(
+            title="merchant", objects=[Item(
+                20, name=name, extra={"message": f"{name} for 1 silver"})],
+            links=[f"[a=:buy 1 {name}]One[/a]"])
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.talks[-1], ("buy 5 balm of minor healing",
+                                            "merchant"))
+        self.assertEqual(client.state.bank_balance, 2_500)
+        # The merchant had three: the server sold those.
+        client.state.place_item(Item(
+            30, item_type=c.TYPE_POTION, quality=80, quantity=3, name=name), 7)
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertEqual(task.bought, 3)
+        self.assertEqual(client.state.bank_balance, 2_700)
+        self.assertIn("3 balm of minor healing", client.decisions[-1][1])
+
     def test_healing_stock_without_a_usable_heal_completes_unbought(self):
         from .tasks import BuyHealingStockTask
 
@@ -6638,7 +6679,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             client.state.map.world_x, client.state.map.world_y = 1, 11
             if potion:
                 client.state.inventory.append(Item(
-                    60, item_type=c.TYPE_POTION, name="potion of healing"))
+                    60, item_type=c.TYPE_POTION, quality=80, name="potion of healing"))
             node = MapNode(path="/test", width=12, height=14)
             node.terrain = {(x, y): 1 for x in range(12) for y in range(14)}
             task = FarmTask(zone="/test", patrol=[(7, 9)])
@@ -21323,7 +21364,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # A healing potion, a ready recall or level 17: no wait at 50 %.
         for setup in (
                 lambda client: client.state.place_item(Item(
-                    95, item_type=c.TYPE_POTION, name="potion of healing"),
+                    95, item_type=c.TYPE_POTION, quality=80, name="potion of healing"),
                     client.state.player_tag),
                 lambda client: client.state.place_item(Item(
                     96, item_type=c.TYPE_ROD, quality=80, condition=80,
@@ -21533,6 +21574,8 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # From Brynknot no route reaches Asteria without the crocodile road:
         # the trip may cross it, as recall shopping's does...
         self.assertTrue(trip.navigation.allow_ranged_hazard_fallback)
+        self.assertTrue(trip.hostile_transit)
+        self.assertNotIn("navigation-threat-fallback", self.actions(client))
         # ...but never while unprepared, when only a strict route will do.
         self.assertIsNone(circuit._new_heal_restock(client, strict=True))
         # Where a strict route exists (in Asteria), that is the trip.
@@ -21542,9 +21585,18 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
                          "/shattered_islands/world_4_47")
         self.assertTrue(strict.navigation.strict_safety)
         self.assertFalse(strict.navigation.allow_ranged_hazard_fallback)
+        self.assertFalse(strict.hostile_transit)
         # No merchant that sells heals: no trip.
         self.assertIsNone(self.heal_circuit(client, WorldGraph())
                           ._new_heal_restock(client, strict=False))
+        # Nor one no route reaches, even with the hostile-transit fallback.
+        from .navigation import DialogueVendor
+        nowhere = DialogueVendor("/nowhere", 1, 1, "ghost",
+                                 "/python/generic/merchant.py",
+                                 ("scroll min heal",), ("random_potion",))
+        with patch("atrinik_bot.navigation.heal_restock_vendors",
+                   return_value=[(nowhere, True)]):
+            self.assertIsNone(circuit._new_heal_restock(client, strict=False))
 
     def test_heal_restock_backs_off_without_a_seller_or_stock(self):
         from .navigation import heal_restock_alerts
@@ -21612,12 +21664,18 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         wait = settle(bought=1)
         self.assertIn("ran short", client.state.heal_restock_note)
         self.assertGreater(wait, FarmCircuitTask.HEAL_RESTOCK_INTERVAL - 60)
-        # Bought enough: the note is cleared and nothing holds the next.
+        # Bought enough: the note is cleared, and the next waits two hours
+        # (at high level one fight can use all five), with no alert.
         client.state.items[91].quantity = 5
-        settle(bought=5)
-        self.assertEqual((client.state.heal_restock_note,
-                          client.state.heal_restock_retry_until), ("", 0.0))
+        wait = settle(bought=5)
+        self.assertEqual(client.state.heal_restock_note, "")
+        self.assertGreater(wait, FarmCircuitTask.HEAL_RESTOCK_MIN_INTERVAL - 60)
+        self.assertLess(wait, FarmCircuitTask.HEAL_RESTOCK_MIN_INTERVAL + 1)
+        client.state.remove_item(91)
+        self.assertFalse(circuit._needs_heal_restock(client))
         self.assertEqual(heal_restock_alerts(client), [])
+        client.state.heal_restock_retry_until = time.time() - 1
+        self.assertTrue(circuit._needs_heal_restock(client))
 
     def test_heal_restock_is_the_one_optional_trip_an_unprepared_hold_allows(self):
         from .tasks import UNPREPARED_REST_LIMIT_SECONDS, unprepared_for_trips
@@ -21693,6 +21751,102 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             asyncio.run(circuit.tick(client))
         self.assertIn("errand", circuit.drop_discretionary_trips(client))
         self.assertIsNone(circuit._heal_restock)
+
+    def test_a_hostile_road_restock_departs_only_at_full_hp_and_sp(self):
+        def setup(hp, sp, *, recall=False):
+            client, _ = self.client(recall=recall, bank=20_000)
+            client.state.stats.update(hp=hp, maxhp=134, sp=sp, maxsp=20)
+            circuit = self.unprepared_circuit(client, "")
+            circuit._needs_heal_restock = (
+                FarmCircuitTask._needs_heal_restock.__get__(circuit))
+            planned = []
+
+            def trip(client, *, strict):
+                planned.append(strict)
+                errand = _DoneErrand(status=TaskStatus.RUNNING)
+                errand.task.merchant = "merchant"
+                errand.navigation = types.SimpleNamespace(
+                    destination="/shattered_islands/world_4_47")
+                errand.hostile_transit = True
+                return errand
+
+            circuit._new_heal_restock = trip
+            return client, circuit, planned
+
+        def farm(circuit):
+            return circuit.child.task
+
+        # 95 %: not unprepared, but no heal and no recall, and the road is
+        # hostile: she waits, and the farm pulls nothing meanwhile.
+        client, circuit, planned = setup(127, 20)
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        self.assertEqual(planned, [False])
+        self.assertIsNone(circuit._heal_restock)
+        self.assertTrue(farm(circuit).rest_for_departure)
+        self.assertEqual(self.actions(client).count("heal-restock-waits"), 1)
+        self.assertNotIn("heal-restock-backoff", self.actions(client))
+        # Full HP and SP: re-planned at once, and she goes.
+        client.state.stats.update(hp=134, sp=20)
+        asyncio.run(circuit.tick(client))
+        self.assertEqual(planned, [False, False])
+        self.assertIsNotNone(circuit._heal_restock)
+        self.assertFalse(farm(circuit).rest_for_departure)
+        # Full HP but SP short counts as not full.
+        client, circuit, planned = setup(134, 10)
+        asyncio.run(circuit.tick(client))
+        self.assertIsNone(circuit._heal_restock)
+        # A ready recall: no wait, she goes at once.
+        client, circuit, planned = setup(127, 20, recall=True)
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        self.assertIsNotNone(circuit._heal_restock)
+        # Ten minutes without getting full: a two-hour backoff, and the
+        # farm farms again.
+        client, circuit, planned = setup(127, 20)
+        for _ in range(3):
+            asyncio.run(circuit.tick(client))
+        circuit._heal_restock_full_since -= (
+            FarmCircuitTask.HEAL_RESTOCK_FULL_WAIT_SECONDS)
+        asyncio.run(circuit.tick(client))
+        self.assertIsNone(circuit._heal_restock)
+        self.assertIn("full HP and SP", client.state.heal_restock_note)
+        self.assertFalse(farm(circuit).rest_for_departure)
+
+    def test_an_unusable_heal_is_no_heal_for_safety_or_restock(self):
+        from .tasks import heal_consumables, unprepared_for_trips
+
+        client, _ = self.client(recall=False, bank=5_000)
+        client.state.stats.update(hp=107, maxhp=134, sp=0)
+        client.state.inventory_replay_complete = True
+        tag = client.state.player_tag
+        circuit = self.heal_circuit(client)
+        # A scroll she cannot read, an unpaid and a cursed potion, an
+        # unidentified one and a spellbook: neither her safety policy nor
+        # the restock counts any of them.
+        for item in (
+                Item(81, item_type=c.TYPE_SCROLL, quality=80,
+                     name="paper scroll of minor healing (lvl 20)"),
+                Item(82, item_type=c.TYPE_POTION, quality=80,
+                     flags=c.ITEM_UNPAID, name="potion of minor healing"),
+                Item(83, item_type=c.TYPE_POTION, quality=80,
+                     flags=c.ITEM_CURSED, name="potion of minor healing"),
+                Item(84, item_type=c.TYPE_POTION,
+                     name="balm of minor healing"),
+                Item(85, item_type=c.TYPE_SPELLBOOK, quality=80,
+                     name="spellbook of minor healing")):
+            client.state.place_item(item, tag)
+        self.assertIsNone(SafetyPolicy()._usable_heal(client))
+        self.assertTrue(unprepared_for_trips(client))
+        self.assertEqual(heal_consumables(client), 0)
+        self.assertTrue(circuit._needs_heal_restock(client))
+        # Able to read it: both see the scroll.
+        for skill_tag, skill in ((86, "literacy"), (87, "wizardry spells")):
+            client.state.place_item(Item(
+                skill_tag, item_type=c.TYPE_SKILL, name=skill), tag)
+        self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 81)
+        self.assertFalse(unprepared_for_trips(client))
+        self.assertEqual(heal_consumables(client), 1)
 
     def test_an_unprepared_farm_rest_is_no_stuck_wait_and_only_that(self):
         from .tasks import UNPREPARED_REST_LIMIT_SECONDS
@@ -25448,7 +25602,7 @@ class FactTests(unittest.TestCase):
             plain.note_tile_refusal = None
             plain.tile_fact_prefers_other_heal = None
             spell = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
-            potion = Item(27, item_type=c.TYPE_POTION, name="potion of minor healing")
+            potion = Item(27, item_type=c.TYPE_POTION, quality=80, name="potion of minor healing")
             for client in (ours, plain):
                 client.state.place_item(spell, client.state.player_tag)
                 client.state.place_item(potion, client.state.player_tag)
