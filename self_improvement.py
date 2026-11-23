@@ -38,8 +38,9 @@ HEAL_STEP, HEAL_CAP = 0.02, 0.98
 PAUSE_FAILURES, PAUSE_WINDOW_SECONDS = 3, 3600.0
 PAUSE_SECONDS = 3600.0
 KEEP_REVIEWS = 10
-# An area where this many pack or out-damaged failures, or deaths on the
-# way to it, happened with one combat kit, within the window, is hazardous
+# An area where this many pack or out-damaged failures, deaths on the way
+# to it, or pack recalls on the way to it (ROUTE_PACK_ATTACKERS or more
+# attackers at once), happened with one combat kit, within the window, is hazardous
 # for that kit: the analyzer ranks it, but her kit cannot hold it. Tighter
 # margins did not help: live, ten deaths in about 90 minutes on the treant
 # and underground-city maps. The analyzer ranks several overlapping circuits
@@ -47,6 +48,13 @@ KEEP_REVIEWS = 10
 KIT_HAZARD_FAILURES = 3
 KIT_HAZARD_WINDOW_SECONDS = 24 * 3600.0
 KIT_HAZARD_CAUSES = frozenset({"pack", "out-damaged"})
+# An emergency recall on the way to a spot counts toward its kit hazard
+# when this many attackers hit her at once: an approach pack that large is
+# the area's own pack, not a stray. Live, on 2026-11-23, three orcs forced
+# a recall at the Underground City entrance at 02:43 on the way to the
+# circuit whose casters and orcs killed her at 19:13; counted, the two
+# failures were one short of the hazard.
+ROUTE_PACK_ATTACKERS = 3
 # A map she died on while travelling to a farm spot stays a farm-selection
 # hazard this long (route_death_maps): every spot routed through it is
 # skipped, as long as navigation avoids a map where a route death took
@@ -265,6 +273,7 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
                     KIT_HAZARD_WINDOW_SECONDS]
     failure = {"time": review.time, "cause": review.cause,
                "kind": review.kind, "map": review.map,
+               "peak_attackers": int(review.peak_attackers),
                "kit": dict(kit or {})}
     if map_damage is not None:
         failure["map_damage"] = int(map_damage)
@@ -278,15 +287,41 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
     return record, pause
 
 
-def hazard_failure(entry: dict) -> bool:
+def hazard_failure(entry: dict, record: dict | None = None) -> bool:
     """Whether a kit failure counts toward a kit hazard.
 
     Pack and out-damaged failures on the spot count, and so does a death on
-    the way to it ("route"); an emergency recall on the way does not.
+    the way to it ("route"). An emergency recall on the way counts only
+    with ROUTE_PACK_ATTACKERS or more attackers at once. A failure stored
+    before its peak was kept takes it from the review of the same time and
+    kind in its ``record``.
     """
     cause = entry.get("cause")
-    return cause in KIT_HAZARD_CAUSES or (
-        cause == "route" and entry.get("kind") == "death")
+    if cause in KIT_HAZARD_CAUSES:
+        return True
+    if cause != "route":
+        return False
+    if entry.get("kind") == "death":
+        return True
+    return (entry.get("kind") == "emergency-recall" and
+            _peak_attackers(entry, record) >= ROUTE_PACK_ATTACKERS)
+
+
+def _peak_attackers(entry: dict, record: dict | None) -> int:
+    """A kit failure's peak attackers, from its own entry or its review."""
+    def number(value) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if "peak_attackers" in entry:
+        return number(entry.get("peak_attackers"))
+    for review in (record or {}).get("reviews", ()) or ():
+        if (isinstance(review, dict) and review.get("time") == entry.get("time") and
+                review.get("kind") == entry.get("kind")):
+            return number(review.get("peak_attackers"))
+    return 0
 
 
 def route_death_times(adaptations: dict | None,
@@ -295,16 +330,16 @@ def route_death_times(adaptations: dict | None,
     """Maps she recently died on, or fled by recall from, on the way to a
     farm, each with the time of its newest such failure.
 
-    Each route death (hazard_failure with cause "route") keeps the map she
-    actually died on, the transit map, in its kit failure. That map is a
+    Each route death (a kit failure of kind "death", cause "route") keeps
+    the map she actually died on, the transit map, in its kit failure. That map is a
     farm-selection hazard for ROUTE_DEATH_HAZARD_SECONDS, for every spot
     whose route enters it, whichever spot she was heading to. ``applies``
     judges the kit the death happened with (a genuinely improved kit clears
     it). A route emergency recall counts the same way when that map hurt
     her (map_damage above 0): live, three recalls on the underground city
     entrance did not stop the circuit routing through it, and then she
-    died there. Recalls still do not count toward kit
-    hazards (hazard_failure). Neither counts on a map that did not hurt her
+    died there. Only pack recalls count toward kit hazards
+    (hazard_failure). Neither counts on a map that did not hurt her
     (map_damage 0: she died of earlier hits after crossing onto it), as for
     the navigation's learned route hazards; a death stored before
     map_damage was kept counts, a recall stored without it does not.
@@ -318,7 +353,7 @@ def route_death_times(adaptations: dict | None,
             if not (isinstance(entry, dict) and entry.get("cause") == "route" and
                     entry.get("map")):
                 continue
-            if hazard_failure(entry):
+            if entry.get("kind") == "death":
                 hurt = int(entry.get("map_damage", 1) or 0) > 0
             elif entry.get("kind") == "emergency-recall":
                 hurt = int(entry.get("map_damage", 0) or 0) > 0
@@ -363,7 +398,8 @@ def kit_hazard(adaptations: dict | None, key: str, maps: Iterable[str],
                now: float | None = None) -> bool:
     """Whether the area of spot ``key`` on ``maps`` is hazardous for a kit.
 
-    True after KIT_HAZARD_FAILURES qualifying failures (hazard_failure)
+    True after KIT_HAZARD_FAILURES qualifying failures (hazard_failure:
+    pack recalls on the way included)
     within the window, each with a kit ``same_kit`` judges the same as hers
     now, summed over the spot's own record and every record whose spot
     shares a map with ``maps``. The analyzer ranks overlapping circuits for
@@ -382,7 +418,7 @@ def kit_hazard(adaptations: dict | None, key: str, maps: Iterable[str],
             continue
         count += sum(
             1 for entry in record.get("kit_failures", ())
-            if isinstance(entry, dict) and hazard_failure(entry) and
+            if isinstance(entry, dict) and hazard_failure(entry, record) and
             now - float(entry.get("time", 0.0) or 0.0) <= KIT_HAZARD_WINDOW_SECONDS and
             same_kit(entry.get("kit") or {}))
     return count >= KIT_HAZARD_FAILURES

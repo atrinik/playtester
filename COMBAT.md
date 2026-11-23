@@ -115,7 +115,8 @@ the pursued-stand rule fires, until the set-aside expires.
 Pull request https://github.com/atrinik/playtester/pull/77 ranks
 Wizardry-to-15 spots by running the farm analyzer at the trained skill's
 level with `--max-aggro-pack 1`, so the circuit only picks spots where a lone
-pull is possible.
+pull is possible. Otherwise her single-target kit ranks with
+`--max-aggro-pack 2` ([Safer spot choice](#safer-spot-choice-2026-11-23)).
 
 ## Spell-only Wizardry training
 
@@ -431,8 +432,10 @@ steps away and keeps her distance.
   counts the failures of every adaptation record whose spot shares a map
   with it (each record keeps its spot's maps), plus its own record's. A
   death on the way to a spot (`route`) counts for that spot too, not for
-  spots on the road map; an emergency recall on the way does not. Live, 22
-  such approach failures at the underground city had not counted. Records
+  spots on the road map; so does an emergency recall on the way with three
+  or more attackers at once (`ROUTE_PACK_ATTACKERS`), and no other recall
+  on the way (see [Safer spot choice](#safer-spot-choice-2026-11-23)).
+  Live, 22 such approach failures at the underground city had not counted. Records
   saved before maps were kept count for their own spot, and a single-map
   spot's also for spots sharing that map.
 - **Route deaths mark the map she died on.** A death on the way to a spot
@@ -448,7 +451,8 @@ steps away and keeps her distance.
   coarse map graph is not enough: it reaches the underground city's
   circuits around the entrance through seams she cannot walk.
   - A route emergency recall counts like a death when that map hurt her
-    (`map_damage` above 0); it still does not count toward kit hazards.
+    (`map_damage` above 0); toward kit hazards it counts only with three
+    or more attackers at once.
     Live, on 2026-11-16, three recalls on the underground city entrance
     taught only a route cost, and then she died there.
   - Exceptions: a recall or death on a map that did not hurt her, a
@@ -1274,6 +1278,91 @@ fights or moves:
 The money still pays for the depletion removal through the ordinary temple
 service. Her dashboard and metrics keep an `operator-assisted` marker from
 then on, so later progress is not counted as earned.
+
+## Safer spot choice (2026-11-23)
+
+At 19:13:27 UTC she died at the Underground City circuit of
+`underground_city_1_3`, `2_2`, `2_3` and `3_2`, the XP view's first spot
+(v1.98.0, level 37, 330 health). The analyzer rated it danger 115.6,
+safety 0.95, pack 3, with casters only from `3_2`. Of the 565 damage in
+her last minute, an orc sorcerer's magic bullet did 259: three sorcerers
+spawn on `underground_city_1_2`, seamlessly north of `1_3`, about seven
+tiles from the doorway she fought in. The analyzer scores a spot from its
+own maps alone and judges its pack per map, so it never saw them. Its
+profile allowed any pack (`max_aggro_pack` 0), and the orc recall at the
+entrance `underground_city_0_0` at 02:43 (three orcs at once) had not
+counted toward the spot's kit hazard. Three changes:
+
+- **Seam exposure** (`WorldGraph.seam_exposure`,
+  `farm_analyzer.seam_adjusted`, `navigation.seam_ranking`). Bot-side,
+  from her own world graph and the authored spawns, until the analyzer
+  models it (the fix belongs there; see below). A neighbour is a map tiled
+  to one of the spot's maps, side or diagonal, outside the spot; the
+  circuit never clears it. At each of the spot's spawns, the pack counts
+  every aggressive spawn within its own detection radius, the analyzer's
+  rule now across the seam, plus each neighbour caster within
+  `SEAM_REACH_TILES` (10) of her pull square (the spawn's detection
+  radius from it). Distances ignore walls, as the analyzer's do. Counting
+  every melee spawn that near too would put the open Burnt Forest at a
+  pack of three to eight and leave almost no overworld spot under the cap
+  below. Every ranked spot (each objective, the cure-funding farm's
+  safety view and the farm-score shadow alike) keeps the analyzer's order
+  and gets: `max_aggro_pack` the larger of the two packs; seam casters in
+  `danger_flags` (`seam caster×N`), with `seam_casters`,
+  `seam_aggressive_spawns` (neighbour spawns within 10 tiles) and
+  `seam_maps`; and a spot safety of at most her maximum health over the
+  spot's danger per monster times that pack, plus 20 per seam caster (the
+  analyzer's caster bonus). A spot whose pack, seam included, exceeds
+  the ranked profile's `max_aggro_pack` is left out, as the analyzer
+  leaves out its own. That circuit: pack 4, three seam casters (on `1_2`
+  and beyond), spot safety 0.63. `1_3` alone: pack 3, two seam casters.
+- **A risky spot comes after a safe one.** `farm_analyzer.risky_spot`: a
+  spot whose own safety (`spot_safety_score`, seam exposure included) is
+  under 1 expects one encounter to cost more than her whole health bar.
+  Autoplay farms spots that are neither that nor a risky approach first,
+  in rank order, as for approaches; the risky ones after them, the safest
+  first, and on a safety tie (one approach capping them all) by their own
+  safety.
+- **A pack she can hold.** Outside Wizardry training (pack 1, unchanged),
+  `combat_profile` now ranks for `max_aggro_pack`
+  `SINGLE_TARGET_MAX_AGGRO_PACK` (2): she fights one target at a time and
+  casts no area spell. The analyzer drops a map whose pack exceeds it
+  before it builds circuits, so `2_3`, `3_2`, `1_4` and the other
+  Underground City maps of pack 3 or more leave every circuit.
+- **Pack recalls on the way count** toward the spot's kit hazard
+  (`hazard_failure`): an emergency recall on the way with
+  `ROUTE_PACK_ATTACKERS` (3) or more attackers at once. Each kit failure
+  now keeps its peak; one stored before reads it from the review of the
+  same time. The 02:43 recall and the 19:13 death make two;
+  `KIT_HAZARD_FAILURES` stays 3. Route deaths counted already. Recalls
+  with fewer attackers, and the route-death map rule, are unchanged.
+
+A replay of her live state, with the locked analyzer (v3.10.0) and
+content (v1.14.0) at her profile, from her savebed `world_7_79` and from
+the default origins: allowing any pack, as live, the death circuit is still
+the XP view's first spot, now risky (pack 4, safety 0.62), and every
+non-risky spot is a Burnt Forest circuit hazardous for her kit; so she
+would farm the least exposed Underground City circuit instead
+(`1_2 + 1_3 + 2_2 + 3_2`, sorcerers inside it). Ranked at pack 2, no
+Underground City circuit is left, and seam exposure removes `1_3` alone
+(pack 3), `world_4_73`, `world_7_71` and two Hemlock Cave maps from the
+safety view. Her XP view is then all Burnt Forest circuits; with her kit
+failures there (rebuilt from the dashboard's self-improvement summary)
+every one is hazardous, so she farms the least dangerous of them,
+`world_17_72 + world_17_73 + world_17_74 + world_17_75` (danger 74.9,
+pack 1, no casters). Without those failures she would farm the XP view's
+first, `world_17_72 + world_17_73 + world_18_73 + world_19_73` (pack 2).
+
+Accepted limits: distances ignore walls and line of sight, so a seam
+caster behind rock counts; neighbour melee spawns farther than their
+detection radius do not join the pack, although orcs pursue about nine
+tiles; vertical links are not neighbours.
+
+The fix belongs in the analyzer (atrinik/tools `farming_analyzer`):
+judge a map's and a circuit's pack, and its casters, in one coordinate
+frame with its tiled neighbours, the neighbours' spawns counted as
+uncleared, so its danger, pack filter and safety score agree with this.
+Then this post-adjustment goes.
 
 ## Approach danger: known limitations
 

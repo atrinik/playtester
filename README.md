@@ -724,7 +724,16 @@ ranking is six hours old, it starts one `nice` analyzer process with
 `--ranking all --json` (about 10 to 30 seconds) while the bot keeps playing.
 Runs are at least ten minutes apart, failures back off for fifteen minutes, and
 a failed run keeps the previous ranking. Only melee weapon schools are
-simulated so far.
+simulated so far. She fights one target at a time and casts no area spell,
+so the profile passes `--max-aggro-pack 2` (1 while Wizardry trains): the
+analyzer drops a map whose likely simultaneous aggro is larger.
+
+The analyzer scores a spot from its own maps alone. Until it models tiled
+neighbours, the bot folds them in itself (`seam_ranking`, COMBAT.md "Safer
+spot choice"): from its world graph, a neighbour map's aggressive spawns
+within their detection radius, and its casters within 10 tiles, of where
+she pulls raise the spot's pack, flag `seam caster×N` and lower its own
+safety; a spot whose pack then exceeds the cap is left out.
 
 A spot is only as safe as the way there. Once her savebed is known and exists
 in the locked content, each run passes it as `--approach-origin MAP
@@ -736,8 +745,9 @@ Otherwise the analyzer's default origins apply. A spot the analyzer finds no
 path to is capped at an approach safety of 0.5
 (`--unreachable-approach-safety`), because its walk does not model ships,
 scripts or keys. Autoplay farms spots with a known approach safety of 100%
-before any spot whose approach is unknown or expected to cost more than her
-whole health bar, keeping the analyzer's order within each objective's ranking. A risky
+and a spot safety of 100% (seam exposure included) before any spot whose
+approach is unknown or either is expected to cost more than her whole
+health bar, keeping the analyzer's order within each objective's ranking. A risky
 approach is taken only when nothing else is usable, and then the safest one
 first (unreachable counts as 0.5). An apartment savebed is judged from its
 recorded return, since the apartment is left only through a script the

@@ -19630,12 +19630,14 @@ class FarmAnalyzerTests(unittest.TestCase):
         self.assertEqual(args[args.index("--max-aggro-pack") + 1], "1")
         # Until a cast has been observed, the weapon stands in.
         self.assertEqual(args[args.index("--melee-damage") + 1], "44")
-        # At the target, training ends: main weapon spots, no pack limit,
-        # and the change calls for a new ranking.
+        # At the target, training ends: main weapon spots, capped at the
+        # pack her single-target kit holds, and the change calls for a new
+        # ranking.
         state.items[12].extra["level"] = 15
         main = combat_profile(client)
-        self.assertEqual((main.skill, main.max_aggro_pack), ("slash weapons", 0))
-        self.assertNotIn("--max-aggro-pack", main.arguments())
+        self.assertEqual((main.skill, main.max_aggro_pack), ("slash weapons", 2))
+        main_args = main.arguments()
+        self.assertEqual(main_args[main_args.index("--max-aggro-pack") + 1], "2")
         self.assertTrue(main.materially_differs(profile))
         # Between levels 18 and 24 the first target (10) is already met.
         state.items[12].extra["level"] = 10
@@ -20261,6 +20263,84 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
             character_level=31, max_health=282, speed=0.59,
             armour_class=48, protections=(("impact", 42),))
         return dataclasses.replace(profile, **changes)
+
+    UC = "/shattered_islands/strakewood_island/underground_city/underground_city_"
+
+    def test_seam_exposure_counts_aggressive_and_caster_neighbours(self):
+        graph = built_graph()
+        uc = self.UC
+        # Live, 2026-11-23: three orc sorcerers on 1_2, seamlessly north of
+        # her farm map 1_3, did 259 of the 565 damage that killed her. The
+        # analyzer rated 1_3 alone at pack 1 without a caster.
+        alone = graph.seam_exposure([uc + "1_3"])
+        self.assertIn(uc + "1_2", alone.maps)
+        self.assertGreaterEqual(alone.casters, 2)
+        self.assertGreater(alone.pack, 2)
+        self.assertGreaterEqual(alone.aggressive, alone.casters)
+        # The circuit that killed her: 1_2 is still outside it.
+        circuit = graph.seam_exposure(
+            [uc + "1_3", uc + "2_2", uc + "2_3", uc + "3_2"])
+        self.assertIn(uc + "1_2", circuit.maps)
+        self.assertGreaterEqual(circuit.casters, 2)
+        # A neighbour inside the spot is the spot's own, not a seam threat.
+        self.assertNotIn(uc + "2_3", circuit.maps)
+        with_north = graph.seam_exposure([uc + "1_2", uc + "1_3"])
+        self.assertNotIn(uc + "1_2", with_north.maps)
+        self.assertIs(graph.seam_exposure([uc + "1_3"]), alone)
+
+    def test_seam_adjusted_folds_in_what_the_analyzer_missed(self):
+        from .farm_analyzer import SeamExposure, risky_spot, seam_adjusted
+
+        spot = {"path": "circuit[a + b]", "danger": 115.6, "max_aggro_pack": 3.0,
+                "safety_score": 0.95, "spot_safety_score": 0.95,
+                "danger_flags": ["caster×2"]}
+        kit = self.kit(max_health=330)
+        self.assertIs(seam_adjusted(spot, SeamExposure(), kit), spot)
+        adjusted = seam_adjusted(
+            spot, SeamExposure(5, 4, 2, ("/uc/1_2",)), kit)
+        self.assertEqual(adjusted["max_aggro_pack"], 5.0)
+        self.assertEqual(adjusted["analyzer_max_aggro_pack"], 3.0)
+        self.assertEqual(adjusted["danger_flags"], ["caster×2", "seam caster×2"])
+        self.assertEqual((adjusted["seam_casters"], adjusted["seam_maps"]),
+                         (2, ["/uc/1_2"]))
+        self.assertAlmostEqual(adjusted["spot_safety_score"],
+                               330 / (115.6 * 5 + 2 * 20.0))
+        self.assertEqual(adjusted["safety_score"], adjusted["spot_safety_score"])
+        self.assertTrue(risky_spot(adjusted))
+        self.assertEqual(spot["max_aggro_pack"], 3.0)
+        # Over the profile's pack cap, the spot is left out, as the
+        # analyzer leaves out its own.
+        self.assertIsNone(seam_adjusted(
+            spot, SeamExposure(5, 4, 2, ("/uc/1_2",)), self.kit(max_aggro_pack=2)))
+        # A smaller seam pack never lowers the analyzer's.
+        small = seam_adjusted(spot, SeamExposure(2, 1, 0, ("/uc/1_4",)), kit)
+        self.assertEqual(small["max_aggro_pack"], 3.0)
+        self.assertEqual(small["spot_safety_score"], 0.95)
+
+    def test_a_seam_exposed_circuit_is_demoted_or_left_out(self):
+        from .navigation import analyzer_farm_selection
+
+        uc = self.UC
+        city = analyzer_spot("The Underground City circuit", [
+            uc + "1_3", uc + "2_2", uc + "2_3", uc + "3_2"], ["orc warrior L38"],
+            aggressive=29)
+        city.update(danger=115.6, max_aggro_pack=1.0, safety_score=1.0,
+                    spot_safety_score=1.0)
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        trees.update(danger=30.0, max_aggro_pack=1.0, safety_score=1.0)
+        client = self.client({"xp": [city, trees]})
+        # Allowing any pack, the exposed circuit is only demoted below a
+        # spot whose encounters stay under her health.
+        client.farm_analyzer.profile = self.kit(max_health=330)
+        self.assertEqual(analyzer_farm_selection(
+            client, built_graph())[1]["name"], "Trees")
+        # Alone, she still farms it rather than idle.
+        client.farm_analyzer.rankings = {"xp": [city]}
+        self.assertEqual(analyzer_farm_selection(
+            client, built_graph())[1]["name"], "The Underground City circuit")
+        # Capped at her single-target pack, it is left out.
+        client.farm_analyzer.profile = self.kit(max_health=330, max_aggro_pack=2)
+        self.assertIsNone(analyzer_farm_selection(client, built_graph()))
 
     def test_repeated_pack_deaths_rate_a_spot_hazardous_for_her_kit(self):
         from . import self_improvement as si
@@ -24406,6 +24486,45 @@ class SelfImprovementTests(unittest.TestCase):
                                        now=1000.0))
         self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.SPOT], lambda other: False,
                                        now=1000.0))
+
+    def test_kit_hazard_counts_route_pack_recalls(self):
+        from . import self_improvement as si
+
+        kit = {"skill": "slash weapons", "skill_level": 35}
+        road = "/underground_city/entrance"
+        three = ["orc fighter hit you for 30 (-30) pierce damage.",
+                 "orc berserker hit you for 40 (-40) impact damage.",
+                 "orc outlaw hit you for 35 (-35) impact damage."]
+        pack_recall = self.review(three, failure_map=road, action="emergency-recall")
+        pair_recall = self.review(three[:2], failure_map=road, action="emergency-recall")
+        self.assertEqual((pack_recall.cause, pack_recall.peak_attackers), ("route", 3))
+        died = self.review(three, action="death")
+        self.assertEqual(died.cause, "pack")
+        # Live, 2026-11-23: a three-orc recall on the way at 02:43, then the
+        # pack death at the spot at 19:13, make two.
+        record, _ = si.learn({}, pack_recall, now=1000.0, kit=kit, maps=[self.SPOT])
+        self.assertEqual(record["kit_failures"][-1]["peak_attackers"], 3)
+        record, _ = si.learn(record, died, now=1000.0, kit=kit, maps=[self.SPOT])
+        hazard = lambda record: si.kit_hazard(  # noqa: E731
+            {self.SPOT: record}, self.SPOT, [self.SPOT], kit.__eq__, now=1000.0)
+        self.assertFalse(hazard(record))
+        # A two-attacker recall on the way still does not count,
+        paired, _ = si.learn(record, pair_recall, now=1000.0, kit=kit, maps=[self.SPOT])
+        self.assertFalse(hazard(paired))
+        # a third pack failure does.
+        record, _ = si.learn(record, pack_recall, now=1000.0, kit=kit, maps=[self.SPOT])
+        self.assertTrue(hazard(record))
+        # A recall stored before its peak was kept takes it from its review.
+        for entry in record["kit_failures"]:
+            entry.pop("peak_attackers")
+        self.assertTrue(hazard(record))
+        for review in record["reviews"]:
+            review["peak_attackers"] = 2
+        self.assertFalse(hazard(record))
+        # The route-death map rule is unchanged: a recall without map damage
+        # marks no map.
+        self.assertEqual(si.route_death_maps(
+            {self.SPOT: record}, lambda kit: True, now=1000.0), set())
 
     def test_kit_hazard_reads_records_persisted_before_maps_were_kept(self):
         from . import self_improvement as si
