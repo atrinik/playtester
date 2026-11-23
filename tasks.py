@@ -436,6 +436,14 @@ def wand_charges(client: AtrinikClient) -> dict[int, int]:
     return charges
 
 
+def wand_poof_names(client: AtrinikClient, tag: int, match: re.Match) -> bool:
+    """Whether a WAND_EMPTY_MESSAGE match can be the wand ``tag``'s: the
+    server names the wand's own name (types/wand.c), which her item's
+    name contains; an unknown item is not ruled out."""
+    item = (getattr(client.state, "items", None) or {}).get(tag)
+    return item is None or match.group(1).casefold() in item.name.casefold()
+
+
 def observe_wand_feedback(client: AtrinikClient, tag: int,
                           since: float) -> bool:
     """Learn a wand's charges from server text after it was examined or used.
@@ -454,7 +462,8 @@ def observe_wand_feedback(client: AtrinikClient, tag: int,
         match = WAND_CHARGES_MESSAGE.match(text)
         if match:
             wand_charges(client)[tag] = int(match.group(1))
-        elif WAND_EMPTY_MESSAGE.match(text):
+        elif ((poof := WAND_EMPTY_MESSAGE.match(text)) and
+              wand_poof_names(client, tag, poof)):
             wand_charges(client)[tag] = 0
             empty = True
     return empty
@@ -805,8 +814,11 @@ def heal_landed(client: AtrinikClient,
         text = str(entry[-1]).strip()
         if HEALED_MESSAGE.match(text) or HEAL_FAILED_MESSAGE.match(text):
             return True
-        if (RECALL_REFUSED_MESSAGE.match(text) or
-                item_type == c.TYPE_WAND and WAND_EMPTY_MESSAGE.match(text)):
+        if RECALL_REFUSED_MESSAGE.match(text):
+            return text
+        if (item_type == c.TYPE_WAND and
+                (poof := WAND_EMPTY_MESSAGE.match(text)) and
+                wand_poof_names(client, tag, poof)):
             return text
     if item_type not in (c.TYPE_SPELL, c.TYPE_ROD, c.TYPE_WAND):
         item = next((item for item in getattr(state, "inventory", ())
@@ -1042,11 +1054,14 @@ class SafetyPolicy:
         if device or heal.item_type == c.TYPE_SPELL:
             if getattr(client.state, "combat", False):
                 # A hit turns combat mode back on (attack_player_retarget),
-                # so this repeats on each tick of the wait.
-                if getattr(client, "heal_combat_force", None) is None:
-                    _set_client(client, "heal_combat_force", bool(
-                        getattr(client.state, "combat_force", False)))
+                # so this repeats on each tick of the wait. Any other
+                # combat-off drops the restore (AtrinikClient.set_combat):
+                # it is set after this one.
+                force = getattr(client, "heal_combat_force", None)
+                if force is None:
+                    force = bool(getattr(client.state, "combat_force", False))
                 await client.set_combat(False)
+                _set_client(client, "heal_combat_force", force)
             # One server tick of margin on a running timer: the client's
             # countdown can run out just before the server's.
             if (float(client.state.stats.get("action_time", 0) or 0) > 0 and

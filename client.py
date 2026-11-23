@@ -1801,6 +1801,9 @@ class AtrinikClient:
         # objects remain in memory for those few event-loop turns.
         self.state.inventory_replay_complete = False
         self.load_character_memory(self.state.player_name)
+        # A heal's wait (tasks.heal_waiting) never survives a new login.
+        self.heal_combat_force = None
+        self.heal_waiting_until = 0.0
         self.state.phase = "playing"
         self.state.quests_loaded = False
         self.state.inventories.setdefault(self.state.player_tag, [])
@@ -3174,6 +3177,11 @@ class AtrinikClient:
         await self.send(Packet(c.S_TARGET).u8(c.TARGET_CLEAR))
 
     async def set_combat(self, enabled: bool, force: bool = False) -> None:
+        if not enabled:
+            # A deliberate combat-off (a Stop, a handover, a retreat) wins
+            # over a heal's pending restore; the heal's own wait sets it
+            # again after this (tasks.SafetyPolicy._heal).
+            self.heal_combat_force = None
         self.record_action("combat",
                            f"{'on' if enabled else 'off'}{' forced' if force else ''}")
         await self.send(Packet(c.S_COMBAT).u8(int(enabled)).u8(int(force)))

@@ -63,7 +63,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     healing_outpaced, recent_hostile_attackers,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
-                    combat_allowed, out_of_heals_and_recall,
+                    combat_allowed, heal_waiting, out_of_heals_and_recall,
                     UnpreparedHold, wand_known_empty)
 from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
 log = logging.getLogger(__name__)
@@ -4996,7 +4996,10 @@ class NavigateThenTask(BotTask):
         # its equal-distance steps shuffled her beside a troll, combat off,
         # and the cornered defence below fights instead.
         if not escape_due and (
-                (not safe and not starving_without_food(client)) or
+                # A heal waiting for her action timer holds even then: a
+                # fight below would restart the timer it waits for.
+                (not safe and (not starving_without_food(client) or
+                               heal_waiting(client))) or
                 (overwhelmed and not hold_fire)):
             if safety_action_issued:
                 # FIRE/APPLY was just sent by SafetyPolicy. Clearing in this

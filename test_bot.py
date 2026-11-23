@@ -6904,6 +6904,29 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(task._cornered_breakout_target, 200)
         self.assertEqual(len(client.direct_moves), task.PURSUIT_STAND_STEPS)
 
+    def test_no_pursued_stand_while_a_heal_waits(self):
+        # The stand above, with a heal waiting for her action timer
+        # (heal_waiting): a swing would restart that timer, so she steps.
+        client = self._combat_client()
+        client.state.stats.update(hp=100, maxhp=176)
+        task = FarmTask(zone="/test")
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        task.map_bounds = (25, 25)
+        client.state.map.world_x = client.state.map.world_y = 12
+        for _ in range(task.PURSUIT_STAND_STEPS):
+            asyncio.run(task.low_health_retreat(client))
+            task._retreat_attempt = None
+            task._last_retreat_step_at = 0.0
+        client.heal_waiting_until = time.monotonic() + 5.0
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(client.targets, [])
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(task._cornered_breakout_target, 0)
+        self.assertEqual(len(client.direct_moves),
+                         task.PURSUIT_STAND_STEPS + 1)
+
     def test_pursued_stand_ends_at_the_health_floor(self):
         client = self._combat_client()
         client.state.stats.update(hp=100, maxhp=176)
@@ -10286,6 +10309,18 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(len(client.fired), 1)
         self.assertNotIn(True, client.combat)
 
+    def test_no_pursued_cast_while_a_heal_waits(self):
+        client, task = self._spell_pursuit_client()
+        self.assertTrue(self._retreat_once(client, task))
+        # The cast above would restart the timer a heal waits for.
+        client.heal_waiting_until = time.monotonic() + 5.0
+        self.assertTrue(self._retreat_once(client, task))
+        self.assertEqual(client.fired, [])
+        self.assertNotIn("pursued-cast",
+                         [action for action, _ in client.recorded])
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(len(client.direct_moves), 2)
+
     def test_spell_training_pursuer_melee_when_she_cannot_afford_a_cast(self):
         client, task = self._spell_pursuit_client()
         client.state.stats["sp"] = 0
@@ -11974,6 +12009,38 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         _, x, y, _ = task._retreat_attempt
         client.state.map.world_x, client.state.map.world_y = x, y
         task._record_trail(client)
+
+    def test_starving_she_never_fights_while_a_heal_waits(self):
+        # Starving with nothing to eat skips the safety hold, but a heal
+        # waiting for her action timer (heal_waiting) still holds: she
+        # steps away with combat off rather than walk on or fight, which
+        # would restart the timer.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="orc warrior", target_id=700, target_hp=100)
+        client.state.stats.update(hp=150, maxhp=330, sp=40, maxsp=47, food=0)
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        client.state.messages = [
+            (time.time(), 2, "cc66ff", "orc warrior hit you for 17 damage.")]
+        client.state.combat = True
+        client.state.stats["action_time"] = 2.0
+        client.state.stat_observed_at["action_time"] = time.monotonic()
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node}
+        farm = FarmTask(zone="/farm", target="orc warrior")
+        task = NavigateThenTask(graph, "/farm", farm, combat_approach=True,
+                                safety=farm.safety)
+        for _ in range(3):
+            self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+            task._last_defense_action = 0.0
+        self.assertTrue(client.direct_moves)
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(client.targets, [])
 
     def test_critical_escape_runs_from_the_attacker(self):
         client, _, task = self._outpost_escape()
@@ -34234,6 +34301,82 @@ class HealsLandInMeleeTests(unittest.TestCase):
         client.state.stats["hp"] = 300
         self.assertTrue(asyncio.run(SafetyPolicy().enforce(client)))
         self.assertTrue(server.combat)
+
+
+    def real_client(self):
+        """An AtrinikClient in a melee: combat on and forced, her swing
+        timer running."""
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.player_tag = 7
+        client.state.stats.update(hp=150, maxhp=330, sp=82, food=999)
+        client.state.place_item(self.spell(), 7)
+        client.state.combat = client.state.combat_force = True
+        client.state.stats["action_time"] = self.WEAPON_SPEED
+        client.state.stat_observed_at["action_time"] = self.clock.now
+        sent = []
+
+        async def send(packet):
+            data = bytes(packet.data)
+            if packet.packet_type == c.S_COMBAT:
+                sent.append((bool(data[0]), bool(data[1])))
+                # The server echoes its combat state.
+                client.state.combat = bool(data[0] or data[1])
+
+        client.send = send
+        return client, sent
+
+    def test_a_stop_during_the_wait_keeps_combat_off(self):
+        from .web_server import WebControlServer
+        client, sent = self.real_client()
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertEqual(sent, [(False, False)])
+        # The operator replaces the task (as Stop does): combat off.
+        engine = TaskEngine(client)
+        server = WebControlServer(client, engine, WorldGraph())
+
+        async def clear(*_args):
+            pass
+
+        client.clear_actions = client.clear_target = clear
+        asyncio.run(server._replace_task(BotTask("next")))
+        # Healthy, the next policy restores nothing.
+        client.state.stats["hp"] = 330
+        self.assertTrue(asyncio.run(SafetyPolicy().enforce(client)))
+        self.assertEqual(sent, [(False, False), (False, False)])
+
+    def test_a_handover_combat_off_wins_over_the_restore(self):
+        # Autoplay's handovers (recovery, temple food, a failed child)
+        # turn combat off; the heal must not turn it back on, forced.
+        client, sent = self.real_client()
+        policy = SafetyPolicy()
+        asyncio.run(policy.enforce(client))
+        asyncio.run(client.set_combat(False))
+        self.clock.now += self.WEAPON_SPEED + 0.2
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertNotIn(True, [enabled for enabled, _ in sent])
+        # Without one, the cast restores combat as it was, forced.
+        client, sent = self.real_client()
+        asyncio.run(policy.enforce(client))
+        self.clock.now += self.WEAPON_SPEED + 0.2
+        asyncio.run(SafetyPolicy().enforce(client))
+        self.assertEqual(sent[-1], (True, True))
+
+    def test_another_wands_poof_is_not_hers(self):
+        from .tasks import heal_landed, observe_wand_feedback, wand_charges
+        wand = Item(28, item_type=c.TYPE_WAND, quality=100,
+                    name="wand of minor healing", flags=c.ITEM_APPLIED)
+        client, _ = self.melee(wand)
+        pending = (self.clock.now, client.state.message_count, 28,
+                   c.TYPE_WAND, 1)
+        since = time.time() - 1.0
+        client.state.add_message(0, "white", "The rod says poof.")
+        self.assertIsNone(heal_landed(client, pending))
+        self.assertFalse(observe_wand_feedback(client, 28, since))
+        self.assertNotIn(28, wand_charges(client))
+        client.state.add_message(0, "white", "The wand says poof.")
+        self.assertEqual(heal_landed(client, pending), "The wand says poof.")
+        self.assertTrue(observe_wand_feedback(client, 28, since))
 
 
 if __name__ == "__main__":

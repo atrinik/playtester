@@ -1275,7 +1275,9 @@ Now (`SafetyPolicy.enforce`, `_heal`):
   tick that sent a heal or readied its device): callers retreat and step
   away meanwhile, which no timer gates, but while `heal_waiting` holds,
   `low_health_retreat` makes no stand, cornered breakout or pursued cast,
-  since each would restart the timer. A rod or wand not yet readied is
+  and the walk's defence holds even when she is starving with nothing to
+  eat (which otherwise skips the safety hold), since each fight would
+  restart the timer. A rod or wand not yet readied is
   applied once (it readies it; applying it again would unready it), then
   fired by its tag. A potion or scroll is applied at once, with combat
   left as it is.
@@ -1287,7 +1289,10 @@ Now (`SafetyPolicy.enforce`, `_heal`):
   also turns it back on; a recall waiting for the timer (`combat_allowed`)
   keeps it off. What to restore is kept on the client, so whichever safety
   policy runs next restores it, the engine's idle one after a task ended
-  mid-wait among them.
+  mid-wait among them. Any other combat-off (a Stop, an operator's task
+  change, an autoplay handover, a retreat) drops it: whoever turned combat
+  off owns it (the farm turns it on again whenever it fights), and a new
+  login starts without one.
 - **A heal counts once it lands** (`heal_landed`). The server answers
   every heal it runs, spell, potion, scroll, rod or wand, with "The spell
   heals you for N hp!" (or "The healing spell fails!", `cast_heal`); a
@@ -1299,7 +1304,7 @@ Now (`SafetyPolicy.enforce`, `_heal`):
   while, but nothing happens" or "is impossible to handle for you" is
   backed off for `RECALL_DEVICE_RETRY_SECONDS` (20 s, the recall's own
   back-off, shared with it), and a wand that "says poof" is known empty
-  (`wand_known_empty`). Neither counts as a usable heal meanwhile, so the
+  (`wand_known_empty`; the name in the message must be the wand's). Neither counts as a usable heal meanwhile, so the
   next heal in her pack, her spell among them, heals instead of the
   combat-off wait repeating on a device that cannot fire. A cast unanswered
   for `heal_confirm_seconds` (1 s) was dropped: it is recorded as
