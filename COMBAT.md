@@ -765,13 +765,48 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
     survives Stop and restarts, and is cleared once recall works again (or
     below level 18);
   - `recall-missing` (info): otherwise.
-- **Safety without a recall** stays with the existing rules: healing, the
-  low-health retreat and flee thresholds, the pack-split retreat, and the
-  routing danger weight, which already plans with the safety λ while she
-  has no ready recall (ROUTING 4.5). Preferring the analyzer's safety
-  objective, or tighter retreat thresholds, while she has no working
-  recall is a possible follow-up, not part of this change: switching the
-  objective re-ranks spots each time a wand's charge is learned.
+- **Without a recall, safety comes from not engaging when out of heals
+  and from fleeing.** The recall at 35 % used to pre-empt the worst case
+  from level 18. Live, on 2026-11-22, with no recall, she sat at "critical
+  health 15% and no usable heal" for 45 s until she died among troll
+  guards, a stone giant master guard and a lava golem on the
+  mana-crystal-upgrade errand. So, while she has neither a usable heal (an
+  item, or a healing spell she has the SP for) nor a ready recall
+  (`out_of_heals_and_recall`):
+  - **No new pull below 90 %.** From level 18 the farm pulls nothing new
+    below `UNPREPARED_PULL_HEALTH` (90 %): only what is beside her or
+    already coming at her is fought. Otherwise she rests where she stands,
+    combat off, recorded once as `unprepared-rest`, until her SP buys a
+    heal again, a recall is ready, or her health is back
+    (`FarmTask.unprepared_for_pulls`). This is how she restocks the heal
+    she carries, her healing spell's SP.
+  - **The cornered breakout is the last resort.** At or below
+    `STAND_HEALTH_FLOOR` (35 %), at any level, a cornered breakout looks
+    for a step away again on every tick and takes the first one, combat
+    off; it fights its blocker on only while no step away exists
+    (`cornered-breakout` is recorded once per blocker).
+  - **Never stand with combat on.** At the flee threshold, when the
+    low-health retreat finds nothing to do, the farm backs away from an
+    attacker she cannot see (`invisible_contact_retreat`) and otherwise
+    turns combat off.
+  - **Travel.** On a walk (`NavigateThenTask`), at the flee threshold with
+    no step away (`_retreat_step` found none), she fights the weakest
+    adjacent attacker rather than stand with combat off
+    (`navigation-cornered-fight`), and looks for a step away again at the
+    next defence step.
+
+  The routing danger weight already plans with the safety λ while she has
+  no ready recall (ROUTING 4.5). Follow-ups, not part of this change: a
+  town trip to buy healing potions when the heals she carries are
+  exhausted (no existing trip buys them, and the sage's stock is random),
+  and preferring the analyzer's safety objective while she has no working
+  recall (switching the objective re-ranks spots each time a wand's
+  charge is learned).
+- **Recall alerts use fresh quotes only.** A recall quote older than a
+  day (`RECALL_SHOP_INTERVAL`) is no price: it neither gates recall
+  shopping nor raises `recall-unfunded`. When an alternative's quote never
+  arrives, the cheapest price she could not pay is still recorded. A
+  recall spell costing more SP than her whole bar is not a recall source.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 

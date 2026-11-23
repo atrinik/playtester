@@ -4736,6 +4736,25 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                          ("buy 1 wand of word of recall (lvl 12)", "sage"))
         self.assertEqual(client.quotes, [
             ("recall-source", "wand of word of recall (lvl 12)", 9_595)])
+        # The alternative's quote never arrives: the price she could not pay
+        # is still recorded.
+        client = FakeClient()
+        task = BuyDialogueStockTask(
+            "sage", r"word of recall", observation_key="recall-source",
+            try_alternatives=True)
+        asyncio.run(task.tick(client))
+        client.state.interface = InterfaceState(title="sage", links=[
+            "[a=:buy rod of word of recall]Rod[/a]",
+            "[a=:buy wand of word of recall (lvl 12)]Wand[/a]"])
+        asyncio.run(task.tick(client))
+        quote(client, "rod of word of recall", "1 gold 50 silver")
+        asyncio.run(task.tick(client))
+        client.state.interface = None
+        task._sent_at -= 6.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(client.quotes, [
+            ("recall-source", "rod of word of recall", 15_000)])
         # Without the fallback the first choice's failure is unchanged.
         client = FakeClient()
         task = BuyDialogueStockTask("sage", r"word of recall")
@@ -6454,6 +6473,198 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(len(client.direct_moves), moves + 1)
         # The engagement with the proven attacker survives the release.
         self.assertEqual(task._engaged_target[0], 200)
+
+    def _no_heal_no_recall(self, client, hp):
+        """Live, 2026-11-22: level 36, no SP, no potions, no recall."""
+        client.state.stats.update(hp=hp, maxhp=32, level=36, sp=0, maxsp=40)
+        client.decisions = []
+        client.record_action = (
+            lambda action, detail="": client.decisions.append(action))
+
+    def test_a_cornered_breakout_at_the_floor_steps_away_once_it_can(self):
+        # The cornered breakout used to fight its blocker at any health. At
+        # the critical floor it is the last resort only: a step away, once
+        # one opens, comes first.
+        client = self._combat_client()
+        self._no_heal_no_recall(client, 32)
+        client.state.map.tiles.clear()
+        client.state.map.world_x, client.state.map.world_y = 22, 11
+        client.state.map.tile(7, 9).objects[3] = MapObject(
+            3, 1, 0, 0, name="wolf", target_id=100)
+        client.state.map.tile(6, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="grey bear", target_id=200)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        walls = {(21, 10), (22, 10), (23, 10), (21, 11), (23, 11), (22, 12),
+                 (23, 12)}
+        node.blocked.update(walls)
+        task = FarmTask(zone="/test")
+        task.map_node, task.map_bounds = node, (25, 25)
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(task._cornered_breakout_target, 100)
+        # Pinned at 15 % and still cornered: she fights on, recorded once.
+        client.state.stats["hp"] = 5
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(client.targets[-1], (7, 9, 100))
+        self.assertIs(client.combat[-1], True)
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.decisions.count("cornered-breakout"), 1)
+        # A square opens: she steps away, combat off, the latch dropped.
+        node.blocked.discard((23, 10))
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(task._cornered_breakout_target, 0)
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertIs(client.combat[-1], False)
+        # Above the floor the breakout keeps its latch, as before.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x, client.state.map.world_y = 22, 11
+        client.state.map.tile(7, 9).objects[3] = MapObject(
+            3, 1, 0, 0, name="wolf", target_id=100)
+        node.blocked.update(walls)
+        task = FarmTask(zone="/test")
+        task.map_node, task.map_bounds = node, (25, 25)
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        node.blocked.discard((23, 10))
+        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(task._cornered_breakout_target, 100)
+
+    def test_without_heal_or_recall_she_pulls_nothing_below_90_percent(self):
+        def farm(hp, *, level=36, potion=False):
+            client = self._combat_client()
+            self._no_heal_no_recall(client, hp)
+            client.state.stats["level"] = level
+            client.state.map.tiles.clear()
+            client.state.map.world_x, client.state.map.world_y = 1, 11
+            if potion:
+                client.state.inventory.append(Item(
+                    60, item_type=c.TYPE_POTION, name="potion of healing"))
+            node = MapNode(path="/test", width=12, height=14)
+            node.terrain = {(x, y): 1 for x in range(12) for y in range(14)}
+            task = FarmTask(zone="/test", patrol=[(7, 9)])
+            task.map_node, task.map_bounds = node, (12, 14)
+            asyncio.run(task.tick(client))
+            return client, task
+
+        # 75 %, nothing to heal with, no recall: she rests, combat off.
+        client, task = farm(24)
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.decisions, ["unprepared-rest"])
+        self.assertEqual(client.combat, [False])
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.decisions, ["unprepared-rest"])
+        # 90 % and up, a potion, or below level 18: she patrols to pull.
+        for client, _ in (farm(29), farm(24, potion=True), farm(24, level=17)):
+            self.assertEqual(len(client.direct_moves), 1)
+            self.assertNotIn("unprepared-rest", client.decisions)
+        # A healing spell she has the SP for counts; without the SP it does not.
+        client = self._combat_client()
+        self._no_heal_no_recall(client, 24)
+        client.state.inventory.append(Item(
+            61, item_type=c.TYPE_SPELL, name="minor healing", extra={"cost": 5}))
+        task = FarmTask(zone="/test")
+        self.assertTrue(task.unprepared_for_pulls(client))
+        client.state.stats["sp"] = 5
+        self.assertFalse(task.unprepared_for_pulls(client))
+        # A ready recall counts too.
+        client.state.stats["sp"] = 0
+        client.state.inventory.append(Item(
+            62, item_type=c.TYPE_ROD, quality=80, condition=80,
+            name="rod of word of recall"))
+        self.assertFalse(task.unprepared_for_pulls(client))
+
+    def test_critical_with_no_heal_and_no_recall_never_stands_with_combat_on(self):
+        # Hit, with nothing to heal with and no recall, and the low-health
+        # retreat finds nothing to do: she backs away towards safe ground,
+        # else turns combat off.
+        client = self._combat_client()
+        self._no_heal_no_recall(client, 5)
+        client.state.map.tiles.clear()
+        client.state.map.tile(11, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="troll guard", target_id=300, target_hp=60)
+        client.state.map.world_x, client.state.map.world_y = 5, 5
+        client.state.messages = [
+            (time.time(), 2, "ff0000", "troll guard hit you for 30 damage.")]
+        node = MapNode(path="/test", width=12, height=12)
+        node.terrain = {(x, y): 1 for x in range(12) for y in range(12)}
+        task = FarmTask(zone="/test")
+        task.map_node, task.map_bounds = node, (12, 12)
+        retreats = []
+
+        async def back_away(client):
+            retreats.append(1)
+            return True
+
+        async def no_retreat(client):
+            return False
+
+        task.low_health_retreat = no_retreat
+        task.invisible_contact_retreat = back_away
+        asyncio.run(task.tick(client))
+        self.assertEqual(retreats, [1])
+
+        async def stuck(client):
+            return False
+
+        task.invisible_contact_retreat = stuck
+        client.state.combat = True
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertIs(client.combat[-1], False)
+
+    def test_navigation_cornered_without_heal_or_recall_fights_as_last_resort(self):
+        # Live, 2026-11-22: on the mana-crystal-upgrade errand, at 15 % with
+        # no heal and no recall, she stood among troll guards until she died.
+        client = self._combat_client()
+        self._no_heal_no_recall(client, 5)
+        client.state.map.tiles.clear()
+        guard = MapObject(3, 1, 0, 0, name="troll guard", target_id=300,
+                          target_hp=60)
+        client.state.map.tile(9, 8).objects[3] = guard
+        client.state.messages = [
+            (time.time(), 2, "ff0000", "troll guard hit you for 30 damage.")]
+        client.state.map.world_x, client.state.map.world_y = 12, 12
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        walls = {(12 + dx, 12 + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                 if (dx, dy) not in ((0, 0), (1, 0))}
+        node.blocked.update(walls)
+        graph = WorldGraph()
+        graph.nodes = {"/test": node}
+        task = NavigateThenTask(graph, "/elsewhere", BotTask("crystal"),
+                                combat_approach=True)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.targets[-1], (9, 8, 300))
+        self.assertIs(client.combat[-1], True)
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.decisions.count("navigation-cornered-fight"), 1)
+        # Between steps the fight goes on; combat is not turned off.
+        combat = len(client.combat)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(len(client.combat), combat)
+        # A square opens: the next step goes there, combat off.
+        node.blocked.discard((11, 11))
+        task._last_defense_action = 0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertIs(client.combat[-1], False)
+        # With a healing potion she is not in that last resort: no fight.
+        client = self._combat_client()
+        self._no_heal_no_recall(client, 5)
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = guard
+        client.state.messages = [
+            (time.time(), 2, "ff0000", "troll guard hit you for 30 damage.")]
+        client.state.map.world_x, client.state.map.world_y = 12, 12
+        client.state.inventory.append(Item(
+            60, item_type=c.TYPE_POTION, name="potion of healing"))
+        node.blocked.update(walls)
+        task = NavigateThenTask(graph, "/elsewhere", BotTask("crystal"),
+                                combat_approach=True)
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertNotIn("navigation-cornered-fight", client.decisions)
 
     def _pursued_stand_task(self, client):
         client.state.stats.update(hp=100, maxhp=176)
@@ -20537,8 +20748,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         return [alert["id"] for alert in alerts]
 
     def test_unsafe_reasons_follow_the_depletion_threshold_only(self):
-        from .navigation import (emergency_recall_unusable, farming_unsafe_reason,
-                                 has_working_recall)
+        from .navigation import farming_unsafe_reason, has_working_recall
         from .tasks import wand_charges
 
         client, _ = self.client(recall=False)
@@ -20548,7 +20758,7 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         # Two empty wands, as live (2026-11-22): no working source, and
         # still no blocker (owner decision, 2026-11-22).
         self.empty_wands(client, 77, 78)
-        self.assertTrue(emergency_recall_unusable(client))
+        self.assertFalse(has_working_recall(client))
         self.assertEqual(farming_unsafe_reason(client), "")
         # A wand of unknown charge counts until its examine says otherwise.
         wand_charges(client).pop(78)
@@ -20562,11 +20772,14 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         client.recall_device_retry_at = {79: time.monotonic() + 20.0}
         self.assertFalse(has_working_recall(client))
         self.assertEqual(farming_unsafe_reason(client), "")
-        # A known spell is a source whatever her mana.
+        # A known spell costing more than her whole mana bar (20) is none.
         client.state.stats["sp"] = 0
         client.state.place_item(Item(
             71, item_type=c.TYPE_SPELL, name="word of recall",
             extra={"cost": 24}), client.state.player_tag)
+        self.assertFalse(has_working_recall(client))
+        # Within it, it is a source whatever her mana now.
+        client.state.items[71].extra["cost"] = 20
         self.assertTrue(has_working_recall(client))
         # Depleted at the temple threshold, whatever her recall.
         client, _ = self.client(
@@ -20642,8 +20855,13 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
                          ["recall-missing"])
         # A quote older than a day no longer holds her back: stock changes.
         client.state.bank_balance = 2_413
+        self.assertEqual(self.ids(alerts.recovery_alerts(client)[0]),
+                         ["recall-unfunded"])
         self.quote_recall(client, 9_595, age=FarmCircuitTask.RECALL_SHOP_INTERVAL)
         self.assertTrue(circuit._needs_recall_shopping(client))
+        # Nor is it a price on the dashboard: no unfunded warning.
+        self.assertEqual(self.ids(alerts.recovery_alerts(client)[0]),
+                         ["recall-missing"])
         # The trip buys with the same reserve and records the quote.
         shopper = circuit._new_recall_shopping(client).task
         self.assertEqual(shopper.cash_reserve, FarmCircuitTask.RECALL_SHOP_RESERVE)

@@ -433,6 +433,17 @@ def recall_waiting(client: AtrinikClient) -> bool:
     return float(getattr(client, "recall_waiting_until", 0.0) or 0.0) > time.monotonic()
 
 
+def out_of_heals_and_recall(client: AtrinikClient,
+                            safety: "SafetyPolicy") -> bool:
+    """Neither a usable heal (SafetyPolicy._usable_heal: an item, or a
+    healing spell she has the SP for) nor a ready recall
+    (FarmTask.emergency_recall_candidates). Without a recall to rely on
+    (owner decision, 2026-11-22), this is when she must not engage, and
+    when at critical health she always tries to get away."""
+    return (safety._usable_heal(client) is None and
+            not FarmTask.emergency_recall_candidates(client))
+
+
 def combat_allowed(client: AtrinikClient) -> bool:
     """The one guard every combat entry point checks: not in recall mode."""
     return not recall_waiting(client)
@@ -509,6 +520,11 @@ RECALL_DEVICE_REFUSED_MESSAGE = re.compile(
     r"^The .+ (?:whines for a while, but nothing happens|"
     r"is impossible to handle for you)\.", re.I)
 RECALL_DEVICE_RETRY_SECONDS = 20.0
+# From this level recall shopping buys a recall source when she can afford
+# one (navigation.FarmCircuitTask._needs_recall_shopping), and a farm with
+# neither a usable heal nor a ready recall rests before pulling
+# (FarmTask.unprepared_for_pulls).
+RECALL_REQUIRED_LEVEL = 18
 
 
 def _message_position(client: AtrinikClient) -> int:
@@ -1818,6 +1834,9 @@ class FarmTask(BotTask):
         # and when the rest was last confirmed (see training_rest_active).
         self._training_resting = False
         self._training_rest_at = 0.0
+        # Resting for want of a usable heal or a ready recall
+        # (unprepared_for_pulls), recorded once per rest.
+        self._unprepared_resting = False
         self._melee_cycle_anchor = 0.0
         self._melee_anchor_message_at = 0.0
         self._finish_race_targets: set[int] = set()
@@ -2294,6 +2313,40 @@ class FarmTask(BotTask):
         cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
         return spell is not None and (
             maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
+
+    # Without a usable heal or a ready recall, she pulls only from this
+    # share of her health up (owner decision, 2026-11-22: a recall is not
+    # relied on, so not engaging while out of heals is what keeps her safe).
+    UNPREPARED_PULL_HEALTH = 0.90
+
+    def unprepared_for_pulls(self, client: AtrinikClient) -> bool:
+        """Whether a new pull must wait: from RECALL_REQUIRED_LEVEL, below
+        UNPREPARED_PULL_HEALTH, with neither a usable heal (an item, or a
+        healing spell she has the SP for: SafetyPolicy._usable_heal) nor a
+        ready recall (emergency_recall_candidates)."""
+        stats = client.state.stats
+        maxhp = int(stats.get("maxhp", 0) or 0)
+        if (maxhp <= 0 or
+                int(stats.get("level", 0) or 0) < RECALL_REQUIRED_LEVEL or
+                int(stats.get("hp", 0) or 0) / maxhp >=
+                self.UNPREPARED_PULL_HEALTH):
+            return False
+        return out_of_heals_and_recall(client, self.safety)
+
+    async def _unprepared_rest(self, client: AtrinikClient,
+                               ratio: float) -> None:
+        """Rest where she stands, combat off, until a heal is usable again
+        (her SP regenerates), a recall is ready, or her health is back to
+        UNPREPARED_PULL_HEALTH. Recorded once per rest."""
+        if self._unprepared_resting:
+            return
+        self._unprepared_resting = True
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("unprepared-rest",
+                     f"hp={ratio:.0%}: no usable heal and no ready recall")
+        await client.clear_actions()
+        await client.set_combat(False)
 
     def training_rest_active(self) -> bool:
         """Whether a mana rest was confirmed on the farm just now."""
@@ -4354,6 +4407,8 @@ class FarmTask(BotTask):
             max(abs(x - cx), abs(y - cy)) <= 1), None)
         ratio = (int(client.state.stats.get("hp", 0) or 0) /
                  max(1, int(client.state.stats.get("maxhp", 1) or 1)))
+        # The blocker a cornered breakout was fighting, re-checked below.
+        rechecked = 0
         if (breakout is not None and self._stand_latch and
                 ratio <= self.STAND_HEALTH_FLOOR):
             # A stand chosen over a failing retreat ends at the critical
@@ -4363,6 +4418,14 @@ class FarmTask(BotTask):
             breakout = None
             self._cornered_breakout_target = 0
             self._stand_latch = False
+        elif breakout is not None and ratio <= self.STAND_HEALTH_FLOOR:
+            # At the critical floor a cornered breakout is the last resort
+            # only: look for a step away again on every tick, and fight the
+            # blocker on only while none exists (the no-choice branch
+            # below picks it again).
+            rechecked = self._cornered_breakout_target
+            breakout = None
+            self._cornered_breakout_target = 0
         if breakout is not None:
             # With no walkable escape square, repeatedly alternating one
             # forced swing with combat-off retreat ticks makes neither
@@ -4478,7 +4541,7 @@ class FarmTask(BotTask):
                     return False
                 await client.set_combat(True, force=True)
                 recorder = getattr(client, "record_action", None)
-                if recorder is not None:
+                if recorder is not None and obj.target_id != rechecked:
                     recorder("cornered-breakout",
                              f"blocking_target={obj.target_id}")
                 self._last_action = now
@@ -5486,6 +5549,17 @@ class FarmTask(BotTask):
                 return
             if await self.low_health_retreat(client):
                 return
+            if out_of_heals_and_recall(client, self.safety):
+                # Nothing to heal with and no recall: never stand here with
+                # combat on. Back away from an attacker she cannot see, and
+                # otherwise keep combat off (the cornered breakout above
+                # fights an adjacent blocker when no step away exists).
+                if (hostile_contact and
+                        await self.invisible_contact_retreat(client)):
+                    self._last_action = time.monotonic()
+                    return
+                if getattr(client.state, "combat", False):
+                    await client.set_combat(False)
             self._last_action = time.monotonic()
             return
         if (not finish_before_healing and not isolated_kite and
@@ -5661,12 +5735,19 @@ class FarmTask(BotTask):
                 targets = threats
             targets = [entry for entry in targets
                        if entry[3].target_id not in pulled_aside_ids]
-        if self.hold_new_pulls and engaged is None:
-            # Farming is about to stop (hold_new_pulls): no new pull, only
-            # what is beside her or already coming at her.
+        unprepared = engaged is None and self.unprepared_for_pulls(client)
+        if not unprepared:
+            self._unprepared_resting = False
+        if (self.hold_new_pulls or unprepared) and engaged is None:
+            # Farming is about to stop (hold_new_pulls), or she has neither
+            # a usable heal nor a ready recall below
+            # UNPREPARED_PULL_HEALTH: no new pull, only what is beside her
+            # or already coming at her.
             targets = [entry for entry in targets
                        if entry[0] <= 1 or active_threat(entry)]
             if not targets:
+                if unprepared:
+                    await self._unprepared_rest(client, ratio)
                 self._last_action = time.monotonic()
                 return
         if engaged is None and self.single_target_wizardry(client):
@@ -6630,6 +6711,14 @@ class BuyDialogueStockTask(BotTask):
             if not quantity or cost is None:
                 if now - self._sent_at <= 5.0:
                     return
+                if (self.cheapest_unaffordable is not None and
+                        self.observation_key):
+                    # An alternative's quote never came: what she could
+                    # not pay is still the price to remember.
+                    recorder = getattr(client, "record_vendor_quote", None)
+                    if recorder is not None:
+                        recorder(self.observation_key,
+                                 *self.cheapest_unaffordable)
                 self.fail("merchant utility quote was incomplete")
                 return
             wallet = BuyShopUpgradeTask.wallet_value(client)

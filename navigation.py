@@ -63,7 +63,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     healing_outpaced, recent_hostile_attackers,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
-                    combat_allowed, wand_known_empty)
+                    combat_allowed, out_of_heals_and_recall, wand_known_empty)
+from .tasks import RECALL_REQUIRED_LEVEL
 log = logging.getLogger(__name__)
 
 
@@ -4228,6 +4229,9 @@ class NavigateThenTask(BotTask):
         self._halo_yield: set[int] = set()
         # Since when held-fire halos alone have closed the local route.
         self._halo_closed_since = 0.0
+        # The adjacent attacker a cornered last-resort fight is on
+        # (_cornered_last_resort).
+        self._cornered_fight_target = 0
         self._halo_closed_for: frozenset[int] = frozenset()
         self._last_danger_target = 0
         self._last_pack_signature: tuple[int, ...] = ()
@@ -4421,6 +4425,35 @@ class NavigateThenTask(BotTask):
         self.navigation._issued_goal = None
         self.navigation._issued_click = None
         self.navigation._last_progress = time.monotonic()
+        self._last_defense_action = time.monotonic()
+        return True
+
+    async def _cornered_last_resort(self, client: AtrinikClient,
+                                    nearby) -> bool:
+        """Critical, with no heal and no recall, and no step away
+        (_retreat_step found none): fight the weakest adjacent attacker
+        rather than stand with combat off while it hits her. Only the last
+        resort: every later tick looks for a step away first. Live
+        (2026-11-22, the mana-crystal-upgrade errand) she stood at 15 %
+        among troll guards until she died."""
+        adjacent = [threat for threat in nearby if threat[0] <= 1]
+        if not adjacent:
+            return False
+        _, x, y, obj = min(adjacent, key=lambda threat: (
+            int(getattr(threat[3], "target_hp", 0) or 100),
+            threat[3].target_id))
+        if not await select_target(client, x, y, obj.target_id):
+            return False
+        if isinstance(self.task, FarmTask):
+            self.task.remember_engagement(client, x, y, obj.target_id)
+        await client.set_combat(True, force=True)
+        if self._cornered_fight_target != obj.target_id:
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("navigation-cornered-fight",
+                         f"target={obj.target_id}: no step away, no heal, "
+                         "no recall")
+        self._cornered_fight_target = obj.target_id
         self._last_defense_action = time.monotonic()
         return True
 
@@ -4885,13 +4918,24 @@ class NavigateThenTask(BotTask):
                 return True
             self._defending = True
             await client.clear_actions()
-            await client.set_combat(False)
+            critical = (ratio <= self.safety.flee_below and
+                        out_of_heals_and_recall(client, self.safety))
             if nearby and time.monotonic() - self._last_defense_action >= 0.30:
                 # A pack-splitting step must not immediately reverse on an
                 # equal-distance plateau. Route following and the next safety
                 # tick otherwise alternate forever between the same squares.
-                await self._retreat_step(
-                    client, nearby, avoid_backtrack=True)
+                if (not await self._retreat_step(
+                        client, nearby, avoid_backtrack=True) and critical and
+                        await self._cornered_last_resort(client, nearby)):
+                    return True
+            elif critical and any(
+                    threat[0] <= 1 and
+                    threat[3].target_id == self._cornered_fight_target
+                    for threat in nearby):
+                # Between steps the last-resort fight goes on.
+                return True
+            self._cornered_fight_target = 0
+            await client.set_combat(False)
             return True
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.
@@ -5498,9 +5542,9 @@ def effective_farm_objective(state) -> str:
     return "safety" if depleted_for_temple(state) else chosen
 
 
-# From this level recall shopping buys a recall source when she can afford
-# one (FarmCircuitTask._needs_recall_shopping); below it nothing would.
-RECALL_REQUIRED_LEVEL = 18
+# RECALL_REQUIRED_LEVEL (tasks.py): from this level recall shopping buys a
+# recall source when she can afford one (FarmCircuitTask._needs_recall_shopping);
+# below it nothing would.
 # Where recall shopping keeps the latest recall quote she was given
 # (client.state.vendor_quotes): the cheapest one the merchant offered.
 RECALL_QUOTE_KEY = "recall-source"
@@ -5511,20 +5555,25 @@ def _recall_sources(client: AtrinikClient) -> tuple[bool, bool]:
 
     A source is what FarmTask.emergency_recall_candidates fires, read
     without its mana check: a known Word of Recall spell, or a paid,
-    identified, uncursed rod or wand. It works unless it is a wand known to
-    be empty (observe_wand_feedback) or a device waiting out
+    identified, uncursed rod or wand. A spell costing more SP than her
+    maximum is none (as in care_recall_ready): she could never cast it. A
+    source works unless it is a wand known to be empty
+    (observe_wand_feedback) or a device waiting out
     RECALL_DEVICE_RETRY_SECONDS after it said it cannot fire. A wand of
     unknown charge works until its examine text says otherwise.
     """
     retry = getattr(client, "recall_device_retry_at", {}) or {}
     now = time.monotonic()
     policy = InventoryPolicy()
+    maxsp = int((getattr(client.state, "stats", {}) or {}).get("maxsp", 0) or 0)
     owned = False
     for item in getattr(client.state, "inventory", ()):
         if (not re.search(r"\bword of recall\b", item.name, re.I) or
                 item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)):
             continue
         if item.item_type == c.TYPE_SPELL:
+            if int(item.extra.get("cost", 0) or 0) > maxsp:
+                continue
             return True, True
         if (item.item_type in (c.TYPE_ROD, c.TYPE_WAND) and
                 policy.identified(item)):
@@ -5535,13 +5584,6 @@ def _recall_sources(client: AtrinikClient) -> tuple[bool, bool]:
     return owned, False
 
 
-def emergency_recall_unusable(client: AtrinikClient) -> bool:
-    """Whether she owns a recall source but none of them works now
-    (_recall_sources). Owning none at all is not this."""
-    owned, working = _recall_sources(client)
-    return owned and not working
-
-
 def has_working_recall(client: AtrinikClient) -> bool:
     """Whether a recall source of hers works now (_recall_sources)."""
     return _recall_sources(client)[1]
@@ -5549,11 +5591,15 @@ def has_working_recall(client: AtrinikClient) -> bool:
 
 def recall_quote(client: AtrinikClient) -> tuple[str, int] | None:
     """The recall source recall shopping was last quoted, and its price:
-    the cheapest stock the merchant offered (RECALL_QUOTE_KEY)."""
+    the cheapest stock the merchant offered (RECALL_QUOTE_KEY), while it is
+    younger than FarmCircuitTask.RECALL_SHOP_INTERVAL. An older quote is
+    no price: merchant stock changes, and the next trip finds out."""
     quote = (getattr(client.state, "vendor_quotes", {}) or {}).get(
         RECALL_QUOTE_KEY) or {}
     cost = quote.get("unit_cost")
-    if not isinstance(cost, (int, float)) or cost <= 0:
+    observed = float(quote.get("observed_at", 0.0) or 0.0)
+    if (not isinstance(cost, (int, float)) or cost <= 0 or
+            time.time() - observed >= FarmCircuitTask.RECALL_SHOP_INTERVAL):
         return None
     return str(quote.get("item", "") or "recall source"), int(cost)
 
@@ -5566,8 +5612,9 @@ def recall_alerts(client: AtrinikClient) -> list[dict[str, str]]:
     2026-11-22): she farms on without one, and recall shopping buys one
     once she can afford it. So none of these is critical:
 
-    - recall-unfunded (warning): the recall she was last quoted, plus the
-      reserve recall shopping keeps, costs more than she has;
+    - recall-unfunded (warning): the recall she was quoted within a day
+      (recall_quote), plus the reserve recall shopping keeps, costs more
+      than she has;
     - recall-unavailable (info): the last recall shopping failed or bought
       nothing, or getting the ship key it needs failed, within a day
       (GameState.recall_unavailable);
@@ -8527,10 +8574,7 @@ class FarmCircuitTask(BotTask):
         else RECALL_SHOP_MINIMUM_WALLET. An older quote no longer holds her
         back: merchant stock changes, and a trip finds out the new price."""
         quote = recall_quote(client)
-        observed = float(((getattr(client.state, "vendor_quotes", {}) or {})
-                          .get(RECALL_QUOTE_KEY) or {}).get("observed_at", 0.0)
-                         or 0.0)
-        if quote is None or time.time() - observed >= self.RECALL_SHOP_INTERVAL:
+        if quote is None:
             return self.RECALL_SHOP_MINIMUM_WALLET
         return max(self.RECALL_SHOP_MINIMUM_WALLET,
                    quote[1] + self.RECALL_SHOP_RESERVE)
