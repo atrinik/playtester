@@ -254,6 +254,11 @@ class GameState:
     recall_unavailable: str = ""
     recall_unavailable_at: float = 0.0
     last_utility_shop_check_at: float = 0.0
+    # The farm circuit's heal restock (FarmCircuitTask._needs_heal_restock):
+    # why the last one came to nothing, and the wall-clock time before
+    # which she does not try again; heal_restock_alerts shows the note.
+    heal_restock_note: str = ""
+    heal_restock_retry_until: float = 0.0
     # Wall-clock time before which a paid-but-ineffective temple restoration
     # is not attempted again.
     paid_restoration_retry_until: float = 0.0

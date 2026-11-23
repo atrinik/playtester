@@ -53,7 +53,7 @@ from .model import STARTER_APARTMENT, Item
 from .pathfinding import graph_search, grid_reachable, grid_search
 from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyDialogueStockTask, BuyGroundItemsTask,
-                    BuyShopUpgradeTask,
+                    BuyHealingStockTask, BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
                     RANGED_RESIDENT_MARKERS, RANGED_RESIDENT_RADIUS,
@@ -65,7 +65,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     retreat_mobility, unresolved_hostile_contact,
                     combat_allowed, out_of_heals_and_recall,
                     UnpreparedHold, wand_known_empty)
-from .tasks import RECALL_REQUIRED_LEVEL
+from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
 log = logging.getLogger(__name__)
 
 
@@ -5727,6 +5727,65 @@ def recall_alerts(client: AtrinikClient) -> list[dict[str, str]]:
                      "can afford it" + tail}]
 
 
+# Where the heal restock keeps the cheapest healing price it was last
+# given (client.state.vendor_quotes), for heal_restock_quote.
+HEAL_QUOTE_KEY = "heal-restock"
+# Compiled merchant stock names are archetype names ("scroll min heal").
+_HEAL_STOCK_ARCH = re.compile(r"^(?:potion|balm|scroll)\b.*\b(?:heal|wounds)",
+                              re.I)
+
+
+def heal_restock_vendors(graph: "WorldGraph", client: AtrinikClient
+                         ) -> list[tuple[DialogueVendor, bool]]:
+    """Dialogue merchants that may sell her a healing consumable, each
+    with whether its authored stock holds one she can use (a scroll only
+    while she reads scrolls); the others roll random potions
+    (``random_potion``), which can be balms of healing."""
+    readable = reads_scrolls(client)
+    found = []
+    for vendor in graph.dialogue_vendors:
+        fixed = any(
+            _HEAL_STOCK_ARCH.search(name) and
+            (readable or not name.casefold().startswith("scroll"))
+            for name in vendor.stock)
+        rolled = any(value.casefold() == "random_potion"
+                     for value in vendor.treasure_lists)
+        if fixed or rolled:
+            found.append((vendor, fixed))
+    return found
+
+
+def heal_restock_quote(client: AtrinikClient) -> tuple[str, int] | None:
+    """The cheapest healing item the heal restock was last quoted, and its
+    price, while younger than FarmCircuitTask.HEAL_RESTOCK_INTERVAL."""
+    quote = (getattr(client.state, "vendor_quotes", {}) or {}).get(
+        HEAL_QUOTE_KEY) or {}
+    cost = quote.get("unit_cost")
+    observed = float(quote.get("observed_at", 0.0) or 0.0)
+    if (not isinstance(cost, (int, float)) or cost <= 0 or
+            time.time() - observed >= FarmCircuitTask.HEAL_RESTOCK_INTERVAL):
+        return None
+    return str(quote.get("item", "") or "healing item"), int(cost)
+
+
+def heal_restock_alerts(client: AtrinikClient) -> list[dict[str, str]]:
+    """The dashboard's heal-restock note: while the heal restock backs off
+    (GameState.heal_restock_note) and she still carries fewer usable
+    healing consumables than FarmCircuitTask.HEAL_RESTOCK_LOW. Info only:
+    she farms on, and rests rather than pulls while unprepared."""
+    state = client.state
+    note = getattr(state, "heal_restock_note", "") or ""
+    until = float(getattr(state, "heal_restock_retry_until", 0.0) or 0.0)
+    now = time.time()
+    if (not note or until <= now or
+            heal_consumables(client) >= FarmCircuitTask.HEAL_RESTOCK_LOW):
+        return []
+    minutes = max(1, int((until - now) // 60))
+    return [{"id": "heal-restock-unavailable", "level": "info",
+             "text": f"No healing potions: {note}; next try in "
+                     f"{minutes // 60}h {minutes % 60:02d}m"}]
+
+
 def farming_unsafe_reason(client: AtrinikClient) -> str:
     """Why farming must wait, or "" while it is safe enough to farm.
 
@@ -6810,6 +6869,36 @@ class FarmCircuitTask(BotTask):
     # What recall shopping keeps back after paying (BuyDialogueStockTask).
     RECALL_SHOP_RESERVE = 1_000
     UTILITY_SHOP_INTERVAL = 24 * 60 * 60
+    # The heal restock (_needs_heal_restock): from RECALL_REQUIRED_LEVEL,
+    # with fewer than HEAL_RESTOCK_LOW usable healing consumables she buys
+    # up to HEAL_RESTOCK_TARGET, keeping HEAL_RESTOCK_RESERVE; without a
+    # healing quote from the last HEAL_RESTOCK_INTERVAL she starts only
+    # with HEAL_RESTOCK_MINIMUM_WALLET, with one only with that price plus
+    # the reserve. No seller, no stock she can use, or stock that ran short
+    # backs off for HEAL_RESTOCK_INTERVAL; a failed trip for
+    # HEAL_RESTOCK_RETRY_SECONDS. While the unprepared hold holds
+    # (UnpreparedHold) she goes only by a strict route and from
+    # HEAL_RESTOCK_SAFETY's flee threshold up; with no strict route she
+    # tries again after HEAL_RESTOCK_STRICT_RETRY_SECONDS.
+    HEAL_RESTOCK_LOW = 2
+    HEAL_RESTOCK_TARGET = 5
+    HEAL_RESTOCK_RESERVE = 1_000
+    HEAL_RESTOCK_MINIMUM_WALLET = 1_250
+    HEAL_RESTOCK_INTERVAL = 24 * 60 * 60
+    HEAL_RESTOCK_RETRY_SECONDS = 2 * 60 * 60
+    HEAL_RESTOCK_STRICT_RETRY_SECONDS = 600.0
+    HEAL_RESTOCK_SAFETY = (0.85, 0.70)
+    # After a restock that reached the low mark, the next waits this long:
+    # at high level a fight can use all five, and restocking at once would
+    # empty the merchant's stock in back-to-back trips.
+    HEAL_RESTOCK_MIN_INTERVAL = 2 * 60 * 60
+    # Out of heals and recall, a trip whose route needs the hostile-transit
+    # fallback departs only at full HP and SP; meanwhile the farm rests
+    # (FarmTask.rest_for_departure), the trip is re-planned this often, and
+    # after HEAL_RESTOCK_FULL_WAIT_SECONDS she gives up for
+    # HEAL_RESTOCK_RETRY_SECONDS.
+    HEAL_RESTOCK_FULL_RECHECK_SECONDS = 30.0
+    HEAL_RESTOCK_FULL_WAIT_SECONDS = 600.0
     UPGRADE_SWEEP_WALLET_GROWTH = 5_000
     UPGRADE_SWEEP_POLICY = 8
     BANK_DEPOSIT_MINIMUM = 1_000
@@ -6954,6 +7043,12 @@ class FarmCircuitTask(BotTask):
         self._recall_shopping_retry_at = 0.0
         self._utility_shopping: NavigateThenTask | None = None
         self._utility_shopping_retry_at = 0.0
+        self._heal_restock: NavigateThenTask | None = None
+        # Only for a strict (unprepared) plan that found no seller; every
+        # other backoff is persisted (GameState.heal_restock_retry_until).
+        self._heal_restock_retry_at = 0.0
+        # Since when a hostile-transit restock waits for full HP and SP.
+        self._heal_restock_full_since: float | None = None
         self._ship_key: MorgeeanShipKeyTask | None = None
         self._ship_key_retry_at = 0.0
         self._spell_purchase: NavigateThenTask | None = None
@@ -7004,7 +7099,7 @@ class FarmCircuitTask(BotTask):
         "_cure_funding_retry_at", "_banking_retry_at", "_bank_sync_retry_at",
         "_shopping_retry_at", "_recall_shopping_retry_at",
         "_utility_shopping_retry_at", "_ship_key_retry_at", "_spell_retry_at",
-        "_cure_retry_at", "_restoration_retry_at",
+        "_cure_retry_at", "_restoration_retry_at", "_heal_restock_retry_at",
     )
 
     def backoffs(self) -> dict[str, float]:
@@ -8459,7 +8554,7 @@ class FarmCircuitTask(BotTask):
             self._storage, self._identification, self._cure_funding,
             self._bed_binding, self._selling, self._banking,
             self._bank_sync, self._shopping, self._recall_shopping,
-            self._utility_shopping,
+            self._utility_shopping, self._heal_restock,
             self._ship_key,
             self._spell_purchase, self._cure, self._restoration,
             self._expedition_return, self._capability,
@@ -8487,12 +8582,12 @@ class FarmCircuitTask(BotTask):
         return bool(blocking) and self._expedition_return is None
 
     # Trips autoplay drops at once when farming turns unsafe: discretionary
-    # purchases, recall shopping (never bought with the cure's money) and
-    # savebed rebinding. Every other trip is an
+    # purchases, recall shopping and the heal restock (never bought with
+    # the cure's money) and savebed rebinding. Every other trip is an
     # essential (food, bank, identify, storage, the cure and its funding,
     # the ship key) and finishes first.
     DROPPED_AT_HANDOVER = ("_shopping", "_spell_purchase", "_utility_shopping",
-                           "_recall_shopping", "_bed_binding")
+                           "_recall_shopping", "_heal_restock", "_bed_binding")
 
     def drop_discretionary_trips(self, client: AtrinikClient) -> list[str]:
         """End the trips in DROPPED_AT_HANDOVER; the names of those ended.
@@ -8537,7 +8632,12 @@ class FarmCircuitTask(BotTask):
                 service is not None for service in self._maintenance_services()):
             return False
         farm = self.child.task if self.child is not None else None
-        return isinstance(farm, FarmTask) and farm.unprepared_resting()
+        return isinstance(farm, FarmTask) and (
+            farm.unprepared_resting() or
+            # A heal restock waiting for full HP and SP to take the
+            # hostile road (_heal_restock_waiting) is a wait too.
+            (farm.rest_for_departure and
+             self._heal_restock_full_since is not None))
 
     def hold_new_pulls(self, hold: bool = True) -> None:
         """While the switch to recovery waits: the farm pulls no new target
@@ -8837,6 +8937,194 @@ class FarmCircuitTask(BotTask):
         task.navigation.tolerance = 2
         task.navigation.allow_ranged_hazard_fallback = True
         return task
+
+    def _heal_restock_funds(self, client: AtrinikClient) -> int:
+        """What the heal restock needs in her wallet before it starts: the
+        healing price she was last quoted (heal_restock_quote) plus the
+        reserve, at least HEAL_RESTOCK_MINIMUM_WALLET."""
+        quote = heal_restock_quote(client)
+        if quote is None:
+            return self.HEAL_RESTOCK_MINIMUM_WALLET
+        return max(self.HEAL_RESTOCK_MINIMUM_WALLET,
+                   quote[1] + self.HEAL_RESTOCK_RESERVE)
+
+    def _needs_heal_restock(self, client: AtrinikClient, *,
+                            ignore_retry: bool = False) -> bool:
+        """Whether to go and buy healing consumables now: from
+        RECALL_REQUIRED_LEVEL (where being out of heals and recall makes
+        her rest rather than pull), with fewer than HEAL_RESTOCK_LOW she
+        can use, room to carry them, the money for one plus the reserve,
+        no depletion due (the recovery phase comes first) and no backoff
+        in force (GameState.heal_restock_retry_until). ``ignore_retry``
+        leaves out the in-memory re-plan pause (_heal_restock_retry_at)."""
+        state = client.state
+        if (int(state.stats.get("level", 0) or 0) < RECALL_REQUIRED_LEVEL or
+                not self._inventory_ready(client) or
+                depleted_for_temple(state) or
+                heal_consumables(client) >= self.HEAL_RESTOCK_LOW or
+                time.time() < float(getattr(
+                    state, "heal_restock_retry_until", 0.0) or 0.0) or
+                (not ignore_retry and
+                 self.clock() < self._heal_restock_retry_at)):
+            return False
+        if InventoryPolicy().weight_ratio(client) >= self.FOOD_RESERVE_MAX_LOAD:
+            return False
+        return (BuyShopUpgradeTask.wallet_value(client) >=
+                self._heal_restock_funds(client))
+
+    def _heal_restock_may_leave(self, client: AtrinikClient,
+                                unprepared: bool) -> bool:
+        """Whether the heal restock may set out now. Unlike every other
+        optional trip, the unprepared hold (UnpreparedHold) does not hold
+        it: it is what ends being unprepared. But while the hold holds she
+        leaves only from HEAL_RESTOCK_SAFETY's flee threshold up; below it
+        the farm's unprepared rest regenerates her first."""
+        if not unprepared:
+            return True
+        stats = client.state.stats
+        maxhp = max(1, int(stats.get("maxhp", 1) or 1))
+        return (int(stats.get("hp", 0) or 0) / maxhp >=
+                self.HEAL_RESTOCK_SAFETY[1])
+
+    def back_off_heal_restock(self, client: AtrinikClient, note: str,
+                              seconds: float) -> None:
+        """Persist why the heal restock came to nothing and wait
+        ``seconds`` before the next (heal_restock_alerts shows the note);
+        a note of "" is a pause without an alert, and 0 seconds clears."""
+        until = time.time() + seconds if seconds > 0 else 0.0
+        setter = getattr(client, "set_heal_restock_backoff", None)
+        if setter is not None:
+            setter(note, until)
+        else:
+            client.state.heal_restock_note = note
+            client.state.heal_restock_retry_until = until
+        recorder = getattr(client, "record_action", None)
+        if note and recorder is not None:
+            recorder("heal-restock-backoff",
+                     f"{note}; next try in {int(seconds // 60)} min")
+
+    def _new_heal_restock(self, client: AtrinikClient, *,
+                          strict: bool) -> NavigateThenTask | None:
+        """A trip to the nearest merchant that may sell her a usable heal
+        (heal_restock_vendors), or None when there is none to go to.
+
+        Planned as recall shopping is: the nearest by a route without a
+        threat fallback, authored healing stock before random potions, a
+        route over its budget after every other. When no such route
+        exists, the same ranking over routes that need the hostile-transit
+        fallback (Asteria is reached by the crocodile road), as recall
+        shopping's own trip may take; the trip is then marked
+        ``hostile_transit``. ``strict`` (while unprepared): only a strict
+        route, never that fallback, else None.
+        """
+        vendors = heal_restock_vendors(self.graph, client)
+        hostile = False
+
+        def ranking(fallback: bool) -> list:
+            ranked = []
+            for vendor, fixed in vendors:
+                navigation = NavigateTask(
+                    self.graph, vendor.map_path, (vendor.x, vendor.y),
+                    tolerance=2)
+                navigation.strict_safety = strict
+                navigation.allow_ranged_hazard_fallback = fallback
+                # A probe: no navigation-threat-fallback decision.
+                navigation._threat_fallback = fallback
+                try:
+                    route = navigation._plan(client)
+                except ValueError:
+                    continue
+                if navigation._threat_fallback and not fallback:
+                    continue
+                ranked.append((navigation.over_budget, not fixed, len(route),
+                               vendor.name.casefold(), vendor.map_path, vendor))
+            return ranked
+
+        ranked = ranking(False)
+        if not ranked and not strict:
+            ranked, hostile = ranking(True), True
+        if not ranked:
+            return None
+        vendor = min(ranked, key=lambda entry: entry[:-1])[-1]
+        heal_below, flee_below = self.HEAL_RESTOCK_SAFETY
+        safety = SafetyPolicy(heal_below=heal_below, flee_below=flee_below)
+        task = NavigateThenTask(
+            self.graph, vendor.map_path,
+            BuyHealingStockTask(
+                vendor.name,
+                quantity=self.HEAL_RESTOCK_TARGET - heal_consumables(client),
+                cash_reserve=self.HEAL_RESTOCK_RESERVE,
+                observation_key=HEAL_QUOTE_KEY),
+            destination_xy=(vendor.x, vendor.y), combat_approach=True,
+            safety=safety)
+        task.navigation.tolerance = 2
+        task.navigation.strict_safety = strict
+        task.navigation.allow_ranged_hazard_fallback = not strict
+        task.hostile_transit = hostile
+        return task
+
+    @staticmethod
+    def _full_hp_sp(client: AtrinikClient) -> bool:
+        stats = client.state.stats
+        return (int(stats.get("hp", 0) or 0) >= int(stats.get("maxhp", 0) or 0)
+                and int(stats.get("sp", 0) or 0) >=
+                int(stats.get("maxsp", 0) or 0))
+
+    def _heal_restock_waiting(self, client: AtrinikClient,
+                              farm: FarmTask) -> bool:
+        """Whether a hostile-transit restock still waits for full HP and SP
+        (HEAL_RESTOCK_FULL_WAIT_SECONDS at most). Once she is full, or has
+        a heal or a ready recall again, the trip is re-planned at once."""
+        since = self._heal_restock_full_since
+        if since is None:
+            return False
+        if not self._needs_heal_restock(client, ignore_retry=True):
+            # No longer due (heals found, money spent, a backoff, too
+            # heavy): no wait, and no backoff of its own.
+            self._heal_restock_full_since = None
+            return False
+        if (self._full_hp_sp(client) or
+                not out_of_heals_and_recall(client, farm.safety)):
+            self._heal_restock_full_since = None
+            self._heal_restock_retry_at = 0.0
+            return False
+        if self.clock() - since >= self.HEAL_RESTOCK_FULL_WAIT_SECONDS:
+            self._heal_restock_full_since = None
+            self.back_off_heal_restock(
+                client, "no full HP and SP within 10 minutes for the "
+                "hostile road, without a heal or a ready recall",
+                self.HEAL_RESTOCK_RETRY_SECONDS)
+            return False
+        return True
+
+    def _settle_heal_restock(self, client: AtrinikClient) -> None:
+        """Record a finished heal restock and when the next may start."""
+        trip = self._heal_restock
+        if trip is None:
+            return
+        shopper = trip.task
+        if trip.status == TaskStatus.FAILED:
+            log.warning("heal restock failed: %s", trip.error)
+            self.back_off_heal_restock(
+                client, f"heal restock failed: {trip.error}",
+                self.HEAL_RESTOCK_RETRY_SECONDS)
+        elif not (isinstance(shopper, BuyHealingStockTask) and
+                  shopper.purchased):
+            self.back_off_heal_restock(
+                client, f"{getattr(shopper, 'merchant', 'the merchant')} on "
+                f"{trip.navigation.destination} had no healing stock she "
+                "can use", self.HEAL_RESTOCK_INTERVAL)
+        elif heal_consumables(client) < self.HEAL_RESTOCK_LOW:
+            self.back_off_heal_restock(
+                client, f"{shopper.merchant}'s healing stock ran short",
+                self.HEAL_RESTOCK_INTERVAL)
+        else:
+            log.info("heal restock bought %d %s; returning to farm",
+                     shopper.bought, shopper.bought_name)
+            # No alert, only the pause before the next.
+            self.back_off_heal_restock(client, "",
+                                       self.HEAL_RESTOCK_MIN_INTERVAL)
+        self._heal_restock = None
 
     def _new_upgrade_shopping(
             self, client: AtrinikClient) -> ShopUpgradeSweepTask:
@@ -9291,6 +9579,12 @@ class FarmCircuitTask(BotTask):
                     self._recall_shopping_retry_at = self.clock() + 60.0
                 self._recall_shopping = None
             return True
+        if self._heal_restock is not None:
+            await self._heal_restock.tick(client)
+            if self._heal_restock.status in (
+                    TaskStatus.COMPLETE, TaskStatus.FAILED):
+                self._settle_heal_restock(client)
+            return True
         if self._utility_shopping is not None:
             await self._utility_shopping.tick(client)
             if self._utility_shopping.status in (
@@ -9676,6 +9970,66 @@ class FarmCircuitTask(BotTask):
         # on the same hold (FarmTask._unprepared_rest).
         unprepared = (isinstance(farm, FarmTask) and
                       self._unprepared_hold.active(client, farm.safety))
+        # The heal restock is the one optional trip the hold leaves alone:
+        # it is the cure for being unprepared. While the hold holds it goes
+        # only by a strict route, and not below its flee threshold
+        # (_heal_restock_may_leave); once the hold's cap runs out, like
+        # any optional trip.
+        # Out of heals and recall, a restock over the hostile road waits
+        # for full HP and SP, checked once, before it departs; the farm
+        # rests meanwhile.
+        if isinstance(farm, FarmTask):
+            farm.rest_for_departure = self._heal_restock_waiting(client, farm)
+        if (isinstance(farm, FarmTask) and
+                self._needs_heal_restock(client) and
+                not self._busy_finishing_fight_or_loot(client, farm) and
+                self._heal_restock_may_leave(client, unprepared)):
+            strict = unprepared
+            trip = self._new_heal_restock(client, strict=strict)
+            recorder = getattr(client, "record_action", None)
+            if (trip is not None and getattr(trip, "hostile_transit", False)
+                    and out_of_heals_and_recall(client, farm.safety) and
+                    not self._full_hp_sp(client)):
+                self._heal_restock_retry_at = (
+                    self.clock() + self.HEAL_RESTOCK_FULL_RECHECK_SECONDS)
+                if self._heal_restock_full_since is None:
+                    self._heal_restock_full_since = self.clock()
+                    if recorder is not None:
+                        recorder("heal-restock-waits",
+                                 "no heal and no ready recall: the road to "
+                                 f"{trip.navigation.destination} crosses "
+                                 "hostile transit, so she waits for full "
+                                 "HP and SP")
+                farm.rest_for_departure = True
+            elif trip is not None:
+                self._heal_restock_full_since = None
+                farm.rest_for_departure = False
+                await client.clear_actions()
+                await client.set_combat(False)
+                self._heal_restock = trip
+                if recorder is not None:
+                    recorder("heal-restock",
+                             f"{heal_consumables(client)} usable heal(s); to "
+                             f"{trip.task.merchant} on "
+                             f"{trip.navigation.destination}"
+                             f"{' by a strict route' if strict else ''}")
+                await trip.tick(client)
+                return
+            elif strict:
+                self._heal_restock_full_since = None
+                farm.rest_for_departure = False
+                self._heal_restock_retry_at = (
+                    self.clock() + self.HEAL_RESTOCK_STRICT_RETRY_SECONDS)
+                if recorder is not None:
+                    recorder("heal-restock-deferred",
+                             "no strict route to a healing merchant while "
+                             "unprepared")
+            elif trip is None:
+                self._heal_restock_full_since = None
+                farm.rest_for_departure = False
+                self.back_off_heal_restock(
+                    client, "no reachable merchant sells healing potions",
+                    self.HEAL_RESTOCK_INTERVAL)
         if (isinstance(farm, FarmTask) and
                 self._needs_ship_key(client) and not unprepared and
                 not self._busy_finishing_fight_or_loot(client, farm)):

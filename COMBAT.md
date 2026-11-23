@@ -827,7 +827,8 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
     still starts the farm circuit, where the farm's rest keeps its
     defence. Essential trips are not delayed: temple food, the recovery
     phase and its cure, and the circuit's food, bank, identify, storage
-    and savebed trips.
+    and savebed trips. The one optional trip the hold leaves alone is the
+    [healing-potion restock](#healing-potion-restock), on its own rules.
   - **At most ten minutes.** The farm's rest and the circuit's optional
     trips share one hold, owned by the circuit (`UnpreparedHold`), so a
     rebuilt farm does not restart it. It lasts at most
@@ -844,17 +845,104 @@ rules ([ROUTING 4.5](docs/ROUTING.md)):
   SP buys a heal again, or a recall becomes ready. Below level 18, and
   with a heal or a ready recall, nothing changes. The routing danger weight already
   plans with the safety λ while she has no ready recall (ROUTING 4.5).
-  Follow-ups, not part of this change: a town trip to buy healing potions
-  (no existing trip buys them, and the sage's stock is random), and
+  Follow-up, not part of this change:
   preferring the analyzer's safety objective while she has no working
   recall (switching it re-ranks spots each time a wand's charge is
   learned). The in-fight escape on a walk is
-  [below](#critical-escape-on-a-walk-2026-11-22).
+  [below](#critical-escape-on-a-walk-2026-11-22), and so is the
+  [healing-potion restock](#healing-potion-restock).
 - **Recall alerts use fresh quotes only.** A recall quote older than a
   day (`RECALL_SHOP_INTERVAL`) is no price: it neither gates recall
   shopping nor raises `recall-unfunded`. When an alternative's quote never
   arrives, the cheapest price she could not pay is still recorded. A
   recall spell costing more SP than her whole bar is not a recall source.
+
+## Healing-potion restock
+
+Live, on 2026-11-22, Sera died at critical health with no usable heal: no
+trip bought healing items, and being unprepared only made her rest. The
+farm circuit now restocks them (`FarmCircuitTask._needs_heal_restock`),
+so she is rarely without a heal:
+
+- **When.** From level 18 (`RECALL_REQUIRED_LEVEL`, where being out of
+  heals and recall starts to hold her), when she carries fewer than
+  `HEAL_RESTOCK_LOW` (2) usable healing consumables (`heal_consumables`):
+  identified, paid, neither cursed nor damned potions and balms named like
+  the heals her safety policy applies (`healing_patterns`), and scrolls
+  only while she has both literacy and wizardry spells, which reading one
+  needs (`types/scroll.c`). Her safety policy uses the same test
+  (`usable_heal_item`) for its heals, so she is "unprepared" exactly when
+  the restock sees no heal: an unreadable scroll, an unpaid, cursed or
+  unidentified potion or a spellbook is no heal to either. Healing spells,
+  rods and wands are not counted, on purpose: the restock is the backup
+  for when her SP or charges run out. Not with depletion due (the recovery phase
+  comes first), not above the food trips' load limit (80 % of her carry
+  weight), and only with the money for one item plus the 1,000 copper
+  reserve (`HEAL_RESTOCK_RESERVE`): with a healing quote from the last day
+  (`heal_restock_quote`, vendor quote `heal-restock`), its price plus the
+  reserve; without one, 1,250 copper to go and look.
+- **Where.** The nearest merchant that may sell her one
+  (`heal_restock_vendors`): authored healing stock she can use (the
+  Asteria merchant's scroll of minor healing) before stock rolled from
+  `random_potion` (balms of minor or greater healing), a route over its
+  budget after every other, as recall shopping ranks its vendors. When
+  no route without a threat fallback reaches one, as from the Burnt
+  Forest and Brynknot (Asteria lies behind the crocodile road), the same
+  ranking runs over routes that need the hostile-transit fallback, which
+  recall and utility shopping's trips may also take; a merchant no route
+  reaches at all is never chosen. Out of heals and recall
+  (`out_of_heals_and_recall`), such a hostile-road trip departs only at
+  full HP and SP, checked once before it sets out (no re-wait when its
+  route is re-planned). Until then the farm pulls nothing new
+  (`FarmTask.rest_for_departure`, combat off once per rest; whatever is
+  beside her or coming at her is still fought), the trip is re-planned
+  every 30 s, and after 10 minutes without getting full she backs off for
+  two hours. A rebuilt circuit keeps the 30 s re-plan pause but starts
+  the ten-minute wait afresh (a recovery phase in between would otherwise
+  count against it). The wait ends without a backoff once the restock is
+  no longer due, and is an explained wait for the dashboard's stuck
+  alert. After a fight during the rest, combat off is sent once more.
+  The walk keeps the trip's safety policy (heal at 85 %, flee at 70 %).
+- **What.** `BuyHealingStockTask` asks the price of every healing choice
+  she can use and buys up to `HEAL_RESTOCK_TARGET` (5) of the one with
+  the most heal per copper (`heal_estimate`: the server's minor and
+  greater healing rolls at the item's level), as many as the reserve
+  leaves. Heal per copper favours cheap minor heals over a bigger greater
+  heal; that is intended, more uses for the money. The merchant sells at
+  most what it stocks, so what arrives is counted: the purchase record
+  says that many, and the bank reservation for the rest is given back.
+  The cheapest price is recorded. A merchant answer that she cannot carry
+  them ends it at once.
+- **An optional trip, not an essential one.** It never crosses an owner
+  block, keeps the errand budget and planning with the safety λ, and is
+  dropped when farming turns unsafe (`DROPPED_AT_HANDOVER`). Being without
+  a heal is when trips are most dangerous, so making it essential (care
+  crossings and route overrides) would send her through the worst routes
+  exactly when she can least afford a fight.
+- **But the unprepared hold does not hold it.** It is the cure for being
+  unprepared, so it is the one optional trip that may start while the
+  hold holds, on stricter rules: only by a strict route (`strict_safety`,
+  no hostile-transit fallback), and only from its flee threshold (70 %
+  HP) up; below that the farm's unprepared rest regenerates her first.
+  With no strict route she tries again after 10 minutes
+  (`heal-restock-deferred`), not a day. Once the hold's ten minutes run
+  out, it goes like any optional trip, ahead of the others. Prepared (a
+  ready recall, SP for a healing spell, or 90 % HP), it is an ordinary
+  optional trip. Never while depletion is due.
+- **No loops.** A merchant with no healing stock she can use, stock that
+  ran short of the low mark, or no merchant at all backs her off for a
+  day; a failed trip (she could pay for none, a route declined, a
+  dialogue that did not answer) for two hours. The backoff and its reason
+  are kept in her persisted state (`heal_restock_note`,
+  `heal_restock_retry_until`), recorded once as `heal-restock-backoff`,
+  and shown on the dashboard as the `heal-restock-unavailable` info
+  alert while she still lacks heals. A purchase that reaches the low mark
+  clears it, and the next restock waits at least two hours
+  (`HEAL_RESTOCK_MIN_INTERVAL`), without an alert: at high level one fight
+  can use all five, and restocking at once would empty the merchant's
+  stock in back-to-back trips. A strict route over its budget is
+  declined like any optional trip's and counts as a failed trip (two
+  hours).
 
 ## Critical escape on a walk (2026-11-22)
 

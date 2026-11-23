@@ -715,6 +715,23 @@ def safe_food(item: Item) -> bool:
             InventoryPolicy().identified(item))
 
 
+def usable_heal_item(client: AtrinikClient, item: Item,
+                     patterns: tuple[str, ...]) -> bool:
+    """Whether a carried item is a heal she can use: named like one
+    (``patterns``), identified, paid, neither cursed nor damned, no
+    spellbook (applying one learns, it does not heal), and a scroll only
+    while she reads scrolls (reads_scrolls). The one test behind both her
+    safety policy's heals (SafetyPolicy._known_heal, so whether she is
+    unprepared) and the heal restock's count (heal_consumables)."""
+    folded = item.name.casefold()
+    if (not any(pattern in folded for pattern in patterns) or
+            item.item_type == c.TYPE_SPELLBOOK or
+            item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED) or
+            not InventoryPolicy().identified(item)):
+        return False
+    return item.item_type != c.TYPE_SCROLL or reads_scrolls(client)
+
+
 @dataclass(slots=True)
 class SafetyPolicy:
     heal_below: float = 0.70
@@ -780,9 +797,10 @@ class SafetyPolicy:
 
         No spell, scroll, rod or wand on a square where the server blocks
         spellcasting, nor while a recall waits for her action timer
-        (recall_waiting).
+        (recall_waiting). Only a heal she can use (usable_heal_item).
         """
-        items = client.state.inventory
+        items = [item for item in client.state.inventory
+                 if usable_heal_item(client, item, self.healing_patterns)]
         if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items):
             other = [item for item in items
                      if item.item_type not in MAGIC_BLOCKED_TYPES]
@@ -1804,6 +1822,13 @@ class FarmTask(BotTask):
         # phase waits for this fight: finish the engaged target and fight
         # what attacks her, but pull nothing new.
         self.hold_new_pulls = False
+        # Set by its farm circuit while a heal restock waits to depart at
+        # full HP and SP (FarmCircuitTask._heal_restock_waiting): no new
+        # pull, combat off, as in an unprepared rest.
+        self.rest_for_departure = False
+        # Whether combat was turned off for the current departure rest
+        # (sent once per rest, as for an unprepared rest).
+        self._departure_resting = False
         # Peaceful creatures seen occupying a named spawn; attacked with force.
         self._spawn_blocker_ids: set[int] = set()
         self._visible_target_count = 0
@@ -5792,7 +5817,11 @@ class FarmTask(BotTask):
                       self._unprepared_hold.active(client, self.safety))
         if not unprepared:
             self._unprepared_resting = False
-        if (self.hold_new_pulls or unprepared) and engaged is None:
+        if not self.rest_for_departure or engaged is not None:
+            # A fight in between: combat off is sent again after it.
+            self._departure_resting = False
+        if ((self.hold_new_pulls or unprepared or self.rest_for_departure)
+                and engaged is None):
             # Farming is about to stop (hold_new_pulls), or she has neither
             # a usable heal nor a ready recall below
             # UNPREPARED_PULL_HEALTH: no new pull, only what is beside her
@@ -5802,6 +5831,10 @@ class FarmTask(BotTask):
             if not targets:
                 if unprepared:
                     await self._unprepared_rest(client, ratio)
+                elif self.rest_for_departure and not self._departure_resting:
+                    self._departure_resting = True
+                    await client.clear_actions()
+                    await client.set_combat(False)
                 self._last_action = time.monotonic()
                 return
         if engaged is None and self.single_target_wizardry(client):
@@ -6855,6 +6888,238 @@ class BuyDialogueStockTask(BotTask):
                 self.fail("merchant rejected stock purchase")
             elif now - self._sent_at > 8.0:
                 self.fail("merchant stock did not enter inventory")
+
+
+# Healing consumables the farm circuit's heal restock counts and buys
+# (FarmCircuitTask._needs_heal_restock): potions and balms, and scrolls
+# once she can read them. Reading a scroll needs both the literacy and the
+# wizardry spells skill (types/scroll.c); no healing spell comes as dust,
+# which is thrown, not applied to herself.
+# Names carry a material ("paper scroll of ...") and a level ("(lvl 20)").
+HEAL_STOCK_FORMS = re.compile(r"\b(?:potion|balm|(scroll))s?\b", re.I)
+# A device level in an item name, such as "(lvl 20)".
+HEAL_ITEM_LEVEL = re.compile(r"\(lvl (\d+)\)", re.I)
+# The cast level heal_estimate assumes when the name gives none.
+DEFAULT_HEAL_ITEM_LEVEL = 10
+
+
+def reads_scrolls(client: AtrinikClient) -> bool:
+    """Whether she has both skills reading a scroll needs."""
+    skills = {item.name.casefold() for item in client.state.inventory
+              if item.item_type == c.TYPE_SKILL}
+    return {"literacy", "wizardry spells"} <= skills
+
+
+def usable_heal_consumable(client: AtrinikClient, name: str,
+                           safety: "SafetyPolicy | None" = None) -> bool:
+    """Whether a potion, balm or scroll of this name is a heal she can use:
+    named like the heals SafetyPolicy applies (healing_patterns), and a
+    scroll only while she reads scrolls (reads_scrolls)."""
+    folded = name.casefold()
+    patterns = (safety or SafetyPolicy()).healing_patterns
+    form = HEAL_STOCK_FORMS.search(folded)
+    if form is None or not any(pattern in folded for pattern in patterns):
+        return False
+    return form.group(1) is None or reads_scrolls(client)
+
+
+def heal_consumables(client: AtrinikClient,
+                     safety: "SafetyPolicy | None" = None) -> int:
+    """How many healing potions, balms and scrolls she carries that her
+    safety policy would use (usable_heal_item). Healing spells, rods and
+    wands are not counted: the restock is the backup for when her SP or
+    charges run out."""
+    patterns = (safety or SafetyPolicy()).healing_patterns
+    return sum(
+        max(1, int(item.quantity or 1)) for item in client.state.inventory
+        if item.item_type in (c.TYPE_POTION, c.TYPE_SCROLL) and
+        usable_heal_item(client, item, patterns))
+
+
+def heal_estimate(name: str) -> float:
+    """The health one use of a healing item of this name restores on
+    average, as the server rolls it at the item's level (spell_effect.c):
+    greater healing rndm(4, 5 + L) twice plus 12, any other heal as minor
+    healing, rndm(2, 5 + L) plus 6. Only a ranking: the level is read from
+    the name, else DEFAULT_HEAL_ITEM_LEVEL."""
+    folded = name.casefold()
+    match = HEAL_ITEM_LEVEL.search(folded)
+    level = int(match.group(1)) if match else DEFAULT_HEAL_ITEM_LEVEL
+    if "greater healing" in folded:
+        return level + 21.0
+    return level / 2 + 9.5
+
+
+class BuyHealingStockTask(BotTask):
+    """Buy healing consumables from a dialogue merchant: the most estimated
+    heal per copper (heal_estimate) she can use and pay for.
+
+    It opens the merchant's stock and asks the price of every healing
+    choice she can use (usable_heal_consumable), then buys up to
+    ``quantity`` of the best one, keeping ``cash_reserve``. The cheapest
+    price is recorded under ``observation_key``. With no usable healing
+    stock it completes without buying (``checked``, not ``purchased``);
+    when she can pay for none it fails naming the cheapest price.
+    """
+
+    QUOTE_WAIT_SECONDS = 5.0
+    ARRIVAL_WAIT_SECONDS = 8.0
+
+    def __init__(self, merchant: str, *, quantity: int,
+                 cash_reserve: int = 1_000, observation_key: str = "",
+                 safety: SafetyPolicy | None = None):
+        super().__init__(f"buy-healing-stock:{merchant}")
+        self.merchant = merchant
+        self.quantity = max(1, int(quantity))
+        self.cash_reserve = max(0, int(cash_reserve))
+        self.observation_key = observation_key
+        self.safety = safety
+        # Price per item, by stock name.
+        self.quotes: dict[str, int] = {}
+        self.checked = False
+        self.purchased = False
+        self.bought = 0
+        self.bought_name = ""
+        self._pending: list[str] = []
+        self._asking = ""
+        self._stage = ""
+        self._sent_at = 0.0
+        self._quantity_before = 0
+        self._heals_before = 0
+        self._reserved = 0
+
+    def _same_name(self, client: AtrinikClient) -> int:
+        return sum(max(1, int(item.quantity or 1))
+                   for item in client.state.inventory
+                   if item.name.casefold() == self.bought_name.casefold())
+
+    async def _ask(self, client: AtrinikClient, now: float) -> None:
+        self._asking = self._pending.pop(0)
+        client.state.interface = None
+        await client.talk(f"buy {self._asking}", self.merchant)
+        self._stage = "quote"
+        self._sent_at = now
+
+    async def _buy(self, client: AtrinikClient, now: float) -> None:
+        if not self.quotes:
+            self.fail("merchant gave no healing price")
+            return
+        cheapest = min(self.quotes.items(),
+                       key=lambda entry: (entry[1], entry[0].casefold()))
+        recorder = getattr(client, "record_vendor_quote", None)
+        if recorder is not None and self.observation_key:
+            recorder(self.observation_key, *cheapest)
+        wallet = BuyShopUpgradeTask.wallet_value(client)
+        spare = max(0, wallet - self.cash_reserve)
+        affordable = [entry for entry in self.quotes.items()
+                      if entry[1] <= spare]
+        if not affordable:
+            self.fail(f"healing stock costs at least "
+                      f"{format_money(cheapest[1])}, wallet "
+                      f"{format_money(wallet)}, reserve "
+                      f"{format_money(self.cash_reserve)}")
+            return
+        name, cost = max(affordable, key=lambda entry: (
+            heal_estimate(entry[0]) / entry[1], -entry[1],
+            entry[0].casefold()))
+        count = min(self.quantity, spare // cost)
+        self.bought_name, self.bought = name, count
+        self._quantity_before = self._same_name(client)
+        self._heals_before = heal_consumables(client, self.safety)
+        client.state.interface = None
+        # The merchant's dialogue takes any count (Merchant.Seller.dialog)
+        # and sells at most what it has in stock: what arrives is counted
+        # on arrival.
+        balance = int(getattr(client.state, "bank_balance", 0) or 0)
+        await BuyShopUpgradeTask.send_purchase(
+            client, cost * count,
+            lambda: client.talk(f"buy {count} {name}", self.merchant))
+        self._reserved = max(0, balance - int(
+            getattr(client.state, "bank_balance", 0) or 0))
+        self._stage = "buy"
+        self._sent_at = now
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        now = time.monotonic()
+        if not self._stage:
+            client.state.interface = None
+            await client.talk("hello", self.merchant)
+            self._stage = "stock"
+            self._sent_at = now
+            return
+        if self._stage == "stock":
+            destinations = BuyDialogueStockTask._destinations(client)
+            if not destinations:
+                if now - self._sent_at <= self.QUOTE_WAIT_SECONDS:
+                    return
+                self.fail("merchant stock dialogue did not arrive")
+                return
+            self.checked = True
+            self._pending = sorted(dict.fromkeys(
+                destination[4:] for destination in destinations
+                if destination.casefold().startswith("buy ") and
+                not re.match(r"buy\s+\d+\s", destination, re.I) and
+                usable_heal_consumable(client, destination[4:], self.safety)),
+                key=str.casefold)
+            if not self._pending:
+                self.complete()
+                return
+            await self._ask(client, now)
+            return
+        if self._stage == "quote":
+            offered = any(
+                re.fullmatch(rf"buy\s+\d+\s+{re.escape(self._asking)}",
+                             destination, re.I)
+                for destination in BuyDialogueStockTask._destinations(client))
+            cost = BuyDialogueStockTask._coin_value(
+                BuyDialogueStockTask._interface_payload(client))
+            if not offered or cost is None:
+                if now - self._sent_at <= self.QUOTE_WAIT_SECONDS:
+                    return
+                # No price for this one (sold out meanwhile): the others.
+            else:
+                self.quotes[self._asking] = int(cost)
+            if self._pending:
+                await self._ask(client, now)
+            else:
+                await self._buy(client, now)
+            return
+        if self._stage == "buy":
+            # Its inventory name may differ from the stock name ("paper
+            # scroll of ..."), so more usable heals count as arrival too.
+            arrived = max(self._same_name(client) - self._quantity_before,
+                          heal_consumables(client, self.safety) -
+                          self._heals_before)
+            if arrived > 0:
+                self.purchased = True
+                if arrived < self.bought:
+                    # The merchant had fewer: give back what the bank
+                    # funds reserved for the rest (account_purchase).
+                    refund = min(self._reserved, (self.bought - arrived) *
+                                 self.quotes[self.bought_name])
+                    if refund and getattr(client.state, "bank_balance_known",
+                                          False):
+                        BuyShopUpgradeTask._set_bank_balance(
+                            client, int(client.state.bank_balance) + refund)
+                    self.bought = arrived
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("heal-restock-buy",
+                             f"{self.bought} {self.bought_name} at "
+                             f"{format_money(self.quotes[self.bought_name])}"
+                             " each")
+                self.complete()
+                return
+            payload = BuyDialogueStockTask._interface_payload(client).casefold()
+            if "carry that much" in payload:
+                self.fail("merchant: she cannot carry that much")
+            elif ("don't have enough money" in payload or
+                  "do not have enough money" in payload):
+                self.fail("merchant rejected the healing purchase")
+            elif now - self._sent_at > self.ARRIVAL_WAIT_SECONDS:
+                self.fail("healing stock did not enter inventory")
 
 
 @dataclass(slots=True)
