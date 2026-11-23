@@ -1837,6 +1837,9 @@ class FarmTask(BotTask):
         self._opened_corpses: set[int] = set()
         self._unsafe_corpses: set[int] = set()
         self._corpse_take_all: dict[int, tuple[int, float]] = {}
+        # Corpses whose /take all has run its course: what it left behind
+        # stays listed while the corpse is open, and must not restart it.
+        self._corpse_take_all_done: set[int] = set()
         self._corpse_step_attempt: tuple[str, int, int, int, int, float] | None = None
         self._ignored_corpse_tiles: set[tuple[str, int, int]] = set()
         self._loot_move_attempts: dict[int, int] = {}
@@ -3846,7 +3849,8 @@ class FarmTask(BotTask):
                 # ignore; never recreate a zero-age take timer for the older
                 # searched corpse on every tick.
                 continue
-            if corpse.tag in self._opened_corpses:
+            if (corpse.tag in self._opened_corpses and
+                    corpse.tag not in self._corpse_take_all_done):
                 take_phase, take_at = self._corpse_take_all.get(
                     corpse.tag, (0, now))
                 if take_phase == 0 and now - take_at >= 0.55:
@@ -3863,9 +3867,12 @@ class FarmTask(BotTask):
                         (client.state.map.path,
                          client.state.map.world_x,
                          client.state.map.world_y))
-                    # Completed phases must not keep service detours (food,
-                    # banking, selling) marked busy for the rest of a farm.
-                    self._corpse_take_all.pop(corpse.tag, None)
+                # Completed phases must not keep service detours (food,
+                # banking, selling) or the skill-cap review marked busy for
+                # the rest of a farm, even when /take all left something
+                # behind (too heavy, say): the open corpse keeps it listed.
+                self._corpse_take_all.pop(corpse.tag, None)
+                self._corpse_take_all_done.add(corpse.tag)
             wanted = [item for item in contents
                       if self.loot.wants(item) and
                       self._loot_move_attempts.get(item.tag, 0) < 3]
@@ -7626,6 +7633,9 @@ class DepositItemsTask(BotTask):
 class RetrieveItemsTask(BotTask):
     """Retrieve matching items from an already visible house container."""
 
+    # A move the server has not carried out within this long was ignored.
+    MOVE_CONFIRM_SECONDS = 5.0
+
     def __init__(self, container_name: str, patterns: tuple[str, ...] = (), *,
                  require_match: bool = False,
                  predicate: Callable[[Item], bool] | None = None,
@@ -7645,6 +7655,8 @@ class RetrieveItemsTask(BotTask):
         self._opened_at = 0.0
         self._feedback_start = 0
         self._reopen_attempted = False
+        # When each item's move was first sent (by tag).
+        self._sent_at: dict[int, float] = {}
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
@@ -7680,10 +7692,11 @@ class RetrieveItemsTask(BotTask):
                 client.state.messages_since(self._feedback_start)
                 if len(entry) > 3)
             if (not self._reopen_attempted and
-                    re.search(r"\byou (?:close|leave) [^.\n]*"
-                              + re.escape(self.container_name), feedback)):
+                    re.search(r"\byou (?:close|leave) (?:the )?"
+                              + re.escape(container.name.casefold())
+                              + r"\b", feedback)):
                 # The server names the chest in full ("You close spruce
-                # chest.", types/container.c apply_func).
+                # chest.", types/container.c apply_func): only this one.
                 # This process really did already have the chest selected;
                 # the first application closed it. Apply once more to open it
                 # and establish a fresh response window.
@@ -7734,8 +7747,17 @@ class RetrieveItemsTask(BotTask):
                 self.complete()
             return
         self._matched = True
+        # A move the server ignores (the chest is no longer this player's
+        # open container, say) would otherwise be resent forever.
+        stuck = [item for item in items[:5] if item.tag in self._sent_at and
+                 now - self._sent_at[item.tag] > self.MOVE_CONFIRM_SECONDS]
+        if stuck:
+            self.fail(f"storage items did not move: {len(stuck)} item(s)"
+                      " still in the container")
+            return
         for item in items[:5]:
             self.retrieved.add(item.tag)
+            self._sent_at.setdefault(item.tag, now)
             await client.move_item(
                 client.state.player_tag, item.tag, item.quantity)
 

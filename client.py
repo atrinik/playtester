@@ -1730,7 +1730,16 @@ class AtrinikClient:
             self.state.phase = "characters"
 
     async def _handle_player(self, cur: Cursor, raw: bytes) -> None:
+        previous_tag = self.state.player_tag
         self.state.player_tag = cur.u32()
+        # A new login: the server closed every open container at logout
+        # (player.c container_close), but that close never reached this
+        # connection. Forget their listed contents, or the login's ground
+        # redraw reattaches them to the same chest tag.
+        for tag in [tag for tag in self.state.inventories
+                    if tag not in (0, previous_tag, self.state.player_tag)]:
+            for child in self.state.inventories.pop(tag, []):
+                self.state.remove_item(child)
         weight, face = cur.u32(), cur.u32()
         self.state.player_name = cur.cstring()
         self.state.party_name = ""
@@ -2647,7 +2656,7 @@ class AtrinikClient:
                 self.state.remove_item(tag)
             self.state.inventories[location_to_clear] = []
             if not cur.remaining:
-                self._drop_nested(nested)
+                self._drop_nested(nested, set())
                 if completes_player_replay:
                     self.state.inventory_replay_complete = True
                     self._forget_cured_depletion()
@@ -2672,17 +2681,23 @@ class AtrinikClient:
             changed.append(item)
         for tag in [tag for tag in nested if tag in self.state.items]:
             self.state.inventories[tag] = nested.pop(tag)
-        self._drop_nested(nested)
+        self._drop_nested(nested, {item.tag for item in changed})
         if completes_player_replay:
             self.state.inventory_replay_complete = True
             self._forget_cured_depletion()
         await self.emit("items", changed)
 
-    def _drop_nested(self, nested: dict[int, list[int]]) -> None:
-        """Forget the contents of replaced items the server did not resend."""
+    def _drop_nested(self, nested: dict[int, list[int]],
+                     resent: set[int]) -> None:
+        """Forget the contents of replaced items the server did not resend.
+
+        A child the same packet sent again (moved out to the ground, say)
+        stays where the packet put it.
+        """
         for children in nested.values():
             for child in children:
-                self.state.remove_item(child)
+                if child not in resent:
+                    self.state.remove_item(child)
 
     async def _handle_item_update(self, cur: Cursor, raw: bytes) -> None:
         flags, tag = cur.u16(), cur.u32()
