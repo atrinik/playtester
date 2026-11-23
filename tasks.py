@@ -1817,10 +1817,10 @@ class FarmTask(BotTask):
     OUT_HEALED_WINDOW_SECONDS = 12.0
     OUT_HEALED_HOLD_SECONDS = 8.0
     OUT_OF_LEAGUE_SECONDS = 600.0
-    # While heals lose, a step unanswered this long, or this many steps in
-    # a row with an attacker still beside her, let a heal go first.
+    # While heals lose, a step unanswered this long, or a ready heal with
+    # none sent for this long, lets the heal go first.
     OUT_HEALED_ACK_WAIT_SECONDS = 0.75
-    OUT_HEALED_UNSHED_STEPS = 2
+    OUT_HEALED_HEAL_GAP_SECONDS = 2.5
     # Casts from one square that did nothing before that line is futile,
     # and seconds without any shot before a target is set aside.
     FUTILE_CAST_LIMIT = 2
@@ -1969,8 +1969,6 @@ class FarmTask(BotTask):
         self._outpaced_until = 0.0
         # Until when heals losing the fight keep her disengaging (monotonic).
         self._out_healed_until = 0.0
-        # Gain-only steps in a row that found an attacker still beside her.
-        self._out_healed_unshed = 0
         # The finisher's last cast (line key, wall-clock time), casts that
         # did nothing per line, lines given up on, and since when the
         # current target has had no shot (see _observe_cast_effect and
@@ -4569,7 +4567,6 @@ class FarmTask(BotTask):
                                  self.OUT_HEALED_WINDOW_SECONDS)):
             return False
         self._out_healed_until = now + self.OUT_HEALED_HOLD_SECONDS
-        self._out_healed_unshed = 0
         kinds = sorted(recent_hostile_attackers(
             client, seconds=self.OUT_HEALED_WINDOW_SECONDS))
         store = getattr(client, "out_of_league_kinds", None)
@@ -4583,11 +4580,19 @@ class FarmTask(BotTask):
                      f"hp={ratio:.0%} kinds={','.join(kinds) or 'unknown'}")
         return True
 
-    def out_of_league(self, client: AtrinikClient, semantic: str) -> bool:
-        """Whether this creature kind out-healed her lately (out_healed).
+    @staticmethod
+    def _kind_key(value: str) -> str:
+        """A creature kind, normalized: case, underscores and word order."""
+        value = re.sub(r"\.\d+$", "", str(value).casefold().replace("_", " "))
+        return " ".join(sorted(value.split()))
 
-        Kept on the client, so a rebuilt farm task (a failure review)
-        still knows; expired kinds are forgotten.
+    def out_of_league(self, client: AtrinikClient, obj) -> bool:
+        """Whether this creature's kind out-healed her lately (out_healed).
+
+        The kind is matched exactly, by its name or visual name (a mark for
+        "rat" is not one for "pirate"). Kept on the client, so a rebuilt
+        farm task (a failure review) still knows; expired kinds are
+        forgotten.
         """
         store = getattr(client, "out_of_league_kinds", None)
         if not store:
@@ -4596,7 +4601,24 @@ class FarmTask(BotTask):
         for kind, until in list(store.items()):
             if until <= now:
                 store.pop(kind, None)
-        return any(_same_semantic_identity(kind, semantic) for kind in store)
+        names = {self._kind_key(obj.name),
+                 self._kind_key(map_object_visual_name(client, obj))}
+        return any(self._kind_key(kind) in names for kind in store)
+
+    def out_of_league_idle(self, client: AtrinikClient, obj,
+                           hostile_contact: bool) -> bool:
+        """An out-of-league creature that is not hitting her: not fought.
+
+        Only one whose kind hit her in this contact may be fought.
+        """
+        if not self.out_of_league(client, obj):
+            return False
+        if not hostile_contact:
+            return True
+        names = {self._kind_key(obj.name),
+                 self._kind_key(map_object_visual_name(client, obj))}
+        return not any(self._kind_key(name) in names
+                       for name in recent_hostile_attackers(client))
 
     async def low_health_retreat(self, client: AtrinikClient,
                                  gain_only: bool = False) -> bool:
@@ -4608,9 +4630,11 @@ class FarmTask(BotTask):
         on the way. Without one it does nothing and returns False, before
         touching any latch, so the caller's healing and the usual retreat
         decide. It also returns False, letting a heal go first, while a
-        step has gone unanswered for OUT_HEALED_ACK_WAIT_SECONDS, and once
-        OUT_HEALED_UNSHED_STEPS steps in a row left an attacker beside her
-        (a pursuer as fast as she is).
+        step has gone unanswered for OUT_HEALED_ACK_WAIT_SECONDS, and when
+        a heal is ready with none sent for OUT_HEALED_HEAL_GAP_SECONDS.
+        Gain-only steps leave the pursuit count alone. While heals lose
+        (out_healed), no call makes a pursued stand or cast, and a stand
+        already latched ends.
         """
         m = client.state.map
         now = time.monotonic()
@@ -4635,8 +4659,9 @@ class FarmTask(BotTask):
             max(abs(x - cx), abs(y - cy)) <= 1), None)
         ratio = (int(client.state.stats.get("hp", 0) or 0) /
                  max(1, int(client.state.stats.get("maxhp", 1) or 1)))
+        out_healed = self._out_healed_until > now
         if (breakout is not None and self._stand_latch and
-                ratio <= self.STAND_HEALTH_FLOOR):
+                (ratio <= self.STAND_HEALTH_FLOOR or out_healed)):
             # A stand chosen over a failing retreat ends at the critical
             # floor: run again rather than fight to the death. The
             # engagement stays, so recovery cannot rebind to a bystander.
@@ -4744,17 +4769,14 @@ class FarmTask(BotTask):
             # Only a step that sheds the nearest threat; an equal-distance
             # one shuffles her beside it with her heals still losing.
             nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
-            if nearest > 1:
-                self._out_healed_unshed = 0
-            elif self._out_healed_unshed >= self.OUT_HEALED_UNSHED_STEPS:
-                # Running is not shedding it: this tick's heal goes first.
-                self._out_healed_unshed = 0
+            last_heal = self.safety._last_heal
+            if (now - last_heal >= self.OUT_HEALED_HEAL_GAP_SECONDS and
+                    self.safety._usable_heal(client) is not None):
+                # Running never shuts healing out: a heal due goes first.
                 return False
             choices = [choice for choice in choices if choice[1] > nearest]
             if not choices:
                 return False
-            if nearest <= 1:
-                self._out_healed_unshed += 1
             # Running ends a stand; combat goes off with the step below.
             self._cornered_breakout_target = 0
             self._stand_latch = False
@@ -4828,7 +4850,7 @@ class FarmTask(BotTask):
         ] if (spell is not None and ratio > cast_floor and
               self.offensive_spell_affordable(client, spell)) else []
         caster_stand = bool(castable)
-        if (caster_stand and not gain_only and
+        if (caster_stand and not out_healed and
                 self._pursued_retreats >= self.PURSUIT_CAST_STEPS and
                 self.spell_ready(client, spell)):
             (x, y, obj), cast_direction = min(castable, key=lambda item: (
@@ -4848,7 +4870,7 @@ class FarmTask(BotTask):
                              f"hp={ratio:.0%}")
                 return True
         if (stand_candidates and not caster_stand and fight and
-                not gain_only and
+                not out_healed and
                 self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
                 ratio > self.STAND_HEALTH_FLOOR):
             x, y, obj = min(stand_candidates, key=lambda entry: (
@@ -4871,9 +4893,11 @@ class FarmTask(BotTask):
             self._stand_latch = False
             self.release_engagement(obj.target_id)
             await client.set_combat(False)
-        self._pursued_retreats = self._pursued_retreats + 1 if adjacent else 0
-        self._pursuit_ids = adjacent_ids
-        self._pursuit_last_at = now
+        if not gain_only:
+            self._pursued_retreats = (
+                self._pursued_retreats + 1 if adjacent else 0)
+            self._pursuit_ids = adjacent_ids
+            self._pursuit_last_at = now
         if recorder is not None:
             recorder(
                 "retreat-choice",
@@ -4897,7 +4921,7 @@ class FarmTask(BotTask):
             hp / maxhp <= self.safety.flee_below or
             (next_heal > 0 and sp < next_heal) or
             self._outpaced_until > now or
-            self._out_healed_until > now
+            out_healed
         )
         if emergency_disengage and recorder is not None:
             recorder(
@@ -5858,21 +5882,18 @@ class FarmTask(BotTask):
                     priority_rank is None):
                 continue
             # A kind whose hits outpaced her heals is not pulled again for
-            # a while (out_of_league); one still engaged is still fought.
-            if (self.out_of_league(client, semantic) and
-                    (self._engaged_target is None or
-                     obj.target_id != self._engaged_target[0])):
+            # a while (out_of_league_idle): only one hitting her is fought.
+            if self.out_of_league_idle(client, obj, hostile_contact):
                 continue
             targets.append((distance, x, y, obj))
-        if self._engaged_target is not None and not hostile_contact:
+        if self._engaged_target is not None:
             # Once it has stopped hitting her, an engagement with such a
             # kind is dropped rather than walked back to.
             engaged_entry = next((
                 entry for entry in threats
                 if entry[3].target_id == self._engaged_target[0]), None)
-            if (engaged_entry is not None and engaged_entry[0] > 3 and
-                    self.out_of_league(client, map_object_semantic(
-                        client, engaged_entry[3]))):
+            if (engaged_entry is not None and self.out_of_league_idle(
+                    client, engaged_entry[3], hostile_contact)):
                 self.release_engagement(engaged_entry[3].target_id)
                 targets = [entry for entry in targets
                            if entry[3].target_id != engaged_entry[3].target_id]
@@ -5990,7 +6011,9 @@ class FarmTask(BotTask):
             else:
                 targets = threats
             targets = [entry for entry in targets
-                       if entry[3].target_id not in pulled_aside_ids]
+                       if entry[3].target_id not in pulled_aside_ids and
+                       not self.out_of_league_idle(
+                           client, entry[3], hostile_contact)]
         unprepared = (engaged is None and
                       self._unprepared_hold.active(client, self.safety))
         if not unprepared:

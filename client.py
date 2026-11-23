@@ -313,6 +313,9 @@ class AtrinikClient:
         self.spell_cast: tuple[tuple[str, int, int], int, float] | None = None
         # Health, SP and food samples, and the deaths reviewed from them.
         self.vitals: deque[list[float]] = deque(maxlen=post_mortem.MAX_LIVE_VITALS)
+        # Creature kinds whose hits outpaced her heals, until when
+        # (monotonic; FarmTask.out_healed).
+        self.out_of_league_kinds: dict[str, float] = {}
         # Each other character's live reports, while this client plays another.
         self._live_post_mortems: dict[str, list[dict]] = {}
         # The last record of each history at the previous report: the next
@@ -408,6 +411,7 @@ class AtrinikClient:
         if self._memory_character and not same_character:
             self.vitals.clear()
             self.review_messages.clear()
+            self.out_of_league_kinds.clear()
             self.action_history.clear()
             # A loss buffered for the previous character's death is not hers.
             self._pending_death_losses.clear()

@@ -1061,18 +1061,26 @@ Now, on the farm map:
   step that takes her farther from the nearest threat counts (the gain
   rule of the walk's critical escape), taken as soon as the previous one is
   answered rather than at the fighting retreat's 2 s cadence, with combat
-  off and no pursued stand or cast. With no such step it does nothing,
-  touches no latch, and healing and the usual retreat decide as before,
-  the cornered breakout among them. With no attacker within 2 tiles she
-  heals as usual. Running never shuts healing out: a step unanswered for
-  `OUT_HEALED_ACK_WAIT_SECONDS` (0.75 s), or `OUT_HEALED_UNSHED_STEPS`
-  (2) steps in a row that left an attacker beside her (a pursuer as fast
-  as she is), let that tick's heal go first.
+  off. These steps leave the pursuit count alone. With no such step it
+  does nothing, touches no latch, and healing and the usual retreat
+  decide, the cornered breakout among them. With no attacker within
+  2 tiles she heals as usual. Running never shuts healing out: a step
+  unanswered for `OUT_HEALED_ACK_WAIT_SECONDS` (0.75 s), or a usable heal
+  with none sent for `OUT_HEALED_HEAL_GAP_SECONDS` (2.5 s), lets that
+  tick's heal go first, whatever the attacker's distance.
+- **No stand while it holds.** Every retreat on the farm map, not only
+  the gain-only one, makes no pursued stand or pursued cast while the
+  disengage holds, and a stand already latched ends (combat off). Combat
+  stays off on every retreat step meanwhile (`emergency-disengage`).
 - **Out of her league** (`OUT_OF_LEAGUE_SECONDS`, 10 minutes, kept on the
-  client so a rebuilt farm task still knows): those kinds are not pulled.
-  An engagement with one more than 3 tiles off is dropped once it has
-  stopped hitting her, rather than walked back to. One that hits her, or comes within 3 tiles,
-  is still fought, as any is.
+  client so a rebuilt farm task still knows, and cleared for another
+  character): those kinds are neither pulled nor engaged, even within the
+  3 tiles where she otherwise fights anything; an engagement with one is
+  dropped rather than walked back to. Only one of that kind while that
+  kind is hitting her (hostile contact, its name in the hits) is fought.
+  A kind matches exactly, by name or visual name, ignoring case,
+  underscores and word order: a mark for "rat" is not one for "pirate"
+  or "giant rat".
 
 Accepted limits:
 

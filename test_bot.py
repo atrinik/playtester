@@ -10375,7 +10375,13 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task.map_node = node
         client.state.map.world_x = client.state.map.world_y = 12
         task.remember_engagement(client, 9, 8, 100)
+        # Her last heal went out a second ago; the next is not yet due.
+        task.safety._last_heal = time.monotonic() - 1.0
         return task
+
+    @staticmethod
+    def _treant(name="charred treant"):
+        return MapObject(3, 1, 0, 0, name=name, target_id=1)
 
     def test_heals_losing_reads_the_incident_vitals(self):
         from .tasks import heals_losing
@@ -10415,7 +10421,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # The step sheds the treant at (9, 8) from her (8, 8).
         self.assertGreater(max(abs(8 + dx - 9), abs(8 + dy - 8)), 1)
         self.assertNotIn(True, client.combat)
-        self.assertTrue(task.out_of_league(client, "charred treant"))
+        self.assertTrue(task.out_of_league(client, self._treant()))
         self.assertIn("kinds=charred treant",
                       dict(client.recorded)["out-healed-disengage"])
         # The step landed and the treant followed: she steps again at once,
@@ -10460,23 +10466,31 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                          (100, True))
         task._cornered_breakout_target = 0
         task._stand_latch = False
+        task.safety._last_heal = 0.0
         asyncio.run(task.tick(client))
         self.assertIn("out-healed-disengage",
                       [action for action, _ in client.recorded])
         self.assertIn((0, 43), client.fired)
 
-    def test_out_healed_heals_when_running_does_not_shed_the_attacker(self):
+    def test_out_healed_heal_goes_first_once_due(self):
         client = self._combat_client()
         task = self._out_healed_fight(client)
-        for _ in range(2):
-            # Each step lands, and the pursuer is beside her again.
-            asyncio.run(task.tick(client))
-            task._retreat_attempt = None
-            task._last_action = 0.0
-        self.assertEqual(len(client.direct_moves), 2)
+        # A follower two tiles off, as a caster or a pursuer as fast as
+        # she is: she steps while her last heal is recent.
+        client.state.map.tiles.clear()
+        client.state.map.tile(10, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=60)
+        task.remember_engagement(client, 10, 8, 100)
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.direct_moves), 1)
         self.assertNotIn((0, 43), client.fired)
+        # Once none has gone out for 2.5 s, the heal goes first.
+        task._retreat_attempt = None
+        task._last_action = 0.0
+        task.safety._last_heal = time.monotonic() - 3.0
         asyncio.run(task.tick(client))
         self.assertIn((0, 43), client.fired)
+        self.assertEqual(len(client.direct_moves), 1)
         # A step unanswered past the wait lets the heal go first too.
         task.safety._last_heal = 0.0
         client.fired.clear()
@@ -10486,17 +10500,68 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertIn((0, 43), client.fired)
 
+    def test_out_healed_never_stands_with_the_heal_on_cooldown(self):
+        client = self._combat_client()
+        task = self._out_healed_fight(client, hp=125)
+        # Hemmed in beside two treants: no step gains, and the heal sent
+        # half a second ago is still cooling down.
+        client.state.map.tile(9, 9).objects[4] = MapObject(
+            4, 1, 0, 0, name="charred treant", target_id=101, target_hp=90)
+        task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
+                                 (13, 12): 1, (13, 13): 1}
+        task.safety._last_heal = time.monotonic() - 0.5
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100, 101}
+        task._pursuit_last_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("out-healed-disengage", actions)
+        self.assertNotIn("pursued-stand", actions)
+        self.assertNotIn("pursued-cast", actions)
+        self.assertNotIn(True, client.combat)
+
+    def test_out_of_league_matches_the_exact_kind(self):
+        client = self._combat_client()
+        client.out_of_league_kinds = {"rat": time.monotonic() + 600.0}
+        task = FarmTask(zone="/test")
+        self.assertTrue(task.out_of_league(client, self._treant("rat")))
+        self.assertTrue(task.out_of_league(client, self._treant("Rat")))
+        self.assertFalse(task.out_of_league(client, self._treant("pirate")))
+        self.assertFalse(task.out_of_league(client, self._treant("giant rat")))
+
+    def test_out_of_league_kind_nearby_is_fought_only_when_it_hits(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(10, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=100)
+        client.state.messages = []
+        client.out_of_league_kinds = {
+            "charred treant": time.monotonic() + 600.0}
+        task = FarmTask(zone="/test", target="treant")
+        asyncio.run(task.tick(client))
+        # Two tiles off and not hitting her: not engaged.
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.targets, [])
+        client.state.messages.append(
+            (time.time(), 2, "ff0000",
+             "charred treant hit you for 5 (-2) impact damage."))
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertIsNotNone(task._engaged_target)
+        self.assertEqual(task._engaged_target[0], 100)
+
     def test_winnable_fight_heals_as_before(self):
         client = self._combat_client()
         task = self._out_healed_fight(client, hits=(20, 18), flee=0.55,
                                       heal=0.70)
         client.state.stats["hp"] = 150
         client.vitals.append([time.time() - 1.0, 180, 322, 72, 82, 190])
+        task.safety._last_heal = 0.0
         asyncio.run(task.tick(client))
         self.assertNotIn("out-healed-disengage",
                          [action for action, _ in client.recorded])
         self.assertIn((0, 43), client.fired)
-        self.assertFalse(task.out_of_league(client, "charred treant"))
+        self.assertFalse(task.out_of_league(client, self._treant()))
 
     def test_out_of_league_kind_is_not_pulled_and_expires(self):
         client = self._combat_client()
@@ -10510,12 +10575,11 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task.remember_engagement(client, 13, 8, 100)
         asyncio.run(task.tick(client))
         # Not hitting her: the engagement is dropped, and no pull starts.
-        # (One that comes within 3 tiles is still fought, as any is.)
         self.assertIsNone(task._engaged_target)
         self.assertEqual(task._visible_target_count, 0)
         self.assertEqual(client.targets, [])
         client.out_of_league_kinds["charred treant"] = time.monotonic() - 1.0
-        self.assertFalse(task.out_of_league(client, "charred treant"))
+        self.assertFalse(task.out_of_league(client, self._treant()))
         self.assertEqual(client.out_of_league_kinds, {})
         # Expired, it is a target again.
         task = FarmTask(zone="/test", target="treant")
