@@ -23315,10 +23315,18 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         from .navigation import CURE_FUNDING_FARM_RESUMED, cure_funding_farm
 
         client, autoplay, recovery = self.home_break()
+        # A strict-route retry is cleared; a full chest's backoff is kept.
+        services = recovery.services
+        services._selling_retry_at = (
+            services.clock() + services.STRICT_ROUTE_RETRY_SECONDS)
+        services._storage_retry_at = (
+            services.clock() + services.STORAGE_FULL_RETRY_SECONDS)
         asyncio.run(autoplay.tick(client))
         self.assertIn(CURE_FUNDING_FARM_RESUMED, self.actions(client))
         self.assertTrue(cure_funding_farm(client))
         self.assertNotIn("_heal_restock_retry_at", autoplay._circuit_backoffs)
+        self.assertNotIn("_selling_retry_at", autoplay._circuit_backoffs)
+        self.assertIn("_storage_retry_at", autoplay._circuit_backoffs)
         asyncio.run(autoplay.tick(client))
         circuit = autoplay.child
         self.assertIsInstance(circuit, FarmCircuitTask)
@@ -23356,6 +23364,24 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(circuit.tick(client))
         self.assertEqual(planned, [self.HOME[0]])
         self.assertIsNotNone(circuit._heal_restock)
+
+    def test_completed_town_errands_count_for_a_break_home(self):
+        client, _ = self.client(depletion=7, bank=2_245)
+        services = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        client.state.cure_funding_farm_errand_at = 0.0
+        # A heal restock that bought nothing achieved nothing.
+        restock = _DoneErrand(task=types.SimpleNamespace(
+            purchased=False, merchant="Healer"))
+        restock.navigation = types.SimpleNamespace(destination=self.SHOP[0])
+        services._heal_restock = restock
+        asyncio.run(services._tick_running_service(client))
+        self.assertIsNone(services._heal_restock)
+        self.assertEqual(client.state.cure_funding_farm_errand_at, 0.0)
+        # A completed junk sale did.
+        services._selling = _DoneErrand()
+        asyncio.run(services._tick_running_service(client))
+        self.assertIsNone(services._selling)
+        self.assertGreater(client.state.cure_funding_farm_errand_at, 0.0)
 
     def test_fruitless_breaks_home_stop_after_two(self):
         from .navigation import (CURE_FUNDING_FARM_HOME,

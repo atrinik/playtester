@@ -954,15 +954,17 @@ not block her either.
   funding trip) from her savebed. With none left to start and no trip
   under way, the same farm resumes (`cure-funding-farm-resumed`), its
   start and deaths kept. The heal restock and the apartment storage trip
-  are not recovery errands, so on resuming the retry deadlines of the
-  trips a break is for (heal restock, sale, deposit, identify-all,
+  are not recovery errands, so on resuming the strict-route retries of
+  the trips a break is for (heal restock, sale, deposit, identify-all,
   storage; `CURE_FUNDING_FARM_HOME_TRIPS`) are cleared: the circuit's
   first maintenance ticks run them from her savebed, where strict routes
-  exist, before she walks out. A break lasts at most
+  exist, before she walks out. Longer backoffs, such as a full chest's
+  6 h or a failed trip's, are kept. A break lasts at most
   `CURE_FUNDING_FARM_HOME_SECONDS` (30 min), and another starts no sooner
   than that after one began: a refusal meanwhile keeps the trip's own
   retry. A break that completed no town errand (sale, deposit,
-  identify-all, storage or heal restock) since the break before is
+  identify-all, storage, or a heal restock that bought something) since
+  the break before is
   fruitless; after `CURE_FUNDING_FARM_HOME_FRUITLESS` (2) fruitless
   breaks in a row she stops going home for the rest of that funding farm
   (`cure-funding-farm-home-given-up`) and farms on, with the warning

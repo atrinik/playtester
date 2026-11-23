@@ -5948,8 +5948,9 @@ CURE_FUNDING_FARM_HOME_FRUITLESS = 2
 CURE_FUNDING_FARM_HOME = "cure-funding-farm-home"
 CURE_FUNDING_FARM_RESUMED = "cure-funding-farm-resumed"
 CURE_FUNDING_FARM_HOME_GIVEN_UP = "cure-funding-farm-home-given-up"
-# The strict town trips a break home is for: their retry deadlines are
-# cleared when the farm resumes, so they run from her savebed at once.
+# The strict town trips a break home is for: their strict-route retry
+# deadlines are cleared when the farm resumes, so they run from her savebed
+# at once; longer backoffs (a full chest, a failed trip) are kept.
 CURE_FUNDING_FARM_HOME_TRIPS = (
     "_heal_restock_retry_at", "_selling_retry_at", "_banking_retry_at",
     "_identification_retry_at", "_storage_retry_at")
@@ -10036,7 +10037,10 @@ class FarmCircuitTask(BotTask):
             await self._heal_restock.tick(client)
             if self._heal_restock.status in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
-                if self._heal_restock.status == TaskStatus.COMPLETE:
+                shopper = self._heal_restock.task
+                if (self._heal_restock.status == TaskStatus.COMPLETE and
+                        isinstance(shopper, BuyHealingStockTask) and
+                        shopper.purchased):
                     note_cure_funding_errand(client)
                 self._settle_heal_restock(client)
             return True
@@ -11216,9 +11220,17 @@ class RecoveryTask(BotTask):
                 # Home from the cure-funding farm for its errands: the
                 # same farm resumes, deaths kept, and the town trips it
                 # came home for (the heal restock and the storage chest
-                # are not recovery errands) run from here first.
+                # are not recovery errands) run from here first. Only
+                # their strict-route retries are cleared: a longer backoff
+                # (a full chest, a failed trip) still holds.
+                services = self.services
+                now = services.clock()
                 for name in CURE_FUNDING_FARM_HOME_TRIPS:
-                    setattr(self.services, name, 0.0)
+                    window = (services.HEAL_RESTOCK_STRICT_RETRY_SECONDS
+                              if name == "_heal_restock_retry_at"
+                              else services.STRICT_ROUTE_RETRY_SECONDS)
+                    if getattr(services, name) - now <= window:
+                        setattr(services, name, 0.0)
                 self._resume(client, "back to the cure-funding farm")
             elif self._cure_funding_farm_due(client):
                 self._start_cure_funding_farm(client)
