@@ -556,7 +556,9 @@ steps away and keeps her distance.
   heals: from the heal threshold down she retreats with combat off
   (`healing-outpaced`, 4 s at a time), and an emergency recall fires at the
   heal threshold instead of the flee threshold. At the flee threshold
-  healing resumes alongside the retreat.
+  healing resumes alongside the retreat. Below the flee threshold, heals
+  that keep losing start the
+  [heals-losing disengage](#heals-losing-on-the-farm-2026-11-23).
 
 - **No casts where magic is blocked.** On a no-magic square the server
   answers every spell with "Something blocks your spellcasting."
@@ -1088,10 +1090,87 @@ Accepted limits:
   farther off, or one she cannot see, does not start it.
 
 The farm map's own retreat (`FarmTask.low_health_retreat`, the cornered
-breakout and the pursued stand) is unchanged; an earlier attempt to change
-them, during the review of
+breakout and the pursued stand) is unchanged here; an earlier attempt to
+change them, during the review of
 [pull request 117](https://github.com/atrinik/playtester/pull/117), spawned
-edge cases and was reverted.
+edge cases and was reverted. Only the narrow
+[heals-losing disengage](#heals-losing-on-the-farm-2026-11-23) below
+touches it.
+
+## Heals losing on the farm (2026-11-23)
+
+Read from her post-mortem, decisions and journal (v1.88.0, Burnt Forest
+circuit, `world_18_73`): charred treants, level 37 and slow
+(`treant_evil`, speed 0.048), took her from 89% to 19% in about 10 s,
+with three of them in view (`farm-pack-split`) and two at a time beside
+her late on. The circuit's adapted margins (flee 89%, heal 98%) put the
+whole fight below the flee threshold, where the farm heals first and
+retreats only on ticks without a heal. For the last 28 s she cast minor
+healing (12-26 a cast) every ~2 s and held between 19% and 39% (62-128
+of 322), while three `pursued-stand`s at 38-39%, above the 35% stand
+floor, turned her back into melee. `healing-outpaced` had fired once, at
+90%; below the flee threshold it does nothing. Her retreat steps mostly
+gained a tile (`separation=2`), but each heal and stand in between let
+the treants close again; with two of them on either side the last steps
+could not gain (`separation=1`). One 66-damage burst
+from two treants then killed her at 52 HP; depletion went from 0 to 7.
+
+Now, on the farm map:
+
+- **Heals losing** (`heals_losing`, over `OUT_HEALED_WINDOW_SECONDS`,
+  12 s, from the first heal in it on): three heals with the hits since the
+  first at least what the later ones restored, or four heals that never
+  lifted her above `OUT_HEALED_CEILING` (50%, from her vitals samples; no
+  samples, no stall). It counts only from the flee threshold down and
+  under hostile contact. A fight her heals win lifts her above the ceiling
+  and restores more than she takes, so it never counts.
+- **Disengage once** (`FarmTask.out_healed`, recorded once as
+  `out-healed-disengage` with the kinds that hit her in the window). It
+  holds `OUT_HEALED_HOLD_SECONDS` (8 s) past her last hostile contact
+  (a hit or miss within the last 10 s, so up to about 18 s after the last
+  one), and ends at once above the heal threshold. While it holds,
+  with an active attacker within 2 tiles, the farm's own retreat
+  (`low_health_retreat`, `gain_only`) runs before the next heal: only a
+  step that takes her farther from the nearest threat counts (the gain
+  rule of the walk's critical escape), taken as soon as the previous one is
+  answered rather than at the fighting retreat's 2 s cadence, with combat
+  off. These steps leave the pursuit count alone. With no such step it
+  does nothing, touches no latch, and healing and the usual retreat
+  decide, the cornered breakout among them. With no attacker within
+  2 tiles she heals as usual. Running never shuts healing out: a step
+  unanswered for `OUT_HEALED_ACK_WAIT_SECONDS` (0.75 s), or a usable heal
+  with none sent for `OUT_HEALED_HEAL_GAP_SECONDS` (2.5 s), lets that
+  tick's heal go first, whatever the attacker's distance.
+- **No stand while she runs.** The gain-only retreat runs only while she
+  has a usable heal (an item, or the SP for the spell). While the
+  disengage holds, she has a usable heal and a gain-only retreat found a
+  gaining step within `OUT_HEALED_GAIN_SECONDS` (2 s;
+  `out_healed_running`), every retreat on the farm map makes no pursued
+  stand or pursued cast, a stand already latched ends, and combat stays
+  off on each retreat step (`emergency-disengage`). Otherwise (no heal,
+  or no way out) the ordinary retreat, its pursued stand and cornered
+  breakout among them, defends her as before.
+- **Out of her league** (`OUT_OF_LEAGUE_SECONDS`, 10 minutes, kept on the
+  client so a rebuilt farm task still knows, and cleared for another
+  character): those kinds are neither pulled nor engaged, even within the
+  3 tiles where she otherwise fights anything; an engagement with one is
+  dropped rather than walked back to. Only one of that kind while that
+  kind is hitting her (hostile contact, its name in the hits) is fought.
+  A kind matches exactly, by name or visual name, ignoring case,
+  underscores and word order: a mark for "rat" is not one for "pirate"
+  or "giant rat". Hits are matched by the name in their message: a
+  ranged or spell hit may name its missile instead, so a marked ranged
+  caster may never count as hitting her and is then not fought.
+
+Accepted limits:
+
+- nothing here feeds the failure review or the farm adaptations: a
+  disengage she survives is not a failure, and the review rebuilds the
+  farm task. A death still counts as before;
+- on a circuit whose only target is that kind, she pulls nothing there
+  for those 10 minutes;
+- a burst from full health that ends the fight before three heals is not
+  seen; the existing flee threshold and recall handle it.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 

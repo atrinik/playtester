@@ -10520,6 +10520,311 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             client, ratio=0.65, nearby_count=1, hostile_contact=True,
             healing_outpaced=True)))
 
+    @staticmethod
+    def _out_healed_fight(client, hits=(39, 38, 35, 31), hp=97, flee=0.89,
+                          heal=0.98):
+        """The 2026-11-23 shape: a charred treant beside her, 322 maximum
+        health held between 60 and 125 by minor healing every 2 s."""
+        now = time.time()
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=60)
+        client.state.stats.update(hp=hp, maxhp=322, sp=72)
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        heals = [(now - 10.0, 18), (now - 8.0, 25), (now - 6.0, 12),
+                 (now - 4.0, 20), (now - 2.0, 17)]
+        messages = [(stamp, 2, "ffffff", f"The spell heals you for {amount} hp!")
+                    for stamp, amount in heals]
+        messages.extend(
+            (now - 9.0 + 2.0 * index, 2, "ff0000",
+             f"charred treant hit you for {amount} (-27) impact damage.")
+            for index, amount in enumerate(hits))
+        client.state.messages = sorted(messages, key=lambda entry: entry[0])
+        client.vitals = collections.deque(
+            [now - 11.0 + 0.5 * index, value, 322, 72, 82, 190]
+            for index, value in enumerate(
+                (122, 83, 70, 85, 106, 89, 62, 64, 80, 95, 97, 85, 101,
+                 103, 83, 70, 71, 85, 106, 89, 91, 118)))
+        client.fired = []
+
+        async def fire(direction, tag=0):
+            client.fired.append((direction, tag))
+
+        client.fire = fire
+        QuestTests._record_actions(client)
+        task = FarmTask(zone="/test")
+        task.safety.flee_below = flee
+        task.safety.heal_below = heal
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        client.state.map.world_x = client.state.map.world_y = 12
+        task.remember_engagement(client, 9, 8, 100)
+        # Her last heal went out a second ago; the next is not yet due.
+        task.safety._last_heal = time.monotonic() - 1.0
+        return task
+
+    @staticmethod
+    def _treant(name="charred treant"):
+        return MapObject(3, 1, 0, 0, name=name, target_id=1)
+
+    def test_heals_losing_reads_the_incident_vitals(self):
+        from .tasks import heals_losing
+
+        client = self._combat_client()
+        self._out_healed_fight(client)
+        # 143 hits against 74 healed after the first heal: losing.
+        self.assertTrue(heals_losing(client, 0.50))
+        # Fewer hits than the heals restored, but five heals never lifted
+        # her above 39%: a stalemate.
+        self._out_healed_fight(client, hits=(30, 30))
+        self.assertTrue(heals_losing(client, 0.50))
+        # The same heals lifting her above half: winning.
+        client.vitals.append([time.time() - 1.0, 170, 322, 72, 82, 190])
+        self.assertFalse(heals_losing(client, 0.50))
+        # Without vitals since the first heal, a stall is not proven.
+        client.vitals = collections.deque()
+        self.assertFalse(heals_losing(client, 0.50))
+
+    def test_heals_losing_to_one_attacker_disengages_early(self):
+        client = self._combat_client()
+        task = self._out_healed_fight(client, hp=125)
+        # She has already stepped away three times with it still beside
+        # her: at 39%, above the stand floor, the old retreat would turn
+        # and stand, as it did three times live.
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100}
+        task._pursuit_last_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("out-healed-disengage", actions)
+        self.assertNotIn("pursued-stand", actions)
+        self.assertNotIn((0, 43), client.fired)
+        self.assertEqual(len(client.direct_moves), 1)
+        direction = client.direct_moves[0][0]
+        dx, dy = c.DIRECTION_DELTAS[direction]
+        # The step sheds the treant at (9, 8) from her (8, 8).
+        self.assertGreater(max(abs(8 + dx - 9), abs(8 + dy - 8)), 1)
+        self.assertNotIn(True, client.combat)
+        self.assertTrue(task.out_of_league(client, self._treant()))
+        self.assertIn("kinds=charred treant",
+                      dict(client.recorded)["out-healed-disengage"])
+        # The step landed and the treant followed: she steps again at once,
+        # with no second decision for the same disengage.
+        client.state.map.world_x += dx
+        client.state.map.world_y += dy
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.direct_moves), 2)
+        self.assertEqual(
+            [action for action, _ in client.recorded].count(
+                "out-healed-disengage"), 1)
+        self.assertNotIn((0, 43), client.fired)
+
+    def test_out_healed_disengage_ends_above_the_heal_threshold(self):
+        client = self._combat_client()
+        task = self._out_healed_fight(client)
+        self.assertTrue(task.out_healed(client, 0.30, True))
+        # Held through a pause in the hits, until her health recovers.
+        self.assertTrue(task.out_healed(client, 0.60, False))
+        self.assertFalse(task.out_healed(client, 0.99, False))
+        self.assertEqual(task._out_healed_until, 0.0)
+        # Above the flee threshold it does not start.
+        self.assertFalse(task.out_healed(client, 0.95, True))
+
+    def test_out_healed_with_no_step_that_gains_keeps_healing(self):
+        client = self._combat_client()
+        task = self._out_healed_fight(client)
+        # Only the squares beside the treant are walkable: no step sheds
+        # it, so she heals as before instead of shuffling beside it.
+        task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
+                                 (13, 12): 1}
+        self.assertTrue(task.out_healed(client, 0.30, True))
+        task._cornered_breakout_target = 100
+        task._stand_latch = True
+        # The gain-only retreat leaves everything as it was.
+        self.assertFalse(asyncio.run(
+            task.low_health_retreat(client, gain_only=True)))
+        self.assertEqual(client.combat, [])
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual((task._cornered_breakout_target, task._stand_latch),
+                         (100, True))
+        task._cornered_breakout_target = 0
+        task._stand_latch = False
+        task.safety._last_heal = 0.0
+        asyncio.run(task.tick(client))
+        self.assertIn("out-healed-disengage",
+                      [action for action, _ in client.recorded])
+        self.assertIn((0, 43), client.fired)
+
+    def test_out_healed_heal_goes_first_once_due(self):
+        client = self._combat_client()
+        task = self._out_healed_fight(client)
+        # A follower two tiles off, as a caster or a pursuer as fast as
+        # she is: she steps while her last heal is recent.
+        client.state.map.tiles.clear()
+        client.state.map.tile(10, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=60)
+        task.remember_engagement(client, 10, 8, 100)
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertNotIn((0, 43), client.fired)
+        # Once none has gone out for 2.5 s, the heal goes first.
+        task._retreat_attempt = None
+        task._last_action = 0.0
+        task.safety._last_heal = time.monotonic() - 3.0
+        asyncio.run(task.tick(client))
+        self.assertIn((0, 43), client.fired)
+        self.assertEqual(len(client.direct_moves), 1)
+        # A step unanswered past the wait lets the heal go first too.
+        task.safety._last_heal = 0.0
+        client.fired.clear()
+        task._last_action = 0.0
+        task._retreat_attempt = ("/test", 12, 12, 12, 11,
+                                 time.monotonic() - 1.0)
+        asyncio.run(task.tick(client))
+        self.assertIn((0, 43), client.fired)
+
+    def test_out_healed_never_stands_within_the_gain_window(self):
+        client = self._combat_client()
+        task = self._out_healed_fight(client, hp=125)
+        # Hemmed in beside two treants: no step gains, and the heal sent
+        # half a second ago is still cooling down.
+        client.state.map.tile(9, 9).objects[4] = MapObject(
+            4, 1, 0, 0, name="charred treant", target_id=101, target_hp=90)
+        task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
+                                 (13, 12): 1, (13, 13): 1}
+        task.safety._last_heal = time.monotonic() - 0.5
+        # Her last gain-only step, half a second ago, still counts.
+        task._out_healed_gain_at = time.monotonic() - 0.5
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100, 101}
+        task._pursuit_last_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("out-healed-disengage", actions)
+        self.assertNotIn("pursued-stand", actions)
+        self.assertNotIn("pursued-cast", actions)
+        self.assertNotIn(True, client.combat)
+
+    def _out_healed_without_sp(self, corridor):
+        client = self._combat_client()
+        task = self._out_healed_fight(client, hp=150, flee=0.55, heal=0.70)
+        client.state.stats["sp"] = 0
+        if corridor:
+            # The only steps stay beside the treant.
+            task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
+                                     (13, 12): 1}
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100}
+        task._pursuit_last_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("out-healed-disengage", actions)
+        # No heal to buy time with: the ordinary retreat's stand defends her.
+        self.assertIn("pursued-stand", actions)
+        self.assertIn(True, client.combat)
+
+    def _cornered_out_healed(self, gain_age, sp):
+        client = self._combat_client()
+        task = self._out_healed_fight(client, hp=125)
+        task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
+                                 (13, 12): 1}
+        client.state.stats["sp"] = sp
+        task.safety._last_heal = time.monotonic() - 0.5
+        task._out_healed_gain_at = time.monotonic() - gain_age
+        task._pursued_retreats = 5
+        task._pursuit_ids = {100}
+        task._pursuit_last_at = time.monotonic()
+        asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertIn("out-healed-disengage", actions)
+        self.assertIn("pursued-stand", actions)
+        self.assertIn(True, client.combat)
+
+    def test_out_healed_stands_once_the_gain_window_lapses(self):
+        # SP for a heal, but her last gaining step was 3 s ago and none
+        # gains now: the ordinary retreat stands.
+        self._cornered_out_healed(gain_age=3.0, sp=72)
+
+    def test_out_healed_stands_once_her_heal_is_gone(self):
+        # A gaining step half a second ago, but SP just ran out.
+        self._cornered_out_healed(gain_age=0.5, sp=0)
+
+    def test_out_healed_without_sp_still_stands_in_the_open(self):
+        self._out_healed_without_sp(corridor=False)
+
+    def test_out_healed_without_sp_still_stands_in_a_corridor(self):
+        self._out_healed_without_sp(corridor=True)
+
+    def test_out_of_league_matches_the_exact_kind(self):
+        client = self._combat_client()
+        client.out_of_league_kinds = {"rat": time.monotonic() + 600.0}
+        task = FarmTask(zone="/test")
+        self.assertTrue(task.out_of_league(client, self._treant("rat")))
+        self.assertTrue(task.out_of_league(client, self._treant("Rat")))
+        self.assertFalse(task.out_of_league(client, self._treant("pirate")))
+        self.assertFalse(task.out_of_league(client, self._treant("giant rat")))
+
+    def test_out_of_league_kind_nearby_is_fought_only_when_it_hits(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(10, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=100)
+        client.state.messages = []
+        client.out_of_league_kinds = {
+            "charred treant": time.monotonic() + 600.0}
+        task = FarmTask(zone="/test", target="treant")
+        asyncio.run(task.tick(client))
+        # Two tiles off and not hitting her: not engaged.
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(client.targets, [])
+        client.state.messages.append(
+            (time.time(), 2, "ff0000",
+             "charred treant hit you for 5 (-2) impact damage."))
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertIsNotNone(task._engaged_target)
+        self.assertEqual(task._engaged_target[0], 100)
+
+    def test_winnable_fight_heals_as_before(self):
+        client = self._combat_client()
+        task = self._out_healed_fight(client, hits=(20, 18), flee=0.55,
+                                      heal=0.70)
+        client.state.stats["hp"] = 150
+        client.vitals.append([time.time() - 1.0, 180, 322, 72, 82, 190])
+        task.safety._last_heal = 0.0
+        asyncio.run(task.tick(client))
+        self.assertNotIn("out-healed-disengage",
+                         [action for action, _ in client.recorded])
+        self.assertIn((0, 43), client.fired)
+        self.assertFalse(task.out_of_league(client, self._treant()))
+
+    def test_out_of_league_kind_is_not_pulled_and_expires(self):
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(13, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=100)
+        client.state.messages = []
+        client.out_of_league_kinds = {
+            "charred treant": time.monotonic() + 600.0}
+        task = FarmTask(zone="/test", target="treant")
+        task.remember_engagement(client, 13, 8, 100)
+        asyncio.run(task.tick(client))
+        # Not hitting her: the engagement is dropped, and no pull starts.
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(task._visible_target_count, 0)
+        self.assertEqual(client.targets, [])
+        client.out_of_league_kinds["charred treant"] = time.monotonic() - 1.0
+        self.assertFalse(task.out_of_league(client, self._treant()))
+        self.assertEqual(client.out_of_league_kinds, {})
+        # Expired, it is a target again.
+        task = FarmTask(zone="/test", target="treant")
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._visible_target_count, 1)
+
     def test_unprobed_zero_hp_living_target_remains_attackable(self):
         client = self._combat_client()
         client.state.map.tile(11, 8).objects.clear()
