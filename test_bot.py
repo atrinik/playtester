@@ -10397,9 +10397,10 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
 
     def test_heals_losing_to_one_attacker_disengages_early(self):
         client = self._combat_client()
-        task = self._out_healed_fight(client)
+        task = self._out_healed_fight(client, hp=125)
         # She has already stepped away three times with it still beside
-        # her: at 30% the old retreat would turn and stand.
+        # her: at 39%, above the stand floor, the old retreat would turn
+        # and stand, as it did three times live.
         task._pursued_retreats = 5
         task._pursuit_ids = {100}
         task._pursuit_last_at = time.monotonic()
@@ -10447,9 +10448,42 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # it, so she heals as before instead of shuffling beside it.
         task.map_node.terrain = {(12, 12): 1, (12, 11): 1, (12, 13): 1,
                                  (13, 12): 1}
+        self.assertTrue(task.out_healed(client, 0.30, True))
+        task._cornered_breakout_target = 100
+        task._stand_latch = True
+        # The gain-only retreat leaves everything as it was.
+        self.assertFalse(asyncio.run(
+            task.low_health_retreat(client, gain_only=True)))
+        self.assertEqual(client.combat, [])
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual((task._cornered_breakout_target, task._stand_latch),
+                         (100, True))
+        task._cornered_breakout_target = 0
+        task._stand_latch = False
         asyncio.run(task.tick(client))
         self.assertIn("out-healed-disengage",
                       [action for action, _ in client.recorded])
+        self.assertIn((0, 43), client.fired)
+
+    def test_out_healed_heals_when_running_does_not_shed_the_attacker(self):
+        client = self._combat_client()
+        task = self._out_healed_fight(client)
+        for _ in range(2):
+            # Each step lands, and the pursuer is beside her again.
+            asyncio.run(task.tick(client))
+            task._retreat_attempt = None
+            task._last_action = 0.0
+        self.assertEqual(len(client.direct_moves), 2)
+        self.assertNotIn((0, 43), client.fired)
+        asyncio.run(task.tick(client))
+        self.assertIn((0, 43), client.fired)
+        # A step unanswered past the wait lets the heal go first too.
+        task.safety._last_heal = 0.0
+        client.fired.clear()
+        task._last_action = 0.0
+        task._retreat_attempt = ("/test", 12, 12, 12, 11,
+                                 time.monotonic() - 1.0)
+        asyncio.run(task.tick(client))
         self.assertIn((0, 43), client.fired)
 
     def test_winnable_fight_heals_as_before(self):

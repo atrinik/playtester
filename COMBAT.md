@@ -1053,8 +1053,9 @@ Now, on the farm map:
   and restores more than she takes, so it never counts.
 - **Disengage once** (`FarmTask.out_healed`, recorded once as
   `out-healed-disengage` with the kinds that hit her in the window). It
-  holds `OUT_HEALED_HOLD_SECONDS` (8 s) past her last hit, renewed by
-  each one, and ends at once above the heal threshold. While it holds,
+  holds `OUT_HEALED_HOLD_SECONDS` (8 s) past her last hostile contact
+  (a hit or miss within the last 10 s, so up to about 18 s after the last
+  one), and ends at once above the heal threshold. While it holds,
   with an active attacker within 2 tiles, the farm's own retreat
   (`low_health_retreat`, `gain_only`) runs before the next heal: only a
   step that takes her farther from the nearest threat counts (the gain
@@ -1063,11 +1064,14 @@ Now, on the farm map:
   off and no pursued stand or cast. With no such step it does nothing,
   touches no latch, and healing and the usual retreat decide as before,
   the cornered breakout among them. With no attacker within 2 tiles she
-  heals as usual.
+  heals as usual. Running never shuts healing out: a step unanswered for
+  `OUT_HEALED_ACK_WAIT_SECONDS` (0.75 s), or `OUT_HEALED_UNSHED_STEPS`
+  (2) steps in a row that left an attacker beside her (a pursuer as fast
+  as she is), let that tick's heal go first.
 - **Out of her league** (`OUT_OF_LEAGUE_SECONDS`, 10 minutes, kept on the
   client so a rebuilt farm task still knows): those kinds are not pulled.
-  An engagement with one is dropped once it has stopped hitting her,
-  rather than walked back to. One that hits her, or comes within 3 tiles,
+  An engagement with one more than 3 tiles off is dropped once it has
+  stopped hitting her, rather than walked back to. One that hits her, or comes within 3 tiles,
   is still fought, as any is.
 
 Accepted limits:

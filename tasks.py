@@ -1817,6 +1817,10 @@ class FarmTask(BotTask):
     OUT_HEALED_WINDOW_SECONDS = 12.0
     OUT_HEALED_HOLD_SECONDS = 8.0
     OUT_OF_LEAGUE_SECONDS = 600.0
+    # While heals lose, a step unanswered this long, or this many steps in
+    # a row with an attacker still beside her, let a heal go first.
+    OUT_HEALED_ACK_WAIT_SECONDS = 0.75
+    OUT_HEALED_UNSHED_STEPS = 2
     # Casts from one square that did nothing before that line is futile,
     # and seconds without any shot before a target is set aside.
     FUTILE_CAST_LIMIT = 2
@@ -1965,6 +1969,8 @@ class FarmTask(BotTask):
         self._outpaced_until = 0.0
         # Until when heals losing the fight keep her disengaging (monotonic).
         self._out_healed_until = 0.0
+        # Gain-only steps in a row that found an attacker still beside her.
+        self._out_healed_unshed = 0
         # The finisher's last cast (line key, wall-clock time), casts that
         # did nothing per line, lines given up on, and since when the
         # current target has had no shot (see _observe_cast_effect and
@@ -4563,6 +4569,7 @@ class FarmTask(BotTask):
                                  self.OUT_HEALED_WINDOW_SECONDS)):
             return False
         self._out_healed_until = now + self.OUT_HEALED_HOLD_SECONDS
+        self._out_healed_unshed = 0
         kinds = sorted(recent_hostile_attackers(
             client, seconds=self.OUT_HEALED_WINDOW_SECONDS))
         store = getattr(client, "out_of_league_kinds", None)
@@ -4600,12 +4607,17 @@ class FarmTask(BotTask):
         than at the fighting retreat's cadence, and with no stand or cast
         on the way. Without one it does nothing and returns False, before
         touching any latch, so the caller's healing and the usual retreat
-        decide.
+        decide. It also returns False, letting a heal go first, while a
+        step has gone unanswered for OUT_HEALED_ACK_WAIT_SECONDS, and once
+        OUT_HEALED_UNSHED_STEPS steps in a row left an attacker beside her
+        (a pursuer as fast as she is).
         """
         m = client.state.map
         now = time.monotonic()
+        attempt = self._retreat_attempt
         if self.retreat_ack_pending(client, now):
-            return True
+            return not (gain_only and attempt is not None and
+                        now - attempt[5] >= self.OUT_HEALED_ACK_WAIT_SECONDS)
         cx, cy = m.width // 2, m.height // 2
         engaged_id = self._engaged_target[0] if self._engaged_target else 0
         proven_attackers = recent_hostile_attackers(client)
@@ -4732,9 +4744,17 @@ class FarmTask(BotTask):
             # Only a step that sheds the nearest threat; an equal-distance
             # one shuffles her beside it with her heals still losing.
             nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
+            if nearest > 1:
+                self._out_healed_unshed = 0
+            elif self._out_healed_unshed >= self.OUT_HEALED_UNSHED_STEPS:
+                # Running is not shedding it: this tick's heal goes first.
+                self._out_healed_unshed = 0
+                return False
             choices = [choice for choice in choices if choice[1] > nearest]
             if not choices:
                 return False
+            if nearest <= 1:
+                self._out_healed_unshed += 1
             # Running ends a stand; combat goes off with the step below.
             self._cornered_breakout_target = 0
             self._stand_latch = False
@@ -5850,8 +5870,9 @@ class FarmTask(BotTask):
             engaged_entry = next((
                 entry for entry in threats
                 if entry[3].target_id == self._engaged_target[0]), None)
-            if engaged_entry is not None and self.out_of_league(
-                    client, map_object_semantic(client, engaged_entry[3])):
+            if (engaged_entry is not None and engaged_entry[0] > 3 and
+                    self.out_of_league(client, map_object_semantic(
+                        client, engaged_entry[3]))):
                 self.release_engagement(engaged_entry[3].target_id)
                 targets = [entry for entry in targets
                            if entry[3].target_id != engaged_entry[3].target_id]
