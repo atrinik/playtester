@@ -1416,8 +1416,11 @@ owner's own square with no monster next to it is taken as ranged.
   area) and creature level bands, so an authored name in them counts as a
   player too when it could be one: green when the server marks it her
   friend (outside PvP every player is, `is_friend_of`), red on a PvP map
-  or one she does not know. A hostile green or red creature keeps its
-  kind. Of the party packets the
+  or one she does not know. Such a possible player is never a creature
+  and makes the engagement shared within 6 squares of the owner, so a
+  friendly green NPC or pet farther off does not drop every fight; a
+  certain player does anywhere in view. A hostile green or red creature
+  keeps its kind. Of the party packets the
   client keeps only the operator character's vitals and discards every
   other member's name and numbers as they are parsed.
 - No name is stored. A row belongs to her own character. A monster kind

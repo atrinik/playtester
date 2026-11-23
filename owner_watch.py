@@ -30,8 +30,10 @@ name, less the server's bracketed tags (" [AFK]", permission tags;
 ``generate_quick_name``), must equal the configured name and carry a
 player's name colour. Other players are only ever positions: while one is
 in her view (any distance, any level she sees) the engagement is shared
-and is dropped whole; so is a green friend or, in a PvP area, a red name,
-even with an authored name, since those colours are players' too. A
+and is dropped whole; so is a green friend or, in a PvP area, a red name
+within ``MAYBE_PLAYER_RADIUS`` squares, even with an authored name, since
+those colours are players' too (a friendly NPC or pet farther off does not
+drop every fight). A
 player she cannot see is not detected. No name is stored: a row belongs
 to her own character, and a monster kind is stored only when it is an
 authored creature name.
@@ -62,6 +64,10 @@ log = logging.getLogger(__name__)
 QUIET_SECONDS = 10.0
 # The longest engagement kept as one row.
 MAX_ENGAGEMENT_SECONDS = 900.0
+# A possible player (an authored name in a player colour) this close to
+# the operator character (squares, either axis) makes the engagement
+# shared; a certain player does anywhere in view.
+MAYBE_PLAYER_RADIUS = 6
 # A step within this long after a ranged hit counts as stepping away.
 STEP_AFTER_RANGED_SECONDS = 3.0
 # Monster kinds kept per engagement, in order of first hit.
@@ -347,17 +353,21 @@ def owner_view(client: Any, recorder: OwnerWatchRecorder) -> OwnerView | None:
     owner: list[tuple[int, int]] = []
     creatures: list[Creature] = []
     others: list[tuple[int, int]] = []
+    maybe: list[tuple[int, int]] = []
     pvp = node is None or bool(getattr(node, "pvp", False))
     for depth, x, y, obj in m.depth_targets():
         square = (m.world_x + x - cx, m.world_y + y - cy)
         if depth != 0:
             # Another level: only whether a player is there matters.
-            if is_player(obj, own, content) or _maybe_player(obj, names, pvp):
+            if is_player(obj, own, content):
                 others.append(square)
+            elif _maybe_player(obj, names, pvp):
+                maybe.append(square)
             continue
         if _maybe_player(obj, names, pvp):
-            # Perhaps a player with an authored name: counted as one.
-            others.append(square)
+            # Perhaps a player with an authored name (or a friendly NPC or
+            # pet): never a creature, and shared when close.
+            maybe.append(square)
             continue
         if is_player(obj, own, content):
             if map_player_name(obj.name) == operator:
@@ -376,6 +386,8 @@ def owner_view(client: Any, recorder: OwnerWatchRecorder) -> OwnerView | None:
     if node is not None and not (0 <= square[0] < node.width and 0 <= square[1] < node.height):
         # On a map tiled to hers: another frame of squares and terrain.
         return view
+    others.extend(other for other in maybe
+                  if chebyshev(square, other) <= MAYBE_PLAYER_RADIUS)
     view.owner, view.creatures, view.others = square, creatures, others
     view.animations = [(a.at, a.x, a.y, a.kind, a.value) for a in fresh
                        if a.map == m.path and a.depth == 0]

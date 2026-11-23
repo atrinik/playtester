@@ -29886,6 +29886,15 @@ class OwnerWatchTests(unittest.TestCase):
         self.remove(client, 1)
         client.world_graph.nodes["/t"].pvp = False
         self.assertEqual((client.owner_watch.shared_dropped, self.stored()), (5, []))
+        # A friendly green NPC or pet farther off shares nothing, and is no
+        # creature either.
+        far.objects[5] = MapObject(5, 1, 0, 0, name="orc", name_color="00ff00",
+                                   target_id=14, is_friend=True)
+        self.animate(client, 5, c.ANIM_DAMAGE, 12)
+        observe_owner(client)
+        self.assertFalse(client.owner_watch.engagement.shared)
+        client.owner_watch.reset()
+        far.objects.pop(5)
         # Her own fight: nothing is watched.
         client.state.combat = True
         self.animate(client, 5, c.ANIM_DAMAGE, 12)
