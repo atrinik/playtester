@@ -323,6 +323,16 @@ Getting the crystal and upgrading it:
   which a loop's records can fill. A failure recorded only in that
   history before this change no longer backs an errand off; the route
   check still sees its deaths.
+- **Walking out.** A pool leg that fails, or a trip over its 30 minutes,
+  while she stands on a map with hostile spawns first runs the defended
+  return leg to Gandyld's map (`mana-crystal-walk-out`), for at most 10
+  minutes, and only then fails; a death or recall still ends it at once.
+  Live (2026-11-24) a failed leg left her deep in the Old Outpost and
+  autoplay built its next farm circuit from there. A pack beside the last
+  stairs on no longer fails the leg: she holds by them for up to 3 minutes
+  (ROUTING 1.8). With two or more of the pack near, she fights back while
+  holding only with the cornered-fight fix
+  (https://github.com/atrinik/playtester/pull/132).
 - **Replacement.** Gandyld's dialogue offers no replacement crystal, but the
   pool's script creates the enhanced crystal whether or not she carries the
   old one. So the pool trip also replaces a lost crystal.

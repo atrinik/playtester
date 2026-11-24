@@ -12691,6 +12691,15 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
         graph = WorldGraph()
         graph.nodes = {"/test": node}
+        # The well is one way to the farm; another exit is the alternate
+        # (the last way on is never excluded).
+        for path in ("/well", "/farm"):
+            graph.nodes[path] = MapNode(path=path, width=3, height=3, terrain={
+                (x, y): 1 for x in range(3) for y in range(3)})
+        node.edges = [
+            MapEdge("/test", "/well", 13, 22, 1, 1, kind="exit", label="stone well"),
+            MapEdge("/test", "/farm", 1, 1, 1, 1, kind="exit")]
+        graph.nodes["/well"].edges = [MapEdge("/well", "/farm", 0, 0, 1, 1, kind="exit")]
         task = NavigateThenTask(
             graph, "/farm", FarmTask(zone="/farm"),
             combat_approach=True)
@@ -14221,6 +14230,180 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         route = leg.navigation._plan(client)
         self.assertEqual(route[-1].destination,
                          "/shattered_islands/world_6_58")
+
+    @staticmethod
+    def _outpost_client(path, xy):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats["level"] = 37
+        client.state.map = MapState(path=path, world_x=xy[0], world_y=xy[1])
+        client.decision_history = []
+
+        def record_action(action, detail=""):
+            client.decision_history.append(
+                {"time": time.time(), "action": action, "detail": detail})
+
+        async def noop(*args, **kwargs):
+            return None
+
+        client.record_action = record_action
+        client.clear_actions = client.set_combat = noop
+        client.request_quests = noop
+        return client
+
+    def test_outpost_stairs_held_by_a_pack_wait_instead_of_failing(self):
+        # Live: a pack beside both Old Outpost stairs down got each one
+        # excluded in turn, and the dip failed on "no component route".
+        graph = built_graph()
+        outpost = "/shattered_islands/strakewood_island/old_outpost/"
+        client = self._outpost_client(outpost + "old_outpost_0202", (10, 15))
+        policy = POLICIES[AutoplayTask.MANA_CRYSTAL_QUEST]
+        trip = apply_ground_trip(graph, policy.parts["A Better Crystal"].action)
+        navigation = trip.navigation
+        navigation.status = TaskStatus.RUNNING
+        navigation.route = navigation._plan(client)
+
+        def key(edge):
+            return edge.source, edge.destination, edge.x, edge.y
+
+        first = navigation.route[0]
+        self.assertEqual(
+            (first.destination, first.y in (18, 19)),
+            (outpost + "old_outpost_a_0202", True))
+        # The first held stair is bypassed: the other one is left.
+        trip._pack_exit_stall = (key(first), time.monotonic() - 20)
+        self.assertTrue(asyncio.run(trip._bypass_pack_blocked_exit(client)))
+        navigation.route = navigation._plan(client)
+        second = navigation.route[0]
+        self.assertEqual((second.x, second.destination), (10, first.destination))
+        self.assertNotEqual(second.y, first.y)
+        # The second, the last way down, is never excluded.
+        trip._pack_exit_stall = (key(second), time.monotonic() - 20)
+        self.assertFalse(asyncio.run(trip._bypass_pack_blocked_exit(client)))
+        self.assertNotIn(key(second), navigation._excluded_edges)
+        self.assertEqual(navigation.route[0], second)
+        actions = [record["action"] for record in client.decision_history]
+        self.assertEqual(actions.count("navigation-pack-exit-kept"), 1)
+        # That answer is cached: asking again expands nothing.
+        with patch.object(graph, "_expand_component_states",
+                          side_effect=AssertionError("expanded again")):
+            self.assertFalse(navigation.graph_route_open(
+                client, navigation._excluded_edges | {key(second)}))
+        # The hold is bounded: kept for PACK_EXIT_KEEP_SECONDS in all, it is
+        # excluded as before.
+        held = apply_ground_trip(graph, policy.parts["A Better Crystal"].action)
+        held.navigation.status = TaskStatus.RUNNING
+        held.navigation.route = [second]
+        held.navigation._exclude_edge(first)
+        held._pack_exit_kept[key(second)] = (
+            time.monotonic() - held.PACK_EXIT_KEEP_SECONDS - 1)
+        held._pack_exit_stall = (key(second), time.monotonic() - 20)
+        self.assertTrue(asyncio.run(held._bypass_pack_blocked_exit(client)))
+        self.assertIn(key(second), held.navigation._excluded_edges)
+        # Excluded anyway (a click that found no path): the replan waits
+        # for the soonest exclusion instead of failing the trip.
+        navigation._exclude_edge(second)
+        # An unrelated, sooner exclusion (a seam elsewhere) is not what she
+        # waits for: she waits for the stairs.
+        navigation._edge_exclusions[
+            ("/shattered_islands/world_1_1", "/shattered_islands/world_1_2")] = (
+                time.monotonic() + 10)
+        navigation._replan(client)
+        self.assertEqual(navigation.status, TaskStatus.RUNNING)
+        self.assertEqual(navigation.route, [])
+        self.assertEqual(client.decision_history[-1]["action"],
+                         "navigation-exclusion-wait")
+        self.assertAlmostEqual(navigation._exclusion_wait_until,
+                               navigation._edge_exclusions[key(first)])
+        # Until then no tick replans.
+        with patch.object(navigation, "_plan",
+                          side_effect=AssertionError("replanned")):
+            asyncio.run(navigation.tick(client))
+        self.assertEqual(navigation.status, TaskStatus.RUNNING)
+        # Once it expires she goes down the stair it freed.
+        navigation._edge_exclusions[key(first)] = time.monotonic() - 1
+        navigation._exclusion_wait_until = time.monotonic() - 1
+        navigation._replan(client)
+        self.assertEqual(navigation.status, TaskStatus.RUNNING)
+        self.assertEqual(navigation.route[0], first)
+        # Only one wait a trip: an edge that fails again (a click that never
+        # finds a path) fails it as before, instead of waiting forever.
+        navigation._exclude_edge(first)
+        navigation._replan(client)
+        self.assertEqual(navigation.status, TaskStatus.FAILED)
+        self.assertIn("no component route", navigation.error)
+
+    def test_a_plan_no_exclusion_closed_still_fails(self):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.map = MapState(path="/start", world_x=1, world_y=0)
+        task = NavigateTask(blocks_graph(), "/nowhere")
+        task.status = TaskStatus.RUNNING
+        task._exclude_edge(MapEdge("/start", "/blocked", 9, 0, 0, 0))
+        task._replan(client)
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(task._exclusion_wait_until, 0.0)
+
+    def test_a_failed_dip_walks_out_of_the_outpost_before_failing(self):
+        graph = built_graph()
+        outpost = "/shattered_islands/strakewood_island/old_outpost/"
+        client = self._outpost_client(outpost + "old_outpost_a_0202", (5, 20))
+        client.state.quests_loaded = True
+        client.state.quests = self._gandyld_client().state.quests
+        task = ManaCrystalUpgradeTask(graph)
+        asyncio.run(task.tick(client))
+        dip = task.child
+        self.assertIsInstance(dip.task, ApplyGroundTask)
+
+        async def failed(_client):
+            dip.status, dip.error = TaskStatus.FAILED, "no component route"
+
+        dip.tick = failed
+        asyncio.run(task.tick(client))
+        # Not failed yet: the return leg walks her out first, and says so.
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertIsInstance(task.child.task, ArrivedTask)
+        self.assertEqual(task.child.navigation.destination, task.GANDYLD_MAP)
+        self.assertEqual(client.decision_history[-1]["action"],
+                         "mana-crystal-walk-out")
+        leg = task.child
+
+        async def arrived(_client):
+            leg.status = TaskStatus.COMPLETE
+
+        leg.tick = arrived
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("no component route", task.error)
+        self.assertIn("walked out", task.error)
+        # The walk out is bounded.
+        task = ManaCrystalUpgradeTask(graph)
+        asyncio.run(task.tick(client))
+
+        async def running(_client):
+            return None
+
+        task.child.tick = running
+        task._started_at -= task.MAX_SECONDS + 1
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        self.assertIsInstance(task.child.task, ArrivedTask)
+        task.child.tick = running
+        task._walk_out_started -= task.WALK_OUT_SECONDS + 1
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIn("30 minutes", task.error)
+        self.assertIn("walk out took over 10 minutes", task.error)
+        # Outside a hostile map the failed dip fails at once.
+        client = self._outpost_client(task.GANDYLD_MAP, (10, 10))
+        client.state.quests_loaded = True
+        client.state.quests = self._gandyld_client().state.quests
+        task = ManaCrystalUpgradeTask(graph)
+        asyncio.run(task.tick(client))
+        dip = task.child
+        dip.tick = failed
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
 
     def test_alchemists_pool_is_reachable_through_the_old_outpost(self):
         graph = built_graph()
@@ -25127,8 +25310,11 @@ class RouteFailureTests(unittest.TestCase):
             for edge in stairs:
                 every._exclude_edge(edge)
         navigation_tick(every, client, 1000.0)
-        self.assertEqual(every.status, TaskStatus.FAILED)
-        self.assertIn("no component route", every.error)
+        # The trip does not fail: it waits for the soonest to expire.
+        self.assertEqual(every.status, TaskStatus.RUNNING)
+        self.assertEqual(every.route, [])
+        self.assertEqual(every._exclusion_wait_until,
+                         1000.0 + NavigateTask.EDGE_EXCLUSION_SECONDS)
         navigation_tick(every, client,
                         1000.0 + NavigateTask.EDGE_EXCLUSION_SECONDS + 1)
         self.assertEqual(every.status, TaskStatus.RUNNING)
@@ -34219,8 +34405,14 @@ class DialogueEdgeTests(unittest.IsolatedAsyncioTestCase):
             now[0] += 4.5
             await task.tick(self.client)
         self.assertIn("navigation-voyage-failed", self.client.actions())
-        self.assertIn("stalled", self.client.decision_history[-1]["detail"])
-        self.assertEqual(task.status, TaskStatus.FAILED)
+        failed = [record["detail"] for record in self.client.decision_history
+                  if record["action"] == "navigation-voyage-failed"]
+        self.assertIn("stalled", failed[-1])
+        # The voyage was the only way: the trip waits for its exclusion to
+        # expire instead of failing.
+        self.assertEqual(self.client.decision_history[-1]["action"],
+                         "navigation-exclusion-wait")
+        self.assertEqual(task.status, TaskStatus.RUNNING)
         self.assertIn(("/dock", "/isle", 5, 1), task._edge_exclusions)
 
     async def test_a_gap_between_ticks_restarts_the_approach_timer(self):
