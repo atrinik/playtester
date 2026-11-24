@@ -7853,6 +7853,54 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         x, y = task._retreat_attempt[1:3]
         self.assertEqual(max(abs(x - 8), abs(y - 11)), 3)
 
+    def test_navigation_retreat_never_shuffles_back_towards_the_way_out(self):
+        """A one-wide corridor, the way out east past one attacker and
+        another north-west: a step back towards the exit beat the backtrack
+        penalty, and she shuffled (11, 5) <-> (12, 5) for good."""
+        client = self._combat_client()
+        m = client.state.map
+        m.path = "/corr"
+        node = MapNode(path="/corr", width=24, height=12)
+        node.terrain = {(x, 5): 1 for x in range(24)}
+        graph = WorldGraph()
+        graph.nodes[node.path] = node
+        task = NavigateThenTask(
+            graph, "/other", FarmTask(zone="/other"), combat_approach=True)
+        task.navigation.route = [MapEdge("/corr", "/other", 23, 5,
+                                         kind="tile")]
+        position, visits = (11, 5), []
+        for _ in range(8):
+            m.world_x, m.world_y = position
+            task._record_trail(client)
+            m.tiles.clear()
+            threats = []
+            for index, (x, y) in enumerate(((8, 2), (15, 5))):
+                view = 8 + x - position[0], 8 + y - position[1]
+                obj = MapObject(3, 1, 0, 0, name="golem",
+                                target_id=900 + index, target_hp=100)
+                m.tile(*view).objects[3] = obj
+                threats.append((max(abs(view[0] - 8), abs(view[1] - 8)),
+                                *view, obj))
+            task._retreat_attempt = None
+            self.assertTrue(asyncio.run(task._retreat_step(
+                client, threats, avoid_backtrack=True)))
+            position = task._retreat_attempt[1:3]
+            visits.append(position)
+        self.assertLessEqual(max(visits.count(point) for point in visits), 2)
+        self.assertLessEqual(position[0], 6)
+
+    def test_navigation_retreat_forgets_an_excluded_way_out(self):
+        client, task, threats = self._outpost_retreat((10, 10), [(12, 13)])
+        exit_edge = MapEdge(self.OUTPOST, self.OUTPOST.replace(
+            "0202", "a_0202"), 10, 18)
+        task.navigation.route = [exit_edge]
+        self.assertEqual(task._way_out(client), (10, 18))
+        # A pack held the stairs: the bypass excludes them, clears the route.
+        task.navigation._exclude_edge(exit_edge)
+        task.navigation.route = []
+        self.assertIsNone(task._way_out(client))
+        self.assertIsNone(task._way_out_goal)
+
     def test_navigation_retreat_rejects_a_dead_end_square(self):
         """A square with no onward step (escape depth 0) is taken only when
         nothing else is open, even when it separates her farther."""
@@ -20824,6 +20872,34 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.map.path = "/shattered_islands/world_14_78"
         self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
                          "Far")
+
+    def test_a_chosen_circuit_is_not_switched_mid_walk_by_travel(self):
+        """The circuit re-chooses on every farm tick from wherever her walk
+        has got to; a comparable circuit starting on a map she passes must
+        not replace the one she is walking to."""
+        from .navigation import analyzer_farm_choice
+
+        graph = built_graph()
+        far = analyzer_spot("Far", ["/shattered_islands/world_14_79"],
+                            ["evil treant L13"])
+        near = analyzer_spot("Near", ["/shattered_islands/world_10_78"],
+                             ["evil treant L13"])
+        client = self.client({"xp": [{**far, "xp_hour": 9.0e6},
+                                     {**near, "xp_hour": 8.0e6}]})
+        client.state.map.path = "/shattered_islands/world_10_77"
+        on = analyzer_farm_choice(client, graph, search=False)[1]
+        self.assertEqual(on[0][0], "/shattered_islands/world_10_78")
+        # Walking to Far, she passes beside Near: Far stays.
+        far_legs = ((("/shattered_islands/world_14_79",
+                      on[0][1]),))
+        self.assertEqual(analyzer_farm_choice(
+            client, graph, search=False, current_legs=far_legs)[1], far_legs)
+        # A circuit no longer comparable is still replaced.
+        client.farm_analyzer.rankings["xp"] = [
+            {**near, "xp_hour": 9.0e6}, {**far, "xp_hour": 6.0e6}]
+        self.assertEqual(analyzer_farm_choice(
+            client, graph, search=False, current_legs=far_legs)[2]["name"],
+            "Near")
 
     def test_deep_in_a_dungeon_she_walks_home_before_farming(self):
         from .navigation import FARM_HOME_FIRST_HOPS, farm_home_first, map_hops

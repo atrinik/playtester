@@ -1481,7 +1481,13 @@ Now:
   ground. The way out is the next route edge's square on this map, or her
   destination square on the destination map (not on a farm's own map), and
   it is kept for the map while a pack avoidance or a failed plan clears
-  the route. Progress is the 8-way walking distance on the authored map
+  the route, and forgotten once its edge is excluded (a pack-blocked exit
+  bypassed, a failed click or seam). With `avoid_backtrack`, a step that
+  undoes her last one (her previous trail square, or where a retreat step
+  was sent from in the last `RETREAT_REVERSAL_SECONDS`, 10 s, since the
+  trail collapses a step back) never counts as progress and is the
+  backtrack it penalizes, so the penalty still holds: in a one-wide corridor a step back towards the
+  exit otherwise beat it and she shuffled between two squares. Progress is the 8-way walking distance on the authored map
   (`_way_out_distances`); a seam square beyond the map's bounds is measured
   from the square inside. Without a known way out the key is 0 and the
   choice is the old one. `navigation-retreat-choice` records `progress=`.
@@ -1498,8 +1504,12 @@ Now:
   `score`, `safety_score`) is at least `FARM_COMPARABLE_SHARE` (80 %) of
   the first-ranked one's are taken by fewest map transitions from where
   she stands to the circuit's first map (`map_hops`, the authored edges
-  alone), then by rank; the rest follow by rank. Risky spots, the
-  hazardous fallback and the cure-funding farm keep their orders.
+  alone), then by rank; the rest follow by rank. The circuit she is on
+  stays first while it is comparable: the circuit re-chooses on every farm
+  tick from wherever her walk has got to (`_upgrade_progression`), and a
+  comparable circuit starting on a map she passes must not replace it
+  mid-trip. Risky spots, the hazardous fallback and the cure-funding farm
+  keep their orders.
 - **Home first from deep in a dungeon.** Off the surface grid and more
   than `FARM_HOME_FIRST_HOPS` (3) map transitions from both her savebed and
   the chosen circuit's first map (`farm_home_first`), autoplay walks to her

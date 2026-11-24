@@ -570,7 +570,9 @@ class FarmAnalyzer:
     # every one rated hazardous for her kit, so she farmed the least
     # dangerous of them 49 map transitions away while the Underground
     # City's outer maps, Hemlock Cave and Eld Woods Island ranked 60th to
-    # 125th. A few per area keep alternatives that avoid one bad map.
+    # 125th. Capping the circuits per area leaves room for other areas; it
+    # does not ensure that a kept circuit avoids a map that failed (live,
+    # every Burnt Forest circuit shared one).
     AREA_CIRCUITS = 3
 
     def __init__(self, analyzer_root: Path, content_root: Path, server_root: Path, *,

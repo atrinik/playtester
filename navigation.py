@@ -4324,6 +4324,7 @@ class NavigateThenTask(BotTask):
         self._retreat_attempt: tuple[str, int, int, float] | None = None
         # Where she stood when the step in _retreat_attempt was sent.
         self._retreat_from: tuple[str, int, int] | None = None
+        self._retreat_sent_at = 0.0
         # Retreat squares a step to which never landed, and when each was
         # learned; they expire (_prune_retreat_blocked).
         self._retreat_blocked: set[tuple[str, int, int]] = set()
@@ -4332,7 +4333,7 @@ class NavigateThenTask(BotTask):
         # The square her planned route leaves the current map by, kept for
         # this map while a pack avoidance or a failed plan clears the route
         # (_way_out): her retreat steps prefer making progress towards it.
-        self._way_out_goal: tuple[str, int, int] | None = None
+        self._way_out_goal: tuple[str, int, int, tuple | None] | None = None
         self._combat_attempt: tuple[str, int, int, float] | None = None
         self._combat_blocked: set[tuple[str, int, int]] = set()
         self._last_pull_target = 0
@@ -4476,24 +4477,36 @@ class NavigateThenTask(BotTask):
         The next route edge's square when it starts here, else her own
         destination square on the destination map, else the last such
         square noted on this map: avoiding a pack clears the route, and the
-        retreat that follows still knows which way is out.
+        retreat that follows still knows which way is out. A noted edge
+        that has since been excluded (_bypass_pack_blocked_exit, a failed
+        click or seam) is forgotten.
         """
         m = client.state.map
         navigation = self.navigation
         route = getattr(navigation, "route", None) or ()
-        goal = None
+        goal = key = None
         if route and route[0].source == m.path:
-            goal = route[0].x, route[0].y
+            edge = route[0]
+            goal = edge.x, edge.y
+            # _exclude_edge's key: an excluded edge is no way out.
+            key = ((edge.source, edge.destination, edge.x, edge.y)
+                   if edge.kind != "tile" else (edge.source, edge.destination))
         elif (m.path == navigation.destination and
               navigation.destination_xy is not None and
               not isinstance(self.task, FarmTask)):
             goal = tuple(navigation.destination_xy)
         if goal is not None:
-            self._way_out_goal = (m.path, int(goal[0]), int(goal[1]))
+            self._way_out_goal = (m.path, int(goal[0]), int(goal[1]), key)
             return int(goal[0]), int(goal[1])
-        if self._way_out_goal is not None and self._way_out_goal[0] == m.path:
-            return self._way_out_goal[1], self._way_out_goal[2]
-        return None
+        cached = self._way_out_goal
+        if cached is None or cached[0] != m.path:
+            return None
+        if cached[3] is not None and cached[3] in set(
+                getattr(navigation, "_excluded_edges", ()) or ()):
+            # Bypassed (a pack held its approach) or failed: forgotten.
+            self._way_out_goal = None
+            return None
+        return cached[1], cached[2]
 
     @staticmethod
     def _way_out_distances(node, goal: tuple[int, int], *,
@@ -4524,6 +4537,10 @@ class NavigateThenTask(BotTask):
                 distances[nxt] = distances[current] + 1
                 queue.append(nxt)
         return distances
+
+    # A step back to where a retreat step was sent from this recently
+    # undoes it (_retreat_step).
+    RETREAT_REVERSAL_SECONDS = 10.0
 
     # A retreat square learned as blocked is tried again after this long:
     # what blocked it was most often a creature, which moves on.
@@ -4575,6 +4592,7 @@ class NavigateThenTask(BotTask):
         m = client.state.map
         self._retreat_attempt = (m.path, x, y, now)
         self._retreat_from = (m.path, m.world_x, m.world_y)
+        self._retreat_sent_at = now
 
     async def _retreat_step(self, client: AtrinikClient, threats,
                             *, avoid_backtrack: bool = False,
@@ -4604,13 +4622,6 @@ class NavigateThenTask(BotTask):
             max(abs(m.world_x - x), abs(m.world_y - y))
             for x, y in threat_world)
         previous = self._trail[-2] if len(self._trail) >= 2 else None
-        # Progress towards the way out (_way_out): steps closer to where her
-        # route leaves this map rank above steps that hold or lose ground.
-        goal = self._way_out(client)
-        out_distances = (self._way_out_distances(
-            node, goal, allow_locked=self.navigation._allow_locked(client))
-            if goal is not None else {})
-        here_out = out_distances.get((m.world_x, m.world_y))
         candidates = []
         mobility_blocked = {(m.world_x, m.world_y), *threat_world}
         mobility_blocked.update(
@@ -4630,37 +4641,61 @@ class NavigateThenTask(BotTask):
                     gain_only and minimum == current_min):
                 continue
             backtrack = int(previous == (m.path, *point))
-            trail_score = -backtrack if avoid_backtrack else backtrack
+            # Undoing her last retreat step: the trail collapses a step
+            # back, so where a recent step was sent from counts as well.
+            reverses = int(bool(backtrack) or (
+                now - self._retreat_sent_at <= self.RETREAT_REVERSAL_SECONDS
+                and self._retreat_from == (m.path, *point)))
+            trail_score = -reverses if avoid_backtrack else backtrack
             escape_depth, escape_area = retreat_mobility(
                 node, point, blocked=mobility_blocked,
                 allow_locked=self.navigation._allow_locked(client))
-            # Progress out: 1 closer to the way out, 0 as close (or no way
-            # out known), -1 farther, -2 cut off from it.
-            if here_out is None:
-                progress = 0
-            elif point in out_distances:
-                progress = max(-1, min(1, here_out - out_distances[point]))
-            else:
-                progress = -2
-            # Continuing escape mobility outranks immediate separation: a
-            # farther tile in a dead end is not safer than an open flank.
-            # Then the way out: of the steps that separate her as far, the
-            # one towards where her route leaves the map, not the open room
-            # beyond it (live, 2026-11-24, the Old Outpost: she walked off
-            # the way out into a five-walled corner and stalled there for 14
-            # minutes). For a dangerous single monster, an equal-distance
-            # step must not reverse immediately or a two-tile plateau becomes
-            # an endless oscillation.
             candidates.append(
-                (int(escape_depth >= 2), minimum, progress, escape_depth,
-                 escape_area, trail_score, sum(distances), direction))
+                (int(escape_depth >= 2), minimum, point, reverses,
+                 escape_depth, escape_area, trail_score, sum(distances),
+                 direction))
         if not candidates:
             return False
+        # Progress towards the way out (_way_out), measured only once a
+        # step exists: 1 closer to where her route leaves this map, 0 as
+        # close (or no way out known), -1 farther, -2 cut off from it. With
+        # avoid_backtrack, a step undoing her last one (her previous trail
+        # square, or where her last retreat step was sent from) never
+        # counts as progress (at best -1, as a step away): a step back
+        # towards the exit beat the backtrack penalty and shuffled her
+        # between two squares of a corridor.
+        goal = self._way_out(client)
+        out_distances = (self._way_out_distances(
+            node, goal, allow_locked=self.navigation._allow_locked(client))
+            if goal is not None else {})
+        here_out = out_distances.get((m.world_x, m.world_y))
+
+        def progress_of(point, reverses) -> int:
+            if here_out is None:
+                return 0
+            if point not in out_distances:
+                return -2
+            progress = max(-1, min(1, here_out - out_distances[point]))
+            return min(progress, -1) if avoid_backtrack and reverses else progress
+
+        # Continuing escape mobility outranks immediate separation: a
+        # farther tile in a dead end is not safer than an open flank. Then
+        # the way out: of the steps that separate her as far, the one
+        # towards where her route leaves the map, not the open room beyond
+        # it (live, 2026-11-24, the Old Outpost: she walked off the way out
+        # into a five-walled corner and stalled there for 14 minutes). For a
+        # dangerous single monster, an equal-distance step must not reverse
+        # immediately or a two-tile plateau becomes an endless oscillation.
+        scored = [
+            (viable, minimum, progress_of(point, reverses), escape_depth,
+             escape_area, trail_score, total, direction)
+            for (viable, minimum, point, reverses, escape_depth, escape_area,
+                 trail_score, total, direction) in candidates]
         # A square with no onward step at all (escape depth 0) is a dead
         # end: taken only when nothing else is open.
-        open_candidates = [entry for entry in candidates if entry[3] > 0]
+        open_candidates = [entry for entry in scored if entry[3] > 0]
         (viable, minimum, progress, escape_depth, escape_area, _, _,
-         direction) = max(open_candidates or candidates)
+         direction) = max(open_candidates or scored)
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder(
@@ -6502,7 +6537,7 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
 
 # Map transitions from a map to every map it reaches, per graph and map
 # (map_hops).
-_map_hops_cache: dict[tuple[int, str, int], dict[str, int]] = {}
+_map_hops_cache: dict[tuple[int, str, int, int], dict[str, int]] = {}
 
 
 def map_hops(graph: "WorldGraph", source: str) -> dict[str, int]:
@@ -6510,7 +6545,10 @@ def map_hops(graph: "WorldGraph", source: str) -> dict[str, int]:
     cheap estimate of a trip's length from where she stands, by the
     authored edges alone (no component, lock or hazard)."""
     nodes = getattr(graph, "nodes", {}) or {}
-    key = (id(graph), source, len(nodes))
+    # Edges change without the map count changing (a rebuild or a test
+    # graph): their count is part of the key.
+    key = (id(graph), source, len(nodes),
+           sum(len(getattr(node, "edges", ())) for node in nodes.values()))
     cached = _map_hops_cache.get(key)
     if cached is not None:
         return cached
@@ -6841,15 +6879,18 @@ def route_death_blocked_maps(client: AtrinikClient, graph: "WorldGraph", *,
 
 def analyzer_farm_choice(
         client: AtrinikClient, graph: "WorldGraph", *, search: bool = True,
-        search_verdict: bool | None = None
+        search_verdict: bool | None = None,
+        current_legs: tuple[tuple[str, str], ...] | None = None
 ) -> tuple[str, tuple[tuple[str, str], ...], dict] | None:
     """The objective farmed now, with its highest-ranked usable spot
     (_analyzer_farm_choice). With ``search`` (autoplay's own call, not the
     dashboard's or the metrics'), the farm score's shadow (ROUTING P6,
     route_shadow.py) is offered this choice to compare against; that never
-    changes the choice or raises."""
+    changes the choice or raises. ``current_legs`` is the circuit she is
+    on, if any."""
     choice = _analyzer_farm_choice(client, graph, search=search,
-                                   search_verdict=search_verdict)
+                                   search_verdict=search_verdict,
+                                   current_legs=current_legs)
     if search:
         route_shadow.request_farm(client, graph, choice)
     return choice
@@ -6857,7 +6898,8 @@ def analyzer_farm_choice(
 
 def _analyzer_farm_choice(
         client: AtrinikClient, graph: "WorldGraph", *, search: bool = True,
-        search_verdict: bool | None = None
+        search_verdict: bool | None = None,
+        current_legs: tuple[tuple[str, str], ...] | None = None
 ) -> tuple[str, tuple[tuple[str, str], ...], dict] | None:
     """The objective farmed now, with its highest-ranked usable spot.
 
@@ -6994,12 +7036,18 @@ def _analyzer_farm_choice(
             best_measure.setdefault(tier, measure)
 
     def travel(entry, position: int, risky: bool) -> tuple[int, float]:
-        # (0, transitions) for a comparable spot, (1, 0) for the rest.
+        # (0, transitions) for a comparable spot, (1, 0) for the rest. The
+        # circuit she is on (``current_legs``), while comparable, stays
+        # first: re-chosen on every farm tick from wherever her walk has
+        # got to, a comparable circuit starting on a map she passes would
+        # replace it mid-trip.
         measure = _farm_measure(entry[0], entry[2])
         best = best_measure.get((position, risky))
         if measure is None or best is None or (
                 measure < FARM_COMPARABLE_SHARE * best):
             return 1, 0.0
+        if current_legs is not None and entry[1] == tuple(current_legs):
+            return 0, -1.0
         return 0, float(hops.get(entry[1][0][0], math.inf))
 
     def preference(entry) -> tuple:
@@ -8210,7 +8258,8 @@ class FarmCircuitTask(BotTask):
                    route_death_blocked_maps(client, self.graph, search=False) is None)
         choice = analyzer_farm_choice(
             client, self.graph, search=not busy,
-            search_verdict=not busy or overdue)
+            search_verdict=not busy or overdue,
+            current_legs=tuple(self.legs))
         if choice is None:
             # Nothing usable is ranked. Never keep farming a spot that live
             # failures just excluded (quarantined, or only reachable through
