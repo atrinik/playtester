@@ -17,7 +17,8 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          cure_funding_farm, cure_funding_farm_alerts,
                          cure_funding_farm_home,
                          has_working_recall, heal_restock_alerts,
-                         recall_alerts, settle_cure_funding_farm,
+                         recall_alerts, route_death_origin,
+                         settle_cure_funding_farm,
                          WorldGraph, analyzer_farm_selection,
                          farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
@@ -273,31 +274,43 @@ class AutoplayTask(BotTask):
         backoffs[detour] = float(until)
         client.state.mana_crystal_retry_until = backoffs
 
-    def _mana_crystal_legs(self, client: AtrinikClient,
-                           detour: str) -> list[str]:
-        """The errand's own stops, from a fixed origin: her savebed (where
-        she is otherwise, without one) to Gandyld for the opening reward or
-        to the apartment chest for a recovery, and Gandyld's map to the
-        pool and back for the upgrade. Not from where she happens to
-        stand: the road from her farm is the farm's, and its failures
-        would skip the errand for good."""
+    def _mana_crystal_legs(self, client: AtrinikClient, detour: str
+                           ) -> tuple[list[str], tuple[int, int] | None, bool]:
+        """The errand's own stops from a fixed origin, the square it
+        starts from (None when unknown), and whether that origin is fixed.
+
+        Not from where she happens to stand: the road from her farm is the
+        farm's, and its failures would skip the errand for good. The
+        upgrade runs from Gandyld's map to the pool and back. The opening
+        reward (to Gandyld) and a recovery (to the apartment chest) start
+        from route_death_origin, as the route-death checks do: her
+        savebed, an apartment one left by its recorded return; without
+        one, where she stands, which is then not fixed."""
         gandyld = ManaCrystalUpgradeTask.GANDYLD_MAP
         if detour == "upgrade":
             pool = POLICIES[self.MANA_CRYSTAL_QUEST].parts[
                 ManaCrystalUpgradeTask.PART].action.place
             return ([gandyld, pool.map_path, gandyld] if pool is not None
-                    else [gandyld])
-        home = (getattr(client.state, "savebed_map", "") or
-                client.state.map.path)
+                    else [gandyld]), None, True
+        try:
+            origin = route_death_origin(client, self.graph)
+        except Exception:
+            origin = None
+        if origin is not None:
+            home, xy, fixed = origin[0], origin[1], origin[3]
+        else:
+            home, xy, fixed = client.state.map.path, None, False
         return [home, gandyld if detour == "start"
-                else self.MANA_CRYSTAL_APARTMENT]
+                else self.MANA_CRYSTAL_APARTMENT], xy, fixed
 
     def _mana_crystal_errand_maps(self, client: AtrinikClient,
                                   detour: str) -> set[str]:
         """The maps the errand ``detour`` crosses: the fewest-transition
         routes between its stops (_mana_crystal_legs; gates follow her
-        access set), and the stops themselves."""
-        stops = self._mana_crystal_legs(client, detour)
+        access set), and the stops themselves. An origin that is only
+        where she stands (no savebed) is left out: she is there already,
+        usually farming it."""
+        stops, source_xy, fixed = self._mana_crystal_legs(client, detour)
         maps = set(stops)
         try:
             access = unlocks.unlock_state(client, self.graph).access
@@ -305,11 +318,15 @@ class AutoplayTask(BotTask):
             access = None
         for source, destination in zip(stops, stops[1:]):
             try:
-                route = self.graph.route(source, destination, access=access)
+                route = self.graph.route(source, destination, access=access,
+                                         source_xy=source_xy)
             except (ValueError, KeyError):
                 route = []
             maps.update(edge.source for edge in route)
             maps.update(edge.destination for edge in route)
+            source_xy = None
+        if not fixed and stops[0] not in stops[1:]:
+            maps.discard(stops[0])
         maps.discard("")
         return maps
 

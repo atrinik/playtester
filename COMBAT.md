@@ -302,9 +302,11 @@ Getting the crystal and upgrading it:
   empty recall wands. The wait is recorded once (`mana-crystal-wait`).
   Then the errand's own legs are checked, from a fixed origin, not from
   where she stands (the road from her farm is the farm's): her savebed to
-  Gandyld (opening reward) or to the apartment chest (recovery), and
-  Gandyld's map to the pool and back (upgrade), along their
-  fewest-transition routes. A death on any of those maps (post-mortems
+  Gandyld (opening reward) or to the apartment chest (recovery), from
+  `route_death_origin` as the route-death checks use it (an apartment
+  savebed is left by its recorded return), and Gandyld's map to the pool
+  and back (upgrade), along their fewest-transition routes. Without a
+  savebed the leg starts where she stands, and that map is left out. A death on any of those maps (post-mortems
   and route events' deaths in transit, not to another player), or a pack
   or out-damaged failure (farm reviews and kit failures) on one of its
   dungeon maps, those off the overworld, within 7 days

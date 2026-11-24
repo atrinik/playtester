@@ -351,6 +351,9 @@ class AtrinikClient:
         # When the last death's bookkeeping ended (its records are its own).
         self._post_mortem_booked = 0.0
         self.post_mortems: list[dict] = []
+        # Whether a mana-crystal backoff without a character to persist it
+        # for is already logged (set_mana_crystal_retry).
+        self._mana_crystal_unpersisted_warned = False
         # (time, path) of each arrival on a new map, newest last.
         self.map_arrivals: list[tuple[float, str]] = []
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
@@ -1082,8 +1085,10 @@ class AtrinikClient:
         self.state.mana_crystal_retry_until = backoffs
         character = self.state.player_name or self.config.character
         if not character:
-            log.warning("mana-crystal %s backoff kept in memory only: no "
-                        "character to persist it for", detour)
+            if not self._mana_crystal_unpersisted_warned:
+                self._mana_crystal_unpersisted_warned = True
+                log.warning("mana-crystal %s backoff kept in memory only: no "
+                            "character to persist it for", detour)
             return
         self._runtime_memory.setdefault(character, {})[
             "mana_crystal_retry_until"] = dict(backoffs)

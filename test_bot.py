@@ -23332,6 +23332,46 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
                                 "map": self.OUTPOST, "cause": "out-damaged"}]
         self.assertTrue(autoplay._mana_crystal_route_danger(client, "upgrade"))
 
+    def test_mana_crystal_start_and_recovery_legs_run_from_her_savebed(self):
+        # Standing on a farm far from her savebed: the opening errand's leg
+        # runs from the savebed (world_0_67) to Gandyld, not from the farm.
+        client, _ = self.client()
+        farm = "/shattered_islands/world_17_75"
+        self.place(client, (farm, (10, 10)))
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        stops, xy, fixed = autoplay._mana_crystal_legs(client, "start")
+        self.assertEqual((stops[0], xy, fixed), (self.HOME[0], self.HOME[1], True))
+        for detour in ("start", "recovery"):
+            maps = autoplay._mana_crystal_errand_maps(client, detour)
+            self.assertIn(self.HOME[0], maps)
+            self.assertNotIn(farm, maps)
+        leg = "/shattered_islands/world_4_60"
+        maps = autoplay._mana_crystal_errand_maps(client, "start")
+        self.assertIn(leg, maps)
+        recent = time.time() - 3600
+        client.post_mortems = [{"time": recent, "map": farm,
+                                "cause": "out-damaged"}]
+        self.assertFalse(autoplay._mana_crystal_route_danger(client, "start"))
+        client.post_mortems.append({"time": recent, "map": leg,
+                                    "cause": "out-damaged"})
+        self.assertTrue(autoplay._mana_crystal_route_danger(client, "start"))
+
+    def test_mana_crystal_legs_without_a_savebed_leave_her_map_out(self):
+        client, _ = self.client()
+        client.state.savebed_map, client.state.savebed_xy = "", None
+        farm = "/shattered_islands/world_17_75"
+        self.place(client, (farm, (10, 10)))
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        stops, _, fixed = autoplay._mana_crystal_legs(client, "recovery")
+        self.assertEqual((stops[0], fixed), (farm, False))
+        maps = autoplay._mana_crystal_errand_maps(client, "recovery")
+        self.assertIn(AutoplayTask.MANA_CRYSTAL_APARTMENT, maps)
+        self.assertNotIn(farm, maps)
+        client.post_mortems = [{"time": time.time() - 3600, "map": farm,
+                                "cause": "out-damaged"}]
+        self.assertFalse(
+            autoplay._mana_crystal_route_danger(client, "recovery"))
+
     def test_mana_crystal_route_check_reads_transit_deaths(self):
         from .route_blocks import map_subject
 
