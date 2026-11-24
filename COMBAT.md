@@ -1622,7 +1622,9 @@ below it was never reached; 100 of the 102 attacks on her missed.
   holds, combat off, and lets them come). The
   attacker she fights stays her target until it dies or is more than 4
   tiles off, so a square opening mid-fight, or her step toward one
-  farther off, does not turn her back into a combat-off retreat. The safety's low-health hold and the critical
+  farther off, does not turn her back into a combat-off retreat. Off her
+  side it stays her target only while no other attacker is beside her and
+  she is still being hit. The safety's low-health hold and the critical
   escape still come first.
 - **No resent hold.** A pack split that repeats the last tick's (same
   square, same creatures within 4 tiles) sends neither its clear nor

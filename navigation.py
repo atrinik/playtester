@@ -4776,7 +4776,8 @@ class NavigateThenTask(BotTask):
         her target (``_cornered_target``) until it dies or is more than 4
         tiles off, so a square opening mid-fight, or the step she takes
         toward one farther off, does not turn her back into a combat-off
-        retreat. Live (2026-11-24, the Old
+        retreat. Off her side it stays her target only while no other
+        attacker is beside her and she is still being hit. Live (2026-11-24, the Old
         Outpost): boxed in by walls on five sides beside two stone giants
         and a lava golem, she turned combat off twice a second and never
         swung.
@@ -4784,6 +4785,12 @@ class NavigateThenTask(BotTask):
         latched = next((threat for threat in nearby
                         if threat[3].target_id == self._cornered_target),
                        None)
+        if latched is not None and latched[0] > 1 and (
+                any(threat[0] <= 1 for threat in nearby) or
+                not recent_hostile_contact(client, 3.0)):
+            # Off her side, it stays her target only while nothing else is
+            # beside her and she is still being hit.
+            latched = None
         if latched is None:
             self._cornered_target = 0
             if await self._retreat_step(

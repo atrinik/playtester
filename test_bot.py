@@ -12860,6 +12860,27 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(client.targets[-1][2], 801)
         self.assertEqual(client.direct_moves[1:], [])
 
+    def test_cornered_target_off_her_side_yields_to_one_beside_her(self):
+        """Latched on a giant that steps back two tiles while the golem
+        beside her goes on hitting: she turns on the golem."""
+        client, node, task = self._outpost_box()
+        self._hit(client)
+        self._corner(task, client)
+        task._cornered_target = 801
+        client.state.map.tiles.clear()
+        for target_id, (wx, wy), name in (
+                (801, (14, 6), "stone giant master guard"),
+                (802, (14, 8), "stone giant master guard"),
+                (803, (16, 7), "lava golem")):
+            client.state.map.tile(8 + wx - 16, 8 + wy - 6).objects[3] = (
+                MapObject(3, 1, 0, 0, name=name, target_id=target_id,
+                          target_hp=100))
+        node.blocked.update({(15, 6), (15, 7)})
+        self._hit(client, "lava golem")
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.targets[-1][2], 803)
+        self.assertEqual(task._cornered_target, 803)
+
     def test_outclassed_pack_does_not_split_her(self):
         """At level 37 the Old Outpost's level 16-17 giants and golems
         are no pack: boxed in or not, she fights them."""
