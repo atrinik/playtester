@@ -1610,21 +1610,32 @@ below it was never reached; 100 of the 102 attacks on her missed.
   `OUTCLASSED_LEVEL_GAP` (10) below hers counts toward neither the
   pack split (two within 4 tiles) nor the pack avoidance and pack pull
   (two within 6). She still fights it, one at a time, and it still counts
-  as a threat for retreats, halos and the critical escape. A creature of
-  unknown level always counts. The protections against dangerous packs
-  stand: creatures 4 or more levels above her are avoided as before, and
-  two within the gap still split.
-- **Cornered, she fights.** When a pack split finds no retreat square
-  (`_retreat_step` with `probe`, which sends nothing), she fights the
-  closest attacker (`_cornered_split`, recorded once per target as
+  as a threat for retreats, halos and the critical escape. Never
+  outclassed: a creature of unknown level; an authored caster of the map
+  (`caster_identities`); and a monster whose spawn rerolls its level
+  from the map's difficulty (`item_condition`, server `spawn_point.c`;
+  `WorldGraph.level_rerolled`), whose authored level says nothing (the
+  difficulty 60 world_2_67_-2 spawns ghouls authored at a low level).
+  `OUTCLASSED_PACK` (3) or more outclassed creatures within 4 tiles are a
+  pack again: then none is outclassed. The protections against dangerous
+  packs stand: creatures 4 or more levels above her are avoided as before,
+  and two within the gap still split.
+- **Cornered, she fights.** Cornered is a pack split with no retreat step
+  that gains distance from the nearest attacker (`_retreat_step` with
+  `probe` and `gain_only`, which sends nothing): an equal-distance step
+  only shuffles her beside the pack with combat off. Then she fights the
+  closest attacker (`_cornered_split`, recorded once per creature as
   `navigation-cornered-fight`), as the farm's cornered breakout does: one
   beside her, or one farther off only while she is being hit (else she
-  holds, combat off, and lets them come). The
-  attacker she fights stays her target until it dies or is more than 4
-  tiles off, so a square opening mid-fight, or her step toward one
-  farther off, does not turn her back into a combat-off retreat. Off her
-  side it stays her target only while no other attacker is beside her and
-  she is still being hit. The safety's low-health hold and the critical
+  holds, combat off, and lets them come). The attacker she fights stays
+  her target until it dies or is more than 4 tiles off, so a square
+  opening mid-fight, or her step toward one farther off, does not turn her
+  back into a combat-off retreat. Off her side it stays her target only
+  while no other attacker is beside her and hit text of the last 3 s names
+  its kind (hit text names no individual, so another of the same kind
+  hitting her also holds it; with no name in the text any hit does). While
+  it is in view the pack avoidance (combat off and a replan) does not
+  interrupt that fight. The safety's low-health hold and the critical
   escape still come first.
 - **No resent hold.** A pack split that repeats the last tick's (same
   square, same creatures within 4 tiles) sends neither its clear nor
@@ -1632,12 +1643,11 @@ below it was never reached; 100 of the 102 attacks on her missed.
   step in flight is waited for, as before.
 
 Accepted limits: the level gap reads authored levels only, not her
-equipment or theirs; a retreat step that keeps her as close to the
-nearest attacker (still beside it) counts as a way out, so against a
-pack within the gap she may still step sideways with combat off rather
-than fight (retreat scoring is not changed here); the farm map's own
-pack split (`farm-pack-split` in `FarmTask`) has no authored levels and
-still counts every active threat, with its cornered breakout unchanged.
+equipment or theirs; a pack split that does find a gaining step still
+retreats with combat off, stepping again each time the pack closes in;
+the farm map's own pack split (`farm-pack-split` in `FarmTask`) has no
+authored levels and still counts every active threat, with its cornered
+breakout unchanged.
 
 ## Approach danger: known limitations
 
