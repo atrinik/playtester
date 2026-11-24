@@ -65,7 +65,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
                     combat_allowed, heal_waiting, out_of_heals_and_recall,
-                    UnpreparedHold, wand_known_empty)
+                    UnpreparedHold, wand_known_empty,
+                    area_caster_identities, tiled_neighbours)
 from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
 log = logging.getLogger(__name__)
 
@@ -496,6 +497,10 @@ class WorldGraph:
         # classify it.
         self.peaceful_monster_identities: set[str] = set()
         self.map_monster_levels: dict[str, dict[str, int]] = defaultdict(dict)
+        # Identities of monsters whose spawn rerolls their level from the
+        # map's difficulty (``item_condition``, server spawn_point.c): their
+        # authored level is no guide to the level that spawns.
+        self.map_rerolled_monsters: dict[str, set[str]] = defaultdict(set)
         self.map_roaming_monster_levels: dict[
             str, dict[str, int]] = defaultdict(dict)
         self._component_cache: dict[
@@ -675,6 +680,9 @@ class WorldGraph:
                             attrs, "level", base.get("level")) or 0)
                     except (TypeError, ValueError):
                         spawn_level = 0
+                    rerolled = str(one(
+                        attrs, "item_condition",
+                        base.get("item_condition")) or "0") != "0"
                     for raw_name in (
                             obj["arch"].replace("_", " "), name,
                             one(attrs, "animation",
@@ -688,6 +696,9 @@ class WorldGraph:
                             node_levels = self.map_monster_levels[source]
                             node_levels[normalized] = max(
                                 spawn_level, node_levels.get(normalized, 0))
+                            if rerolled:
+                                self.map_rerolled_monsters[source].add(
+                                    normalized)
                     if one(attrs, "can_cast_spell",
                            base.get("can_cast_spell")) == "1":
                         for raw_name in (
@@ -1097,6 +1108,19 @@ class WorldGraph:
             self.monster_levels.get(identity, 0)
             for identity in normalized
         ), default=0)
+
+    def level_rerolled(self, *identities: str, map_path: str) -> bool:
+        """Whether a spawn on this map or one tiled to it rerolls this
+        monster's level from the map difficulty (map_rerolled_monsters)."""
+        normalized = {self._semantic_name(value)
+                      for value in identities if value}
+        paths = [map_path]
+        node = self.nodes.get(map_path)
+        if node is not None:
+            paths.extend(edge.destination for edge in node.edges
+                         if edge.kind == "tile")
+        return any(normalized & self.map_rerolled_monsters.get(path, set())
+                   for path in paths)
 
     def is_monster(self, name: str) -> bool:
         """Whether a name (as in "<name> hit you") is an authored monster
@@ -4446,6 +4470,15 @@ class NavigateThenTask(BotTask):
     TRANSIT_CORNERED_SECONDS = 4.0
     # A held-fire halo that alone leaves no route yields after this long.
     HALO_YIELD_SECONDS = 5.0
+    # A hostile whose authored level is more than this many levels below
+    # hers does not count toward a pack (_outclassed_ids): she still fights
+    # it, but two of them do not make her split and retreat.
+    OUTCLASSED_LEVEL_GAP = 10
+    # This many outclassed creatures within 4 tiles count as a pack again.
+    OUTCLASSED_PACK = 3
+    # A cornered pack split that holds (nothing beside her, nothing hitting
+    # her, no step that gains distance) fights the nearest after this long.
+    CORNERED_HOLD_SECONDS = 8.0
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -4508,11 +4541,26 @@ class NavigateThenTask(BotTask):
         # A critical escape (_critical_escape_due) under way: it holds until
         # she is back above the heal threshold or has a heal or recall again.
         self._escaping = False
+        # The pack-split hold of the last tick: (position, nearby ids). A
+        # repeat with no change resends neither its clear nor combat off.
+        self._split_hold: tuple | None = None
+        # The attacker a cornered pack-split fights (no retreat square):
+        # fought until it dies or is more than 4 tiles off, so an opening
+        # square does not flip her back to retreating mid-fight.
+        self._cornered_target = 0
+        # Targets a cornered fight has been logged for, once each.
+        self._cornered_logged: set[int] = set()
+        # Since when a cornered split has held with no step (0: not).
+        self._cornered_hold_since = 0.0
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
         # A new walk starts no escape of an earlier one.
         self._escaping = False
+        self._cornered_target = 0
+        self._cornered_logged.clear()
+        self._cornered_hold_since = 0.0
+        self._split_hold = None
 
     async def _bypass_pack_blocked_exit(
             self, client: AtrinikClient) -> bool:
@@ -4772,13 +4820,16 @@ class NavigateThenTask(BotTask):
 
     async def _retreat_step(self, client: AtrinikClient, threats,
                             *, avoid_backtrack: bool = False,
-                            gain_only: bool = False) -> bool:
+                            gain_only: bool = False,
+                            probe: bool = False) -> bool:
         """Take one authored-walkable step away from the visible pack.
 
         While a step is in flight it waits for it (_retreat_step_pending)
         and answers True. ``gain_only`` takes only a step that increases
         her separation from the nearest threat: an equal-distance step can
         shuffle between two squares beside a creature that stands still.
+        ``probe`` sends nothing: it answers whether there is a step to take
+        (or one in flight), so a caller can tell she is cornered.
         """
         m = client.state.map
         now = time.monotonic()
@@ -4830,8 +4881,8 @@ class NavigateThenTask(BotTask):
                 (int(escape_depth >= 2), minimum, point, reverses,
                  escape_depth, escape_area, trail_score, sum(distances),
                  direction))
-        if not candidates:
-            return False
+        if not candidates or probe:
+            return bool(candidates)
         # Progress towards the way out (_way_out), measured only once a
         # step exists: 1 closer to where her route leaves this map, 0 as
         # close (or no way out known), -1 farther, -2 cut off from it. With
@@ -5042,6 +5093,125 @@ class NavigateThenTask(BotTask):
                             node.walkable(*point, allow_locked=allow_locked)):
                         self.navigation._threat_blocked.add(point)
 
+    async def _cornered_split(self, client: AtrinikClient, nearby):
+        """The attacker to fight when a pack split has no retreat step.
+
+        None while a step that gains distance exists (or one is in
+        flight): the split retreats. With none she is cornered, and the closest attacker is
+        fought (the farm's cornered breakout does the same): one beside
+        her, or one farther off only while she is being hit; otherwise she
+        holds (None) and lets them come to her, for at most
+        CORNERED_HOLD_SECONDS, then fights the nearest, on for as long as she
+        stays cornered and overwhelmed. The one she fights stays
+        her target (``_cornered_target``) until it dies or is more than 4
+        tiles off, so a square opening mid-fight, or the step she takes
+        toward one farther off, does not turn her back into a combat-off
+        retreat. Off her side it stays her target only while no other
+        attacker is beside her and it is still hitting her (_hit_by).
+        Live (2026-11-24, the Old Outpost): boxed in by walls on five sides beside two stone giants
+        and a lava golem, she turned combat off twice a second and never
+        swung.
+        """
+        latched = next((threat for threat in nearby
+                        if threat[3].target_id == self._cornered_target),
+                       None)
+        if latched is not None and latched[0] > 1 and (
+                any(threat[0] <= 1 for threat in nearby) or
+                not self._hit_by(client, latched[3])):
+            # Off her side, it stays her target only while nothing else is
+            # beside her and it (its kind: hit text names no individual)
+            # is still hitting her.
+            latched = None
+        if latched is None:
+            self._cornered_target = 0
+            # Cornered means no step that gains distance: an equal-distance
+            # one only shuffles her beside the pack, combat off.
+            if await self._retreat_step(
+                    client, nearby, avoid_backtrack=True, gain_only=True,
+                    probe=True):
+                self._cornered_hold_since = 0.0
+                return None
+        target = latched or min(nearby, key=lambda threat: threat[0])
+        if (latched is None and target[0] > 1 and
+                not recent_hostile_contact(client, 3.0)):
+            # Holding, combat off, to let them come; not for longer than
+            # CORNERED_HOLD_SECONDS, or two that never approach would hold
+            # her there for ever.
+            now = time.monotonic()
+            if not self._cornered_hold_since:
+                self._cornered_hold_since = now
+            if now - self._cornered_hold_since < self.CORNERED_HOLD_SECONDS:
+                return None
+            # An expired hold stays expired while she stays cornered and
+            # overwhelmed: she fights on rather than hold another bound.
+        if target[3].target_id != self._cornered_target:
+            self._cornered_target = target[3].target_id
+        if target[3].target_id not in self._cornered_logged:
+            self._cornered_logged.add(target[3].target_id)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("navigation-cornered-fight",
+                         f"target={target[3].target_id} nearby={len(nearby)}")
+        return target
+
+    @staticmethod
+    def _hit_by(client: AtrinikClient, obj) -> bool:
+        """Whether hit text of the last 3 s names this creature's kind;
+        any hostile contact counts when none names a kind."""
+        if not recent_hostile_contact(client, 3.0):
+            return False
+        attackers = recent_hostile_attackers(client, seconds=3.0)
+        if not attackers:
+            return True
+        names = {FarmTask._kind_key(obj.name),
+                 FarmTask._kind_key(map_object_visual_name(client, obj))}
+        names.discard("")
+        return any(FarmTask._kind_key(attacker) in names
+                   for attacker in attackers)
+
+    def _outclassed_ids(self, client: AtrinikClient, threats) -> set[int]:
+        """Threats far below her level, which count toward no pack.
+
+        One is outclassed when its authored level (the world graph's, for
+        this map and the maps tiled to it) is known and more than
+        OUTCLASSED_LEVEL_GAP below hers. An unknown level always counts, as
+        does a monster whose spawn rerolls its level from the map's
+        difficulty (WorldGraph.level_rerolled) and an authored caster of
+        the map. OUTCLASSED_PACK or more of them within 4 tiles count
+        again: none is outclassed then.
+        Live (2026-11-24, the Old Outpost): Sera at level 37 shuffled for
+        14 minutes between two squares beside four level 16 lava golems,
+        and stood boxed in beside two level 17 stone giants, combat off,
+        because two within four tiles made her split the pack; 100 of
+        their 102 attacks missed.
+        """
+        player_level = int(client.state.stats.get("level", 0) or 0)
+        resolver = getattr(self.navigation.graph, "monster_level", None)
+        if resolver is None or player_level <= self.OUTCLASSED_LEVEL_GAP:
+            return set()
+        m = client.state.map
+        graph = self.navigation.graph
+        rerolled = getattr(graph, "level_rerolled", None)
+        node = getattr(graph, "nodes", {}).get(m.path)
+        # Casters of this map and of the maps tiled to it, as for levels.
+        casters = area_caster_identities(node, tiled_neighbours(graph, node))
+        outclassed = set()
+        for threat in threats:
+            obj = threat[3]
+            visual = map_object_visual_name(client, obj)
+            if ({WorldGraph._semantic_name(obj.name),
+                 WorldGraph._semantic_name(visual)} & casters or
+                    (rerolled is not None and
+                     rerolled(obj.name, visual, map_path=m.path))):
+                continue
+            level = resolver(obj.name, visual, map_path=m.path)
+            if 0 < level < player_level - self.OUTCLASSED_LEVEL_GAP:
+                outclassed.add(obj.target_id)
+        if sum(threat[0] <= 4 and threat[3].target_id in outclassed
+               for threat in threats) >= self.OUTCLASSED_PACK:
+            return set()
+        return outclassed
+
     async def _defend_while_navigating(self, client: AtrinikClient,
                                        *, own_walk: bool = False) -> bool:
         """Pause an encounter approach to heal or clear an aggroed pack.
@@ -5148,7 +5318,13 @@ class NavigateThenTask(BotTask):
         if committed_id and committed is None:
             self._last_pull_target = 0
         nearby = [threat for threat in threats if threat[0] <= 4]
-        pull_pack = [threat for threat in threats if threat[0] <= 6]
+        # Pack counts leave out creatures far below her (_outclassed_ids);
+        # she still fights them, one at a time.
+        outclassed = self._outclassed_ids(client, threats)
+        pull_pack = [threat for threat in threats if threat[0] <= 6 and
+                     threat[3].target_id not in outclassed]
+        # The pack-split hold of the last tick, if this tick repeats it.
+        split_held, self._split_hold = self._split_hold, None
         # Travel is not farming. Off the destination map, combat is the last
         # resort: only when something is hitting her and she has not moved
         # for a while (or has no route at all). Otherwise she keeps
@@ -5193,7 +5369,8 @@ class NavigateThenTask(BotTask):
         ratio = hp / maxhp
         # Without a verified area-control option, never begin or continue
         # fighting two nearby enemies. Split them before committing to one.
-        overwhelmed = len(nearby) >= 2
+        overwhelmed = sum(threat[3].target_id not in outclassed
+                          for threat in nearby) >= 2
         # A healthy character may reserve a deliberate training finisher
         # before a routine heal. FarmTask applies its stricter 80% health gate;
         # below that, survival immediately wins and normal melee remains free
@@ -5265,8 +5442,10 @@ class NavigateThenTask(BotTask):
             nearest = committed or min(
                 manageable, key=lambda value: value[0], default=None)
             nearby = [threat for threat in manageable if threat[0] <= 4]
-            pull_pack = [threat for threat in manageable if threat[0] <= 6]
-            overwhelmed = len(nearby) >= 2
+            pull_pack = [threat for threat in manageable if threat[0] <= 6 and
+                         threat[3].target_id not in outclassed]
+            overwhelmed = sum(threat[3].target_id not in outclassed
+                              for threat in nearby) >= 2
             # Visible high-level wildlife is removed from routine road combat.
             # Within likely approach range, its tile halo also becomes a live
             # path obstacle. Actual retreat is reserved for melee range or an
@@ -5314,10 +5493,21 @@ class NavigateThenTask(BotTask):
                     await self._retreat_step(
                         client, dangerous, avoid_backtrack=True)
                 return True
+        if not overwhelmed or not any(
+                threat[3].target_id == self._cornered_target
+                for threat in nearby):
+            # A cornered fight ends with the pack split or its target.
+            self._cornered_target = 0
+        if not overwhelmed:
+            self._cornered_hold_since = 0.0
         pack_offensive = (self.task.primary_combat_spell(client)
                           if isinstance(self.task, FarmTask) else None)
         if (safe and nearest is not None and nearest[0] > 2 and
-                len(pull_pack) >= 2 and (pack_offensive is None or hold_fire)):
+                len(pull_pack) >= 2 and
+                (pack_offensive is None or hold_fire) and
+                not self._cornered_target):
+            # A cornered fight at range is not turned into a pack avoidance
+            # (combat off, replan) between its own ticks.
             if await self._bypass_pack_blocked_exit(client):
                 return False
             node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
@@ -5392,26 +5582,48 @@ class NavigateThenTask(BotTask):
         # A critical escape that found no step gaining distance skips it too:
         # its equal-distance steps shuffled her beside a troll, combat off,
         # and the cornered defence below fights instead.
-        if not escape_due and (
-                # A heal waiting for her action timer holds even then: a
-                # fight below would restart the timer it waits for.
-                (not safe and (not starving_without_food(client) or
-                               heal_waiting(client))) or
-                (overwhelmed and not hold_fire)):
+        # A heal waiting for her action timer holds even then: a fight
+        # below would restart the timer it waits for.
+        safety_hold = not safe and (not starving_without_food(client) or
+                                    heal_waiting(client))
+        split = overwhelmed and not hold_fire and not safety_hold
+        cornered = None
+        if split and not escape_due:
+            cornered = await self._cornered_split(client, nearby)
+        if cornered is not None:
+            if safety_action_issued:
+                # A heal or meal just sent: the fight below would clear it.
+                return True
+            # Cornered (no retreat square): the fight below, at the
+            # attacker beside her, rather than combat off every tick with
+            # nowhere to go.
+            nearest = cornered
+        elif not escape_due and (safety_hold or split):
             if safety_action_issued:
                 # FIRE/APPLY was just sent by SafetyPolicy. Clearing in this
                 # same tick cancels it and creates an endless heal/food retry
                 # loop at a fixed coordinate.
                 return True
             self._defending = True
-            await client.clear_actions()
-            await client.set_combat(False)
+            hold = (m.path, m.world_x, m.world_y,
+                    frozenset(threat[3].target_id for threat in nearby))
+            if not split or split_held != hold:
+                await client.clear_actions()
+                await client.set_combat(False)
+            elif getattr(client.state, "combat", False):
+                # The same split hold as last tick: nothing to clear again,
+                # and combat off only if something turned it back on.
+                await client.set_combat(False)
+            if split:
+                self._split_hold = hold
             if nearby and time.monotonic() - self._last_defense_action >= 0.30:
                 # A pack-splitting step must not immediately reverse on an
                 # equal-distance plateau. Route following and the next safety
                 # tick otherwise alternate forever between the same squares.
+                # A split takes only a step that gains distance, the kind
+                # whose absence makes her cornered (_cornered_split).
                 await self._retreat_step(
-                    client, nearby, avoid_backtrack=True)
+                    client, nearby, avoid_backtrack=True, gain_only=split)
             return True
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.

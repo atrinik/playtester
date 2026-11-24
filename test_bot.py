@@ -12801,7 +12801,10 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task._retreat_attempt = (*first_attempt[:3], 0)
         asyncio.run(task.tick(client))
         self.assertIn(first_attempt[:3], task._retreat_blocked)
-        self.assertGreaterEqual(len(client.direct_moves), 2)
+        # The only step that gained distance is learned blocked; the rest
+        # keep a kobold beside her, so she is cornered and fights.
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertEqual(client.combat[-1], True)
 
     def test_resupply_navigation_splits_two_healthy_threats(self):
         client = self._combat_client()
@@ -12897,7 +12900,423 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             time.time(), 2, "cc66ff", "kobold chief hit you for 4 damage.")]
         self._corner(task, client)
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertEqual(calls, [{"avoid_backtrack": True}])
+        # A probe (is there a step?) comes first; it sends nothing.
+        self.assertEqual(calls, [{"avoid_backtrack": True, "gain_only": True,
+                                  "probe": True},
+                                 {"avoid_backtrack": True, "gain_only": True}])
+
+    def _outpost_box(self, *, golem_level=0, giant_level=0, level=37):
+        """Live shape (2026-11-24, the Old Outpost upper-middle room): she
+        stands at (16, 6), walls on five sides, two stone giant master
+        guards west and south-west, a lava golem south, and they hit her."""
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x, client.state.map.world_y = 16, 6
+        client.state.stats.update(hp=330, maxhp=330, level=level)
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        for target_id, (wx, wy), name in (
+                (801, (15, 6), "stone giant master guard"),
+                (802, (15, 7), "stone giant master guard"),
+                (803, (16, 7), "lava golem")):
+            client.state.map.tile(8 + wx - 16, 8 + wy - 6).objects[3] = (
+                MapObject(3, 1, 0, 0, name=name, target_id=target_id,
+                          target_hp=100))
+        node = MapNode(path="/outpost", width=24, height=24)
+        node.terrain = {(x, y): 1 for x in range(24) for y in range(24)}
+        for wall in ((15, 5), (16, 5), (17, 5), (17, 6), (17, 7)):
+            node.blocked.add(wall)
+        client.state.map.path = "/outpost"
+        graph = WorldGraph()
+        graph.nodes = {"/outpost": node,
+                       "/pool": MapNode(path="/pool", width=24, height=24)}
+        if giant_level:
+            graph.monster_levels["stone giant master guard"] = giant_level
+        if golem_level:
+            graph.monster_levels["lava golem"] = golem_level
+        task = NavigateThenTask(
+            graph, "/pool", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task._trail = [("/outpost", 9, 9), ("/outpost", 16, 6)]
+        return client, node, task
+
+    def _hit(self, client, name="stone giant master guard"):
+        client.state.messages = [(
+            time.time(), 2, "cc66ff", f"{name} hit you for 9 damage.")]
+
+    def test_cornered_pack_split_fights_instead_of_combat_off(self):
+        """Boxed in with no retreat square, two of a pack beside her (of
+        unknown level, so they count as a pack): she fights the attacker
+        beside her rather than turning combat off every tick."""
+        client, node, task = self._outpost_box()
+        self.assertTrue(all(not node.walkable(16 + dx, 6 + dy)
+                            for dx, dy in ((-1, -1), (0, -1), (1, -1),
+                                           (1, 0), (1, 1))))
+        for _ in range(4):
+            self._hit(client)
+            self._corner(task, client)
+            task._last_defense_action = 0.0
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertNotIn(False, client.combat)
+        self.assertEqual(client.combat[-1], True)
+        fought = client.targets[-1][2]
+        self.assertIn(fought, (801, 802, 803))
+        self.assertEqual({target for _, _, target in client.targets},
+                         {fought})
+        self.assertEqual(
+            [action for action, _ in client.decisions].count(
+                "navigation-cornered-fight"), 1)
+
+    def test_cornered_fight_holds_its_target_when_a_square_opens(self):
+        """Once fighting cornered, a square opening beside her does not
+        flip her back to a combat-off retreat while that attacker stays."""
+        client, node, task = self._outpost_box()
+        self._hit(client)
+        self._corner(task, client)
+        asyncio.run(task._defend_while_navigating(client))
+        fought = client.targets[-1][2]
+        node.blocked.discard((17, 6))
+        self._hit(client)
+        self._corner(task, client)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertNotIn(False, client.combat)
+        self.assertEqual(client.targets[-1][2], fought)
+
+    def test_cornered_fight_at_range_does_not_step_back_into_the_corner(self):
+        """Cornered at a corridor's dead end with the pack two and three
+        tiles off and hitting her: she closes on the nearest and goes on
+        fighting it once her step has opened a retreat square behind her."""
+        client, node, task = self._outpost_box()
+        client.state.map.tiles.clear()
+        client.state.map.world_x, client.state.map.world_y = 16, 3
+        node.blocked.clear()
+        node.terrain = {(16, y): 1 for y in range(3, 11)}
+        for target_id, wy in ((801, 5), (802, 6)):
+            client.state.map.tile(8, 8 + wy - 3).objects[3] = MapObject(
+                3, 1, 0, 0, name="stone giant master guard",
+                target_id=target_id, target_hp=100)
+        task._trail = [("/outpost", 16, 4), ("/outpost", 16, 3)]
+        self._hit(client)
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.targets[-1][2], 801)
+        self.assertEqual(client.combat, [True])
+        # Her step toward it lands: (16, 3) behind her would now be a
+        # retreat square, but she keeps fighting the one she chose.
+        client.state.map.world_y = 4
+        client.state.map.tiles.clear()
+        for target_id, wy in ((801, 5), (802, 6)):
+            client.state.map.tile(8, 8 + wy - 4).objects[3] = MapObject(
+                3, 1, 0, 0, name="stone giant master guard",
+                target_id=target_id, target_hp=100)
+        task._combat_attempt = None
+        self._hit(client)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertNotIn(False, client.combat)
+        self.assertEqual(client.targets[-1][2], 801)
+        self.assertEqual(client.direct_moves[1:], [])
+
+    def test_cornered_target_off_her_side_yields_to_one_beside_her(self):
+        """Latched on a giant that steps back two tiles while the golem
+        beside her goes on hitting: she turns on the golem."""
+        client, node, task = self._outpost_box()
+        self._hit(client)
+        self._corner(task, client)
+        task._cornered_target = 801
+        client.state.map.tiles.clear()
+        for target_id, (wx, wy), name in (
+                (801, (14, 6), "stone giant master guard"),
+                (802, (14, 8), "stone giant master guard"),
+                (803, (16, 7), "lava golem")):
+            client.state.map.tile(8 + wx - 16, 8 + wy - 6).objects[3] = (
+                MapObject(3, 1, 0, 0, name=name, target_id=target_id,
+                          target_hp=100))
+        node.blocked.update({(15, 6), (15, 7)})
+        self._hit(client, "lava golem")
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.targets[-1][2], 803)
+        self.assertEqual(task._cornered_target, 803)
+
+    def test_outclassed_pack_does_not_split_her(self):
+        """At level 37 two of the Old Outpost's level 17 giants are no
+        pack: with a retreat square open she fights them."""
+        client, node, task = self._outpost_box(golem_level=16, giant_level=17)
+        node.blocked.clear()  # open room: a retreat square exists
+        client.state.map.tile(8, 9).objects.clear()  # the golem is gone
+        self._hit(client)
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.combat, [True])
+        self.assertNotIn("navigation-cornered-fight",
+                         [action for action, _ in client.decisions])
+
+    def _exit_room(self, *, golem_level, level=37):
+        """Live shape (2026-11-24): the Old Outpost exit room, four lava
+        golems within four tiles, one of them hitting her."""
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.path = "/outpost"
+        client.state.map.world_x, client.state.map.world_y = 5, 19
+        client.state.stats.update(hp=330, maxhp=330, level=level)
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        for target_id, (vx, vy) in ((901, (9, 8)), (902, (10, 10)),
+                                     (903, (6, 9)), (904, (8, 12))):
+            client.state.map.tile(vx, vy).objects[3] = MapObject(
+                3, 1, 0, 0, name="lava golem", target_id=target_id,
+                target_hp=100)
+        node = MapNode(path="/outpost", width=24, height=24)
+        node.terrain = {(x, y): 1 for x in range(1, 9) for y in range(15, 24)}
+        graph = WorldGraph()
+        graph.nodes = {"/outpost": node,
+                       "/pool": MapNode(path="/pool", width=24, height=24)}
+        graph.monster_levels["lava golem"] = golem_level
+        task = NavigateThenTask(
+            graph, "/pool", BuyGroundItemsTask(r"^staple food$", 5),
+            combat_approach=True)
+        task._trail = [("/outpost", 4, 24), ("/outpost", 5, 19)]
+        return client, task
+
+    def test_exit_room_golems_far_below_her_are_fought_not_shuffled(self):
+        client, task = self._exit_room(golem_level=16)
+        # Two within 4 tiles, the other two farther off.
+        m = client.state.map
+        for (old_x, old_y), (new_x, new_y) in (((10, 10), (13, 8)),
+                                               ((8, 12), (8, 13))):
+            m.tile(new_x, new_y).objects[3] = m.tile(old_x, old_y).objects.pop(3)
+        for _ in range(6):
+            self._hit(client, "lava golem")
+            self._corner(task, client)
+            task._last_defense_action = 0.0
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertNotIn(False, client.combat)
+        self.assertEqual(client.targets[-1][2], 901)
+
+    def test_exit_room_golems_near_her_level_still_split(self):
+        """A pack within OUTCLASSED_LEVEL_GAP of her still splits: she
+        retreats with combat off, as before."""
+        client, task = self._exit_room(golem_level=30)
+        self._hit(client, "lava golem")
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.combat, [False])
+        self.assertEqual(client.targets, [])
+        self.assertEqual(len(client.direct_moves), 1)
+        # Unknown levels count too.
+        client, task = self._exit_room(golem_level=0)
+        self._hit(client, "lava golem")
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.combat, [False])
+        self.assertEqual(len(client.direct_moves), 1)
+
+    def test_three_outclassed_within_four_tiles_are_a_pack_again(self):
+        """Four level 16 golems within 4 tiles are a pack for her at level
+        37 (OUTCLASSED_PACK): she splits them, combat off."""
+        client, task = self._exit_room(golem_level=16)
+        self._hit(client, "lava golem")
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.combat, [False])
+        self.assertEqual(client.targets, [])
+        self.assertEqual(len(client.direct_moves), 1)
+
+    def test_an_authored_caster_is_never_outclassed(self):
+        client, task = self._exit_room(golem_level=16)
+        threats = [(1, 9, 8, client.state.map.tile(9, 8).objects[3]),
+                   (2, 6, 9, client.state.map.tile(6, 9).objects[3])]
+        self.assertEqual(task._outclassed_ids(client, threats), {901, 903})
+        task.navigation.graph.nodes["/outpost"].caster_identities.add(
+            "lava golem")
+        self.assertEqual(task._outclassed_ids(client, threats), set())
+
+    def test_a_spawn_rerolled_from_map_difficulty_is_never_outclassed(self):
+        """world_2_67_-2 (difficulty 60) spawns ghouls authored at a low
+        level with item_condition: the server rerolls their level from the
+        map's difficulty, so at level 37 she does not discount them."""
+        graph = built_graph()
+        path = "/shattered_islands/world_2_67_-2"
+        self.assertTrue(graph.level_rerolled("ghoul", map_path=path))
+        self.assertFalse(graph.level_rerolled(
+            "ghoul", map_path="/shattered_islands/world_3_69"))
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.path = path
+        client.state.stats["level"] = 37
+        ghoul = MapObject(3, 1, 0, 0, name="ghoul", target_id=950,
+                          target_hp=100)
+        client.state.map.tile(9, 8).objects[3] = ghoul
+        task = NavigateThenTask(
+            graph, "/shattered_islands/world_3_69",
+            BuyGroundItemsTask(r"^staple food$", 5), combat_approach=True)
+        self.assertLess(graph.monster_level("ghoul", map_path=path), 27)
+        self.assertEqual(task._outclassed_ids(client, [(1, 9, 8, ghoul)]),
+                         set())
+
+    def test_exit_room_near_level_pack_with_only_level_steps_is_fought(self):
+        """Against the west wall of the exit room between two level 30
+        golems, every step keeps one of them beside her: no step gains
+        distance, so she fights instead of shuffling with combat off."""
+        client, task = self._exit_room(golem_level=30)
+        m = client.state.map
+        m.tiles.clear()
+        m.world_x, m.world_y = 1, 16
+        for target_id, (wx, wy) in ((901, (2, 15)), (902, (2, 17))):
+            m.tile(8 + wx - 1, 8 + wy - 16).objects[3] = MapObject(
+                3, 1, 0, 0, name="lava golem", target_id=target_id,
+                target_hp=100)
+        task._trail = [("/outpost", 1, 17), ("/outpost", 1, 16)]
+        for _ in range(4):
+            self._hit(client, "lava golem")
+            self._corner(task, client)
+            task._last_defense_action = 0.0
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertNotIn(False, client.combat)
+        self.assertEqual(
+            [action for action, _ in client.decisions].count(
+                "navigation-cornered-fight"), 1)
+
+    def test_pack_split_takes_the_gaining_step_not_a_sideways_one(self):
+        """The split's step is the kind the cornered probe looks for: one
+        that gains distance (an alcove behind her), never an open square
+        to the side that keeps the golem beside her."""
+        client, task = self._exit_room(golem_level=30)
+        m = client.state.map
+        m.tiles.clear()
+        m.world_x, m.world_y = 10, 10
+        node = task.navigation.graph.nodes["/outpost"]
+        node.terrain = {(x, y): 1 for x in range(10, 16)
+                        for y in range(10, 15)}
+        node.terrain[(9, 9)] = 1
+        for target_id, (wx, wy) in ((901, (11, 10)), (902, (12, 12))):
+            m.tile(8 + wx - 10, 8 + wy - 10).objects[3] = MapObject(
+                3, 1, 0, 0, name="lava golem", target_id=target_id,
+                target_hp=100)
+        task._trail = [("/outpost", 10, 11), ("/outpost", 10, 10)]
+        self._hit(client, "lava golem")
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]],
+                         (-1, -1))
+
+    def test_a_caster_across_a_seam_is_never_outclassed(self):
+        client, task = self._exit_room(golem_level=16)
+        graph = task.navigation.graph
+        threats = [(1, 9, 8, client.state.map.tile(9, 8).objects[3]),
+                   (2, 6, 9, client.state.map.tile(6, 9).objects[3])]
+        neighbour = MapNode(path="/outpost_east", width=24, height=24)
+        neighbour.caster_identities.add("lava golem")
+        graph.nodes["/outpost_east"] = neighbour
+        with patch("atrinik_bot.navigation.tiled_neighbours",
+                   return_value={(1, 0): neighbour}):
+            self.assertEqual(task._outclassed_ids(client, threats), set())
+        self.assertEqual(task._outclassed_ids(client, threats), {901, 903})
+
+    def test_cornered_hit_text_matches_a_visual_kind(self):
+        client, task = self._exit_room(golem_level=30)
+        golem = client.state.map.tile(9, 8).objects[3]
+        golem.name = ""
+        client.faces = {}
+        with patch("atrinik_bot.navigation.map_object_visual_name",
+                   return_value="lava_golem.111"):
+            self._hit(client, "Lava golem")
+            self.assertTrue(task._hit_by(client, golem))
+            self._hit(client, "stone giant master guard")
+            self.assertFalse(task._hit_by(client, golem))
+
+    def test_a_stale_cornered_target_does_not_block_pack_avoidance(self):
+        client, task = self._exit_room(golem_level=30)
+        m = client.state.map
+        m.tiles.clear()
+        for target_id, (vx, vy) in ((901, (12, 8)), (902, (3, 8))):
+            m.tile(vx, vy).objects[3] = MapObject(
+                3, 1, 0, 0, name="lava golem", target_id=target_id,
+                target_hp=100)
+        # Locked on the golem four tiles off, though she is no longer
+        # overwhelmed (only it is within 4): the lock is stale.
+        task._cornered_target = 901
+        client.state.messages = []
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task._cornered_target, 0)
+        self.assertIn("navigation-pack-avoid",
+                      [action for action, _ in client.decisions])
+
+    def test_a_cornered_hold_fights_after_its_bound(self):
+        """Two golems that never come closer, two and three tiles off at a
+        dead end, nothing hitting her: she holds, combat off, for
+        CORNERED_HOLD_SECONDS, then fights the nearest."""
+        client, task = self._exit_room(golem_level=30)
+        m = client.state.map
+        m.tiles.clear()
+        m.world_x, m.world_y = 1, 15
+        node = task.navigation.graph.nodes["/outpost"]
+        node.terrain = {(1, y): 1 for y in range(15, 24)}
+        for target_id, wy in ((901, 17), (902, 18)):
+            m.tile(8, 8 + wy - 15).objects[3] = MapObject(
+                3, 1, 0, 0, name="lava golem", target_id=target_id,
+                target_hp=100)
+        task._trail = [("/outpost", 1, 16), ("/outpost", 1, 15)]
+        client.state.messages = []
+        task.navigation.destination = "/outpost"  # fights on this map
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.0):
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.0 + task.CORNERED_HOLD_SECONDS - 1):
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(client.targets, [])
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.0 + task.CORNERED_HOLD_SECONDS):
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        self.assertEqual(client.combat[-1], True)
+        self.assertEqual(client.targets[-1][2], 901)
+        # Half a second on, the same far golems, still not hitting her: the
+        # bound stays spent and she fights on.
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.5 + task.CORNERED_HOLD_SECONDS):
+            self.assertEqual(asyncio.run(task._cornered_split(
+                client, [(2, 8, 10, m.tile(8, 10).objects[3]),
+                         (3, 8, 11, m.tile(8, 11).objects[3])]))[3].target_id,
+                901)
+
+    def test_repeated_pack_split_hold_is_not_resent(self):
+        """While her split step is in flight and nothing changes, the hold
+        resends neither its clear nor combat off every tick."""
+        client, task = self._exit_room(golem_level=30)
+        self._hit(client, "lava golem")
+        self._corner(task, client)
+        asyncio.run(task._defend_while_navigating(client))
+        clears, combat = client.clears, list(client.combat)
+        self.assertEqual(len(client.direct_moves), 1)
+        for _ in range(5):
+            self._hit(client, "lava golem")
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        self.assertEqual(client.clears, clears)
+        self.assertEqual(client.combat, combat)
+        self.assertEqual(len(client.direct_moves), 1)
+        # Turned back on meanwhile, combat goes off again.
+        client.state.combat = True
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertEqual(client.combat, combat + [False])
 
     def test_maintenance_travel_avoids_overlevelled_wildlife(self):
         client = self._combat_client()

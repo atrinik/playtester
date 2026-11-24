@@ -1712,6 +1712,70 @@ frame with its tiled neighbours, the neighbours' spawns counted as
 uncleared, so its danger, pack filter and safety score agree with this.
 Then this post-adjustment goes.
 
+## Packs on a walk: cornered and outclassed (2026-11-24)
+
+Live (v1.101.0, the Old Outpost on the mana-crystal errand) Sera at level
+37 stood 14 minutes among the Outpost's level 12-24 residents without
+fighting: four level 16 lava golems in the exit room, then boxed in at
+(16, 6) by walls on five sides, two level 17 stone giant master guards
+and a lava golem. Two hostiles within 4 tiles made the walk's defence
+(`NavigateThenTask._defend_while_navigating`, which the farm circuit's
+legs also use) split the pack: clear, combat off and a retreat step,
+twice a second. With no retreat square it did nothing else, so the fight
+below it was never reached; 100 of the 102 attacks on her missed.
+
+- **Outclassed creatures are no pack.** A hostile whose authored level
+  (the world graph's, for this map and the maps tiled to it) is more than
+  `OUTCLASSED_LEVEL_GAP` (10) below hers counts toward neither the
+  pack split (two within 4 tiles) nor the pack avoidance and pack pull
+  (two within 6). She still fights it, one at a time, and it still counts
+  as a threat for retreats, halos and the critical escape. Never
+  outclassed: a creature of unknown level; an authored caster of the map
+  or of a map tiled to it (`area_caster_identities`); and a monster whose spawn rerolls its level
+  from the map's difficulty (`item_condition`, server `spawn_point.c`;
+  `WorldGraph.level_rerolled`), whose authored level says nothing (the
+  difficulty 60 world_2_67_-2 spawns ghouls authored at a low level).
+  `OUTCLASSED_PACK` (3) or more outclassed creatures within 4 tiles are a
+  pack again: then none is outclassed. The protections against dangerous
+  packs stand: creatures 4 or more levels above her are avoided as before,
+  and two within the gap still split.
+- **Cornered, she fights.** Cornered is a pack split with no retreat step
+  that gains distance from the nearest attacker (`_retreat_step` with
+  `probe` and `gain_only`, which sends nothing): an equal-distance step
+  only shuffles her beside the pack with combat off. The split's own
+  step is likewise one that gains distance, even into an alcove over an
+  open square to the side. Without one she fights the
+  closest attacker (`_cornered_split`, recorded once per creature as
+  `navigation-cornered-fight`), as the farm's cornered breakout does: one
+  beside her, or one farther off only while she is being hit (else she
+  holds, combat off, and lets them come, for at most
+  `CORNERED_HOLD_SECONDS` (8 s) of such a hold, after which she fights
+  the nearest and goes on fighting while she stays cornered and
+  overwhelmed; the hold's clock restarts only when a gaining step
+  appears, when she is no longer overwhelmed, and on a new walk). The attacker she fights stays
+  her target until it dies or is more than 4 tiles off, so a square
+  opening mid-fight, or her step toward one farther off, does not turn her
+  back into a combat-off retreat. Off her side it stays her target only
+  while no other attacker is beside her and hit text of the last 3 s names
+  its kind, by name or visual name, case, underscores and word order
+  aside (hit text names no individual, so another of the same kind
+  hitting her also holds it; with no name in the text any hit does). The
+  target is dropped as soon as she is no longer overwhelmed or it is not
+  within 4 tiles; until then the pack avoidance (combat off and a replan)
+  does not interrupt that fight. The safety's low-health hold and the critical
+  escape still come first.
+- **No resent hold.** A pack split that repeats the last tick's (same
+  square, same creatures within 4 tiles) sends neither its clear nor
+  combat off again, unless combat was turned back on meanwhile; a retreat
+  step in flight is waited for, as before.
+
+Accepted limits: the level gap reads authored levels only, not her
+equipment or theirs; a pack split that does find a gaining step still
+retreats with combat off, stepping again each time the pack closes in;
+the farm map's own pack split (`farm-pack-split` in `FarmTask`) has no
+authored levels and still counts every active threat, with its cornered
+breakout unchanged.
+
 ## Approach danger: known limitations
 
 Since analyzer v3.10.0, autoplay prefers spots whose approach from her
