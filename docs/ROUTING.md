@@ -346,6 +346,30 @@ Dungeon maps are never pack hazards, however dense: Underground City
   (`navigation.py:2696-2697`), a seam with no remaining crossing
   (`navigation.py:2570-2580`) and an exit held by a pack for 15 s
   (`NavigateThenTask._bypass_pack_blocked_exit`, `navigation.py:2769-2800`).
+  A pack-held exit is excluded only while the static graph still joins her
+  to the destination without it: the last way on is kept, recorded once as
+  `navigation-pack-exit-kept`, and she holds by it, trying again every
+  15 s, for at most 3 minutes in all per exit and trip
+  (`PACK_EXIT_KEEP_SECONDS`); then it is excluded as before. While she
+  holds, the transit defence decides whether she fights; with two or more
+  of the pack near she fights back only with the cornered-fight fix
+  (https://github.com/atrinik/playtester/pull/132), and the 3-minute cap
+  bounds the exposure either way. Live (2026-11-24) a pack beside both Old
+  Outpost stairs down (`old_outpost_0202` (10,18) and (10,19)) got each
+  excluded in turn and the errand failed on "no component route".
+- A plan that fails while live exclusions are what close the graph (it
+  routes without them, not with them; `NavigateTask._wait_for_exclusions`)
+  does not fail the trip the first time: the route is dropped until the
+  first exclusion expiry that reopens it, not an unrelated sooner one
+  (`navigation-exclusion-wait`; at most 300 s),
+  then replanned. This also covers a click that found no path and a voyage
+  NPC that did not answer. It happens once a trip: an edge that fails again
+  fails the trip as before, as does any other plan failure. On the
+  destination map she makes no click toward the goal while waiting.
+- Both checks ask only the static map graph (`WorldGraph.route_open`,
+  cached per start component and inputs): no hazard tier, strict-safety
+  avoidance or owner block. A walled or strict trip whose only allowed way
+  on is held can still have it excluded, and fails as before.
 - `_failed_tile_crossings` (`navigation.py:1673`, filled at `2519`) holds
   seam crossings that stalled, so `_retry_stalled_tile_crossing`
   (`navigation.py:2450-2595`) tries another row or column.

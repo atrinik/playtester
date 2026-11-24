@@ -559,6 +559,12 @@ class ManaCrystalUpgradeTask(BotTask):
     The trip leaves the farm circuit, whose death and recall handling never
     sees it, so it fails itself on a death or emergency recall and after
     MAX_SECONDS; autoplay then waits a day before trying again.
+
+    A dip leg that fails, or an overrun, while she stands on a map with
+    hostile spawns first walks her out with the return leg (_walk_out,
+    at most WALK_OUT_SECONDS; a death or recall still ends it at once),
+    then fails: live, a failed dip left her deep in the Old Outpost and
+    autoplay built a farm circuit from there.
     """
 
     QUEST = "Gandyld's Mana Crystal"
@@ -566,6 +572,7 @@ class ManaCrystalUpgradeTask(BotTask):
     UPGRADED_CAPACITY = 100
     REPORT_WAIT_SECONDS = 6.0
     MAX_SECONDS = 30 * 60
+    WALK_OUT_SECONDS = 10 * 60
     EXAMINE_ATTEMPTS = 3
     GANDYLD_MAP = "/shattered_islands/world_6_58"
 
@@ -582,6 +589,10 @@ class ManaCrystalUpgradeTask(BotTask):
         self._started_at = 0.0
         self._started_epoch = 0.0
         self._examine_attempts = 0
+        # The failure a walk out of a hostile map (_walk_out) ends with, and
+        # when that walk started.
+        self._walk_out_error = ""
+        self._walk_out_started = 0.0
 
     def _part_active(self, client: AtrinikClient) -> bool:
         quest = client.state.quests.get(self.QUEST)
@@ -599,9 +610,42 @@ class ManaCrystalUpgradeTask(BotTask):
                 break
             if record.get("action") in ("death", "emergency-recall"):
                 return f"{record['action']} during the trip"
-        if time.monotonic() - self._started_at > self.MAX_SECONDS:
-            return f"trip took over {self.MAX_SECONDS // 60} minutes"
         return ""
+
+    def _hostile_here(self, client: AtrinikClient) -> bool:
+        path = client.state.map.path
+        return any(not spawn.peaceful
+                   for spawn in self.graph.named_spawns.get(path, ()))
+
+    def _fail_or_walk_out(self, client: AtrinikClient, error: str) -> None:
+        """Fail with ``error``, or first walk out with the return leg when
+        she stands on a map with hostile spawns."""
+        if self._walk_out_error or not self._hostile_here(client):
+            self.fail(error)
+            return
+        self._walk_out_error = error
+        self._walk_out_started = time.monotonic()
+        self.child = self._return_leg()
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("mana-crystal-walk-out",
+                     f"{error}; walking out from {client.state.map.path}")
+
+    async def _walk_out(self, client: AtrinikClient, now: float) -> None:
+        """Run the walk out, then fail with the error that started it."""
+        error = self._walk_out_error
+        if now - self._walk_out_started > self.WALK_OUT_SECONDS:
+            self.fail(f"{error}; the walk out took over "
+                      f"{self.WALK_OUT_SECONDS // 60} minutes")
+            return
+        child = self.child
+        await child.tick(client)
+        if child.status == TaskStatus.FAILED:
+            self.fail(f"{error}; the walk out failed: {child.error}")
+        elif child.status == TaskStatus.COMPLETE:
+            await client.clear_actions()
+            await client.set_combat(False)
+            self.fail(f"{error}; walked out to {client.state.map.path}")
 
     def _return_leg(self) -> NavigateThenTask:
         """Back to Gandyld's map, fighting out of the Old Outpost."""
@@ -627,6 +671,13 @@ class ManaCrystalUpgradeTask(BotTask):
             return
         if client.state.phase != "playing":
             return
+        if self._walk_out_error:
+            await self._walk_out(client, now)
+            return
+        if now - self._started_at > self.MAX_SECONDS:
+            self._fail_or_walk_out(
+                client, f"trip took over {self.MAX_SECONDS // 60} minutes")
+            return
         if not client.state.quests_loaded:
             if now - self._last_request > 1.0:
                 await client.request_quests()
@@ -638,7 +689,12 @@ class ManaCrystalUpgradeTask(BotTask):
         if self.child is not None:
             await self.child.tick(client)
             if self.child.status == TaskStatus.FAILED:
-                self.fail(f"{self.child.name}: {self.child.error}")
+                error = f"{self.child.name}: {self.child.error}"
+                if (isinstance(self.child, NavigateThenTask) and
+                        isinstance(self.child.task, ApplyGroundTask)):
+                    self._fail_or_walk_out(client, error)
+                else:
+                    self.fail(error)
                 return
             if self.child.status != TaskStatus.COMPLETE:
                 return
