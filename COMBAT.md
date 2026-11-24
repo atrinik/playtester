@@ -1620,9 +1620,9 @@ below it was never reached; 100 of the 102 attacks on her missed.
   `navigation-cornered-fight`), as the farm's cornered breakout does: one
   beside her, or one farther off only while she is being hit (else she
   holds, combat off, and lets them come). The
-  attacker she fights beside her stays her target until it dies or leaves
-  her side, so a square opening mid-fight does not turn her back into a
-  combat-off retreat. The safety's low-health hold and the critical
+  attacker she fights stays her target until it dies or is more than 4
+  tiles off, so a square opening mid-fight, or her step toward one
+  farther off, does not turn her back into a combat-off retreat. The safety's low-health hold and the critical
   escape still come first.
 - **No resent hold.** A pack split that repeats the last tick's (same
   square, same creatures within 4 tiles) sends neither its clear nor
@@ -1630,9 +1630,12 @@ below it was never reached; 100 of the 102 attacks on her missed.
   step in flight is waited for, as before.
 
 Accepted limits: the level gap reads authored levels only, not her
-equipment or theirs; the farm map's own pack split (`farm-pack-split` in
-`FarmTask`) has no authored levels and still counts every active threat,
-with its cornered breakout unchanged.
+equipment or theirs; a retreat step that keeps her as close to the
+nearest attacker (still beside it) counts as a way out, so against a
+pack within the gap she may still step sideways with combat off rather
+than fight (retreat scoring is not changed here); the farm map's own
+pack split (`farm-pack-split` in `FarmTask`) has no authored levels and
+still counts every active threat, with its cornered breakout unchanged.
 
 ## Approach danger: known limitations
 

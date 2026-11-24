@@ -12825,6 +12825,41 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertNotIn(False, client.combat)
         self.assertEqual(client.targets[-1][2], fought)
 
+    def test_cornered_fight_at_range_does_not_step_back_into_the_corner(self):
+        """Cornered at a corridor's dead end with the pack two and three
+        tiles off and hitting her: she closes on the nearest and goes on
+        fighting it once her step has opened a retreat square behind her."""
+        client, node, task = self._outpost_box()
+        client.state.map.tiles.clear()
+        client.state.map.world_x, client.state.map.world_y = 16, 3
+        node.blocked.clear()
+        node.terrain = {(16, y): 1 for y in range(3, 11)}
+        for target_id, wy in ((801, 5), (802, 6)):
+            client.state.map.tile(8, 8 + wy - 3).objects[3] = MapObject(
+                3, 1, 0, 0, name="stone giant master guard",
+                target_id=target_id, target_hp=100)
+        task._trail = [("/outpost", 16, 4), ("/outpost", 16, 3)]
+        self._hit(client)
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.targets[-1][2], 801)
+        self.assertEqual(client.combat, [True])
+        # Her step toward it lands: (16, 3) behind her would now be a
+        # retreat square, but she keeps fighting the one she chose.
+        client.state.map.world_y = 4
+        client.state.map.tiles.clear()
+        for target_id, wy in ((801, 5), (802, 6)):
+            client.state.map.tile(8, 8 + wy - 4).objects[3] = MapObject(
+                3, 1, 0, 0, name="stone giant master guard",
+                target_id=target_id, target_hp=100)
+        task._combat_attempt = None
+        self._hit(client)
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertNotIn(False, client.combat)
+        self.assertEqual(client.targets[-1][2], 801)
+        self.assertEqual(client.direct_moves[1:], [])
+
     def test_outclassed_pack_does_not_split_her(self):
         """At level 37 the Old Outpost's level 16-17 giants and golems
         are no pack: boxed in or not, she fights them."""

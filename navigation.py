@@ -4362,9 +4362,9 @@ class NavigateThenTask(BotTask):
         # The pack-split hold of the last tick: (position, nearby ids). A
         # repeat with no change resends neither its clear nor combat off.
         self._split_hold: tuple | None = None
-        # The adjacent attacker a cornered pack-split fights (no retreat
-        # square): fought until it dies or is no longer beside her, so an
-        # opening square does not flip her back to retreating mid-fight.
+        # The attacker a cornered pack-split fights (no retreat square):
+        # fought until it dies or is more than 4 tiles off, so an opening
+        # square does not flip her back to retreating mid-fight.
         self._cornered_target = 0
 
     async def start(self, client: AtrinikClient) -> None:
@@ -4772,26 +4772,28 @@ class NavigateThenTask(BotTask):
         retreats. With none she is cornered, and the closest attacker is
         fought (the farm's cornered breakout does the same): one beside
         her, or one farther off only while she is being hit; otherwise she
-        holds (None) and lets them come to her. The one she
-        fights beside her stays her target (``_cornered_target``) until it
-        dies or leaves her side, so a square opening mid-fight does not
-        turn her back into a combat-off retreat. Live (2026-11-24, the Old
+        holds (None) and lets them come to her. The one she fights stays
+        her target (``_cornered_target``) until it dies or is more than 4
+        tiles off, so a square opening mid-fight, or the step she takes
+        toward one farther off, does not turn her back into a combat-off
+        retreat. Live (2026-11-24, the Old
         Outpost): boxed in by walls on five sides beside two stone giants
         and a lava golem, she turned combat off twice a second and never
         swung.
         """
         latched = next((threat for threat in nearby
-                        if threat[3].target_id == self._cornered_target and
-                        threat[0] <= 1), None)
+                        if threat[3].target_id == self._cornered_target),
+                       None)
         if latched is None:
             self._cornered_target = 0
             if await self._retreat_step(
                     client, nearby, avoid_backtrack=True, probe=True):
                 return None
         target = latched or min(nearby, key=lambda threat: threat[0])
-        if target[0] > 1 and not recent_hostile_contact(client, 3.0):
+        if (latched is None and target[0] > 1 and
+                not recent_hostile_contact(client, 3.0)):
             return None
-        if target[0] <= 1 and target[3].target_id != self._cornered_target:
+        if target[3].target_id != self._cornered_target:
             self._cornered_target = target[3].target_id
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
