@@ -97,6 +97,38 @@ class Tile:
         return [obj for obj in self.objects.values() if obj.target_id]
 
 
+@dataclass(slots=True, frozen=True)
+class TileAnimation:
+    """One MAP2 tile animation (``MAP_EXT_ANIM``): the damage number the
+    server shows on a tile whose living object was hit this round
+    (``ANIM_DAMAGE``, the damage dealt) or the kill marker where something
+    died (``ANIM_KILL``), server ``socket/request.c``. ``x``, ``y`` are
+    world squares on ``map`` at ``depth``; ``at`` is the wall clock."""
+
+    at: float
+    map: str
+    x: int
+    y: int
+    depth: int
+    sub_layer: int
+    kind: int
+    value: int
+
+
+@dataclass(slots=True, frozen=True)
+class PartyVitals:
+    """One party member's health and mana in percent (1 to 100), from
+    ``CMD_PARTY_UPDATE`` or ``CMD_PARTY_WHO`` (server ``party.c``)."""
+
+    name: str
+    hp: int
+    sp: int
+
+
+# The tile animations GameState keeps, newest last.
+MAX_TILE_ANIMATIONS = 512
+
+
 # DRAWINFO channels that carry player chat (constants.CHAT_TYPE_*).
 CHAT_MESSAGE_TYPES = frozenset({3, 4, 5, 7})
 # The markup naming a player, which frames speech on any channel ("[a=#
@@ -129,6 +161,10 @@ class MapState:
     # Actor counts the server would not select, with the monotonic time until
     # which they are no longer offered as targets.
     ignored_targets: dict[int, float] = field(default_factory=dict)
+    # The tile animations of the MAP2 generation being built or last
+    # published: (view x, view y, depth, sub-layer, kind, value). The
+    # client turns them into GameState.tile_animations on publish.
+    animations: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if 0 in self.level_tiles:
@@ -334,6 +370,17 @@ class GameState:
     # asked (monotonic).
     target_request: tuple[int, float, float] = (0, 0.0, 0.0)
     party_name: str = ""
+    # The configured operator character's health and mana percent and when
+    # they arrived (wall clock), while that character shares her party
+    # (CMD_PARTY_UPDATE/WHO). No other member's vitals or name are kept.
+    operator_vitals: tuple[int, int, float] | None = None
+    # Digests of her party members' names (owner_watch.name_digest), in
+    # memory only: a green creature name a member carries may be them.
+    party_member_digests: set[str] = field(default_factory=set)
+    # MAP2 damage and kill tile animations, newest last (TileAnimation),
+    # bounded like ``messages``; positions count from the first ever.
+    tile_animations: list[TileAnimation] = field(default_factory=list)
+    tile_animation_offset: int = 0
     server_version: int = 0
     last_packet_at: float = 0.0
 
@@ -343,6 +390,21 @@ class GameState:
         if excess > 0:
             del self.messages[:excess]
             self.message_offset += excess
+
+    def add_tile_animation(self, animation: TileAnimation) -> None:
+        self.tile_animations.append(animation)
+        excess = len(self.tile_animations) - MAX_TILE_ANIMATIONS
+        if excess > 0:
+            del self.tile_animations[:excess]
+            self.tile_animation_offset += excess
+
+    @property
+    def tile_animation_count(self) -> int:
+        """The position after the newest tile animation."""
+        return self.tile_animation_offset + len(self.tile_animations)
+
+    def tile_animations_since(self, position: int) -> list[TileAnimation]:
+        return self.tile_animations[max(0, position - self.tile_animation_offset):]
 
     @property
     def message_count(self) -> int:

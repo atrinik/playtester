@@ -131,6 +131,9 @@
         <div id="terrain-rates" class="list"><span class="muted">Loading…</span></div>
         <div id="terrain-fights" class="list"></div>
         <p class="muted small">Where she stood in each fight and how it went: the square's feature (corridor, doorway, room or open ground) and reach (how many neighbouring squares a melee attacker could stand on), the most attackers hitting her within 8 seconds, ranged monsters in view and how many a wall covered. Rates weight each day's fights with a 7-day half-life. Recorded only; nothing she does depends on it. Read-only.</p>
+        <div class="row between"><h3>Watching the owner</h3><span id="owner-watch-summary" class="muted small"></span></div>
+        <div id="owner-watch" class="list"><span class="muted">Loading…</span></div>
+        <p class="muted small">How the operator character fights while it is on her map and she is not fighting herself (the watch_owner flag, off by default): where it stood, the monster kinds it hit in order, the most monsters next to it at once, damage numbers on its square and its targets, whether it stepped after a ranged hit, and its health before and after (only while it is in her party). A fight while another player is in view is dropped whole. Recorded only; nothing she does depends on it. Read-only.</p>
         <p class="muted small">Ranked by the farming analyzer from the locked content and Classic experience tables, simulating Sera's live combat stats. Rates are model estimates for comparing spots, not live measurements.</p>
       </div>
 
@@ -218,6 +221,6 @@
     </section>
   </main>
   <div id="toast" role="status"></div>
-  <script src="/app.js?v=38"></script>
+  <script src="/app.js?v=39"></script>
 </body>
 </html>

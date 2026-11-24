@@ -31,6 +31,12 @@
   systemd unit, reads the GitHub App key or holds a JWT or token; no game
   module imports it, and none of them is ever printed, logged or stored.
   The filer never creates labels.
+- Watching the owner (docs/LEARNING_AND_FEEDBACK.md 4.14, `owner_watch.py`)
+  records only the exact operator character, behind the off-by-default
+  `watch_owner` flag, and only while she is not fighting. Other players
+  are positions only and a fight with one in view is dropped; no player's name is
+  stored. Following the owner and rules from what she saw (W2, W3) need a
+  new owner decision.
 - Source modules remain at repository root and CMake assembles the installable
   `atrinik_bot` package with its native extension under `build/`.
 - Keep `dependencies.lock.json`, the atomic compatibility cache installer,

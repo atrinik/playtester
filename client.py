@@ -21,7 +21,8 @@ from . import constants as c
 from .access_codes import normalize_access_code
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
 from .model import (STARTER_APARTMENT, STARTER_APARTMENT_BED, Character, GameState,
-                    InterfaceState, Item, MapObject, MapState)
+                    InterfaceState, Item, MapObject, MapState, PartyVitals,
+                    TileAnimation)
 from .alerts import ProgressWatch
 from .memory import BotMemory
 from .metrics import BotMetrics
@@ -30,6 +31,8 @@ from . import feedback
 from . import feedback_producers
 from .observations import AuthoredContent, Observation, ObservationRecorder, text_hash
 from . import post_mortem
+from .owner_watch import OwnerWatchRecorder, name_digest
+from .owner_watch import capture as owner_watch_capture
 from .terrain import FightRecorder
 from . import route_events, route_shadow
 from .self_improvement import PLAYER_CHANNELS, from_server
@@ -143,6 +146,21 @@ def map_object_visual_name(client, obj: MapObject) -> str:
     return getattr(client, "faces", {}).get(obj.face, "")
 
 
+def party_vitals(cur: Cursor, *, repeated: bool) -> list[PartyVitals]:
+    """``CMD_PARTY_UPDATE`` (one member) or ``CMD_PARTY_WHO`` (every member)
+    after the command byte: each a name, then health and mana percent,
+    which the server clamps to 1..100 (server ``party.c``,
+    ``commands/player/party.c``). A truncated record or trailing bytes
+    are a protocol error, like the other party commands."""
+    members: list[PartyVitals] = []
+    while not members or repeated and cur.remaining:
+        name, hp, sp = cur.cstring(), cur.u8(), cur.u8()
+        members.append(PartyVitals(name, min(hp, 100), min(sp, 100)))
+    if cur.remaining:
+        raise ProtocolError("party vitals trailing bytes")
+    return members
+
+
 def logical_map_path(path: str) -> str:
     """Convert a server-side player-unique filename to its authored path."""
     if path.startswith("./data/players/"):
@@ -190,6 +208,15 @@ class ClientConfig:
     # and farm choices are as before and the learned ones run in the shadow
     # (route_shadow.py); the owner turns it on after the shadow soak.
     learned_route_costs: bool = False
+    # Another character on the same account (ATRINIK_BOT_OPERATOR_CHARACTER):
+    # the only player whose party vitals she keeps and, behind
+    # ``watch_owner``, whom she watches play.
+    operator_character: str = ""
+    # docs/LEARNING_AND_FEEDBACK.md 4.14, phase W1: record how the operator
+    # character fights while she is not fighting herself (owner_watch.py).
+    # Off (the default) nothing is recorded; the client still decodes tile
+    # animations into a bounded ring and keeps the operator's vitals.
+    watch_owner: bool = False
 
 
 # kill_player (server types/player.c) sends exactly one of these, as the whole
@@ -354,6 +381,9 @@ class AtrinikClient:
         # Her fights by terrain (terrain.py), fed by the task engine's steps
         # (tasks.observe_fight) and her death and recall decisions.
         self.fight_recorder = FightRecorder()
+        # How the operator character fights, watched only behind the
+        # owner's watch_owner flag (owner_watch.py), fed like the above.
+        self.owner_watch = OwnerWatchRecorder()
         # The authored world graph the CLI built (web and autoplay), for
         # the terrain of her fights; without it a fight's feature is unknown.
         self.world_graph = None
@@ -1796,6 +1826,8 @@ class AtrinikClient:
         weight, face = cur.u32(), cur.u32()
         self.state.player_name = cur.cstring()
         self.state.party_name = ""
+        self.state.operator_vitals = None
+        self.state.party_member_digests = set()
         # PLAYER arrives before the full ITEM inventory packet. Preserve this
         # explicit barrier across reconnects even though the prior inventory
         # objects remain in memory for those few event-loop turns.
@@ -1831,6 +1863,9 @@ class AtrinikClient:
         command = cur.u8()
         if command == c.CMD_PARTY_JOIN:
             self.state.party_name = cur.cstring()
+            # A new party: its members' vitals and names arrive afresh.
+            self.state.operator_vitals = None
+            self.state.party_member_digests = set()
             self._party_setup_pending = ""
             self.record_action("party-ready", self.state.party_name)
             await self.emit("party", {
@@ -1838,15 +1873,54 @@ class AtrinikClient:
         elif command == c.CMD_PARTY_LEAVE:
             old_name = self.state.party_name
             self.state.party_name = ""
+            self.state.operator_vitals = None
+            self.state.party_member_digests = set()
             await self.emit("party", {"name": old_name, "joined": False})
         elif command == c.CMD_PARTY_PASSWORD:
             # Preserve defensive framing validation even though the bot does
             # not interactively enter passwords. Configured parties are open.
             await self.emit("party_password", cur.cstring())
+        elif command in (c.CMD_PARTY_UPDATE, c.CMD_PARTY_WHO):
+            size = cur.remaining
+            members = party_vitals(cur, repeated=command == c.CMD_PARTY_WHO)
+            self._note_operator_vitals(members, roster=command == c.CMD_PARTY_WHO)
+            await self.emit("party_packet", (command, size))
+        elif command == c.CMD_PARTY_REMOVE_MEMBER:
+            size = cur.remaining
+            name = cur.cstring()
+            if cur.remaining:
+                raise ProtocolError("party member removal trailing bytes")
+            if name == self.config.operator_character.strip():
+                self.state.operator_vitals = None
+            self.state.party_member_digests.discard(name_digest(name))
+            await self.emit("party_packet", (command, size))
         else:
-            # LIST/WHO/UPDATE payloads belong to the graphical roster. The bot
-            # needs only authoritative join/leave membership state.
+            # The LIST payload belongs to the graphical party list. The bot
+            # needs only membership and the operator character's vitals.
             await self.emit("party_packet", (command, cur.remaining))
+
+    def _note_operator_vitals(self, members: list[PartyVitals], *, roster: bool) -> None:
+        """Keep the configured operator character's vitals, and only theirs:
+        every other member's vitals are dropped here, and their names kept
+        only as in-memory digests (``owner_watch.name_digest``), so the
+        owner watch can tell a party member from a monster of the same
+        name. A roster (``CMD_PARTY_WHO``) replaces both; one without the
+        operator character clears its vitals."""
+        digests = {name_digest(member.name) for member in members}
+        if roster:
+            self.state.party_member_digests = digests
+        else:
+            self.state.party_member_digests |= digests
+        operator = self.config.operator_character.strip()
+        if not operator or operator == self.state.player_name:
+            self.state.operator_vitals = None
+            return
+        for member in members:
+            if member.name == operator:
+                self.state.operator_vitals = (member.hp, member.sp, time.time())
+                return
+        if roster:
+            self.state.operator_vitals = None
 
     async def _handle_drawinfo(self, cur: Cursor, raw: bytes) -> None:
         msg_type, color = cur.u8(), cur.cstring()
@@ -2940,9 +3014,12 @@ class AtrinikClient:
                 animations=body.u8(); seen_sub=set()
                 if animations > 7: raise ProtocolError("too many MAP2 animations")
                 for _ in range(animations):
-                    sub, kind=body.u8(), body.u8(); body.i16()
-                    if sub >= 7 or sub in seen_sub or kind not in (1,2): raise ProtocolError("invalid MAP2 animation")
+                    sub, kind=body.u8(), body.u8(); value=body.i16()
+                    if sub >= 7 or sub in seen_sub or kind not in (c.ANIM_DAMAGE, c.ANIM_KILL): raise ProtocolError("invalid MAP2 animation")
                     seen_sub.add(sub)
+                    # A damage number or kill marker on this tile this round:
+                    # published with the generation (_publish_tile_animations).
+                    m.animations.append((x, y, depth, sub, kind, value))
             if ext & c.MAP_EXT_LOCAL_LIGHT:
                 # Coarse per-sublayer local light: a signed 5-bit level
                 # (-16 is invalid), the tli bit, a reserved bit, vision floor.
@@ -2965,6 +3042,18 @@ class AtrinikClient:
             else:
                 tile.fogged = False
         if body.remaining: raise ProtocolError("MAP2 level trailing bytes")
+
+    def _publish_tile_animations(self, m: MapState) -> None:
+        """The published generation's damage and kill animations, in world
+        squares of its map, onto GameState.tile_animations."""
+        if not m.animations:
+            return
+        now = time.time()
+        cx, cy = m.width // 2, m.height // 2
+        for x, y, depth, sub, kind, value in m.animations:
+            self.state.add_tile_animation(TileAnimation(
+                now, m.path, m.world_x + x - cx, m.world_y + y - cy, depth, sub,
+                kind, value))
 
     async def _handle_map(self, cur: Cursor, raw: bytes) -> None:
         # A malformed envelope invalidates an unfinished generation.  The
@@ -2992,6 +3081,8 @@ class AtrinikClient:
             m, total, sequence, px, py, sublayer, declared, old_path = pending
         else:
             m=copy.deepcopy(self.state.map); old_path=m.path
+            # A new generation's animations are its own.
+            m.animations=[]
             physical_width = physical_height = None
             if update != c.MAP_SAME:
                 m.name,m.music,m.weather=self._map_string(cur,4095),self._map_string(cur,4095),self._map_string(cur,255)
@@ -3049,6 +3140,10 @@ class AtrinikClient:
             if marker:
                 self._map_pending=(m,marker,1,px,py,sublayer,depths,old_path); return
             self.state.map=m
+        self._publish_tile_animations(m)
+        # The owner watch's frame of this generation (owner_watch.py):
+        # behind its flag, never raises.
+        owner_watch_capture(self, m)
         self._note_position(m)
         self._observe_map_change(old_path, m)
         self._observe(lambda recorder: recorder.note_position(self.state))

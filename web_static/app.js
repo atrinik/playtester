@@ -709,7 +709,7 @@ $$(".tabs button").forEach(b => (b.onclick = () => {
   if (b.dataset.tab === "activity") renderActivity();
   if (b.dataset.tab === "knowledge") pollKnowledge();
   if (b.dataset.tab === "equipment") renderEquipment();
-  if (b.dataset.tab === "farming") pollTerrain();
+  if (b.dataset.tab === "farming") { pollTerrain(); pollOwnerWatch(); }
   if (b.dataset.tab === "feedback") pollFeedback();
 }));
 
@@ -987,6 +987,48 @@ function renderTerrain(t) {
   $("#terrain-fights").replaceChildren(...fights);
 }
 
+// ---------- watching the owner (read-only; docs/LEARNING_AND_FEEDBACK.md 4.14) ----------
+// The operator character's fights she watched, built with node() only.
+let ownerWatchBusy = false, lastOwnerWatchSig = "";
+async function pollOwnerWatch() {
+  if (ownerWatchBusy) return;
+  ownerWatchBusy = true;
+  try {
+    const r = await fetch("/api/owner-watch?limit=20", { cache: "no-store" });
+    if (r.ok) renderOwnerWatch(await r.json());
+  } catch { /* offline: the next poll retries */ } finally { ownerWatchBusy = false; }
+}
+function renderOwnerWatch(w) {
+  const sig = JSON.stringify(w);
+  if (sig === lastOwnerWatchSig) return;
+  lastOwnerWatchSig = sig;
+  const state = !w.operator_configured ? "no operator character configured" :
+    !w.enabled ? "off (watch_owner flag)" : w.engaged ? "watching a fight" : w.in_view ? "in view" : "not in view";
+  $("#owner-watch-summary").textContent = `${state} · ${(w.total || 0).toLocaleString()} kept` +
+    (w.shared_dropped ? ` · ${w.shared_dropped} shared dropped` : "") +
+    (w.busy ? " · the database is busy; try again shortly" : "");
+  const when = s => new Date(s * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const rows = (w.observations || []).map(o => {
+    const row = node("div", "reading");
+    const head = node("div", "reading-head");
+    head.append(node("b", "", FEATURE_LABELS[o.feature] || o.feature), node("span", "", `reach ${o.reach ?? "?"}`),
+      node("span", o.kills ? "flag good" : "flag", `${o.kills} killed`), node("time", "", when(o.ended)));
+    row.append(head);
+    const kinds = (o.kinds || []).map(k => `${k[0]}${k[1] ? ` (${k[1]})` : ""}`).join(", ");
+    const parts = [`${o.peak_adjacent} next to it at once`, `${o.damage_dealt} dealt in ${o.hits_dealt} hits`,
+      `${o.damage_taken} taken in ${o.hits_taken}`, `${Math.round(o.seconds)} s`];
+    if (o.ranged_hits) parts.push(`${o.ranged_hits} ranged hit${o.ranged_hits === 1 ? "" : "s"}, stepped after ${o.stepped_after_ranged}`);
+    if (o.hp_before != null) parts.push(`HP ${o.hp_before}% before, ${o.hp_low}% lowest, ${o.hp_after}% after`);
+    if (o.owner_died) parts.push("it died");
+    if (o.gap_seconds != null) parts.push(`${Math.round(o.gap_seconds)} s since the last fight`);
+    row.append(node("p", "", parts.join(" · ")));
+    if (kinds) row.append(node("p", "", kinds));
+    row.append(node("small", "", `${o.map} (${o.x}, ${o.y})`));
+    return row;
+  });
+  $("#owner-watch").replaceChildren(...(rows.length ? rows : [node("span", "muted", "No fights watched yet.")]));
+}
+
 // ---------- feedback drafts (read-only) ----------
 // Her feedback queue (feedback.py), built from DOM nodes and text only: a
 // body is shown as the plain Markdown text that would be filed, never
@@ -1067,7 +1109,7 @@ async function pollSlow() {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
     if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderVoyages(); renderBlocks(); renderLearned(); renderShadow(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
-    if ($("#tab-farming").classList.contains("active")) pollTerrain();
+    if ($("#tab-farming").classList.contains("active")) { pollTerrain(); pollOwnerWatch(); }
     if ($("#tab-feedback").classList.contains("active")) pollFeedback();
   } finally { slowBusy = false; }
 }

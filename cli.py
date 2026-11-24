@@ -88,6 +88,13 @@ def parser() -> argparse.ArgumentParser:
              "override (default: off; the learned plans run in the shadow until "
              "the owner approves the flip)",
     )
+    p.add_argument(
+        "--watch-owner", action="store_true",
+        default=os.getenv("ATRINIK_BOT_WATCH_OWNER", "").strip().casefold()
+        in ("1", "true", "yes", "on"),
+        help="record how the operator character fights while it is in view "
+             "and she is not fighting (default: off; recording only)",
+    )
     p.add_argument("--register", action="store_true")
     p.add_argument("--create-character", action="store_true")
     p.add_argument("--archetype", default="half_elf_male")
@@ -665,6 +672,8 @@ async def main_async(args: argparse.Namespace) -> None:
         persist_tile_facts=args.persist_tile_facts,
         dialogue_edges=args.dialogue_edges,
         learned_route_costs=args.learned_route_costs,
+        operator_character=args.operator_character.strip(),
+        watch_owner=args.watch_owner,
         register=args.register, create_character=args.create_character,
         character_archetype=args.archetype,
     )

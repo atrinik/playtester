@@ -2,9 +2,10 @@
 
 Status: design proposal. Phases F1 (the observation ledger), F2 (fact
 parsers and tile facts), F3 (effective item stats), F5 (the draft
-feedback queue), F6 (owner approval and GitHub filing) and F10 (fights by
-terrain) are implemented; "F1 as built", "F2 as built", "F3 as built",
-"F5 as built", "F6 as built" and "F10 as built" in section 6 record where
+feedback queue), F6 (owner approval and GitHub filing), F10 (fights by
+terrain) and W1 (watching the owner, recording only, behind a flag) are
+implemented; "F1 as built", "F2 as built", "F3 as built", "F5 as built",
+"F6 as built", "F10 as built" and "W1 as built" in section 6 record where
 they differ from this text. Nothing else here is
 implemented, and nothing here changes behaviour until the phased pull
 requests at the end land.
@@ -1328,6 +1329,146 @@ rates by feature).
   serializes all of it and searches); the dashboard has no feedback write
   route; no POST changes a behaviour flag.
 
+### 4.14 Watch the owner
+
+The owner asked on 2026-11-23 whether Sera could watch her play for a
+while to learn some tricks. This section is the design. Phase W1 below
+records only, and nothing she does depends on it. Following the owner
+(W2) and turning what she saw into rules (W3) come later, each behind its
+own owner decision.
+
+**Goals.** Learn from the owner's fights what Sera's own records
+(`fight_positions`, 4.7) cannot show her, because she does not do these
+things yet:
+
+- which monster in a mixed pack the owner hits first (casters first?);
+- where the owner stands to take a pack (doorways and corridors, against
+  the room behind);
+- how many attackers the owner lets reach her at once;
+- whether the owner steps out of a ranged or caster monster's line after
+  its first hit;
+- how much health the owner has before the next pull, and how long she
+  rests;
+- which places the owner leaves alone.
+
+The last death in the Underground City (2026-11-23) shows why. Sera
+fought on the room side of a doorway, in an orc sorcerer's line of sight,
+never targeted the sorcerer, and kept fighting three adjacent attackers
+while her heals failed. An owner who takes the same room from the
+corridor, kills the sorcerer first and rests to full is the example she
+lacks.
+
+**What the Classic protocol lets her observe.** Checked in
+`server/src`:
+
+- **Every visible living object on every map frame** (`socket/request.c`,
+  the MAP2 living layer): name and name colour (`MAP2_FLAG_NAME` for
+  players and every live creature), and facing and animation state
+  (`MAP2_FLAG_ANIMATION`). A player's map name is
+  `generate_quick_name`: the character name, its bracketed permission tags
+  and " [AFK]". A creature's name colour is its level against hers
+  (`get_living_level_color`: gray, green, blue, yellow, orange, red,
+  purple). A player's is white, green in her party, or red in a PvP area
+  (`get_playername_color`). The owner's square and steps are therefore
+  visible whenever the owner is in view.
+- **Damage numbers and kill markers on tiles** (`MAP_EXT_ANIM`). A living
+  object hit this round carries `ANIM_DAMAGE` with the damage dealt
+  (`last_damage`, `request.c:2764-2771`). A square where something died
+  carries `ANIM_KILL` (the map's damage round tag, `request.c:3093-3104`).
+  The client used to parse these and drop them. They do not say who struck
+  the blow, only where it landed. One animation per sub-layer and round
+  is sent: a kill marker replaces the killing blow's damage number on its
+  square, so the last blow's damage is not seen.
+- **Spell projectiles as objects.** A magic bullet is an effect-layer
+  object (`arch/magic/bullet`: layer 7, animated, turnable) that moves
+  square by square with a face and a facing. It carries no name.
+- **Sounds at a square** (`play_sound_map`, `socket/sounds.c`): weapon,
+  spell and death sounds near her, with the square they came from.
+- **Health and mana percent, for party members only.**
+  `CMD_PARTY_UPDATE` (`server/party.c:785`, `party_update_who`) sends a
+  member's name with health and mana percent (clamped 1 to 100) to every
+  member whenever either changes. `/party who` (`CMD_PARTY_WHO`) sends the
+  whole roster. The owner's health is known only while the owner shares
+  her party.
+
+**What is not observable:** the owner's target (`CLIENT_CMD_TARGET` goes
+to the owner only), the owner's combat text (draw_info to the owner),
+which consumables the owner uses, the owner's stats, protections and
+equipment beyond the visible face, and who dealt a damage number. A hit
+on a monster next to the owner is taken as the owner's. A hit on the
+owner's own square with no monster next to it is taken as ranged.
+
+**Privacy.**
+
+- Only the exact operator character is watched: the name in
+  `ATRINIK_BOT_OPERATOR_CHARACTER` (`ClientConfig.operator_character`).
+  The map name, less the server's trailing bracketed tags, must equal it
+  exactly, and its name colour must be a player's (`observations.is_player`).
+  A creature of the same name, a longer name or a different case is not
+  the owner.
+- No other player is ever recorded, followed or stored. Other players are
+  read only as squares. While any of them is in her view, at any distance
+  and on any level she sees, the engagement is *shared* and is dropped
+  whole: an archer or caster hits from afar. A player she cannot see (out
+  of her view, in fog, invisible) is not detected; an engagement with one
+  could count that player's hits as the owner's, but stores no trace of
+  who they were. Green and red are both player colours (her party, a PvP
+  area) and creature level bands, so an authored name in them counts as a
+  player too when it could be one: green when the server marks it her
+  friend (outside PvP every player is, `is_friend_of`), red on a PvP map
+  or one she does not know. Such a possible player is never a creature
+  and makes the engagement shared within 6 squares of the owner, so a
+  friendly green NPC or pet farther off does not drop every fight; a
+  certain player does anywhere in view. A hostile green or red creature
+  keeps its kind. Of the party packets the client keeps only the
+  operator character's vitals. Other members' numbers are discarded as
+  they are parsed, and their names are kept only as in-memory SHA-256
+  digests, so that a green creature name a party member carries is
+  treated as a possible player even when the server does not mark it
+  her friend (she may be berserk). The digests are never stored.
+- No name is stored. A row belongs to her own character. A monster kind
+  is kept only when it is an authored creature name from the content
+  index (`unknown` otherwise, and always without the index). The
+  operator character's name is never written to a row or sent by the
+  dashboard.
+- The flag `watch_owner` (`--watch-owner`, `ATRINIK_BOT_WATCH_OWNER=1`)
+  is off by default. With it off the recorder reads and records nothing.
+  The client still parses the tile animations and keeps the operator
+  character's party vitals in memory, whatever the flag.
+
+**Phases.**
+
+- **W1, passive parsing and recording** (this design's first pull
+  request). Parse the tile animations and the party vitals into client
+  state. While the operator character is in view on her map and she is
+  not fighting herself, record one `owner_observations` row per owner
+  engagement: map, square and cell, terrain feature and reach (4.7's
+  `terrain.features`), the monster kinds and level bands hit in order,
+  the most monsters next to the owner at once, hits and damage both ways,
+  ranged hits and whether the owner stepped within 3 seconds after one,
+  health before the pull, at its lowest and after (party only), seconds
+  since the previous engagement while the owner stayed in view (the
+  rest), kills, the owner's death and duration. A read-only dashboard
+  section lists them.
+- **W2, following at a safe distance** (later, owner decision). The
+  owner starts it from the dashboard. Sera walks after the operator
+  character on the same map and keeps 4 to 8 squares back, out of the
+  pack's detection radius, with combat off. She stops when the owner
+  leaves the map or the dashboard says stop, and she never follows anyone
+  else. Her own safety (heals, recall, idle survival) still runs. It
+  needs the navigation and safety owners' review.
+- **W3, distilling rules** (later, owner decision). Turn enough W1 rows
+  into rules her combat and spot choice can use:
+  - caster priority: which kinds the owner hits first in a mixed pack;
+  - doorway and corridor stands: the features the owner fights from,
+    against the room;
+  - the most simultaneous attackers the owner accepts;
+  - the health the owner rests to before a pull;
+  - avoid-zones: cells the owner leaves alone or leaves quickly.
+
+  They become tie-breakers next to 4.7's (F11) and inputs to the farm
+  spot choice, each shadow-logged before a flag turns it on.
+
 ## 5. Concrete examples from the content
 
 All from the content maps (see "How the evidence was gathered").
@@ -2174,6 +2315,91 @@ adapter, queueing and the dashboard indicator.
 process; only authored observations are sent; LLM facts are capped at 0.5
 confidence and never produce a clarity verdict, unlock or draft by
 themselves.
+
+**W1. `feat(learning)`: watch the owner, passive.** The tile animation
+and party vitals parsers, the recorder and `owner_observations` (4.14),
+and a read-only dashboard section, behind `watch_owner`. No behaviour
+change.
+*Accept:* MAP2 damage and kill animations arrive as world squares on her
+map; only the operator character's party vitals are kept; an owner
+engagement next to an orc becomes one row with counts and the authored
+kind; another player's fight, a shared fight and her own fight are never
+recorded; with the flag off the recorder reads nothing; rows are capped
+and expire.
+
+*W1 as built* (`owner_watch.py`, `client.py`, `model.py`, `memory.py`,
+the Farming tab's **Watching the owner** section):
+
+- **Parsing.** Each MAP2 generation collects its tile animations and
+  publishes them with the generation as `GameState.tile_animations` (at
+  most 512, positions counted like `messages`), in world squares of her
+  map: the view's centre is her square. A rejected or unfinished
+  generation publishes none. `CMD_PARTY_UPDATE` and `CMD_PARTY_WHO`
+  parse into name, health and mana. Only the operator character's entry
+  is kept, as `GameState.operator_vitals`, and only while it is not her
+  own name. A roster without it, `CMD_PARTY_REMOVE_MEMBER` for it, her
+  leaving or joining a party or a new login clears it, and the watch
+  ignores a reading older than 30 seconds. A truncated record or
+  trailing bytes are a protocol error, like the other party commands.
+- **Frames.** Each published MAP2 generation becomes one frame for the
+  watch, taken as the client publishes it (`owner_watch.capture`, only
+  behind the flag). A frame records the operator character's square,
+  the monsters in view, whether another (possible) player was in view,
+  whether she was fighting herself, and that generation's animations.
+  "Fighting herself" means her combat mode, an active fight record, an
+  animation on her own square, or one of her own contact lines in the
+  last 10 seconds. The engine step scores every frame since the last
+  step in order, each animation against its own frame. So a player who
+  walks in, strikes and leaves between two steps still makes the
+  engagement shared, and an owner who moved between generations is
+  credited on the square it stood on then. If more than 256 frames
+  arrive between steps, the oldest are lost. Every engagement from then
+  until a frame with none is then shared, including one that began in
+  the lost frames.
+- **An engagement** starts at the first damage number on the operator
+  character's square, damage number on a monster next to it, or kill
+  marker next to it. A kill marker counts only where a monster stood
+  next to the owner in that frame or the one before: a kill by position
+  alone could be anyone's. The marker replaces the killing blow's damage
+  number, so it also counts as a dealt hit with its value. A kill marker
+  on the owner's own square is its death (`owner_died`). It ends 10 seconds after the last one, when the
+  operator character leaves her view or her map's bounds (the row is
+  kept), or after 15 minutes. It is dropped, never kept, when she starts
+  fighting herself (her combat mode or an active fight record), when she
+  changes map, or when another player was in view during it.
+- **Columns:** `map`, `x`, `y`, `cell`, `feature` and `reach` (the owner's
+  square at the start, `terrain.features`), `kinds_json` (up to 12
+  `[kind, level band]` pairs in order of the first hit), `peak_adjacent`,
+  `hits_dealt`, `damage_dealt`, `hits_taken`, `damage_taken`,
+  `ranged_hits`, `stepped_after_ranged`, `hp_before` (the operator
+  character's health at the step before the first contact), `hp_low`,
+  `hp_after` (at the end, so 10 quiet seconds of regeneration included),
+  `gap_seconds` (since the previous engagement ended, only while the
+  owner stayed in view on the same map and that one was not cut at 15
+  minutes, so a rest is measured), `kills`, `owner_died`, `seconds`.
+  `character` is hers.
+- **Bounds:** with the flag off, or without an operator character, no
+  frame is taken and the step reads nothing. Otherwise each published
+  generation costs one pass over the living objects in view and at most
+  the 100 newest messages, and the engine scores the held frames once a
+  step, after the fight recorder. It never
+  raises: an error forgets the engagement and is logged once, then
+  counted every 10 minutes. A row waits at most 0.25 s for a locked
+  database. Rows are capped at 5,000 a character, oldest evicted first,
+  and rows older than 90 days are deleted, both checked every 50 rows.
+- **Dashboard:** `GET /api/owner-watch?limit=N` (up to 200) gives the
+  flag, whether an operator character is configured, whether it is in
+  view or engaged now, the shared engagements dropped since start, and
+  the newest rows. It never includes a name. The section is built from
+  DOM nodes under the dashboard's CSP.
+
+**W2. `feat(learning)`: follow the owner at a safe distance.** 4.14's W2,
+started from the dashboard, combat off. *Depends on* W1 and an owner
+decision.
+
+**W3. `feat(combat)`: rules from watching the owner.** 4.14's W3, as
+tie-breakers behind their own flag after a shadow soak. *Depends on* W1,
+F11 and an owner decision.
 
 ## 7. Open questions for the owner
 

@@ -223,6 +223,10 @@ MAP2_OCCLUDER_RESERVED = 0xC0F0
 MAP2_OCCLUDER_VERTICAL_RESERVED = 0xF0
 MAP_EXT_RGB16 = MAP_EXT_LIGHT_RGB
 ANIM_MOVING = 0x01
+# MAP_EXT_ANIM tile animation kinds (server socket/request.c): a damage
+# number on a living object hit this round, and the marker where one died.
+ANIM_DAMAGE = 1
+ANIM_KILL = 2
 
 IF_TEXT = 0
 IF_LINK = 1
