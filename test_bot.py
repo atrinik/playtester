@@ -13974,8 +13974,15 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             rebuilt._new_temple_food(client)
         self.assertEqual(asked, [("Talrain",)])
 
+    @staticmethod
+    def _give_recall_rod(client):
+        client.state.inventory.append(Item(
+            96, item_type=c.TYPE_ROD, quality=80, condition=80,
+            name="rod of word of recall"))
+
     def test_autoplay_recovers_started_mana_crystal_from_apartment(self):
         client = self._combat_client()
+        self._give_recall_rod(client)
         client.state.stats.update({"level": 18, "exp": 6_000_000})
         client.state.quests_loaded = True
         client.state.quests = {
@@ -14001,13 +14008,16 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.quests_loaded = True
         client.state.quests["Gandyld's Mana Crystal"] = QuestProgress(
             "Gandyld's Mana Crystal", "active")
-        client.decision_history = [{
-            "time": time.time(), "action": "autoplay-retry",
-            "detail": "mana-crystal-recovery: contents did not load",
-        }]
         autoplay = AutoplayTask(WorldGraph())
-
+        self.assertTrue(autoplay._needs_mana_crystal_recovery(client))
+        # The deadline lives in her character memory, not the bounded
+        # decision history (a loop's records can scroll it out).
+        client.state.mana_crystal_retry_until = {
+            "recovery": time.time() + 3600}
+        client.decision_history = []
         self.assertFalse(autoplay._needs_mana_crystal_recovery(client))
+        client.state.mana_crystal_retry_until = {"recovery": time.time() - 1}
+        self.assertTrue(autoplay._needs_mana_crystal_recovery(client))
 
     def test_power_crystal_is_never_apartment_trophy(self):
         crystal = Item(
@@ -14019,6 +14029,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
     @staticmethod
     def _gandyld_client(*, level=31, part_status="active"):
         client = QuestTests._combat_client()
+        QuestTests._give_recall_rod(client)
         client.state.stats.update({"level": level, "exp": 23_000_000})
         client.state.quests_loaded = True
         client.state.quests = {
@@ -14046,12 +14057,14 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         autoplay.child.fail("route blocked")
         asyncio.run(autoplay.tick(client))
         self.assertFalse(autoplay._needs_mana_crystal_upgrade(client))
-        # Neither after a restart, from the persisted failure.
+        until = client.state.mana_crystal_retry_until["upgrade"]
+        self.assertAlmostEqual(
+            until, time.time() + AutoplayTask.MANA_CRYSTAL_UPGRADE_RETRY,
+            delta=60)
+        # Neither after a restart, from the persisted wall-clock deadline,
+        # with no decision history at all.
         restarted = AutoplayTask(WorldGraph())
-        client.decision_history = [{
-            "time": time.time(), "action": "autoplay-retry",
-            "detail": "mana-crystal-upgrade: mana-crystal-upgrade: blocked",
-        }]
+        client.decision_history = []
         self.assertFalse(restarted._needs_mana_crystal_upgrade(client))
         # Once the first part is done, the vault part is left alone.
         client = self._gandyld_client(part_status="completed")
@@ -14255,6 +14268,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
 
     def test_autoplay_collects_gandyld_opening_reward_at_level_18(self):
         client = self._combat_client()
+        self._give_recall_rod(client)
         client.state.stats.update({"level": 18, "exp": 6_000_000})
         client.state.quests_loaded = True
         client.state.quests = {
@@ -23140,26 +23154,40 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         autoplay.child.safe_for_progression_detour = lambda client: True
         asyncio.run(autoplay.tick(client))
         self.assertEqual(started, [])
-        # Back to 90 %: the mid-circuit detour starts.
+        # Back to 90 %: still no detour without a ready recall (the
+        # errand's own gate), which is recorded once...
         client.state.stats["hp"] = 121
         asyncio.run(autoplay.tick(client))
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(started, [])
+        self.assertEqual(
+            [entry["detail"] for entry in client.decision_history
+             if entry.get("action") == "mana-crystal-wait"],
+            ["upgrade: no ready recall source"])
+        # ...and with one the mid-circuit detour starts.
+        client.state.place_item(Item(
+            96, item_type=c.TYPE_ROD, quality=80, condition=80,
+            name="rod of word of recall"), client.state.player_tag)
+        asyncio.run(autoplay.tick(client))
         self.assertEqual(started, ["mana-crystal-upgrade"])
-        # A healing potion, a ready recall or level 17: no wait at 50 %.
-        for setup in (
-                lambda client: client.state.place_item(Item(
+        # A ready recall: no wait at 50 %. A healing potion alone, or
+        # level 17, no longer starts the errand: it needs the recall.
+        for setup, expected in (
+                (lambda client: client.state.place_item(Item(
                     95, item_type=c.TYPE_POTION, quality=80, name="potion of healing"),
-                    client.state.player_tag),
-                lambda client: client.state.place_item(Item(
+                    client.state.player_tag), []),
+                (lambda client: client.state.place_item(Item(
                     96, item_type=c.TYPE_ROD, quality=80, condition=80,
                     name="rod of word of recall"), client.state.player_tag),
-                lambda client: client.state.stats.update(level=17)):
+                 ["mana-crystal-upgrade"]),
+                (lambda client: client.state.stats.update(level=17), [])):
             client, _ = self.client(recall=False)
             client.state.stats.update(hp=67, maxhp=134, sp=0)
             setup(client)
             autoplay, started = autoplay_for(client)
             asyncio.run(autoplay.tick(client))
             asyncio.run(autoplay.tick(client))
-            self.assertEqual(started, ["mana-crystal-upgrade"])
+            self.assertEqual(started, expected)
         # Essential trips start first, unprepared or not: hungry, the temple
         # food trip goes...
         client, _ = self.client(recall=False)
@@ -23183,6 +23211,145 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(autoplay.tick(client))
         self.assertEqual(autoplay.phase, "recovery")
         self.assertEqual(started, [])
+
+    OUTPOST = "/shattered_islands/strakewood_island/old_outpost/old_outpost_0202"
+
+    def upgrade_autoplay(self, client):
+        """Autoplay with only the mana-crystal upgrade due, its start
+        recorded instead of run."""
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        started = []
+
+        async def start_upgrade(client):
+            started.append("mana-crystal-upgrade")
+
+        client.state.quests[AutoplayTask.MANA_CRYSTAL_QUEST] = QuestProgress(
+            AutoplayTask.MANA_CRYSTAL_QUEST, status="incomplete",
+            parts=[QuestPartProgress("A Better Crystal", status="active")])
+        client.state.place_item(Item(
+            90, item_type=c.TYPE_POWER_CRYSTAL, quality=100,
+            name="Gandyld's Mana Crystal"), client.state.player_tag)
+        autoplay._start_mana_crystal_upgrade = start_upgrade
+        return autoplay, started
+
+    def test_no_mana_crystal_errand_with_empty_wands_and_a_healing_spell(self):
+        # Live, 2026-11-24: a healing spell satisfied the unprepared gate,
+        # and she took the upgrade errand into the Old Outpost with three
+        # empty recall wands.
+        client, _ = self.client(recall=False)
+        self.empty_wands(client, 77, 78, 79)
+        heal = Item(24, item_type=c.TYPE_SPELL, name="minor healing")
+        heal.extra["cost"] = 3
+        client.state.place_item(heal, client.state.player_tag)
+        autoplay, started = self.upgrade_autoplay(client)
+        self.assertTrue(autoplay._needs_mana_crystal_upgrade(client))
+        self.assertIsNotNone(autoplay.safety._usable_heal(client))
+        for _ in range(3):
+            self.assertFalse(asyncio.run(
+                autoplay._start_mana_crystal_detours(client)))
+        self.assertEqual(started, [])
+        self.assertEqual(self.actions(client).count("mana-crystal-wait"), 1)
+        # A working recall rod: the errand goes.
+        client.state.place_item(Item(
+            76, item_type=c.TYPE_ROD, quality=80, condition=80,
+            name="rod of word of recall"), client.state.player_tag)
+        self.assertTrue(asyncio.run(
+            autoplay._start_mana_crystal_detours(client)))
+        self.assertEqual(started, ["mana-crystal-upgrade"])
+
+    def test_no_mana_crystal_errand_through_a_recent_outpost_death(self):
+        client, _ = self.client()
+        autoplay, started = self.upgrade_autoplay(client)
+        self.assertIn(self.OUTPOST,
+                      autoplay._mana_crystal_errand_maps(client, "upgrade"))
+        died = time.time() - 2 * 86400
+        client.post_mortems = [
+            {"time": time.time() - 8 * 86400, "map": self.OUTPOST,
+             "cause": "out-damaged", "attackers": {"lava golem": 3}},
+            {"time": died, "map": self.OUTPOST, "cause": "out-damaged",
+             "attackers": {"stone giant captain": 4}}]
+        self.assertFalse(asyncio.run(
+            autoplay._start_mana_crystal_detours(client)))
+        self.assertEqual(started, [])
+        # Skipped until a week after the newest death, recorded once and
+        # persisted, so the next ticks neither go nor record again.
+        self.assertAlmostEqual(
+            client.state.mana_crystal_retry_until["upgrade"],
+            died + AutoplayTask.MANA_CRYSTAL_DANGER_SECONDS, places=3)
+        self.assertFalse(autoplay._needs_mana_crystal_upgrade(client))
+        for _ in range(3):
+            self.assertFalse(asyncio.run(
+                autoplay._start_mana_crystal_detours(client)))
+        skipped = [entry["detail"] for entry in client.decision_history
+                   if entry["action"] == "mana-crystal-skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn(f"newest death on {self.OUTPOST}", skipped[0])
+        # A pack failure on the route counts too; a death older than the
+        # window does not.
+        client.state.mana_crystal_retry_until = {}
+        client.post_mortems = client.post_mortems[:1]
+        client.state.farm_adaptations = {"outpost": {"reviews": [
+            {"time": time.time() - 3600, "kind": "emergency-recall",
+             "map": self.OUTPOST, "cause": "pack"}]}}
+        self.assertFalse(asyncio.run(
+            autoplay._start_mana_crystal_detours(client)))
+        client.state.mana_crystal_retry_until = {}
+        client.state.farm_adaptations = {}
+        self.assertTrue(asyncio.run(
+            autoplay._start_mana_crystal_detours(client)))
+        self.assertEqual(started, ["mana-crystal-upgrade"])
+
+    def test_mana_crystal_backoff_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+
+            def started_client():
+                client = AtrinikClient(ClientConfig(
+                    character="Sera", runtime_state_path=path))
+                client.state.player_name = "Sera"
+                client.load_character_memory("Sera")
+
+                async def send(packet):
+                    pass
+
+                client.send = send
+                return client
+
+            client = started_client()
+            client.state.phase = "playing"
+            client.state.stats.update(level=36, hp=134, maxhp=134, food=900)
+            client.state.quests_loaded = True
+            client.state.quests = {
+                AutoplayTask.MANA_CRYSTAL_QUEST: QuestProgress(
+                    AutoplayTask.MANA_CRYSTAL_QUEST, status="incomplete",
+                    parts=[QuestPartProgress("A Better Crystal",
+                                             status="active")])}
+            autoplay = AutoplayTask(WorldGraph())
+            autoplay.phase = "mana-crystal-upgrade"
+            autoplay.child = ManaCrystalUpgradeTask(WorldGraph())
+            autoplay.child.fail("death during the trip")
+            asyncio.run(autoplay.tick(client))
+            self.assertIsNone(autoplay.child)
+            self.assertFalse(autoplay._needs_mana_crystal_upgrade(client))
+
+            restarted = started_client()
+            # The failure's records are gone (a loop filled the history).
+            restarted.decision_history = []
+            restarted.state.phase = "playing"
+            restarted.state.stats.update(level=36, hp=134, maxhp=134)
+            restarted.state.quests_loaded = True
+            restarted.state.quests = client.state.quests
+            self.assertAlmostEqual(
+                restarted.state.mana_crystal_retry_until["upgrade"],
+                time.time() + AutoplayTask.MANA_CRYSTAL_UPGRADE_RETRY,
+                delta=60)
+            self.assertFalse(
+                AutoplayTask(WorldGraph())._needs_mana_crystal_upgrade(restarted))
+            # Once the deadline passes, it is due again.
+            restarted.state.mana_crystal_retry_until = {
+                "upgrade": time.time() - 1}
+            self.assertTrue(
+                AutoplayTask(WorldGraph())._needs_mana_crystal_upgrade(restarted))
 
     def unprepared_circuit(self, client, needs, *, legs=None, clock=None):
         """A circuit at the point where it starts optional trips, with

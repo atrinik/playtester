@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import sqlite3
 import time
 
+from . import route_events, self_improvement, unlocks
 from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
@@ -20,8 +22,9 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          temple_food_trip)
 from .alerts import HUNGRY_FOOD
 from .quest_tasks import EscapingDesertedIslandTask
-from .tasks import (BotTask, RetrieveItemsTask, SafetyPolicy, TaskStatus,
-                    unprepared_for_trips)
+from .route_blocks import map_subject
+from .tasks import (BotTask, FarmTask, RetrieveItemsTask, SafetyPolicy,
+                    TaskStatus, unprepared_for_trips)
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +48,14 @@ class AutoplayTask(BotTask):
     # level 24 (troll elite soldiers): wait until she outlevels them well.
     MANA_CRYSTAL_UPGRADE_LEVEL = 30
     MANA_CRYSTAL_UPGRADE_RETRY = 24 * 60 * 60
+    # A mana-crystal errand is skipped while a map it crosses saw a death,
+    # or a pack or out-damaged failure, this recently. A week: her Old
+    # Outpost deaths came one to three days apart (2026-11-18, 11-19,
+    # 11-22), so the day-long failure backoff sent her back after each;
+    # route events are kept a week (route_events.EVENT_MAX_AGE).
+    MANA_CRYSTAL_DANGER_SECONDS = 7 * 24 * 60 * 60
+    MANA_CRYSTAL_APARTMENT = (
+        "/shattered_islands/strakewood_island/apartments/apartment_cheap")
     # A switch to the recovery phase waits at most this long for the
     # circuit's essential trip or farm fight: farm combat can pull the next
     # target, and a cure trip can stall.
@@ -62,7 +73,9 @@ class AutoplayTask(BotTask):
         self.phase = "bootstrap"
         self._intro_complete = False
         self._mana_recovery_attempted = False
-        self._mana_upgrade_retry_at = 0.0
+        # Whether the wait for a ready recall (_mana_crystal_recall_ready)
+        # is already recorded.
+        self._mana_recall_wait_recorded = False
         self._retry_at = 0.0
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
@@ -185,6 +198,13 @@ class AutoplayTask(BotTask):
         the farm) meanwhile. Live, on 2026-11-22, the mana-crystal-upgrade
         errand took her into the Old Outpost with no heals and no recall,
         and she died there.
+
+        The errands are optional, so a due one also waits for a ready
+        recall (_mana_crystal_recall_ready), however she can heal, and is
+        skipped while its route is dangerous (_mana_crystal_route_danger).
+        Live, on 2026-11-24, she went back into the Old Outpost with a
+        healing spell, three empty recall wands and three deaths there in
+        the past week.
         """
         # Its own safety policy reads the same heal as a farm's would:
         # SafetyPolicy._usable_heal depends only on her inventory, SP and
@@ -198,15 +218,181 @@ class AutoplayTask(BotTask):
         if cure_funding_farm(client) or cure_funding_farm_home(client):
             return False
         if self._needs_mana_crystal_start(client):
-            await self._start_mana_crystal_detour(client)
+            detour, start = "start", self._start_mana_crystal_detour
+        elif self._needs_mana_crystal_recovery(client):
+            detour, start = "recovery", self._start_mana_crystal_recovery
+        elif self._needs_mana_crystal_upgrade(client):
+            detour, start = "upgrade", self._start_mana_crystal_upgrade
+        else:
+            return False
+        if not self._mana_crystal_recall_ready(client, detour):
+            return False
+        if self._mana_crystal_route_danger(client, detour):
+            return False
+        await start(client)
+        return True
+
+    def _mana_crystal_recall_ready(self, client: AtrinikClient,
+                                   detour: str) -> bool:
+        """Whether she has a ready recall for a mana-crystal errand: the
+        farm's emergency recall candidates (a known-empty wand is none).
+        A healing spell is not enough on its own: on such a long, optional
+        trip a recall is the way out when a pack overwhelms her. The wait
+        is recorded once until a recall is ready again."""
+        if FarmTask.emergency_recall_candidates(client):
+            self._mana_recall_wait_recorded = False
             return True
-        if self._needs_mana_crystal_recovery(client):
-            await self._start_mana_crystal_recovery(client)
-            return True
-        if self._needs_mana_crystal_upgrade(client):
-            await self._start_mana_crystal_upgrade(client)
-            return True
+        if not self._mana_recall_wait_recorded:
+            self._mana_recall_wait_recorded = True
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("mana-crystal-wait",
+                         f"{detour}: no ready recall source")
         return False
+
+    def _mana_crystal_backed_off(self, client: AtrinikClient,
+                                 detour: str) -> bool:
+        """Whether the errand ``detour`` waits out a persisted backoff
+        (GameState.mana_crystal_retry_until, a wall-clock deadline)."""
+        backoffs = getattr(client.state, "mana_crystal_retry_until", None) or {}
+        return time.time() < float(backoffs.get(detour, 0.0) or 0.0)
+
+    @staticmethod
+    def _back_off_mana_crystal(client: AtrinikClient, detour: str,
+                               until: float) -> None:
+        """Persist the errand's deadline in her character memory."""
+        setter = getattr(client, "set_mana_crystal_retry", None)
+        if setter is not None:
+            setter(detour, until)
+            return
+        backoffs = dict(getattr(client.state, "mana_crystal_retry_until",
+                                None) or {})
+        backoffs[detour] = float(until)
+        client.state.mana_crystal_retry_until = backoffs
+
+    def _mana_crystal_destinations(self, detour: str) -> list[str]:
+        """The maps the errand ``detour`` walks to, in order."""
+        gandyld = ManaCrystalUpgradeTask.GANDYLD_MAP
+        if detour == "start":
+            return [gandyld]
+        if detour == "recovery":
+            return [self.MANA_CRYSTAL_APARTMENT]
+        pool = POLICIES[self.MANA_CRYSTAL_QUEST].parts[
+            ManaCrystalUpgradeTask.PART].action.place
+        return [pool.map_path, gandyld] if pool is not None else [gandyld]
+
+    def _mana_crystal_errand_maps(self, client: AtrinikClient,
+                                  detour: str) -> set[str]:
+        """The maps the errand ``detour`` crosses: its fewest-transition
+        routes from where she stands through each destination (gates
+        follow her access set), and the destinations themselves. The map
+        she stands on is left out: she is there already (usually farming
+        it), and the errand only takes her away from it."""
+        destinations = self._mana_crystal_destinations(detour)
+        maps = set(destinations)
+        here = source = client.state.map.path
+        source_xy: tuple[int, int] | None = (
+            client.state.map.world_x, client.state.map.world_y)
+        try:
+            access = unlocks.unlock_state(client, self.graph).access
+        except Exception:
+            access = None
+        for destination in destinations:
+            try:
+                route = self.graph.route(source, destination, access=access,
+                                         source_xy=source_xy)
+            except (ValueError, KeyError):
+                route = []
+            maps.update(edge.source for edge in route)
+            maps.update(edge.destination for edge in route)
+            source, source_xy = destination, None
+        if here not in destinations:
+            maps.discard(here)
+        maps.discard("")
+        return maps
+
+    def _mana_crystal_dangers(self, client: AtrinikClient,
+                              maps: set[str]) -> list[tuple[float, str]]:
+        """Her deaths and pack or out-damaged failures on ``maps`` within
+        MANA_CRYSTAL_DANGER_SECONDS, as (time, what): post-mortems (a
+        death to another player is not the route's), route-event deaths
+        (route_events.py: deaths in transit, kept a week), and farm
+        reviews and kit failures (self_improvement)."""
+        now = time.time()
+        since = now - self.MANA_CRYSTAL_DANGER_SECONDS
+        found: list[tuple[float, str]] = []
+
+        def stamp(value) -> float:
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        for report in getattr(client, "post_mortems", None) or ():
+            if not isinstance(report, dict):
+                continue
+            when, path = stamp(report.get("time")), str(report.get("map") or "")
+            if when < since or path not in maps:
+                continue
+            if any(route_events.player_attacker(client, who)
+                   for who in (report.get("attackers") or {})):
+                continue
+            found.append((when, f"death on {path}"))
+        store = getattr(client, "_memory_store", None)
+        character = (getattr(client.state, "player_name", "") or
+                     getattr(getattr(client, "config", None), "character", ""))
+        if callable(store) and character:
+            subjects = {map_subject(path): path for path in maps}
+            try:
+                rows = store().route_events(
+                    character, since=since, timeout=route_events.WRITE_TIMEOUT)
+            except (sqlite3.Error, OSError, ValueError, AttributeError):
+                rows = []
+            found.extend((when, f"death in transit on {subjects[subject]}")
+                         for when, subject, signal, _ in rows
+                         if signal == route_events.DEATH and subject in subjects)
+        for record in (getattr(client.state, "farm_adaptations", None) or {}).values():
+            if not isinstance(record, dict):
+                continue
+            for entry in (list(record.get("reviews", ()) or ()) +
+                          list(record.get("kit_failures", ()) or ())):
+                if not isinstance(entry, dict):
+                    continue
+                when, path = stamp(entry.get("time")), str(entry.get("map") or "")
+                cause = str(entry.get("cause") or "")
+                if (when >= since and path in maps and
+                        (cause in self_improvement.KIT_HAZARD_CAUSES or
+                         entry.get("kind") == "death")):
+                    found.append((when, f"{cause or 'death'} failure on {path}"))
+        return found
+
+    def _mana_crystal_route_danger(self, client: AtrinikClient,
+                                   detour: str) -> bool:
+        """Whether the errand ``detour`` is skipped for a dangerous route.
+
+        Any death, or pack or out-damaged failure, on a map the errand
+        crosses within MANA_CRYSTAL_DANGER_SECONDS skips it until the
+        newest one is that old, persisted as its backoff, so the decision
+        (mana-crystal-skipped) is taken and recorded once per window.
+        """
+        dangers = self._mana_crystal_dangers(
+            client, self._mana_crystal_errand_maps(client, detour))
+        if not dangers:
+            return False
+        newest, what = max(dangers)
+        until = newest + self.MANA_CRYSTAL_DANGER_SECONDS
+        self._back_off_mana_crystal(client, detour, until)
+        log.warning("mana-crystal %s skipped: %d recent failure(s) on its "
+                    "route, newest %s", detour, len(dangers), what)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("mana-crystal-skipped",
+                     f"{detour}: {len(dangers)} death(s) or pack failure(s) "
+                     f"on its route within "
+                     f"{self.MANA_CRYSTAL_DANGER_SECONDS // 86400} days, "
+                     f"newest {what}; retry after "
+                     f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(until))} UTC")
+        return True
 
     def _needs_mana_crystal_start(self, client: AtrinikClient) -> bool:
         """Collect Gandyld's safe 50-SP opening reward exactly once."""
@@ -216,7 +402,8 @@ class AutoplayTask(BotTask):
             self.MANA_CRYSTAL_LEVEL and
             self.MANA_CRYSTAL_QUEST not in client.state.quests and
             not any("gandyld's mana crystal" in item.name.casefold()
-                    for item in client.state.inventory)
+                    for item in client.state.inventory) and
+            not self._mana_crystal_backed_off(client, "start")
         )
 
     def _has_mana_crystal(self, client: AtrinikClient) -> bool:
@@ -225,18 +412,12 @@ class AutoplayTask(BotTask):
 
     def _needs_mana_crystal_recovery(self, client: AtrinikClient) -> bool:
         quest = client.state.quests.get(self.MANA_CRYSTAL_QUEST)
-        recent_failure = any(
-            entry.get("action") == "autoplay-retry" and
-            "mana-crystal-recovery" in str(entry.get("detail", "")) and
-            time.time() - float(entry.get("time", 0) or 0) <
-            self.MANA_CRYSTAL_RECOVERY_RETRY
-            for entry in reversed(getattr(client, "decision_history", ()))
-            if isinstance(entry, dict))
         return bool(
             client.state.quests_loaded and quest is not None and
             quest.status != "completed" and
             not self._has_mana_crystal(client) and
-            not self._mana_recovery_attempted and not recent_failure)
+            not self._mana_recovery_attempted and
+            not self._mana_crystal_backed_off(client, "recovery"))
 
     def _needs_mana_crystal_upgrade(self, client: AtrinikClient) -> bool:
         """Take the crystal to the alchemists' pool and report to Gandyld.
@@ -245,13 +426,6 @@ class AutoplayTask(BotTask):
         whether or not she carries one.
         """
         quest = client.state.quests.get(self.MANA_CRYSTAL_QUEST)
-        recent_failure = any(
-            entry.get("action") == "autoplay-retry" and
-            "mana-crystal-upgrade" in str(entry.get("detail", "")) and
-            time.time() - float(entry.get("time", 0) or 0) <
-            self.MANA_CRYSTAL_UPGRADE_RETRY
-            for entry in reversed(getattr(client, "decision_history", ()))
-            if isinstance(entry, dict))
         return bool(
             client.state.quests_loaded and quest is not None and
             quest.status != "completed" and
@@ -260,8 +434,7 @@ class AutoplayTask(BotTask):
                 for part in quest.parts) and
             int(client.state.stats.get("level", 0) or 0) >=
             self.MANA_CRYSTAL_UPGRADE_LEVEL and
-            time.monotonic() >= self._mana_upgrade_retry_at and
-            not recent_failure)
+            not self._mana_crystal_backed_off(client, "upgrade"))
 
     async def _start_mana_crystal_upgrade(
             self, client: AtrinikClient) -> None:
@@ -293,9 +466,7 @@ class AutoplayTask(BotTask):
             await self._set_child(
                 client, "mana-crystal-recovery",
                 NavigateThenTask(
-                    self.graph,
-                    "/shattered_islands/strakewood_island/apartments/"
-                    "apartment_cheap",
+                    self.graph, self.MANA_CRYSTAL_APARTMENT,
                     RetrieveItemsTask(
                         "chest", (r"Gandyld's Mana Crystal",),
                         require_match=True),
@@ -487,9 +658,14 @@ class AutoplayTask(BotTask):
                         return
                 elif self.phase == "mana-crystal-upgrade":
                     # A long, hostile trip: do not repeat it every few
-                    # minutes when it cannot succeed.
-                    self._mana_upgrade_retry_at = (
-                        time.monotonic() + self.MANA_CRYSTAL_UPGRADE_RETRY)
+                    # minutes when it cannot succeed, nor after a restart.
+                    self._back_off_mana_crystal(
+                        client, "upgrade",
+                        time.time() + self.MANA_CRYSTAL_UPGRADE_RETRY)
+                elif self.phase == "mana-crystal-recovery":
+                    self._back_off_mana_crystal(
+                        client, "recovery",
+                        time.time() + self.MANA_CRYSTAL_RECOVERY_RETRY)
                 await self._recover_child_failure(client)
                 return
             completed_phase = self.phase

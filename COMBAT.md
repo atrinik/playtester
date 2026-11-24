@@ -278,7 +278,8 @@ Getting the crystal and upgrading it:
 
 - **Opening reward.** At level 18 Gandyld gives her the 50-SP crystal.
 - **Recovery.** If the quest has started and she does not carry the crystal,
-  she checks the apartment chest, at most once a day.
+  she checks the apartment chest, once per run and at most once a day
+  after a failed check.
 - **The free upgrade (`ManaCrystalUpgradeTask`).** It runs from level 30
   while "A Better Crystal" is active. Her crystal's capacity is checked
   first, by examining it again if an earlier examine went unanswered; a
@@ -293,6 +294,27 @@ Getting the crystal and upgrading it:
   recall handling never sees it. It fails on a death or emergency recall
   recorded after it started, and after 30 minutes. A failed trip waits a
   day before it is tried again.
+- **Start gates (all three errands).** None starts while she is
+  unprepared (`unprepared_for_trips`) or farms to fund her cure. Each also
+  needs a ready recall source (`FarmTask.emergency_recall_candidates`; a
+  wand known to be empty is none), however she can heal: live, on
+  2026-11-24, a healing spell let her into the Old Outpost with three
+  empty recall wands. The wait is recorded once (`mana-crystal-wait`).
+  Then the maps the errand crosses (its fewest-transition routes from
+  where she stands through each destination, less the map she is on) are
+  checked for a death (post-mortems, not to another player, and route
+  events' deaths in transit) or a pack or out-damaged failure (farm
+  reviews and kit failures) within 7 days
+  (`AutoplayTask.MANA_CRYSTAL_DANGER_SECONDS`). Her Old Outpost deaths
+  came one to three days apart (2026-11-18, 11-19, 11-22), so the day's
+  backoff sent her back after each; a week also matches how long route
+  events are kept. Any such failure skips the errand until the newest one
+  is a week old, recorded once (`mana-crystal-skipped`).
+- **Backoffs survive restarts.** The failure and danger backoffs are
+  wall-clock deadlines in her character memory
+  (`GameState.mana_crystal_retry_until`, per errand: `start`, `recovery`,
+  `upgrade`), not an in-process timer or the bounded decision history,
+  which a loop's records can fill.
 - **Replacement.** Gandyld's dialogue offers no replacement crystal, but the
   pool's script creates the enhanced crystal whether or not she carries the
   old one. So the pool trip also replaces a lost crystal.
