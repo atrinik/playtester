@@ -4331,6 +4331,9 @@ class NavigateThenTask(BotTask):
     OUTCLASSED_LEVEL_GAP = 10
     # This many outclassed creatures within 4 tiles count as a pack again.
     OUTCLASSED_PACK = 3
+    # A cornered pack split that holds (nothing beside her, nothing hitting
+    # her, no step that gains distance) fights the nearest after this long.
+    CORNERED_HOLD_SECONDS = 8.0
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -4394,6 +4397,8 @@ class NavigateThenTask(BotTask):
         self._cornered_target = 0
         # Targets a cornered fight has been logged for, once each.
         self._cornered_logged: set[int] = set()
+        # Since when a cornered split has held with no step (0: not).
+        self._cornered_hold_since = 0.0
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -4401,6 +4406,7 @@ class NavigateThenTask(BotTask):
         self._escaping = False
         self._cornered_target = 0
         self._cornered_logged.clear()
+        self._cornered_hold_since = 0.0
         self._split_hold = None
 
     async def _bypass_pack_blocked_exit(
@@ -4801,7 +4807,8 @@ class NavigateThenTask(BotTask):
         flight): the split retreats. With none she is cornered, and the closest attacker is
         fought (the farm's cornered breakout does the same): one beside
         her, or one farther off only while she is being hit; otherwise she
-        holds (None) and lets them come to her. The one she fights stays
+        holds (None) and lets them come to her, for at most
+        CORNERED_HOLD_SECONDS, then fights the nearest. The one she fights stays
         her target (``_cornered_target``) until it dies or is more than 4
         tiles off, so a square opening mid-fight, or the step she takes
         toward one farther off, does not turn her back into a combat-off
@@ -4828,11 +4835,20 @@ class NavigateThenTask(BotTask):
             if await self._retreat_step(
                     client, nearby, avoid_backtrack=True, gain_only=True,
                     probe=True):
+                self._cornered_hold_since = 0.0
                 return None
         target = latched or min(nearby, key=lambda threat: threat[0])
         if (latched is None and target[0] > 1 and
                 not recent_hostile_contact(client, 3.0)):
-            return None
+            # Holding, combat off, to let them come; not for longer than
+            # CORNERED_HOLD_SECONDS, or two that never approach would hold
+            # her there for ever.
+            now = time.monotonic()
+            if not self._cornered_hold_since:
+                self._cornered_hold_since = now
+            if now - self._cornered_hold_since < self.CORNERED_HOLD_SECONDS:
+                return None
+        self._cornered_hold_since = 0.0
         if target[3].target_id != self._cornered_target:
             self._cornered_target = target[3].target_id
         if target[3].target_id not in self._cornered_logged:
@@ -5187,6 +5203,8 @@ class NavigateThenTask(BotTask):
                 for threat in nearby):
             # A cornered fight ends with the pack split or its target.
             self._cornered_target = 0
+        if not overwhelmed:
+            self._cornered_hold_since = 0.0
         pack_offensive = (self.task.primary_combat_spell(client)
                           if isinstance(self.task, FarmTask) else None)
         if (safe and nearest is not None and nearest[0] > 2 and

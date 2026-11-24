@@ -13088,12 +13088,48 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             m.tile(vx, vy).objects[3] = MapObject(
                 3, 1, 0, 0, name="lava golem", target_id=target_id,
                 target_hp=100)
-        task._cornered_target = 999  # a creature long gone
+        # Locked on the golem four tiles off, though she is no longer
+        # overwhelmed (only it is within 4): the lock is stale.
+        task._cornered_target = 901
         client.state.messages = []
         self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(task._cornered_target, 0)
         self.assertIn("navigation-pack-avoid",
                       [action for action, _ in client.decisions])
+
+    def test_a_cornered_hold_fights_after_its_bound(self):
+        """Two golems that never come closer, two and three tiles off at a
+        dead end, nothing hitting her: she holds, combat off, for
+        CORNERED_HOLD_SECONDS, then fights the nearest."""
+        client, task = self._exit_room(golem_level=30)
+        m = client.state.map
+        m.tiles.clear()
+        m.world_x, m.world_y = 1, 15
+        node = task.navigation.graph.nodes["/outpost"]
+        node.terrain = {(1, y): 1 for y in range(15, 24)}
+        for target_id, wy in ((901, 17), (902, 18)):
+            m.tile(8, 8 + wy - 15).objects[3] = MapObject(
+                3, 1, 0, 0, name="lava golem", target_id=target_id,
+                target_hp=100)
+        task._trail = [("/outpost", 1, 16), ("/outpost", 1, 15)]
+        client.state.messages = []
+        task.navigation.destination = "/outpost"  # fights on this map
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.0):
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.0 + task.CORNERED_HOLD_SECONDS - 1):
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(client.targets, [])
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.0 + task.CORNERED_HOLD_SECONDS):
+            self.assertTrue(asyncio.run(
+                task._defend_while_navigating(client)))
+        self.assertEqual(client.combat[-1], True)
+        self.assertEqual(client.targets[-1][2], 901)
 
     def test_repeated_pack_split_hold_is_not_resent(self):
         """While her split step is in flight and nothing changes, the hold

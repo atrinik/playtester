@@ -1629,7 +1629,10 @@ below it was never reached; 100 of the 102 attacks on her missed.
   closest attacker (`_cornered_split`, recorded once per creature as
   `navigation-cornered-fight`), as the farm's cornered breakout does: one
   beside her, or one farther off only while she is being hit (else she
-  holds, combat off, and lets them come). The attacker she fights stays
+  holds, combat off, and lets them come, for at most
+  `CORNERED_HOLD_SECONDS` (8 s) of such a hold, after which she fights
+  the nearest; the hold's clock restarts when a gaining step appears,
+  when she is no longer overwhelmed, and on a new walk). The attacker she fights stays
   her target until it dies or is more than 4 tiles off, so a square
   opening mid-fight, or her step toward one farther off, does not turn her
   back into a combat-off retreat. Off her side it stays her target only
