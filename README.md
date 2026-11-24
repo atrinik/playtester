@@ -758,10 +758,14 @@ first (unreachable counts as 0.5). An apartment savebed is judged from its
 recorded return, since the apartment is left only through a script the
 analyzer does not follow, and an origin the analyzer rejects is retried once
 from the default origins and not passed again. Raw rankings list every
-circuit permutation, so each run keeps the top 40 per objective, except the
-safety view, which keeps 250: its score is capped at 1 for every spot whose
-danger stays under her health, so its first 40 can all be permutations of one
-high-XP area (see COMBAT.md, the cure-funding farm). The Farming
+circuit permutation, so each run keeps the top 40 per objective with at most
+three circuits of one area, except the safety view, which keeps 250: its
+score is capped at 1 for every spot whose danger stays under her health, so
+its first 40 can all be permutations of one high-XP area (see COMBAT.md, the
+cure-funding farm). Among safe spots within 80% of the first-ranked one's
+rate, the nearest from where she stands (fewest map transitions) goes first;
+deep in a dungeon, far from both her savebed and the spot, she walks home
+first and chooses again (COMBAT.md, the Old Outpost stall). The Farming
 tab shows each spot's approach: its safety, worst map and danger, or that it
 is unknown, and marks the spot autoplay farms with its rank.
 

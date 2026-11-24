@@ -946,7 +946,8 @@ not block her either.
   is her maximum health over a spot's danger, capped at 1, so every spot
   under her health ties, and the analyzer orders the ties by its balanced
   score. The safety view is therefore kept 250 deep
-  (`FarmAnalyzer.SAFETY_TOP`; the other views keep 40).
+  (`FarmAnalyzer.SAFETY_TOP`; the other views keep 40, at most three
+  circuits of one area: see the Old Outpost stall).
 
   The funding farm skips the depleted strict town check
   (`town_safely_reachable`), which is statically unsatisfiable in the
@@ -1491,6 +1492,84 @@ to it. Accepted limit: casts and swings alternate, so in melee a heal
 lands about every swing plus one cast (about 3.3 s with a 2.25 s weapon),
 not every 1.15 s; a fight that needs more is for the disengage and the
 recall.
+
+## The Old Outpost stall (2026-11-24)
+
+Read from her journal and dashboard state (v1.101.0): a failed
+mana-crystal errand left Sera (level 37, 330 health) in the Old Outpost's
+`old_outpost_0202`, and autoplay sent her from there to the Burnt Forest
+(`world_16_74`), 49 map transitions away. Her way out of the map was the
+seam at (4, 24), through the exit room (x 1-8, y 15-23), where four lava
+golems stood. Retreating from them, she walked 8,13 -> 9,9 -> 16,6,
+deeper into the upper middle room: each step was the most open square,
+whatever its direction. The last one had an escape depth of 0, the room's
+north-east corner, walled on five sides, and she shuffled there for 14
+minutes. Separately, the XP view she chose from held 40 Burnt Forest
+circuit permutations, every one rated hazardous for her kit, so she got
+the least dangerous of them (#39, danger 70.6). The Underground City's
+outer maps, Hemlock Cave and Eld Woods Island ranked from 60th.
+
+Now:
+
+- **Retreat towards the way out.** `NavigateThenTask._retreat_step` keeps
+  its order (a step never brings her closer to an attacker; `gain_only`
+  takes only a step that separates her farther; a continuing escape,
+  depth 2 or more, outranks separation), and then ranks progress towards
+  where her route leaves the map (`_way_out`) above escape depth and area:
+  of the steps that separate her as far, the one that gets closer to the
+  way out first, then one that holds its distance, then one that loses
+  ground. The way out is the next route edge's square on this map, or her
+  destination square on the destination map (not on a farm's own map), and
+  it is kept for the map while a pack avoidance or a failed plan clears
+  the route, and forgotten once its edge is excluded (a pack-blocked exit
+  bypassed, a failed click or seam). With `avoid_backtrack`, a step that
+  undoes her last one (her previous trail square, or where a retreat step
+  was sent from in the last `RETREAT_REVERSAL_SECONDS`, 10 s, since the
+  trail collapses a step back) never counts as progress and is the
+  backtrack it penalizes, so the penalty still holds: in a one-wide corridor a step back towards the
+  exit otherwise beat it and she shuffled between two squares. Progress is the 8-way walking distance on the authored map
+  (`_way_out_distances`); a seam square beyond the map's bounds is measured
+  from the square inside. Without a known way out the key is 0 and the
+  choice is the old one. `navigation-retreat-choice` records `progress=`.
+- **No dead-end square while another is open.** A candidate with escape
+  depth 0 (no onward step at all) is taken only when no other candidate
+  exists.
+- **A few circuits per area.** Each analyzer view but safety keeps its
+  first 40 spots with at most `FarmAnalyzer.AREA_CIRCUITS` (3) circuits of
+  one area (the analyzer's region and name); single-map spots are their
+  own area. The safety view keeps its 250.
+- **Comparable spots go nearest first.** In `_analyzer_farm_choice`, among
+  the safe spots of one ranking (neither `risky_approach` nor `risky_spot`),
+  those whose objective measure (`xp_hour`, `money_hour`, `loot_hour`,
+  `score`, `safety_score`) is at least `FARM_COMPARABLE_SHARE` (80 %) of
+  the first-ranked one's are taken by fewest map transitions from where
+  she stands to the circuit's first map (`map_hops`, the authored edges
+  alone), then by rank; the rest follow by rank. The circuit she is on
+  stays first while it is comparable: the circuit re-chooses on every farm
+  tick from wherever her walk has got to (`_upgrade_progression`), and a
+  comparable circuit starting on a map she passes must not replace it
+  mid-trip. Risky spots, the hazardous fallback and the cure-funding farm
+  keep their orders.
+- **Home first from deep in a dungeon.** Off the surface grid and more
+  than `FARM_HOME_FIRST_HOPS` (3) map transitions from both her savebed and
+  the chosen circuit's first map (`farm_home_first`), autoplay walks to her
+  savebed first (phase `farm-home-first`, `farm-home-first` decision; the
+  recovery phase's ordinary walk home), then chooses again from there,
+  where the analyzer judged every approach. A failed walk lets her farm
+  from where she stands for `FARM_HOME_FIRST_RETRY` (15 minutes).
+
+A replay of the incident's ranking (her profile, approach origin
+`world_7_79`, the three Burnt Forest failures of the day counted for every
+Burnt Forest map) keeps 29 spots in the XP view: 3 Burnt Forest circuits,
+then single maps. Before, she got the Burnt Forest circuit
+`world_16_74 + world_17_74 + world_18_73 + world_18_74` (hazardous,
+danger 70.6) from anywhere. Now, from `world_4_58` and from her savebed
+alike, she gets Hemlock Cave's `hemlock_cave_0202` (danger 46.9, safe,
+not hazardous; 12 and 11 map transitions), and from `old_outpost_0202`
+she first walks home (11 transitions).
+
+The overwhelmed-and-cornered decision in `_defend_while_navigating`
+(fighting back once no retreat step is left) is a separate fix.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 
