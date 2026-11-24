@@ -12,7 +12,7 @@ import posixpath
 import dataclasses
 import re
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import time
@@ -4329,6 +4329,10 @@ class NavigateThenTask(BotTask):
         self._retreat_blocked: set[tuple[str, int, int]] = set()
         self._retreat_blocked_at: dict[tuple[str, int, int], float] = {}
         self._trail: list[tuple[str, int, int]] = []
+        # The square her planned route leaves the current map by, kept for
+        # this map while a pack avoidance or a failed plan clears the route
+        # (_way_out): her retreat steps prefer making progress towards it.
+        self._way_out_goal: tuple[str, int, int] | None = None
         self._combat_attempt: tuple[str, int, int, float] | None = None
         self._combat_blocked: set[tuple[str, int, int]] = set()
         self._last_pull_target = 0
@@ -4466,6 +4470,61 @@ class NavigateThenTask(BotTask):
             self._trail.append(position)
             del self._trail[:-200]
 
+    def _way_out(self, client: AtrinikClient) -> tuple[int, int] | None:
+        """Where her planned route leaves the current map, if known.
+
+        The next route edge's square when it starts here, else her own
+        destination square on the destination map, else the last such
+        square noted on this map: avoiding a pack clears the route, and the
+        retreat that follows still knows which way is out.
+        """
+        m = client.state.map
+        navigation = self.navigation
+        route = getattr(navigation, "route", None) or ()
+        goal = None
+        if route and route[0].source == m.path:
+            goal = route[0].x, route[0].y
+        elif (m.path == navigation.destination and
+              navigation.destination_xy is not None and
+              not isinstance(self.task, FarmTask)):
+            goal = tuple(navigation.destination_xy)
+        if goal is not None:
+            self._way_out_goal = (m.path, int(goal[0]), int(goal[1]))
+            return int(goal[0]), int(goal[1])
+        if self._way_out_goal is not None and self._way_out_goal[0] == m.path:
+            return self._way_out_goal[1], self._way_out_goal[2]
+        return None
+
+    @staticmethod
+    def _way_out_distances(node, goal: tuple[int, int], *,
+                           allow_locked=False) -> dict[tuple[int, int], int]:
+        """Steps from each square of ``node`` to ``goal`` (8-way, authored
+        walkability, static occupants excluded). An edge square beyond the
+        map's bounds (a tiled-map seam) is measured from the nearest square
+        inside them."""
+        width, height = int(node.width or 0), int(node.height or 0)
+        if width <= 0 or height <= 0:
+            return {}
+        gx = min(max(int(goal[0]), 0), width - 1)
+        gy = min(max(int(goal[1]), 0), height - 1)
+        occupied = set(getattr(node, "occupied", ()))
+        seeds = [(gx, gy)] if node.walkable(gx, gy, allow_locked=allow_locked) else [
+            (gx + dx, gy + dy) for dx, dy in c.DIRECTION_DELTAS.values()
+            if (dx or dy) and node.walkable(gx + dx, gy + dy,
+                                            allow_locked=allow_locked)]
+        distances = {point: 0 for point in seeds}
+        queue = deque(seeds)
+        while queue:
+            current = queue.popleft()
+            for dx, dy in c.DIRECTION_DELTAS.values():
+                nxt = current[0] + dx, current[1] + dy
+                if (nxt in distances or nxt in occupied or
+                        not node.walkable(*nxt, allow_locked=allow_locked)):
+                    continue
+                distances[nxt] = distances[current] + 1
+                queue.append(nxt)
+        return distances
+
     # A retreat square learned as blocked is tried again after this long:
     # what blocked it was most often a creature, which moves on.
     RETREAT_BLOCKED_SECONDS = 30.0
@@ -4545,6 +4604,13 @@ class NavigateThenTask(BotTask):
             max(abs(m.world_x - x), abs(m.world_y - y))
             for x, y in threat_world)
         previous = self._trail[-2] if len(self._trail) >= 2 else None
+        # Progress towards the way out (_way_out): steps closer to where her
+        # route leaves this map rank above steps that hold or lose ground.
+        goal = self._way_out(client)
+        out_distances = (self._way_out_distances(
+            node, goal, allow_locked=self.navigation._allow_locked(client))
+            if goal is not None else {})
+        here_out = out_distances.get((m.world_x, m.world_y))
         candidates = []
         mobility_blocked = {(m.world_x, m.world_y), *threat_world}
         mobility_blocked.update(
@@ -4568,24 +4634,40 @@ class NavigateThenTask(BotTask):
             escape_depth, escape_area = retreat_mobility(
                 node, point, blocked=mobility_blocked,
                 allow_locked=self.navigation._allow_locked(client))
+            # Progress out: 1 closer to the way out, 0 as close (or no way
+            # out known), -1 farther, -2 cut off from it.
+            if here_out is None:
+                progress = 0
+            elif point in out_distances:
+                progress = max(-1, min(1, here_out - out_distances[point]))
+            else:
+                progress = -2
             # Continuing escape mobility outranks immediate separation: a
-            # farther tile in a dead end is not safer than an open flank. For a
-            # dangerous single monster, an equal-distance step must not reverse
-            # immediately or a two-tile plateau becomes an endless oscillation.
+            # farther tile in a dead end is not safer than an open flank.
+            # Then the way out: of the steps that separate her as far, the
+            # one towards where her route leaves the map, not the open room
+            # beyond it (live, 2026-11-24, the Old Outpost: she walked off
+            # the way out into a five-walled corner and stalled there for 14
+            # minutes). For a dangerous single monster, an equal-distance
+            # step must not reverse immediately or a two-tile plateau becomes
+            # an endless oscillation.
             candidates.append(
-                (int(escape_depth >= 2), minimum, escape_depth, escape_area,
-                 trail_score, sum(distances), direction))
+                (int(escape_depth >= 2), minimum, progress, escape_depth,
+                 escape_area, trail_score, sum(distances), direction))
         if not candidates:
             return False
-        (viable, minimum, escape_depth, escape_area, _, _,
-         direction) = max(candidates)
+        # A square with no onward step at all (escape depth 0) is a dead
+        # end: taken only when nothing else is open.
+        open_candidates = [entry for entry in candidates if entry[3] > 0]
+        (viable, minimum, progress, escape_depth, escape_area, _, _,
+         direction) = max(open_candidates or candidates)
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder(
                 "navigation-retreat-choice",
                 f"direction={direction} separation={minimum} "
                 f"escape_depth={escape_depth} escape_area={escape_area} "
-                f"continuation={viable}")
+                f"continuation={viable} progress={progress}")
         await client.clear_actions()
         # run=True is a persistent directional run mode in the protocol, not
         # a faster single step. Leaving it enabled caused the character to
@@ -5302,6 +5384,8 @@ class NavigateThenTask(BotTask):
         if client.state.phase != "playing":
             return
         self._record_trail(client)
+        # Noted before a defence clears the route (_way_out).
+        self._way_out(client)
         # Her trip stays under way while a fight or a recovery hold keeps
         # its navigation from ticking: what happens meanwhile is the route's.
         route_events.note_hold(client, self.navigation)
@@ -6416,6 +6500,100 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
         (path for path, _ in legs), same_kit)
 
 
+# Map transitions from a map to every map it reaches, per graph and map
+# (map_hops).
+_map_hops_cache: dict[tuple[int, str, int], dict[str, int]] = {}
+
+
+def map_hops(graph: "WorldGraph", source: str) -> dict[str, int]:
+    """Fewest map transitions from ``source`` to each map it reaches: a
+    cheap estimate of a trip's length from where she stands, by the
+    authored edges alone (no component, lock or hazard)."""
+    nodes = getattr(graph, "nodes", {}) or {}
+    key = (id(graph), source, len(nodes))
+    cached = _map_hops_cache.get(key)
+    if cached is not None:
+        return cached
+    if len(_map_hops_cache) > 64:
+        _map_hops_cache.clear()
+    hops = {source: 0} if source in nodes else {}
+    queue = deque(hops)
+    while queue:
+        current = queue.popleft()
+        for edge in getattr(nodes.get(current), "edges", ()):
+            if edge.destination not in hops and edge.destination in nodes:
+                hops[edge.destination] = hops[current] + 1
+                queue.append(edge.destination)
+    _map_hops_cache[key] = hops
+    return hops
+
+
+# Each objective's own measure in a ranked spot (the analyzer's views are
+# ordered by it). Spots of one preference tier measuring at least
+# FARM_COMPARABLE_SHARE of the tier's first-ranked spot are comparable:
+# among them the nearest from where she stands goes first
+# (_analyzer_farm_choice).
+FARM_OBJECTIVE_MEASURES = {"xp": "xp_hour", "money": "money_hour",
+                           "loot": "loot_hour", "balanced": "score",
+                           "safety": "safety_score"}
+FARM_COMPARABLE_SHARE = 0.8
+# Off the surface grid (a dungeon, a cave, a building) and farther than
+# this many map transitions from both her savebed and the chosen spot, she
+# walks home before farming (farm_home_first).
+FARM_HOME_FIRST_HOPS = 3
+
+
+def _farm_measure(objective: str, spot: dict) -> float | None:
+    value = spot.get(FARM_OBJECTIVE_MEASURES.get(objective, ""))
+    if (isinstance(value, (int, float)) and not isinstance(value, bool) and
+            value == value):
+        return float(value)
+    return None
+
+
+def farm_home_first(client: AtrinikClient, graph: "WorldGraph",
+                    legs) -> tuple[str, tuple[int, int]] | None:
+    """Her savebed, when she should walk there before farming ``legs``.
+
+    Only while she stands off the surface grid, more than
+    FARM_HOME_FIRST_HOPS map transitions from her savebed and from the
+    circuit's first map (map_hops; unreachable counts as far). The farming
+    analyzer judged the circuit's approach from her savebed, not from where
+    she stands. Live, on 2026-11-24, a failed errand left Sera deep in the
+    Old Outpost and autoplay sent her 49 map transitions to the Burnt
+    Forest from there, through six pack-threat maps.
+    """
+    state = client.state
+    here = getattr(getattr(state, "map", None), "path", "") or ""
+    home = getattr(state, "savebed_map", "") or ""
+    xy = getattr(state, "savebed_xy", None)
+    nodes = getattr(graph, "nodes", {}) or {}
+    if (not here or not home or xy is None or not legs or here == home or
+            home not in nodes or here not in nodes or
+            NavigateTask.SURFACE_MAP.fullmatch(here)):
+        return None
+    hops = map_hops(graph, here)
+    far = FARM_HOME_FIRST_HOPS
+    if (hops.get(home, far + 1) <= far or
+            hops.get(legs[0][0], far + 1) <= far):
+        return None
+    return home, (int(xy[0]), int(xy[1]))
+
+
+def farm_home_walk(graph: "WorldGraph", client: AtrinikClient,
+                   home: tuple[str, tuple[int, int]]) -> "NavigateThenTask":
+    """The walk to her savebed before farming (farm_home_first): the
+    recovery phase's ordinary walk home (RecoveryTask._new_home_walk), not
+    an essential trip."""
+    walk = NavigateThenTask(graph, home[0], _ArriveTask("savebed"),
+                            destination_xy=home[1], combat_approach=True)
+    walk.navigation.tolerance = 1
+    walk.navigation.allow_ranged_hazard_fallback = (
+        FarmCircuitTask._combat_progression_level(client) >=
+        FarmCircuitTask.SWAMP_TRANSIT_LEVEL)
+    return walk
+
+
 # The cure-funding farm never takes a spot whose analyzer danger is this
 # share of her maximum health or more: at most half, so she survives two
 # such encounters back to back (_analyzer_farm_choice).
@@ -6797,6 +6975,32 @@ def _analyzer_farm_choice(
         recent = {id(entry): sum(1 for maps in failures
                                  if maps & {path for path, _ in entry[1]})
                   for entry in usable}
+    # Travel from where she stands: among comparable spots (each tier's
+    # measure at least FARM_COMPARABLE_SHARE of its first-ranked spot's),
+    # fewest map transitions to the circuit's first map first (map_hops).
+    # The analyzer judged every approach from her savebed; a failed errand
+    # can leave her far from it.
+    here = getattr(getattr(client.state, "map", None), "path", "") or ""
+    hops = map_hops(graph, here) if here else {}
+    # Each tier's first-ranked spot sets what is comparable: the analyzer
+    # would farm it.
+    best_measure: dict[tuple[int, bool], float] = {}
+    for entry in sorted(usable, key=lambda entry: order[id(entry)]):
+        position, _ = order[id(entry)]
+        tier = (position, plan.risky_approach(entry[2]) or
+                plan.risky_spot(entry[2]))
+        measure = _farm_measure(entry[0], entry[2])
+        if measure is not None:
+            best_measure.setdefault(tier, measure)
+
+    def travel(entry, position: int, risky: bool) -> tuple[int, float]:
+        # (0, transitions) for a comparable spot, (1, 0) for the rest.
+        measure = _farm_measure(entry[0], entry[2])
+        best = best_measure.get((position, risky))
+        if measure is None or best is None or (
+                measure < FARM_COMPARABLE_SHARE * best):
+            return 1, 0.0
+        return 0, float(hops.get(entry[1][0][0], math.inf))
 
     def preference(entry) -> tuple:
         # Within each objective's ranking (the effective one first, so the
@@ -6822,9 +7026,13 @@ def _analyzer_farm_choice(
             return (position, recent[id(entry)], -safety,
                     _spot_danger(spot), rank)
         # Risky spots tied on safety (one approach caps them all) go by
-        # their own safety, seam exposure included, then by rank.
+        # their own safety, seam exposure included, then by rank. Safe
+        # ones go nearest first among comparable spots (travel), then by
+        # rank.
         own = plan.spot_safety(spot) if risky else 0.0
-        return (position, risky, -safety if risky else 0.0, -own, rank)
+        return (position, risky, -safety if risky else 0.0, -own,
+                *((1, 0.0) if risky else travel(entry, position, risky)),
+                rank)
 
     usable.sort(key=preference)
     if funding or not depleted_for_temple(client.state):

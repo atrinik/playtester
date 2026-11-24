@@ -422,6 +422,16 @@ merged rule.
   1.9.
 - Savebed selection routes with `route_points` but no access set
   (`navigation.py:4430`), so keyed shortcuts such as the ship do not count.
+- Since 2026-11-24 (COMBAT.md, the Old Outpost stall) two cheap distance
+  terms exist outside the planner. `map_hops` counts map transitions over
+  the authored edges alone (no component, lock or hazard): among comparable
+  safe spots `analyzer_farm_choice` takes the nearest from where she
+  stands, and `farm_home_first` sends her home before farming when she is
+  off the surface grid and far from both her savebed and the spot. On a
+  defended walk, `NavigateThenTask._retreat_step` ranks progress towards
+  the route's square out of the current map (`_way_out`) after separation.
+  Neither compares route cost or danger; the farm score (4.5) would replace
+  the first.
 
 ### 1.11 Dashboard and metrics
 

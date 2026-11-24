@@ -564,6 +564,14 @@ class FarmAnalyzer:
     # depth, parsed off the event loop); the other views are cut back to
     # TOP once it is read.
     SAFETY_TOP = 250
+    # Circuits of one area (the analyzer's region and name) kept per view
+    # but safety. The raw views list every permutation of a circuit: live,
+    # on 2026-11-24, the XP view's first 40 were all Burnt Forest circuits,
+    # every one rated hazardous for her kit, so she farmed the least
+    # dangerous of them 49 map transitions away while the Underground
+    # City's outer maps, Hemlock Cave and Eld Woods Island ranked 60th to
+    # 125th. A few per area keep alternatives that avoid one bad map.
+    AREA_CIRCUITS = 3
 
     def __init__(self, analyzer_root: Path, content_root: Path, server_root: Path, *,
                  python: str = sys.executable,
@@ -757,14 +765,41 @@ class FarmAnalyzer:
             raise RuntimeError("report has no ranking for every objective")
         return self._bounded(report)
 
+    @staticmethod
+    def circuit_area(spot) -> tuple[str, str] | None:
+        """The area a circuit permutation belongs to (its region and name);
+        None for a single-map spot, which is its own area."""
+        if not isinstance(spot, dict) or not str(
+                spot.get("path", "")).startswith("circuit["):
+            return None
+        return str(spot.get("region", "")), str(spot.get("name", ""))
+
+    def _distinct(self, ranked: list) -> list:
+        """The first TOP spots of a view, at most AREA_CIRCUITS circuits of
+        any one area (circuit_area), in rank order."""
+        kept: list = []
+        per_area: dict[tuple[str, str], int] = {}
+        for spot in ranked:
+            area = self.circuit_area(spot)
+            if area is not None:
+                if per_area.get(area, 0) >= self.AREA_CIRCUITS:
+                    continue
+                per_area[area] = per_area.get(area, 0) + 1
+            kept.append(spot)
+            if len(kept) >= self.TOP:
+                break
+        return kept
+
     def _bounded(self, report: dict) -> dict:
-        """The report with every view but safety, and its unranked results,
-        cut back to TOP (the analyzer's --top applies to all of them)."""
+        """The report with its safety view cut back to SAFETY_TOP, every
+        other view to TOP spots with at most AREA_CIRCUITS circuits of one
+        area (_distinct; the analyzer's --top, SAFETY_TOP, applies to all
+        of them), and its unranked results to TOP."""
         rankings = report["rankings"]
         for name, ranked in list(rankings.items()):
             if isinstance(ranked, list):
-                rankings[name] = ranked[:self.SAFETY_TOP if name == "safety"
-                                        else self.TOP]
+                rankings[name] = (ranked[:self.SAFETY_TOP] if name == "safety"
+                                  else self._distinct(ranked))
         for name in ("results", "groups"):
             if isinstance(report.get(name), list):
                 report[name] = report[name][:self.TOP]
