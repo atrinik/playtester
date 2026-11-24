@@ -1784,7 +1784,7 @@ class WorldGraph:
         start = self._component(source, source_xy, allow_locked=allow_locked)
         if not start:
             return False
-        key = (source, min(start), destination, tuple(destination_points),
+        key = (source, start, destination, tuple(destination_points),
                frozenset(excluded or ()), frozenset(avoided_maps or ()),
                allow_locked, offer)
         cache = self.__dict__.setdefault("_route_open_cache", {})
@@ -2572,8 +2572,8 @@ class NavigateTask(BotTask):
         two stairs down were both excluded for a pack beside them and the
         errand failed on "no component route" with the pool one floor
         below. When the graph joins her to the destination without them
-        but not with them, the route is dropped until the soonest of them
-        expires (her defence holds meanwhile), then replanned. Only once a
+        but not with them, the route is dropped until the first expiry that
+        reopens it (her defence holds meanwhile), then replanned. Only once a
         trip: an edge that fails again after it (an NPC that never answers,
         a click that never finds a path) fails the trip as before. Any other
         failure fails as before."""
@@ -2584,7 +2584,16 @@ class NavigateTask(BotTask):
             return False
         self._exclusion_waited = True
         now = time.monotonic()
-        until = min(self._edge_exclusions.values())
+        # The first expiry that reopens the route, not merely the soonest:
+        # an unrelated short exclusion (a seam elsewhere) must not spend the
+        # trip's one wait.
+        exclusions = dict(self._edge_exclusions)
+        until = max(exclusions.values())
+        for expiry in sorted(set(exclusions.values())):
+            if self.graph_route_open(client, {
+                    key for key, ends in exclusions.items() if ends > expiry}):
+                until = expiry
+                break
         self.route = []
         self._issued_goal = self._issued_click = None
         self._last_progress = now
@@ -2619,7 +2628,7 @@ class NavigateTask(BotTask):
         # How often each key was excluded on this trip (see _exclude_edge).
         self._edge_exclusion_strikes: dict[tuple, int] = {}
         # Until when a plan that only live exclusions closed waits for the
-        # soonest of them to expire (_wait_for_exclusions); 0.0 when none.
+        # first expiry that reopens it (_wait_for_exclusions); 0.0 when none.
         self._exclusion_wait_until = 0.0
         self._exclusion_waited = False
         self._runtime_blocked: set[tuple[int, int]] = set()
@@ -4520,10 +4529,18 @@ class NavigateThenTask(BotTask):
         if held < self.PACK_EXIT_BYPASS_SECONDS:
             return False
         kept_since = self._pack_exit_kept.get(key)
-        if ((kept_since is None or
-             now - kept_since < self.PACK_EXIT_KEEP_SECONDS) and
-                not await self.navigation.graph_route_open_async(
-                    client, self.navigation._excluded_edges | {key})):
+        last_way = ((kept_since is None or
+                     now - kept_since < self.PACK_EXIT_KEEP_SECONDS) and
+                    not await self.navigation.graph_route_open_async(
+                        client, self.navigation._excluded_edges | {key}))
+        # The search may have handed the loop back: act only on the same
+        # exit, at the time it ended.
+        if (not self.navigation.route or self.navigation.route[0] != edge or
+                self._pack_exit_stall is None or
+                self._pack_exit_stall[0] != key):
+            return False
+        now = time.monotonic()
+        if last_way:
             # The last way on toward the destination (live: both Old
             # Outpost stairs down, a pack beside them) is not excluded:
             # she holds here and tries again after another

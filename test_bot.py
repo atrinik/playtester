@@ -14272,7 +14272,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         actions = [record["action"] for record in client.decision_history]
         self.assertEqual(actions.count("navigation-pack-exit-kept"), 1)
         # That answer is cached: asking again expands nothing.
-        with patch.object(graph, "_component_states",
+        with patch.object(graph, "_expand_component_states",
                           side_effect=AssertionError("expanded again")):
             self.assertFalse(navigation.graph_route_open(
                 client, navigation._excluded_edges | {key(second)}))
@@ -14290,6 +14290,11 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # Excluded anyway (a click that found no path): the replan waits
         # for the soonest exclusion instead of failing the trip.
         navigation._exclude_edge(second)
+        # An unrelated, sooner exclusion (a seam elsewhere) is not what she
+        # waits for: she waits for the stairs.
+        navigation._edge_exclusions[
+            ("/shattered_islands/world_1_1", "/shattered_islands/world_1_2")] = (
+                time.monotonic() + 10)
         navigation._replan(client)
         self.assertEqual(navigation.status, TaskStatus.RUNNING)
         self.assertEqual(navigation.route, [])

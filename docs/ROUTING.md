@@ -360,7 +360,8 @@ Dungeon maps are never pack hazards, however dense: Underground City
 - A plan that fails while live exclusions are what close the graph (it
   routes without them, not with them; `NavigateTask._wait_for_exclusions`)
   does not fail the trip the first time: the route is dropped until the
-  soonest exclusion expires (`navigation-exclusion-wait`; at most 300 s),
+  first exclusion expiry that reopens it, not an unrelated sooner one
+  (`navigation-exclusion-wait`; at most 300 s),
   then replanned. This also covers a click that found no path and a voyage
   NPC that did not answer. It happens once a trip: an edge that fails again
   fails the trip as before, as does any other plan failure. On the
