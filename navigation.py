@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import logging
 import math
@@ -307,6 +308,9 @@ def _coord(node: dict, parent: dict | None, name: str) -> int:
 def _clear_components(graph) -> None:
     """Drop a graph's cached components, and their access-set order."""
     graph._component_cache.clear()
+    route_open = getattr(graph, "_route_open_cache", None)
+    if isinstance(route_open, dict):
+        route_open.clear()
     order = getattr(graph, "_component_access_order", None)
     if isinstance(order, list):
         order.clear()
@@ -498,6 +502,8 @@ class WorldGraph:
             tuple[str, bool, tuple[int, int]], frozenset[tuple[int, int]]
         ] = {}
         self._aggro_pack_cache: dict[tuple[str, int, bool], int] = {}
+        # route_open answers, by start component and inputs.
+        self._route_open_cache: dict[tuple, bool] = {}
         self._seam_exposure_cache: dict[
             frozenset[str], farm_analyzer_plan.SeamExposure] = {}
         self._world_search_snapshot: tuple[
@@ -1754,6 +1760,57 @@ class WorldGraph:
             avoided_maps=avoided_maps, offer=offer, stop_maps=stop_maps)[0]
         return frozenset(map_path for map_path, _ in states)
 
+    ROUTE_OPEN_CACHE_SIZE = 256
+
+    def route_open(self, *args, **kwargs) -> bool:
+        """route_open_iter run to the end."""
+        return drain(self.route_open_iter(*args, **kwargs))
+
+    def route_open_iter(self, source: str, source_xy: tuple[int, int],
+                        destination: str,
+                        destination_points: list[tuple[int, int]], *,
+                        allow_locked=False,
+                        excluded: set[tuple] | None = None,
+                        avoided_maps: set[str] | None = None,
+                        offer: dialogue_edges.DialogueOffer | None = None):
+        """Whether route_points would find a route (no walls, no
+        penalties), without building it; a generator that yields as it
+        expands (_expand_component_states), returning the answer. Cheap
+        first: the search stops on reaching the destination map (a few
+        milliseconds); only a miss there runs the whole expansion (about
+        1.4 s for the Old Outpost with both stairs closed). Answers are
+        cached per graph by her start component and the inputs (cleared
+        with the components)."""
+        start = self._component(source, source_xy, allow_locked=allow_locked)
+        if not start:
+            return False
+        key = (source, start, destination, tuple(destination_points),
+               frozenset(excluded or ()), frozenset(avoided_maps or ()),
+               allow_locked, offer)
+        cache = self.__dict__.setdefault("_route_open_cache", {})
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        result = False
+        for stop_maps in ({destination}, None):
+            states, positions = (yield from self._expand_component_states(
+                source, source_xy, destination, allow_locked=allow_locked,
+                excluded=excluded, avoided_maps=avoided_maps, offer=offer,
+                stop_maps=stop_maps))[:2]
+            if any(map_path == destination and (
+                    not destination_points or any(
+                        self.local_path(map_path, position, point,
+                                        allow_locked=allow_locked)
+                        for point in destination_points))
+                   for (map_path, _), position in zip(states, positions)):
+                result = True
+                break
+        if len(cache) >= self.ROUTE_OPEN_CACHE_SIZE:
+            cache.clear()
+        cache[key] = result
+        return result
+
     def route_points(self, source: str, source_xy: tuple[int, int],
                      destination: str,
                      destination_points: list[tuple[int, int]], *,
@@ -2466,6 +2523,87 @@ class NavigateTask(BotTask):
                       self.EDGE_EXCLUSION_SECONDS * 2 ** min(strikes, 8))
         self._edge_exclusions[key] = time.monotonic() + seconds
 
+    def graph_route_open(self, client: AtrinikClient,
+                         excluded: set[tuple] | None = None) -> bool:
+        """Whether the static graph, behind ``excluded`` (and the lethal
+        transit every tier avoids), still joins where she stands to the
+        destination: no hazard tier, no strict avoidance, no owner block,
+        only the map graph (WorldGraph.route_open, cached)."""
+        return drain(self.graph_route_open_iter(client, excluded))
+
+    def graph_route_open_iter(self, client: AtrinikClient,
+                              excluded: set[tuple] | None = None):
+        """graph_route_open as a generator (WorldGraph.route_open_iter)."""
+        m = client.state.map
+        return self.graph.route_open_iter(
+            m.path, (m.world_x, m.world_y), self.destination,
+            list(self._goal_points()),
+            allow_locked=self._allow_locked(client),
+            excluded=set(excluded or ()),
+            avoided_maps=set(self.KNOWN_LETHAL_TRANSIT),
+            offer=dialogue_edges.dialogue_offer(client, self.graph))
+
+    # A cooperative graph_route_open hands the event loop back after this
+    # many expanded states.
+    ROUTE_OPEN_YIELD_STATES = 200
+
+    async def graph_route_open_async(self, client: AtrinikClient,
+                                     excluded: set[tuple] | None = None) -> bool:
+        """graph_route_open from a coroutine: a cold whole-world miss
+        hands the event loop back every ROUTE_OPEN_YIELD_STATES states, so
+        the connection keeps being served while it runs."""
+        search = self.graph_route_open_iter(client, excluded)
+        steps = 0
+        while True:
+            try:
+                next(search)
+            except StopIteration as done:
+                return done.value
+            steps += 1
+            if steps % self.ROUTE_OPEN_YIELD_STATES == 0:
+                await asyncio.sleep(0)
+
+    def _wait_for_exclusions(self, client: AtrinikClient,
+                             error: Exception) -> bool:
+        """A plan failed: wait instead of failing when only live edge
+        exclusions close it (ROUTING 1.8).
+
+        Exclusions are detour hints that expire; live, the Old Outpost's
+        two stairs down were both excluded for a pack beside them and the
+        errand failed on "no component route" with the pool one floor
+        below. When the graph joins her to the destination without them
+        but not with them, the route is dropped until the first expiry that
+        reopens it (her defence holds meanwhile), then replanned. Only once a
+        trip: an edge that fails again after it (an NPC that never answers,
+        a click that never finds a path) fails the trip as before. Any other
+        failure fails as before."""
+        excluded = self._excluded_edges
+        if (self._exclusion_waited or not excluded or
+                self.graph_route_open(client, excluded) or
+                not self.graph_route_open(client, set())):
+            return False
+        self._exclusion_waited = True
+        now = time.monotonic()
+        # The first expiry that reopens the route, not merely the soonest:
+        # an unrelated short exclusion (a seam elsewhere) must not spend the
+        # trip's one wait.
+        exclusions = dict(self._edge_exclusions)
+        until = max(exclusions.values())
+        for expiry in sorted(set(exclusions.values())):
+            if self.graph_route_open(client, {
+                    key for key, ends in exclusions.items() if ends > expiry}):
+                until = expiry
+                break
+        self.route = []
+        self._issued_goal = self._issued_click = None
+        self._last_progress = now
+        self._exclusion_wait_until = until
+        self._record(client, "navigation-exclusion-wait",
+                     f"{self.destination}: {len(excluded)} excluded edge(s) "
+                     f"close every route; replanning in {until - now:.0f}s "
+                     f"({error})")
+        return True
+
     def __init__(self, graph: WorldGraph, destination: str,
                  destination_xy: tuple[int, int] | None = None,
                  tolerance: int = 0,
@@ -2489,6 +2627,10 @@ class NavigateTask(BotTask):
         self._edge_exclusions: dict[tuple, float] = {}
         # How often each key was excluded on this trip (see _exclude_edge).
         self._edge_exclusion_strikes: dict[tuple, int] = {}
+        # Until when a plan that only live exclusions closed waits for the
+        # first expiry that reopens it (_wait_for_exclusions); 0.0 when none.
+        self._exclusion_wait_until = 0.0
+        self._exclusion_waited = False
         self._runtime_blocked: set[tuple[int, int]] = set()
         # When the current local route first disappeared (0.0 while one exists).
         # Separate from _last_progress, which approach-candidate rotation resets.
@@ -4060,7 +4202,8 @@ class NavigateTask(BotTask):
         try:
             self.route = self._plan(client)
         except ValueError as exc:
-            self.fail(str(exc))
+            if not self._wait_for_exclusions(client, exc):
+                self.fail(str(exc))
 
     async def _take_voyage(self, client: AtrinikClient, edge: MapEdge) -> None:
         """Take one dialogue voyage (dialogue_edges.py): walk beside the
@@ -4209,6 +4352,10 @@ class NavigateTask(BotTask):
                     destination = self.destination_xy
             else:
                 destination = self.destination_xy
+            if time.monotonic() < self._exclusion_wait_until:
+                # Waiting for an exclusion: the goal is not reachable on
+                # this map without the edge it closes.
+                return
             if not await self._click_path(client, *destination):
                 self.fail(f"no authored path to destination {destination}")
             return
@@ -4228,12 +4375,10 @@ class NavigateTask(BotTask):
         if not self.route or self.route[0].source != client.state.map.path:
             if self._voyage is not None:
                 self._voyage_landed_elsewhere(client)
-            try:
-                self.route = self._plan(client)
-            except ValueError as exc:
-                self.fail(str(exc))
+            if time.monotonic() < self._exclusion_wait_until:
                 return
-            if not self.route:
+            self._replan(client)
+            if self.status != TaskStatus.RUNNING or not self.route:
                 return
             if self.care is not None and await self._care_hold(client):
                 return
@@ -4277,10 +4422,7 @@ class NavigateTask(BotTask):
                 else:
                     recorder("navigation-click-failed", detail)
             self._exclude_edge(edge)
-            try:
-                self.route = self._plan(client)
-            except ValueError as exc:
-                self.fail(str(exc))
+            self._replan(client)
             return
         if (client.state.map.path == edge.destination and
                 (edge.source != edge.destination or
@@ -4296,6 +4438,9 @@ class NavigateThenTask(BotTask):
     """Route to an authored map, then run another character-state task."""
 
     PACK_EXIT_BYPASS_SECONDS = 15.0
+    # A pack-held exit kept as the last way on is held at most this long in
+    # all, from when it was first kept, then excluded as any other.
+    PACK_EXIT_KEEP_SECONDS = 180.0
     # Off the destination map, fight back only once something has been
     # hitting her and the route has made no progress for this long.
     TRANSIT_CORNERED_SECONDS = 4.0
@@ -4354,6 +4499,9 @@ class NavigateThenTask(BotTask):
         self._last_pack_signature: tuple[int, ...] = ()
         self._pack_exit_stall: tuple[
             tuple[str, str, int, int], float] | None = None
+        # Pack-held exits kept because they were the last way on, and when
+        # each was first kept (PACK_EXIT_KEEP_SECONDS).
+        self._pack_exit_kept: dict[tuple[str, str, int, int], float] = {}
         self._recovering_after_combat = False
         self._transit_stall: tuple[
             int, str, int, int, int, int, int, float] | None = None
@@ -4384,6 +4532,34 @@ class NavigateThenTask(BotTask):
             return False
         held = now - self._pack_exit_stall[1]
         if held < self.PACK_EXIT_BYPASS_SECONDS:
+            return False
+        kept_since = self._pack_exit_kept.get(key)
+        last_way = ((kept_since is None or
+                     now - kept_since < self.PACK_EXIT_KEEP_SECONDS) and
+                    not await self.navigation.graph_route_open_async(
+                        client, self.navigation._excluded_edges | {key}))
+        # The search may have handed the loop back: act only on the same
+        # exit, at the time it ended.
+        if (not self.navigation.route or self.navigation.route[0] != edge or
+                self._pack_exit_stall is None or
+                self._pack_exit_stall[0] != key):
+            return False
+        now = time.monotonic()
+        if last_way:
+            # The last way on toward the destination (live: both Old
+            # Outpost stairs down, a pack beside them) is not excluded:
+            # she holds here and tries again after another
+            # PACK_EXIT_BYPASS_SECONDS, for PACK_EXIT_KEEP_SECONDS in all.
+            self._pack_exit_stall = (key, now)
+            if kept_since is None:
+                self._pack_exit_kept[key] = now
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder(
+                        "navigation-pack-exit-kept",
+                        f"{edge.source} -> {edge.destination} "
+                        f"at={edge.x},{edge.y} held={held:.0f}s: the last "
+                        "way on")
             return False
         route_events.note_edge(client, self.navigation, edge)
         self.navigation._exclude_edge(edge)
