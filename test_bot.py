@@ -13130,6 +13130,14 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                 task._defend_while_navigating(client)))
         self.assertEqual(client.combat[-1], True)
         self.assertEqual(client.targets[-1][2], 901)
+        # Half a second on, the same far golems, still not hitting her: the
+        # bound stays spent and she fights on.
+        with patch("atrinik_bot.navigation.time.monotonic",
+                   return_value=1000.5 + task.CORNERED_HOLD_SECONDS):
+            self.assertEqual(asyncio.run(task._cornered_split(
+                client, [(2, 8, 10, m.tile(8, 10).objects[3]),
+                         (3, 8, 11, m.tile(8, 11).objects[3])]))[3].target_id,
+                901)
 
     def test_repeated_pack_split_hold_is_not_resent(self):
         """While her split step is in flight and nothing changes, the hold

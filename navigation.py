@@ -4808,7 +4808,8 @@ class NavigateThenTask(BotTask):
         fought (the farm's cornered breakout does the same): one beside
         her, or one farther off only while she is being hit; otherwise she
         holds (None) and lets them come to her, for at most
-        CORNERED_HOLD_SECONDS, then fights the nearest. The one she fights stays
+        CORNERED_HOLD_SECONDS, then fights the nearest, on for as long as she
+        stays cornered and overwhelmed. The one she fights stays
         her target (``_cornered_target``) until it dies or is more than 4
         tiles off, so a square opening mid-fight, or the step she takes
         toward one farther off, does not turn her back into a combat-off
@@ -4848,7 +4849,8 @@ class NavigateThenTask(BotTask):
                 self._cornered_hold_since = now
             if now - self._cornered_hold_since < self.CORNERED_HOLD_SECONDS:
                 return None
-        self._cornered_hold_since = 0.0
+            # An expired hold stays expired while she stays cornered and
+            # overwhelmed: she fights on rather than hold another bound.
         if target[3].target_id != self._cornered_target:
             self._cornered_target = target[3].target_id
         if target[3].target_id not in self._cornered_logged:
