@@ -14271,6 +14271,22 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(navigation.route[0], second)
         actions = [record["action"] for record in client.decision_history]
         self.assertEqual(actions.count("navigation-pack-exit-kept"), 1)
+        # That answer is cached: asking again expands nothing.
+        with patch.object(graph, "_component_states",
+                          side_effect=AssertionError("expanded again")):
+            self.assertFalse(navigation.graph_route_open(
+                client, navigation._excluded_edges | {key(second)}))
+        # The hold is bounded: kept for PACK_EXIT_KEEP_SECONDS in all, it is
+        # excluded as before.
+        held = apply_ground_trip(graph, policy.parts["A Better Crystal"].action)
+        held.navigation.status = TaskStatus.RUNNING
+        held.navigation.route = [second]
+        held.navigation._exclude_edge(first)
+        held._pack_exit_kept[key(second)] = (
+            time.monotonic() - held.PACK_EXIT_KEEP_SECONDS - 1)
+        held._pack_exit_stall = (key(second), time.monotonic() - 20)
+        self.assertTrue(asyncio.run(held._bypass_pack_blocked_exit(client)))
+        self.assertIn(key(second), held.navigation._excluded_edges)
         # Excluded anyway (a click that found no path): the replan waits
         # for the soonest exclusion instead of failing the trip.
         navigation._exclude_edge(second)
@@ -14292,6 +14308,12 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         navigation._replan(client)
         self.assertEqual(navigation.status, TaskStatus.RUNNING)
         self.assertEqual(navigation.route[0], first)
+        # Only one wait a trip: an edge that fails again (a click that never
+        # finds a path) fails it as before, instead of waiting forever.
+        navigation._exclude_edge(first)
+        navigation._replan(client)
+        self.assertEqual(navigation.status, TaskStatus.FAILED)
+        self.assertIn("no component route", navigation.error)
 
     def test_a_plan_no_exclusion_closed_still_fails(self):
         client = type("Client", (), {})()
