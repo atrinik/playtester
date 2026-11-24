@@ -16,6 +16,7 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          has_working_recall, heal_restock_alerts,
                          recall_alerts, settle_cure_funding_farm,
                          WorldGraph, analyzer_farm_selection,
+                         farm_home_first, farm_home_walk,
                          farming_unsafe_reason, food_reserve, hungry,
                          temple_food_trip)
 from .alerts import HUNGRY_FOOD
@@ -53,6 +54,9 @@ class AutoplayTask(BotTask):
     HANDOVER_UNPAID_SECONDS = 300.0
     # A priest whose food trip failed is passed over this long.
     TEMPLE_PRIEST_RETRY = 60 * 60
+    # After a failed walk home before farming (farm_home_first), she farms
+    # from where she stands for this long.
+    FARM_HOME_FIRST_RETRY = 15 * 60
 
     def __init__(self, graph: WorldGraph, *, target_level: int = 115):
         super().__init__(f"autoplay:level-{max(1, int(target_level))}")
@@ -67,6 +71,7 @@ class AutoplayTask(BotTask):
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
         self._temple_food_retry_at = 0.0
+        self._farm_home_first_retry_at = 0.0
         # Priests whose food trip failed, until when they are passed over.
         self._failed_priests: dict[str, float] = {}
         # Whether this hunger episode already tried a second priest.
@@ -485,6 +490,9 @@ class AutoplayTask(BotTask):
                 if self.phase == "temple-food":
                     if await self._temple_food_failed(client):
                         return
+                elif self.phase == "farm-home-first":
+                    self._farm_home_first_retry_at = (
+                        time.monotonic() + self.FARM_HOME_FIRST_RETRY)
                 elif self.phase == "mana-crystal-upgrade":
                     # A long, hostile trip: do not repeat it every few
                     # minutes when it cannot succeed.
@@ -550,6 +558,20 @@ class AutoplayTask(BotTask):
             return
         self._awaiting_ranking_recorded = False
         legs, spot = selection
+        # Deep in a dungeon far from her savebed and from the spot: home
+        # first, where the analyzer judged the spot's approach from, then
+        # choose again.
+        home = (farm_home_first(client, self.graph, legs)
+                if time.monotonic() >= self._farm_home_first_retry_at else None)
+        if home is not None:
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("farm-home-first",
+                         f"{client.state.map.path} -> {home[0]} before "
+                         f"{spot.get('name', '?')}")
+            await self._set_child(client, "farm-home-first",
+                                  farm_home_walk(self.graph, client, home))
+            return
         await self._set_child(
             client, "adaptive-farming",
             FarmCircuitTask(
