@@ -346,6 +346,17 @@ Dungeon maps are never pack hazards, however dense: Underground City
   (`navigation.py:2696-2697`), a seam with no remaining crossing
   (`navigation.py:2570-2580`) and an exit held by a pack for 15 s
   (`NavigateThenTask._bypass_pack_blocked_exit`, `navigation.py:2769-2800`).
+  A pack-held exit is excluded only while the static graph still joins her
+  to the destination without it: the last way on is kept, recorded once as
+  `navigation-pack-exit-kept`, and she holds and defends by it, trying
+  again after another 15 s. Live (2026-11-24) a pack beside both Old Outpost
+  stairs down (`old_outpost_0202` (10,18) and (10,19)) got each excluded in
+  turn and the errand failed on "no component route".
+- A plan that fails while live exclusions are what close the graph (it
+  routes without them, not with them; `NavigateTask._wait_for_exclusions`)
+  does not fail the trip: the route is dropped until the soonest exclusion
+  expires (`navigation-exclusion-wait`), her defence holding meanwhile, and
+  then replanned. Any other plan failure fails the trip as before.
 - `_failed_tile_crossings` (`navigation.py:1673`, filled at `2519`) holds
   seam crossings that stalled, so `_retry_stalled_tile_crossing`
   (`navigation.py:2450-2595`) tries another row or column.

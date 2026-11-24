@@ -2466,6 +2466,52 @@ class NavigateTask(BotTask):
                       self.EDGE_EXCLUSION_SECONDS * 2 ** min(strikes, 8))
         self._edge_exclusions[key] = time.monotonic() + seconds
 
+    def graph_route_open(self, client: AtrinikClient,
+                         excluded: set[tuple] | None = None) -> bool:
+        """Whether the static graph, behind ``excluded`` (and the lethal
+        transit every tier avoids), still joins where she stands to the
+        destination: no hazard tier, no owner block, only the map graph."""
+        m = client.state.map
+        try:
+            self.graph.route_points(
+                m.path, (m.world_x, m.world_y), self.destination,
+                list(self._goal_points()),
+                allow_locked=self._allow_locked(client),
+                excluded=set(excluded or ()),
+                avoided_maps=set(self.KNOWN_LETHAL_TRANSIT),
+                offer=dialogue_edges.dialogue_offer(client, self.graph))
+        except ValueError:
+            return False
+        return True
+
+    def _wait_for_exclusions(self, client: AtrinikClient,
+                             error: Exception) -> bool:
+        """A plan failed: wait instead of failing when only live edge
+        exclusions close it (ROUTING 1.8).
+
+        Exclusions are detour hints that expire; live, the Old Outpost's
+        two stairs down were both excluded for a pack beside them and the
+        errand failed on "no component route" with the pool one floor
+        below. When the graph joins her to the destination without them
+        but not with them, the route is dropped until the soonest of them
+        expires (her defence holds and fights meanwhile), then replanned.
+        Any other failure fails as before."""
+        excluded = self._excluded_edges
+        if not excluded or self.graph_route_open(client, excluded) or \
+                not self.graph_route_open(client, set()):
+            return False
+        now = time.monotonic()
+        until = min(self._edge_exclusions.values())
+        self.route = []
+        self._issued_goal = self._issued_click = None
+        self._last_progress = now
+        self._exclusion_wait_until = until
+        self._record(client, "navigation-exclusion-wait",
+                     f"{self.destination}: {len(excluded)} excluded edge(s) "
+                     f"close every route; replanning in {until - now:.0f}s "
+                     f"({error})")
+        return True
+
     def __init__(self, graph: WorldGraph, destination: str,
                  destination_xy: tuple[int, int] | None = None,
                  tolerance: int = 0,
@@ -2489,6 +2535,9 @@ class NavigateTask(BotTask):
         self._edge_exclusions: dict[tuple, float] = {}
         # How often each key was excluded on this trip (see _exclude_edge).
         self._edge_exclusion_strikes: dict[tuple, int] = {}
+        # Until when a plan that only live exclusions closed waits for the
+        # soonest of them to expire (_wait_for_exclusions); 0.0 when none.
+        self._exclusion_wait_until = 0.0
         self._runtime_blocked: set[tuple[int, int]] = set()
         # When the current local route first disappeared (0.0 while one exists).
         # Separate from _last_progress, which approach-candidate rotation resets.
@@ -4060,7 +4109,8 @@ class NavigateTask(BotTask):
         try:
             self.route = self._plan(client)
         except ValueError as exc:
-            self.fail(str(exc))
+            if not self._wait_for_exclusions(client, exc):
+                self.fail(str(exc))
 
     async def _take_voyage(self, client: AtrinikClient, edge: MapEdge) -> None:
         """Take one dialogue voyage (dialogue_edges.py): walk beside the
@@ -4228,12 +4278,10 @@ class NavigateTask(BotTask):
         if not self.route or self.route[0].source != client.state.map.path:
             if self._voyage is not None:
                 self._voyage_landed_elsewhere(client)
-            try:
-                self.route = self._plan(client)
-            except ValueError as exc:
-                self.fail(str(exc))
+            if time.monotonic() < self._exclusion_wait_until:
                 return
-            if not self.route:
+            self._replan(client)
+            if self.status != TaskStatus.RUNNING or not self.route:
                 return
             if self.care is not None and await self._care_hold(client):
                 return
@@ -4277,10 +4325,7 @@ class NavigateTask(BotTask):
                 else:
                     recorder("navigation-click-failed", detail)
             self._exclude_edge(edge)
-            try:
-                self.route = self._plan(client)
-            except ValueError as exc:
-                self.fail(str(exc))
+            self._replan(client)
             return
         if (client.state.map.path == edge.destination and
                 (edge.source != edge.destination or
@@ -4349,6 +4394,9 @@ class NavigateThenTask(BotTask):
         self._last_pack_signature: tuple[int, ...] = ()
         self._pack_exit_stall: tuple[
             tuple[str, str, int, int], float] | None = None
+        # Pack-held exits kept because they were the last way on (recorded
+        # once each).
+        self._pack_exit_kept: set[tuple[str, str, int, int]] = set()
         self._recovering_after_combat = False
         self._transit_stall: tuple[
             int, str, int, int, int, int, int, float] | None = None
@@ -4379,6 +4427,23 @@ class NavigateThenTask(BotTask):
             return False
         held = now - self._pack_exit_stall[1]
         if held < self.PACK_EXIT_BYPASS_SECONDS:
+            return False
+        if not self.navigation.graph_route_open(
+                client, self.navigation._excluded_edges | {key}):
+            # The last way on toward the destination (live: both Old
+            # Outpost stairs down, a pack beside them) is never excluded:
+            # she holds and defends here, and tries again after another
+            # PACK_EXIT_BYPASS_SECONDS.
+            self._pack_exit_stall = (key, now)
+            if key not in self._pack_exit_kept:
+                self._pack_exit_kept.add(key)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder(
+                        "navigation-pack-exit-kept",
+                        f"{edge.source} -> {edge.destination} "
+                        f"at={edge.x},{edge.y} held={held:.0f}s: the last "
+                        "way on")
             return False
         route_events.note_edge(client, self.navigation, edge)
         self.navigation._exclude_edge(edge)

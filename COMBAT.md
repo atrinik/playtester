@@ -293,6 +293,12 @@ Getting the crystal and upgrading it:
   recall handling never sees it. It fails on a death or emergency recall
   recorded after it started, and after 30 minutes. A failed trip waits a
   day before it is tried again.
+- **Walking out.** A pool leg that fails, or a trip over its 30 minutes,
+  while she stands on a map with hostile spawns first runs the defended
+  return leg to Gandyld's map (`mana-crystal-walk-out`), for at most 10
+  minutes, and only then fails; a death or recall still ends it at once.
+  Live (2026-11-24) a failed leg left her deep in the Old Outpost and
+  autoplay built its next farm circuit from there.
 - **Replacement.** Gandyld's dialogue offers no replacement crystal, but the
   pool's script creates the enhanced crystal whether or not she carries the
   old one. So the pool trip also replaces a lost crystal.
