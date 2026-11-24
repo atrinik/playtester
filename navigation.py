@@ -64,7 +64,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
                     combat_allowed, heal_waiting, out_of_heals_and_recall,
-                    UnpreparedHold, wand_known_empty)
+                    UnpreparedHold, wand_known_empty,
+                    area_caster_identities, tiled_neighbours)
 from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
 log = logging.getLogger(__name__)
 
@@ -4851,9 +4852,11 @@ class NavigateThenTask(BotTask):
         attackers = recent_hostile_attackers(client, seconds=3.0)
         if not attackers:
             return True
-        names = {obj.name.casefold().strip(),
-                 map_object_visual_name(client, obj).casefold().strip()}
-        return bool(names & attackers)
+        names = {FarmTask._kind_key(obj.name),
+                 FarmTask._kind_key(map_object_visual_name(client, obj))}
+        names.discard("")
+        return any(FarmTask._kind_key(attacker) in names
+                   for attacker in attackers)
 
     def _outclassed_ids(self, client: AtrinikClient, threats) -> set[int]:
         """Threats far below her level, which count toward no pack.
@@ -4879,7 +4882,8 @@ class NavigateThenTask(BotTask):
         graph = self.navigation.graph
         rerolled = getattr(graph, "level_rerolled", None)
         node = getattr(graph, "nodes", {}).get(m.path)
-        casters = node.caster_identities if node is not None else set()
+        # Casters of this map and of the maps tiled to it, as for levels.
+        casters = area_caster_identities(node, tiled_neighbours(graph, node))
         outclassed = set()
         for threat in threats:
             obj = threat[3]
@@ -5178,13 +5182,17 @@ class NavigateThenTask(BotTask):
                     await self._retreat_step(
                         client, dangerous, avoid_backtrack=True)
                 return True
+        if not overwhelmed or not any(
+                threat[3].target_id == self._cornered_target
+                for threat in nearby):
+            # A cornered fight ends with the pack split or its target.
+            self._cornered_target = 0
         pack_offensive = (self.task.primary_combat_spell(client)
                           if isinstance(self.task, FarmTask) else None)
         if (safe and nearest is not None and nearest[0] > 2 and
                 len(pull_pack) >= 2 and
                 (pack_offensive is None or hold_fire) and
-                not any(threat[3].target_id == self._cornered_target
-                        for threat in threats)):
+                not self._cornered_target):
             # A cornered fight at range is not turned into a pack avoidance
             # (combat off, replan) between its own ticks.
             if await self._bypass_pack_blocked_exit(client):
@@ -5266,8 +5274,6 @@ class NavigateThenTask(BotTask):
         safety_hold = not safe and (not starving_without_food(client) or
                                     heal_waiting(client))
         split = overwhelmed and not hold_fire and not safety_hold
-        if not overwhelmed:
-            self._cornered_target = 0
         cornered = None
         if split and not escape_due:
             cornered = await self._cornered_split(client, nearby)
@@ -5301,8 +5307,10 @@ class NavigateThenTask(BotTask):
                 # A pack-splitting step must not immediately reverse on an
                 # equal-distance plateau. Route following and the next safety
                 # tick otherwise alternate forever between the same squares.
+                # A split takes only a step that gains distance, the kind
+                # whose absence makes her cornered (_cornered_split).
                 await self._retreat_step(
-                    client, nearby, avoid_backtrack=True)
+                    client, nearby, avoid_backtrack=True, gain_only=split)
             return True
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.

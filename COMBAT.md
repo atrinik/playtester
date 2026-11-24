@@ -1612,7 +1612,7 @@ below it was never reached; 100 of the 102 attacks on her missed.
   (two within 6). She still fights it, one at a time, and it still counts
   as a threat for retreats, halos and the critical escape. Never
   outclassed: a creature of unknown level; an authored caster of the map
-  (`caster_identities`); and a monster whose spawn rerolls its level
+  or of a map tiled to it (`area_caster_identities`); and a monster whose spawn rerolls its level
   from the map's difficulty (`item_condition`, server `spawn_point.c`;
   `WorldGraph.level_rerolled`), whose authored level says nothing (the
   difficulty 60 world_2_67_-2 spawns ghouls authored at a low level).
@@ -1623,7 +1623,9 @@ below it was never reached; 100 of the 102 attacks on her missed.
 - **Cornered, she fights.** Cornered is a pack split with no retreat step
   that gains distance from the nearest attacker (`_retreat_step` with
   `probe` and `gain_only`, which sends nothing): an equal-distance step
-  only shuffles her beside the pack with combat off. Then she fights the
+  only shuffles her beside the pack with combat off. The split's own
+  step is likewise one that gains distance, even into an alcove over an
+  open square to the side. Without one she fights the
   closest attacker (`_cornered_split`, recorded once per creature as
   `navigation-cornered-fight`), as the farm's cornered breakout does: one
   beside her, or one farther off only while she is being hit (else she
@@ -1632,10 +1634,12 @@ below it was never reached; 100 of the 102 attacks on her missed.
   opening mid-fight, or her step toward one farther off, does not turn her
   back into a combat-off retreat. Off her side it stays her target only
   while no other attacker is beside her and hit text of the last 3 s names
-  its kind (hit text names no individual, so another of the same kind
-  hitting her also holds it; with no name in the text any hit does). While
-  it is in view the pack avoidance (combat off and a replan) does not
-  interrupt that fight. The safety's low-health hold and the critical
+  its kind, by name or visual name, case, underscores and word order
+  aside (hit text names no individual, so another of the same kind
+  hitting her also holds it; with no name in the text any hit does). The
+  target is dropped as soon as she is no longer overwhelmed or it is not
+  within 4 tiles; until then the pack avoidance (combat off and a replan)
+  does not interrupt that fight. The safety's low-health hold and the critical
   escape still come first.
 - **No resent hold.** A pack split that repeats the last tick's (same
   square, same creatures within 4 tiles) sends neither its clear nor

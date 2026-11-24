@@ -12745,7 +12745,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # A probe (is there a step?) comes first; it sends nothing.
         self.assertEqual(calls, [{"avoid_backtrack": True, "gain_only": True,
                                   "probe": True},
-                                 {"avoid_backtrack": True}])
+                                 {"avoid_backtrack": True, "gain_only": True}])
 
     def _outpost_box(self, *, golem_level=0, giant_level=0, level=37):
         """Live shape (2026-11-24, the Old Outpost upper-middle room): she
@@ -13029,6 +13029,71 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(
             [action for action, _ in client.decisions].count(
                 "navigation-cornered-fight"), 1)
+
+    def test_pack_split_takes_the_gaining_step_not_a_sideways_one(self):
+        """The split's step is the kind the cornered probe looks for: one
+        that gains distance (an alcove behind her), never an open square
+        to the side that keeps the golem beside her."""
+        client, task = self._exit_room(golem_level=30)
+        m = client.state.map
+        m.tiles.clear()
+        m.world_x, m.world_y = 10, 10
+        node = task.navigation.graph.nodes["/outpost"]
+        node.terrain = {(x, y): 1 for x in range(10, 16)
+                        for y in range(10, 15)}
+        node.terrain[(9, 9)] = 1
+        for target_id, (wx, wy) in ((901, (11, 10)), (902, (12, 12))):
+            m.tile(8 + wx - 10, 8 + wy - 10).objects[3] = MapObject(
+                3, 1, 0, 0, name="lava golem", target_id=target_id,
+                target_hp=100)
+        task._trail = [("/outpost", 10, 11), ("/outpost", 10, 10)]
+        self._hit(client, "lava golem")
+        self._corner(task, client)
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]],
+                         (-1, -1))
+
+    def test_a_caster_across_a_seam_is_never_outclassed(self):
+        client, task = self._exit_room(golem_level=16)
+        graph = task.navigation.graph
+        threats = [(1, 9, 8, client.state.map.tile(9, 8).objects[3]),
+                   (2, 6, 9, client.state.map.tile(6, 9).objects[3])]
+        neighbour = MapNode(path="/outpost_east", width=24, height=24)
+        neighbour.caster_identities.add("lava golem")
+        graph.nodes["/outpost_east"] = neighbour
+        with patch("atrinik_bot.navigation.tiled_neighbours",
+                   return_value={(1, 0): neighbour}):
+            self.assertEqual(task._outclassed_ids(client, threats), set())
+        self.assertEqual(task._outclassed_ids(client, threats), {901, 903})
+
+    def test_cornered_hit_text_matches_a_visual_kind(self):
+        client, task = self._exit_room(golem_level=30)
+        golem = client.state.map.tile(9, 8).objects[3]
+        golem.name = ""
+        client.faces = {}
+        with patch("atrinik_bot.navigation.map_object_visual_name",
+                   return_value="lava_golem.111"):
+            self._hit(client, "Lava golem")
+            self.assertTrue(task._hit_by(client, golem))
+            self._hit(client, "stone giant master guard")
+            self.assertFalse(task._hit_by(client, golem))
+
+    def test_a_stale_cornered_target_does_not_block_pack_avoidance(self):
+        client, task = self._exit_room(golem_level=30)
+        m = client.state.map
+        m.tiles.clear()
+        for target_id, (vx, vy) in ((901, (12, 8)), (902, (3, 8))):
+            m.tile(vx, vy).objects[3] = MapObject(
+                3, 1, 0, 0, name="lava golem", target_id=target_id,
+                target_hp=100)
+        task._cornered_target = 999  # a creature long gone
+        client.state.messages = []
+        self.assertFalse(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(task._cornered_target, 0)
+        self.assertIn("navigation-pack-avoid",
+                      [action for action, _ in client.decisions])
 
     def test_repeated_pack_split_hold_is_not_resent(self):
         """While her split step is in flight and nothing changes, the hold
