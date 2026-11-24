@@ -1082,6 +1082,8 @@ class AtrinikClient:
         self.state.mana_crystal_retry_until = backoffs
         character = self.state.player_name or self.config.character
         if not character:
+            log.warning("mana-crystal %s backoff kept in memory only: no "
+                        "character to persist it for", detour)
             return
         self._runtime_memory.setdefault(character, {})[
             "mana_crystal_retry_until"] = dict(backoffs)

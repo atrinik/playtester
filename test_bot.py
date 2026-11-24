@@ -23299,6 +23299,91 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             autoplay._start_mana_crystal_detours(client)))
         self.assertEqual(started, ["mana-crystal-upgrade"])
 
+    def test_mana_crystal_errand_ignores_farm_fights_on_its_overworld_road(self):
+        # Review: from her farm, the road to Gandyld crosses farm maps whose
+        # pack failures would have skipped the errand week after week.
+        client, _ = self.client()
+        self.place(client, ("/shattered_islands/world_16_74", (10, 10)))
+        autoplay, started = self.upgrade_autoplay(client)
+        maps = autoplay._mana_crystal_errand_maps(client, "upgrade")
+        # Her own position is no origin of the errand.
+        self.assertNotIn("/shattered_islands/world_16_74", maps)
+        self.assertIn(ManaCrystalUpgradeTask.GANDYLD_MAP, maps)
+        road = sorted(path for path in maps if AutoplayTask._overworld(path))
+        self.assertTrue(road)
+        client.state.farm_adaptations = {"farm": {"reviews": [
+            {"time": time.time() - 3600, "kind": "emergency-recall",
+             "map": path, "cause": "pack"} for path in road + [
+                 "/shattered_islands/world_15_73"]]}}
+        self.assertTrue(asyncio.run(
+            autoplay._start_mana_crystal_detours(client)))
+        self.assertEqual(started, ["mana-crystal-upgrade"])
+        # A pack failure against another player is not the dungeon's.
+        client.state.farm_adaptations = {"outpost": {"reviews": [
+            {"time": time.time() - 3600, "kind": "emergency-recall",
+             "map": self.OUTPOST, "cause": "pack",
+             "attackers": {"Somebody": 3}}]}}
+        with patch("atrinik_bot.route_events.player_attacker",
+                   lambda client, who: who == "Somebody"):
+            self.assertEqual(autoplay._mana_crystal_dangers(client, maps), [])
+        # An Outpost death does skip it.
+        client.state.farm_adaptations = {}
+        client.post_mortems = [{"time": time.time() - 3600,
+                                "map": self.OUTPOST, "cause": "out-damaged"}]
+        self.assertTrue(autoplay._mana_crystal_route_danger(client, "upgrade"))
+
+    def test_mana_crystal_route_check_reads_transit_deaths(self):
+        from .route_blocks import map_subject
+
+        client, _ = self.client()
+        client.state.player_name = "Sera"
+        autoplay, _ = self.upgrade_autoplay(client)
+        maps = autoplay._mana_crystal_errand_maps(client, "upgrade")
+        died = time.time() - 3 * 86400
+
+        class Store:
+            fail = False
+
+            def route_events(self, character, *, since, timeout):
+                if self.fail:
+                    raise sqlite3.OperationalError("database is locked")
+                return [(died, map_subject(self_outpost), "death", 1.0),
+                        (died + 60, map_subject(self_outpost), "recall", 1.0)]
+
+        self_outpost = self.OUTPOST
+        store = Store()
+        client._memory_store = lambda: store
+        self.assertEqual(
+            autoplay._mana_crystal_dangers(client, maps),
+            [(died, f"death in transit on {self.OUTPOST}")])
+        # Unreadable: fails open on the other sources, logged once.
+        store.fail = True
+        with self.assertLogs("atrinik_bot.autoplay", "WARNING") as logs:
+            for _ in range(3):
+                self.assertEqual(autoplay._mana_crystal_dangers(client, maps), [])
+        self.assertEqual(len(logs.records), 1)
+
+    def test_the_opening_mana_crystal_errand_waits_for_a_recall(self):
+        client, _ = self.client(recall=False, level=18)
+        client.state.quests.pop(AutoplayTask.MANA_CRYSTAL_QUEST)
+        autoplay = AutoplayTask(built_graph(), target_level=115)
+        started = []
+
+        async def detour(client):
+            started.append("mana-crystal-starter")
+
+        autoplay._start_mana_crystal_detour = detour
+        self.assertTrue(autoplay._needs_mana_crystal_start(client))
+        self.assertFalse(asyncio.run(
+            autoplay._start_mana_crystal_detours(client)))
+        self.assertEqual(started, [])
+        client.state.place_item(Item(
+            76, item_type=c.TYPE_ROD, quality=80, condition=80,
+            name="rod of word of recall"), client.state.player_tag)
+        self.assertTrue(asyncio.run(
+            autoplay._start_mana_crystal_detours(client)))
+        self.assertEqual(started, ["mana-crystal-starter"])
+
     def test_mana_crystal_backoff_survives_a_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.json")

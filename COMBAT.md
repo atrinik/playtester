@@ -300,21 +300,27 @@ Getting the crystal and upgrading it:
   wand known to be empty is none), however she can heal: live, on
   2026-11-24, a healing spell let her into the Old Outpost with three
   empty recall wands. The wait is recorded once (`mana-crystal-wait`).
-  Then the maps the errand crosses (its fewest-transition routes from
-  where she stands through each destination, less the map she is on) are
-  checked for a death (post-mortems, not to another player, and route
-  events' deaths in transit) or a pack or out-damaged failure (farm
-  reviews and kit failures) within 7 days
-  (`AutoplayTask.MANA_CRYSTAL_DANGER_SECONDS`). Her Old Outpost deaths
-  came one to three days apart (2026-11-18, 11-19, 11-22), so the day's
-  backoff sent her back after each; a week also matches how long route
-  events are kept. Any such failure skips the errand until the newest one
-  is a week old, recorded once (`mana-crystal-skipped`).
+  Then the errand's own legs are checked, from a fixed origin, not from
+  where she stands (the road from her farm is the farm's): her savebed to
+  Gandyld (opening reward) or to the apartment chest (recovery), and
+  Gandyld's map to the pool and back (upgrade), along their
+  fewest-transition routes. A death on any of those maps (post-mortems
+  and route events' deaths in transit, not to another player), or a pack
+  or out-damaged failure (farm reviews and kit failures) on one of its
+  dungeon maps, those off the overworld, within 7 days
+  (`AutoplayTask.MANA_CRYSTAL_DANGER_SECONDS`) skips the errand until the
+  newest one is a week old, recorded once (`mana-crystal-skipped`). Her
+  Old Outpost deaths came one to three days apart (2026-11-18, 11-19,
+  11-22), so the day's backoff sent her back after each; a week also
+  matches how long route events are kept. An unreadable route-event
+  database is logged once and leaves the other sources to decide.
 - **Backoffs survive restarts.** The failure and danger backoffs are
   wall-clock deadlines in her character memory
   (`GameState.mana_crystal_retry_until`, per errand: `start`, `recovery`,
   `upgrade`), not an in-process timer or the bounded decision history,
-  which a loop's records can fill.
+  which a loop's records can fill. A failure recorded only in that
+  history before this change no longer backs an errand off; the route
+  check still sees its deaths.
 - **Replacement.** Gandyld's dialogue offers no replacement crystal, but the
   pool's script creates the enhanced crystal whether or not she carries the
   old one. So the pool trip also replaces a lost crystal.

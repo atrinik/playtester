@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import sqlite3
 import time
 
@@ -76,6 +77,8 @@ class AutoplayTask(BotTask):
         # Whether the wait for a ready recall (_mana_crystal_recall_ready)
         # is already recorded.
         self._mana_recall_wait_recorded = False
+        # Whether an unreadable route-event database is already logged.
+        self._mana_route_events_warned = False
         self._retry_at = 0.0
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
@@ -270,56 +273,62 @@ class AutoplayTask(BotTask):
         backoffs[detour] = float(until)
         client.state.mana_crystal_retry_until = backoffs
 
-    def _mana_crystal_destinations(self, detour: str) -> list[str]:
-        """The maps the errand ``detour`` walks to, in order."""
+    def _mana_crystal_legs(self, client: AtrinikClient,
+                           detour: str) -> list[str]:
+        """The errand's own stops, from a fixed origin: her savebed (where
+        she is otherwise, without one) to Gandyld for the opening reward or
+        to the apartment chest for a recovery, and Gandyld's map to the
+        pool and back for the upgrade. Not from where she happens to
+        stand: the road from her farm is the farm's, and its failures
+        would skip the errand for good."""
         gandyld = ManaCrystalUpgradeTask.GANDYLD_MAP
-        if detour == "start":
-            return [gandyld]
-        if detour == "recovery":
-            return [self.MANA_CRYSTAL_APARTMENT]
-        pool = POLICIES[self.MANA_CRYSTAL_QUEST].parts[
-            ManaCrystalUpgradeTask.PART].action.place
-        return [pool.map_path, gandyld] if pool is not None else [gandyld]
+        if detour == "upgrade":
+            pool = POLICIES[self.MANA_CRYSTAL_QUEST].parts[
+                ManaCrystalUpgradeTask.PART].action.place
+            return ([gandyld, pool.map_path, gandyld] if pool is not None
+                    else [gandyld])
+        home = (getattr(client.state, "savebed_map", "") or
+                client.state.map.path)
+        return [home, gandyld if detour == "start"
+                else self.MANA_CRYSTAL_APARTMENT]
 
     def _mana_crystal_errand_maps(self, client: AtrinikClient,
                                   detour: str) -> set[str]:
-        """The maps the errand ``detour`` crosses: its fewest-transition
-        routes from where she stands through each destination (gates
-        follow her access set), and the destinations themselves. The map
-        she stands on is left out: she is there already (usually farming
-        it), and the errand only takes her away from it."""
-        destinations = self._mana_crystal_destinations(detour)
-        maps = set(destinations)
-        here = source = client.state.map.path
-        source_xy: tuple[int, int] | None = (
-            client.state.map.world_x, client.state.map.world_y)
+        """The maps the errand ``detour`` crosses: the fewest-transition
+        routes between its stops (_mana_crystal_legs; gates follow her
+        access set), and the stops themselves."""
+        stops = self._mana_crystal_legs(client, detour)
+        maps = set(stops)
         try:
             access = unlocks.unlock_state(client, self.graph).access
         except Exception:
             access = None
-        for destination in destinations:
+        for source, destination in zip(stops, stops[1:]):
             try:
-                route = self.graph.route(source, destination, access=access,
-                                         source_xy=source_xy)
+                route = self.graph.route(source, destination, access=access)
             except (ValueError, KeyError):
                 route = []
             maps.update(edge.source for edge in route)
             maps.update(edge.destination for edge in route)
-            source, source_xy = destination, None
-        if here not in destinations:
-            maps.discard(here)
         maps.discard("")
         return maps
 
+    @staticmethod
+    def _overworld(path: str) -> bool:
+        return re.search(r"/world_-?\d+_-?\d+$", path) is not None
+
     def _mana_crystal_dangers(self, client: AtrinikClient,
                               maps: set[str]) -> list[tuple[float, str]]:
-        """Her deaths and pack or out-damaged failures on ``maps`` within
-        MANA_CRYSTAL_DANGER_SECONDS, as (time, what): post-mortems (a
-        death to another player is not the route's), route-event deaths
-        (route_events.py: deaths in transit, kept a week), and farm
-        reviews and kit failures (self_improvement)."""
+        """Within MANA_CRYSTAL_DANGER_SECONDS, as (time, what): her deaths
+        on ``maps`` (post-mortems, and route events' deaths in transit,
+        kept a week), and pack or out-damaged failures (farm reviews and
+        kit failures, self_improvement) on the errand's dungeon maps, its
+        maps off the overworld: the overworld road is shared with her
+        farms, whose fights are theirs. A fight with another player in it
+        is not the route's."""
         now = time.time()
         since = now - self.MANA_CRYSTAL_DANGER_SECONDS
+        dungeon = {path for path in maps if not self._overworld(path)}
         found: list[tuple[float, str]] = []
 
         def stamp(value) -> float:
@@ -328,16 +337,16 @@ class AutoplayTask(BotTask):
             except (TypeError, ValueError):
                 return 0.0
 
+        def pvp(entry: dict) -> bool:
+            return any(route_events.player_attacker(client, who)
+                       for who in (entry.get("attackers") or {}))
+
         for report in getattr(client, "post_mortems", None) or ():
             if not isinstance(report, dict):
                 continue
             when, path = stamp(report.get("time")), str(report.get("map") or "")
-            if when < since or path not in maps:
-                continue
-            if any(route_events.player_attacker(client, who)
-                   for who in (report.get("attackers") or {})):
-                continue
-            found.append((when, f"death on {path}"))
+            if when >= since and path in maps and not pvp(report):
+                found.append((when, f"death on {path}"))
         store = getattr(client, "_memory_store", None)
         character = (getattr(client.state, "player_name", "") or
                      getattr(getattr(client, "config", None), "character", ""))
@@ -346,8 +355,17 @@ class AutoplayTask(BotTask):
             try:
                 rows = store().route_events(
                     character, since=since, timeout=route_events.WRITE_TIMEOUT)
-            except (sqlite3.Error, OSError, ValueError, AttributeError):
+            except (sqlite3.Error, OSError, ValueError, AttributeError) as error:
+                # Fail open on the other sources: a busy database never
+                # blocks the errand on its own.
+                if not self._mana_route_events_warned:
+                    self._mana_route_events_warned = True
+                    log.warning("mana-crystal route check: route events "
+                                "not readable (%s)", error)
                 rows = []
+            else:
+                self._mana_route_events_warned = False
+            # A death to a player records no route event (route_events).
             found.extend((when, f"death in transit on {subjects[subject]}")
                          for when, subject, signal, _ in rows
                          if signal == route_events.DEATH and subject in subjects)
@@ -360,19 +378,20 @@ class AutoplayTask(BotTask):
                     continue
                 when, path = stamp(entry.get("time")), str(entry.get("map") or "")
                 cause = str(entry.get("cause") or "")
-                if (when >= since and path in maps and
-                        (cause in self_improvement.KIT_HAZARD_CAUSES or
-                         entry.get("kind") == "death")):
-                    found.append((when, f"{cause or 'death'} failure on {path}"))
+                if (when >= since and path in dungeon and
+                        cause in self_improvement.KIT_HAZARD_CAUSES and
+                        not pvp(entry)):
+                    found.append((when, f"{cause} failure on {path}"))
         return found
 
     def _mana_crystal_route_danger(self, client: AtrinikClient,
                                    detour: str) -> bool:
         """Whether the errand ``detour`` is skipped for a dangerous route.
 
-        Any death, or pack or out-damaged failure, on a map the errand
-        crosses within MANA_CRYSTAL_DANGER_SECONDS skips it until the
-        newest one is that old, persisted as its backoff, so the decision
+        A death on a map the errand crosses, or a pack or out-damaged
+        failure on one of its dungeon maps (_mana_crystal_dangers), within
+        MANA_CRYSTAL_DANGER_SECONDS skips it until the newest one is that
+        old, persisted as its backoff, so the decision
         (mana-crystal-skipped) is taken and recorded once per window.
         """
         dangers = self._mana_crystal_dangers(
