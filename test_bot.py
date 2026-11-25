@@ -11167,6 +11167,51 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(client.combat[-1], True)
         self.assertEqual(client.targets[-1], (9, 8, 100))
 
+    def test_seam_contact_with_the_pack_at_range_does_not_close_in(self):
+        # Seam contact with nobody beside her but two treants three tiles
+        # off: the seam fight does not apply, and the walk's pack handling
+        # runs as on the farm's own map (avoid or split), rather than the
+        # nearest-fight walking her into the pack.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = client.state.map.world_y = 10
+        engaged = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=80)
+        other = MapObject(
+            3, 2, 0, 0, name="charred treant", target_id=101, target_hp=100)
+        client.state.map.tile(11, 8).objects[3] = engaged
+        client.state.map.tile(11, 10).objects[3] = other
+        client.state.stats.update(hp=267, maxhp=356, sp=60, maxsp=71)
+        client.state.combat = False
+        client.state.messages = [(
+            time.time() - 1.0, 2, "ff0000",
+            "charred treant hit you for 25 (-20) impact damage.")]
+        self._record_actions(client)
+        transit = MapNode(path="/test", width=25, height=25)
+        transit.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": transit,
+                       "/farm": MapNode(path="/farm", width=24, height=24)}
+        farm = FarmTask(zone="/farm", target="charred treant")
+        farm.remember_engagement(client, 11, 8, engaged.target_id)
+        farm._seam_step_at = time.monotonic() - 1.0
+        task = NavigateThenTask(
+            graph, "/farm", farm, combat_approach=True, safety=farm.safety)
+        task._last_pull_target = engaged.target_id
+        task._last_moved_at = time.monotonic()
+
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertTrue(task._seam_retreat_contact(client))
+        self.assertIn("navigation-pack-avoid",
+                      [action for action, _ in client.recorded])
+        self.assertEqual(client.targets, [])
+        self.assertNotIn(True, client.combat)
+        self.assertEqual(client.moves, [])
+        # Any step she took is not towards them.
+        for direction, _ in client.direct_moves:
+            dx, _ = c.DIRECTION_DELTAS[direction]
+            self.assertLessEqual(dx, 0)
+
     def test_no_corpse_probe_while_under_hostile_contact(self):
         # Live at 16:15 two corpse probes were queued while three attackers
         # hit her: the engaged target had only left her view.

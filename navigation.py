@@ -5525,6 +5525,11 @@ class NavigateThenTask(BotTask):
                  (self.navigation.status == TaskStatus.FAILED or
                   time.monotonic() - self._last_moved_at >=
                   self.TRANSIT_CORNERED_SECONDS)))
+        # The seam fight replaces the pack split and avoidance only with an
+        # attacker beside her; with the pack still at range they run as
+        # before, so she never closes in on it.
+        seam_beside = seam_contact and any(
+            threat[0] <= 1 for threat in nearby)
         combat_released = False
         if hold_fire:
             engaged = (self.task._engaged_target
@@ -5689,7 +5694,7 @@ class NavigateThenTask(BotTask):
         if (safe and nearest is not None and nearest[0] > 2 and
                 len(pull_pack) >= 2 and
                 (pack_offensive is None or hold_fire) and
-                not self._cornered_target and not seam_contact):
+                not self._cornered_target and not seam_beside):
             # A cornered fight at range is not turned into a pack avoidance
             # (combat off, replan) between its own ticks.
             if await self._bypass_pack_blocked_exit(client):
@@ -5803,7 +5808,7 @@ class NavigateThenTask(BotTask):
                     int(getattr(threat[3], "target_hp", 0) or 100),
                     threat[3].target_id))
         split = (overwhelmed and not hold_fire and not safety_hold and
-                 not seam_contact)
+                 not seam_beside)
         cornered = None
         if split and not escape_due:
             cornered = await self._cornered_split(client, nearby)

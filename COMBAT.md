@@ -1889,13 +1889,18 @@ attackers on her, and two corpse probes were queued mid-fight.
   `SEAM_RETREAT_FIGHT_CAP_SECONDS` (90 s) after the step at the latest.
   While it holds:
   - there is no transit hold-fire, so her engagement and target are not
-    dropped; the walk does not split the pack or turn it into a pack
-    avoidance, and its return to the farm map sends no combat off;
+    dropped, and the walk's return to the farm map sends no combat off;
+  - with nobody beside her, the walk's pack split and pack avoidance run
+    as before, so she does not close in on a pack at range;
   - with an attacker beside her, above the farm's own pack flee line
     (`FarmTask.pack_flee`: the flee threshold, at least 80% with two
     within 4 tiles, 94% with three), she fights it, combat on, healing
     first. She fights the committed target if it is beside her, otherwise
-    the weakest attacker beside her;
+    the weakest attacker beside her. With two or more beside her she
+    stands there where the farm map would split them. That is intended
+    and bounded by the line: with two near, the line is at least 80%, so
+    on an aggressive spot (heal at 95%) the stand costs at most about 14%
+    of her health before she steps away;
   - at or below that line she takes a step that gains distance, combat
     off, as the farm's retreat would. With none she is cornered and
     fights the attacker beside her.
