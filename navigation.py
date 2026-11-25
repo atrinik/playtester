@@ -7040,8 +7040,8 @@ def seam_ranking(client: AtrinikClient, graph: "WorldGraph",
     return ranked
 
 
-# An area (the analyzer's region and map name: circuit_area for a circuit,
-# MapNode.region and .name for each map) with at most this many maps is one
+# An area (each map header's region and name, MapNode.region and .name, as
+# the analyzer's circuit_area names a circuit of one area) with at most this many maps is one
 # place for kit hazards and pauses (map_areas). The Burnt Forest has 25
 # maps; a name used more widely names a whole island or sea (Eld Woods
 # Island 42, Strakewood Island 190, World 2115), where a hazard or a pause
@@ -7060,9 +7060,10 @@ def _area_key(node) -> str:
 
 def area_maps(graph: "WorldGraph | None") -> dict[str, frozenset[str]]:
     """Every bounded area's maps (at most AREA_HAZARD_MAX_MAPS), by area
-    key ("region|name"); cached per graph."""
+    key ("region|name"); cached per node table."""
     nodes = getattr(graph, "nodes", None) or {}
-    key = (id(graph), len(nodes))
+    # Planner views share the loop graph's nodes: one entry for all.
+    key = (id(nodes), len(nodes))
     cached = _area_maps_cache.get(key)
     if cached is not None:
         return cached
@@ -8778,7 +8779,8 @@ class FarmCircuitTask(BotTask):
         # live Old Outpost trial proved exactly this). During the ordinary farm
         # NavigateThen child, attribute a transit failure to the requested
         # destination so autoplay moves on instead of replaying the same lethal
-        # road. Maintenance children are held separately and never reach this.
+        # road. Maintenance children are held separately and never reach this
+        # (nor the seam rule below: _seam_failure_leg).
         if (not path and self.child is not None and
                 self.child.navigation.destination in active_paths and
                 self.child.navigation.status != TaskStatus.COMPLETE):
@@ -8837,8 +8839,17 @@ class FarmCircuitTask(BotTask):
         return entered
 
     # A death or emergency recall off the spot's maps this soon after she
-    # was on one of them counts for the spot (_seam_failure_leg).
+    # was on one of them counts for the spot (_seam_failure_leg), and on a
+    # seam neighbour or a map of the same bounded area, this soon.
     FARM_SEAM_FAILURE_SECONDS = 30.0
+    FARM_AREA_FAILURE_SECONDS = 120.0
+    # The maintenance trips _tick_running_service runs: while one is under
+    # way, the farm child is not ticked, and a failure is not the spot's.
+    SERVICE_ATTRIBUTES = (
+        "_bank_sync", "_capability", "_storage", "_identification",
+        "_bed_binding", "_resupply", "_selling", "_cure_funding", "_banking",
+        "_shopping", "_recall_shopping", "_utility_shopping", "_heal_restock",
+        "_ship_key", "_spell_purchase", "_cure", "_restoration")
 
     def _seam_failure_leg(self, client: AtrinikClient, failure: dict) -> str:
         """The leg map a failure just off the spot's maps counts for, or "".
@@ -8847,38 +8858,47 @@ class FarmCircuitTask(BotTask):
         or emergency recall counts for it when it happened within
         FARM_SEAM_FAILURE_SECONDS of her being on one of its maps (map
         arrivals, else her records), or on a map tiled to one of them
-        (a seam neighbour) or of the same bounded area (map_areas): the
-        leg she was on last, else the first. Live, on 2026-11-25, a retreat
+        (a seam neighbour) or of the same bounded area (map_areas) within
+        FARM_AREA_FAILURE_SECONDS: the leg she was on last. Never during a
+        maintenance trip (SERVICE_ATTRIBUTES): the farm child is not ticked
+        then, so its walk still reads complete. Live, on 2026-11-25, a retreat
         from world_16_74 stepped across the seam onto world_17_74 and she
         died there at 16:15:19; the review, the kit failure and its cause
         were never recorded, because only a leg map or the walk's
         destination counted.
         """
         child = self.child
-        if child is None or child.navigation.status != TaskStatus.COMPLETE:
+        if (child is None or child.navigation.status != TaskStatus.COMPLETE or
+                any(getattr(self, name, None) is not None
+                    for name in self.SERVICE_ATTRIBUTES)):
             return ""
         failure_map = str(failure.get("map", ""))
         when = float(failure.get("time", 0.0) or 0.0)
         legs = [path for path, _ in self.legs]
         if not failure_map or not legs or failure_map in legs:
             return ""
-        window = self.FARM_SEAM_FAILURE_SECONDS
-        recent = ""
         arrivals = sorted((float(stamp), str(where)) for stamp, where in
                           getattr(client, "map_arrivals", ()) if stamp <= when)
-        for index, (stamp, where) in enumerate(arrivals):
-            left = (arrivals[index + 1][0] if index + 1 < len(arrivals)
-                    else when)
-            if where in legs and when - left <= window:
-                recent = where
-        if not recent:
-            stamps = [(float(record.get("time", 0.0) or 0.0), record.get("map"))
-                      for record in (*getattr(client, "action_history", ()),
-                                     *getattr(client, "decision_history", ()))
-                      if isinstance(record, dict)]
-            recent = max(((stamp, where) for stamp, where in stamps
-                          if where in legs and 0.0 <= when - stamp <= window),
-                         default=(0.0, ""))[1]
+        stamps = [(float(record.get("time", 0.0) or 0.0), record.get("map"))
+                  for record in (*getattr(client, "action_history", ()),
+                                 *getattr(client, "decision_history", ()))
+                  if isinstance(record, dict)]
+
+        def last_leg(window: float) -> str:
+            """The leg she was on last, if she left it within ``window``."""
+            recent = ""
+            for index, (_, where) in enumerate(arrivals):
+                left = (arrivals[index + 1][0] if index + 1 < len(arrivals)
+                        else when)
+                if where in legs and when - left <= window:
+                    recent = where
+            if recent:
+                return recent
+            return max(((stamp, where) for stamp, where in stamps
+                        if where in legs and 0.0 <= when - stamp <= window),
+                       default=(0.0, ""))[1]
+
+        recent = last_leg(self.FARM_SEAM_FAILURE_SECONDS)
         if recent:
             return recent
         neighbours = getattr(self.graph, "_seam_neighbours", None)
@@ -8888,8 +8908,7 @@ class FarmCircuitTask(BotTask):
         if not nearby and not (map_areas(self.graph, (failure_map,)) &
                                map_areas(self.graph, legs)):
             return ""
-        previous = [where for _, where in arrivals if where in legs]
-        return previous[-1] if previous else legs[0]
+        return last_leg(self.FARM_AREA_FAILURE_SECONDS)
 
     def _learn_from_failure(self, client: AtrinikClient, failure: dict,
                             path: str, what: str, *,

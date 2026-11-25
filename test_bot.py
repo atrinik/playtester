@@ -22882,6 +22882,41 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertFalse(circuit._observe_farm_death(other))
         self.assertEqual(other.state.farm_adaptations, {})
 
+    def test_a_death_in_the_spots_area_counts_unless_on_a_maintenance_trip(self):
+        def death(maintenance):
+            spot = analyzer_spot("Burnt Forest", [self.BURNT_16_74],
+                                 ["charred treant L33"])
+            client = self.client({"xp": [spot]})
+            circuit = self.circuit(client, spot)
+            circuit._failure_epoch = 0.0
+            circuit.child.navigation.status = TaskStatus.COMPLETE
+            if maintenance:
+                circuit._selling = object()
+            now = time.time()
+            # A minute off the spot, past the 30 s rule, on world_17_72: the
+            # same Burnt Forest, not tiled to world_16_74.
+            client.map_arrivals = [(now - 300, self.BURNT_16_74),
+                                   (now - 60, self.BURNT_17_74),
+                                   (now - 30, self.BURNT_17_72)]
+            client.state.messages.append(
+                (now - 1, 2, "ff0000",
+                 "charred treant hit you for 90 (-90) impact damage."))
+            client.decision_history.append({
+                "time": now, "action": "death", "detail": "",
+                "task": "", "map": self.BURNT_17_72})
+            circuit._observe_farm_death(client)
+            return client.state.farm_adaptations
+
+        self.assertNotIn(self.BURNT_17_72, [
+            path for path, _, _ in built_graph()._seam_neighbours(self.BURNT_16_74)])
+        counted = death(False)
+        self.assertEqual([entry["map"] for record in counted.values()
+                          for entry in record["kit_failures"]],
+                         [self.BURNT_17_72])
+        # During a maintenance trip the farm walk still reads complete,
+        # but the failure is not the spot's.
+        self.assertEqual(death(True), {})
+
     def test_kit_failures_count_for_every_spot_of_one_area(self):
         """Failures on a world_17_72 circuit make a world_16_74 spot, of the
         same Burnt Forest but no shared map, hazardous for her kit; a spot

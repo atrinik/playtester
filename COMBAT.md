@@ -1625,19 +1625,23 @@ and learned too little from them. Three changes:
   (the farm walk complete), a death or emergency recall off the spot's
   maps counts for it when she was on one of its maps within
   `FARM_SEAM_FAILURE_SECONDS` (30 s) before it, or when it happened on a
-  map tiled to one of them or in the same bounded area
-  (`FarmCircuitTask._seam_failure_leg`). The review then judges its cause
+  map tiled to one of them or in the same bounded area within
+  `FARM_AREA_FAILURE_SECONDS` (2 minutes) of her leaving the spot
+  (`FarmCircuitTask._seam_failure_leg`). It never counts during a
+  maintenance trip: the farm walk is not ticked then, so it still reads
+  complete. The review then judges its cause
   as on the spot (pack, out-damaged and so on), not as a death on the way,
   so it records the farm-failure review, the kit failure and the
   adaptation, and teaches no route hazard on the seam map. Live, a
   retreat from world_16_74 crossed the seam onto world_17_74 and she
   died there at 16:15:19. Only a leg map or the walk's destination
   counted, so that death taught nothing.
-- **Kit hazards count by area.** An area is the analyzer's region and map
-  name (`circuit_area` for a circuit, each map's header otherwise), such
-  as `eld_woods_island|Burnt Forest`. Each adaptation record now keeps its
+- **Kit hazards count by area.** An area is a map header's region and
+  name (`MapNode.region` and `.name`, which the analyzer's `circuit_area`
+  also uses for a circuit of one area), such as
+  `eld_woods_island|Burnt Forest`; a spot's areas are its maps'. Each adaptation record now keeps its
   spot's areas, and `kit_hazard` counts a record for every candidate that
-  shares a map or an area with it. Three pack or out-damaged failures in
+  shares a map or an area with it. Three qualifying failures in
   24 hours anywhere in the Burnt Forest now mark every Burnt Forest circuit
   and single map hazardous for that kit, the southern L27-30 maps
   included. Live, moving from the world_17_72 circuits to world_16_74 (no
@@ -1672,7 +1676,15 @@ Accepted limits:
   bear, so this rule would not have fired then;
 - an area hazard also covers the area's easier maps. Kit matching, time
   and the fallback that farms the least dangerous hazardous spot when
-  every usable spot is hazardous still apply.
+  every usable spot is hazardous still apply;
+- an area is grouped by header alone, not by tiled connection, so a
+  bounded name reused by maps apart from each other is still one area;
+- once a retreat across the seam ends and her walk back to the spot
+  starts, a death on the seam map takes the old rule for a death on the
+  way: cause `route`, with a route hazard on that map;
+- out-of-league marks hold for 10 minutes wherever she is, so a spot
+  reached in that time whose every resident kind is marked is left on
+  arrival.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 
