@@ -320,6 +320,11 @@ class GameState:
     cure_funding_farm_errand_at: float = 0.0
     cure_funding_farm_home_fruitless: int = 0
     cure_funding_farm_home_given_up: bool = False
+    # Gandyld's mana-crystal errands ("start", "recovery", "upgrade"), each
+    # with the wall-clock time before which autoplay does not start it again
+    # (after a failure, or a recent death on its route), kept across
+    # restarts (AutoplayTask._mana_crystal_backed_off).
+    mana_crystal_retry_until: dict[str, float] = field(default_factory=dict)
     # Maps where a route death took combat damage, by wall-clock time until
     # which navigation avoids them.
     route_hazards: dict[str, float] = field(default_factory=dict)

@@ -278,7 +278,8 @@ Getting the crystal and upgrading it:
 
 - **Opening reward.** At level 18 Gandyld gives her the 50-SP crystal.
 - **Recovery.** If the quest has started and she does not carry the crystal,
-  she checks the apartment chest, at most once a day.
+  she checks the apartment chest, once per run and at most once a day
+  after a failed check.
 - **The free upgrade (`ManaCrystalUpgradeTask`).** It runs from level 30
   while "A Better Crystal" is active. Her crystal's capacity is checked
   first, by examining it again if an earlier examine went unanswered; a
@@ -293,6 +294,35 @@ Getting the crystal and upgrading it:
   recall handling never sees it. It fails on a death or emergency recall
   recorded after it started, and after 30 minutes. A failed trip waits a
   day before it is tried again.
+- **Start gates (all three errands).** None starts while she is
+  unprepared (`unprepared_for_trips`) or farms to fund her cure. Each also
+  needs a ready recall source (`FarmTask.emergency_recall_candidates`; a
+  wand known to be empty is none), however she can heal: live, on
+  2026-11-24, a healing spell let her into the Old Outpost with three
+  empty recall wands. The wait is recorded once (`mana-crystal-wait`).
+  Then the errand's own legs are checked, from a fixed origin, not from
+  where she stands (the road from her farm is the farm's): her savebed to
+  Gandyld (opening reward) or to the apartment chest (recovery), from
+  `route_death_origin` as the route-death checks use it (an apartment
+  savebed is left by its recorded return), and Gandyld's map to the pool
+  and back (upgrade), along their fewest-transition routes. Without a
+  savebed the leg starts where she stands, and that map is left out. A death on any of those maps (post-mortems
+  and route events' deaths in transit, not to another player), or a pack
+  or out-damaged failure (farm reviews and kit failures) on one of its
+  dungeon maps, those off the overworld, within 7 days
+  (`AutoplayTask.MANA_CRYSTAL_DANGER_SECONDS`) skips the errand until the
+  newest one is a week old, recorded once (`mana-crystal-skipped`). Her
+  Old Outpost deaths came one to three days apart (2026-11-18, 11-19,
+  11-22), so the day's backoff sent her back after each; a week also
+  matches how long route events are kept. An unreadable route-event
+  database is logged once and leaves the other sources to decide.
+- **Backoffs survive restarts.** The failure and danger backoffs are
+  wall-clock deadlines in her character memory
+  (`GameState.mana_crystal_retry_until`, per errand: `start`, `recovery`,
+  `upgrade`), not an in-process timer or the bounded decision history,
+  which a loop's records can fill. A failure recorded only in that
+  history before this change no longer backs an errand off; the route
+  check still sees its deaths.
 - **Walking out.** A pool leg that fails, or a trip over its 30 minutes,
   while she stands on a map with hostile spawns first runs the defended
   return leg to Gandyld's map (`mana-crystal-walk-out`), for at most 10

@@ -351,6 +351,9 @@ class AtrinikClient:
         # When the last death's bookkeeping ended (its records are its own).
         self._post_mortem_booked = 0.0
         self.post_mortems: list[dict] = []
+        # Whether a mana-crystal backoff without a character to persist it
+        # for is already logged (set_mana_crystal_retry).
+        self._mana_crystal_unpersisted_warned = False
         # (time, path) of each arrival on a new map, newest last.
         self.map_arrivals: list[tuple[float, str]] = []
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
@@ -601,6 +604,12 @@ class AtrinikClient:
                 self.state.cure_funding_farm_counted_at = 0.0
                 self.state.cure_funding_farm_funded_at = 0.0
                 self.state.cure_funding_farm_retry_until = 0.0
+            backoffs = record.get("mana_crystal_retry_until", {})
+            self.state.mana_crystal_retry_until = {
+                str(detour): float(until)
+                for detour, until in (backoffs.items() if isinstance(backoffs, dict) else ())
+                if isinstance(until, (int, float)) and not isinstance(until, bool) and
+                math.isfinite(until) and until > 0}
             hazards = record.get("route_hazards", {})
             self.state.route_hazards = {
                 str(path): float(until)
@@ -712,6 +721,7 @@ class AtrinikClient:
             self.state.cure_funding_farm_counted_at = 0.0
             self.state.cure_funding_farm_funded_at = 0.0
             self.state.cure_funding_farm_retry_until = 0.0
+            self.state.mana_crystal_retry_until = {}
             self.state.route_hazards = {}
             self.state.vendor_quotes = {}
             self.state.farm_zone_quarantine = {}
@@ -1056,6 +1066,32 @@ class AtrinikClient:
                     "cure_funding_farm_counted_at", "cure_funding_farm_funded_at",
                     "cure_funding_farm_retry_until"):
             memory[key] = getattr(self.state, key)
+        self._persist_character_memory()
+
+    def set_mana_crystal_retry(self, detour: str, until: float) -> None:
+        """Persist the wall-clock time before which the mana-crystal errand
+        ``detour`` does not start again (AutoplayTask): the bounded decision
+        history alone would scroll its failure out, and an in-process timer
+        would not survive a restart. Elapsed deadlines are dropped."""
+        now = time.time()
+        backoffs = {key: value
+                    for key, value in self.state.mana_crystal_retry_until.items()
+                    if value > now}
+        until = float(until)
+        if math.isfinite(until) and until > now:
+            backoffs[str(detour)] = until
+        else:
+            backoffs.pop(str(detour), None)
+        self.state.mana_crystal_retry_until = backoffs
+        character = self.state.player_name or self.config.character
+        if not character:
+            if not self._mana_crystal_unpersisted_warned:
+                self._mana_crystal_unpersisted_warned = True
+                log.warning("mana-crystal %s backoff kept in memory only: no "
+                            "character to persist it for", detour)
+            return
+        self._runtime_memory.setdefault(character, {})[
+            "mana_crystal_retry_until"] = dict(backoffs)
         self._persist_character_memory()
 
     def remember_route_hazard(self, path: str, until: float) -> None:
