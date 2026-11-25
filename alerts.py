@@ -1,8 +1,8 @@
 """Dashboard alerts: what needs the operator's attention right now.
 
 Raised for repeated deaths, starvation, an idle character that cannot reach
-food, a character that is stuck while autoplay runs, a lost connection, and
-a task engine whose steps keep failing. Autoplay adds its own while farming
+food, a character that is stuck while autoplay runs, a lost connection, a
+task engine whose steps keep failing, and an event loop that stalled. Autoplay adds its own while farming
 is unsafe, and its non-blocking recall note (AutoplayTask.recovery_alerts).
 The client keeps a ``ProgressWatch`` current; the dashboard serves the active
 alerts on every live poll.
@@ -29,6 +29,10 @@ IDLE_HUNGER_ACTIONS = ("idle-hunger", "idle-hunger-fed", "idle-hunger-failed")
 # and no idle survival, so she stands there.
 ENGINE_ERROR_STEPS = 5
 ENGINE_ERROR_CRITICAL_SECONDS = 10 * 60.0
+# An event-loop stall (planner.LoopWatchdog: nothing ran, not even her
+# safety or the connection) stays alerted this long.
+LOOP_STALL_ACTION = "event-loop-stall"
+LOOP_STALL_ALERT_SECONDS = 15 * 60.0
 
 
 class ProgressWatch:
@@ -96,6 +100,20 @@ def idle_food_failure(decisions: Iterable[dict], now: float) -> dict | None:
     return latest
 
 
+def loop_stall(decisions: Iterable[dict], now: float) -> tuple[dict | None, int]:
+    """The latest event-loop stall within LOOP_STALL_ALERT_SECONDS (or
+    None), and how many there were in that window."""
+    latest, count = None, 0
+    for record in decisions:
+        if (isinstance(record, dict) and record.get("action") == LOOP_STALL_ACTION and
+                now - float(record.get("time", 0.0) or 0.0) < LOOP_STALL_ALERT_SECONDS):
+            count += max(1, int(record.get("count", 1) or 1))
+            if (latest is None or float(record.get("time", 0.0) or 0.0) >=
+                    float(latest.get("time", 0.0) or 0.0)):
+                latest = record
+    return latest, count
+
+
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
            autoplay_started_at: float | None, task_running: bool = False,
            engine_error: dict | None = None,
@@ -146,6 +164,12 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
         alerts.append({"id": "idle-food", "level": "critical",
                        "text": "Idle and cannot reach food: "
                                f"{failure.get('detail', '')}"})
+    stall, stalls = loop_stall(decisions, now)
+    if stall is not None:
+        alerts.append({"id": "loop-stall", "level": "warn",
+                       "text": "Event loop stalled" +
+                               (f" {stalls} times in 15 min, last" if stalls > 1 else "") +
+                               f": {stall.get('detail', '')}"})
     if autoplay_started_at is not None and getattr(state, "phase", "") == "playing":
         # Inactivity before this autoplay run started is not being stuck.
         since = max(watch.exp_changed_at, watch.moved_at, autoplay_started_at)

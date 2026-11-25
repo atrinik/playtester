@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import json
 import logging
 import math
 import multiprocessing
 import os
 import posixpath
+import threading
 import dataclasses
 import re
 import xml.etree.ElementTree as ET
@@ -37,6 +39,7 @@ from . import requirements as req
 from . import route_blocks
 from . import route_costs
 from . import route_events
+from . import planner
 from . import route_shadow
 from . import unlocks
 from .equipment import abandon_gear_examine
@@ -472,6 +475,10 @@ def _dialogue_seller_interfaces(
     return sellers
 
 
+# Makes each planner view once (WorldGraph.planner_view).
+_PLANNER_VIEW_LOCK = threading.Lock()
+
+
 class WorldGraph:
     def __init__(self, map_root: Path | None = None):
         self.map_root = map_root or CONTENT_ROOT / "maps"
@@ -522,6 +529,51 @@ class WorldGraph:
         # owner's dialogue_edges flag) uses them.
         self.voyages: list[dialogue_edges.Voyage] = []
         self.gated_exits: dict[tuple[str, int, int], Requirement] = {}
+
+    # The derived caches the planners fill as they search; a planner view
+    # (planner_view) has its own.
+    _PLANNER_CACHES = ("_component_cache", "_aggro_pack_cache", "_route_open_cache",
+                       "_seam_exposure_cache", "_gated_route_snapshots")
+
+    def planner_view(self, generation: int | None = None) -> "WorldGraph":
+        """This graph for a planner worker (planner.py): the same map data,
+        with caches of its own; one view per worker ``generation`` (the
+        current worker's by default).
+
+        After build the map data is never changed, so the view shares it.
+        The derived caches are filled (and cleared) while a search runs, so
+        the view has its own and the worker never changes one the loop is
+        reading, nor reads one it changes. A defaultdict grows on a lookup
+        of a missing key, so the view has its own copy of each of those
+        too; each copy is one C-level dict copy, which the GIL keeps whole
+        whichever thread makes it. Only one worker thread plans on a view:
+        a worker that replaces a stuck one (planner.replace) has its own."""
+        if self.__dict__.get("_is_planner_view"):
+            return self
+        if generation is None:
+            generation = planner.generation()
+        views = self.__dict__.setdefault("_planner_views", {})
+        view = views.get(generation)
+        if view is None:
+            with _PLANNER_VIEW_LOCK:
+                view = views.get(generation)
+                if view is None:
+                    view = copy.copy(self)
+                    view.__dict__.pop("_component_access_order", None)
+                    view.__dict__.pop("_planner_views", None)
+                    for name in self._PLANNER_CACHES:
+                        setattr(view, name, {})
+                    view._world_search_snapshot = None
+                    for name, value in list(view.__dict__.items()):
+                        if isinstance(value, defaultdict):
+                            setattr(view, name, copy.copy(value))
+                    view._is_planner_view = True
+                    views[generation] = view
+                    # Older views go: only the worker before this one (an
+                    # abandoned worker may still run) keeps its own.
+                    for old in [old for old in views if old < generation - 1]:
+                        del views[old]
+        return view
 
     def build(self) -> "WorldGraph":
         archetypes = load_archetypes()
@@ -2495,6 +2547,55 @@ def mark_essential(task: BotTask | None, kind: str) -> BotTask | None:
     return task
 
 
+@dataclass(frozen=True)
+class PlanInputs:
+    """What a plan reads from her memory and unlock state (her owner walls,
+    dialogue offer and access set), taken on the loop so a planner thread
+    (planner.py) never reads them from her live client."""
+    walls: OwnerWalls
+    offer: Any
+    access: Any
+
+
+def plan_inputs(client: AtrinikClient, graph: "WorldGraph") -> PlanInputs:
+    """Her plan inputs now (PlanInputs). Call on the loop."""
+    return PlanInputs(route_blocks.owner_walls(client),
+                      dialogue_edges.dialogue_offer(client, graph),
+                      unlocks.unlock_state(client, graph).access)
+
+
+def _plan_inputs_of(client: Any) -> PlanInputs | None:
+    """The inputs a planning client carries (planning_client), or None for
+    her live client, whose plans read them themselves."""
+    inputs = getattr(client, "plan_inputs", None)
+    return inputs if isinstance(inputs, PlanInputs) else None
+
+
+class PlanCancelled(Exception):
+    """A background ranking was dropped: its remaining probes stop (not a
+    ValueError, so no ranking takes it for an unreachable destination)."""
+
+
+def _check_cancelled(client: Any) -> None:
+    flag = getattr(client, "cancelled", None)
+    if isinstance(flag, threading.Event) and flag.is_set():
+        raise PlanCancelled("the ranking was dropped")
+
+
+class ComponentRefresh:
+    """One cache refresh shared by a ranking's probes (NavigateTask.refresh).
+
+    A failed plan is retried once with the graph's components cleared, in
+    case a stale one closed the route. A ranking plans many trips from the
+    same place: after its first refresh the components are fresh, and
+    clearing them again for every unreachable destination only rebuilt
+    them each time (1.1 to 1.3 s a priest, about 22 s of the temple
+    ranking's 23 s from world_7_79)."""
+
+    def __init__(self) -> None:
+        self.done = False
+
+
 class NavigateTask(BotTask):
     """Follow the authored path one verified protocol move at a time."""
 
@@ -2628,6 +2729,19 @@ class NavigateTask(BotTask):
                      f"({error})")
         return True
 
+    @property
+    def graph(self) -> WorldGraph:
+        """Her world graph; on the planner worker, its planner view
+        (WorldGraph.planner_view), so a plan made there never touches a
+        cache the loop uses."""
+        graph = self._graph
+        generation = planner.worker_generation()
+        return graph if generation is None else graph.planner_view(generation)
+
+    @graph.setter
+    def graph(self, graph: WorldGraph) -> None:
+        self._graph = graph
+
     def __init__(self, graph: WorldGraph, destination: str,
                  destination_xy: tuple[int, int] | None = None,
                  tolerance: int = 0,
@@ -2717,6 +2831,8 @@ class NavigateTask(BotTask):
         self.care: CareCrossing | None = None
         self._care_staging: tuple | None = None
         self._care_staging_retry_at = 0.0
+        # A ranking's probes share one component refresh.
+        self.refresh: ComponentRefresh | None = None
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -2736,6 +2852,9 @@ class NavigateTask(BotTask):
         """Her access set: the unlock state's, unless the task overrides it."""
         if self._allow_locked_override is not None:
             return self._allow_locked_override
+        inputs = _plan_inputs_of(client)
+        if inputs is not None:
+            return inputs.access
         return unlocks.unlock_state(client, self.graph).access
 
     def _goal_points(self) -> list[tuple[int, int]]:
@@ -2888,8 +3007,13 @@ class NavigateTask(BotTask):
         other trip fails with the block as its reason. A walk to a safe
         place for that care never crosses one.
         """
-        self._walls = route_blocks.owner_walls(client)
-        self._offer = dialogue_edges.dialogue_offer(client, self.graph)
+        _check_cancelled(client)
+        inputs = _plan_inputs_of(client)
+        if inputs is not None:
+            self._walls, self._offer = inputs.walls, inputs.offer
+        else:
+            self._walls = route_blocks.owner_walls(client)
+            self._offer = dialogue_edges.dialogue_offer(client, self.graph)
         self._plan_client, self._crossed, self._bounded = client, (), ()
         learned = learned_route_costs(client)
         try:
@@ -3274,6 +3398,21 @@ class NavigateTask(BotTask):
         self._issued_goal = self._issued_click = None
         self._last_progress = time.monotonic()
 
+    def _refresh_components(self) -> bool:
+        """Clear the graph's components before retrying a failed plan; False
+        when this plan's ranking already did (ComponentRefresh): they are
+        fresh, so the failure is not retried. A background ranking's
+        planning client carries one for all its probes."""
+        refresh = self.refresh
+        if refresh is None:
+            refresh = getattr(self._plan_client, "refresh", None)
+        if isinstance(refresh, ComponentRefresh):
+            if refresh.done:
+                return False
+            refresh.done = True
+        _clear_components(self.graph)
+        return True
+
     def _plan_tiers(self, client: AtrinikClient, *,
                     origin: tuple[str, tuple[int, int]] | None = None) -> list[MapEdge]:
         # Learned hazards are a cost, never a wall: one search finds the route
@@ -3362,9 +3501,8 @@ class NavigateTask(BotTask):
         owner blocks keep P3's rules."""
         snapshot = self._trip_snapshot(client, origin)
         plan = drain(learned_route(snapshot))
-        if plan.outcome == route_costs.NO_ROUTE:
+        if plan.outcome == route_costs.NO_ROUTE and self._refresh_components():
             # Components are derived data; retry once with a fresh cache.
-            _clear_components(self.graph)
             plan = drain(learned_route(snapshot))
         self.learned_plan = plan
         # A planning probe (a trip not started: the temple, food and recall
@@ -3446,11 +3584,12 @@ class NavigateTask(BotTask):
         }
         try:
             route = self._route_points(*args, unwalled_retry=False, **kwargs)
-        except ValueError:
+        except ValueError as first:
             # Components are derived data; retry once with a fresh cache.
-            _clear_components(self.graph)
             try:
                 try:
+                    if not self._refresh_components():
+                        raise first
                     route = self._route_points(*args, unwalled_retry=False, **kwargs)
                 except ValueError as walled:
                     if not self._walls:
@@ -3496,12 +3635,13 @@ class NavigateTask(BotTask):
 
         try:
             route = self._route_points(*args, unwalled_retry=False, **kwargs)
-        except ValueError:
+        except ValueError as first:
             # Components are derived acceleration data. A live exceptional
             # start square (closed door, runtime map mutation, occupied seam)
             # must never make a later route permanently unroutable.
-            _clear_components(self.graph)
             try:
+                if not self._refresh_components():
+                    raise first
                 route = self._route_points(*args, unwalled_retry=False, **kwargs)
             except ValueError as preferred_exc:
                 # Tiled levels only joined the hazards to keep surface trips
@@ -7728,21 +7868,27 @@ def apartment_exit_origin(
     return back[0], (int(back[1][0]), int(back[1][1]))
 
 
-def temple_food_trip(graph: "WorldGraph", client: AtrinikClient, *,
-                     exclude: Iterable[str] = ()) -> NavigateThenTask | None:
-    """Route to the nearest priest reachable without a threat fallback.
+def rank_temple_priests(graph: "WorldGraph", client: Any, *,
+                        exclude: Iterable[str] = (),
+                        origin: tuple[str, tuple[int, int]] | None = None
+                        ) -> DialogueVendor | None:
+    """The nearest priest reachable without a threat fallback, or None.
 
     Priests named in ``exclude`` (whose trip just failed) are passed over.
+    One route plan per priest: a whole-world search each, so live this
+    runs on the planner worker (TempleFoodPlanner). Its probes share one
+    component refresh (ComponentRefresh).
     """
     ranked = []
-    origin = apartment_exit_origin(client)
     excluded = {name.casefold() for name in exclude}
+    refresh = ComponentRefresh()
     for priest in graph.temple_priests:
         if priest.name.casefold() in excluded:
             continue
         navigation = NavigateTask(
             graph, priest.map_path, (priest.x, priest.y), tolerance=2)
         navigation.essential = "food"
+        navigation.refresh = refresh
         try:
             route = navigation._plan(client, origin=origin)
         except ValueError:
@@ -7753,13 +7899,217 @@ def temple_food_trip(graph: "WorldGraph", client: AtrinikClient, *,
                            len(route), priest.name.casefold(), priest))
     if not ranked:
         return None
-    priest = min(ranked, key=lambda entry: entry[:-1])[-1]
+    return min(ranked, key=lambda entry: entry[:-1])[-1]
+
+
+def temple_food_task(graph: "WorldGraph", priest: DialogueVendor) -> NavigateThenTask:
+    """The free temple food trip to ``priest``."""
     task = NavigateThenTask(
         graph, priest.map_path, TempleFoodTask(priest.name),
         destination_xy=(priest.x, priest.y), combat_approach=True)
     task.navigation.tolerance = 2
     task.navigation.essential = "food"
     return task
+
+
+def temple_food_trip(graph: "WorldGraph", client: AtrinikClient, *,
+                     exclude: Iterable[str] = ()) -> NavigateThenTask | None:
+    """Route to the nearest priest reachable without a threat fallback,
+    ranked right here (rank_temple_priests). A tick never calls this: it
+    can take most of a minute, so ticks use TempleFoodPlanner.
+
+    Priests named in ``exclude`` (whose trip just failed) are passed over.
+    """
+    priest = rank_temple_priests(graph, client, exclude=exclude,
+                                 origin=apartment_exit_origin(client))
+    return None if priest is None else temple_food_task(graph, priest)
+
+
+class _Planning:
+    """A background plan's answer while it still runs (BackgroundPlans)."""
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "PLANNING"
+
+
+PLANNING = _Planning()
+
+
+def planning_client(client: AtrinikClient, graph: "WorldGraph") -> planner.PlanningClient:
+    """Her client for the planner worker (planner.PlanningClient), with her
+    plan inputs (PlanInputs) taken now, on the loop: every route a worker
+    plans with it reads her walls, offer and access set from here, never
+    from her live client. With learned costs on, her learned model is
+    refreshed here too, so the worker reads it warm."""
+    model = route_costs.learned_model(client) if learned_route_costs(client) else None
+    proxy = planner.PlanningClient(client)
+    proxy.plan_inputs = plan_inputs(client, graph)
+    proxy.refresh = ComponentRefresh()
+    if model is not None:
+        # Frozen for this plan: learned_model(proxy) returns it and never
+        # reads her memory on the worker (its state reads as never stale).
+        state = getattr(client, "_route_cost_model_state", (model.character, 0.0, 0))
+        proxy._route_cost_model = model
+        proxy._route_cost_model_state = (state[0], math.inf, state[2])
+    return proxy
+
+
+class _BackgroundPlan:
+    """One build(PlanningClient) call on the planner worker."""
+
+    def __init__(self, graph: "WorldGraph", client: AtrinikClient,
+                 build: Callable[[Any], Any], key: Any,
+                 clock: Callable[[], float], priority: int):
+        self.key = key
+        # When the worker was first seen running it: time in the queue
+        # behind other rankings does not count towards MAX_PENDING_SECONDS.
+        self.running_since: float | None = None
+        self.finished_at: float | None = None
+        # The view is made here, warm for the worker.
+        graph.planner_view()
+        self.proxy = planning_client(client, graph)
+        self.future = planner.submit(build, self.proxy, priority=priority)
+        self.future.add_done_callback(lambda _: setattr(self, "finished_at", clock()))
+
+
+class BackgroundPlans:
+    """Route rankings on the planner worker, so no tick waits for one
+    (ROUTING 1.12).
+
+    ``get(name, graph, client, build)`` runs ``build`` with her
+    PlanningClient on the worker, where every NavigateTask plans on the
+    graph's planner view, and answers PLANNING (falsy) until it is done,
+    while safety, healing, combat and the connection carry on; then its
+    result, the actions it recorded replayed on her client and its error
+    raised as the ranking itself would have raised it. A result is used
+    only for the same ``key`` (the inputs that change what it finds), and
+    within RESULT_SECONDS of finishing: one left waiting while she did
+    something else is planned again.
+    """
+
+    RESULT_SECONDS = 60.0
+    # A plan still running after this is given up (planner-timeout) and
+    # answers None, so the caller's no-route path, retry and alert run
+    # instead of waiting for ever.
+    MAX_PENDING_SECONDS = 300.0
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic):
+        self.clock = clock
+        self._plans: dict[str, _BackgroundPlan] = {}
+
+    def _stale(self, plan: _BackgroundPlan) -> bool:
+        return (plan.finished_at is not None and
+                self.clock() - plan.finished_at > self.RESULT_SECONDS)
+
+    def planning(self, name: str) -> bool:
+        """Whether ``name`` was started and is still to be collected (a
+        result left past RESULT_SECONDS is dropped)."""
+        plan = self._plans.get(name)
+        if plan is not None and self._stale(plan):
+            self.forget(name)
+            return False
+        return plan is not None
+
+    def forget(self, name: str) -> None:
+        """Drop ``name``'s plan under way, if any: a queued one never runs,
+        a running one stops at its next probe (PlanCancelled)."""
+        plan = self._plans.pop(name, None)
+        if plan is not None:
+            plan.future.cancel()
+            plan.proxy.cancelled.set()
+
+    def get(self, name: str, graph: "WorldGraph", client: AtrinikClient,
+            build: Callable[[Any], Any], *, key: Any = None,
+            priority: int = planner.PRIORITY_OTHER) -> Any:
+        plan = self._plans.get(name)
+        if plan is not None and (plan.key != key or self._stale(plan)):
+            self.forget(name)
+            plan = None
+        if plan is None:
+            plan = self._plans[name] = _BackgroundPlan(
+                graph, client, build, key, self.clock, priority)
+        if not plan.future.done():
+            recorder = getattr(client, "record_action", None)
+            stuck = planner.unstick(self.MAX_PENDING_SECONDS)
+            if stuck and recorder is not None:
+                recorder("planner-replaced", f"{stuck}; a fresh planner worker took over")
+            now = self.clock()
+            if plan.running_since is None and plan.future.running():
+                plan.running_since = now
+            ran = 0.0 if plan.running_since is None else now - plan.running_since
+            if ran <= self.MAX_PENDING_SECONDS:
+                return PLANNING
+            self.forget(name)
+            log.warning("%s plan gave no answer in %.0f s; giving up", name, ran)
+            if recorder is not None:
+                recorder("planner-timeout", f"{name}: no answer in {ran:.0f} s")
+            return None
+        del self._plans[name]
+        plan.proxy.replay_actions(client)
+        return plan.future.result()
+
+
+class TempleFoodPlanner:
+    """The temple food ranking (rank_temple_priests) as a background plan
+    (BackgroundPlans): ``trip`` answers PLANNING until it is done, then the
+    trip to the priest it chose, or None when none is reachable.
+
+    A ranking holds for the priests it passed over and runs to the end
+    wherever she walks meanwhile (the trip plans its own route from where
+    she is). The priest it chose is remembered for RESUME_SECONDS with the
+    map the ranking started from: when a disconnect drops the trip while
+    she is still on that map, the next one goes to the same priest at once
+    (one route, not a new ranking); anywhere else she ranks again.
+    ``forget`` ends both: a trip done or failed, an operator hold, a task
+    taking over.
+    """
+
+    RESUME_SECONDS = 600.0
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic):
+        self.clock = clock
+        self.plans = BackgroundPlans(clock=clock)
+        self._chosen: tuple[DialogueVendor, float, str] | None = None
+        # The map the ranking under way started from.
+        self._origin_map = ""
+
+    @property
+    def planning(self) -> bool:
+        """Whether a ranking was started and not yet collected."""
+        return self.plans.planning("temple")
+
+    def forget(self) -> None:
+        """Drop a ranking under way and the remembered priest."""
+        self.plans.forget("temple")
+        self._chosen = None
+
+    def trip(self, graph: "WorldGraph", client: AtrinikClient, *,
+             exclude: Iterable[str] = ()) -> NavigateThenTask | None | _Planning:
+        """The trip to start now, None, or PLANNING (class doc)."""
+        excluded = tuple(sorted({name.casefold() for name in exclude}))
+        here = client.state.map.path
+        now = self.clock()
+        if self._chosen is not None:
+            priest, chosen_at, ranked_from = self._chosen
+            if (now - chosen_at <= self.RESUME_SECONDS and ranked_from == here and
+                    priest.name.casefold() not in excluded):
+                return temple_food_task(graph, priest)
+            self._chosen = None
+        if not self.plans.planning("temple"):
+            self._origin_map = here
+        origin = apartment_exit_origin(client)
+        priest = self.plans.get(
+            "temple", graph, client,
+            lambda proxy: rank_temple_priests(graph, proxy, exclude=excluded,
+                                              origin=origin),
+            key=excluded, priority=planner.PRIORITY_FOOD)
+        if priest is PLANNING or priest is None:
+            return priest
+        self._chosen = (priest, now, self._origin_map)
+        return temple_food_task(graph, priest)
 
 
 # Paths of private savebeds: an apartment or house bed only works for its owner.
@@ -8185,6 +8535,7 @@ class FarmCircuitTask(BotTask):
                  spot: dict | None = None,
                  backoffs: dict[str, float] | None = None,
                  avoid_priests: Callable[[], Iterable[str]] = tuple,
+                 food_planner: "TempleFoodPlanner | None" = None,
                  clock: Callable[[], float] = time.monotonic):
         if not legs:
             raise ValueError("a farm circuit needs at least one leg")
@@ -8237,6 +8588,12 @@ class FarmCircuitTask(BotTask):
         self._resupply_retry_at = 0.0
         # Whether the running resupply is a shop purchase or temple food.
         self._resupply_kind = ""
+        # Route rankings off the event loop (ROUTING 1.12): the temple's
+        # (autoplay's own planner, shared: one ranking and one remembered
+        # priest across its circuits), and the food, heal and recall
+        # merchants'.
+        self._food_planner = food_planner or TempleFoodPlanner()
+        self._plans = BackgroundPlans()
         self._temple_food_retry_at = 0.0
         self._storage: NavigateThenTask | None = None
         self._storage_retry_at = 0.0
@@ -9087,8 +9444,10 @@ class FarmCircuitTask(BotTask):
         return (self._hungry(client) and
                 int(client.state.stats.get("food", 1000) or 0) < self.FOOD_URGENT)
 
-    def _food_trip(self, client: AtrinikClient) -> tuple[NavigateThenTask | None, str]:
-        """The food trip to start now: a temple priest, the shop, or none.
+    def _food_trip(self, client: AtrinikClient
+                   ) -> tuple[NavigateThenTask | None | _Planning, str]:
+        """The food trip to start now: a temple priest, the shop, or none;
+        PLANNING while its ranking runs off the loop.
 
         Hungry, she asks a temple priest first: the food is free, so no
         wallet ever turns her away (live, a broke character walked to the
@@ -9101,7 +9460,10 @@ class FarmCircuitTask(BotTask):
         if self._hungry(client) and temple_ready:
             return self._new_temple_food(client), "temple"
         if now >= self._resupply_retry_at:
-            return self._new_food_resupply(client), "shop"
+            # Its merchant ranking runs off the loop too.
+            return self._plans.get("food-resupply", self.graph, client,
+                                   self._new_food_resupply,
+                                   priority=planner.PRIORITY_FOOD), "shop"
         return None, ""
 
     def _food_order_cost(self) -> int:
@@ -9145,6 +9507,9 @@ class FarmCircuitTask(BotTask):
         if self._resupply is None:
             return
         temple = self._resupply_kind == "temple"
+        if temple and self._resupply.status in (TaskStatus.FAILED, TaskStatus.COMPLETE):
+            # Fed, or that priest failed: the next trip ranks afresh.
+            self._food_planner.forget()
         if self._resupply.status == TaskStatus.FAILED:
             log.warning("%s failed: %s",
                         "temple food" if temple else "food resupply",
@@ -9168,9 +9533,12 @@ class FarmCircuitTask(BotTask):
                          "temple food" if temple else "food resupply")
             self._resupply = None
 
-    def _new_temple_food(self, client: AtrinikClient) -> NavigateThenTask | None:
-        return temple_food_trip(self.graph, client,
-                                exclude=tuple(self.avoid_priests()))
+    def _new_temple_food(self, client: AtrinikClient
+                         ) -> NavigateThenTask | None | _Planning:
+        """The temple food trip, None, or PLANNING while the ranking runs
+        off the loop (TempleFoodPlanner)."""
+        return self._food_planner.trip(self.graph, client,
+                                       exclude=tuple(self.avoid_priests()))
 
     def _food_resupply_quantity(
             self, client: AtrinikClient, profile: FoodProfile) -> int:
@@ -11154,14 +11522,22 @@ class FarmCircuitTask(BotTask):
                 await self._cure_funding.tick(client)
                 return
         # Survival supplies first, then clear unknown/cursed-item risk and
-        # carrying pressure; discretionary shopping is always last.
+        # carrying pressure; discretionary shopping is always last. While a
+        # survival trip's ranking runs off the loop, no later errand starts
+        # in its place: the farm carries on until it is done.
+        survival_pending = False
         if (isinstance(farm, FarmTask) and self._needs_food_resupply(client) and
                 (self._food_urgent(client) or
                  not self._busy_finishing_fight_or_loot(client, farm))):
             resupply, kind = self._food_trip(client)
-            if resupply is None and kind == "temple":
+            if resupply is PLANNING:
+                resupply, survival_pending = None, True
+            elif resupply is None and kind == "temple":
                 self._temple_food_retry_at = (
                     self.clock() + self.TEMPLE_FOOD_RETRY_SECONDS)
+            elif resupply is None and kind == "shop":
+                # Its ranking gave no answer (planner-timeout).
+                self._resupply_retry_at = self.clock() + 1800.0
             if resupply is not None:
                 await client.clear_actions()
                 await client.set_combat(False)
@@ -11176,7 +11552,7 @@ class FarmCircuitTask(BotTask):
             await client.set_combat(False)
             await self._capability.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_mass_identification(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -11184,7 +11560,7 @@ class FarmCircuitTask(BotTask):
             self._identification = self._new_mass_identification()
             await self._identification.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_apartment_storage(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -11197,7 +11573,7 @@ class FarmCircuitTask(BotTask):
         # no savebed rebinding, shopping, ship key or spell purchase spends
         # the cure's money or time.
         funding = cure_funding_farm(client)
-        if (isinstance(farm, FarmTask) and not funding and
+        if (isinstance(farm, FarmTask) and not funding and not survival_pending and
                 not self._busy_finishing_fight_or_loot(client, farm) and
                 self._needs_savebed(client)):
             await client.clear_actions()
@@ -11213,7 +11589,7 @@ class FarmCircuitTask(BotTask):
                          f"{current if current is not None else 'unknown'}")
             await self._bed_binding.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_junk_sale(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -11221,7 +11597,7 @@ class FarmCircuitTask(BotTask):
             self._selling = self._new_junk_sale(client)
             await self._selling.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_bank_deposit(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -11235,7 +11611,7 @@ class FarmCircuitTask(BotTask):
         # on the same hold (FarmTask._unprepared_rest).
         unprepared = (isinstance(farm, FarmTask) and
                       self._unprepared_hold.active(client, farm.safety))
-        held = unprepared or funding
+        held = unprepared or funding or survival_pending
         # The heal restock is the one optional trip the hold leaves alone:
         # it is the cure for being unprepared. While the hold holds it goes
         # only by a strict route, and not below its flee threshold
@@ -11253,9 +11629,16 @@ class FarmCircuitTask(BotTask):
             # Depleted on the cure-funding farm, it never takes the hazard
             # fallback either; with no strict route it is deferred.
             strict = unprepared or funding
-            trip = self._new_heal_restock(client, strict=strict)
+            # Its merchant ranking runs off the loop (BackgroundPlans): the
+            # farm carries on meanwhile.
+            trip = self._plans.get(
+                "heal-restock", self.graph, client,
+                lambda proxy: self._new_heal_restock(proxy, strict=strict), key=strict,
+                priority=planner.PRIORITY_HEAL)
             recorder = getattr(client, "record_action", None)
-            if (trip is not None and getattr(trip, "hostile_transit", False)
+            if trip is PLANNING:
+                held = True
+            elif (trip is not None and getattr(trip, "hostile_transit", False)
                     and out_of_heals_and_recall(client, farm.safety) and
                     not self._full_hp_sp(client)):
                 self._heal_restock_retry_at = (
@@ -11322,11 +11705,19 @@ class FarmCircuitTask(BotTask):
         if (isinstance(farm, FarmTask) and
                 self._needs_recall_shopping(client) and not held and
                 not self._busy_finishing_fight_or_loot(client, farm)):
-            await client.clear_actions()
-            await client.set_combat(False)
-            self._recall_shopping = self._new_recall_shopping(client)
-            await self._recall_shopping.tick(client)
-            return
+            # Its vendor ranking runs off the loop (BackgroundPlans): the
+            # farm carries on meanwhile.
+            shopping = self._plans.get("recall-shopping", self.graph, client,
+                                       self._new_recall_shopping)
+            if shopping is PLANNING:
+                # Recall before utility and upgrade shopping, as before.
+                held = True
+            elif shopping is not None:
+                await client.clear_actions()
+                await client.set_combat(False)
+                self._recall_shopping = shopping
+                await self._recall_shopping.tick(client)
+                return
         if (isinstance(farm, FarmTask) and
                 self._needs_utility_shopping(client) and not held and
                 not self._busy_finishing_fight_or_loot(client, farm)):
