@@ -5770,7 +5770,8 @@ class NavigateThenTask(BotTask):
         # below would restart the timer it waits for.
         safety_hold = not safe and (not starving_without_food(client) or
                                     heal_waiting(client))
-        if (safety_hold and seam_contact and not heal_waiting(client) and
+        if (safety_hold and seam_contact and not hold_fire and
+                not heal_waiting(client) and
                 any(threat[0] <= 1 for threat in nearby) and
                 not (ratio <= FarmTask.STAND_HEALTH_FLOOR and
                      await self._retreat_step(client, nearby, gain_only=True,
@@ -5780,8 +5781,15 @@ class NavigateThenTask(BotTask):
             # farm does (the heal itself went out above, or waits for its
             # cooldown), rather than a combat-off step every tick. Live at
             # 16:15 she was at 130/356. Only critical, with a step that
-            # gains distance, does she still step away.
+            # gains distance, does she still step away. She fights the
+            # attacker beside her: the committed one if it is, else the
+            # weakest.
             safety_hold = False
+            if nearest is None or nearest[0] > 1:
+                nearest = min((threat for threat in nearby if threat[0] <= 1),
+                              key=lambda threat: (
+                                  int(getattr(threat[3], "target_hp", 0)
+                                      or 100), threat[3].target_id))
         split = (overwhelmed and not hold_fire and not safety_hold and
                  not seam_contact)
         cornered = None
@@ -5820,7 +5828,12 @@ class NavigateThenTask(BotTask):
                 # A split takes only a step that gains distance, the kind
                 # whose absence makes her cornered (_cornered_split).
                 await self._retreat_step(
-                    client, nearby, avoid_backtrack=True, gain_only=split)
+                    client, nearby, avoid_backtrack=True,
+                    # Critical under a seam fight: only the gaining step
+                    # its probe found, never an equal-distance shuffle.
+                    gain_only=split or (
+                        seam_contact and
+                        ratio <= FarmTask.STAND_HEALTH_FLOOR))
             return True
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.

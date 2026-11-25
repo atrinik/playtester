@@ -1877,17 +1877,18 @@ attackers on her, and two corpse probes were queued mid-fight.
   damage she takes meanwhile. That damage is the rate of the hits of the
   last `WINNABLE_WINDOW_SECONDS` (8 s, counted from the first of them and
   over at least 3 s) times the time to kill every attacker within 2 tiles
-  at her observed damage per swing (`observed_target_hp`) and weapon
-  speed. Heals are left out, and an attacker with no damage sample makes
-  it unknown, so not winnable. Then:
+  at her observed damage per swing (`observed_target_hp`, at least two
+  swings measured, the last within that window) and weapon speed. Heals
+  are left out, and an attacker without such a sample makes it unknown,
+  so not winnable. Then:
   - healing outpaced starts no disengage: she fights on, healing as usual
     (`winnable-fight`, once per 4 s);
   - an out-healed hold runs no gain-only retreat. Its learning is kept:
     the kinds still become out of her league;
   - a due pursued stand against two beside her is not declined for
-    healing outpaced. That stand ends as soon as heals are outpaced and
-    the fight is no longer winnable (at the flee line, say), not at the
-    35% stand floor.
+    healing outpaced. That stand ends as soon as heals are outpaced, or
+    she has no heal left to cast, and the fight is no longer winnable (at
+    the flee line, say), not at the 35% stand floor.
 
   Otherwise she disengages as before ([pull request
   86](https://github.com/atrinik/playtester/pull/86): one charred treant
@@ -1909,9 +1910,10 @@ attackers on her, and two corpse probes were queued mid-fight.
   heal threshold, with an attacker beside her, she fights back between
   heals as the farm does, instead of the safety hold's combat-off step:
   the heal itself still goes first, and a heal waiting for her action
-  timer still holds. Only at or below the 35% stand floor, with a step
-  that gains distance, does she step away. A care crossing still holds
-  fire.
+  timer still holds. She fights the attacker beside her (the committed
+  one if it is, else the weakest), not one farther off. Only at or below
+  the 35% stand floor, with a step that gains distance, does she step
+  away, and then only by such a step. A care crossing still holds fire.
 - **No corpse probe under contact.** `loot_nearby` does nothing while
   something is on her (`under_hostile_contact`), the walk's corpse
   detour waits too, and a target that vanishes under contact without a

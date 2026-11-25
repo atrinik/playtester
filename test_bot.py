@@ -11033,12 +11033,18 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                 self.assertIn("healing-outpaced",
                               [action for action, _ in client.recorded])
                 self.assertNotIn(True, client.combat)
-        # No damage sample for the attacker: unknown, not winnable.
+        # No damage sample for the attacker, a single swing measured, or a
+        # stale sample: unknown, not winnable. Two fresh ones: winnable.
         client = self._winnable_client((9, 8, "goblin", 100, 10))
         task = self._winnable_task()
-        self.assertFalse(task.fight_winnable(
-            client, [(1, 9, 8, client.state.map.tile(9, 8).objects[3])],
-            0.80))
+        reach = [(1, 9, 8, client.state.map.tile(9, 8).objects[3])]
+        self.assertFalse(task.fight_winnable(client, reach, 0.80))
+        task._target_damage[100] = (10, time.monotonic(), 20.0, 1)
+        self.assertFalse(task.fight_winnable(client, reach, 0.80))
+        task._target_damage[100] = (10, time.monotonic() - 60.0, 20.0, 3)
+        self.assertFalse(task.fight_winnable(client, reach, 0.80))
+        task._target_damage[100] = (10, time.monotonic(), 20.0, 2)
+        self.assertTrue(task.fight_winnable(client, reach, 0.80))
 
     def test_two_treants_outpacing_heals_disengage_along_the_trail(self):
         # Two treants beside her out-damage her heals at 90%: not
@@ -11067,7 +11073,12 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # A due pursued stand against two beside her is not declined for
         # outpaced heals while she wins before the flee line; once she no
         # longer would, the stand ends at once rather than at the 35%
-        # stand floor.
+        # stand floor: with heals outpaced, or with none left to cast.
+        for no_heal in (False, True):
+            with self.subTest(no_heal=no_heal):
+                self._winnable_stand_ends(no_heal)
+
+    def _winnable_stand_ends(self, no_heal):
         client = self._winnable_client(
             (7, 8, "charred treant", 100, 5),
             (8, 7, "charred treant", 101, 5))
@@ -11088,6 +11099,12 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
 
         # At 290 of 356 (81%, the two-threat flee line 80%), 5 HP to spare.
         client.state.stats["hp"] = 290
+        if no_heal:
+            # Out of mana: no heal to cast, so none outpaced either.
+            client.state.stats["sp"] = 0
+            client.state.messages = [
+                entry for entry in client.state.messages
+                if "heals you" not in entry[-1]]
         client.direct_moves.clear()
         task._last_action = 0.0
         self.assertTrue(asyncio.run(task.low_health_retreat(client)))
@@ -11215,6 +11232,20 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(client.combat[-1], True)
         self.assertIn((9, 8, engaged.target_id), client.targets)
         self.assertEqual(farm._engaged_target[0], engaged.target_id)
+
+        # With the committed target two tiles off, she fights the one
+        # beside her instead of walking to it.
+        client.state.map.tiles.clear()
+        client.state.map.tile(10, 8).objects[3] = engaged
+        client.state.map.tile(8, 9).objects[3] = other
+        client.targets.clear()
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.targets[-1], (8, 9, other.target_id))
+        self.assertEqual(client.direct_moves, [])
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = engaged
+        client.state.map.tile(8, 9).objects[3] = other
 
         # Critical, with a step that gains distance: she steps away.
         client.state.stats["hp"] = 100

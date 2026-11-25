@@ -5355,9 +5355,10 @@ class FarmTask(BotTask):
         WINNABLE_MARGIN, the damage she takes meanwhile: the hits of the
         last WINNABLE_WINDOW_SECONDS (from the first of them, at least
         3 s) as a rate, times the time to kill every one of them at her
-        observed damage per swing (observed_target_hp) and weapon speed.
-        Heals are left out. An attacker she has no damage sample for, or
-        no hits at all, makes it unknown: not winnable. Live, one charred
+        observed damage per swing (observed_target_hp: two swings at least,
+        the last within the window) and weapon speed. Heals are left out.
+        An attacker without such a sample, or no hits at all, makes it
+        unknown: not winnable. Live, one charred
         treant out-damaged chained minor healing from 89% to death, so an
         outpaced heal from full health is no reason by itself to fight on.
         """
@@ -5385,8 +5386,13 @@ class FarmTask(BotTask):
         for entry in reach:
             obj = entry[3]
             observation = self._target_damage.get(obj.target_id)
-            if observation is None or observation[3] <= 0 or \
-                    observation[2] <= 0:
+            # At least two swings measured, the last within the window: one
+            # delta may be a burst or someone else's hit, an old one another
+            # weapon's.
+            if (observation is None or observation[3] < 2 or
+                    observation[2] <= 0 or
+                    time.monotonic() - observation[1] >
+                    self.WINNABLE_WINDOW_SECONDS):
                 return False
             target_hp = int(obj.target_hp or observation[0] or 0)
             kill_seconds += target_hp / (observation[2] / interval)
@@ -5436,10 +5442,13 @@ class FarmTask(BotTask):
         # A gaining gain-only step normally clears the stand latch first;
         # out_healed here only guards against one left over.
         # A stand only a winnable fight allowed ends once heals are
-        # outpaced and it is winnable no more (at the flee line, say).
+        # outpaced (or there is none left to cast) and it is winnable no
+        # more (at the flee line, say).
         lost_winnable = (
             breakout is not None and self._stand_latch and
-            self._winnable_stand and healing_outpaced(client) and
+            self._winnable_stand and (
+                healing_outpaced(client) or
+                self.safety._usable_heal(client) is None) and
             not self.fight_winnable(client, [
                 (1, x, y, obj) for x, y, obj in visible_threats
                 if max(abs(x - cx), abs(y - cy)) <= 1],
