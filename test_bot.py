@@ -22981,6 +22981,32 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(failure["cause"], "route")
         self.assertIn(self.BURNT_17_74, client.state.route_hazards)
 
+    def test_a_death_on_the_walk_back_after_a_recall_is_on_the_way(self):
+        """She left world_16_74 by an emergency recall, already learned.
+        Walking back, a death on world_17_74 is a death on the way."""
+        spot = analyzer_spot("Burnt Forest", [self.BURNT_16_74],
+                             ["charred treant L33"])
+        client = self.client({"xp": [spot]})
+        client.farm_analyzer.profile = self.kit()
+        circuit = self.circuit(client, spot)
+        circuit.child.navigation.status = TaskStatus.RUNNING
+        now = time.time()
+        client.decision_history.append({
+            "time": now - 60, "action": "emergency-recall", "detail": "",
+            "task": "", "map": self.BURNT_16_74})
+        circuit._failure_epoch = now - 30
+        client.map_arrivals = [(now - 300, self.BURNT_16_74),
+                               (now - 59, "/shattered_islands/world_0_67"),
+                               (now - 10, self.BURNT_17_74)]
+        client.state.messages.append(
+            (now - 2, 2, "ff0000", "charred treant hit you for 90 (-90) impact damage."))
+        client.decision_history.append({
+            "time": now, "action": "death", "detail": "",
+            "task": "", "map": self.BURNT_17_74})
+        circuit._observe_farm_death(client)
+        failure = client.state.farm_adaptations[spot["path"]]["kit_failures"][-1]
+        self.assertEqual(failure["cause"], "route")
+
     def test_a_death_on_the_walk_back_after_respawning_is_on_the_way(self):
         """She left world_16_74 by dying there. Walking back after
         respawning, a death on world_17_74 is a death on the way, however
@@ -26645,6 +26671,39 @@ class SelfImprovementTests(unittest.TestCase):
         # Other kits' failures still do not count.
         self.assertFalse(si.kit_hazard(adaptations, "candidate", [self.UC_B], lambda other: False,
                                        now=1000.0))
+
+    def test_kit_hazard_counts_each_failure_for_its_own_area(self):
+        from . import self_improvement as si
+
+        kit = {"skill": "wizardry spells", "skill_level": 13}
+        pack = self.review(["giant frog hit you for 20 (-20) slash damage.",
+                            "crocodile hit you for 25 (-25) pierce damage."],
+                           failure_map=self.UC_A)
+        record = {}
+        for area in ("r|A", "r|A", "r|B"):
+            record, _ = si.learn(record, pack, now=1000.0, kit=kit,
+                                 maps=[self.UC_A, self.UC_B], areas=[area])
+        self.assertEqual(record["areas"], ["r|A", "r|B"])
+        adaptations = {"mixed": record}
+
+        def hazard(areas):
+            return si.kit_hazard(adaptations, "candidate", [self.FOREST],
+                                 kit.__eq__, now=1000.0, areas=areas)
+
+        # Two failures in A and one in B: neither area is hazardous alone.
+        self.assertFalse(hazard(["r|B"]))
+        self.assertFalse(hazard(["r|A"]))
+        # A candidate in both areas has all three.
+        self.assertTrue(hazard(["r|A", "r|B"]))
+        # Sharing a map, every failure counts as before.
+        self.assertTrue(si.kit_hazard(adaptations, "candidate", [self.UC_B],
+                                      kit.__eq__, now=1000.0))
+        # Failures stored before they kept an area take the record's.
+        for entry in record["kit_failures"]:
+            entry.pop("areas")
+        record["areas"] = ["r|A"]
+        self.assertTrue(hazard(["r|A"]))
+        self.assertFalse(hazard(["r|B"]))
 
     def test_kit_hazard_failures_on_disjoint_maps_do_not_combine(self):
         from . import self_improvement as si

@@ -1632,8 +1632,8 @@ and learned too little from them. Three changes:
   containment restarts it, and this rule is judged before the one for a
   death on the way. It never counts during a maintenance trip, and never
   on her first walk to the spot, since she has not been on a leg map yet.
-  Only a leg she was on in this life counts: after a death, the walk back
-  from her respawn is a walk to the spot. The seam rule is also skipped
+  Only a leg she was on since her last death or emergency recall counts:
+  after either one, the walk back is a walk to the spot. The seam rule is also skipped
   while her walk heads to a different leg from the one she left. That
   covers a walk between a circuit's legs and a first walk whose route
   crossed a leg map. A death there stays a death on the way (cause
@@ -1653,10 +1653,13 @@ and learned too little from them. Three changes:
   name (`MapNode.region` and `.name`, which the analyzer's `circuit_area`
   also uses for a circuit of one area), such as
   `eld_woods_island|Burnt Forest`. A map without a region or with an
-  unnamed header has no area. Each failure adds only the area of the leg
-  it counts for to its adaptation record, so a circuit that spans two
-  areas does not mark both after a failure in one, and its earlier
-  failures still count for their own area. `kit_hazard` counts a
+  unnamed header has no area. Each kit failure keeps the area of the leg
+  it counts for, and the record keeps all of its failures' areas. A
+  candidate that shares only an area with a record counts only that
+  record's failures in that area. So two failures in one area and one in
+  the other, on a circuit that spans two areas, leave neither area
+  hazardous. Failures stored before they kept an area take their
+  record's. `kit_hazard` counts a
   record for every candidate with a map or a leg's area in common with it. Three qualifying failures in
   24 hours anywhere in the Burnt Forest now mark every Burnt Forest circuit
   and single map hazardous for that kit, the southern L27-30 maps

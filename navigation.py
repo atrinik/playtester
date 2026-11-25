@@ -8873,7 +8873,7 @@ class FarmCircuitTask(BotTask):
         (a seam neighbour) or of the same bounded area (map_areas) within
         FARM_AREA_FAILURE_SECONDS: the leg she was on last. Never during a
         maintenance trip (SERVICE_ATTRIBUTES), never for a leg she left
-        in an earlier life, and never while her walk heads to another leg
+        before her last death or emergency recall, and never while her walk heads to another leg
         than the one she left (a walk between legs, or a first walk whose
         route crossed a leg): that is a death on the way. On her first walk to the
         spot she was never on a leg, so this never applies. Live, on
@@ -8892,11 +8892,13 @@ class FarmCircuitTask(BotTask):
         legs = [path for path, _ in self.legs]
         if not failure_map or not legs or failure_map in legs:
             return ""
-        # Only this life: a leg she left by dying is no proof she was at
-        # the spot when she died again on the walk back after respawning.
+        # Only this life: a leg she left by dying, or by an emergency recall,
+        # is no proof she was at the spot when she failed again on the walk
+        # back.
         life = max((float(record.get("time", 0.0) or 0.0)
                     for record in getattr(client, "decision_history", ())
-                    if isinstance(record, dict) and record.get("action") == "death"
+                    if isinstance(record, dict) and
+                    record.get("action") in ("death", "emergency-recall")
                     and record is not failure and record != failure and
                     float(record.get("time", 0.0) or 0.0) < when), default=0.0)
         arrivals = sorted((float(stamp), str(where)) for stamp, where in

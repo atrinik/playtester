@@ -365,12 +365,16 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
                "kit": dict(kit or {})}
     if map_damage is not None:
         failure["map_damage"] = int(map_damage)
+    areas = sorted(set(areas))
+    if areas:
+        # Each failure counts for its own area (kit_hazard), not for every
+        # area its record has collected.
+        failure["areas"] = areas
     kit_failures.append(failure)
     maps = sorted(set(maps))
     if maps:
         record["maps"] = maps
-    # Merged: a circuit across two areas keeps each failure's own area,
-    # so its earlier failures still count for theirs.
+    # Merged, for the record's spot: a circuit across two areas holds both.
     areas = sorted(set(areas) | record_areas(record))
     if areas:
         record["areas"] = areas
@@ -525,12 +529,25 @@ def kit_hazard(adaptations: dict | None, key: str, maps: Iterable[str],
     for record_key, record in (adaptations or {}).items():
         if not isinstance(record, dict):
             continue
-        if (record_key != key and not record_maps(record_key, record) & maps and
-                not record_areas(record) & areas):
+        spot = record_key == key or bool(record_maps(record_key, record) & maps)
+        if not spot and not record_areas(record) & areas:
             continue
+
+        def counts(entry: dict) -> bool:
+            # Same spot or a shared map: every failure. Area alone: only a
+            # failure of that area; one stored before failures kept their
+            # area takes its record's.
+            if spot:
+                return True
+            own = entry.get("areas")
+            own = ({str(area) for area in own} if isinstance(own, (list, tuple))
+                   else record_areas(record))
+            return bool(own & areas)
+
         count += sum(
             1 for entry in record.get("kit_failures", ())
-            if isinstance(entry, dict) and hazard_failure(entry, record) and
+            if isinstance(entry, dict) and counts(entry) and
+            hazard_failure(entry, record) and
             now - float(entry.get("time", 0.0) or 0.0) <= KIT_HAZARD_WINDOW_SECONDS and
             same_kit(entry.get("kit") or {}))
     return count >= KIT_HAZARD_FAILURES
