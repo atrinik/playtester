@@ -8872,7 +8872,10 @@ class FarmCircuitTask(BotTask):
         arrivals, else her records), or on a map tiled to one of them
         (a seam neighbour) or of the same bounded area (map_areas) within
         FARM_AREA_FAILURE_SECONDS: the leg she was on last. Never during a
-        maintenance trip (SERVICE_ATTRIBUTES). On her first walk to the
+        maintenance trip (SERVICE_ATTRIBUTES), never for a leg she left
+        in an earlier life, and never while her walk heads to another leg
+        than the one she left (a walk between legs, or a first walk whose
+        route crossed a leg): that is a death on the way. On her first walk to the
         spot she was never on a leg, so this never applies. Live, on
         2026-11-25, a retreat from world_16_74 stepped across the seam
         onto world_17_74 (the walk RUNNING: its transit hold-fire fired 13 s
@@ -8889,6 +8892,13 @@ class FarmCircuitTask(BotTask):
         legs = [path for path, _ in self.legs]
         if not failure_map or not legs or failure_map in legs:
             return ""
+        # Only this life: a leg she left by dying is no proof she was at
+        # the spot when she died again on the walk back after respawning.
+        life = max((float(record.get("time", 0.0) or 0.0)
+                    for record in getattr(client, "decision_history", ())
+                    if isinstance(record, dict) and record.get("action") == "death"
+                    and record is not failure and record != failure and
+                    float(record.get("time", 0.0) or 0.0) < when), default=0.0)
         arrivals = sorted((float(stamp), str(where)) for stamp, where in
                           getattr(client, "map_arrivals", ()) if stamp <= when)
         stamps = [(float(record.get("time", 0.0) or 0.0), record.get("map"))
@@ -8897,22 +8907,34 @@ class FarmCircuitTask(BotTask):
                   if isinstance(record, dict)]
 
         def last_leg(window: float) -> str:
-            """The leg she was on last, if she left it within ``window``."""
+            """The leg she was on last in this life, if she left it within
+            ``window``."""
             recent = ""
-            for index, (_, where) in enumerate(arrivals):
+            for index, (stamp, where) in enumerate(arrivals):
                 left = (arrivals[index + 1][0] if index + 1 < len(arrivals)
                         else when)
-                if where in legs and when - left <= window:
+                if where in legs and stamp > life and when - left <= window:
                     recent = where
             if recent:
                 return recent
             return max(((stamp, where) for stamp, where in stamps
-                        if where in legs and 0.0 <= when - stamp <= window),
+                        if where in legs and stamp > life and
+                        0.0 <= when - stamp <= window),
                        default=(0.0, ""))[1]
+
+        def leg_switch(left: str) -> bool:
+            """Whether her walk is heading to another leg than the one she
+            left: a walk between legs (or a first walk whose route crossed
+            a leg). A death on its way is a death on the way, for the
+            destination rule (cause route, a route hazard)."""
+            navigation = self.child.navigation
+            return (navigation.status != TaskStatus.COMPLETE and
+                    navigation.destination in legs and
+                    navigation.destination != left)
 
         recent = last_leg(self.FARM_SEAM_FAILURE_SECONDS)
         if recent:
-            return recent
+            return "" if leg_switch(recent) else recent
         neighbours = getattr(self.graph, "_seam_neighbours", None)
         nearby = neighbours is not None and any(
             failure_map == neighbour
@@ -8920,7 +8942,8 @@ class FarmCircuitTask(BotTask):
         if not nearby and not (map_areas(self.graph, (failure_map,)) &
                                map_areas(self.graph, legs)):
             return ""
-        return last_leg(self.FARM_AREA_FAILURE_SECONDS)
+        recent = last_leg(self.FARM_AREA_FAILURE_SECONDS)
+        return "" if recent and leg_switch(recent) else recent
 
     def _learn_from_failure(self, client: AtrinikClient, failure: dict,
                             path: str, what: str, *,

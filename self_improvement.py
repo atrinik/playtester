@@ -333,8 +333,9 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
     ``kit`` describes the combat profile she failed with (the analyzer's),
     kept with the failure for ``kit_hazard``; ``maps`` are the spot's maps,
     kept so that its failures also count for overlapping spots, and
-    ``areas`` its areas (the analyzer's region and map name), kept so that
-    they count for every spot of the same area, sharing a map or not.
+    ``areas`` the failure's area (the analyzer's region and map name),
+    added to those kept, so that they count for every spot of the same
+    area, sharing a map or not.
     ``map_damage`` is the damage she took on the failure map itself, kept
     so that route_death_maps blames only a map that actually hurt her.
     """
@@ -368,7 +369,9 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
     maps = sorted(set(maps))
     if maps:
         record["maps"] = maps
-    areas = sorted(set(areas))
+    # Merged: a circuit across two areas keeps each failure's own area,
+    # so its earlier failures still count for theirs.
+    areas = sorted(set(areas) | record_areas(record))
     if areas:
         record["areas"] = areas
     record.update(level=min(MAX_LEVEL, level + 1), failures=failures[-PAUSE_FAILURES:],
