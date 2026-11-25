@@ -10916,6 +10916,44 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # one's radius.
         self.assertEqual((dx, dy), (1, -1))
 
+    def test_farm_retreat_gets_clear_before_avoiding_a_spawn(self):
+        # When every way clear of the attacker enters a spawn's radius,
+        # she still gets clear: a hazard-free step that stays beside it
+        # and leads nowhere clear only circles it with combat off. Here a
+        # corridor three squares wide runs east into the spawn's radius.
+        from . import tasks as tasks_module
+
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.stats.update(hp=30, maxhp=100, sp=0)
+        self._record_actions(client)
+        task = FarmTask(zone="/test", target="charred treant")
+        task.resident_spawns = [(16, 12, 3)]
+        node = MapNode(path="/test", width=24, height=24)
+        node.terrain = {(x, y): (1 if 11 <= y <= 13 else 0)
+                        for x in range(24) for y in range(24)}
+        task.map_node = node
+        task.map_bounds = (24, 24)
+        client.state.map.world_x = client.state.map.world_y = 12
+        client.state.map.tile(7, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=80)
+        task.remember_engagement(client, 7, 8, 100)
+        client.state.messages = [(
+            time.time(), 2, "ff0000",
+            "charred treant hit you for 25 (-20) impact damage.")]
+        with patch.object(tasks_module.random, "random", return_value=0.5):
+            self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        dx, _ = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        self.assertEqual(dx, 1)
+        self.assertIn("hazards=1", next(
+            detail for action, detail in client.recorded
+            if action == "retreat-choice"))
+
+        # A spawn whose radius she stood in lately, with nothing on her,
+        # is empty or asleep: no hazard.
+        task._cleared_trail[("/test", 13, 12)] = time.monotonic()
+        self.assertEqual(task.retreat_hazards(client, {100}), [])
+
     def test_slow_melee_at_ninety_percent_is_fought_not_run_from(self):
         # Live on world_16_74, healing outpaced at 90% turned into an
         # emergency disengage: combat off, running from one slow treant
@@ -11035,12 +11073,22 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertNotIn(False, client.combat)
 
-        # Long after a seam step, or with nothing on her, transit holds
-        # fire as before.
+        # Contact that goes on holds it past the start window, but not
+        # past the cap; a seam step long ago with no latch starts nothing.
         farm._seam_step_at = time.monotonic() - 60.0
-        task._seam_contact = False
-        client.combat.clear()
+        self.assertTrue(task._seam_retreat_contact(client))
+        farm._seam_step_at = (
+            time.monotonic() - task.SEAM_RETREAT_FIGHT_CAP_SECONDS - 1)
         self.assertFalse(task._seam_retreat_contact(client))
+        farm._seam_step_at = time.monotonic() - 60.0
+        self.assertFalse(task._seam_retreat_contact(client))
+        # Nor does it override a care crossing's hold-fire.
+        farm._seam_step_at = time.monotonic() - 1.0
+        task.navigation.care_holds_fire = lambda path: True
+        client.recorded.clear()
+        asyncio.run(task._defend_while_navigating(client))
+        self.assertIn("navigation-transit-hold-fire",
+                      [action for action, _ in client.recorded])
 
     def test_no_corpse_probe_while_under_hostile_contact(self):
         # Live at 16:15 two corpse probes were queued while three attackers

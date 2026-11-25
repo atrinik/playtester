@@ -4636,6 +4636,8 @@ class NavigateThenTask(BotTask):
     # After a farm retreat's seam step, contact this soon after it keeps
     # her fighting off the farm map (_seam_retreat_contact).
     SEAM_RETREAT_FIGHT_SECONDS = 20.0
+    # ... and never longer than this after it: then the walk home wins.
+    SEAM_RETREAT_FIGHT_CAP_SECONDS = 90.0
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -5382,9 +5384,11 @@ class NavigateThenTask(BotTask):
         Contact is a hit or miss in the last 3 s that no kill resolved, or a
         hostile beside her (FarmTask.under_hostile_contact). It starts
         within SEAM_RETREAT_FIGHT_SECONDS of the seam step and holds for as
-        long as the contact does. Live at 16:15 the walk's hold-fire turned
-        combat off and dropped her target with three attackers on her after
-        such a step; she died cornered on the next map.
+        long as the contact does, at most SEAM_RETREAT_FIGHT_CAP_SECONDS
+        after the step: residents of that map must not keep her there.
+        Live at 16:15 the walk's hold-fire turned combat off and dropped
+        her target with three attackers on her after such a step; she died
+        cornered on the next map.
         """
         farm = self.task
         if (not isinstance(farm, FarmTask) or
@@ -5392,10 +5396,12 @@ class NavigateThenTask(BotTask):
                 not farm.under_hostile_contact(client)):
             self._seam_contact = False
             return False
-        if (not self._seam_contact and (
-                not farm._seam_step_at or
-                time.monotonic() - farm._seam_step_at >
-                self.SEAM_RETREAT_FIGHT_SECONDS)):
+        since = (time.monotonic() - farm._seam_step_at
+                 if farm._seam_step_at else float("inf"))
+        if since > self.SEAM_RETREAT_FIGHT_CAP_SECONDS or (
+                not self._seam_contact and
+                since > self.SEAM_RETREAT_FIGHT_SECONDS):
+            self._seam_contact = False
             return False
         self._seam_contact = True
         return True

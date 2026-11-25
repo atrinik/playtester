@@ -1845,13 +1845,22 @@ attackers on her, and two corpse probes were queued mid-fight.
   In the fight are the engaged target, a breakout or stand target, the
   attackers of the current pursuit, and anything within 2 tiles of her.
   A spawn with a hostile in view within a tile of it is that hostile's,
-  and one within its radius of a creature in the fight is taken to be
-  that creature's. Steps are ranked by: a continuation (escape depth 2 or
-  more), then fewest hazards, then a step off every threat's side
-  (separation 2), then the cleared trail, then separation and escape room
-  as before. A step into a hazard is taken only when every step with
-  fewer is a dead end. The decision adds `hazards=N` and `trail=1` when
-  they apply.
+  one within its radius of a creature in the fight is taken to be that
+  creature's, and one whose radius held a cleared-trail square within
+  `TRAIL_QUIET_SECONDS` (60 s) is empty or asleep. On a neutral farm
+  visible creatures are no hazard. Steps are ranked by:
+  1. a continuation (escape depth 2 or more);
+  2. getting clear of every threat's side: at once (separation 2), or by
+     a walkable, hazard-free square beside the step that is. A step that
+     can do neither only circles an attacker with combat off;
+  3. fewest hazards;
+  4. off every threat's side now;
+  5. the cleared trail;
+  6. then separation and escape room as before.
+
+  So a step into a hazard is taken only when no hazard-free step gets
+  her clear or continues. The decision adds `hazards=N` and `trail=1`
+  when they apply.
 - **Back out along the trail** (`note_trail`, `_cleared_trail`). Each
   square she stands on with nothing on her (no unresolved hit or miss in
   the last 3 s, no attacker beside her), on her walk in and on the farm,
@@ -1878,7 +1887,9 @@ attackers on her, and two corpse probes were queued mid-fight.
   step is still only a last resort (every farm step a dead end). Off the
   farm map, within `SEAM_RETREAT_FIGHT_SECONDS` (20 s) of the farm's seam
   step, and for as long as contact lasts once it started
-  (`NavigateThenTask._seam_retreat_contact`), the walk's defence does not
+  (`NavigateThenTask._seam_retreat_contact`), but never more than
+  `SEAM_RETREAT_FIGHT_CAP_SECONDS` (90 s) after the step, the walk's
+  defence does not
   hold fire: combat stays on and the engaged target is kept. It does not
   split the pack there either (the retreat already ran) and fights the
   committed attacker. Its return to the farm map does not turn combat off

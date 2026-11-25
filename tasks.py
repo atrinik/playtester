@@ -5227,6 +5227,9 @@ class FarmTask(BotTask):
     # (note_trail).
     TRAIL_SECONDS = 300.0
     TRAIL_SQUARES = 200
+    # A spawn whose radius held a trail square this recently is no hazard
+    # (retreat_hazards).
+    TRAIL_QUIET_SECONDS = 60.0
     # A melee creature moving at most this share of her speed (her speed
     # unknown: at most SLOW_MELEE_SPEED) is slow (slow_melee). A charred
     # treant moves at 0.048, a singed bear at 0.06, Sera at about 0.8.
@@ -5283,11 +5286,13 @@ class FarmTask(BotTask):
         """What a retreat step must not wake: (view x, view y, radius).
 
         Each visible hostile not in the fight (``fight_ids``, or within 2
-        tiles of her) with its detection radius, and each unengaged known
-        resident spawn of the farm map (resident_spawns) with its authored
-        radius. A spawn with a hostile in view within a tile of it is that
-        hostile's (counted as itself, or in the fight), and one within its
-        radius of a hostile in the fight is taken to be that fighter's.
+        tiles of her) with its detection radius (none on a neutral farm),
+        and each unengaged known resident spawn of the farm map
+        (resident_spawns) with its authored radius. A spawn with a hostile
+        in view within a tile of it is that hostile's (counted as itself,
+        or in the fight), one within its radius of a hostile in the fight
+        is taken to be that fighter's, and one whose radius held a cleared
+        trail square within TRAIL_QUIET_SECONDS is empty or asleep.
         Live on world_16_74 her retreats from two treants ran past the
         other spawns and the pack grew to eight in 23 s.
         """
@@ -5305,11 +5310,23 @@ class FarmTask(BotTask):
                     max(abs(x - cx), abs(y - cy)) <= 2):
                 fighters.append((x, y))
                 continue
+            if self.neutral_targets:
+                # On a neutral farm nothing acquires her by proximity.
+                continue
             hazards.append((x, y, self.detection_radius(client, obj)))
         node = self.map_node
         if node is not None and node.path != m.path:
             return hazards
+        now = time.monotonic()
+        quiet = [(x, y) for (path, x, y), seen in self._cleared_trail.items()
+                 if path == m.path and
+                 now - seen <= self.TRAIL_QUIET_SECONDS]
         for spawn_x, spawn_y, radius in self.resident_spawns:
+            if any(max(abs(x - spawn_x), abs(y - spawn_y)) <= radius
+                   for x, y in quiet):
+                # She stood within its radius lately with nothing on her:
+                # it is empty (killed) or did not wake.
+                continue
             view_x = cx + spawn_x - m.world_x
             view_y = cy + spawn_y - m.world_y
             if any(max(abs(view_x - x), abs(view_y - y)) <= 1
@@ -5492,9 +5509,9 @@ class FarmTask(BotTask):
         # A step must not wake what is not yet in the fight
         # (retreat_hazards); among the rest the cleared trail she came in
         # on comes first once a step is clear of every threat.
-        hazards = self.retreat_hazards(client, {
-            engaged_id, self._cornered_breakout_target,
-            *self._pursuit_ids} - {0})
+        pursuit = (self._pursuit_ids if now - self._pursuit_last_at <=
+                   self.PURSUIT_WINDOW_SECONDS else set())
+        hazards = self.retreat_hazards(client, {engaged_id, *pursuit} - {0})
         seam_choices = []
         for direction, (dx, dy) in c.DIRECTION_DELTAS.items():
             if not direction:
@@ -5542,14 +5559,30 @@ class FarmTask(BotTask):
                 max(abs(view_x - x), abs(view_y - y)) <= radius
                 for x, y, radius in hazards)
             on_trail = int((m.path, world_x, world_y) in self._cleared_trail)
-            # The order: a continuation, then fewest hazards woken, then
-            # off every threat's side (separation 2), then the trail, then
-            # the separation itself and the escape. Choice index 4 is the
-            # separation, 9 the direction, 10 and 11 the world square.
+            # Whether the step gets her clear of every threat's side: at
+            # once (separation 2), or by a hazard-free, walkable square
+            # beside it that is. A step that can do neither only circles
+            # an attacker with combat off.
+            clear = separation >= 2 or (seam is None and any(
+                (m.path, world_x + nx, world_y + ny)
+                not in self._retreat_blocked and
+                self.within_farm_map(client, view_x + nx, view_y + ny) and
+                self.retreat_tile_walkable(
+                    m.path, world_x + nx, world_y + ny) and
+                min(max(abs(view_x + nx - x), abs(view_y + ny - y))
+                    for x, y in threats) >= 2 and
+                not any(max(abs(view_x + nx - x), abs(view_y + ny - y)) <=
+                        radius for x, y, radius in hazards)
+                for nx, ny in c.DIRECTION_DELTAS.values() if nx or ny))
+            # The order: a continuation, then getting clear, then fewest
+            # hazards woken, then off every threat's side now, then the
+            # trail, then the separation itself and the escape. Choice
+            # index 5 is the separation, 10 the direction, 11 and 12 the
+            # world square.
             (choices if seam is None else seam_choices).append((
-                int(escape_depth >= 2), -hazard, min(separation, 2),
-                on_trail, separation, escape_depth, escape_area,
-                -anchor_distance, random.random(), direction,
+                int(escape_depth >= 2), int(clear), -hazard,
+                min(separation, 2), on_trail, separation, escape_depth,
+                escape_area, -anchor_distance, random.random(), direction,
                 world_x, world_y))
         if seam_choices and not any(choice[0] for choice in choices):
             # Every step on the farm map is a dead end (a seam pocket): a
@@ -5567,9 +5600,9 @@ class FarmTask(BotTask):
             here_crowd = crowd((cx, cy))
             choices.extend(
                 choice for choice in seam_choices
-                if choice[0] and choice[4] > nearest and crowd(
-                    (cx + choice[10] - m.world_x,
-                     cy + choice[11] - m.world_y)) <= here_crowd)
+                if choice[0] and choice[5] > nearest and crowd(
+                    (cx + choice[11] - m.world_x,
+                     cy + choice[12] - m.world_y)) <= here_crowd)
         if gain_only:
             # Only a step that sheds the nearest threat; an equal-distance
             # one shuffles her beside it with her heals still losing.
@@ -5582,7 +5615,7 @@ class FarmTask(BotTask):
                     self.safety._usable_heal(client) is not None):
                 # Running never shuts healing out: a heal due goes first.
                 return False
-            choices = [choice for choice in choices if choice[4] > nearest]
+            choices = [choice for choice in choices if choice[5] > nearest]
             if not choices:
                 return False
             self._out_healed_gain_at = now
@@ -5616,7 +5649,7 @@ class FarmTask(BotTask):
                 self._last_action = now
                 return True
             return False
-        (viable, unhazard, _, on_trail, separation, escape_depth,
+        (viable, _, unhazard, _, on_trail, separation, escape_depth,
          escape_area, _, _, direction, world_x, world_y) = max(choices)
         recorder = getattr(client, "record_action", None)
         hp = int(client.state.stats.get("hp", 0) or 0)
@@ -5713,9 +5746,9 @@ class FarmTask(BotTask):
             # comes first (the gain-only rule; an equal-distance step
             # would shuffle her beside them). Without one she stands.
             nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
-            gaining = [choice for choice in choices if choice[4] > nearest]
+            gaining = [choice for choice in choices if choice[5] > nearest]
             if gaining:
-                (viable, unhazard, _, on_trail, separation, escape_depth,
+                (viable, _, unhazard, _, on_trail, separation, escape_depth,
                  escape_area, _, _, direction, world_x, world_y) = max(
                      gaining)
                 if recorder is not None:
