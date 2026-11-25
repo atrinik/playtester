@@ -4620,6 +4620,11 @@ class NavigateThenTask(BotTask):
     # A cornered pack split that holds (nothing beside her, nothing hitting
     # her, no step that gains distance) fights the nearest after this long.
     CORNERED_HOLD_SECONDS = 8.0
+    # After a farm retreat's seam step, contact this soon after it keeps
+    # her fighting off the farm map (_seam_retreat_contact).
+    SEAM_RETREAT_FIGHT_SECONDS = 20.0
+    # ... and never longer than this after it: then the walk home wins.
+    SEAM_RETREAT_FIGHT_CAP_SECONDS = 90.0
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -4693,6 +4698,9 @@ class NavigateThenTask(BotTask):
         self._cornered_logged: set[int] = set()
         # Since when a cornered split has held with no step (0: not).
         self._cornered_hold_since = 0.0
+        # Whether the last tick was under contact after a farm retreat's
+        # seam step (_seam_retreat_contact): it holds while contact lasts.
+        self._seam_contact = False
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -4828,6 +4836,9 @@ class NavigateThenTask(BotTask):
         """Remember the cleared route and collapse it while backtracking."""
         m = client.state.map
         position = (m.path, m.world_x, m.world_y)
+        if isinstance(self.task, FarmTask):
+            # The farm's retreat backs out along the way she came in.
+            self.task.note_trail(client)
         if self._trail and self._trail[-1] == position:
             return
         if len(self._trail) >= 2 and self._trail[-2] == position:
@@ -5353,6 +5364,35 @@ class NavigateThenTask(BotTask):
             return set()
         return outclassed
 
+    def _seam_retreat_contact(self, client: AtrinikClient) -> bool:
+        """Whether she is off the farm map under hostile contact after the
+        farm's retreat stepped across a seam.
+
+        Contact is a hit or miss in the last 3 s that no kill resolved, or a
+        hostile beside her (FarmTask.under_hostile_contact). It starts
+        within SEAM_RETREAT_FIGHT_SECONDS of the seam step and holds for as
+        long as the contact does, at most SEAM_RETREAT_FIGHT_CAP_SECONDS
+        after the step: residents of that map must not keep her there.
+        Live at 16:15 the walk's hold-fire turned combat off and dropped
+        her target with three attackers on her after such a step; she died
+        cornered on the next map.
+        """
+        farm = self.task
+        if (not isinstance(farm, FarmTask) or
+                client.state.map.path == self.navigation.destination or
+                not farm.under_hostile_contact(client)):
+            self._seam_contact = False
+            return False
+        since = (time.monotonic() - farm._seam_step_at
+                 if farm._seam_step_at else float("inf"))
+        if since > self.SEAM_RETREAT_FIGHT_CAP_SECONDS or (
+                not self._seam_contact and
+                since > self.SEAM_RETREAT_FIGHT_SECONDS):
+            self._seam_contact = False
+            return False
+        self._seam_contact = True
+        return True
+
     async def _defend_while_navigating(self, client: AtrinikClient,
                                        *, own_walk: bool = False) -> bool:
         """Pause an encounter approach to heal or clear an aggroed pack.
@@ -5475,13 +5515,22 @@ class NavigateThenTask(BotTask):
         # A care crossing (an essential trip across an owner block) holds
         # fire on every map until it ends, the destination map included;
         # the cornered last resort below still fights back.
+        # Under contact after the farm's own retreat crossed a seam she
+        # keeps fighting there, combat on and target kept, and does not
+        # split the pack (_seam_retreat_contact): the retreat already ran.
+        seam_contact = self._seam_retreat_contact(client)
         hold_fire = (
-            (m.path != self.navigation.destination or
+            ((m.path != self.navigation.destination and not seam_contact) or
              self.navigation.care_holds_fire(m.path)) and
             not (recent_hostile_contact(client, 3.0) and
                  (self.navigation.status == TaskStatus.FAILED or
                   time.monotonic() - self._last_moved_at >=
                   self.TRANSIT_CORNERED_SECONDS)))
+        # The seam fight replaces the pack split and avoidance only with an
+        # attacker beside her; with the pack still at range they run as
+        # before, so she never closes in on it.
+        seam_beside = seam_contact and any(
+            threat[0] <= 1 for threat in nearby)
         combat_released = False
         if hold_fire:
             engaged = (self.task._engaged_target
@@ -5646,7 +5695,7 @@ class NavigateThenTask(BotTask):
         if (safe and nearest is not None and nearest[0] > 2 and
                 len(pull_pack) >= 2 and
                 (pack_offensive is None or hold_fire) and
-                not self._cornered_target):
+                not self._cornered_target and not seam_beside):
             # A cornered fight at range is not turned into a pack avoidance
             # (combat off, replan) between its own ticks.
             if await self._bypass_pack_blocked_exit(client):
@@ -5727,7 +5776,40 @@ class NavigateThenTask(BotTask):
         # below would restart the timer it waits for.
         safety_hold = not safe and (not starving_without_food(client) or
                                     heal_waiting(client))
-        split = overwhelmed and not hold_fire and not safety_hold
+        beside = [threat for threat in nearby if threat[0] <= 1]
+        if (seam_contact and not hold_fire and beside and
+                not heal_waiting(client)):
+            # Under contact after the farm retreat's seam step, with an
+            # attacker beside her. Above the farm's own pack flee line
+            # (FarmTask.pack_flee) she fights it, combat on and target
+            # kept, healing first (a heal sent this tick has returned
+            # above), rather than hold fire or a combat-off step. Live at
+            # 16:15 the walk's hold-fire dropped her target there with
+            # three attackers on her. At or below that line she steps
+            # away, combat off, by a step that gains distance, as the
+            # farm's retreat would; with none she is cornered and fights.
+            line = FarmTask.pack_flee(
+                getattr(getattr(self.task, "safety", None), "flee_below",
+                        self.safety.flee_below), len(nearby))
+            if (ratio <= line and
+                    await self._retreat_step(client, nearby, gain_only=True,
+                                             probe=True)):
+                self._defending = True
+                await client.clear_actions()
+                await client.set_combat(False)
+                if time.monotonic() - self._last_defense_action >= 0.30:
+                    await self._retreat_step(
+                        client, nearby, avoid_backtrack=True, gain_only=True)
+                    self._last_defense_action = time.monotonic()
+                return True
+            safety_hold = False
+            if nearest is None or nearest[0] > 1:
+                # The attacker beside her, not a committed one farther off.
+                nearest = min(beside, key=lambda threat: (
+                    int(getattr(threat[3], "target_hp", 0) or 100),
+                    threat[3].target_id))
+        split = (overwhelmed and not hold_fire and not safety_hold and
+                 not seam_beside)
         cornered = None
         if split and not escape_due:
             cornered = await self._cornered_split(client, nearby)
@@ -5958,16 +6040,21 @@ class NavigateThenTask(BotTask):
         # keep fighting there forever before the return route gets a tick.
         if (self.navigation.status == TaskStatus.COMPLETE and
                 client.state.map.path != self.navigation.destination):
-            await client.clear_actions()
-            await client.set_combat(False)
+            seam_contact = self._seam_retreat_contact(client)
+            if not seam_contact:
+                await client.clear_actions()
+                await client.set_combat(False)
             self.navigation.status = TaskStatus.RUNNING
             self.navigation.route = []
             self.navigation._issued_goal = None
             self.navigation._issued_click = None
             self.navigation._last_progress = time.monotonic()
             self._defending = False
-            await self.navigation.tick(client)
-            return
+            if not seam_contact:
+                await self.navigation.tick(client)
+                return
+            # Under contact after the farm retreat's seam step: the
+            # defence below keeps fighting, combat on, before any walk.
         # Once the authored destination is reached, the child owns behavior.
         # Letting the travel wrapper keep intercepting farm combat prevented
         # FarmTask pull and emergency-retreat policies from ever running.
@@ -5985,9 +6072,11 @@ class NavigateThenTask(BotTask):
         if isinstance(self.task, FarmTask):
             m = client.state.map
             cx, cy = m.width // 2, m.height // 2
+            # Nor while something is on her (under_hostile_contact).
             immediate = any(
                 max(abs(x - cx), abs(y - cy)) <= 2
-                for x, y, _ in m.targets(friendly=False))
+                for x, y, _ in m.targets(friendly=False)
+            ) or self.task.under_hostile_contact(client)
             if not immediate and await self.task.loot_nearby(client):
                 return
             if not immediate:
@@ -9683,6 +9772,11 @@ class FarmCircuitTask(BotTask):
             aggressive_detection_ranges=aggressive_detection_ranges,
             pull_avoidance=pull_avoidance,
             pull_squares=pull_squares,
+            # Every aggressive resident's spawn and the radius it acquires
+            # her within: the farm retreat keeps out of them (COMBAT.md,
+            # "Retreat tactics").
+            resident_spawns=[(spawn.x, spawn.y, spawn.pull_clearance_radius)
+                             for spawn in residents],
             allow_launchers=(
                 not self._auto_combat_build and not bool(self.combat_spell)))
         farm._lore_book_attempts = self._lore_book_attempts

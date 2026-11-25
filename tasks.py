@@ -2309,7 +2309,8 @@ class FarmTask(BotTask):
                      tuple[int, int], set[tuple[int, int]]] | None = None,
                  pull_squares: dict[
                      tuple[int, int], tuple[int, int]] | None = None,
-                 allow_launchers: bool | None = None):
+                 allow_launchers: bool | None = None,
+                 resident_spawns: list[tuple[int, int, int]] | None = None):
         super().__init__(f"farm:{target or item or zone or 'current-zone'}")
         self.zone = zone
         self.target_pattern = re.compile(target, re.I) if target else None
@@ -2343,6 +2344,15 @@ class FarmTask(BotTask):
             (int(spawn[0]), int(spawn[1])): (int(goal[0]), int(goal[1]))
             for spawn, goal in (pull_squares or {}).items()
         }
+        # Every aggressive resident's spawn (x, y, the radius it acquires her
+        # within) on the farm map: the retreat keeps out of unengaged ones
+        # (retreat_hazards).
+        self.resident_spawns = [
+            (int(x), int(y), max(1, int(radius)))
+            for x, y, radius in (resident_spawns or ())]
+        # Squares she stood on without hostile contact (path, x, y) ->
+        # monotonic time: the cleared trail a retreat backs out along.
+        self._cleared_trail: dict[tuple[str, int, int], float] = {}
         self._priority_target_ids: dict[int, int] = {}
         # Set by the farm circuit while autoplay's switch to its recovery
         # phase waits for this fight: finish the engaged target and fight
@@ -2866,6 +2876,15 @@ class FarmTask(BotTask):
                     "corpse-probe-skip",
                     f"unconfirmed distant vanish at {path} "
                     f"({world_x}, {world_y})")
+            return
+        if not kill_confirmed and self.under_hostile_contact(client):
+            # A vanish with no kill while something is on her is a fight
+            # moving out of view (a seam, a heal's retarget), not a corpse.
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder(
+                    "corpse-probe-skip",
+                    f"under hostile contact at {path} ({world_x}, {world_y})")
             return
         key = (path, world_x, world_y)
         if not self.corpse_tile_standable(path, world_x, world_y):
@@ -4698,9 +4717,15 @@ class FarmTask(BotTask):
                    if self.item_pattern.search(item.name))
 
     async def loot_nearby(self, client: AtrinikClient) -> bool:
-        """Reach/open a nearby corpse and transfer its wanted contents."""
+        """Reach/open a nearby corpse and transfer its wanted contents.
+
+        Never while something is on her (under_hostile_contact): live at
+        16:15 two corpse probes were queued with three attackers on her.
+        """
         now = time.monotonic()
         if time.monotonic() - self._last_action < 0.30:
+            return False
+        if self.under_hostile_contact(client):
             return False
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
@@ -5512,6 +5537,126 @@ class FarmTask(BotTask):
                 now - self._out_healed_gain_at <= self.OUT_HEALED_GAIN_SECONDS
                 and self.safety._usable_heal(client) is not None)
 
+    # The cleared trail keeps squares this long, and at most this many
+    # (note_trail).
+    TRAIL_SECONDS = 300.0
+    TRAIL_SQUARES = 200
+    # A spawn whose radius held a trail square this recently is no hazard
+    # (retreat_hazards).
+    TRAIL_QUIET_SECONDS = 60.0
+    def under_hostile_contact(self, client: AtrinikClient,
+                              seconds: float = 3.0) -> bool:
+        """Whether something is on her: a hit or miss within ``seconds``
+        that no kill has resolved, or an attacker beside her (her engaged
+        target, or a kind whose hits of the last 10 s name it)."""
+        if unresolved_hostile_contact(client, seconds):
+            return True
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        engaged_id = self._engaged_target[0] if self._engaged_target else 0
+        attackers = recent_hostile_attackers(client)
+        for x, y, obj in m.targets(friendly=False):
+            if max(abs(x - cx), abs(y - cy)) > 1 or not obj.target_id:
+                continue
+            if obj.target_id == engaged_id:
+                return True
+            semantic = map_object_semantic(client, obj).casefold()
+            if any(_same_semantic_identity(name, semantic)
+                   for name in attackers):
+                return True
+        return False
+
+    def note_trail(self, client: AtrinikClient) -> None:
+        """Remember her square as cleared trail while nothing is on her.
+
+        The farm's own ticks and its walk (NavigateThenTask) call this, so
+        the trail holds the way she came in. A retreat prefers it
+        (low_health_retreat): those squares woke nothing when she crossed
+        them.
+        """
+        if self.under_hostile_contact(client):
+            return
+        m = client.state.map
+        now = time.monotonic()
+        self._cleared_trail[(m.path, m.world_x, m.world_y)] = now
+        if len(self._cleared_trail) > self.TRAIL_SQUARES:
+            kept = sorted(self._cleared_trail.items(),
+                          key=lambda item: item[1])[-self.TRAIL_SQUARES:]
+            self._cleared_trail = dict(kept)
+        if (self._cleared_trail and
+                min(self._cleared_trail.values()) < now - self.TRAIL_SECONDS):
+            self._cleared_trail = {
+                key: seen for key, seen in self._cleared_trail.items()
+                if seen >= now - self.TRAIL_SECONDS}
+
+    def retreat_hazards(self, client: AtrinikClient,
+                        fight_ids: set[int]) -> list[tuple[int, int, int]]:
+        """What a retreat step must not wake: (view x, view y, radius).
+
+        Each visible hostile not in the fight (``fight_ids``, or within 2
+        tiles of her) with its detection radius (none on a neutral farm),
+        and each unengaged known resident spawn of the farm map
+        (resident_spawns) with its authored radius. A spawn with a hostile
+        in view within a tile of it is that hostile's (counted as itself,
+        or in the fight), one within its radius of a hostile in the fight
+        is taken to be that fighter's, and one in view whose radius held a
+        cleared trail square within TRAIL_QUIET_SECONDS is empty or asleep.
+        Live on world_16_74 her retreats from two treants ran past the
+        other spawns and the pack grew to eight in 23 s.
+        """
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        visible = []
+        fighters = []
+        hazards = []
+        for x, y, obj in m.targets(friendly=False):
+            if (self.authored_peaceful(client, obj) or
+                    self.ignore_unrequested_peaceful(client, obj)):
+                continue
+            visible.append((x, y))
+            if (obj.target_id in fight_ids or
+                    max(abs(x - cx), abs(y - cy)) <= 2):
+                fighters.append((x, y))
+                continue
+            if self.neutral_targets:
+                # On a neutral farm nothing acquires her by proximity.
+                continue
+            hazards.append((x, y, self.detection_radius(client, obj)))
+        node = self.map_node
+        if node is not None and node.path != m.path:
+            return hazards
+        now = time.monotonic()
+        quiet = [(x, y) for (path, x, y), seen in self._cleared_trail.items()
+                 if path == m.path and
+                 now - seen <= self.TRAIL_QUIET_SECONDS]
+        for spawn_x, spawn_y, radius in self.resident_spawns:
+            view_x = cx + spawn_x - m.world_x
+            view_y = cy + spawn_y - m.world_y
+            if (view_x, view_y) in m.tiles and any(
+                    max(abs(x - spawn_x), abs(y - spawn_y)) <= radius
+                    for x, y in quiet):
+                # In view with nobody near it (below), and she stood within
+                # its radius lately with nothing on her: it is empty
+                # (killed) or did not wake.
+                if not any(max(abs(view_x - x), abs(view_y - y)) <= 1
+                           for x, y in visible):
+                    continue
+            if any(max(abs(view_x - x), abs(view_y - y)) <= 1
+                   for x, y in visible):
+                continue
+            if any(max(abs(view_x - x), abs(view_y - y)) <= radius
+                   for x, y in fighters):
+                continue
+            hazards.append((view_x, view_y, radius))
+        return hazards
+
+    @staticmethod
+    def pack_flee(flee_below: float, near: int) -> float:
+        """The flee line for this many threats within 4 tiles: the farm
+        tick's dynamic_flee."""
+        return max(flee_below,
+                   0.94 if near >= 3 else 0.80 if near >= 2 else 0.0)
+
     async def low_health_retreat(self, client: AtrinikClient,
                                  gain_only: bool = False) -> bool:
         """Run one tile away from the visible pack, learning blocked steps.
@@ -5647,6 +5792,12 @@ class FarmTask(BotTask):
         # Between otherwise equal steps, prefer the engaged pull's anchor.
         anchor = (self.target_anchor(client, engaged_id)
                   if engaged_id else None)
+        # A step must not wake what is not yet in the fight
+        # (retreat_hazards); among the rest the cleared trail she came in
+        # on comes first once a step is clear of every threat.
+        pursuit = (self._pursuit_ids if now - self._pursuit_last_at <=
+                   self.PURSUIT_WINDOW_SECONDS else set())
+        hazards = self.retreat_hazards(client, {engaged_id, *pursuit} - {0})
         seam_choices = []
         for direction, (dx, dy) in c.DIRECTION_DELTAS.items():
             if not direction:
@@ -5690,8 +5841,36 @@ class FarmTask(BotTask):
                         for x, y in threats})
             anchor_distance = 0 if anchor is None else max(
                 abs(anchor[0] - world_x), abs(anchor[1] - world_y))
+            hazard = sum(
+                max(abs(view_x - x), abs(view_y - y)) <= radius
+                for x, y, radius in hazards)
+            on_trail = int((m.path, world_x, world_y) in self._cleared_trail)
+            # Whether the step gets her clear of every threat's side: at
+            # once (separation 2), or by a hazard-free, walkable square
+            # beside it that is. A step that can do neither only circles
+            # an attacker with combat off.
+            clear = separation >= 2 or (seam is None and any(
+                (nx, ny) != (-dx, -dy) and
+                (m.path, world_x + nx, world_y + ny)
+                not in self._retreat_blocked and
+                not any(obj.target_id for obj in getattr(m.tiles.get((
+                    view_x + nx, view_y + ny)), "objects", {}).values()) and
+                self.within_farm_map(client, view_x + nx, view_y + ny) and
+                self.retreat_tile_walkable(
+                    m.path, world_x + nx, world_y + ny) and
+                min(max(abs(view_x + nx - x), abs(view_y + ny - y))
+                    for x, y in threats) >= 2 and
+                not any(max(abs(view_x + nx - x), abs(view_y + ny - y)) <=
+                        radius for x, y, radius in hazards)
+                for nx, ny in c.DIRECTION_DELTAS.values() if nx or ny))
+            # The order: a continuation, then getting clear, then fewest
+            # hazards woken, then off every threat's side now, then the
+            # trail, then the separation itself and the escape. Choice
+            # index 5 is the separation, 10 the direction, 11 and 12 the
+            # world square.
             (choices if seam is None else seam_choices).append((
-                int(escape_depth >= 2), separation, escape_depth,
+                int(escape_depth >= 2), int(clear), -hazard,
+                min(separation, 2), on_trail, separation, escape_depth,
                 escape_area, -anchor_distance, random.random(), direction,
                 world_x, world_y))
         if seam_choices and not any(choice[0] for choice in choices):
@@ -5710,9 +5889,9 @@ class FarmTask(BotTask):
             here_crowd = crowd((cx, cy))
             choices.extend(
                 choice for choice in seam_choices
-                if choice[0] and choice[1] > nearest and crowd(
-                    (cx + choice[7] - m.world_x,
-                     cy + choice[8] - m.world_y)) <= here_crowd)
+                if choice[0] and choice[5] > nearest and crowd(
+                    (cx + choice[11] - m.world_x,
+                     cy + choice[12] - m.world_y)) <= here_crowd)
         if gain_only:
             # Only a step that sheds the nearest threat; an equal-distance
             # one shuffles her beside it with her heals still losing.
@@ -5725,7 +5904,7 @@ class FarmTask(BotTask):
                     self.safety._usable_heal(client) is not None):
                 # Running never shuts healing out: a heal due goes first.
                 return False
-            choices = [choice for choice in choices if choice[1] > nearest]
+            choices = [choice for choice in choices if choice[5] > nearest]
             if not choices:
                 return False
             self._out_healed_gain_at = now
@@ -5759,8 +5938,8 @@ class FarmTask(BotTask):
                 self._last_action = now
                 return True
             return False
-        (viable, separation, escape_depth, escape_area, _, _, direction,
-         world_x, world_y) = max(choices)
+        (viable, _, unhazard, _, on_trail, separation, escape_depth,
+         escape_area, _, _, direction, world_x, world_y) = max(choices)
         recorder = getattr(client, "record_action", None)
         hp = int(client.state.stats.get("hp", 0) or 0)
         maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
@@ -5852,10 +6031,11 @@ class FarmTask(BotTask):
             # comes first (the gain-only rule; an equal-distance step
             # would shuffle her beside them). Without one she stands.
             nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
-            gaining = [choice for choice in choices if choice[1] > nearest]
+            gaining = [choice for choice in choices if choice[5] > nearest]
             if gaining:
-                (viable, separation, escape_depth, escape_area, _, _,
-                 direction, world_x, world_y) = max(gaining)
+                (viable, _, unhazard, _, on_trail, separation, escape_depth,
+                 escape_area, _, _, direction, world_x, world_y) = max(
+                     gaining)
                 if recorder is not None:
                     recorder("pursued-stand-declined",
                              f"adjacent={len(adjacent)} hp={ratio:.0%}")
@@ -5892,7 +6072,9 @@ class FarmTask(BotTask):
                 "retreat-choice",
                 f"direction={direction} separation={separation} "
                 f"escape_depth={escape_depth} escape_area={escape_area} "
-                f"continuation={viable}" + (
+                f"continuation={viable}" +
+                (f" hazards={-unhazard}" if unhazard else "") +
+                (" trail=1" if on_trail else "") + (
                     "" if self.within_farm_map(
                         client, cx + world_x - m.world_x,
                         cy + world_y - m.world_y) else " seam=1"))
@@ -6644,6 +6826,7 @@ class FarmTask(BotTask):
         # takes precedence and triggers the normal escape path.
         hostile_contact = unresolved_hostile_contact(client, seconds=10.0)
         proven_attackers = recent_hostile_attackers(client)
+        self.note_trail(client)
 
         def detection_radius(obj: MapObject) -> int:
             return self.detection_radius(client, obj)
