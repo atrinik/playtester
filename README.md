@@ -948,6 +948,13 @@ exits. The design for alternative routes, unlocks such as keys, quests and
 NPC voyages, and costs learned from her own experience is in
 [docs/ROUTING.md](docs/ROUTING.md).
 
+Route rankings that plan many trips at once (the temple priests, the food,
+heal and recall merchants) run on a planner worker thread against a
+snapshot of her state, so her connection, safety and combat never wait for
+them. An event-loop stall over a second is logged, recorded as
+`event-loop-stall` with what was running, and raised as the dashboard's
+`loop-stall` warning; see section 1.12 of [docs/ROUTING.md](docs/ROUTING.md).
+
 She can watch the owner play, behind the `watch_owner` flag
 (`--watch-owner` or `ATRINIK_BOT_WATCH_OWNER=1`), off by default; with it
 off nothing is recorded (the client still decodes the map's damage

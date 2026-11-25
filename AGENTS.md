@@ -37,6 +37,12 @@
   are positions only and a fight with one in view is dropped; no player's name is
   stored. Following the owner and rules from what she saw (W2, W3) need a
   new owner decision.
+- Her connection, safety, combat and every task tick share one asyncio
+  event loop. Never run a whole-world route search or a ranking of many
+  routes on it: run it on the planner worker (`planner.py`,
+  `navigation.BackgroundPlans`) against a `PlanningClient` snapshot, and
+  poll the result from later ticks (docs/ROUTING.md 1.12). The
+  `event-loop-stall` record and `loop-stall` alert show any stall over 1 s.
 - Source modules remain at repository root and CMake assembles the installable
   `atrinik_bot` package with its native extension under `build/`.
 - Keep `dependencies.lock.json`, the atomic compatibility cache installer,

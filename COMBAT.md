@@ -655,7 +655,8 @@ food is below 100: food falls about a point every 4.3 s, and at zero the
 server drains her health one-for-one (`types/player.c`). After the hold, a
 still-hungry character goes again: starving is worse than overriding the
 operator. Starting any task hands her back to it; a trip in flight is
-dropped. Live,
+dropped. A disconnect drops it too, but the next trip goes to the priest
+already chosen, without a new ranking (the temple-ranking stall). Live,
 on 2026-11-14, Stop left Sera idle, without food or money, on her savebed in
 Clearhaven; she starved to death 22 times, about every 50 minutes, and her
 depletion rose from 41 to 67.
@@ -1570,6 +1571,37 @@ she first walks home (11 transitions).
 
 The overwhelmed-and-cornered decision in `_defend_while_navigating`
 (fighting back once no retreat step is left) is a separate fix.
+
+## The temple-ranking stall (2026-11-24/25)
+
+Read from her journal and dashboard state, and replayed offline: hungry
+with nothing to eat on `world_7_79`, Sera ranked the 23 temple priests by
+planning a route to each, on the event loop that also runs her connection,
+safety and combat. It took about 45 s live (23 s offline; each unreachable
+priest also rebuilt the component cache, 1.1 to 1.3 s). The QUIC
+connection went quiet past its idle timeout and the server dropped her.
+The reconnect dropped the idle food trip, so the next tick ranked again:
+about 1,000 disconnect cycles, heals retried on a dead connection, and she
+starved six times. The hunger policy itself is unchanged (the server
+change that removes starvation is separate).
+
+Now (ROUTING.md 1.12):
+
+- **Rankings never run on a tick.** The temple ranking, and the farm
+  circuit's food, heal and recall merchant rankings, run on the planner
+  worker thread against a snapshot of her state. Until one is done the
+  tick carries on: idle safety heals and eats, the circuit keeps fighting,
+  autoplay keeps ticking its current phase. Autoplay's fallback to another
+  priest after a failed trip starts its ranking at once and the trip once
+  it is done.
+- **One cache refresh per ranking.** The ranking from `world_7_79` takes
+  about 15 s offline instead of 23 s, off the loop.
+- **A reconnect keeps the priest.** The trip a disconnect dropped goes to
+  the same priest at once, with one route plan, for 10 minutes, unless
+  that priest's trip failed.
+- **The `loop-stall` alert.** Any stall of the event loop over 1 s is
+  logged and recorded (`event-loop-stall`, with what was running) and
+  raises a dashboard warning for 15 minutes.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 
