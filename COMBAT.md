@@ -1408,7 +1408,8 @@ Accepted limits:
 
 - after a seam step she is off the farm map. The circuit's walk
   (`NavigateThenTask`) then takes her back to it, and its own defence,
-  not the farm's, handles the attackers that follow;
+  not the farm's, handles the attackers that follow; under contact it
+  keeps fighting there ([retreat tactics](#retreat-tactics-2026-11-25));
 - cover is judged from the authored walls and the casters in view. A
   caster out of view, a summoned or unauthored one, or a door an orc has
   closed again is not modelled. A spell hit with no caster in view
@@ -1816,6 +1817,83 @@ retreats with combat off, stepping again each time the pack closes in;
 the farm map's own pack split (`farm-pack-split` in `FarmTask`) has no
 authored levels and still counts every active threat, with its cornered
 breakout unchanged.
+
+## Retreat tactics (2026-11-25)
+
+Live (v1.106.0, the Burnt Forest, level 31-40 charred treants, singed
+bears, deer and saplings, all slow melee: `treant_evil` speed 0.048,
+`bear_grey` and `deer` 0.06, Sera about 0.8) she died five times in
+90 minutes, never with a recall. On `world_16_74` a `farm-pack-split`
+from two treants turned into a pack of eight within 23 s of retreating:
+her steps ran past the other spawns, which acquire her within 3 tiles.
+`healing-outpaced` at 90% then made each retreat an `emergency-disengage`
+(combat off), and she ran a loop around the map with the treants
+following until she was cornered at a map edge. At 16:15 a retreat's seam
+step onto `world_17_74` put her under the walk's transit hold-fire
+(`navigation-transit-hold-fire`): combat off and target dropped with three
+attackers on her, and two corpse probes were queued mid-fight.
+
+- **A retreat wakes nothing new** (`FarmTask.retreat_hazards`). The
+  farm's retreat (`low_health_retreat`, which the pack split, the
+  out-healed run and the emergency disengage all use) counts, for each
+  step, the hazards whose radius it enters:
+  - each visible hostile not in the fight, with its detection radius;
+  - each unengaged known spawn of the farm map, with its authored radius
+    (`resident_spawns`, every aggressive resident's spawn, as the pull
+    squares use).
+
+  In the fight are the engaged target, a breakout or stand target, the
+  attackers of the current pursuit, and anything within 2 tiles of her.
+  A spawn with a hostile in view within a tile of it is that hostile's,
+  and one within its radius of a creature in the fight is taken to be
+  that creature's. Steps are ranked by: a continuation (escape depth 2 or
+  more), then fewest hazards, then a step off every threat's side
+  (separation 2), then the cleared trail, then separation and escape room
+  as before. A step into a hazard is taken only when every step with
+  fewer is a dead end. The decision adds `hazards=N` and `trail=1` when
+  they apply.
+- **Back out along the trail** (`note_trail`, `_cleared_trail`). Each
+  square she stands on with nothing on her (no unresolved hit or miss in
+  the last 3 s, no attacker beside her), on her walk in and on the farm,
+  is cleared trail, kept `TRAIL_SECONDS` (5 minutes), at most
+  `TRAIL_SQUARES` (200). The retreat prefers a trail step over another
+  equally safe one.
+- **Slow melee is fought, not run from** (`slow_melee`,
+  `slow_melee_contact`). A creature is slow melee when its authored speed
+  is known (`NamedSpawn.speed`, the map's residents in `monster_speeds`)
+  and at most `SLOW_MELEE_SPEED_SHARE` (a quarter) of hers, and it is
+  neither an authored caster nor a ranged kind. When every active threat
+  within 2 tiles is slow melee, and so is every kind that hit her in the
+  last 10 s, then above the tick's flee threshold (`dynamic_flee`):
+  - healing outpaced no longer starts a disengage: she goes on fighting
+    the engaged one, healing as usual (`slow-melee-stand`, once per 4 s);
+  - an out-healed hold runs no gain-only retreat. Its learning is kept:
+    the kinds still become out of her league;
+  - a due pursued stand against two of them is not declined for healing
+    outpaced.
+
+  At the flee threshold the retreat runs as before, and the hazard
+  ranking gives it a direction that gains distance without waking more.
+- **Seam steps come last, and the fight goes on across the seam.** A seam
+  step is still only a last resort (every farm step a dead end). Off the
+  farm map, within `SEAM_RETREAT_FIGHT_SECONDS` (20 s) of the farm's seam
+  step, and for as long as contact lasts once it started
+  (`NavigateThenTask._seam_retreat_contact`), the walk's defence does not
+  hold fire: combat stays on and the engaged target is kept. It does not
+  split the pack there either (the retreat already ran) and fights the
+  committed attacker. Its return to the farm map does not turn combat off
+  meanwhile. A care crossing still holds fire, and the safety's
+  low-health hold still comes first.
+- **No corpse probe under contact.** `loot_nearby` does nothing while
+  something is on her (`under_hostile_contact`), the walk's corpse
+  detour waits too, and a target that vanishes under contact without a
+  kill queues no probe (`corpse-probe-skip ... under hostile contact`).
+
+Accepted limits: a spawn's resident may be dead, so its radius is avoided
+needlessly; speeds are authored, not observed, and a wanderer of no known
+spawn has none, so it counts as not slow; the trail is per farm task and
+starts again on a new leg; transit hold-fire after anything other than
+the farm's own seam step is unchanged.
 
 ## Approach danger: known limitations
 

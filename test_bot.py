@@ -10814,6 +10814,265 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                       [action for action, _ in client.recorded])
         self.assertNotIn(True, client.combat)
 
+    # world_16_74's aggressive residents (spawns.txt): eight charred
+    # treants, a singed bear and a singed deer, each acquiring her within 3.
+    WORLD_16_74_SPAWNS = [
+        (0, 9, 3), (4, 3, 3), (6, 12, 3), (8, 19, 3), (13, 3, 3),
+        (14, 9, 3), (14, 16, 3), (19, 4, 3), (20, 13, 3), (22, 19, 3)]
+
+    def test_farm_retreat_backs_out_along_the_trail_clear_of_other_spawns(self):
+        # Live on world_16_74 (2026-11-25) her retreat from one or two
+        # treants ran past the other spawns: the pack grew from 2 to 8 in
+        # 23 s and she ran a loop around the whole map. Engaged by the
+        # (4, 3) treant at (6, 7), she backs out along the cleared trail she
+        # came in on (y 7 from the east), then keeps clear of every other
+        # spawn's radius.
+        from . import tasks as tasks_module
+
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.stats.update(hp=30, maxhp=100, sp=0)
+        self._record_actions(client)
+        task = FarmTask(zone="/test", target="charred treant")
+        task.resident_spawns = list(self.WORLD_16_74_SPAWNS)
+        node = MapNode(path="/test", width=24, height=24)
+        node.terrain = {(x, y): 1 for x in range(24) for y in range(24)}
+        task.map_node = node
+        task.map_bounds = (24, 24)
+        now = time.monotonic()
+        task._cleared_trail = {
+            ("/test", x, 7): now for x in (10, 9, 8, 7, 6)}
+        position = (6, 7)
+        treant = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=80)
+        behind = (5, 6)
+        steps = []
+        with patch.object(tasks_module.random, "random", return_value=0.5):
+            for _ in range(6):
+                m = client.state.map
+                m.world_x, m.world_y = position
+                m.tiles.clear()
+                m.tile(8 + behind[0] - position[0],
+                       8 + behind[1] - position[1]).objects[3] = treant
+                client.state.messages = [(
+                    time.time(), 2, "ff0000",
+                    "charred treant hit you for 25 (-20) impact damage.")]
+                task.remember_engagement(
+                    client, 8 + behind[0] - position[0],
+                    8 + behind[1] - position[1], 100)
+                task._last_retreat_step_at = 0.0
+                client.direct_moves.clear()
+                self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+                self.assertEqual(len(client.direct_moves), 1)
+                dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+                # The slow treant follows onto the square she left.
+                behind, position = position, (
+                    position[0] + dx, position[1] + dy)
+                steps.append(position)
+        self.assertEqual(steps[:4], [(7, 7), (8, 7), (9, 7), (10, 7)])
+        for x, y in steps:
+            for spawn_x, spawn_y, radius in self.WORLD_16_74_SPAWNS:
+                if (spawn_x, spawn_y) == (4, 3):
+                    continue
+                self.assertGreater(
+                    max(abs(x - spawn_x), abs(y - spawn_y)), radius,
+                    (steps, (spawn_x, spawn_y)))
+        self.assertIn("trail=1", next(
+            detail for action, detail in client.recorded
+            if action == "retreat-choice"))
+
+    def test_farm_retreat_keeps_clear_of_a_visible_idle_hostile(self):
+        # A hostile in view but not in the fight wakes within its detection
+        # radius: of two otherwise equal steps she takes the one that
+        # stays out of it.
+        from . import tasks as tasks_module
+
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.stats.update(hp=30, maxhp=100, sp=0)
+        self._record_actions(client)
+        task = FarmTask(zone="/test", target="charred treant",
+                        aggressive_detection_ranges={"charred treant": 3})
+        node = MapNode(path="/test", width=24, height=24)
+        node.terrain = {(x, y): 1 for x in range(24) for y in range(24)}
+        task.map_node = node
+        task.map_bounds = (24, 24)
+        client.state.map.world_x = client.state.map.world_y = 12
+        # The engaged one to her west; an idle one four tiles east and
+        # three south of her.
+        client.state.map.tile(7, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=80)
+        client.state.map.tile(12, 11).objects[3] = MapObject(
+            3, 2, 0, 0, name="charred treant", target_id=101, target_hp=100)
+        task.remember_engagement(client, 7, 8, 100)
+        client.state.messages = [(
+            time.time(), 2, "ff0000",
+            "charred treant hit you for 25 (-20) impact damage.")]
+        with patch.object(tasks_module.random, "random", return_value=0.5):
+            self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        # Every step east keeps two tiles from the engaged treant and has
+        # the most room; only the north-east one stays out of the idle
+        # one's radius.
+        self.assertEqual((dx, dy), (1, -1))
+
+    def test_slow_melee_at_ninety_percent_is_fought_not_run_from(self):
+        # Live on world_16_74, healing outpaced at 90% turned into an
+        # emergency disengage: combat off, running from one slow treant
+        # (speed 0.048) around the map. Above the flee threshold she
+        # fights it instead; the run waits for the real threshold.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=90)
+        client.state.stats.update(hp=90, maxhp=100, sp=40, speed=0.8)
+        client.state.inventory.append(Item(
+            43, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        client.state.messages = self._outpaced_messages()
+        client.fired = []
+
+        async def fire(direction, tag=0):
+            client.fired.append((direction, tag))
+
+        client.fire = fire
+        self._record_actions(client)
+        task = FarmTask(zone="/test", target="charred treant",
+                        safety=SafetyPolicy(heal_below=0.95, flee_below=0.80))
+        task.monster_speeds = {"charred treant": 0.048}
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task.map_node = node
+        client.state.map.world_x = client.state.map.world_y = 12
+        task.remember_engagement(client, 9, 8, 100)
+        client.state.target_id = 100
+        client.state.combat = True
+        # The heal goes out, combat off for her action timer; between
+        # heals combat comes back on against the treant beside her.
+        for _ in range(3):
+            task._last_action = 0.0
+            asyncio.run(task.tick(client))
+        actions = [action for action, _ in client.recorded]
+        self.assertEqual(client.direct_moves, [])
+        self.assertNotIn("healing-outpaced", actions)
+        self.assertNotIn("emergency-disengage", actions)
+        self.assertIn("slow-melee-stand", actions)
+        self.assertEqual(task._outpaced_until, 0.0)
+        self.assertIn((0, 43), client.fired)
+        self.assertEqual(client.combat[-1], True)
+
+        # At the flee threshold the retreat runs as before.
+        client.state.stats.update(hp=78)
+        client.direct_moves.clear()
+        task.safety._last_heal = time.monotonic()
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        self.assertEqual(len(client.direct_moves), 1)
+
+        # A fast attacker is still run from at 90%.
+        client.state.stats.update(hp=90)
+        task.monster_speeds = {"charred treant": 0.5}
+        client.direct_moves.clear()
+        client.state.messages = self._outpaced_messages()
+        task._last_action = task._last_retreat_step_at = 0.0
+        task._retreat_attempt = None
+        asyncio.run(task.tick(client))
+        self.assertIn("healing-outpaced",
+                      [action for action, _ in client.recorded])
+
+    def test_seam_retreat_under_contact_keeps_combat_and_target(self):
+        # Live at 16:15 a farm retreat stepped across the seam onto
+        # world_17_74; the walk's defence there held fire because that map
+        # was not the destination: combat off and target cleared with three
+        # attackers on her. Under contact after such a step she fights on.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.map.world_x = 10
+        client.state.map.world_y = 10
+        engaged = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=55)
+        other = MapObject(
+            3, 2, 0, 0, name="singed bear", target_id=101, target_hp=100)
+        client.state.map.tile(9, 8).objects[3] = engaged
+        client.state.map.tile(8, 9).objects[3] = other
+        client.state.stats.update(hp=300, maxhp=356, sp=60, maxsp=71)
+        client.state.target_id = engaged.target_id
+        client.state.combat = True
+        now = time.time()
+        client.state.messages = [
+            (now - 1.0, 2, "ff0000",
+             "charred treant hit you for 25 (-20) impact damage."),
+            (now - 0.5, 2, "ff0000",
+             "singed bear hit you for 22 (-21) cleave damage.")]
+        self._record_actions(client)
+        transit = MapNode(path="/test", width=25, height=25)
+        transit.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": transit,
+                       "/farm": MapNode(path="/farm", width=24, height=24)}
+        farm = FarmTask(zone="/farm", target="charred treant")
+        farm.remember_engagement(client, 9, 8, engaged.target_id)
+        farm._seam_step_at = time.monotonic() - 1.0
+        task = NavigateThenTask(
+            graph, "/farm", farm, combat_approach=True, safety=farm.safety)
+        task._last_pull_target = engaged.target_id
+        task._last_moved_at = time.monotonic()
+
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        actions = [action for action, _ in client.recorded]
+        self.assertNotIn("navigation-transit-hold-fire", actions)
+        self.assertIsNotNone(farm._engaged_target)
+        self.assertEqual(farm._engaged_target[0], engaged.target_id)
+        self.assertEqual(client.cleared_targets, 0)
+        self.assertEqual(client.combat[-1], True)
+        self.assertIn((9, 8, engaged.target_id), client.targets)
+        self.assertEqual(client.direct_moves, [])
+
+        # The walk's own tick, back on its way off the farm map, sends no
+        # combat off either.
+        task.navigation.status = TaskStatus.COMPLETE
+        client.combat.clear()
+        asyncio.run(task.tick(client))
+        self.assertNotIn(False, client.combat)
+
+        # Long after a seam step, or with nothing on her, transit holds
+        # fire as before.
+        farm._seam_step_at = time.monotonic() - 60.0
+        task._seam_contact = False
+        client.combat.clear()
+        self.assertFalse(task._seam_retreat_contact(client))
+
+    def test_no_corpse_probe_while_under_hostile_contact(self):
+        # Live at 16:15 two corpse probes were queued while three attackers
+        # hit her: the engaged target had only left her view.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        self._record_actions(client)
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        task = FarmTask(zone="/test", target="charred treant")
+        task.map_node = node
+        client.state.map.world_x = client.state.map.world_y = 12
+        task._engaged_target = (100, "/test", 13, 12, time.monotonic() - 1.0)
+        client.state.messages = [(
+            time.time() - 0.5, 2, "ff0000",
+            "singed bear hit you for 22 (-21) cleave damage.")]
+        task.observe_engaged_target(client, [])
+        self.assertIsNone(task._engaged_target)
+        self.assertEqual(task._suspected_corpse_tiles, {})
+        self.assertIn("corpse-probe-skip",
+                      [action for action, _ in client.recorded])
+
+        # Nor is a queued probe walked to under contact.
+        key = ("/test", 14, 12)
+        task._suspected_corpse_tiles[key] = (time.monotonic() - 1.0, 0)
+        self.assertFalse(asyncio.run(task.loot_nearby(client)))
+        self.assertEqual(client.direct_moves, [])
+        # Once nothing is on her, it is.
+        client.state.messages = []
+        self.assertTrue(asyncio.run(task.loot_nearby(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+
     def test_outpaced_healing_recalls_at_the_heal_threshold(self):
         client = self._combat_client()
         rod = Item(73, item_type=c.TYPE_ROD, quality=70, condition=70,
@@ -14207,6 +14466,42 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         goal = farm.pull_squares[(10, 10)]
         self.assertIn(goal, farm.patrol)
         return goal
+
+    def test_burnt_forest_farm_knows_its_spawns_and_slow_treants(self):
+        # The farm retreat's inputs come from the authored map: every
+        # aggressive resident spawn with its radius, and its speed
+        # (treant_evil 0.048, bear_grey and deer 0.06).
+        path = "/shattered_islands/world_16_74"
+        circuit = FarmCircuitTask(built_graph(), [(path, "charred treant")])
+        task = circuit._new_child()
+        farm = task.task
+        self.assertIn((4, 3, 3), farm.resident_spawns)
+        self.assertIn((6, 12, 3), farm.resident_spawns)
+        self.assertEqual(len(farm.resident_spawns), 10)
+        self.assertAlmostEqual(farm.monster_speeds["charred treant"], 0.048)
+        self.assertAlmostEqual(farm.monster_speeds["singed bear"], 0.06)
+        client = self._combat_client()
+        client.state.stats["speed"] = 0.8
+        treant = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=1, target_hp=100)
+        self.assertTrue(farm.slow_melee(client, treant))
+        self.assertFalse(farm.slow_melee(client, MapObject(
+            3, 1, 0, 0, name="kobold", target_id=2, target_hp=100)))
+
+        # Her walk in feeds the farm's cleared trail; under contact it
+        # does not.
+        client.state.map.path = path
+        client.state.map.tiles.clear()
+        client.state.map.world_x, client.state.map.world_y = 3, 20
+        client.state.messages = []
+        task._record_trail(client)
+        self.assertIn((path, 3, 20), farm._cleared_trail)
+        client.state.map.world_x = 4
+        client.state.messages = [(
+            time.time(), 2, "ff0000",
+            "charred treant hit you for 25 (-20) impact damage.")]
+        task._record_trail(client)
+        self.assertNotIn((path, 4, 20), farm._cleared_trail)
 
     def test_pull_square_keeps_clear_of_residents_outside_the_leg(self):
         kobold = NamedSpawn("/camp", 14, 10, "kobold", ("kobold",),

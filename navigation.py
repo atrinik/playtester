@@ -139,6 +139,10 @@ class NamedSpawn:
     level: int = 0
     peaceful: bool = False
     aggro_radius: int = 0
+    # The fastest candidate's authored movement speed (archetype ``speed``,
+    # without its sign); 0 when unknown. A charred treant moves at 0.048,
+    # Sera at about 0.8 (FarmTask.slow_melee).
+    speed: float = 0.0
 
     def available_at(self, minute: float) -> bool:
         if self.start_minute is None or self.end_minute is None:
@@ -898,6 +902,7 @@ class WorldGraph:
                          obj_type == "83")):
                     candidates = []
                     aggro_radii = []
+                    speeds = []
                     for sibling in parent["children"]:
                         sibling_base = archetypes.get(
                             sibling["arch"], {}).get("attrs", {})
@@ -914,6 +919,12 @@ class WorldGraph:
                         aggro_radii.append(int(one(
                             sibling["attrs"], "item_power",
                             sibling_base.get("item_power")) or 0))
+                        try:
+                            speeds.append(abs(float(one(
+                                sibling["attrs"], "speed",
+                                sibling_base.get("speed")) or 0)))
+                        except (TypeError, ValueError):
+                            speeds.append(0.0)
                     schedule = one(
                         attrs, "spawn_time", base.get("spawn_time")) or ""
                     schedule_match = re.fullmatch(
@@ -929,7 +940,10 @@ class WorldGraph:
                         tuple(dict.fromkeys(candidates)),
                         start_minute, end_minute,
                         int(one(attrs, "level", base.get("level")) or 0),
-                        authored_peaceful, max(aggro_radii, default=0))
+                        authored_peaceful, max(aggro_radii, default=0),
+                        # One candidate of unknown speed makes it unknown.
+                        (0.0 if not speeds or min(speeds) <= 0 else
+                         max(speeds)))
                     if spawn not in self.named_spawns[source]:
                         self.named_spawns[source].append(spawn)
                 destination = one(attrs, "slaying", base.get("slaying"))
@@ -4619,6 +4633,9 @@ class NavigateThenTask(BotTask):
     # A cornered pack split that holds (nothing beside her, nothing hitting
     # her, no step that gains distance) fights the nearest after this long.
     CORNERED_HOLD_SECONDS = 8.0
+    # After a farm retreat's seam step, contact this soon after it keeps
+    # her fighting off the farm map (_seam_retreat_contact).
+    SEAM_RETREAT_FIGHT_SECONDS = 20.0
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -4692,6 +4709,9 @@ class NavigateThenTask(BotTask):
         self._cornered_logged: set[int] = set()
         # Since when a cornered split has held with no step (0: not).
         self._cornered_hold_since = 0.0
+        # Whether the last tick was under contact after a farm retreat's
+        # seam step (_seam_retreat_contact): it holds while contact lasts.
+        self._seam_contact = False
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -4827,6 +4847,9 @@ class NavigateThenTask(BotTask):
         """Remember the cleared route and collapse it while backtracking."""
         m = client.state.map
         position = (m.path, m.world_x, m.world_y)
+        if isinstance(self.task, FarmTask):
+            # The farm's retreat backs out along the way she came in.
+            self.task.note_trail(client)
         if self._trail and self._trail[-1] == position:
             return
         if len(self._trail) >= 2 and self._trail[-2] == position:
@@ -5352,6 +5375,31 @@ class NavigateThenTask(BotTask):
             return set()
         return outclassed
 
+    def _seam_retreat_contact(self, client: AtrinikClient) -> bool:
+        """Whether she is off the farm map under hostile contact after the
+        farm's retreat stepped across a seam.
+
+        Contact is a hit or miss in the last 3 s that no kill resolved, or a
+        hostile beside her (FarmTask.under_hostile_contact). It starts
+        within SEAM_RETREAT_FIGHT_SECONDS of the seam step and holds for as
+        long as the contact does. Live at 16:15 the walk's hold-fire turned
+        combat off and dropped her target with three attackers on her after
+        such a step; she died cornered on the next map.
+        """
+        farm = self.task
+        if (not isinstance(farm, FarmTask) or
+                client.state.map.path == self.navigation.destination or
+                not farm.under_hostile_contact(client)):
+            self._seam_contact = False
+            return False
+        if (not self._seam_contact and (
+                not farm._seam_step_at or
+                time.monotonic() - farm._seam_step_at >
+                self.SEAM_RETREAT_FIGHT_SECONDS)):
+            return False
+        self._seam_contact = True
+        return True
+
     async def _defend_while_navigating(self, client: AtrinikClient,
                                        *, own_walk: bool = False) -> bool:
         """Pause an encounter approach to heal or clear an aggroed pack.
@@ -5474,8 +5522,12 @@ class NavigateThenTask(BotTask):
         # A care crossing (an essential trip across an owner block) holds
         # fire on every map until it ends, the destination map included;
         # the cornered last resort below still fights back.
+        # Under contact after the farm's own retreat crossed a seam she
+        # keeps fighting there, combat on and target kept, and does not
+        # split the pack (_seam_retreat_contact): the retreat already ran.
+        seam_contact = self._seam_retreat_contact(client)
         hold_fire = (
-            (m.path != self.navigation.destination or
+            ((m.path != self.navigation.destination and not seam_contact) or
              self.navigation.care_holds_fire(m.path)) and
             not (recent_hostile_contact(client, 3.0) and
                  (self.navigation.status == TaskStatus.FAILED or
@@ -5726,7 +5778,8 @@ class NavigateThenTask(BotTask):
         # below would restart the timer it waits for.
         safety_hold = not safe and (not starving_without_food(client) or
                                     heal_waiting(client))
-        split = overwhelmed and not hold_fire and not safety_hold
+        split = (overwhelmed and not hold_fire and not safety_hold and
+                 not seam_contact)
         cornered = None
         if split and not escape_due:
             cornered = await self._cornered_split(client, nearby)
@@ -5957,16 +6010,21 @@ class NavigateThenTask(BotTask):
         # keep fighting there forever before the return route gets a tick.
         if (self.navigation.status == TaskStatus.COMPLETE and
                 client.state.map.path != self.navigation.destination):
-            await client.clear_actions()
-            await client.set_combat(False)
+            seam_contact = self._seam_retreat_contact(client)
+            if not seam_contact:
+                await client.clear_actions()
+                await client.set_combat(False)
             self.navigation.status = TaskStatus.RUNNING
             self.navigation.route = []
             self.navigation._issued_goal = None
             self.navigation._issued_click = None
             self.navigation._last_progress = time.monotonic()
             self._defending = False
-            await self.navigation.tick(client)
-            return
+            if not seam_contact:
+                await self.navigation.tick(client)
+                return
+            # Under contact after the farm retreat's seam step: the
+            # defence below keeps fighting, combat on, before any walk.
         # Once the authored destination is reached, the child owns behavior.
         # Letting the travel wrapper keep intercepting farm combat prevented
         # FarmTask pull and emergency-retreat policies from ever running.
@@ -5984,9 +6042,11 @@ class NavigateThenTask(BotTask):
         if isinstance(self.task, FarmTask):
             m = client.state.map
             cx, cy = m.width // 2, m.height // 2
+            # Nor while something is on her (under_hostile_contact).
             immediate = any(
                 max(abs(x - cx), abs(y - cy)) <= 2
-                for x, y, _ in m.targets(friendly=False))
+                for x, y, _ in m.targets(friendly=False)
+            ) or self.task.under_hostile_contact(client)
             if not immediate and await self.task.loot_nearby(client):
                 return
             if not immediate:
@@ -9385,6 +9445,17 @@ class FarmCircuitTask(BotTask):
                         aggressive_detection_ranges[semantic] = max(
                             aggressive_detection_ranges.get(semantic, 0),
                             spawn.aggro_radius)
+        # Authored movement speeds of the map's residents, for the farm's
+        # slow-melee rule (FarmTask.slow_melee).
+        monster_speeds: dict[str, float] = {}
+        for spawn in residents:
+            if spawn.speed <= 0:
+                continue
+            for identity in (spawn.named, *spawn.candidates):
+                semantic = self.graph._semantic_name(identity)
+                if semantic:
+                    monster_speeds[semantic] = max(
+                        monster_speeds.get(semantic, 0.0), spawn.speed)
         farm = FarmTask(
             zone=zone, target=target, combat_skill=self.combat_skill,
             combat_spell=self.combat_spell, patrol=patrol,
@@ -9395,6 +9466,12 @@ class FarmCircuitTask(BotTask):
             aggressive_detection_ranges=aggressive_detection_ranges,
             pull_avoidance=pull_avoidance,
             pull_squares=pull_squares,
+            # Every aggressive resident's spawn and the radius it acquires
+            # her within: the farm retreat keeps out of them (COMBAT.md,
+            # "Retreat tactics").
+            resident_spawns=[(spawn.x, spawn.y, spawn.pull_clearance_radius)
+                             for spawn in residents],
+            monster_speeds=monster_speeds,
             allow_launchers=(
                 not self._auto_combat_build and not bool(self.combat_spell)))
         farm._lore_book_attempts = self._lore_book_attempts
