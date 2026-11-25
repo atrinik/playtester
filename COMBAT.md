@@ -1621,27 +1621,35 @@ Now (ROUTING.md 1.12):
 Live, in the Burnt Forest on 2026-11-25, she died five times in 90 minutes
 and learned too little from them. Three changes:
 
-- **Failures across a seam count for the spot.** Once she is at the spot
-  (the farm walk complete), a death or emergency recall off the spot's
-  maps counts for it when she was on one of its maps within
+- **Failures across a seam count for the spot.** A death or emergency
+  recall off the spot's maps counts for it when she was on one of its
+  maps within
   `FARM_SEAM_FAILURE_SECONDS` (30 s) before it, or when it happened on a
   map tiled to one of them or in the same bounded area within
   `FARM_AREA_FAILURE_SECONDS` (2 minutes) of her leaving the spot
-  (`FarmCircuitTask._seam_failure_leg`). It never counts during a
-  maintenance trip: the farm walk is not ticked then, so it still reads
-  complete. The review then judges its cause
+  (`FarmCircuitTask._seam_failure_leg`). This holds whether her farm walk
+  reads complete or running again: off the destination, the walk's zone
+  containment restarts it, and this rule is judged before the one for a
+  death on the way. It never counts during a maintenance trip, and never
+  on her first walk to the spot, since she has not been on a leg map yet.
+  The review then judges its cause
   as on the spot (pack, out-damaged and so on), not as a death on the way,
   so it records the farm-failure review, the kit failure and the
   adaptation, and teaches no route hazard on the seam map. Live, a
   retreat from world_16_74 crossed the seam onto world_17_74 and she
-  died there at 16:15:19. Only a leg map or the walk's destination
-  counted, so that death taught nothing.
+  died there at 16:15:19, with the walk running (its transit hold-fire
+  fired 13 s before). No farm-failure review appeared for it. Under the
+  old rules it could only count as a death on the way to the spot (cause
+  `route`, with a route hazard on the spot's own neighbour), never as the
+  pack fight on the spot that it was.
 - **Kit hazards count by area.** An area is a map header's region and
   name (`MapNode.region` and `.name`, which the analyzer's `circuit_area`
   also uses for a circuit of one area), such as
-  `eld_woods_island|Burnt Forest`; a spot's areas are its maps'. Each adaptation record now keeps its
-  spot's areas, and `kit_hazard` counts a record for every candidate that
-  shares a map or an area with it. Three qualifying failures in
+  `eld_woods_island|Burnt Forest`. A map without a region or with an
+  unnamed header has no area. Each adaptation record now keeps one area,
+  that of the leg the failure counts for, so a circuit that spans two
+  areas does not mark both after a failure in one. `kit_hazard` counts a
+  record for every candidate with a map or a leg's area in common with it. Three qualifying failures in
   24 hours anywhere in the Burnt Forest now mark every Burnt Forest circuit
   and single map hazardous for that kit, the southern L27-30 maps
   included. Live, moving from the world_17_72 circuits to world_16_74 (no
@@ -1651,8 +1659,12 @@ and learned too little from them. Three changes:
   Woods Island 42 maps, Strakewood Island 190, World 2115), and those
   still count by shared maps only. The last-resort pause (three failures
   within an hour at adaptation level 4) now quarantines every map of the
-  spot's bounded areas for that hour, not only the failure's leg map
-  (`farm-area-quarantine`).
+  failure leg's bounded area for that hour, not only the leg map itself
+  (`farm-area-quarantine`). The cure-funding farm's danger cap
+  ([Safer spot choice](#safer-spot-choice-2026-11-23)) still comes only
+  from spots hazardous by their own maps. An area hazard would let an
+  easy southern Burnt Forest map she never failed on lower the cap for
+  every spot.
 - **She leaves a spot with nothing left to pull.** Once every resident
   kind of the spot is out of her league
   ([heals losing](#heals-losing-on-the-farm-2026-11-23)) while she is
@@ -1679,9 +1691,6 @@ Accepted limits:
   every usable spot is hazardous still apply;
 - an area is grouped by header alone, not by tiled connection, so a
   bounded name reused by maps apart from each other is still one area;
-- once a retreat across the seam ends and her walk back to the spot
-  starts, a death on the seam map takes the old rule for a death on the
-  way: cause `route`, with a route hazard on that map;
 - out-of-league marks hold for 10 minutes wherever she is, so a spot
   reached in that time whose every resident kind is marked is left on
   arrival.

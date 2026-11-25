@@ -22842,8 +22842,10 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         client.farm_analyzer.profile = self.kit()
         circuit = self.circuit(client, spot)
         circuit._failure_epoch = 0.0
-        # At the spot: the farm walk is complete.
-        circuit.child.navigation.status = TaskStatus.COMPLETE
+        # Off the destination, the walk reads RUNNING again (zone
+        # containment in NavigateThenTask.tick), as live: its transit
+        # hold-fire fired 13 s before the death.
+        circuit.child.navigation.status = TaskStatus.RUNNING
         now = time.time()
         client.map_arrivals = [(now - 300, self.BURNT_16_74),
                                (now - 8, self.BURNT_17_74)]
@@ -22889,6 +22891,8 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
             client = self.client({"xp": [spot]})
             circuit = self.circuit(client, spot)
             circuit._failure_epoch = 0.0
+            # A trip from the spot leaves the farm walk complete: it is
+            # not ticked while the trip runs.
             circuit.child.navigation.status = TaskStatus.COMPLETE
             if maintenance:
                 circuit._selling = object()
@@ -22913,9 +22917,56 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual([entry["map"] for record in counted.values()
                           for entry in record["kit_failures"]],
                          [self.BURNT_17_72])
-        # During a maintenance trip the farm walk still reads complete,
-        # but the failure is not the spot's.
+        # During a maintenance trip the failure is not the spot's.
         self.assertEqual(death(True), {})
+
+    def test_a_circuit_across_two_areas_learns_only_the_failures_area(self):
+        from .navigation import _area_key
+
+        graph = built_graph()
+        city = "/shattered_islands/world_-10_54"
+        woods = "/shattered_islands/world_-10_55"
+        self.assertNotEqual(_area_key(graph.nodes[city]),
+                            _area_key(graph.nodes[woods]))
+        client = self.client({"xp": []})
+        circuit = FarmCircuitTask(graph, [(city, "rat"), (woods, "rat")],
+                                  analyzer_driven=True,
+                                  spot={"path": "circuit[mixed]", "name": "Mixed"})
+        circuit.child = circuit._new_child()
+        circuit._failure_epoch = 0.0
+        now = time.time()
+        client.state.messages.append(
+            (now - 1, 2, "ff0000", "rat hit you for 90 (-90) impact damage."))
+        client.decision_history.append({
+            "time": now, "action": "death", "detail": "",
+            "task": "", "map": woods})
+        circuit._observe_farm_death(client)
+        self.assertEqual(client.state.farm_adaptations["circuit[mixed]"]["areas"],
+                         [_area_key(graph.nodes[woods])])
+
+    def test_areas_skip_unnamed_maps_and_are_cached_on_the_graph(self):
+        from .navigation import _area_key, area_maps
+
+        self.assertEqual(_area_key(MapNode("/a", name="Wood", region="")), "")
+        self.assertEqual(_area_key(MapNode("/a", name="<unnamed>", region="r")), "")
+        self.assertEqual(_area_key(MapNode("/a", name="Wood", region="r")), "r|Wood")
+        first, second = WorldGraph(), WorldGraph()
+        first.nodes["/a"] = MapNode("/a", name="Wood", region="r")
+        second.nodes["/b"] = MapNode("/b", name="Moor", region="r")
+        self.assertEqual(area_maps(first), {"r|Wood": frozenset({"/a"})})
+        self.assertEqual(area_maps(second), {"r|Moor": frozenset({"/b"})})
+        self.assertEqual(first._area_maps[1], {"r|Wood": frozenset({"/a"})})
+        # A map added (a test graph) is seen.
+        first.nodes["/c"] = MapNode("/c", name="Wood", region="r")
+        self.assertEqual(area_maps(first), {"r|Wood": frozenset({"/a", "/c"})})
+
+    def test_seam_attribution_skips_every_maintenance_trip(self):
+        import inspect
+        import re as regex
+
+        source = inspect.getsource(FarmCircuitTask._tick_running_service)
+        ticked = set(regex.findall(r"if self\.(_[a-z_]+) is not None", source))
+        self.assertEqual(ticked, set(FarmCircuitTask.SERVICE_ATTRIBUTES))
 
     def test_kit_failures_count_for_every_spot_of_one_area(self):
         """Failures on a world_17_72 circuit make a world_16_74 spot, of the
@@ -26092,6 +26143,39 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertTrue(cure_funding_farm(client))
         settle_cure_funding_farm(client)
         self.assertEqual(client.state.cure_funding_farm_funded_at, 0.0)
+
+    def test_an_area_hazard_does_not_lower_the_funding_cap(self):
+        """Failures on a world_17_72 circuit make the whole Burnt Forest
+        hazardous, but only spots on maps she failed on cap the
+        cure-funding farm's danger: a southern Burnt Forest map she never
+        failed on must not shut out every spot more dangerous than it."""
+        from . import self_improvement as si
+        from .navigation import analyzer_farm_choice, start_cure_funding_farm
+
+        def spot(name, path, danger):
+            result = analyzer_spot(name, [path], ["monster L35"])
+            result.update(path=f"{name}:{path}", danger=danger,
+                          safety_score=1.0, approach_status="path",
+                          approach_safety_score=1.0)
+            return result
+
+        client, _ = self.client(depletion=7, bank=2_245)
+        kit = AnalyzerFarmSelectionTests.kit(max_health=134)
+        failed = spot("Burnt circuit", "/shattered_islands/world_17_72", 60.0)
+        south = spot("Burnt south", "/shattered_islands/world_16_75", 20.0)
+        hemlock = spot("Hemlock", "/shattered_islands/world_17_76", 50.0)
+        client.farm_analyzer = StubAnalyzer(
+            {"xp": [failed, south, hemlock], "safety": [failed, south, hemlock]})
+        client.farm_analyzer.profile = kit
+        client.state.farm_adaptations = {failed["path"]: {
+            "maps": ["/shattered_islands/world_17_72"],
+            "areas": ["eld_woods_island|Burnt Forest"],
+            "kit_failures": [{"time": time.time(), "cause": "pack",
+                              "kit": kit.describe()}] * si.KIT_HAZARD_FAILURES}}
+        start_cure_funding_farm(client, "short")
+        choice = analyzer_farm_choice(client, built_graph(), search=False)
+        self.assertIsNotNone(choice)
+        self.assertEqual(choice[2]["name"], "Hemlock")
 
     def test_the_funding_farm_never_takes_the_hazardous_fallback(self):
         from .navigation import analyzer_farm_choice, start_cure_funding_farm

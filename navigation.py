@@ -7048,27 +7048,26 @@ def seam_ranking(client: AtrinikClient, graph: "WorldGraph",
 # for every map would be out of proportion, and those count by shared maps
 # alone, as before.
 AREA_HAZARD_MAX_MAPS = 30
-# Maps of each bounded area, per graph (area_maps).
-_area_maps_cache: dict[tuple[int, int], dict[str, frozenset[str]]] = {}
 
 
 def _area_key(node) -> str:
-    region = str(getattr(node, "region", "") or "")
-    name = str(getattr(node, "name", "") or "")
-    return f"{region}|{name}" if name else ""
+    """A map's area, "region|name"; "" without a region or a real name
+    (an unnamed map is no place of its own)."""
+    region = str(getattr(node, "region", "") or "").strip()
+    name = str(getattr(node, "name", "") or "").strip()
+    if not region or not name or name.startswith("<"):
+        return ""
+    return f"{region}|{name}"
 
 
 def area_maps(graph: "WorldGraph | None") -> dict[str, frozenset[str]]:
     """Every bounded area's maps (at most AREA_HAZARD_MAX_MAPS), by area
-    key ("region|name"); cached per node table."""
+    key ("region|name"); cached on the graph itself, with its map count
+    (the map data never changes after build)."""
     nodes = getattr(graph, "nodes", None) or {}
-    # Planner views share the loop graph's nodes: one entry for all.
-    key = (id(nodes), len(nodes))
-    cached = _area_maps_cache.get(key)
-    if cached is not None:
-        return cached
-    if len(_area_maps_cache) > 8:
-        _area_maps_cache.clear()
+    cached = getattr(graph, "_area_maps", None)
+    if cached is not None and cached[0] == len(nodes):
+        return cached[1]
     grouped: dict[str, set[str]] = defaultdict(set)
     for path, node in nodes.items():
         area = _area_key(node)
@@ -7076,7 +7075,11 @@ def area_maps(graph: "WorldGraph | None") -> dict[str, frozenset[str]]:
             grouped[area].add(path)
     areas = {area: frozenset(paths) for area, paths in grouped.items()
              if len(paths) <= AREA_HAZARD_MAX_MAPS}
-    _area_maps_cache[key] = areas
+    if graph is not None:
+        try:
+            graph._area_maps = (len(nodes), areas)
+        except AttributeError:
+            pass
     return areas
 
 
@@ -7585,8 +7588,11 @@ def _analyzer_farm_choice(
         cap = FUNDING_FARM_DANGER_SHARE * health if health > 0 else float("inf")
         for spot in analyzer.ranking("safety"):
             legs = analyzer_spot_legs(spot, graph)
+            # By the spot's own maps only (no graph, so no area): an area
+            # hazard would let every spot of the area cap the rest, the
+            # easy ones she never failed on too.
             if (legs and _spot_danger(spot) < cap and
-                    kit_hazardous_spot(client, spot, legs, graph)):
+                    kit_hazardous_spot(client, spot, legs)):
                 cap = _spot_danger(spot)
         usable = [entry for entry in usable
                   if not plan.risky_approach(entry[2]) and
@@ -8781,14 +8787,18 @@ class FarmCircuitTask(BotTask):
         # destination so autoplay moves on instead of replaying the same lethal
         # road. Maintenance children are held separately and never reach this
         # (nor the seam rule below: _seam_failure_leg).
-        if (not path and self.child is not None and
-                self.child.navigation.destination in active_paths and
-                self.child.navigation.status != TaskStatus.COMPLETE):
-            path = self.child.navigation.destination
+        # A failure just after she left the spot (_seam_failure_leg) is
+        # the spot's own fight, judged first: off the destination the walk
+        # reads RUNNING again (NavigateThenTask's zone containment), so the
+        # rule above would take it as one on the way.
         seam = False
         if not path:
             path = self._seam_failure_leg(client, failure)
             seam = bool(path)
+        if (not path and self.child is not None and
+                self.child.navigation.destination in active_paths and
+                self.child.navigation.status != TaskStatus.COMPLETE):
+            path = self.child.navigation.destination
         if not path:
             return False
         what = "combat death" if failure.get("action") == "death" else "emergency recall"
@@ -8854,23 +8864,25 @@ class FarmCircuitTask(BotTask):
     def _seam_failure_leg(self, client: AtrinikClient, failure: dict) -> str:
         """The leg map a failure just off the spot's maps counts for, or "".
 
-        Once she is at the spot (the farm child's walk complete), a death
-        or emergency recall counts for it when it happened within
+        A death or emergency recall off the spot's maps counts for it,
+        whether her walk reads complete or RUNNING again (off the
+        destination, NavigateThenTask's zone containment restarts it), when
+        it happened within
         FARM_SEAM_FAILURE_SECONDS of her being on one of its maps (map
         arrivals, else her records), or on a map tiled to one of them
         (a seam neighbour) or of the same bounded area (map_areas) within
         FARM_AREA_FAILURE_SECONDS: the leg she was on last. Never during a
-        maintenance trip (SERVICE_ATTRIBUTES): the farm child is not ticked
-        then, so its walk still reads complete. Live, on 2026-11-25, a retreat
-        from world_16_74 stepped across the seam onto world_17_74 and she
-        died there at 16:15:19; the review, the kit failure and its cause
-        were never recorded, because only a leg map or the walk's
-        destination counted.
+        maintenance trip (SERVICE_ATTRIBUTES). On her first walk to the
+        spot she was never on a leg, so this never applies. Live, on
+        2026-11-25, a retreat from world_16_74 stepped across the seam
+        onto world_17_74 (the walk RUNNING: its transit hold-fire fired 13 s
+        before) and she died there at 16:15:19. The destination rule could
+        only take it as a death on the way (cause route, a route hazard on
+        the spot's own neighbour), never as the pack fight on the spot it
+        was.
         """
-        child = self.child
-        if (child is None or child.navigation.status != TaskStatus.COMPLETE or
-                any(getattr(self, name, None) is not None
-                    for name in self.SERVICE_ATTRIBUTES)):
+        if self.child is None or any(getattr(self, name, None) is not None
+                                     for name in self.SERVICE_ATTRIBUTES):
             return ""
         failure_map = str(failure.get("map", ""))
         when = float(failure.get("time", 0.0) or 0.0)
@@ -8974,7 +8986,9 @@ class FarmCircuitTask(BotTask):
             adaptations.get(key, {}), review,
             kit=kit.describe() if kit is not None else None,
             maps=[leg for leg, _ in self.legs], map_damage=on_map,
-            areas=map_areas(self.graph, (leg for leg, _ in self.legs)))
+            # One area: the leg's the failure counts for. A circuit across
+            # two areas does not hazard both for a failure in one.
+            areas=map_areas(self.graph, (path,)))
         setter = getattr(client, "set_farm_adaptation", None)
         if setter is not None:
             setter(key, record)
@@ -9011,7 +9025,7 @@ class FarmCircuitTask(BotTask):
                 client, path, "repeated failures at the maximum adaptation level",
                 seconds=self_improvement.PAUSE_SECONDS)
             self._quarantine_farm_area(
-                client, "repeated failures at the maximum adaptation level",
+                client, path, "repeated failures at the maximum adaptation level",
                 seconds=self_improvement.PAUSE_SECONDS)
             return True
         if kit_hazardous_spot(client, self.spot, self.legs, self.graph):
@@ -9043,16 +9057,16 @@ class FarmCircuitTask(BotTask):
         log.warning("autoplay quarantined farm map for %.1f hours: %s (%s)",
                     seconds / 3600, path, reason)
 
-    def _quarantine_farm_area(self, client: AtrinikClient, reason: str, *,
-                              seconds: float) -> None:
-        """Quarantine every map of the spot's bounded areas (map_areas) for
+    def _quarantine_farm_area(self, client: AtrinikClient, path: str,
+                              reason: str, *, seconds: float) -> None:
+        """Quarantine every map of leg ``path``'s bounded area (map_areas) for
         ``seconds``, as its pause quarantines the failure's leg map: a
         sibling circuit or single map of the same area is the same fight.
         Live, on 2026-11-25, the Burnt Forest pauses covered one map each,
         and she died on three different Burnt Forest maps within 90
         minutes. Recorded once (farm-area-quarantine); an area too large
         for map_areas is never quarantined whole."""
-        areas = map_areas(self.graph, (path for path, _ in self.legs))
+        areas = map_areas(self.graph, (path,))
         bounded = area_maps(self.graph)
         maps = sorted(set().union(*(bounded[area] for area in areas))
                       if areas else ())
@@ -9060,8 +9074,8 @@ class FarmCircuitTask(BotTask):
             return
         until = time.time() + seconds
         quarantine = client.state.farm_zone_quarantine
-        for path in maps:
-            quarantine[path] = max(float(quarantine.get(path, 0.0) or 0.0), until)
+        for each in maps:
+            quarantine[each] = max(float(quarantine.get(each, 0.0) or 0.0), until)
         # One persist for the whole area: the setter saves every entry.
         setter = getattr(client, "quarantine_farm_zone", None)
         if setter is not None:
