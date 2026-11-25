@@ -65,6 +65,50 @@ def built_graph():
     return WorldGraph().build()
 
 
+def _submit_inline(fn, /, *args, **kwargs):
+    """planner.submit, run at once on the calling thread."""
+    import concurrent.futures
+
+    future = concurrent.futures.Future()
+    future.set_running_or_notify_cancel()
+    try:
+        future.set_result(fn(*args, **kwargs))
+    except Exception as exc:
+        future.set_exception(exc)
+    return future
+
+
+_inline_planner = None
+
+
+def setUpModule():
+    """Most tests check what a route ranking decides, not where it runs:
+    the planner worker's jobs run inline, so a background ranking answers
+    on the tick that asks (BackgroundPlans collects a finished one at once).
+    PlanningOffLoopTests use the real worker."""
+    global _inline_planner
+    from . import planner as planner_module
+
+    _inline_planner = patch.object(planner_module, "submit", _submit_inline)
+    _inline_planner.start()
+
+
+def tearDownModule():
+    _inline_planner.stop()
+
+
+def fake_temple_trips(fake):
+    """Patch TempleFoodPlanner.trip so that ``fake(graph, client,
+    exclude=...)`` answers at once, as temple_food_trip did on the tick
+    before the ranking moved off the event loop."""
+    from . import navigation as navigation_module
+
+    def trip(self, graph, client, *, exclude=()):
+        return fake(graph, client, exclude=tuple(exclude))
+
+    return patch.object(navigation_module.TempleFoodPlanner, "trip", trip)
+
+
 # Literal circuits for farm-circuit mechanics tests. Production farm spots come
 # only from the farming analyzer (see analyzer_farm_selection).
 EARLY_LEGS = (
@@ -1084,8 +1128,7 @@ class ProtocolTests(unittest.TestCase):
 
             trip = Trip("trip")
             survival = IdleSurvival(WorldGraph())
-            with patch.object(autoplay_module, "temple_food_trip",
-                              return_value=trip), \
+            with fake_temple_trips(lambda *_, **__: trip), \
                     patch.object(autoplay_module, "hungry", return_value=True), \
                     patch.object(autoplay_module, "food_reserve",
                                  return_value=False):
@@ -1115,8 +1158,7 @@ class ProtocolTests(unittest.TestCase):
                     raise KeyError("bug in tick")
 
             survival = IdleSurvival(WorldGraph())
-            with patch.object(autoplay_module, "temple_food_trip",
-                              side_effect=lambda *a, **k: Trip("trip")), \
+            with fake_temple_trips(lambda *a, **k: Trip("trip")), \
                     patch.object(autoplay_module, "hungry", return_value=True), \
                     patch.object(autoplay_module, "food_reserve",
                                  return_value=False), \
@@ -14313,7 +14355,6 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(autoplay.child.legs[0][0], "/shattered_islands/world_14_79")
 
     def test_autoplay_pauses_any_phase_to_eat_at_a_temple_when_starving(self):
-        from . import autoplay as autoplay_module
         from .tasks import BotTask
 
         client = AtrinikClient(ClientConfig())
@@ -14348,7 +14389,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                 return None
             return NavigateThenTask(graph, "/temple", TempleFoodTask("Saruthar"))
 
-        with patch.object(autoplay_module, "temple_food_trip", trip):
+        with fake_temple_trips(trip):
             asyncio.run(autoplay.tick(client))
             self.assertEqual((Walk.ticks, trips), (1, []))
             # Starving with nothing to eat: the walk pauses for the temple.
@@ -14399,7 +14440,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             client.state.inventory_replay_complete = True
         # No reachable priest: keep going, and look again later.
         autoplay.phase, autoplay.child = "mana-crystal-recovery", walk
-        with patch.object(autoplay_module, "temple_food_trip", lambda graph, client, **_: None):
+        with fake_temple_trips(lambda graph, client, **_: None):
             self.assertTrue(autoplay._needs_temple_food(client))
             self.assertFalse(asyncio.run(autoplay._start_temple_food(client)))
             self.assertIs(autoplay.child, walk)
@@ -14428,7 +14469,6 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertNotIn(other.task.priest, ("Friar Marcus", "Talrain"))
 
     def test_autoplay_tries_one_other_priest_per_hunger_episode(self):
-        from . import autoplay as autoplay_module
 
         client = AtrinikClient(ClientConfig())
         client.state.phase = "playing"
@@ -14457,7 +14497,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                     return TempleTrip(priest)
             return None
 
-        with patch.object(autoplay_module, "temple_food_trip", trip):
+        with fake_temple_trips(trip):
             asyncio.run(autoplay.tick(client))
             self.assertEqual(autoplay.phase, "temple-food")
             self.assertEqual(autoplay.child.task.priest, "Talrain")
@@ -14541,13 +14581,12 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual((rebuilt._temple_food_retry_at, rebuilt._resupply_retry_at),
                          (0.0, 0.0))
         # Its own temple food passes over the priest autoplay just failed.
-        from . import navigation as navigation_module
         asked = []
 
         def trip(graph, client, exclude=()):
             asked.append(tuple(exclude))
 
-        with patch.object(navigation_module, "temple_food_trip", trip):
+        with fake_temple_trips(trip):
             rebuilt._new_temple_food(client)
         self.assertEqual(asked, [("Talrain",)])
 
@@ -27786,12 +27825,11 @@ class IdleSurvivalTests(unittest.TestCase):
         return client
 
     def engine(self, client, trip):
-        from . import autoplay as autoplay_module
         from .autoplay import IdleSurvival
 
         engine = TaskEngine(client)
         engine.idle_survival = IdleSurvival(WorldGraph())
-        patcher = patch.object(autoplay_module, "temple_food_trip", trip)
+        patcher = fake_temple_trips(trip)
         patcher.start()
         self.addCleanup(patcher.stop)
         return engine
@@ -27897,9 +27935,8 @@ class IdleSurvivalTests(unittest.TestCase):
             reachable.append(tuple(exclude))
             return None if "Friar Marcus" in exclude else TempleTrip("Friar Marcus")
 
-        from . import autoplay as autoplay_module
 
-        with patch.object(autoplay_module, "temple_food_trip", friar):
+        with fake_temple_trips(friar):
             asyncio.run(engine._protect_idle())
             survival.child.fail("no route to the temple")
             self.assertFalse(asyncio.run(engine._protect_idle()))
@@ -36927,6 +36964,293 @@ class HealsLandInMeleeTests(unittest.TestCase):
         client.state.add_message(0, "white", "The wand says poof.")
         self.assertEqual(heal_landed(client, pending), "The wand says poof.")
         self.assertTrue(observe_wand_feedback(client, 28, since))
+
+
+class PlanningOffLoopTests(unittest.TestCase):
+    """Expensive planning runs on the planner worker, never on the event
+    loop (ROUTING 1.12); the loop watchdog makes any stall visible."""
+
+    BED = "/shattered_islands/world_7_79"
+
+    def setUp(self):
+        from . import planner as planner_module
+
+        # The real worker, not the module's inline one (setUpModule).
+        self.enterContext(patch.object(planner_module, "submit",
+                                       planner_module.worker().submit))
+
+    def client(self, *, food=60):
+        client = AtrinikClient(ClientConfig())
+        client.state.phase = "playing"
+        client.state.map.path = self.BED
+        client.state.map.world_x, client.state.map.world_y = 16, 3
+        client.state.stats.update({"level": 34, "hp": 100, "maxhp": 100,
+                                   "sp": 50, "food": food})
+        client.sent = []
+
+        async def send(packet):
+            client.sent.append(packet)
+
+        client.send = send
+        return client
+
+    @staticmethod
+    def priests_graph():
+        from .navigation import DialogueVendor
+
+        graph = WorldGraph()
+        graph.temple_priests = [
+            DialogueVendor("/shattered_islands/world_8_78", 4, 9, "Telath", ""),
+            DialogueVendor("/shattered_islands/world_9_69", 8, 0, "Talrain", "")]
+        return graph
+
+    @staticmethod
+    def ranked(food_planner):
+        """Whether its temple ranking finished on the worker."""
+        return food_planner.plans._plans["temple"].future.done()
+
+    @staticmethod
+    def wait_for(predicate, seconds=5.0):
+        deadline = time.monotonic() + seconds
+        while not predicate():
+            if time.monotonic() > deadline:
+                raise AssertionError("timed out")
+            time.sleep(0.01)
+
+    def test_the_temple_ranking_never_runs_on_the_tick(self):
+        # Live: 23 route plans on the event loop took about 45 s; the QUIC
+        # connection went idle, the server dropped her, every reconnect
+        # planned again, and she starved. Each plan here waits until the
+        # test lets it go: run on the tick, the tick would wait as long.
+        import threading
+        from . import navigation as navigation_module
+        from .autoplay import IdleSurvival
+
+        release = threading.Event()
+        planned = []
+
+        def plan(task, client, *, origin=None):
+            planned.append((threading.current_thread(), task.graph, client,
+                            getattr(client, "plan_inputs", None)))
+            release.wait(2)
+            if task.destination.endswith("world_8_78"):
+                return []
+            raise ValueError("no component route")
+
+        graph = self.priests_graph()
+        client = self.client()
+        survival = IdleSurvival(graph)
+        with patch.object(navigation_module.NavigateTask, "_plan", plan):
+            started = time.monotonic()
+            self.assertFalse(asyncio.run(survival.tick(client)))
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertIsNone(survival.child)
+            self.assertTrue(survival.food_planner.planning)
+            self.wait_for(lambda: planned)
+            # While it plans, her ticks carry on (the idle safety runs).
+            self.assertFalse(asyncio.run(survival.tick(client)))
+            release.set()
+            self.wait_for(lambda: self.ranked(survival.food_planner))
+            self.assertTrue(asyncio.run(survival.tick(client)))
+        self.assertEqual(survival.child.task.priest, "Telath")
+        # The trip is built on her graph; the ranking used the planner's
+        # view and a snapshot of her client, with inputs taken on the loop.
+        self.assertIs(survival.child.navigation.graph, graph)
+        thread, view, proxy, inputs = planned[0]
+        self.assertIsNot(thread, threading.main_thread())
+        self.assertIs(view, graph.planner_view())
+        self.assertIsNot(view, graph)
+        self.assertIsInstance(proxy, navigation_module.planner.PlanningClient)
+        self.assertIsNotNone(inputs)
+
+    def test_a_trip_dropped_by_a_disconnect_goes_to_the_same_priest(self):
+        # Live, every reconnect dropped the trip and ranked all the priests
+        # again. The priest chosen is kept: one route, not a new ranking.
+        from . import navigation as navigation_module
+        from .autoplay import IdleSurvival
+
+        ranked = []
+
+        def rank(graph, client, *, exclude=(), origin=None, inputs=None):
+            ranked.append(tuple(exclude))
+            return graph.temple_priests[0]
+
+        graph = self.priests_graph()
+        client = self.client()
+        survival = IdleSurvival(graph)
+        with patch.object(navigation_module, "rank_temple_priests", rank):
+            if not asyncio.run(survival.tick(client)):
+                self.wait_for(lambda: self.ranked(survival.food_planner))
+                self.assertTrue(asyncio.run(survival.tick(client)))
+            self.assertEqual(survival.child.task.priest, "Telath")
+            # The connection drops: the engine drops the trip.
+            survival.drop()
+            self.assertTrue(asyncio.run(survival.tick(client)))
+            self.assertEqual(survival.child.task.priest, "Telath")
+            self.assertEqual(ranked, [()])
+            # That priest failed: passed over, so the next trip ranks again.
+            survival.child.fail("no route")
+            asyncio.run(survival.tick(client))
+            survival._retry_at = 0.0
+            asyncio.run(survival.tick(client))
+            self.wait_for(lambda: len(ranked) == 2)
+        self.assertEqual(ranked[1], ("telath",))
+
+    def test_the_circuit_ranks_merchants_off_the_loop(self):
+        # The food, heal and recall merchant rankings plan a route to each
+        # merchant: 10 s, 6 s and 2 s from world_7_79 offline.
+        import threading
+        from .navigation import PLANNING
+        from .planner import PlanningClient
+
+        release = threading.Event()
+        seen = []
+
+        def resupply(client):
+            seen.append((threading.current_thread(), client))
+            release.wait(2)
+            return "shop trip"
+
+        task = FarmCircuitTask(WorldGraph(), [("/a", "treant")], clock=lambda: 10.0)
+        task._new_food_resupply = resupply
+        client = self.client(food=300)
+        self.assertEqual(task._food_trip(client), (PLANNING, "shop"))
+        self.wait_for(lambda: seen)
+        self.assertEqual(task._food_trip(client), (PLANNING, "shop"))
+        release.set()
+        self.wait_for(lambda: task._plans._plans["food-resupply"].future.done())
+        self.assertEqual(task._food_trip(client), ("shop trip", "shop"))
+        self.assertEqual(len(seen), 1)
+        self.assertIsNot(seen[0][0], threading.main_thread())
+        self.assertIsInstance(seen[0][1], PlanningClient)
+
+    def test_on_the_worker_a_route_plans_on_the_planner_view(self):
+        from . import planner as planner_module
+
+        graph = WorldGraph()
+        task = NavigateTask(graph, "/goal")
+        self.assertIs(task.graph, graph)
+        graph.planner_view()
+        on_worker = planner_module.submit(lambda: task.graph).result(5)
+        self.assertIs(on_worker, graph.planner_view())
+        self.assertIsNot(on_worker, graph)
+        self.assertIs(graph.planner_view().planner_view(), graph.planner_view())
+
+    def test_a_ranking_clears_the_components_once(self):
+        # Each unreachable priest cleared and rebuilt the component cache
+        # (1.1 to 1.3 s each, about 22 s of the ranking from world_7_79).
+        from . import navigation as navigation_module
+        from .navigation import temple_food_trip
+
+        graph = self.priests_graph()
+        graph.temple_priests.append(navigation_module.DialogueVendor(
+            "/shattered_islands/world_9_70", 1, 1, "Third", ""))
+        clears = []
+        original = navigation_module._clear_components
+
+        def clear(target):
+            clears.append(target)
+            original(target)
+
+        def no_route(*_args, **_kwargs):
+            raise ValueError("no component route")
+
+        with patch.object(navigation_module, "_clear_components", clear), \
+                patch.object(WorldGraph, "route_points", no_route):
+            self.assertIsNone(temple_food_trip(graph, self.client()))
+            self.assertEqual(clears, [graph])
+            # A single trip still retries once with fresh components.
+            task = NavigateTask(graph, "/shattered_islands/world_8_78", (4, 9))
+            with self.assertRaises(ValueError):
+                task._plan(self.client())
+        self.assertEqual(clears, [graph, graph])
+
+    def test_the_planner_view_has_its_own_caches(self):
+        graph = built_graph()
+        view = graph.planner_view()
+        self.assertIs(graph.planner_view(), view)
+        self.assertIs(view.nodes, graph.nodes)
+        for name in WorldGraph._PLANNER_CACHES:
+            self.assertIsNot(getattr(view, name), getattr(graph, name))
+        self.assertIsNot(view.named_spawns, graph.named_spawns)
+        graph._component_cache[("/probe", False, (0, 0))] = frozenset()
+        self.assertNotIn(("/probe", False, (0, 0)), view._component_cache)
+        del graph._component_cache[("/probe", False, (0, 0))]
+        # A lookup that grows the loop's defaultdict leaves the view's alone.
+        graph.savebeds["/probe"]
+        self.assertNotIn("/probe", view.savebeds)
+        del graph.savebeds["/probe"]
+
+    def test_a_planning_client_is_a_snapshot(self):
+        from .planner import PlanningClient
+
+        client = self.client()
+        bread = Item(61, item_type=c.TYPE_FOOD, name="bread", quantity=2)
+        client.state.place_item(bread, client.state.player_tag)
+        recorded = []
+        client.record_action = lambda action, detail="", **_: recorded.append(action)
+        proxy = PlanningClient(client)
+        client.state.stats["food"] = 999
+        client.state.map.path = "/elsewhere"
+        bread.quantity = 1
+        client.state.remove_item(61)
+        self.assertEqual(proxy.state.stats["food"], 60)
+        self.assertEqual(proxy.state.map.path, self.BED)
+        self.assertEqual([item.quantity for item in proxy.state.inventory], [2])
+        # Reads reach her client; writes and recorded actions stay here...
+        self.assertIs(proxy.config, client.config)
+        proxy._planner_probe = "planner cache"
+        self.assertFalse(hasattr(client, "_planner_probe"))
+        proxy.record_action("navigation-threat-fallback", "probe")
+        self.assertEqual(recorded, [])
+        # ...until the loop replays them.
+        proxy.replay_actions(client)
+        self.assertEqual(recorded, ["navigation-threat-fallback"])
+        proxy.replay_actions(client)
+        self.assertEqual(recorded, ["navigation-threat-fallback"])
+
+    def test_the_watchdog_records_a_stalled_loop(self):
+        from . import alerts
+        from .planner import LoopWatchdog
+
+        client = self.client()
+        watchdog = LoopWatchdog(client, describe=lambda: "autoplay:level-115",
+                                interval=0.02, threshold=0.15)
+
+        async def stall():
+            watching = asyncio.create_task(watchdog.run())
+            await asyncio.sleep(0.05)
+            time.sleep(0.3)  # a planner holding the loop
+            await asyncio.sleep(0.05)
+            watching.cancel()
+
+        with self.assertLogs("atrinik_bot.planner", "WARNING"):
+            asyncio.run(stall())
+        self.assertEqual(watchdog.stalls, 1)
+        self.assertGreaterEqual(watchdog.worst, 0.2)
+        stalls = [record for record in client.decision_history
+                  if record["action"] == "event-loop-stall"]
+        self.assertEqual(len(stalls), 1)
+        self.assertRegex(stalls[0]["detail"], r"^0\.\ds late in autoplay:level-115$")
+        # The dashboard alerts it for a while.
+        found = alerts.active(client.state, client.decision_history, alerts.ProgressWatch(),
+                              autoplay_started_at=None)
+        self.assertEqual([alert["id"] for alert in found], ["loop-stall"])
+        later = alerts.active(client.state, client.decision_history, alerts.ProgressWatch(),
+                              autoplay_started_at=None,
+                              now=time.time() + alerts.LOOP_STALL_ALERT_SECONDS + 1)
+        self.assertEqual(later, [])
+
+    def test_the_engine_names_what_it_runs(self):
+        client = self.client()
+        engine = TaskEngine(client)
+        self.assertEqual(engine.running_context(), "idle")
+        autoplay = AutoplayTask(WorldGraph())
+        autoplay.child = BotTask("temple-food")
+        engine.task = autoplay
+        client.action_context = "safety"
+        self.assertEqual(engine.running_context(),
+                         "autoplay:level-115 > temple-food (safety)")
 
 
 if __name__ == "__main__":

@@ -8903,6 +8903,19 @@ class TaskEngine:
         self.step_error_count = 0
         self.step_error_since = 0.0
 
+    def running_context(self) -> str:
+        """What the engine is running, for the event-loop watchdog
+        (planner.LoopWatchdog): its task and that task's child, or idle,
+        and the client's action context."""
+        task = self.task
+        names = ["idle"] if task is None else [task.name]
+        child = getattr(task, "child", None)
+        if isinstance(child, BotTask):
+            names.append(child.name)
+        text = " > ".join(names)
+        context = getattr(self.client, "action_context", "")
+        return f"{text} ({context})" if context else text
+
     def set_task(self, task: BotTask | None) -> None:
         self.task = task
         if task is not None:
@@ -8961,7 +8974,8 @@ class TaskEngine:
                 self.client.state.phase != "playing"):
             if survival is not None:
                 # A task owns her now, or the connection is gone: a trip in
-                # flight is rebuilt from scratch if she still needs it.
+                # flight is rebuilt if she still needs it, to the priest
+                # already chosen (TempleFoodPlanner), with no new ranking.
                 survival.drop()
             return False
         if survival is not None:

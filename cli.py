@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .build_info import build_info
+from .planner import LoopWatchdog
 from .compatibility import (CompatibilityError, configure_cached_bundle,
                             default_cache_root, doctor, install_bundle,
                             load_lock, preflight_lock)
@@ -811,6 +812,10 @@ async def main_async(args: argparse.Namespace) -> None:
     # which the CLI's approve and the filer require (phase F6), in every
     # mode; it never ends by itself, so it is cancelled when the rest end.
     screening = asyncio.create_task(client.screen_feedback_periodically())
+    # Records every event-loop stall over a second, with what was running
+    # (planner.LoopWatchdog, docs/ROUTING.md 1.12).
+    watching = asyncio.create_task(
+        LoopWatchdog(client, describe=engine.running_context).run())
     if client.farm_analyzer is not None:
         tasks.append(asyncio.create_task(
             run_periodically(client.farm_analyzer, client)))
@@ -818,6 +823,7 @@ async def main_async(args: argparse.Namespace) -> None:
         await asyncio.gather(*tasks)
     finally:
         screening.cancel()
+        watching.cancel()
         if client.farm_analyzer is not None:
             await client.farm_analyzer.close()
         if web_server is not None:

@@ -22,7 +22,7 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          WorldGraph, analyzer_farm_selection,
                          farm_home_first, farm_home_walk,
                          farming_unsafe_reason, food_reserve, hungry,
-                         temple_food_trip)
+                         PLANNING, TempleFoodPlanner)
 from .alerts import HUNGRY_FOOD
 from .quest_tasks import EscapingDesertedIslandTask
 from .route_blocks import map_subject
@@ -88,6 +88,8 @@ class AutoplayTask(BotTask):
         self._consecutive_failures = 0
         self._awaiting_ranking_recorded = False
         self._temple_food_retry_at = 0.0
+        # The temple ranking, off the event loop (ROUTING 1.12).
+        self.food_planner = TempleFoodPlanner()
         self._farm_home_first_retry_at = 0.0
         # Priests whose food trip failed, until when they are passed over.
         self._failed_priests: dict[str, float] = {}
@@ -129,16 +131,23 @@ class AutoplayTask(BotTask):
                     self.MANA_CRYSTAL_QUEST in client.state.quests)
 
     async def _start_temple_food(self, client: AtrinikClient) -> bool:
-        """Pause the current phase for the free temple food service."""
+        """Pause the current phase for the free temple food service.
+
+        False also while the priest ranking runs off the loop
+        (TempleFoodPlanner): the current phase carries on meanwhile."""
         now = time.monotonic()
-        if self.phase != "temple-food" or self.child is None:
-            # A new hunger episode, not the fallback after a failed trip.
+        if not self.food_planner.planning and (
+                self.phase != "temple-food" or self.child is None):
+            # A new hunger episode, not the fallback after a failed trip
+            # (whose ranking may finish once the failed trip is gone).
             self._hunger_fallback_used = False
         self._failed_priests = {
             name: until for name, until in self._failed_priests.items()
             if until > now}
-        trip = temple_food_trip(self.graph, client,
-                                exclude=self._avoided_priests())
+        trip = self.food_planner.trip(self.graph, client,
+                                      exclude=self._avoided_priests())
+        if trip is PLANNING:
+            return False
         if trip is None:
             self._temple_food_retry_at = (
                 now + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
@@ -186,14 +195,20 @@ class AutoplayTask(BotTask):
                 time.monotonic() + self.TEMPLE_PRIEST_RETRY)
         if not self._hunger_fallback_used and hungry(client):
             self._hunger_fallback_used = True
-            if await self._start_temple_food(client):
+            started = await self._start_temple_food(client)
+            if started or self.food_planner.planning:
                 log.warning("autoplay temple food failed: %s; "
                             "trying another priest", failed)
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("autoplay-retry",
                              f"{failed}; trying another priest")
+            if started:
                 return True
+            if self.food_planner.planning:
+                # Its ranking runs off the loop: the failed trip ends now,
+                # and the next ticks start the trip it finds.
+                return False
         self._temple_food_retry_at = (
             time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
         return False
@@ -714,6 +729,9 @@ class AutoplayTask(BotTask):
                 return
             completed_phase = self.phase
             self.child = None
+            if completed_phase == "temple-food":
+                # Fed: the next hunger episode ranks the priests afresh.
+                self.food_planner.forget()
             self._consecutive_failures = 0
             self._retry_at = 0.0
             if completed_phase == "intro-quest":
@@ -835,9 +853,14 @@ class IdleSurvival:
         # Bumped by drop and hold, which the dashboard and the engine call
         # while a tick awaits: the tick then leaves the trip as they left it.
         self._generation = 0
+        # The temple ranking, off the event loop (ROUTING 1.12).
+        self.food_planner = TempleFoodPlanner()
 
     def drop(self) -> None:
-        """Forget a trip in flight; a still-hungry character starts afresh."""
+        """Forget a trip in flight (a task took over, or the connection
+        dropped); a still-hungry character starts afresh. A ranking under
+        way and the priest last chosen are kept (TempleFoodPlanner): the
+        next trip needs no new ranking."""
         self.child = None
         self._generation += 1
 
@@ -924,8 +947,11 @@ class IdleSurvival:
                 not fruitless):
             # Her last meal first: the idle safety policy eats it now.
             return False
-        trip = temple_food_trip(self.graph, client,
-                                exclude=self._avoided_priests())
+        trip = self.food_planner.trip(self.graph, client,
+                                      exclude=self._avoided_priests())
+        if trip is PLANNING:
+            # The ranking runs off the loop: idle safety keeps her alive.
+            return False
         if trip is None:
             self._give_up(client, "no temple priest is reachable")
             return False
@@ -990,6 +1016,7 @@ class IdleSurvival:
             return False
         if trip.status == TaskStatus.COMPLETE:
             self.child = None
+            self.food_planner.forget()
             self._failures = 0
             self._retry_at = 0.0
             self._record(client, "idle-hunger-fed",
