@@ -481,7 +481,9 @@ about 1,000 disconnects, heals cast on a dead connection, and six
 starvations.
 
 - **Rankings run on the planner worker** (`planner.py`). One daemon
-  thread runs submitted plans in order. `BackgroundPlans.get` starts a
+  thread runs submitted plans, survival first: food rankings (the temple
+  and food merchants), then the heal restock's, then the rest; within a
+  priority in order. `BackgroundPlans.get` starts a
   ranking and answers `PLANNING` (falsy) until it is done; the tick
   carries on meanwhile (safety, healing, combat, the farm's fights). It
   covers the temple ranking (`TempleFoodPlanner`: autoplay's temple-food
@@ -491,25 +493,36 @@ starvations.
   A finished result is used only for the same inputs (the priests passed
   over, the strict flag) and within `RESULT_SECONDS` (60 s) of finishing;
   older, it is planned again. A ranking's error is raised on the tick that
-  collects it, as the ranking itself raised it before. A ranking with no
-  answer after `MAX_PENDING_SECONDS` (5 minutes) is given up
-  (`planner-timeout`) and counts as no route, so the caller's retry and
-  alert run. While the food ranking runs, the circuit starts no later
-  errand (storage, selling, banking, shopping) in its place, the heal
-  restock aside; while the heal ranking runs, no optional shopping trip:
-  survival trips keep their priority.
-- **The worker never reads live state.** `planning_client` gives it
-  `planner.PlanningClient`: a copy of her game state taken on the loop
-  (each container field copied one level deep, each item with its own
+  collects it, as the ranking itself raised it before. An identical
+  ranking (same name and inputs) is never submitted while one is queued or
+  running. A dropped ranking (its inputs changed, its result went stale,
+  its owner forgot it) is cancelled: queued, it never runs; running, its
+  next probe stops it (`PlanCancelled`). A ranking that has *run* for
+  `MAX_PENDING_SECONDS` (5 minutes; time queued behind others does not
+  count) is given up (`planner-timeout`) and counts as no route, so the
+  caller's retry and alert run. A worker that has run one job that long
+  is abandoned (`planner-replaced`): its daemon thread may finish or hang,
+  its result is never read, and a fresh worker with graph views of its own
+  takes the queue. While the food ranking runs, the circuit starts no
+  later errand (storage, selling, banking, shopping) in its place, the
+  heal restock aside; while the heal or recall ranking runs, no lesser
+  shopping trip: survival trips keep their priority.
+- **The worker reads no state the loop changes.** `planning_client`
+  gives it `planner.PlanningClient`: a copy of her game state taken on the
+  loop (each container field copied one level deep, each item with its own
   `extra`; deeper values such as tiles are shared, and the planners only
-  read them) and of her decision and action histories. Other attributes are read through to her
-  client (configuration, the analyzer's profile, read-only); attributes the
-  planners set stay on the copy, and `record_action` calls (a probe's
-  `navigation-threat-fallback`) are kept and replayed on the loop when the
-  result is collected. Her owner walls, dialogue offer and access set
-  (`PlanInputs`) are read on the loop too, because their caches live on her
-  client and in module state (`route_blocks`, `dialogue_edges`, `unlocks`);
-  with learned costs on, her learned model is refreshed on the loop first.
+  read them) and of her decision and action histories. Other attributes
+  are read through to her client: configuration, the analyzer's combat
+  profile and recall-device retry times, each read with a single lookup;
+  attributes the planners set stay on the copy, and `record_action` calls
+  (a probe's `navigation-threat-fallback`) are kept and replayed on the
+  loop when the result is collected. Her owner walls, dialogue offer and
+  access set (`PlanInputs`) are read on the loop too, because their caches
+  live on her client and in module state (`route_blocks`,
+  `dialogue_edges`, `unlocks`). With learned costs on, her learned model
+  is refreshed on the loop and frozen on the copy (its state reads as
+  never stale), so `route_costs.learned_model` on the worker returns it
+  and never opens her memory database.
 - **The worker never touches the loop's graph caches.** The map data never
   changes after `WorldGraph.build`, but searches fill and clear derived
   caches (`_component_cache`, `_route_open_cache`, `_aggro_pack_cache`,
@@ -517,29 +530,34 @@ starvations.
   `_world_search_snapshot`, `_component_access_order`). On the worker,
   `NavigateTask.graph` is `WorldGraph.planner_view()`: the same map data
   with caches of its own, and its own copies of the graph's defaultdicts
-  (a lookup of a missing key grows one). The view is made on the loop and
-  only the single worker thread plans on it, so no lock is needed and the
-  loop never waits for the worker. The native searches release the GIL;
+  (a lookup of a missing key grows one; each copy is one C-level dict
+  copy, which the GIL keeps whole). Each worker generation has its own
+  view and only that worker thread plans on it, so no lock is held while
+  planning and the loop never waits for the worker. The native searches release the GIL;
   the Python parts share it at the interpreter's switch interval, so the
   loop is slowed, never held (a replay of the incident's ranking: worst
   loop lag 12 ms, against 15 s on the loop before).
 - **One component refresh per ranking.** A failed plan is retried once
   with the components cleared, in case a stale one closed the route
   (`_refresh_components`). A ranking's probes share one refresh
-  (`ComponentRefresh`): after the first, the components are fresh, and
+  (`ComponentRefresh`, carried by its planning client, so the merchant
+  rankings share one too): after the first, the components are fresh, and
   clearing them for every unreachable priest only rebuilt them (1.1 to
   1.3 s a priest before, 0.8 s now; the ranking from `world_7_79` 23 s
   offline before, 15 s now). A single trip still retries once.
-- **A trip a disconnect dropped keeps its priest.** `TempleFoodPlanner`
-  remembers the priest it chose for `RESUME_SECONDS` (10 minutes): the
-  next trip goes to the same priest at once, one route instead of a new
-  ranking, unless that priest is passed over by then (its trip failed).
-  The trip itself is rebuilt, not resumed: a temple dialogue cut by a
-  reconnect is not continued. A ranking under way survives the reconnect
-  too. Autoplay's adaptive-farming circuits share its planner, so a
-  rebuilt circuit keeps the priest as well. A completed or failed trip,
-  and an operator hold while she is not starving, forget the priest; a
-  failed priest is also passed over for an hour.
+- **A trip a disconnect dropped keeps its priest.** A temple ranking and
+  the priest it chose hold for the map she ranked from and the priests it
+  passed over. `TempleFoodPlanner` remembers the priest for
+  `RESUME_SECONDS` (10 minutes): after a connection drop, while she is
+  still on that map, the next trip goes to the same priest at once, one
+  route instead of a new ranking; anywhere else she ranks again. The trip
+  itself is rebuilt, not resumed: a temple dialogue cut by a reconnect is
+  not continued. A ranking under way survives the reconnect too.
+  Autoplay's adaptive-farming circuits share its planner, so a rebuilt
+  circuit keeps the priest as well. A completed or failed trip, a task
+  taking over from idle survival, and an operator hold while she is not
+  starving forget the priest; a failed priest is also passed over for an
+  hour.
 - **Stalls are visible.** `planner.LoopWatchdog` sleeps 0.5 s at a time
   and measures the overshoot. A stall over 1 s logs a warning and records
   `event-loop-stall` ("2.3s late in autoplay:level-115 > adaptive-farming
