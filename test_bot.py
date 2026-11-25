@@ -5179,15 +5179,16 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             async def talk(self, message, npc):
                 self.talks.append((message, npc))
 
-        def visit(**kwargs):
+        def visit(greater="4 silver", wallet=3_000, **kwargs):
             client = FakeClient()
+            client.state.bank_balance = wallet
             task = BuyHealingStockTask("merchant", quantity=5, **kwargs)
             asyncio.run(task.tick(client))
             client.state.interface = InterfaceState(title="merchant", links=[
                 "[a=:buy balm of greater healing]Balm[/a]",
                 "[a=:buy balm of minor healing]Minor[/a]"])
             asyncio.run(task.tick(client))
-            for name, price in (("balm of greater healing", "4 silver"),
+            for name, price in (("balm of greater healing", greater),
                                 ("balm of minor healing", "1 silver")):
                 client.state.interface = InterfaceState(
                     title="merchant", objects=[Item(
@@ -5201,11 +5202,17 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(visit(spend_share=0.5), "buy 2 balm of greater healing")
         # Saving for the cure: the most heal per copper.
         self.assertEqual(visit(per_copper=True), "buy 5 balm of minor healing")
-        # A cap of 10% (200 copper) would buy no greater balm, but she
-        # still reaches her low mark of two, with what she can pay for.
-        self.assertEqual(visit(spend_share=0.1, min_quantity=2),
-                         "buy 2 balm of greater healing")
-        self.assertEqual(visit(spend_share=0.1), "buy 2 balm of minor healing")
+        # A cap of 1% (20 copper) still leaves enough for her low mark of
+        # two at the cheapest price, and no more.
+        self.assertEqual(visit(spend_share=0.01, min_quantity=2),
+                         "buy 2 balm of minor healing")
+        self.assertEqual(visit(spend_share=0.01), "buy 1 balm of minor healing")
+        # 10,000 above the reserve, a 9,000-copper balm: the low mark never
+        # lets it past the cap; minor balms instead.
+        self.assertEqual(
+            visit(greater="90 silver", wallet=11_000, spend_share=0.5,
+                  min_quantity=2),
+            "buy 5 balm of minor healing")
 
     def test_dynamic_merchant_buys_distinct_utility_groups_in_one_visit(self):
         class FakeClient:
@@ -9585,7 +9592,10 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.stats.update(sp=20, maxsp=60)
         self.assertTrue(task.pull_rest_due(client))
         client.state.stats["sp"] = 30
+        task._pull_rest_first = time.monotonic() - 200
         self.assertFalse(task.pull_rest_due(client))
+        # Rested: a later rest (after a kill-less fight) gets its full limit.
+        self.assertEqual(task._pull_rest_first, 0.0)
         # A rest that cannot finish ends at its limit, until the next kill.
         client.state.stats["hp"] = 50
         self.assertTrue(task.pull_rest_due(client))
@@ -37293,6 +37303,13 @@ class HealsLandInMeleeTests(unittest.TestCase):
         client.state.add_message(
             2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
         self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 28)
+        # A rest on an adapted margin (flee 89%), no SP and no contact:
+        # from 60% up no potion, she regenerates.
+        for hp in (200, 290):
+            client, server = self.melee(minor, self.spell(), greater, hp=hp,
+                                        sp=0)
+            self.assertIsNone(SafetyPolicy(
+                heal_below=0.98, flee_below=0.89)._usable_heal(client))
         # Broken away at 30% with no SP: the potion too.
         client, server = self.melee(minor, self.spell(), greater, hp=100,
                                     sp=0)
@@ -37312,6 +37329,20 @@ class HealsLandInMeleeTests(unittest.TestCase):
         client.state.add_message(
             2, "ffffff", "singed sapling hit you for 28 (-33) cleave damage.")
         self.assertEqual(policy._usable_heal(client).tag, 27)
+        # A bystander of another kind beside her (not hitting her), and
+        # the attacker's tile listed twice: still one attacker.
+        client, server = self.melee(minor, self.spell(), hp=280)
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 300, 0, 0, name="charred treant", target_id=300,
+            target_hp=100)
+        client.state.map.tile(9, 8).objects[4] = MapObject(
+            3, 300, 0, 0, name="charred treant", target_id=300,
+            target_hp=100)
+        client.state.map.tile(7, 8).objects[3] = MapObject(
+            3, 301, 0, 0, name="kobold", target_id=301, target_hp=100)
+        client.state.add_message(
+            2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
+        self.assertEqual(policy._usable_heal(client).tag, 24)
         # Three treants of one name beside her: three attackers, not one.
         client, server = self.melee(minor, self.spell(), hp=280)
         for tag, (x, y) in enumerate(((9, 8), (7, 8), (8, 9)), start=300):

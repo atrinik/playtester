@@ -1108,9 +1108,9 @@ so she is rarely without a heal:
   as many as the reserve leaves: greater healing before minor
   ([heals and pulls](#heals-and-pulls-2026-11-25)), spending at most half
   of her money above the reserve (`HEAL_RESTOCK_SPEND_SHARE`; always
-  enough for the cheapest one, and the cap gives way until she reaches
-  `HEAL_RESTOCK_LOW` if she can pay for that, so it never causes the
-  day's backoff), so a later depletion cure stays affordable. On the cure-funding farm it buys the most heal per copper
+  enough for `HEAL_RESTOCK_LOW` of the cheapest, so the cap never causes
+  the day's backoff and reaching the low mark never costs more than
+  that), so a later depletion cure stays affordable. On the cure-funding farm it buys the most heal per copper
   instead, with no cap. On a dangerous spot she buys up to
   `HEAL_RESTOCK_DANGER_TARGET` (10). The merchant sells at
   most what it stocks, so what arrives is counted: each purchase record
@@ -1175,8 +1175,9 @@ another one beside it.
   (`potions_first`): under attack (a hit or miss in the last 5 s) at or
   below the lower of her flee threshold and 60% (`POTION_FIRST_HEALTH`),
   or at or below the flee threshold with two or more attackers on her:
-  hostiles within 2 tiles, each counted (three treants of one name are
-  three), or two or more kinds in the hits.
+  monsters of a kind hitting her within 2 tiles, each counted once (three
+  treants of one name are three), or two or more kinds in the hits.
+  Accepted: a ranged attacker farther off counts only by its kind.
   An adapted flee threshold reaches 89%, and one treant there is what
   the spell is for; drinking from 89% would use about four potions a
   kill. Then potions, balms and scrolls come first, the biggest heal
@@ -1186,9 +1187,10 @@ another one beside it.
   healing spell she lacks the SP for gives way to the next heal, so a
   carried potion is used when her SP runs out; before, the spell's place
   in her inventory decided, and an unaffordable spell first meant no
-  heal at all. Out of combat above her flee threshold it does not: she
-  regenerates. At or below it (broken away at 30% with no SP, say) the
-  potion is used.
+  heal at all. Out of combat it does not above the lower of her flee
+  threshold and 60%: she regenerates (an adapted flee threshold can be
+  89%, and a rest there must not drink her stock). Below that (broken
+  away at 30% with no SP, say) the potion is used.
 - **Recall charges.** Word of Recall comes only on wands and rods
   (`spellist.h`), and only the Asteria sage rolls wands; at about 96
   silver she could not afford one. The recharge spell works from a
@@ -1202,7 +1204,8 @@ another one beside it.
   carries a usable scroll for an empty wand recall shopping waits for
   the farm to read it, for at most three hours
   (`RECHARGE_READ_WAIT_SECONDS`; on a no-magic map she cannot), and then
-  looks for recall stock only. On a quiet farm tick, never on a square that
+  looks for recall stock only. Accepted: the wait is kept by the farm
+  circuit, so a new autoplay run starts without it. On a quiet farm tick, never on a square that
   blocks spells, she marks the empty wand, waits for "Marked item"
   (marking toggles, so "Unmarked item" marks it again), and reads the
   scroll (`FarmTask.recharge_recall_wand`, recorded as
@@ -1232,7 +1235,8 @@ another one beside it.
   go). A rest interrupted for more than a second turns combat off and is
   logged again. `PULL_REST_LIMIT_SECONDS` (5 minutes) after the first
   rest since the last kill, interruptions or not, the rest is given up
-  until the next kill, and the dwell no longer waits for it. A fight that ends without a
+  until the next kill, and the dwell no longer waits for it. Once she is
+  rested the clock is cleared, so a later rest gets its full limit. A fight that ends without a
   kill (released, abandoned or vanished) is not measured.
 - **One at a time.** When she chooses whom to pull (nothing engaged and
   nothing within two tiles of her), a target at least

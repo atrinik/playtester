@@ -1104,9 +1104,9 @@ class SafetyPolicy:
         """Whether a fight is critical enough to drink before casting:
         under attack (recent_hostile_contact) at or below
         min(flee_below, POTION_FIRST_HEALTH), or at or below flee_below
-        with two or more attackers on her: hostiles within
-        POTION_FIRST_REACH tiles (each counted, so three treants of one
-        name are three), or two or more kinds in the hits
+        with two or more attackers on her: monsters of a kind hitting her
+        within POTION_FIRST_REACH tiles (each counted once, so three
+        treants of one name are three), or two or more kinds in the hits
         (recent_hostile_attackers). An adapted flee threshold can reach
         89%; one attacker there is what the spell is for."""
         if not recent_hostile_contact(client):
@@ -1118,12 +1118,17 @@ class SafetyPolicy:
             return True
         if ratio > self.flee_below:
             return False
+        attackers = recent_hostile_attackers(client, seconds=5.0)
+        if len(attackers) >= 2:
+            return True
+        # Each monster of a kind hitting her within reach counts once.
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
-        near = sum(1 for x, y, _ in m.targets(friendly=False)
-                   if max(abs(x - cx), abs(y - cy)) <= POTION_FIRST_REACH)
-        return (near >= 2 or
-                len(recent_hostile_attackers(client, seconds=5.0)) >= 2)
+        near = {obj.target_id for x, y, obj in m.targets(friendly=False)
+                if max(abs(x - cx), abs(y - cy)) <= POTION_FIRST_REACH and
+                any(_same_semantic_identity(name, obj.name)
+                    for name in attackers)}
+        return len(near) >= 2
 
     def _heals(self, client: AtrinikClient) -> list[Item]:
         """Healing items and healing spells she may use where she stands,
@@ -1162,16 +1167,18 @@ class SafetyPolicy:
 
     def _usable_heal(self, client: AtrinikClient) -> Item | None:
         """The first of her heals (_heals) she can use now: an item, or a
-        healing spell she can afford. Under attack, or at or below her
-        flee threshold, a spell short of SP gives way to the next heal, a
-        carried potion among them; otherwise it does not, and she
-        regenerates instead."""
+        healing spell she can afford. Under attack, or at or below
+        min(flee_below, POTION_FIRST_HEALTH), a spell short of SP gives
+        way to the next heal, a carried potion among them; otherwise it
+        does not, and she regenerates instead (an adapted flee threshold
+        can be 89%)."""
         stats = client.state.stats
         sp = int(stats.get("sp", 0) or 0)
         maxhp = max(1, int(stats.get("maxhp", 1) or 1))
         heals = self._heals(client)
         if (not recent_hostile_contact(client) and
-                int(stats.get("hp", 0) or 0) / maxhp > self.flee_below):
+                int(stats.get("hp", 0) or 0) / maxhp >
+                min(self.flee_below, POTION_FIRST_HEALTH)):
             heals = heals[:1]
         return next((
             heal for heal in heals
@@ -2921,6 +2928,8 @@ class FarmTask(BotTask):
         if (int(stats.get("hp", 0) or 0) / maxhp >= self.PULL_REST_HEALTH and
                 int(stats.get("sp", 0) or 0) >= mana):
             self._costly_kill = False
+            # Rested: the next rest gets its full limit.
+            self._pull_rest_first = 0.0
             return False
         if (self._pull_rest_first and
                 time.monotonic() - self._pull_rest_first >=
@@ -8285,7 +8294,7 @@ class BuyHealingStockTask(BotTask):
         # heals in one visit, though always enough for the cheapest one.
         self.per_copper = bool(per_copper)
         self.spend_share = min(1.0, max(0.0, float(spend_share)))
-        # At least this many whatever spend_share leaves, if she can pay.
+        # spend_share leaves at least enough for this many of the cheapest.
         self.min_quantity = max(0, int(min_quantity))
         self._budget: int | None = None
         self._spent = 0
@@ -8336,14 +8345,13 @@ class BuyHealingStockTask(BotTask):
         wallet = BuyShopUpgradeTask.wallet_value(client)
         spare = max(0, wallet - self.cash_reserve)
         if self._budget is None:
-            self._budget = max(int(spare * self.spend_share), cheapest[1])
-        capped = min(spare, self._budget - self._spent)
-        # Below min_quantity the cap gives way: she reaches the low mark
-        # with what she can pay for.
-        needed = max(0, self.min_quantity - self.bought)
+            # At least min_quantity of the cheapest: the cap never keeps
+            # her below the low mark, and never pays more than that needs.
+            self._budget = max(int(spare * self.spend_share),
+                               cheapest[1] * max(1, self.min_quantity))
+        spare = min(spare, self._budget - self._spent)
         affordable = [entry for entry in self.quotes.items()
-                      if (entry[1] <= capped or
-                          (needed and entry[1] <= spare)) and
+                      if entry[1] <= spare and
                       entry[0].casefold() not in self._bought_names]
         if not affordable:
             if self._bought_names:
@@ -8362,8 +8370,7 @@ class BuyHealingStockTask(BotTask):
             0.0 if self.per_copper else heal_estimate(entry[0]),
             heal_estimate(entry[0]) / entry[1],
             -entry[1], entry[0].casefold()))
-        count = min(self.quantity - self.bought,
-                    max(capped // cost, min(needed, spare // cost)))
+        count = min(self.quantity - self.bought, spare // cost)
         self._buying, self._count = name, count
         self._quantity_before = self._same_name(client)
         self._heals_before = heal_consumables(client, self.safety)
