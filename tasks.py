@@ -1033,8 +1033,31 @@ class SafetyPolicy:
         return next((item for item in safe
                      if item.item_type == c.TYPE_FOOD), None)
 
-    def _known_heal(self, client: AtrinikClient) -> Item | None:
-        """A healing item, or a healing spell she may cast where she stands.
+    def _heal_order(self, client: AtrinikClient,
+                    items: list[Item]) -> list[Item]:
+        """Her heals in the order she uses them. A spell, rod or wand
+        comes first, saving potions, balms and scrolls, except at or below
+        her flee threshold under attack (recent_hostile_contact): then the
+        consumables come first, since applying one waits for no action
+        timer, while in melee a cast waits for her swing (COMBAT.md,
+        "Heals in melee"). Consumables go by the most health one use
+        restores (heal_estimate), so greater healing before minor;
+        otherwise inventory order."""
+        stats = client.state.stats
+        maxhp = max(1, int(stats.get("maxhp", 1) or 1))
+        critical = (int(stats.get("hp", 0) or 0) / maxhp <= self.flee_below
+                    and recent_hostile_contact(client))
+
+        def rank(item: Item) -> tuple[bool, float]:
+            consumable = item.item_type in (c.TYPE_POTION, c.TYPE_SCROLL)
+            return (consumable != critical,
+                    -heal_estimate(item.name) if consumable else 0.0)
+
+        return sorted(items, key=rank)
+
+    def _heals(self, client: AtrinikClient) -> list[Item]:
+        """Healing items and healing spells she may use where she stands,
+        in the order she uses them (_heal_order).
 
         No spell, scroll, rod or wand on a square where the server blocks
         spellcasting, nor while a recall waits for her action timer
@@ -1044,10 +1067,11 @@ class SafetyPolicy:
         """
         retry = getattr(client, "recall_device_retry_at", None) or {}
         now = time.monotonic()
-        items = [item for item in client.state.inventory
-                 if usable_heal_item(client, item, self.healing_patterns) and
-                 not wand_known_empty(client, item) and
-                 retry.get(item.tag, 0.0) <= now]
+        items = self._heal_order(client, [
+            item for item in client.state.inventory
+            if usable_heal_item(client, item, self.healing_patterns) and
+            not wand_known_empty(client, item) and
+            retry.get(item.tag, 0.0) <= now])
         if any(item.item_type in MAGIC_BLOCKED_TYPES for item in items):
             other = [item for item in items
                      if item.item_type not in MAGIC_BLOCKED_TYPES]
@@ -1058,19 +1082,23 @@ class SafetyPolicy:
                 # another heal first; without one she casts, which tests it.
                 prefer = getattr(client, "tile_fact_prefers_other_heal", None)
                 if callable(prefer) and prefer(_square(client)) is True:
-                    found = self._find(other, self.healing_patterns)
-                    if found is not None:
-                        return found
-        return self._find(items, self.healing_patterns)
+                    items = other + [item for item in items
+                                     if item not in other]
+        return items
+
+    def _known_heal(self, client: AtrinikClient) -> Item | None:
+        """The heal she would use first (_heals), if any, SP aside."""
+        return next(iter(self._heals(client)), None)
 
     def _usable_heal(self, client: AtrinikClient) -> Item | None:
-        """A healing item, or a healing spell she can afford, if any."""
-        heal = self._known_heal(client)
-        if heal is not None and heal.item_type == c.TYPE_SPELL:
-            cost = int(heal.extra.get("cost", 0) or 0)
-            if cost > int(client.state.stats.get("sp", 0) or 0):
-                return None
-        return heal
+        """The first of her heals (_heals) she can use now: an item, or a
+        healing spell she can afford. A spell short of SP gives way to
+        the next heal, a carried potion among them."""
+        sp = int(client.state.stats.get("sp", 0) or 0)
+        return next((
+            heal for heal in self._heals(client)
+            if heal.item_type != c.TYPE_SPELL or
+            int(heal.extra.get("cost", 0) or 0) <= sp), None)
 
     def heal_in_flight(self) -> bool:
         """Whether a sent heal still awaits the server's answer."""
@@ -2163,6 +2191,25 @@ class FarmTask(BotTask):
     CASTER_STALL_SECONDS = 10.0
     LURE_STALL_SECONDS = 12.0
     UNREACHABLE_TARGET_COOLDOWN_SECONDS = 5 * 60
+    # Rest between pulls (pull_rest_due): after a kill that cost at least
+    # PULL_REST_KILL_SHARE of her maximum health, or on a spot whose
+    # analyzer danger (spot_danger, the health one kill costs) is that
+    # share or more, she pulls nothing new until she is back to
+    # PULL_REST_HEALTH and, with a healing spell, has PULL_REST_MANA of
+    # her SP (at least healing_mana_reserve). A rest ends after
+    # PULL_REST_LIMIT_SECONDS whatever she has regenerated.
+    PULL_REST_KILL_SHARE = 0.30
+    PULL_REST_HEALTH = 0.95
+    PULL_REST_MANA = 0.50
+    PULL_REST_LIMIT_SECONDS = 300.0
+    # One at a time (isolated_target): a target at least this far from
+    # every other monster in view comes before a nearer one that is not.
+    PULL_ISOLATION_TILES = 4
+    # A scroll of recharge read on an empty recall wand
+    # (recharge_recall_wand): how long each step waits for its answer, and
+    # the pause after an attempt that came to nothing.
+    RECHARGE_ANSWER_SECONDS = 5.0
+    RECHARGE_RETRY_SECONDS = 60.0
 
     def __init__(self, *, zone: str = "", target: str = "", item: str = "",
                  quantity: int = 1, level_until: int = 0,
@@ -2348,6 +2395,22 @@ class FarmTask(BotTask):
         # and when the rest was last confirmed (see training_rest_active).
         self._training_resting = False
         self._training_rest_at = 0.0
+        # The analyzer's danger of the spot she farms (the health one kill
+        # costs; 0 unknown), set by the farm circuit (pull_rest_due).
+        self.spot_danger = 0.0
+        # Her health when the current fight began, whether the last kill
+        # cost PULL_REST_KILL_SHARE or more, since when she rests between
+        # pulls (monotonic, 0 not resting) and when that rest was last
+        # confirmed; a rest given up at its limit waits for the next kill.
+        self._fight_start_hp: int | None = None
+        self._costly_kill = False
+        self._pull_rest_since = 0.0
+        self._pull_rest_at = 0.0
+        self._pull_rest_given_up = False
+        # A recharge under way: (wand tag, scroll tag, "mark" or "read",
+        # sent at, wall clock), and no new one before this (wall clock).
+        self._recharge: tuple[int, int, str, float] | None = None
+        self._recharge_retry_at = 0.0
         # Resting for want of a usable heal or a ready recall
         # (unprepared_for_trips), recorded once per rest, and its cap: its
         # own standalone, its circuit's within one (FarmCircuitTask).
@@ -2683,6 +2746,8 @@ class FarmTask(BotTask):
                 now - last_seen <= 60.0):
             return
         self._engaged_target = None
+        if kill_confirmed:
+            self.note_kill_cost(client)
         if (client.state.map.path != path or now - last_seen > 6.0):
             return
         if kill_confirmed:
@@ -2727,6 +2792,133 @@ class FarmTask(BotTask):
                 recorder("corpse-probe-queued",
                          f"{path} ({world_x}, {world_y})")
 
+    def note_kill_cost(self, client: AtrinikClient) -> None:
+        """A kill ends the fight: what it cost her, from her health when
+        it began (_fight_start_hp). A cost of PULL_REST_KILL_SHARE of her
+        maximum or more makes her rest before the next pull
+        (pull_rest_due); recorded as ``costly-kill``."""
+        start, self._fight_start_hp = self._fight_start_hp, None
+        self._pull_rest_given_up = False
+        if start is None:
+            return
+        stats = client.state.stats
+        maxhp = max(1, int(stats.get("maxhp", 1) or 1))
+        cost = (start - int(stats.get("hp", 0) or 0)) / maxhp
+        if cost < self.PULL_REST_KILL_SHARE:
+            return
+        self._costly_kill = True
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("costly-kill", f"cost={cost:.0%} of her health")
+
+    def pull_rest_due(self, client: AtrinikClient) -> bool:
+        """Whether she rests before the next pull: after a costly kill
+        (note_kill_cost) or on a dangerous spot (spot_danger), until she
+        is back to PULL_REST_HEALTH and, with a healing spell, has
+        PULL_REST_MANA of her SP (at least healing_mana_reserve). A rest
+        that reaches PULL_REST_LIMIT_SECONDS is given up until the next
+        kill, so a spot where she cannot regenerate never holds her."""
+        stats = client.state.stats
+        maxhp = max(1, int(stats.get("maxhp", 1) or 1))
+        dangerous = (self._costly_kill or
+                     self.spot_danger / maxhp >= self.PULL_REST_KILL_SHARE)
+        if not dangerous or self._pull_rest_given_up:
+            return False
+        reserve = self.healing_mana_reserve(client)
+        maxsp = int(stats.get("maxsp", 0) or 0)
+        mana = (min(maxsp, max(reserve, int(maxsp * self.PULL_REST_MANA)))
+                if reserve > 0 else 0)
+        if (int(stats.get("hp", 0) or 0) / maxhp >= self.PULL_REST_HEALTH and
+                int(stats.get("sp", 0) or 0) >= mana):
+            self._costly_kill = False
+            return False
+        if (self._pull_rest_since and time.monotonic() - self._pull_rest_since
+                >= self.PULL_REST_LIMIT_SECONDS):
+            self._costly_kill = False
+            self._pull_rest_given_up = True
+            return False
+        return True
+
+    def pull_rest_active(self) -> bool:
+        """Whether a rest between pulls was confirmed just now."""
+        return bool(self._pull_rest_since and
+                    time.monotonic() - self._pull_rest_at <= 1.0)
+
+    def isolated_target(self, entry: tuple, threats: list[tuple]) -> bool:
+        """Whether a target stands at least PULL_ISOLATION_TILES from every
+        other monster in view: pulling it brings one at a time."""
+        return all(
+            max(abs(other[1] - entry[1]), abs(other[2] - entry[2])) >=
+            self.PULL_ISOLATION_TILES
+            for other in threats
+            if other[3].target_id != entry[3].target_id)
+
+    async def recharge_recall_wand(self, client: AtrinikClient) -> None:
+        """Recharge an empty recall wand with a carried scroll of recharge
+        while nothing threatens. The recharge spell works on the marked
+        wand (spell_effect.c recharge; 1 in 6 the wand explodes), and
+        marking toggles (socket_command_item_mark): she marks the wand,
+        and once the server says "Marked item", reads the scroll. A
+        recharged wand's charges are forgotten, so check_recall_wand
+        examines it again. Anything else waits RECHARGE_RETRY_SECONDS."""
+        now = time.time()
+        pending = self._recharge
+        if pending is not None:
+            wand_tag, scroll_tag, stage, sent_at = pending
+            answers = [
+                str(entry[-1]).strip()
+                for entry in getattr(client.state, "messages", ())
+                if float(entry[0]) >= sent_at and
+                self_improvement.from_server(entry)]
+            recorder = getattr(client, "record_action", None)
+            if stage == "mark":
+                if any(text.startswith("Marked item") for text in answers):
+                    await client.apply(scroll_tag)
+                    self._recharge = (wand_tag, scroll_tag, "read", now)
+                elif any(text.startswith("Unmarked item") for text in answers):
+                    # It was marked already: mark it again.
+                    await client.mark_item(wand_tag)
+                    self._recharge = (wand_tag, scroll_tag, "mark", now)
+                elif now - sent_at > self.RECHARGE_ANSWER_SECONDS:
+                    self._recharge = None
+                    self._recharge_retry_at = now + self.RECHARGE_RETRY_SECONDS
+                return
+            glowed = any("glows with power" in text for text in answers)
+            exploded = any("explodes" in text for text in answers)
+            if not (glowed or exploded):
+                if now - sent_at <= self.RECHARGE_ANSWER_SECONDS:
+                    return
+                self._recharge_retry_at = now + self.RECHARGE_RETRY_SECONDS
+            elif glowed:
+                wand_charges(client).pop(wand_tag, None)
+                self._wand_examined.discard(wand_tag)
+            if recorder is not None:
+                recorder("recall-wand-recharge",
+                         f"tag={wand_tag} " + (
+                             "recharged" if glowed else
+                             "exploded" if exploded else "no answer"))
+            self._recharge = None
+            return
+        if now < self._recharge_retry_at or not reads_scrolls(client):
+            return
+        policy = InventoryPolicy()
+        bad = c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED
+        scroll = next((
+            item for item in client.state.inventory
+            if item.item_type == c.TYPE_SCROLL and
+            re.search(r"\brecharge\b", item.name, re.I) and
+            policy.identified(item) and not item.flags & bad), None)
+        wand = next((
+            item for item in client.state.inventory
+            if item.item_type == c.TYPE_WAND and
+            re.search(r"\bword of recall\b", item.name, re.I) and
+            policy.identified(item) and not item.flags & bad and
+            wand_known_empty(client, item)), None)
+        if scroll is None or wand is None:
+            return
+        await client.mark_item(wand.tag)
+        self._recharge = (wand.tag, scroll.tag, "mark", now)
+
     def remember_engagement(self, client: AtrinikClient, x: int, y: int,
                             target_id: int) -> None:
         m = client.state.map
@@ -2752,6 +2944,9 @@ class FarmTask(BotTask):
             m.world_x + x - cx,
             m.world_y + y - cy,
             time.monotonic())
+        if self._fight_start_hp is None:
+            self._fight_start_hp = int(
+                client.state.stats.get("hp", 0) or 0)
         self._last_threat_origin = (
             m.path, m.world_x + x - cx, m.world_y + y - cy,
             time.monotonic())
@@ -2998,22 +3193,26 @@ class FarmTask(BotTask):
             if item.item_type == c.TYPE_SKILL and
             self.combat_skill in item.name.casefold()), None)
 
-    def single_target_wizardry(self, client: AtrinikClient) -> bool:
-        """Whether Wizardry training must fight one creature at a time.
-
-        Until this farm casts Firestorm, which strikes several at once, a
-        second creature beside the target only adds damage taken, never
-        Wizardry XP. Merely knowing Firestorm is not enough.
-        """
-        casts_firestorm = (
+    def casts_firestorm(self, client: AtrinikClient) -> bool:
+        """Whether this farm casts Firestorm, which strikes several at
+        once: configured and known. Merely knowing it is not enough."""
+        return (
             self.combat_spell == "firestorm" and
             any(item.item_type == c.TYPE_SPELL and
                 item.name.casefold() == "firestorm"
                 for item in client.state.inventory))
+
+    def single_target_wizardry(self, client: AtrinikClient) -> bool:
+        """Whether Wizardry training must fight one creature at a time.
+
+        Until this farm casts Firestorm (casts_firestorm), a second
+        creature beside the target only adds damage taken, never Wizardry
+        XP.
+        """
         return bool(
             "wizardry" in self.combat_skill and
             self.training_active(client) and
-            not casts_firestorm)
+            not self.casts_firestorm(client))
 
     def spell_only_training(self, client: AtrinikClient) -> bool:
         """Whether every hit on a training target must be the trained spell.
@@ -6371,6 +6570,8 @@ class FarmTask(BotTask):
         if not hostile_contact and not initial_threats:
             self.remember_safe_position(client)
             await self.check_recall_wand(client)
+            if self._wand_examine is None and not gear_examine_pending(client):
+                await self.recharge_recall_wand(client)
             if self._wand_examine is None:
                 # Examine carried gear for its effective stats, one item at
                 # a time behind any wand examine (equipment.GearExaminer).
@@ -6681,6 +6882,32 @@ class FarmTask(BotTask):
                 self._last_action = time.monotonic()
                 return
         self._training_resting = False
+        if (engaged is None and
+                (nearest_threat is None or nearest_threat[0] > 2) and
+                not any(active_threat(entry) for entry in threats
+                        if entry[3].target_id not in pulled_aside_ids) and
+                not recent_hostile_contact(client)):
+            if self.pull_rest_due(client):
+                # A kill cost much of her health (or the spot's kills do):
+                # rest to near full before the next pull, combat off.
+                now = time.monotonic()
+                if not self._pull_rest_since:
+                    self._pull_rest_since = now
+                    stats = client.state.stats
+                    recorder = getattr(client, "record_action", None)
+                    if recorder is not None:
+                        recorder(
+                            "pull-rest",
+                            f"hp={stats.get('hp', 0)}/{stats.get('maxhp', 0)} "
+                            f"sp={stats.get('sp', 0)}/{stats.get('maxsp', 0)}")
+                    await client.clear_actions()
+                    await client.set_combat(False)
+                self._pull_rest_at = now
+                if await self.maintain_inventory(client):
+                    return
+                self._last_action = now
+                return
+            self._pull_rest_since = 0.0
         if caster is not None and caster[3].target_id not in pulled_aside_ids:
             # A caster hurting her within reach comes before any melee
             # attacker, the engaged one included (caster_first).
@@ -6727,6 +6954,11 @@ class FarmTask(BotTask):
                     await client.set_combat(False)
                 self._last_action = time.monotonic()
                 return
+        # One at a time (isolated_target) when she chooses whom to pull:
+        # nothing within two tiles of her, and no Firestorm for a pack.
+        one_at_a_time = (engaged is None and
+                         (nearest_threat is None or nearest_threat[0] > 2) and
+                         not self.casts_firestorm(client))
         if engaged is None and self.single_target_wizardry(client):
             # Pull only a lone creature (see _lone_target); one already
             # beside her or coming at her is fought regardless.
@@ -6737,7 +6969,10 @@ class FarmTask(BotTask):
         if (engaged is None and nearest_threat is not None and
                 nearest_threat[0] > 2):
             pull_candidate = min(
-                targets, key=lambda value: value[0], default=None)
+                targets, key=lambda value: (
+                    not one_at_a_time or
+                    not self.isolated_target(value, threats), value[0]),
+                default=None)
             finisher_ready = bool(
                 pull_candidate and
                 self.should_training_finish(client, pull_candidate[3]))
@@ -6762,10 +6997,14 @@ class FarmTask(BotTask):
                 self._last_action = time.monotonic()
                 return
         if targets:
+            # One at a time: an isolated target (isolated_target) before a
+            # nearer one beside others.
             distance, x, y, obj = min(
                 targets, key=lambda value: (
                     self._priority_target_ids.get(
                         value[3].target_id, len(self.priority_spawns)),
+                    one_at_a_time and
+                    not self.isolated_target(value, threats),
                     value[0]))
             self.remember_engagement(client, x, y, obj.target_id)
             if distance <= 2 and self.pull_waiting(obj.target_id):
@@ -7882,15 +8121,20 @@ def heal_estimate(name: str) -> float:
 
 
 class BuyHealingStockTask(BotTask):
-    """Buy healing consumables from a dialogue merchant: the most estimated
-    heal per copper (heal_estimate) she can use and pay for.
+    """Buy healing consumables from a dialogue merchant: the biggest heal
+    (heal_estimate) she can use and pay for, so greater healing before
+    minor, then the most heal per copper.
 
     It opens the merchant's stock and asks the price of every healing
     choice she can use (usable_heal_consumable), then buys up to
-    ``quantity`` of the best one, keeping ``cash_reserve``. The cheapest
+    ``quantity`` of the best one, keeping ``cash_reserve``. When the
+    merchant had fewer (a rolled balm or potion is often a single one),
+    the next best she can still pay for makes up the rest. The cheapest
     price is recorded under ``observation_key``. With no usable healing
     stock it completes without buying (``checked``, not ``purchased``);
     when she can pay for none it fails naming the cheapest price.
+    ``bought`` counts every heal that arrived; ``bought_name`` is the
+    first (best) one bought.
     """
 
     QUOTE_WAIT_SECONDS = 5.0
@@ -7911,6 +8155,11 @@ class BuyHealingStockTask(BotTask):
         self.purchased = False
         self.bought = 0
         self.bought_name = ""
+        # The choice being bought now, how many were asked for, and the
+        # names already bought (never asked again).
+        self._buying = ""
+        self._count = 0
+        self._bought_names: set[str] = set()
         self._pending: list[str] = []
         self._asking = ""
         self._stage = ""
@@ -7920,7 +8169,7 @@ class BuyHealingStockTask(BotTask):
         self._reserved = 0
 
     def _same_name(self, client: AtrinikClient) -> int:
-        names = stock_names(self.bought_name)
+        names = stock_names(self._buying)
         return sum(max(1, int(item.quantity or 1))
                    for item in client.state.inventory
                    if item.name.casefold() in names)
@@ -7939,23 +8188,32 @@ class BuyHealingStockTask(BotTask):
         cheapest = min(self.quotes.items(),
                        key=lambda entry: (entry[1], entry[0].casefold()))
         recorder = getattr(client, "record_vendor_quote", None)
-        if recorder is not None and self.observation_key:
+        if (recorder is not None and self.observation_key and
+                not self._bought_names):
             recorder(self.observation_key, *cheapest)
         wallet = BuyShopUpgradeTask.wallet_value(client)
         spare = max(0, wallet - self.cash_reserve)
         affordable = [entry for entry in self.quotes.items()
-                      if entry[1] <= spare]
+                      if entry[1] <= spare and
+                      entry[0].casefold() not in self._bought_names]
         if not affordable:
+            if self._bought_names:
+                # Some bought, the rest is out of reach: done.
+                self.complete()
+                return
             self.fail(f"healing stock costs at least "
                       f"{format_money(cheapest[1])}, wallet "
                       f"{format_money(wallet)}, reserve "
                       f"{format_money(self.cash_reserve)}")
             return
+        # The biggest heal first: one greater heal in a fight is worth
+        # several minor ones (live, 2026-11-25, five minor-healing
+        # scrolls at heal per copper could not keep up with a treant).
         name, cost = max(affordable, key=lambda entry: (
-            heal_estimate(entry[0]) / entry[1], -entry[1],
-            entry[0].casefold()))
-        count = min(self.quantity, spare // cost)
-        self.bought_name, self.bought = name, count
+            heal_estimate(entry[0]), heal_estimate(entry[0]) / entry[1],
+            -entry[1], entry[0].casefold()))
+        count = min(self.quantity - self.bought, spare // cost)
+        self._buying, self._count = name, count
         self._quantity_before = self._same_name(client)
         self._heals_before = heal_consumables(client, self.safety)
         client.state.interface = None
@@ -8026,23 +8284,30 @@ class BuyHealingStockTask(BotTask):
                           self._heals_before)
             if arrived > 0:
                 self.purchased = True
-                if arrived < self.bought:
+                arrived = min(arrived, self._count)
+                if arrived < self._count:
                     # The merchant had fewer: give back what the bank
                     # funds reserved for the rest (account_purchase).
-                    refund = min(self._reserved, (self.bought - arrived) *
-                                 self.quotes[self.bought_name])
+                    refund = min(self._reserved, (self._count - arrived) *
+                                 self.quotes[self._buying])
                     if refund and getattr(client.state, "bank_balance_known",
                                           False):
                         BuyShopUpgradeTask._set_bank_balance(
                             client, int(client.state.bank_balance) + refund)
-                    self.bought = arrived
+                self.bought += arrived
+                self.bought_name = self.bought_name or self._buying
+                self._bought_names.add(self._buying.casefold())
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("heal-restock-buy",
-                             f"{self.bought} {self.bought_name} at "
-                             f"{format_money(self.quotes[self.bought_name])}"
+                             f"{arrived} {self._buying} at "
+                             f"{format_money(self.quotes[self._buying])}"
                              " each")
-                self.complete()
+                if self.bought < self.quantity:
+                    # Short: the next best choice makes up the rest.
+                    await self._buy(client, now)
+                else:
+                    self.complete()
                 return
             payload = BuyDialogueStockTask._interface_payload(client).casefold()
             if "carry that much" in payload:

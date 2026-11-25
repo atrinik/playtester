@@ -443,8 +443,9 @@ steps away and keeps her distance.
   at once. An empty wand is no longer an emergency candidate, and recall
   shopping treats it as no device. When the last recall source is known
   empty, the recall shop check is reset so a replacement is bought, once
-  she can afford it, without waiting out its daily interval. Recharging
-  needs the recharge spell, which she does not have. She farms on without
+  she can afford it, without waiting out its daily interval. A scroll of
+  recharge refills one
+  ([heals and pulls](#heals-and-pulls-2026-11-25)). She farms on without
   a working recall
   ([owner decision, 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22)).
 - **Hazardous for her kit.** Each farm failure review now stores the
@@ -799,8 +800,9 @@ Before a farm circuit walks out, it examines every recall wand of unknown
 charge and waits for the answers (or the 5 s timeout). The empty mark is
 kept by item tag, and live, each life brought new tags for the same two
 wands (most likely her checkpoint relogs), so she walked back out and
-fired them again. Nobody sells recall charges: recharging needs the
-recharge spell, so an empty wand is replaced, never refilled.
+fired them again. Nobody sells recall charges, but a merchant's rolled
+scroll of recharge refills an empty wand
+([heals and pulls](#heals-and-pulls-2026-11-25)).
 
 ## A working recall is never a blocker (owner decision, 2026-11-22)
 
@@ -1100,14 +1102,16 @@ so she is rarely without a heal:
   alert. After a fight during the rest, combat off is sent once more.
   The walk keeps the trip's safety policy (heal at 85 %, flee at 70 %).
 - **What.** `BuyHealingStockTask` asks the price of every healing choice
-  she can use and buys up to `HEAL_RESTOCK_TARGET` (5) of the one with
-  the most heal per copper (`heal_estimate`: the server's minor and
-  greater healing rolls at the item's level), as many as the reserve
-  leaves. Heal per copper favours cheap minor heals over a bigger greater
-  heal; that is intended, more uses for the money. The merchant sells at
-  most what it stocks, so what arrives is counted: the purchase record
-  says that many, and the bank reservation for the rest is given back.
-  The cheapest price is recorded. A merchant answer that she cannot carry
+  she can use and buys up to `HEAL_RESTOCK_TARGET` (5) of the biggest
+  heal she can pay for (`heal_estimate`: the server's minor and greater
+  healing rolls at the item's level), then of the most heal per copper,
+  as many as the reserve leaves: greater healing before minor
+  ([heals and pulls](#heals-and-pulls-2026-11-25)). On a dangerous spot
+  she buys up to `HEAL_RESTOCK_DANGER_TARGET` (10). The merchant sells at
+  most what it stocks, so what arrives is counted: each purchase record
+  says that many, the bank reservation for the rest is given back, and
+  the next best choice she can still pay for makes up the rest. The
+  cheapest price is recorded. A merchant answer that she cannot carry
   them ends it at once.
 - **An optional trip, not an essential one.** It never crosses an owner
   block, keeps the errand budget and planning with the safety λ, and is
@@ -1140,6 +1144,73 @@ so she is rarely without a heal:
   stock in back-to-back trips. A strict route over its budget is
   declined like any optional trip's and counts as a failed trip (two
   hours).
+
+## Heals and pulls (2026-11-25)
+
+Read from her post-mortems and journal on the Burnt Forest (v1.106.0):
+charred treants (level 31-40, about 370-430 health, no spells, slow)
+cost her about 150 of her 356 health per kill. She had bought five
+scrolls of minor healing and no potion, all three recall wands were
+empty, and after a kill she pulled the next treant hurt, often with
+another one beside it.
+
+- **Real heals first.** The heal restock buys the biggest heal first
+  ([What](#healing-potion-restock)): a potion or balm of greater
+  healing (about `2*rndm(4, 5+L)+12`) before minor healing. In content
+  the only authored healing stock is the Asteria merchant's scroll of
+  minor healing; balms and potions of greater healing come only from
+  the `random_potion` rolls of that merchant and of Greyton's Leria, so
+  a rolled one is often a single item, and the scrolls make up the rest.
+  On a spot whose analyzer danger (the health one kill costs) is at
+  least `DANGEROUS_SPOT_SHARE` (30%) of her maximum health she stocks up
+  to `HEAL_RESTOCK_DANGER_TARGET` (10) instead of 5.
+- **Potions in melee.** Her safety policy orders her heals
+  (`SafetyPolicy._heal_order`). A spell, rod or wand comes first,
+  saving the consumables, except at or below her flee threshold under
+  attack (a hit or miss in the last 5 s): then potions, balms and
+  scrolls come first, the biggest heal first: applying one
+  waits for no action timer, while a cast waits for her swing
+  ([heals in melee](#heals-in-melee-2026-11-23)). A healing spell she
+  lacks the SP for gives way to the next heal, so a carried potion is
+  used when her SP runs out; before, the spell's place in her inventory
+  decided, and an unaffordable spell first meant no heal at all.
+- **Recall charges.** Word of Recall comes only on wands and rods
+  (`spellist.h`), and only the Asteria sage rolls wands; at about 96
+  silver she could not afford one. The recharge spell works from a
+  scroll (`types/scroll.c`, `spell_effect.c` `recharge`), and scrolls
+  of recharge are rolled in `random_scroll` stock (the sage's and
+  Greyton's Nuzem). With an identified recall wand known empty, and the
+  skills to read a scroll, recall shopping now also buys a scroll of
+  recharge, after any recall device the merchant has
+  (`_empty_recall_wand`). On a quiet farm tick she marks the empty wand,
+  waits for "Marked item" (marking toggles, so "Unmarked item" marks it
+  again), and reads the scroll (`FarmTask.recharge_recall_wand`,
+  recorded as `recall-wand-recharge`). A wand that glows has its charges
+  read again by examine; one in six explodes. Recall stays an
+  opportunity, never a precondition
+  ([owner decision, 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22)).
+- **Rest between pulls.** A kill that cost at least
+  `PULL_REST_KILL_SHARE` (30%) of her maximum health, from her health
+  when the fight began, is recorded as `costly-kill`. After one, and
+  before every pull on a dangerous spot (the farm circuit passes the
+  analyzer's danger as `FarmTask.spot_danger`), she pulls nothing new
+  until she is back to `PULL_REST_HEALTH` (95%) and, with a healing
+  spell, half her SP (at least three casts). She rests where she stands
+  with combat off (`pull-rest`, once per rest); whatever comes at her is
+  still fought, and the circuit's dwell does not move her to the next
+  leg mid-rest (maintenance trips may still go). A rest ends after `PULL_REST_LIMIT_SECONDS` (5 minutes)
+  whatever she has regenerated, and is then given up until the next
+  kill.
+- **One at a time.** When she chooses whom to pull (nothing engaged and
+  nothing within two tiles of her), a target at least
+  `PULL_ISOLATION_TILES` (4) from every other monster in view comes
+  before a nearer one beside others (`FarmTask.isolated_target`); named
+  priority targets still come first, and a farm casting Firestorm,
+  which strikes a pack, keeps picking the nearest.
+
+Accepted limits: the kill cost is net of the heals in the fight, so a
+fight her heals kept even is not costly; a recharge scroll is a rare
+roll, so recall shopping may still find nothing for a day.
 
 ## Critical escape on a walk (2026-11-22)
 
