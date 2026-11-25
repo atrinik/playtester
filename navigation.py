@@ -68,7 +68,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
                     combat_allowed, heal_waiting, out_of_heals_and_recall,
-                    UnpreparedHold, wand_known_empty,
+                    UnpreparedHold, empty_recall_wand,
+                    usable_recharge_scroll, wand_known_empty,
                     area_caster_identities, tiled_neighbours)
 from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
 log = logging.getLogger(__name__)
@@ -7129,14 +7130,67 @@ def seam_ranking(client: AtrinikClient, graph: "WorldGraph",
     return ranked
 
 
+# An area (each map header's region and name, MapNode.region and .name, as
+# the analyzer's circuit_area names a circuit of one area) with at most this many maps is one
+# place for kit hazards and pauses (map_areas). The Burnt Forest has 25
+# maps; a name used more widely names a whole island or sea (Eld Woods
+# Island 42, Strakewood Island 190, World 2115), where a hazard or a pause
+# for every map would be out of proportion, and those count by shared maps
+# alone, as before.
+AREA_HAZARD_MAX_MAPS = 30
+
+
+def _area_key(node) -> str:
+    """A map's area, "region|name"; "" without a region or a real name
+    (an unnamed map is no place of its own)."""
+    region = str(getattr(node, "region", "") or "").strip()
+    name = str(getattr(node, "name", "") or "").strip()
+    if not region or not name or name.startswith("<"):
+        return ""
+    return f"{region}|{name}"
+
+
+def area_maps(graph: "WorldGraph | None") -> dict[str, frozenset[str]]:
+    """Every bounded area's maps (at most AREA_HAZARD_MAX_MAPS), by area
+    key ("region|name"); cached on the graph itself, with its map count
+    (the map data never changes after build)."""
+    nodes = getattr(graph, "nodes", None) or {}
+    cached = getattr(graph, "_area_maps", None)
+    if cached is not None and cached[0] == len(nodes):
+        return cached[1]
+    grouped: dict[str, set[str]] = defaultdict(set)
+    for path, node in nodes.items():
+        area = _area_key(node)
+        if area:
+            grouped[area].add(path)
+    areas = {area: frozenset(paths) for area, paths in grouped.items()
+             if len(paths) <= AREA_HAZARD_MAX_MAPS}
+    if graph is not None:
+        try:
+            graph._area_maps = (len(nodes), areas)
+        except AttributeError:
+            pass
+    return areas
+
+
+def map_areas(graph: "WorldGraph | None", paths: Iterable[str]) -> set[str]:
+    """The bounded areas (area_maps) of ``paths``: those of a spot's legs
+    are the spot's own."""
+    nodes = getattr(graph, "nodes", None) or {}
+    bounded = area_maps(graph)
+    return {area for path in paths
+            if (area := _area_key(nodes.get(path))) in bounded}
+
+
 def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
-                       legs) -> bool:
+                       legs, graph: "WorldGraph | None" = None) -> bool:
     """Whether live failures rate this spot hazardous for her current kit.
 
     See self_improvement.kit_hazard: repeated pack or out-damaged failures,
-    or deaths on the way, at any spot sharing a map with this one, with a
-    kit she has not improved on since (CombatProfile.no_survivability_gain:
-    a weaker kit still counts them).
+    or deaths on the way, at any spot sharing a map or (with ``graph``) a
+    bounded area (map_areas) with this one, with a kit she has not
+    improved on since (CombatProfile.no_survivability_gain: a weaker kit
+    still counts them).
     """
     profile = current_combat_kit(client)
     if profile is None:
@@ -7149,7 +7203,8 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
 
     return self_improvement.kit_hazard(
         adaptations, self_improvement.spot_key(spot, legs),
-        (path for path, _ in legs), same_kit)
+        (path for path, _ in legs), same_kit,
+        areas=map_areas(graph, (path for path, _ in legs)))
 
 
 # Map transitions from a map to every map it reaches, per graph and map
@@ -7589,7 +7644,7 @@ def _analyzer_farm_choice(
                     not any(path in blocked for path, _ in legs)):
                 entry = (objective, legs, spot)
                 order[id(entry)] = (position, rank)
-                (hazardous if kit_hazardous_spot(client, spot, legs)
+                (hazardous if kit_hazardous_spot(client, spot, legs, graph)
                  else usable).append(entry)
     if not usable and hazardous and not funding:
         # Every usable spot is hazardous for her kit: farm the least
@@ -7623,6 +7678,9 @@ def _analyzer_farm_choice(
         cap = FUNDING_FARM_DANGER_SHARE * health if health > 0 else float("inf")
         for spot in analyzer.ranking("safety"):
             legs = analyzer_spot_legs(spot, graph)
+            # By the spot's own maps only (no graph, so no area): an area
+            # hazard would let every spot of the area cap the rest, the
+            # easy ones she never failed on too.
             if (legs and _spot_danger(spot) < cap and
                     kit_hazardous_spot(client, spot, legs)):
                 cap = _spot_danger(spot)
@@ -7779,7 +7837,7 @@ def farm_shadow_snapshot(client: AtrinikClient, graph: "WorldGraph",
                 farm_spot_key(objective, spot), str(spot.get("name") or ""), objective,
                 position, rank, route_costs.spot_rate(spot, objective))
             entry = (candidate, legs, spot)
-            (hazardous if kit_hazardous_spot(client, spot, legs) else usable).append(entry)
+            (hazardous if kit_hazardous_spot(client, spot, legs, graph) else usable).append(entry)
     if not usable and hazardous:
         usable = [min(hazardous, key=lambda entry: (
             farm_analyzer_plan.risky_spot(entry[2]),
@@ -8528,6 +8586,9 @@ class FarmCircuitTask(BotTask):
     PROGRESS_CHECKPOINT_INTERVAL = 5 * 60
     UPGRADE_SWEEP_INTERVAL = 24 * 60 * 60
     RECALL_SHOP_INTERVAL = 24 * 60 * 60
+    # After buying a scroll of recharge, recall shopping waits this long
+    # for the farm to read it while she carries it (_needs_recall_shopping).
+    RECHARGE_READ_WAIT_SECONDS = 3 * 60 * 60
     # Recall shopping starts only with this much money (wallet_value), and,
     # while a recall quote from the last RECALL_SHOP_INTERVAL is known
     # (recall_quote), only with that price plus RECALL_SHOP_RESERVE.
@@ -8548,6 +8609,15 @@ class FarmCircuitTask(BotTask):
     # tries again after HEAL_RESTOCK_STRICT_RETRY_SECONDS.
     HEAL_RESTOCK_LOW = 2
     HEAL_RESTOCK_TARGET = 5
+    # On a spot whose analyzer danger (the health one kill costs) is at
+    # least DANGEROUS_SPOT_SHARE of her maximum, she buys up to
+    # HEAL_RESTOCK_DANGER_TARGET instead (_heal_restock_target), and the
+    # farm rests to near full between pulls (FarmTask.spot_danger).
+    DANGEROUS_SPOT_SHARE = FarmTask.PULL_REST_KILL_SHARE
+    HEAL_RESTOCK_DANGER_TARGET = 10
+    # The share of her money above HEAL_RESTOCK_RESERVE one heal restock
+    # may spend (BuyHealingStockTask.spend_share), off the cure-funding farm.
+    HEAL_RESTOCK_SPEND_SHARE = 0.5
     HEAL_RESTOCK_RESERVE = 1_000
     HEAL_RESTOCK_MINIMUM_WALLET = 1_250
     HEAL_RESTOCK_INTERVAL = 24 * 60 * 60
@@ -8714,6 +8784,9 @@ class FarmCircuitTask(BotTask):
         self._shopping_retry_at = 0.0
         self._recall_shopping: NavigateThenTask | None = None
         self._recall_shopping_retry_at = 0.0
+        # Until when recall shopping waits for a scroll of recharge it
+        # bought to be read (RECHARGE_READ_WAIT_SECONDS; on ``clock``).
+        self._recharge_read_until = 0.0
         self._utility_shopping: NavigateThenTask | None = None
         self._utility_shopping_retry_at = 0.0
         self._heal_restock: NavigateThenTask | None = None
@@ -8773,6 +8846,7 @@ class FarmCircuitTask(BotTask):
         "_shopping_retry_at", "_recall_shopping_retry_at",
         "_utility_shopping_retry_at", "_ship_key_retry_at", "_spell_retry_at",
         "_cure_retry_at", "_restoration_retry_at", "_heal_restock_retry_at",
+        "_recharge_read_until",
     )
 
     def backoffs(self) -> dict[str, float]:
@@ -8817,7 +8891,16 @@ class FarmCircuitTask(BotTask):
         # live Old Outpost trial proved exactly this). During the ordinary farm
         # NavigateThen child, attribute a transit failure to the requested
         # destination so autoplay moves on instead of replaying the same lethal
-        # road. Maintenance children are held separately and never reach this.
+        # road. Maintenance children are held separately and never reach this
+        # (nor the seam rule below: _seam_failure_leg).
+        # A failure just after she left the spot (_seam_failure_leg) is
+        # the spot's own fight, judged first: off the destination the walk
+        # reads RUNNING again (NavigateThenTask's zone containment), so the
+        # rule above would take it as one on the way.
+        seam = False
+        if not path:
+            path = self._seam_failure_leg(client, failure)
+            seam = bool(path)
         if (not path and self.child is not None and
                 self.child.navigation.destination in active_paths and
                 self.child.navigation.status != TaskStatus.COMPLETE):
@@ -8827,7 +8910,8 @@ class FarmCircuitTask(BotTask):
         what = "combat death" if failure.get("action") == "death" else "emergency recall"
         if self._analyzer_safety:
             # Analyzer spots are kept: review what happened and adapt.
-            return self._learn_from_failure(client, failure, path, what)
+            return self._learn_from_failure(client, failure, path, what,
+                                            seam=seam)
         self._quarantine_farm_path(
             client, path, f"{what} on {failure_map or 'unknown map'}")
         return True
@@ -8870,8 +8954,108 @@ class FarmCircuitTask(BotTask):
                 entered = stamp
         return entered
 
+    # A death or emergency recall off the spot's maps this soon after she
+    # was on one of them counts for the spot (_seam_failure_leg), and on a
+    # seam neighbour or a map of the same bounded area, this soon.
+    FARM_SEAM_FAILURE_SECONDS = 30.0
+    FARM_AREA_FAILURE_SECONDS = 120.0
+    # The maintenance trips _tick_running_service runs: while one is under
+    # way, the farm child is not ticked, and a failure is not the spot's.
+    SERVICE_ATTRIBUTES = (
+        "_bank_sync", "_capability", "_storage", "_identification",
+        "_bed_binding", "_resupply", "_selling", "_cure_funding", "_banking",
+        "_shopping", "_recall_shopping", "_utility_shopping", "_heal_restock",
+        "_ship_key", "_spell_purchase", "_cure", "_restoration")
+
+    def _seam_failure_leg(self, client: AtrinikClient, failure: dict) -> str:
+        """The leg map a failure just off the spot's maps counts for, or "".
+
+        A death or emergency recall off the spot's maps counts for it,
+        whether her walk reads complete or RUNNING again (off the
+        destination, NavigateThenTask's zone containment restarts it), when
+        it happened within
+        FARM_SEAM_FAILURE_SECONDS of her being on one of its maps (map
+        arrivals, else her records), or on a map tiled to one of them
+        (a seam neighbour) or of the same bounded area (map_areas) within
+        FARM_AREA_FAILURE_SECONDS: the leg she was on last. Never during a
+        maintenance trip (SERVICE_ATTRIBUTES), never for a leg she left
+        before her last death or emergency recall, and never while her walk heads to another leg
+        than the one she left (a walk between legs, or a first walk whose
+        route crossed a leg): that is a death on the way. On her first walk to the
+        spot she was never on a leg, so this never applies. Live, on
+        2026-11-25, a retreat from world_16_74 stepped across the seam
+        onto world_17_74 (the walk RUNNING: its transit hold-fire fired 13 s
+        before) and she died there at 16:15:19. The destination rule could
+        only take it as a death on the way (cause route, a route hazard on
+        the spot's own neighbour), never as the pack fight on the spot it
+        was.
+        """
+        if self.child is None or any(getattr(self, name, None) is not None
+                                     for name in self.SERVICE_ATTRIBUTES):
+            return ""
+        failure_map = str(failure.get("map", ""))
+        when = float(failure.get("time", 0.0) or 0.0)
+        legs = [path for path, _ in self.legs]
+        if not failure_map or not legs or failure_map in legs:
+            return ""
+        # Only this life: a leg she left by dying, or by an emergency recall,
+        # is no proof she was at the spot when she failed again on the walk
+        # back.
+        life = max((float(record.get("time", 0.0) or 0.0)
+                    for record in getattr(client, "decision_history", ())
+                    if isinstance(record, dict) and
+                    record.get("action") in ("death", "emergency-recall")
+                    and record is not failure and record != failure and
+                    float(record.get("time", 0.0) or 0.0) < when), default=0.0)
+        arrivals = sorted((float(stamp), str(where)) for stamp, where in
+                          getattr(client, "map_arrivals", ()) if stamp <= when)
+        stamps = [(float(record.get("time", 0.0) or 0.0), record.get("map"))
+                  for record in (*getattr(client, "action_history", ()),
+                                 *getattr(client, "decision_history", ()))
+                  if isinstance(record, dict)]
+
+        def last_leg(window: float) -> str:
+            """The leg she was on last in this life, if she left it within
+            ``window``."""
+            recent = ""
+            for index, (stamp, where) in enumerate(arrivals):
+                left = (arrivals[index + 1][0] if index + 1 < len(arrivals)
+                        else when)
+                if where in legs and stamp > life and when - left <= window:
+                    recent = where
+            if recent:
+                return recent
+            return max(((stamp, where) for stamp, where in stamps
+                        if where in legs and stamp > life and
+                        0.0 <= when - stamp <= window),
+                       default=(0.0, ""))[1]
+
+        def leg_switch(left: str) -> bool:
+            """Whether her walk is heading to another leg than the one she
+            left: a walk between legs (or a first walk whose route crossed
+            a leg). A death on its way is a death on the way, for the
+            destination rule (cause route, a route hazard)."""
+            navigation = self.child.navigation
+            return (navigation.status != TaskStatus.COMPLETE and
+                    navigation.destination in legs and
+                    navigation.destination != left)
+
+        recent = last_leg(self.FARM_SEAM_FAILURE_SECONDS)
+        if recent:
+            return "" if leg_switch(recent) else recent
+        neighbours = getattr(self.graph, "_seam_neighbours", None)
+        nearby = neighbours is not None and any(
+            failure_map == neighbour
+            for leg in legs for neighbour, _, _ in neighbours(leg))
+        if not nearby and not (map_areas(self.graph, (failure_map,)) &
+                               map_areas(self.graph, legs)):
+            return ""
+        recent = last_leg(self.FARM_AREA_FAILURE_SECONDS)
+        return "" if recent and leg_switch(recent) else recent
+
     def _learn_from_failure(self, client: AtrinikClient, failure: dict,
-                            path: str, what: str) -> bool:
+                            path: str, what: str, *,
+                            seam: bool = False) -> bool:
         """Review a failure at an analyzer spot and adapt instead of leaving it.
 
         Returns True only for the last resort, a short pause after repeated
@@ -8892,8 +9076,14 @@ class FarmCircuitTask(BotTask):
                     if float(entry[0]) > previous_death]
         this_life = [record for record in decisions if isinstance(record, dict) and
                      float(record.get("time", 0.0) or 0.0) > previous_death]
+        # A failure across the spot's seam (_seam_failure_leg) is the
+        # spot's own fight, not one on the way to it: its cause is judged
+        # as on the spot, and it teaches no route hazard.
+        spot_paths = [leg for leg, _ in self.legs]
+        if seam:
+            spot_paths.append(str(failure.get("map", "")))
         review = self_improvement.review_failure(
-            messages, this_life, failure, [leg for leg, _ in self.legs],
+            messages, this_life, failure, spot_paths,
             monster=self.graph.is_monster)
         # Hits stamped before she entered the death map were taken elsewhere:
         # only damage taken on it makes that map the hazard.
@@ -8926,7 +9116,10 @@ class FarmCircuitTask(BotTask):
         record, pause = self_improvement.learn(
             adaptations.get(key, {}), review,
             kit=kit.describe() if kit is not None else None,
-            maps=[leg for leg, _ in self.legs], map_damage=on_map)
+            maps=[leg for leg, _ in self.legs], map_damage=on_map,
+            # One area: the leg's the failure counts for. A circuit across
+            # two areas does not hazard both for a failure in one.
+            areas=map_areas(self.graph, (path,)))
         setter = getattr(client, "set_farm_adaptation", None)
         if setter is not None:
             setter(key, record)
@@ -8962,8 +9155,11 @@ class FarmCircuitTask(BotTask):
             self._quarantine_farm_path(
                 client, path, "repeated failures at the maximum adaptation level",
                 seconds=self_improvement.PAUSE_SECONDS)
+            self._quarantine_farm_area(
+                client, path, "repeated failures at the maximum adaptation level",
+                seconds=self_improvement.PAUSE_SECONDS)
             return True
-        if kit_hazardous_spot(client, self.spot, self.legs):
+        if kit_hazardous_spot(client, self.spot, self.legs, self.graph):
             # Her kit cannot hold this spot: choose again now. It stays
             # skipped while her survivability is the same
             # (analyzer_farm_choice).
@@ -8991,6 +9187,98 @@ class FarmCircuitTask(BotTask):
                      f"{path} until={int(until)} after {reason}")
         log.warning("autoplay quarantined farm map for %.1f hours: %s (%s)",
                     seconds / 3600, path, reason)
+
+    def _quarantine_farm_area(self, client: AtrinikClient, path: str,
+                              reason: str, *, seconds: float) -> None:
+        """Quarantine every map of leg ``path``'s bounded area (map_areas) for
+        ``seconds``, as its pause quarantines the failure's leg map: a
+        sibling circuit or single map of the same area is the same fight.
+        Live, on 2026-11-25, the Burnt Forest pauses covered one map each,
+        and she died on three different Burnt Forest maps within 90
+        minutes. Recorded once (farm-area-quarantine); an area too large
+        for map_areas is never quarantined whole."""
+        areas = map_areas(self.graph, (path,))
+        bounded = area_maps(self.graph)
+        maps = sorted(set().union(*(bounded[area] for area in areas))
+                      if areas else ())
+        if not maps:
+            return
+        until = time.time() + seconds
+        quarantine = client.state.farm_zone_quarantine
+        for each in maps:
+            quarantine[each] = max(float(quarantine.get(each, 0.0) or 0.0), until)
+        # One persist for the whole area: the setter saves every entry.
+        setter = getattr(client, "quarantine_farm_zone", None)
+        if setter is not None:
+            setter(maps[-1], quarantine[maps[-1]])
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("farm-area-quarantine",
+                     f"{', '.join(sorted(area.split('|', 1)[-1] for area in areas))}: "
+                     f"{len(maps)} maps until={int(until)} after {reason}")
+        log.warning("autoplay quarantined farm area for %.1f hours: %s (%d maps; %s)",
+                    seconds / 3600, ", ".join(sorted(areas)), len(maps), reason)
+
+    # How long a spot whose every resident kind is out of her league stays
+    # quarantined (_observe_out_of_league): the failure review's pause.
+    FARM_OUT_OF_LEAGUE_QUARANTINE_SECONDS = self_improvement.PAUSE_SECONDS
+
+    def _observe_out_of_league(self, client: AtrinikClient) -> bool:
+        """Leave a spot with nothing left she may pull.
+
+        Out-healed disengages mark the kinds that hit her out of her league
+        (FarmTask.out_healed, out_of_league_kinds) for
+        FarmTask.OUT_OF_LEAGUE_SECONDS: she neither pulls nor engages them.
+        Once every resident kind of the spot (the authored, not peaceful,
+        spawns of its maps, by name or archetype) is marked while she is
+        there (a spawn that can roll several kinds counts once all are),
+        the spot's maps are quarantined for
+        FARM_OUT_OF_LEAGUE_QUARANTINE_SECONDS (farm-out-of-league), so the
+        analyzer choice (_upgrade_progression) picks another spot and her
+        ordinary walk takes her off the map by its route; with none left,
+        the circuit ends as for any quarantined spot. Live, on 2026-11-25,
+        she stayed on world_16_74 with every kind there marked, ran its
+        edges from slow treants and was cornered at (19,23).
+        """
+        if not self.analyzer_driven or self.child is None:
+            return False
+        legs = [path for path, _ in self.legs]
+        if (self.child.navigation.status != TaskStatus.COMPLETE or
+                client.state.map.path not in legs):
+            return False
+        store = getattr(client, "out_of_league_kinds", None) or {}
+        now = time.monotonic()
+        marked = {FarmTask._kind_key(kind) for kind, until in store.items()
+                  if float(until) > now}
+        if not marked:
+            return False
+        quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
+        if all(float(quarantine.get(path, 0.0) or 0.0) > time.time()
+               for path in legs):
+            return False
+        residents = [spawn for path in legs
+                     for spawn in self.graph.named_spawns.get(path, ())
+                     if not spawn.peaceful]
+        if not residents:
+            return False
+        kinds = set()
+        for spawn in residents:
+            names = {FarmTask._kind_key(name)
+                     for name in (spawn.named, *spawn.candidates) if name}
+            if not names or not names <= marked:
+                return False
+            kinds.add(spawn.named)
+        detail = (f"{(self.spot or {}).get('name', self._spot_key())}: every "
+                  f"resident kind is out of her league "
+                  f"({', '.join(sorted(kinds))})")
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("farm-out-of-league", detail)
+        for path in legs:
+            self._quarantine_farm_path(
+                client, path, "every resident kind out of her league",
+                seconds=self.FARM_OUT_OF_LEAGUE_QUARANTINE_SECONDS)
+        return True
 
     def _observe_stalled_farm(self, client: AtrinikClient,
                               farm: FarmTask) -> bool:
@@ -9495,6 +9783,10 @@ class FarmCircuitTask(BotTask):
         farm._spellbook_attempts = self._spellbook_attempts
         farm._unreachable_targets = self._unreachable_targets
         farm._unprepared_hold = self._unprepared_hold
+        danger = _spot_danger(self.spot or {})
+        if danger != float("inf"):
+            # A dangerous spot's kills make her rest between pulls.
+            farm.spot_danger = danger
         if self._analyzer_safety:
             flee, heal = (self.AGGRESSIVE_SAFETY if aggressive else
                           self.PASSIVE_SAFETY)
@@ -10323,6 +10615,14 @@ class FarmCircuitTask(BotTask):
                 name for name in ("_shopping", "_utility_shopping")
                 if name in running), ""))
 
+    @staticmethod
+    def _farm_resting(client: AtrinikClient, farm: FarmTask) -> bool:
+        """Whether the farm rests, so the circuit's dwell keeps her on this
+        leg: a mana rest confirmed just now, or a rest between pulls due
+        (FarmTask.pull_rest_due; a gap of a few seconds between its rest
+        ticks is still the rest, and a rest given up at its limit is not)."""
+        return farm.training_rest_active() or farm.pull_rest_due(client)
+
     def unprepared_resting(self) -> bool:
         """Whether its farm rests for want of a heal or a recall
         (FarmTask.unprepared_resting): an explained wait, not being stuck.
@@ -10458,6 +10758,14 @@ class FarmCircuitTask(BotTask):
             for item in client.state.inventory)
 
     @staticmethod
+    def _empty_recall_wand(client: AtrinikClient) -> bool:
+        """Whether she carries a recall wand known to be empty
+        (empty_recall_wand) that a scroll of recharge would refill, and
+        no usable scroll of recharge for it (usable_recharge_scroll)."""
+        return (empty_recall_wand(client) is not None and
+                usable_recharge_scroll(client) is None)
+
+    @staticmethod
     def _owned_recall_spellbook(client: AtrinikClient) -> bool:
         return any(
             item.item_type == c.TYPE_SPELLBOOK and
@@ -10495,6 +10803,13 @@ class FarmCircuitTask(BotTask):
             self._known_recall_spell(client) or
             self._owned_recall_spellbook(client))
         if has_immediate and (wizardry < 12 or has_permanent):
+            return False
+        if (reads_scrolls(client) and empty_recall_wand(client) is not None
+                and usable_recharge_scroll(client) is not None and
+                self.clock() < self._recharge_read_until):
+            # A scroll of recharge just bought: the farm reads it first
+            # (FarmTask.recharge_recall_wand). Where no square lets her
+            # read it (a no-magic map), shopping resumes after the wait.
             return False
         last_check = float(getattr(
             client.state, "last_recall_shop_check_at", 0.0) or 0.0)
@@ -10541,10 +10856,17 @@ class FarmCircuitTask(BotTask):
                   if ranked else DialogueVendor(
             "/shattered_islands/world_4_47", 11, 13, "sage",
             "/python/generic/merchant.py"))
+        # With a recall wand known empty she can also recharge it: a
+        # scroll of recharge (a random_scroll roll; spell_effect.c
+        # recharge), which the farm reads on it (recharge_recall_wand).
+        # A recall device ranks first; the scroll is the cheap fallback.
+        pattern = (r"word of recall|scroll of recharge"
+                   if self._empty_recall_wand(client) and reads_scrolls(client)
+                   else r"word of recall")
         task = NavigateThenTask(
             self.graph, vendor.map_path,
             BuyDialogueStockTask(
-                vendor.name, r"word of recall",
+                vendor.name, pattern,
                 cash_reserve=self.RECALL_SHOP_RESERVE,
                 observation_key=RECALL_QUOTE_KEY, try_alternatives=True),
             destination_xy=(vendor.x, vendor.y), combat_approach=True)
@@ -10705,6 +11027,27 @@ class FarmCircuitTask(BotTask):
             recorder("heal-restock-backoff",
                      f"{note}; next try in {int(seconds // 60)} min")
 
+    def _spot_danger_share(self, client: AtrinikClient) -> float:
+        """The analyzer's danger of her spot (the health one kill costs)
+        as a share of her maximum health; 0 when unknown."""
+        danger = _spot_danger(self.spot or {})
+        maxhp = int(client.state.stats.get("maxhp", 0) or 0)
+        if maxhp <= 0 or danger == float("inf"):
+            return 0.0
+        return danger / maxhp
+
+    def _heal_restock_target(self, client: AtrinikClient) -> int:
+        """How many heals the restock buys up to: HEAL_RESTOCK_TARGET, or
+        HEAL_RESTOCK_DANGER_TARGET on a dangerous spot
+        (DANGEROUS_SPOT_SHARE); on the cure-funding farm only
+        HEAL_RESTOCK_LOW, just prepared, at the least cost to the cure's
+        savings."""
+        if cure_funding_farm(client):
+            return self.HEAL_RESTOCK_LOW
+        if self._spot_danger_share(client) >= self.DANGEROUS_SPOT_SHARE:
+            return self.HEAL_RESTOCK_DANGER_TARGET
+        return self.HEAL_RESTOCK_TARGET
+
     def _new_heal_restock(self, client: AtrinikClient, *,
                           strict: bool) -> NavigateThenTask | None:
         """A trip to the nearest merchant that may sell her a usable heal
@@ -10754,11 +11097,18 @@ class FarmCircuitTask(BotTask):
             self.graph, vendor.map_path,
             BuyHealingStockTask(
                 vendor.name,
-                # On the cure-funding farm only up to HEAL_RESTOCK_LOW: just
-                # prepared, at the least cost to the cure's savings.
-                quantity=(self.HEAL_RESTOCK_LOW if cure_funding_farm(client)
-                          else self.HEAL_RESTOCK_TARGET) -
+                quantity=self._heal_restock_target(client) -
                 heal_consumables(client),
+                # On the cure-funding farm the most heal per copper, at
+                # the least cost to the cure's savings; elsewhere the
+                # biggest heal, with at most half her spare money, so a
+                # later depletion cure stays affordable.
+                per_copper=cure_funding_farm(client),
+                spend_share=(1.0 if cure_funding_farm(client) else
+                             self.HEAL_RESTOCK_SPEND_SHARE),
+                # The cap never leaves her below the low mark she could pay
+                # for (which would back the restock off for a day).
+                min_quantity=self.HEAL_RESTOCK_LOW - heal_consumables(client),
                 cash_reserve=self.HEAL_RESTOCK_RESERVE,
                 observation_key=HEAL_QUOTE_KEY),
             destination_xy=(vendor.x, vendor.y), combat_approach=True,
@@ -11267,21 +11617,33 @@ class FarmCircuitTask(BotTask):
                         client, "recall shopping failed: "
                         f"{self._recall_shopping.error}")
                 else:
-                    setter = getattr(
-                        client, "set_last_recall_shop_check", None)
-                    if setter is not None:
-                        setter(time.time())
-                    else:
-                        client.state.last_recall_shop_check_at = time.time()
                     purchased = bool(
                         isinstance(shopper, BuyDialogueStockTask) and
                         shopper.purchased)
+                    recall_bought = purchased and any(
+                        "word of recall" in name
+                        for name in shopper._bought_names)
                     log.info(
                         "recall stock check complete%s; returning to farm",
                         " with purchase" if purchased else "")
-                    self.note_recall_unavailable(client, "" if purchased else
-                                                 "recall shopping found no "
-                                                 "recall source to buy")
+                    if purchased and not recall_bought:
+                        # Only a scroll of recharge: no recall yet. The
+                        # farm reads it; until a wand shows charges
+                        # (FarmTask.check_recall_wand) the note stays, and
+                        # a wand still empty or destroyed lets shopping
+                        # run again without its daily interval.
+                        self._recharge_read_until = (
+                            self.clock() + self.RECHARGE_READ_WAIT_SECONDS)
+                    else:
+                        setter = getattr(
+                            client, "set_last_recall_shop_check", None)
+                        if setter is not None:
+                            setter(time.time())
+                        else:
+                            client.state.last_recall_shop_check_at = time.time()
+                        self.note_recall_unavailable(
+                            client, "" if purchased else
+                            "recall shopping found no recall source to buy")
                     self._recall_shopping_retry_at = self.clock() + 60.0
                 self._recall_shopping = None
             return True
@@ -11527,6 +11889,8 @@ class FarmCircuitTask(BotTask):
             if isinstance(farm, FarmTask) and self._upgrade_progression(
                     client, farm):
                 return
+        # Nothing left she may pull here: the choice below moves her on.
+        self._observe_out_of_league(client)
         if (self.level_until and
                 int(client.state.stats.get("level", 0)) >= self.level_until):
             self.complete()
@@ -11922,7 +12286,7 @@ class FarmCircuitTask(BotTask):
                 (named_spawn_empty or patrol_swept_empty) and
                 live_targets == 0 and elapsed >= 15.0 and
                 not self._busy_finishing_fight_or_loot(client, farm) and
-                not farm.training_rest_active() and
+                not self._farm_resting(client, farm) and
                 not self._unprepared_hold.holding()):
             if not self._empty_spawn_since:
                 self._empty_spawn_since = now
@@ -11954,9 +12318,10 @@ class FarmCircuitTask(BotTask):
         if (isinstance(farm, FarmTask) and
                 self._busy_finishing_fight_or_loot(client, farm)):
             return
-        # Nor mid-rest for mana, or she sets off with a partial bar. Services
-        # may still detour during a rest.
-        if isinstance(farm, FarmTask) and farm.training_rest_active():
+        # Nor mid-rest for mana, or she sets off with a partial bar, nor
+        # mid-rest between pulls (FarmTask.pull_rest_due), or she walks
+        # to the next map hurt. Services may still detour during a rest.
+        if isinstance(farm, FarmTask) and self._farm_resting(client, farm):
             return
         # Nor while she rests without a heal or a recall: no unprepared
         # walk to another map; the hold's cap still runs.

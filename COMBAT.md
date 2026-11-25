@@ -443,8 +443,9 @@ steps away and keeps her distance.
   at once. An empty wand is no longer an emergency candidate, and recall
   shopping treats it as no device. When the last recall source is known
   empty, the recall shop check is reset so a replacement is bought, once
-  she can afford it, without waiting out its daily interval. Recharging
-  needs the recharge spell, which she does not have. She farms on without
+  she can afford it, without waiting out its daily interval. A scroll of
+  recharge refills one
+  ([heals and pulls](#heals-and-pulls-2026-11-25)). She farms on without
   a working recall
   ([owner decision, 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22)).
 - **Hazardous for her kit.** Each farm failure review now stores the
@@ -470,7 +471,9 @@ steps away and keeps her distance.
   three for the burnt forest), and live she moved to a sibling circuit after
   each one was marked, dying about three times an hour. A candidate spot
   counts the failures of every adaptation record whose spot shares a map
-  with it (each record keeps its spot's maps), plus its own record's. A
+  or a bounded area with it (each record keeps its spot's maps and areas;
+  see [Learning from deaths](#learning-from-deaths-2026-11-25)), plus its
+  own record's. A
   death on the way to a spot (`route`) counts for that spot too, not for
   spots on the road map; so does an emergency recall on the way with three
   or more attackers at once (`ROUTE_PACK_ATTACKERS`), and no other recall
@@ -799,8 +802,9 @@ Before a farm circuit walks out, it examines every recall wand of unknown
 charge and waits for the answers (or the 5 s timeout). The empty mark is
 kept by item tag, and live, each life brought new tags for the same two
 wands (most likely her checkpoint relogs), so she walked back out and
-fired them again. Nobody sells recall charges: recharging needs the
-recharge spell, so an empty wand is replaced, never refilled.
+fired them again. Nobody sells recall charges, but a merchant's rolled
+scroll of recharge refills an empty wand
+([heals and pulls](#heals-and-pulls-2026-11-25)).
 
 ## A working recall is never a blocker (owner decision, 2026-11-22)
 
@@ -1100,14 +1104,21 @@ so she is rarely without a heal:
   alert. After a fight during the rest, combat off is sent once more.
   The walk keeps the trip's safety policy (heal at 85 %, flee at 70 %).
 - **What.** `BuyHealingStockTask` asks the price of every healing choice
-  she can use and buys up to `HEAL_RESTOCK_TARGET` (5) of the one with
-  the most heal per copper (`heal_estimate`: the server's minor and
-  greater healing rolls at the item's level), as many as the reserve
-  leaves. Heal per copper favours cheap minor heals over a bigger greater
-  heal; that is intended, more uses for the money. The merchant sells at
-  most what it stocks, so what arrives is counted: the purchase record
-  says that many, and the bank reservation for the rest is given back.
-  The cheapest price is recorded. A merchant answer that she cannot carry
+  she can use and buys up to `HEAL_RESTOCK_TARGET` (5) of the biggest
+  heal she can pay for (`heal_estimate`: the server's minor and greater
+  healing rolls at the item's level), then of the most heal per copper,
+  as many as the reserve leaves: greater healing before minor
+  ([heals and pulls](#heals-and-pulls-2026-11-25)), spending at most half
+  of her money above the reserve (`HEAL_RESTOCK_SPEND_SHARE`; always
+  enough for `HEAL_RESTOCK_LOW` of the cheapest, so the cap never causes
+  the day's backoff and reaching the low mark never costs more than
+  that), so a later depletion cure stays affordable. On the cure-funding farm it buys the most heal per copper
+  instead, with no cap. On a dangerous spot she buys up to
+  `HEAL_RESTOCK_DANGER_TARGET` (10). The merchant sells at
+  most what it stocks, so what arrives is counted: each purchase record
+  says that many, the bank reservation for the rest is given back, and
+  the next best choice she can still pay for makes up the rest. The
+  cheapest price is recorded. A merchant answer that she cannot carry
   them ends it at once.
 - **An optional trip, not an essential one.** It never crosses an owner
   block, keeps the errand budget and planning with the safety λ, and is
@@ -1140,6 +1151,107 @@ so she is rarely without a heal:
   stock in back-to-back trips. A strict route over its budget is
   declined like any optional trip's and counts as a failed trip (two
   hours).
+
+## Heals and pulls (2026-11-25)
+
+Read from her post-mortems and journal on the Burnt Forest (v1.106.0):
+charred treants (level 31-40, about 370-430 health, no spells, slow)
+cost her about 150 of her 356 health per kill. She had bought five
+scrolls of minor healing and no potion, all three recall wands were
+empty, and after a kill she pulled the next treant hurt, often with
+another one beside it.
+
+- **Real heals first.** The heal restock buys the biggest heal first
+  ([What](#healing-potion-restock)): a potion or balm of greater
+  healing (about `2*rndm(4, 5+L)+12`) before minor healing. In content
+  the only authored healing stock is the Asteria merchant's scroll of
+  minor healing; balms and potions of greater healing come only from
+  the `random_potion` rolls of that merchant and of Greyton's Leria, so
+  a rolled one is often a single item, and the scrolls make up the rest.
+  On a spot whose analyzer danger (the health one kill costs) is at
+  least `DANGEROUS_SPOT_SHARE` (30%) of her maximum health she stocks up
+  to `HEAL_RESTOCK_DANGER_TARGET` (10) instead of 5.
+- **Potions in melee.** Her safety policy orders her heals
+  (`SafetyPolicy._heal_order`). A spell, rod or wand comes first,
+  saving the consumables, except when it is truly critical
+  (`potions_first`): under attack (a hit or miss in the last 5 s) at or
+  below the lower of her flee threshold and 60% (`POTION_FIRST_HEALTH`),
+  or at or below the flee threshold with two or more attackers on her:
+  monsters of a kind hitting her within 2 tiles, each counted once (three
+  treants of one name are three), or two or more kinds in the hits.
+  Accepted: a ranged attacker farther off counts only by its kind.
+  An adapted flee threshold reaches 89%, and one treant there is what
+  the spell is for; drinking from 89% would use about four potions a
+  kill. Then potions, balms and scrolls come first, the biggest heal
+  first: applying one
+  waits for no action timer, while a cast waits for her swing
+  ([heals in melee](#heals-in-melee-2026-11-23)). Under attack, a
+  healing spell she lacks the SP for gives way to the next heal, so a
+  carried potion is used when her SP runs out; before, the spell's place
+  in her inventory decided, and an unaffordable spell first meant no
+  heal at all. Out of combat it does not above the lower of her flee
+  threshold and 60%: she regenerates (an adapted flee threshold can be
+  89%, and a rest there must not drink her stock). Below that (broken
+  away at 30% with no SP, say) the potion is used.
+- **Recall charges.** Word of Recall comes only on wands and rods
+  (`spellist.h`), and only the Asteria sage rolls wands; at about 96
+  silver she could not afford one. The recharge spell works from a
+  scroll (`types/scroll.c`, `spell_effect.c` `recharge`), and scrolls
+  of recharge are rolled in `random_scroll` stock (the sage's and
+  Greyton's Nuzem). With an identified recall wand known empty, and the
+  skills to read a scroll, recall shopping now also buys a scroll of
+  recharge, after any recall device the merchant has
+  (`_empty_recall_wand`). Buying only the scroll is not buying a recall:
+  it starts no daily check and keeps the recall note, and while she
+  carries a usable scroll for an empty wand recall shopping waits for
+  the farm to read it, for at most three hours
+  (`RECHARGE_READ_WAIT_SECONDS`; on a no-magic map she cannot), and then
+  looks for recall stock only. Accepted: the wait is kept by the farm
+  circuit, so a new autoplay run starts without it. On a quiet farm tick, never on a square that
+  blocks spells, she marks the empty wand, waits for "Marked item"
+  (marking toggles, so "Unmarked item" marks it again), and reads the
+  scroll (`FarmTask.recharge_recall_wand`, recorded as
+  `recall-wand-recharge`). Only answers naming that wand count. A wand
+  that glows has its charges read again by examine, and once it shows
+  charges the recall note clears; one in six explodes, and a wand still
+  empty or gone lets recall shopping run again. An attempt with no
+  answer waits 1, 2, then 4 minutes, and after three the scroll is given
+  up (`RECHARGE_SCROLL_ATTEMPTS`), so another may be bought. The count is
+  kept per item tag for the session, so a relog starts it afresh
+  (accepted). The wand's name is kept from the mark, since an exploded
+  wand is gone before its answer is read. Reading and
+  buying use the same test for a usable scroll (identified, paid,
+  neither cursed nor damned: `usable_recharge_scroll`). Recall stays an
+  opportunity, never a precondition
+  ([owner decision, 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22)).
+- **Rest between pulls.** A kill that cost at least
+  `PULL_REST_KILL_SHARE` (30%) of her maximum health, from her health
+  when the fight began, is recorded as `costly-kill`. After one, and
+  before every pull on a dangerous spot (the farm circuit passes the
+  analyzer's danger as `FarmTask.spot_danger`), she pulls nothing new
+  until she is back to `PULL_REST_HEALTH` (95%) and, with a healing
+  spell, half her SP (at least three casts). She rests where she stands
+  with combat off (`pull-rest`, once per rest); whatever comes at her is
+  still fought, and while a rest is due (`pull_rest_due`) the circuit's
+  dwell does not move her to the next leg (maintenance trips may still
+  go). A rest interrupted for more than a second turns combat off and is
+  logged again. `PULL_REST_LIMIT_SECONDS` (5 minutes) after the first
+  rest since the last kill, interruptions or not, the rest is given up
+  until the next kill, and the dwell no longer waits for it. Once she is
+  rested the clock is cleared, so a later rest gets its full limit. A fight that ends without a
+  kill (released, abandoned or vanished) is not measured.
+- **One at a time.** When she chooses whom to pull (nothing engaged and
+  nothing within two tiles of her), a target at least
+  `PULL_ISOLATION_TILES` (4) from every other monster in view comes
+  before a nearer one beside others (`FarmTask.isolated_target`); named
+  priority targets still come first, and a farm casting Firestorm,
+  which strikes a pack, keeps picking the nearest. Accepted: the walk to
+  an isolated target may pass near others; the pull squares and the
+  lone-pull checks still apply.
+
+Accepted limits: the kill cost is net of the heals in the fight, so a
+fight her heals kept even is not costly; a recharge scroll is a rare
+roll, so recall shopping may still find nothing for a day.
 
 ## Critical escape on a walk (2026-11-22)
 
@@ -1292,7 +1404,9 @@ Accepted limits:
   disengage she survives is not a failure, and the review rebuilds the
   farm task. A death still counts as before;
 - on a circuit whose only target is that kind, she pulls nothing there
-  for those 10 minutes;
+  for those 10 minutes. Since 2026-11-25 she leaves a spot whose every
+  resident kind is marked
+  ([Learning from deaths](#learning-from-deaths-2026-11-25));
 - a burst from full health that ends the fight before three heals is not
   seen; the existing flee threshold and recall handle it.
 
@@ -1612,6 +1726,96 @@ Now (ROUTING.md 1.12):
 - **The `loop-stall` alert.** Any stall of the event loop over 1 s is
   logged and recorded (`event-loop-stall`, with what was running) and
   raises a dashboard warning for 15 minutes.
+
+## Learning from deaths (2026-11-25)
+
+Live, in the Burnt Forest on 2026-11-25, she died five times in 90 minutes
+and learned too little from them. Three changes:
+
+- **Failures across a seam count for the spot.** A death or emergency
+  recall off the spot's maps counts for it when she was on one of its
+  maps within
+  `FARM_SEAM_FAILURE_SECONDS` (30 s) before it, or when it happened on a
+  map tiled to one of them or in the same bounded area within
+  `FARM_AREA_FAILURE_SECONDS` (2 minutes) of her leaving the spot
+  (`FarmCircuitTask._seam_failure_leg`). This holds whether her farm walk
+  reads complete or running again: off the destination, the walk's zone
+  containment restarts it, and this rule is judged before the one for a
+  death on the way. It never counts during a maintenance trip, and never
+  on her first walk to the spot, since she has not been on a leg map yet.
+  Only a leg she was on since her last death or emergency recall counts:
+  after either one, the walk back is a walk to the spot. The seam rule is also skipped
+  while her walk heads to a different leg from the one she left. That
+  covers a walk between a circuit's legs and a first walk whose route
+  crossed a leg map. A death there stays a death on the way (cause
+  `route`, with a route hazard on that transit map), so she routes around
+  it afterwards.
+  The review then judges its cause
+  as on the spot (pack, out-damaged and so on), not as a death on the way,
+  so it records the farm-failure review, the kit failure and the
+  adaptation, and teaches no route hazard on the seam map. Live, a
+  retreat from world_16_74 crossed the seam onto world_17_74 and she
+  died there at 16:15:19, with the walk running (its transit hold-fire
+  fired 13 s before). No farm-failure review appeared for it. Under the
+  old rules it could only count as a death on the way to the spot (cause
+  `route`, with a route hazard on the spot's own neighbour), never as the
+  pack fight on the spot that it was.
+- **Kit hazards count by area.** An area is a map header's region and
+  name (`MapNode.region` and `.name`, which the analyzer's `circuit_area`
+  also uses for a circuit of one area), such as
+  `eld_woods_island|Burnt Forest`. A map without a region or with an
+  unnamed header has no area. Each kit failure keeps the area of the leg
+  it counts for, and the record keeps all of its failures' areas. A
+  candidate that shares only an area with a record counts only that
+  record's failures in that area. So two failures in one area and one in
+  the other, on a circuit that spans two areas, leave neither area
+  hazardous. Failures stored before they kept an area take their
+  record's. `kit_hazard` counts a
+  record for every candidate with a map or a leg's area in common with it. Three qualifying failures in
+  24 hours anywhere in the Burnt Forest now mark every Burnt Forest circuit
+  and single map hazardous for that kit, the southern L27-30 maps
+  included. Live, moving from the world_17_72 circuits to world_16_74 (no
+  shared map) restarted the count. Only an area of at most
+  `AREA_HAZARD_MAX_MAPS` (30) maps counts this way (`map_areas`); the
+  Burnt Forest has 25. Larger names cover a whole island or sea (Eld
+  Woods Island 42 maps, Strakewood Island 190, World 2115), and those
+  still count by shared maps only. The last-resort pause (three failures
+  within an hour at adaptation level 4) now quarantines every map of the
+  failure leg's bounded area for that hour, not only the leg map itself
+  (`farm-area-quarantine`). The cure-funding farm's danger cap
+  ([Safer spot choice](#safer-spot-choice-2026-11-23)) still comes only
+  from spots hazardous by their own maps. An area hazard would let an
+  easy southern Burnt Forest map she never failed on lower the cap for
+  every spot.
+- **She leaves a spot with nothing left to pull.** Once every resident
+  kind of the spot is out of her league
+  ([heals losing](#heals-losing-on-the-farm-2026-11-23)) while she is
+  there, the spot's maps are quarantined for an hour
+  (`FARM_OUT_OF_LEAGUE_QUARANTINE_SECONDS`, `farm-out-of-league`). A
+  resident kind is one of the authored, non-peaceful spawns on its maps,
+  and a spawn that can roll several kinds counts only once all of them
+  are marked. The analyzer choice then picks another spot, and her
+  ordinary walk takes her off the map along its route. With no spot left,
+  the circuit ends, as for any quarantined spot. Live, she stayed on
+  world_16_74 with every kind there marked, ran along its edges away from
+  slow treants and was cornered at (19,23).
+
+Accepted limits:
+
+- the choice still waits until a fight or loot is finished
+  (`_busy_finishing_fight_or_loot`), so a pack that is already on her
+  still has to be shaken off first. Live, she died 21 s after the
+  out-healed disengage at 16:20; by then the pack had already formed;
+- at 16:20 the disengage marked the treant, deer and sapling but not the
+  bear, so this rule would not have fired then;
+- an area hazard also covers the area's easier maps. Kit matching, time
+  and the fallback that farms the least dangerous hazardous spot when
+  every usable spot is hazardous still apply;
+- an area is grouped by header alone, not by tiled connection, so a
+  bounded name reused by maps apart from each other is still one area;
+- out-of-league marks hold for 10 minutes wherever she is, so a spot
+  reached in that time whose every resident kind is marked is left on
+  arrival.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 

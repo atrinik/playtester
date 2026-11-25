@@ -44,7 +44,9 @@ KEEP_REVIEWS = 10
 # for that kit: the analyzer ranks it, but her kit cannot hold it. Tighter
 # margins did not help: live, ten deaths in about 90 minutes on the treant
 # and underground-city maps. The analyzer ranks several overlapping circuits
-# for one area, so failures count for every spot sharing a map (kit_hazard).
+# for one area, so failures count for every spot sharing a map or an area
+# (kit_hazard): an area is the analyzer's region and map name, such as the
+# Burnt Forest, and each record keeps its spot's areas.
 KIT_HAZARD_FAILURES = 3
 KIT_HAZARD_WINDOW_SECONDS = 24 * 3600.0
 KIT_HAZARD_CAUSES = frozenset({"pack", "out-damaged"})
@@ -324,12 +326,16 @@ def remedies(review: FailureReview) -> tuple[str, ...]:
 
 def learn(record: dict, review: FailureReview, *, now: float | None = None,
           kit: dict | None = None, maps: Iterable[str] = (),
-          map_damage: int | None = None) -> tuple[dict, bool]:
+          map_damage: int | None = None,
+          areas: Iterable[str] = ()) -> tuple[dict, bool]:
     """Fold a review into a spot's adaptation record; return (record, pause).
 
     ``kit`` describes the combat profile she failed with (the analyzer's),
     kept with the failure for ``kit_hazard``; ``maps`` are the spot's maps,
-    kept so that its failures also count for overlapping spots.
+    kept so that its failures also count for overlapping spots, and
+    ``areas`` the failure's area (the analyzer's region and map name),
+    added to those kept, so that they count for every spot of the same
+    area, sharing a map or not.
     ``map_damage`` is the damage she took on the failure map itself, kept
     so that route_death_maps blames only a map that actually hurt her.
     """
@@ -359,10 +365,19 @@ def learn(record: dict, review: FailureReview, *, now: float | None = None,
                "kit": dict(kit or {})}
     if map_damage is not None:
         failure["map_damage"] = int(map_damage)
+    areas = sorted(set(areas))
+    if areas:
+        # Each failure counts for its own area (kit_hazard), not for every
+        # area its record has collected.
+        failure["areas"] = areas
     kit_failures.append(failure)
     maps = sorted(set(maps))
     if maps:
         record["maps"] = maps
+    # Merged, for the record's spot: a circuit across two areas holds both.
+    areas = sorted(set(areas) | record_areas(record))
+    if areas:
+        record["areas"] = areas
     record.update(level=min(MAX_LEVEL, level + 1), failures=failures[-PAUSE_FAILURES:],
                   causes=causes, reviews=reviews, updated_at=now,
                   kit_failures=kit_failures[-KEEP_REVIEWS:])
@@ -479,32 +494,60 @@ def record_maps(key: str, record: dict) -> set[str]:
     return set()
 
 
+def record_areas(record: dict) -> set[str]:
+    """The areas (the analyzer's region and map name) of the spot an
+    adaptation record belongs to; none for a record stored before areas
+    were kept, which then counts by its maps alone."""
+    areas = record.get("areas") if isinstance(record, dict) else None
+    if isinstance(areas, (list, tuple)):
+        return {str(area) for area in areas if area}
+    return set()
+
+
 def kit_hazard(adaptations: dict | None, key: str, maps: Iterable[str],
                same_kit: Callable[[dict], bool], *,
-               now: float | None = None) -> bool:
+               now: float | None = None, areas: Iterable[str] = ()) -> bool:
     """Whether the area of spot ``key`` on ``maps`` is hazardous for a kit.
 
     True after KIT_HAZARD_FAILURES qualifying failures (hazard_failure:
     pack recalls on the way included)
     within the window, each with a kit ``same_kit`` judges the same as hers
     now, summed over the spot's own record and every record whose spot
-    shares a map with ``maps``. The analyzer ranks overlapping circuits for
-    one area; each must not need its own deaths. A death on the way counts
-    for the spot she was travelling to, not for spots on the road map. A
-    materially different kit (the analyzer's own test) clears it, and so
-    does time.
+    shares a map with ``maps`` or an area with ``areas``. The analyzer
+    ranks overlapping circuits for one area; each must not need its own
+    deaths, and neither must a circuit or single map of the same area with
+    no map in common (live, on 2026-11-25, moving from the world_17_72
+    circuits to world_16_74 restarted the count, and she died twice more
+    in the Burnt Forest). A death on the way counts for the spot she was
+    travelling to, not for spots on the road map. A materially different
+    kit (the analyzer's own test) clears it, and so does time.
     """
     now = time.time() if now is None else now
     maps = set(maps)
+    areas = set(areas)
     count = 0
     for record_key, record in (adaptations or {}).items():
         if not isinstance(record, dict):
             continue
-        if record_key != key and not record_maps(record_key, record) & maps:
+        spot = record_key == key or bool(record_maps(record_key, record) & maps)
+        if not spot and not record_areas(record) & areas:
             continue
+
+        def counts(entry: dict) -> bool:
+            # Same spot or a shared map: every failure. Area alone: only a
+            # failure of that area; one stored before failures kept their
+            # area takes its record's.
+            if spot:
+                return True
+            own = entry.get("areas")
+            own = ({str(area) for area in own} if isinstance(own, (list, tuple))
+                   else record_areas(record))
+            return bool(own & areas)
+
         count += sum(
             1 for entry in record.get("kit_failures", ())
-            if isinstance(entry, dict) and hazard_failure(entry, record) and
+            if isinstance(entry, dict) and counts(entry) and
+            hazard_failure(entry, record) and
             now - float(entry.get("time", 0.0) or 0.0) <= KIT_HAZARD_WINDOW_SECONDS and
             same_kit(entry.get("kit") or {}))
     return count >= KIT_HAZARD_FAILURES
