@@ -471,7 +471,9 @@ steps away and keeps her distance.
   three for the burnt forest), and live she moved to a sibling circuit after
   each one was marked, dying about three times an hour. A candidate spot
   counts the failures of every adaptation record whose spot shares a map
-  with it (each record keeps its spot's maps), plus its own record's. A
+  or a bounded area with it (each record keeps its spot's maps and areas;
+  see [Learning from deaths](#learning-from-deaths-2026-11-25)), plus its
+  own record's. A
   death on the way to a spot (`route`) counts for that spot too, not for
   spots on the road map; so does an emergency recall on the way with three
   or more attackers at once (`ROUTE_PACK_ATTACKERS`), and no other recall
@@ -1402,7 +1404,9 @@ Accepted limits:
   disengage she survives is not a failure, and the review rebuilds the
   farm task. A death still counts as before;
 - on a circuit whose only target is that kind, she pulls nothing there
-  for those 10 minutes;
+  for those 10 minutes. Since 2026-11-25 she leaves a spot whose every
+  resident kind is marked
+  ([Learning from deaths](#learning-from-deaths-2026-11-25));
 - a burst from full health that ends the fight before three heals is not
   seen; the existing flee threshold and recall handle it.
 
@@ -1721,6 +1725,96 @@ Now (ROUTING.md 1.12):
 - **The `loop-stall` alert.** Any stall of the event loop over 1 s is
   logged and recorded (`event-loop-stall`, with what was running) and
   raises a dashboard warning for 15 minutes.
+
+## Learning from deaths (2026-11-25)
+
+Live, in the Burnt Forest on 2026-11-25, she died five times in 90 minutes
+and learned too little from them. Three changes:
+
+- **Failures across a seam count for the spot.** A death or emergency
+  recall off the spot's maps counts for it when she was on one of its
+  maps within
+  `FARM_SEAM_FAILURE_SECONDS` (30 s) before it, or when it happened on a
+  map tiled to one of them or in the same bounded area within
+  `FARM_AREA_FAILURE_SECONDS` (2 minutes) of her leaving the spot
+  (`FarmCircuitTask._seam_failure_leg`). This holds whether her farm walk
+  reads complete or running again: off the destination, the walk's zone
+  containment restarts it, and this rule is judged before the one for a
+  death on the way. It never counts during a maintenance trip, and never
+  on her first walk to the spot, since she has not been on a leg map yet.
+  Only a leg she was on since her last death or emergency recall counts:
+  after either one, the walk back is a walk to the spot. The seam rule is also skipped
+  while her walk heads to a different leg from the one she left. That
+  covers a walk between a circuit's legs and a first walk whose route
+  crossed a leg map. A death there stays a death on the way (cause
+  `route`, with a route hazard on that transit map), so she routes around
+  it afterwards.
+  The review then judges its cause
+  as on the spot (pack, out-damaged and so on), not as a death on the way,
+  so it records the farm-failure review, the kit failure and the
+  adaptation, and teaches no route hazard on the seam map. Live, a
+  retreat from world_16_74 crossed the seam onto world_17_74 and she
+  died there at 16:15:19, with the walk running (its transit hold-fire
+  fired 13 s before). No farm-failure review appeared for it. Under the
+  old rules it could only count as a death on the way to the spot (cause
+  `route`, with a route hazard on the spot's own neighbour), never as the
+  pack fight on the spot that it was.
+- **Kit hazards count by area.** An area is a map header's region and
+  name (`MapNode.region` and `.name`, which the analyzer's `circuit_area`
+  also uses for a circuit of one area), such as
+  `eld_woods_island|Burnt Forest`. A map without a region or with an
+  unnamed header has no area. Each kit failure keeps the area of the leg
+  it counts for, and the record keeps all of its failures' areas. A
+  candidate that shares only an area with a record counts only that
+  record's failures in that area. So two failures in one area and one in
+  the other, on a circuit that spans two areas, leave neither area
+  hazardous. Failures stored before they kept an area take their
+  record's. `kit_hazard` counts a
+  record for every candidate with a map or a leg's area in common with it. Three qualifying failures in
+  24 hours anywhere in the Burnt Forest now mark every Burnt Forest circuit
+  and single map hazardous for that kit, the southern L27-30 maps
+  included. Live, moving from the world_17_72 circuits to world_16_74 (no
+  shared map) restarted the count. Only an area of at most
+  `AREA_HAZARD_MAX_MAPS` (30) maps counts this way (`map_areas`); the
+  Burnt Forest has 25. Larger names cover a whole island or sea (Eld
+  Woods Island 42 maps, Strakewood Island 190, World 2115), and those
+  still count by shared maps only. The last-resort pause (three failures
+  within an hour at adaptation level 4) now quarantines every map of the
+  failure leg's bounded area for that hour, not only the leg map itself
+  (`farm-area-quarantine`). The cure-funding farm's danger cap
+  ([Safer spot choice](#safer-spot-choice-2026-11-23)) still comes only
+  from spots hazardous by their own maps. An area hazard would let an
+  easy southern Burnt Forest map she never failed on lower the cap for
+  every spot.
+- **She leaves a spot with nothing left to pull.** Once every resident
+  kind of the spot is out of her league
+  ([heals losing](#heals-losing-on-the-farm-2026-11-23)) while she is
+  there, the spot's maps are quarantined for an hour
+  (`FARM_OUT_OF_LEAGUE_QUARANTINE_SECONDS`, `farm-out-of-league`). A
+  resident kind is one of the authored, non-peaceful spawns on its maps,
+  and a spawn that can roll several kinds counts only once all of them
+  are marked. The analyzer choice then picks another spot, and her
+  ordinary walk takes her off the map along its route. With no spot left,
+  the circuit ends, as for any quarantined spot. Live, she stayed on
+  world_16_74 with every kind there marked, ran along its edges away from
+  slow treants and was cornered at (19,23).
+
+Accepted limits:
+
+- the choice still waits until a fight or loot is finished
+  (`_busy_finishing_fight_or_loot`), so a pack that is already on her
+  still has to be shaken off first. Live, she died 21 s after the
+  out-healed disengage at 16:20; by then the pack had already formed;
+- at 16:20 the disengage marked the treant, deer and sapling but not the
+  bear, so this rule would not have fired then;
+- an area hazard also covers the area's easier maps. Kit matching, time
+  and the fallback that farms the least dangerous hazardous spot when
+  every usable spot is hazardous still apply;
+- an area is grouped by header alone, not by tiled connection, so a
+  bounded name reused by maps apart from each other is still one area;
+- out-of-league marks hold for 10 minutes wherever she is, so a spot
+  reached in that time whose every resident kind is marked is left on
+  arrival.
 
 ## Operator assist: a held, idle square (owner decision, 2026-11-16)
 

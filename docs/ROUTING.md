@@ -400,8 +400,8 @@ damage on the death map, that map is a hazard for `ROUTE_HAZARD_SECONDS`
 key, no travel time and no success signal. `state` is one JSON blob rewritten
 on every save.
 
-Related farm memory: `farm_adaptations`, with per-kit `kit_failures`, feeds
-`self_improvement.kit_hazard` (`self_improvement.py:285-312`).
+Related farm memory: `farm_adaptations`, with per-kit `kit_failures` and
+each spot's maps and bounded areas, feeds `self_improvement.kit_hazard`.
 `farm_zone_quarantine` maps quarantined spot maps to their expiry.
 
 **PR #94** (`fix(navigation): stop route deaths from looping through one
