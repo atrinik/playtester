@@ -1598,7 +1598,11 @@ Now (ROUTING.md 1.12):
   about 15 s offline instead of 23 s, off the loop.
 - **A reconnect keeps the priest.** The trip a disconnect dropped goes to
   the same priest at once, with one route plan, for 10 minutes, unless
-  that priest's trip failed.
+  that priest's trip failed; autoplay's circuits share that memory.
+- **Survival trips keep their priority.** While the food or heal ranking
+  runs, the circuit starts no other errand in its place, and a ranking
+  with no answer in 5 minutes is given up (`planner-timeout`) so the
+  usual retry and alert run.
 - **The `loop-stall` alert.** Any stall of the event loop over 1 s is
   logged and recorded (`event-loop-stall`, with what was running) and
   raises a dashboard warning for 15 minutes.

@@ -7922,6 +7922,7 @@ class _BackgroundPlan:
                  build: Callable[[Any], Any], key: Any,
                  clock: Callable[[], float]):
         self.key = key
+        self.started_at = clock()
         self.finished_at: float | None = None
         # The view is made here, on the loop: it copies the graph's
         # defaultdicts, which a lookup on the loop may grow.
@@ -7947,14 +7948,27 @@ class BackgroundPlans:
     """
 
     RESULT_SECONDS = 60.0
+    # A plan still running after this is given up (planner-timeout) and
+    # answers None, so the caller's no-route path, retry and alert run
+    # instead of waiting for ever.
+    MAX_PENDING_SECONDS = 300.0
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
         self._plans: dict[str, _BackgroundPlan] = {}
 
+    def _stale(self, plan: _BackgroundPlan) -> bool:
+        return (plan.finished_at is not None and
+                self.clock() - plan.finished_at > self.RESULT_SECONDS)
+
     def planning(self, name: str) -> bool:
-        """Whether ``name`` was started and not yet collected."""
-        return name in self._plans
+        """Whether ``name`` was started and is still to be collected (a
+        result left past RESULT_SECONDS is dropped)."""
+        plan = self._plans.get(name)
+        if plan is not None and self._stale(plan):
+            self.forget(name)
+            return False
+        return plan is not None
 
     def forget(self, name: str) -> None:
         """Drop ``name``'s plan under way, if any."""
@@ -7965,15 +7979,21 @@ class BackgroundPlans:
     def get(self, name: str, graph: "WorldGraph", client: AtrinikClient,
             build: Callable[[Any], Any], *, key: Any = None) -> Any:
         plan = self._plans.get(name)
-        if plan is not None and (
-                plan.key != key or plan.finished_at is not None and
-                self.clock() - plan.finished_at > self.RESULT_SECONDS):
+        if plan is not None and (plan.key != key or self._stale(plan)):
             self.forget(name)
             plan = None
         if plan is None:
             plan = self._plans[name] = _BackgroundPlan(graph, client, build, key, self.clock)
         if not plan.future.done():
-            return PLANNING
+            waited = self.clock() - plan.started_at
+            if waited <= self.MAX_PENDING_SECONDS:
+                return PLANNING
+            self.forget(name)
+            log.warning("%s plan gave no answer in %.0f s; giving up", name, waited)
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("planner-timeout", f"{name}: no answer in {waited:.0f} s")
+            return None
         del self._plans[name]
         plan.proxy.replay_actions(client)
         return plan.future.result()
@@ -8453,6 +8473,7 @@ class FarmCircuitTask(BotTask):
                  spot: dict | None = None,
                  backoffs: dict[str, float] | None = None,
                  avoid_priests: Callable[[], Iterable[str]] = tuple,
+                 food_planner: "TempleFoodPlanner | None" = None,
                  clock: Callable[[], float] = time.monotonic):
         if not legs:
             raise ValueError("a farm circuit needs at least one leg")
@@ -8505,9 +8526,11 @@ class FarmCircuitTask(BotTask):
         self._resupply_retry_at = 0.0
         # Whether the running resupply is a shop purchase or temple food.
         self._resupply_kind = ""
-        # Route rankings off the event loop (ROUTING 1.12): the temple's,
-        # and the food, heal and recall merchants'.
-        self._food_planner = TempleFoodPlanner()
+        # Route rankings off the event loop (ROUTING 1.12): the temple's
+        # (autoplay's own planner, shared: one ranking and one remembered
+        # priest across its circuits), and the food, heal and recall
+        # merchants'.
+        self._food_planner = food_planner or TempleFoodPlanner()
         self._plans = BackgroundPlans()
         self._temple_food_retry_at = 0.0
         self._storage: NavigateThenTask | None = None
@@ -11436,15 +11459,16 @@ class FarmCircuitTask(BotTask):
                 await self._cure_funding.tick(client)
                 return
         # Survival supplies first, then clear unknown/cursed-item risk and
-        # carrying pressure; discretionary shopping is always last.
+        # carrying pressure; discretionary shopping is always last. While a
+        # survival trip's ranking runs off the loop, no later errand starts
+        # in its place: the farm carries on until it is done.
+        survival_pending = False
         if (isinstance(farm, FarmTask) and self._needs_food_resupply(client) and
                 (self._food_urgent(client) or
                  not self._busy_finishing_fight_or_loot(client, farm))):
             resupply, kind = self._food_trip(client)
             if resupply is PLANNING:
-                # The temple ranking runs off the loop: the circuit carries
-                # on (and fights) until it is done.
-                resupply = None
+                resupply, survival_pending = None, True
             elif resupply is None and kind == "temple":
                 self._temple_food_retry_at = (
                     self.clock() + self.TEMPLE_FOOD_RETRY_SECONDS)
@@ -11462,7 +11486,7 @@ class FarmCircuitTask(BotTask):
             await client.set_combat(False)
             await self._capability.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_mass_identification(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -11470,7 +11494,7 @@ class FarmCircuitTask(BotTask):
             self._identification = self._new_mass_identification()
             await self._identification.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_apartment_storage(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -11483,7 +11507,7 @@ class FarmCircuitTask(BotTask):
         # no savebed rebinding, shopping, ship key or spell purchase spends
         # the cure's money or time.
         funding = cure_funding_farm(client)
-        if (isinstance(farm, FarmTask) and not funding and
+        if (isinstance(farm, FarmTask) and not funding and not survival_pending and
                 not self._busy_finishing_fight_or_loot(client, farm) and
                 self._needs_savebed(client)):
             await client.clear_actions()
@@ -11499,7 +11523,7 @@ class FarmCircuitTask(BotTask):
                          f"{current if current is not None else 'unknown'}")
             await self._bed_binding.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_junk_sale(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -11507,7 +11531,7 @@ class FarmCircuitTask(BotTask):
             self._selling = self._new_junk_sale(client)
             await self._selling.tick(client)
             return
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_bank_deposit(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
@@ -11521,7 +11545,7 @@ class FarmCircuitTask(BotTask):
         # on the same hold (FarmTask._unprepared_rest).
         unprepared = (isinstance(farm, FarmTask) and
                       self._unprepared_hold.active(client, farm.safety))
-        held = unprepared or funding
+        held = unprepared or funding or survival_pending
         # The heal restock is the one optional trip the hold leaves alone:
         # it is the cure for being unprepared. While the hold holds it goes
         # only by a strict route, and not below its flee threshold
@@ -11532,7 +11556,7 @@ class FarmCircuitTask(BotTask):
         # rests meanwhile.
         if isinstance(farm, FarmTask):
             farm.rest_for_departure = self._heal_restock_waiting(client, farm)
-        if (isinstance(farm, FarmTask) and
+        if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_heal_restock(client) and
                 not self._busy_finishing_fight_or_loot(client, farm) and
                 self._heal_restock_may_leave(client, unprepared)):
@@ -11546,7 +11570,7 @@ class FarmCircuitTask(BotTask):
                 lambda proxy: self._new_heal_restock(proxy, strict=strict), key=strict)
             recorder = getattr(client, "record_action", None)
             if trip is PLANNING:
-                pass
+                held = True
             elif (trip is not None and getattr(trip, "hostile_transit", False)
                     and out_of_heals_and_recall(client, farm.safety) and
                     not self._full_hp_sp(client)):

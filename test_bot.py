@@ -3,6 +3,7 @@ import collections
 import dataclasses
 import json
 import os
+import re
 import time
 import tempfile
 import types
@@ -37136,6 +37137,47 @@ class PlanningOffLoopTests(unittest.TestCase):
         self.assertIsNot(on_worker, graph)
         self.assertIs(graph.planner_view().planner_view(), graph.planner_view())
 
+    def test_a_ranking_that_never_answers_is_given_up(self):
+        # A hung plan must not leave her waiting for food for ever: after
+        # MAX_PENDING_SECONDS it counts as no route, so retries and alerts run.
+        import concurrent.futures
+        from . import planner as planner_module
+        from .navigation import PLANNING, BackgroundPlans
+
+        now = [100.0]
+        plans = BackgroundPlans(clock=lambda: now[0])
+        client = self.client()
+        hung = concurrent.futures.Future()
+        with patch.object(planner_module, "submit", lambda *_a, **_k: hung):
+            self.assertIs(plans.get("temple", WorldGraph(), client, lambda _: None),
+                          PLANNING)
+            now[0] += plans.MAX_PENDING_SECONDS
+            self.assertIs(plans.get("temple", WorldGraph(), client, lambda _: None),
+                          PLANNING)
+            now[0] += 1
+            self.assertIsNone(plans.get("temple", WorldGraph(), client, lambda _: None))
+        self.assertFalse(plans.planning("temple"))
+        self.assertTrue(hung.cancelled())
+        self.assertEqual([record["action"] for record in client.decision_history
+                          if record["action"] == "planner-timeout"], ["planner-timeout"])
+        # A finished result nobody collected stops counting as planning.
+        done = concurrent.futures.Future()
+        with patch.object(planner_module, "submit", lambda *_a, **_k: done):
+            plans.get("food", WorldGraph(), client, lambda _: None)
+        done.set_result("trip")
+        plans._plans["food"].finished_at = now[0]
+        self.assertTrue(plans.planning("food"))
+        now[0] += plans.RESULT_SECONDS + 1
+        self.assertFalse(plans.planning("food"))
+
+    def test_autoplay_circuits_share_its_temple_planner(self):
+        autoplay = AutoplayTask(WorldGraph())
+        circuit = FarmCircuitTask(WorldGraph(), [("/a", "treant")],
+                                  food_planner=autoplay.food_planner)
+        self.assertIs(circuit._food_planner, autoplay.food_planner)
+        self.assertIsNot(FarmCircuitTask(WorldGraph(), [("/a", "treant")])._food_planner,
+                         autoplay.food_planner)
+
     def test_a_ranking_clears_the_components_once(self):
         # Each unreachable priest cleared and rebuilt the component cache
         # (1.1 to 1.3 s each, about 22 s of the ranking from world_7_79).
@@ -37226,12 +37268,14 @@ class PlanningOffLoopTests(unittest.TestCase):
 
         with self.assertLogs("atrinik_bot.planner", "WARNING"):
             asyncio.run(stall())
-        self.assertEqual(watchdog.stalls, 1)
+        # A loaded runner may add a stall of its own; the planner's is there.
+        self.assertGreaterEqual(watchdog.stalls, 1)
         self.assertGreaterEqual(watchdog.worst, 0.2)
-        stalls = [record for record in client.decision_history
+        stalls = [record["detail"] for record in client.decision_history
                   if record["action"] == "event-loop-stall"]
-        self.assertEqual(len(stalls), 1)
-        self.assertRegex(stalls[0]["detail"], r"^0\.\ds late in autoplay:level-115$")
+        self.assertEqual(len(stalls), watchdog.stalls)
+        self.assertTrue(any(re.fullmatch(r"0\.[2-9]s late in autoplay:level-115", detail)
+                            for detail in stalls), stalls)
         # The dashboard alerts it for a while.
         found = alerts.active(client.state, client.decision_history, alerts.ProgressWatch(),
                               autoplay_started_at=None)

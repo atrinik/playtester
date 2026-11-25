@@ -34,6 +34,7 @@ import asyncio
 import concurrent.futures
 import copy
 import dataclasses
+import inspect
 import logging
 import queue
 import threading
@@ -190,8 +191,10 @@ class LoopWatchdog:
 
     Every ``interval`` seconds it sleeps and measures the overshoot. Above
     ``threshold`` it logs a warning and records ``event-loop-stall`` with
-    the lag and what was running (``describe``), which the dashboard turns
-    into an alert (alerts.loop_stall). The worst lag seen is kept in
+    the lag and what runs as the loop resumes (``describe``: the stalled
+    code has returned by then, but a tick's task is usually the same),
+    which the dashboard turns into an alert (alerts.loop_stall). A
+    suspended process reads as a stall too. The worst lag seen is kept in
     ``worst`` and the last in ``last``.
     """
 
@@ -232,9 +235,13 @@ class LoopWatchdog:
         recorder = getattr(self.client, "record_action", None)
         if recorder is not None:
             try:
-                recorder(STALL_ACTION, detail, save_timeout=self.SAVE_TIMEOUT)
-            except TypeError:
-                recorder(STALL_ACTION, detail)
+                parameters = inspect.signature(recorder).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            options = ({"save_timeout": self.SAVE_TIMEOUT}
+                       if "save_timeout" in parameters else {})
+            try:
+                recorder(STALL_ACTION, detail, **options)
             except Exception:
                 log.exception("event loop stall not recorded")
         return True

@@ -491,11 +491,17 @@ starvations.
   A finished result is used only for the same inputs (the priests passed
   over, the strict flag) and within `RESULT_SECONDS` (60 s) of finishing;
   older, it is planned again. A ranking's error is raised on the tick that
-  collects it, as the ranking itself raised it before.
+  collects it, as the ranking itself raised it before. A ranking with no
+  answer after `MAX_PENDING_SECONDS` (5 minutes) is given up
+  (`planner-timeout`) and counts as no route, so the caller's retry and
+  alert run. While the food or heal ranking runs, the circuit starts no
+  later errand (storage, selling, banking, shopping) in its place: survival
+  trips keep their priority.
 - **The worker never reads live state.** `planning_client` gives it
   `planner.PlanningClient`: a copy of her game state taken on the loop
-  (every container copied, each item with its own `extra`) and of her
-  decision and action histories. Other attributes are read through to her
+  (each container field copied one level deep, each item with its own
+  `extra`; deeper values such as tiles are shared, and the planners only
+  read them) and of her decision and action histories. Other attributes are read through to her
   client (configuration, the analyzer's profile, read-only); attributes the
   planners set stay on the copy, and `record_action` calls (a probe's
   `navigation-threat-fallback`) are kept and replayed on the loop when the
@@ -529,13 +535,17 @@ starvations.
   ranking, unless that priest is passed over by then (its trip failed).
   The trip itself is rebuilt, not resumed: a temple dialogue cut by a
   reconnect is not continued. A ranking under way survives the reconnect
-  too. A completed or failed trip forgets the priest.
+  too. Autoplay's farm circuits share its planner, so a rebuilt circuit
+  keeps the priest as well. A completed trip and an operator hold forget
+  the priest; a priest whose trip failed is passed over, so it is never
+  reused.
 - **Stalls are visible.** `planner.LoopWatchdog` sleeps 0.5 s at a time
   and measures the overshoot. A stall over 1 s logs a warning and records
   `event-loop-stall` ("2.3s late in autoplay:level-115 > adaptive-farming
-  (safety)": the engine's task, its child and the client's action
-  context), and the dashboard raises the `loop-stall` warning for
-  15 minutes.
+  (safety)": the engine's task, its child and the client's action context
+  as the loop resumes, usually the tick that stalled), and the dashboard
+  raises the `loop-stall` warning, with the count, for 15 minutes. A
+  suspended process reads as a stall too.
 
 Still on the loop, each measured offline from `world_7_79` and visible to
 the watchdog when it runs long: one trip's own route plan when it starts

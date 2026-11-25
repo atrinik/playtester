@@ -195,19 +195,20 @@ class AutoplayTask(BotTask):
                 time.monotonic() + self.TEMPLE_PRIEST_RETRY)
         if not self._hunger_fallback_used and hungry(client):
             self._hunger_fallback_used = True
-            started = await self._start_temple_food(client)
-            if started or self.food_planner.planning:
+            if await self._start_temple_food(client):
                 log.warning("autoplay temple food failed: %s; "
                             "trying another priest", failed)
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("autoplay-retry",
                              f"{failed}; trying another priest")
-            if started:
                 return True
             if self.food_planner.planning:
-                # Its ranking runs off the loop: the failed trip ends now,
-                # and the next ticks start the trip it finds.
+                # Its ranking runs off the loop: the failed trip ends now
+                # (recorded as a retry), and the next ticks start the trip
+                # it finds.
+                log.warning("autoplay temple food failed: %s; "
+                            "ranking another priest", failed)
                 return False
         self._temple_food_retry_at = (
             time.monotonic() + FarmCircuitTask.TEMPLE_FOOD_RETRY_SECONDS)
@@ -639,6 +640,9 @@ class AutoplayTask(BotTask):
 
         self._forget_stale_recall_note(client)
         settle_cure_funding_farm(client)
+        if not hungry(client):
+            # Fed: the next hunger episode may try another priest again.
+            self._hunger_fallback_used = False
         if (self._needs_temple_food(client) and
                 await self._start_temple_food(client)):
             return
@@ -808,7 +812,8 @@ class AutoplayTask(BotTask):
                 self.graph, list(legs), level_until=self.target_level,
                 analyzer_driven=True, spot=spot,
                 backoffs=self._circuit_backoffs,
-                avoid_priests=self._avoided_priests))
+                avoid_priests=self._avoided_priests,
+                food_planner=self.food_planner))
 
 
 class IdleSurvival:
@@ -876,6 +881,8 @@ class IdleSurvival:
         """
         trip, self.child = self.child, None
         self._generation += 1
+        # The operator took over: the next trip ranks from where she is then.
+        self.food_planner.forget()
         now = time.monotonic()
         food = int(client.state.stats.get("food", 1000) or 0)
         if self._hold_started is None or food >= HUNGRY_FOOD:
