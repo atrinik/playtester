@@ -10952,6 +10952,8 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # A spawn whose radius she stood in lately, with nothing on her,
         # is empty or asleep: no hazard.
         task._cleared_trail[("/test", 13, 12)] = time.monotonic()
+        self.assertEqual(task.retreat_hazards(client, {100}), [(12, 8, 3)])
+        client.state.map.tile(12, 8)  # its square now in view, empty
         self.assertEqual(task.retreat_hazards(client, {100}), [])
 
     def test_slow_melee_at_ninety_percent_is_fought_not_run_from(self):

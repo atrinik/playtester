@@ -1846,12 +1846,13 @@ attackers on her, and two corpse probes were queued mid-fight.
   attackers of the current pursuit, and anything within 2 tiles of her.
   A spawn with a hostile in view within a tile of it is that hostile's,
   one within its radius of a creature in the fight is taken to be that
-  creature's, and one whose radius held a cleared-trail square within
+  creature's, and one in view whose radius held a cleared-trail square within
   `TRAIL_QUIET_SECONDS` (60 s) is empty or asleep. On a neutral farm
   visible creatures are no hazard. Steps are ranked by:
   1. a continuation (escape depth 2 or more);
   2. getting clear of every threat's side: at once (separation 2), or by
-     a walkable, hazard-free square beside the step that is. A step that
+     a walkable, unoccupied, hazard-free square beside the step (not her
+     own) that is. A step that
      can do neither only circles an attacker with combat off;
   3. fewest hazards;
   4. off every threat's side now;

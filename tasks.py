@@ -5291,8 +5291,8 @@ class FarmTask(BotTask):
         (resident_spawns) with its authored radius. A spawn with a hostile
         in view within a tile of it is that hostile's (counted as itself,
         or in the fight), one within its radius of a hostile in the fight
-        is taken to be that fighter's, and one whose radius held a cleared
-        trail square within TRAIL_QUIET_SECONDS is empty or asleep.
+        is taken to be that fighter's, and one in view whose radius held a
+        cleared trail square within TRAIL_QUIET_SECONDS is empty or asleep.
         Live on world_16_74 her retreats from two treants ran past the
         other spawns and the pack grew to eight in 23 s.
         """
@@ -5322,13 +5322,17 @@ class FarmTask(BotTask):
                  if path == m.path and
                  now - seen <= self.TRAIL_QUIET_SECONDS]
         for spawn_x, spawn_y, radius in self.resident_spawns:
-            if any(max(abs(x - spawn_x), abs(y - spawn_y)) <= radius
-                   for x, y in quiet):
-                # She stood within its radius lately with nothing on her:
-                # it is empty (killed) or did not wake.
-                continue
             view_x = cx + spawn_x - m.world_x
             view_y = cy + spawn_y - m.world_y
+            if (view_x, view_y) in m.tiles and any(
+                    max(abs(x - spawn_x), abs(y - spawn_y)) <= radius
+                    for x, y in quiet):
+                # In view with nobody near it (below), and she stood within
+                # its radius lately with nothing on her: it is empty
+                # (killed) or did not wake.
+                if not any(max(abs(view_x - x), abs(view_y - y)) <= 1
+                           for x, y in visible):
+                    continue
             if any(max(abs(view_x - x), abs(view_y - y)) <= 1
                    for x, y in visible):
                 continue
@@ -5564,8 +5568,11 @@ class FarmTask(BotTask):
             # beside it that is. A step that can do neither only circles
             # an attacker with combat off.
             clear = separation >= 2 or (seam is None and any(
+                (nx, ny) != (-dx, -dy) and
                 (m.path, world_x + nx, world_y + ny)
                 not in self._retreat_blocked and
+                not any(obj.target_id for obj in getattr(m.tiles.get((
+                    view_x + nx, view_y + ny)), "objects", {}).values()) and
                 self.within_farm_map(client, view_x + nx, view_y + ny) and
                 self.retreat_tile_walkable(
                     m.path, world_x + nx, world_y + ny) and
