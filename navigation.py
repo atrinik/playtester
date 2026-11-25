@@ -11,6 +11,7 @@ import math
 import multiprocessing
 import os
 import posixpath
+import threading
 import dataclasses
 import re
 import xml.etree.ElementTree as ET
@@ -474,6 +475,10 @@ def _dialogue_seller_interfaces(
     return sellers
 
 
+# Makes each planner view once (WorldGraph.planner_view).
+_PLANNER_VIEW_LOCK = threading.Lock()
+
+
 class WorldGraph:
     def __init__(self, map_root: Path | None = None):
         self.map_root = map_root or CONTENT_ROOT / "maps"
@@ -530,28 +535,40 @@ class WorldGraph:
     _PLANNER_CACHES = ("_component_cache", "_aggro_pack_cache", "_route_open_cache",
                        "_seam_exposure_cache", "_gated_route_snapshots")
 
-    def planner_view(self) -> "WorldGraph":
-        """This graph for the planner worker (planner.py): the same map data,
-        with caches of its own.
+    def planner_view(self, generation: int | None = None) -> "WorldGraph":
+        """This graph for a planner worker (planner.py): the same map data,
+        with caches of its own; one view per worker ``generation`` (the
+        current worker's by default).
 
         After build the map data is never changed, so the view shares it.
         The derived caches are filled (and cleared) while a search runs, so
         the view has its own and the worker never changes one the loop is
         reading, nor reads one it changes. A defaultdict grows on a lookup
         of a missing key, so the view has its own copy of each of those
-        too. Only the planner's single worker thread plans on the view.
-        Called on the loop."""
-        view = self.__dict__.get("_planner_view")
+        too; each copy is one C-level dict copy, which the GIL keeps whole
+        whichever thread makes it. Only one worker thread plans on a view:
+        a worker that replaces a stuck one (planner.replace) has its own."""
+        if self.__dict__.get("_is_planner_view"):
+            return self
+        if generation is None:
+            generation = planner.generation()
+        views = self.__dict__.setdefault("_planner_views", {})
+        view = views.get(generation)
         if view is None:
-            view = copy.copy(self)
-            view.__dict__.pop("_component_access_order", None)
-            for name in self._PLANNER_CACHES:
-                setattr(view, name, {})
-            view._world_search_snapshot = None
-            for name, value in list(view.__dict__.items()):
-                if isinstance(value, defaultdict):
-                    setattr(view, name, copy.copy(value))
-            view._planner_view = self._planner_view = view
+            with _PLANNER_VIEW_LOCK:
+                view = views.get(generation)
+                if view is None:
+                    view = copy.copy(self)
+                    view.__dict__.pop("_component_access_order", None)
+                    view.__dict__.pop("_planner_views", None)
+                    for name in self._PLANNER_CACHES:
+                        setattr(view, name, {})
+                    view._world_search_snapshot = None
+                    for name, value in list(view.__dict__.items()):
+                        if isinstance(value, defaultdict):
+                            setattr(view, name, copy.copy(value))
+                    view._is_planner_view = True
+                    views[generation] = view
         return view
 
     def build(self) -> "WorldGraph":
@@ -2550,6 +2567,17 @@ def _plan_inputs_of(client: Any) -> PlanInputs | None:
     return inputs if isinstance(inputs, PlanInputs) else None
 
 
+class PlanCancelled(Exception):
+    """A background ranking was dropped: its remaining probes stop (not a
+    ValueError, so no ranking takes it for an unreachable destination)."""
+
+
+def _check_cancelled(client: Any) -> None:
+    flag = getattr(client, "cancelled", None)
+    if isinstance(flag, threading.Event) and flag.is_set():
+        raise PlanCancelled("the ranking was dropped")
+
+
 class ComponentRefresh:
     """One cache refresh shared by a ranking's probes (NavigateTask.refresh).
 
@@ -2703,9 +2731,8 @@ class NavigateTask(BotTask):
         (WorldGraph.planner_view), so a plan made there never touches a
         cache the loop uses."""
         graph = self._graph
-        if planner.on_worker():
-            return graph.planner_view()
-        return graph
+        generation = planner.worker_generation()
+        return graph if generation is None else graph.planner_view(generation)
 
     @graph.setter
     def graph(self, graph: WorldGraph) -> None:
@@ -2976,6 +3003,7 @@ class NavigateTask(BotTask):
         other trip fails with the block as its reason. A walk to a safe
         place for that care never crosses one.
         """
+        _check_cancelled(client)
         inputs = _plan_inputs_of(client)
         if inputs is not None:
             self._walls, self._offer = inputs.walls, inputs.offer
@@ -3369,11 +3397,15 @@ class NavigateTask(BotTask):
     def _refresh_components(self) -> bool:
         """Clear the graph's components before retrying a failed plan; False
         when this plan's ranking already did (ComponentRefresh): they are
-        fresh, so the failure is not retried."""
-        if self.refresh is not None:
-            if self.refresh.done:
+        fresh, so the failure is not retried. A background ranking's
+        planning client carries one for all its probes."""
+        refresh = self.refresh
+        if refresh is None:
+            refresh = getattr(self._plan_client, "refresh", None)
+        if isinstance(refresh, ComponentRefresh):
+            if refresh.done:
                 return False
-            self.refresh.done = True
+            refresh.done = True
         _clear_components(self.graph)
         return True
 
@@ -7908,10 +7940,16 @@ def planning_client(client: AtrinikClient, graph: "WorldGraph") -> planner.Plann
     plans with it reads her walls, offer and access set from here, never
     from her live client. With learned costs on, her learned model is
     refreshed here too, so the worker reads it warm."""
-    if learned_route_costs(client):
-        route_costs.learned_model(client)
+    model = route_costs.learned_model(client) if learned_route_costs(client) else None
     proxy = planner.PlanningClient(client)
     proxy.plan_inputs = plan_inputs(client, graph)
+    proxy.refresh = ComponentRefresh()
+    if model is not None:
+        # Frozen for this plan: learned_model(proxy) returns it and never
+        # reads her memory on the worker (its state reads as never stale).
+        state = getattr(client, "_route_cost_model_state", (model.character, 0.0, 0))
+        proxy._route_cost_model = model
+        proxy._route_cost_model_state = (state[0], math.inf, state[2])
     return proxy
 
 
@@ -7920,15 +7958,16 @@ class _BackgroundPlan:
 
     def __init__(self, graph: "WorldGraph", client: AtrinikClient,
                  build: Callable[[Any], Any], key: Any,
-                 clock: Callable[[], float]):
+                 clock: Callable[[], float], priority: int):
         self.key = key
-        self.started_at = clock()
+        # When the worker was first seen running it: time in the queue
+        # behind other rankings does not count towards MAX_PENDING_SECONDS.
+        self.running_since: float | None = None
         self.finished_at: float | None = None
-        # The view is made here, on the loop: it copies the graph's
-        # defaultdicts, which a lookup on the loop may grow.
+        # The view is made here, warm for the worker.
         graph.planner_view()
         self.proxy = planning_client(client, graph)
-        self.future = planner.submit(build, self.proxy)
+        self.future = planner.submit(build, self.proxy, priority=priority)
         self.future.add_done_callback(lambda _: setattr(self, "finished_at", clock()))
 
 
@@ -7971,28 +8010,38 @@ class BackgroundPlans:
         return plan is not None
 
     def forget(self, name: str) -> None:
-        """Drop ``name``'s plan under way, if any."""
+        """Drop ``name``'s plan under way, if any: a queued one never runs,
+        a running one stops at its next probe (PlanCancelled)."""
         plan = self._plans.pop(name, None)
         if plan is not None:
             plan.future.cancel()
+            plan.proxy.cancelled.set()
 
     def get(self, name: str, graph: "WorldGraph", client: AtrinikClient,
-            build: Callable[[Any], Any], *, key: Any = None) -> Any:
+            build: Callable[[Any], Any], *, key: Any = None,
+            priority: int = planner.PRIORITY_OTHER) -> Any:
         plan = self._plans.get(name)
         if plan is not None and (plan.key != key or self._stale(plan)):
             self.forget(name)
             plan = None
         if plan is None:
-            plan = self._plans[name] = _BackgroundPlan(graph, client, build, key, self.clock)
+            plan = self._plans[name] = _BackgroundPlan(
+                graph, client, build, key, self.clock, priority)
         if not plan.future.done():
-            waited = self.clock() - plan.started_at
-            if waited <= self.MAX_PENDING_SECONDS:
+            recorder = getattr(client, "record_action", None)
+            stuck = planner.unstick(self.MAX_PENDING_SECONDS)
+            if stuck and recorder is not None:
+                recorder("planner-replaced", f"{stuck}; a fresh planner worker took over")
+            now = self.clock()
+            if plan.running_since is None and plan.future.running():
+                plan.running_since = now
+            ran = 0.0 if plan.running_since is None else now - plan.running_since
+            if ran <= self.MAX_PENDING_SECONDS:
                 return PLANNING
             self.forget(name)
-            log.warning("%s plan gave no answer in %.0f s; giving up", name, waited)
-            recorder = getattr(client, "record_action", None)
+            log.warning("%s plan gave no answer in %.0f s; giving up", name, ran)
             if recorder is not None:
-                recorder("planner-timeout", f"{name}: no answer in {waited:.0f} s")
+                recorder("planner-timeout", f"{name}: no answer in {ran:.0f} s")
             return None
         del self._plans[name]
         plan.proxy.replay_actions(client)
@@ -8004,10 +8053,12 @@ class TempleFoodPlanner:
     (BackgroundPlans): ``trip`` answers PLANNING until it is done, then the
     trip to the priest it chose, or None when none is reachable.
 
-    The priest chosen is remembered for RESUME_SECONDS: when a disconnect
-    drops the trip, the next one goes to the same priest at once (one
-    route, not a new ranking), unless that priest is passed over by then.
-    ``forget`` ends both once the trip is done or failed.
+    A ranking and the priest it chose hold for the map she ranked from and
+    the priests passed over. The priest is remembered for RESUME_SECONDS:
+    when a disconnect drops the trip while she is still on that map, the
+    next one goes to the same priest at once (one route, not a new
+    ranking). ``forget`` ends both: a trip done or failed, an operator
+    hold, a task taking over.
     """
 
     RESUME_SECONDS = 600.0
@@ -8015,7 +8066,7 @@ class TempleFoodPlanner:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
         self.plans = BackgroundPlans(clock=clock)
-        self._chosen: tuple[DialogueVendor, float] | None = None
+        self._chosen: tuple[DialogueVendor, float, tuple] | None = None
 
     @property
     def planning(self) -> bool:
@@ -8031,11 +8082,13 @@ class TempleFoodPlanner:
              exclude: Iterable[str] = ()) -> NavigateThenTask | None | _Planning:
         """The trip to start now, None, or PLANNING (class doc)."""
         excluded = tuple(sorted({name.casefold() for name in exclude}))
+        # A ranking, and the priest it chose, hold for the map it ranked
+        # from and the priests it passed over.
+        key = (client.state.map.path, excluded)
         now = self.clock()
         if self._chosen is not None:
-            priest, chosen_at = self._chosen
-            if (now - chosen_at <= self.RESUME_SECONDS and
-                    priest.name.casefold() not in excluded):
+            priest, chosen_at, chosen_key = self._chosen
+            if now - chosen_at <= self.RESUME_SECONDS and chosen_key == key:
                 return temple_food_task(graph, priest)
             self._chosen = None
         origin = apartment_exit_origin(client)
@@ -8043,10 +8096,10 @@ class TempleFoodPlanner:
             "temple", graph, client,
             lambda proxy: rank_temple_priests(graph, proxy, exclude=excluded,
                                               origin=origin),
-            key=excluded)
+            key=key, priority=planner.PRIORITY_FOOD)
         if priest is PLANNING or priest is None:
             return priest
-        self._chosen = (priest, now)
+        self._chosen = (priest, now, key)
         return temple_food_task(graph, priest)
 
 
@@ -9400,7 +9453,8 @@ class FarmCircuitTask(BotTask):
         if now >= self._resupply_retry_at:
             # Its merchant ranking runs off the loop too.
             return self._plans.get("food-resupply", self.graph, client,
-                                   self._new_food_resupply), "shop"
+                                   self._new_food_resupply,
+                                   priority=planner.PRIORITY_FOOD), "shop"
         return None, ""
 
     def _food_order_cost(self) -> int:
@@ -11570,7 +11624,8 @@ class FarmCircuitTask(BotTask):
             # farm carries on meanwhile.
             trip = self._plans.get(
                 "heal-restock", self.graph, client,
-                lambda proxy: self._new_heal_restock(proxy, strict=strict), key=strict)
+                lambda proxy: self._new_heal_restock(proxy, strict=strict), key=strict,
+                priority=planner.PRIORITY_HEAL)
             recorder = getattr(client, "record_action", None)
             if trip is PLANNING:
                 held = True
@@ -11645,7 +11700,10 @@ class FarmCircuitTask(BotTask):
             # farm carries on meanwhile.
             shopping = self._plans.get("recall-shopping", self.graph, client,
                                        self._new_recall_shopping)
-            if shopping is not PLANNING and shopping is not None:
+            if shopping is PLANNING:
+                # Recall before utility and upgrade shopping, as before.
+                held = True
+            elif shopping is not None:
                 await client.clear_actions()
                 await client.set_combat(False)
                 self._recall_shopping = shopping

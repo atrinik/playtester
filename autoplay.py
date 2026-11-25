@@ -862,13 +862,15 @@ class IdleSurvival:
         # The temple ranking, off the event loop (ROUTING 1.12).
         self.food_planner = TempleFoodPlanner()
 
-    def drop(self) -> None:
-        """Forget a trip in flight (a task took over, or the connection
-        dropped); a still-hungry character starts afresh. A ranking under
-        way and the priest last chosen are kept (TempleFoodPlanner): the
-        next trip needs no new ranking."""
+    def drop(self, *, task_took_over: bool = False) -> None:
+        """Forget a trip in flight; a still-hungry character starts afresh.
+        After a connection drop a ranking under way and the priest last
+        chosen are kept (TempleFoodPlanner): the next trip from the same
+        map needs no new ranking. A task that takes over ends both."""
         self.child = None
         self._generation += 1
+        if task_took_over:
+            self.food_planner.forget()
 
     def hold(self, client: AtrinikClient, reason: str) -> None:
         """The operator took over: end a running trip and wait a while.

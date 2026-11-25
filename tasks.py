@@ -8974,9 +8974,9 @@ class TaskEngine:
                 self.client.state.phase != "playing"):
             if survival is not None:
                 # A task owns her now, or the connection is gone: a trip in
-                # flight is rebuilt if she still needs it, to the priest
-                # already chosen (TempleFoodPlanner), with no new ranking.
-                survival.drop()
+                # flight is rebuilt if she still needs it; after a connection
+                # drop, to the priest already chosen (TempleFoodPlanner).
+                survival.drop(task_took_over=self.task is not None)
             return False
         if survival is not None:
             self.client.action_context = "idle-survival"
