@@ -37134,6 +37134,43 @@ class PlanningOffLoopTests(unittest.TestCase):
             self.wait_for(lambda: len(ranked) == 2)
         self.assertEqual(ranked[1], ("telath",))
 
+    def test_a_ranking_finishes_while_she_walks(self):
+        # Autoplay keeps a walking phase ticking while the ranking runs; a
+        # map crossing must not restart it, or a starving bot never eats.
+        import threading
+        from . import navigation as navigation_module
+        from .navigation import PLANNING, TempleFoodPlanner
+
+        release = threading.Event()
+        ranked = []
+
+        def rank(graph, client, *, exclude=(), origin=None):
+            ranked.append(client.state.map.path)
+            release.wait(5)
+            return graph.temple_priests[0]
+
+        graph = self.priests_graph()
+        client = self.client()
+        food = TempleFoodPlanner()
+        with patch.object(navigation_module, "rank_temple_priests", rank):
+            self.assertIs(food.trip(graph, client), PLANNING)
+            self.wait_for(lambda: ranked)
+            for path in ("/shattered_islands/world_7_78", "/shattered_islands/world_7_77",
+                         "/shattered_islands/world_8_77"):
+                client.state.map.path = path
+                self.assertIs(food.trip(graph, client), PLANNING)
+            release.set()
+            self.wait_for(lambda: food.plans._plans["temple"].future.done())
+            trip = food.trip(graph, client)
+        self.assertEqual(trip.task.priest, "Telath")
+        self.assertEqual(ranked, [self.BED])
+
+    def test_old_planner_views_are_dropped(self):
+        graph = WorldGraph()
+        views = [graph.planner_view(generation) for generation in (1, 2, 3, 4)]
+        self.assertEqual(sorted(graph._planner_views), [3, 4])
+        self.assertIs(graph.planner_view(4), views[3])
+
     def test_a_task_taking_over_forgets_the_priest(self):
         from . import navigation as navigation_module
         from .autoplay import IdleSurvival
@@ -37350,12 +37387,20 @@ class PlanningOffLoopTests(unittest.TestCase):
         from . import route_costs
         from .navigation import planning_client
 
+        from .route_events import RouteRecorder
+
         config = ClientConfig()
         config.learned_route_costs = True
         client = AtrinikClient(config)
         client.state.map.path = self.BED
+        client.route_recorder = Mock(spec=RouteRecorder, character="Sera", changes=0)
+        store = Mock()
+        store.route_cost_rows.return_value = [{"subject": "map:/a"}]
+        store.route_traversal_rows.return_value = []
+        client._memory_store = lambda: store
         graph = WorldGraph()
         proxy = planning_client(client, graph)
+        self.assertEqual(client._route_cost_model.character, "Sera")
         task = NavigateTask(graph, "/goal")
         task._plan_client = proxy
         with patch.object(navigation_module, "_clear_components", lambda graph: None):

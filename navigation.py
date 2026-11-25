@@ -569,6 +569,10 @@ class WorldGraph:
                             setattr(view, name, copy.copy(value))
                     view._is_planner_view = True
                     views[generation] = view
+                    # Older views go: only the worker before this one (an
+                    # abandoned worker may still run) keeps its own.
+                    for old in [old for old in views if old < generation - 1]:
+                        del views[old]
         return view
 
     def build(self) -> "WorldGraph":
@@ -8053,12 +8057,14 @@ class TempleFoodPlanner:
     (BackgroundPlans): ``trip`` answers PLANNING until it is done, then the
     trip to the priest it chose, or None when none is reachable.
 
-    A ranking and the priest it chose hold for the map she ranked from and
-    the priests passed over. The priest is remembered for RESUME_SECONDS:
-    when a disconnect drops the trip while she is still on that map, the
-    next one goes to the same priest at once (one route, not a new
-    ranking). ``forget`` ends both: a trip done or failed, an operator
-    hold, a task taking over.
+    A ranking holds for the priests it passed over and runs to the end
+    wherever she walks meanwhile (the trip plans its own route from where
+    she is). The priest it chose is remembered for RESUME_SECONDS with the
+    map the ranking started from: when a disconnect drops the trip while
+    she is still on that map, the next one goes to the same priest at once
+    (one route, not a new ranking); anywhere else she ranks again.
+    ``forget`` ends both: a trip done or failed, an operator hold, a task
+    taking over.
     """
 
     RESUME_SECONDS = 600.0
@@ -8066,7 +8072,9 @@ class TempleFoodPlanner:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic):
         self.clock = clock
         self.plans = BackgroundPlans(clock=clock)
-        self._chosen: tuple[DialogueVendor, float, tuple] | None = None
+        self._chosen: tuple[DialogueVendor, float, str] | None = None
+        # The map the ranking under way started from.
+        self._origin_map = ""
 
     @property
     def planning(self) -> bool:
@@ -8082,24 +8090,25 @@ class TempleFoodPlanner:
              exclude: Iterable[str] = ()) -> NavigateThenTask | None | _Planning:
         """The trip to start now, None, or PLANNING (class doc)."""
         excluded = tuple(sorted({name.casefold() for name in exclude}))
-        # A ranking, and the priest it chose, hold for the map it ranked
-        # from and the priests it passed over.
-        key = (client.state.map.path, excluded)
+        here = client.state.map.path
         now = self.clock()
         if self._chosen is not None:
-            priest, chosen_at, chosen_key = self._chosen
-            if now - chosen_at <= self.RESUME_SECONDS and chosen_key == key:
+            priest, chosen_at, ranked_from = self._chosen
+            if (now - chosen_at <= self.RESUME_SECONDS and ranked_from == here and
+                    priest.name.casefold() not in excluded):
                 return temple_food_task(graph, priest)
             self._chosen = None
+        if not self.plans.planning("temple"):
+            self._origin_map = here
         origin = apartment_exit_origin(client)
         priest = self.plans.get(
             "temple", graph, client,
             lambda proxy: rank_temple_priests(graph, proxy, exclude=excluded,
                                               origin=origin),
-            key=key, priority=planner.PRIORITY_FOOD)
+            key=excluded, priority=planner.PRIORITY_FOOD)
         if priest is PLANNING or priest is None:
             return priest
-        self._chosen = (priest, now, key)
+        self._chosen = (priest, now, self._origin_map)
         return temple_food_task(graph, priest)
 
 

@@ -532,7 +532,8 @@ starvations.
   with caches of its own, and its own copies of the graph's defaultdicts
   (a lookup of a missing key grows one; each copy is one C-level dict
   copy, which the GIL keeps whole). Each worker generation has its own
-  view and only that worker thread plans on it, so no lock is held while
+  view (the current one and its predecessor's are kept) and only that
+  worker thread plans on it, so no lock is held while
   planning and the loop never waits for the worker. The native searches release the GIL;
   the Python parts share it at the interpreter's switch interval, so the
   loop is slowed, never held (a replay of the incident's ranking: worst
@@ -545,12 +546,16 @@ starvations.
   clearing them for every unreachable priest only rebuilt them (1.1 to
   1.3 s a priest before, 0.8 s now; the ranking from `world_7_79` 23 s
   offline before, 15 s now). A single trip still retries once.
-- **A trip a disconnect dropped keeps its priest.** A temple ranking and
-  the priest it chose hold for the map she ranked from and the priests it
-  passed over. `TempleFoodPlanner` remembers the priest for
-  `RESUME_SECONDS` (10 minutes): after a connection drop, while she is
-  still on that map, the next trip goes to the same priest at once, one
-  route instead of a new ranking; anywhere else she ranks again. The trip
+- **A trip a disconnect dropped keeps its priest, on the same map.** A
+  temple ranking holds for the priests it passed over and runs to the end
+  wherever she walks meanwhile: the trip plans its own route from where
+  she is, so a ranking from a map or two back is harmless.
+  `TempleFoodPlanner` remembers the priest it chose for `RESUME_SECONDS`
+  (10 minutes) with the map the ranking started from: after a connection
+  drop, while she is still on that map, the next trip goes to the same
+  priest at once, one route instead of a new ranking. Anywhere else she
+  ranks again, off the loop; a drop partway along the walk usually means
+  a new ranking. The trip
   itself is rebuilt, not resumed: a temple dialogue cut by a reconnect is
   not continued. A ranking under way survives the reconnect too.
   Autoplay's adaptive-farming circuits share its planner, so a rebuilt

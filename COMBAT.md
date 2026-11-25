@@ -1596,10 +1596,12 @@ Now (ROUTING.md 1.12):
   it is done.
 - **One cache refresh per ranking.** The ranking from `world_7_79` takes
   about 15 s offline instead of 23 s, off the loop.
-- **A reconnect keeps the priest.** The trip a disconnect dropped goes to
-  the same priest at once, with one route plan, for 10 minutes while she
-  is still on the map she ranked from, unless that priest's trip failed;
-  autoplay's circuits share that memory, and a task taking over ends it.
+- **A reconnect keeps the priest, on the same map.** The trip a
+  disconnect dropped goes to the same priest at once, with one route plan,
+  for 10 minutes while she is still on the map the ranking started from,
+  unless that priest's trip failed; elsewhere she ranks again, off the
+  loop. Autoplay's circuits share that memory, and a task taking over ends
+  it. A ranking under way finishes wherever she walks meanwhile.
 - **Survival trips keep their priority.** While the food or heal ranking
   runs, the circuit starts no lesser errand in its place. Food rankings
   run first on the planner worker, then the heal restock's. A ranking
