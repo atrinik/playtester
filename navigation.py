@@ -8440,6 +8440,9 @@ class FarmCircuitTask(BotTask):
     PROGRESS_CHECKPOINT_INTERVAL = 5 * 60
     UPGRADE_SWEEP_INTERVAL = 24 * 60 * 60
     RECALL_SHOP_INTERVAL = 24 * 60 * 60
+    # After buying a scroll of recharge, recall shopping waits this long
+    # for the farm to read it while she carries it (_needs_recall_shopping).
+    RECHARGE_READ_WAIT_SECONDS = 3 * 60 * 60
     # Recall shopping starts only with this much money (wallet_value), and,
     # while a recall quote from the last RECALL_SHOP_INTERVAL is known
     # (recall_quote), only with that price plus RECALL_SHOP_RESERVE.
@@ -8635,6 +8638,9 @@ class FarmCircuitTask(BotTask):
         self._shopping_retry_at = 0.0
         self._recall_shopping: NavigateThenTask | None = None
         self._recall_shopping_retry_at = 0.0
+        # Until when recall shopping waits for a scroll of recharge it
+        # bought to be read (RECHARGE_READ_WAIT_SECONDS; on ``clock``).
+        self._recharge_read_until = 0.0
         self._utility_shopping: NavigateThenTask | None = None
         self._utility_shopping_retry_at = 0.0
         self._heal_restock: NavigateThenTask | None = None
@@ -8694,6 +8700,7 @@ class FarmCircuitTask(BotTask):
         "_shopping_retry_at", "_recall_shopping_retry_at",
         "_utility_shopping_retry_at", "_ship_key_retry_at", "_spell_retry_at",
         "_cure_retry_at", "_restoration_retry_at", "_heal_restock_retry_at",
+        "_recharge_read_until",
     )
 
     def backoffs(self) -> dict[str, float]:
@@ -10243,6 +10250,14 @@ class FarmCircuitTask(BotTask):
                 name for name in ("_shopping", "_utility_shopping")
                 if name in running), ""))
 
+    @staticmethod
+    def _farm_resting(client: AtrinikClient, farm: FarmTask) -> bool:
+        """Whether the farm rests, so the circuit's dwell keeps her on this
+        leg: a mana rest confirmed just now, or a rest between pulls due
+        (FarmTask.pull_rest_due; a gap of a few seconds between its rest
+        ticks is still the rest, and a rest given up at its limit is not)."""
+        return farm.training_rest_active() or farm.pull_rest_due(client)
+
     def unprepared_resting(self) -> bool:
         """Whether its farm rests for want of a heal or a recall
         (FarmTask.unprepared_resting): an explained wait, not being stuck.
@@ -10425,9 +10440,11 @@ class FarmCircuitTask(BotTask):
         if has_immediate and (wizardry < 12 or has_permanent):
             return False
         if (reads_scrolls(client) and empty_recall_wand(client) is not None
-                and usable_recharge_scroll(client) is not None):
-            # A scroll of recharge in her pack: the farm reads it first
-            # (FarmTask.recharge_recall_wand).
+                and usable_recharge_scroll(client) is not None and
+                self.clock() < self._recharge_read_until):
+            # A scroll of recharge just bought: the farm reads it first
+            # (FarmTask.recharge_recall_wand). Where no square lets her
+            # read it (a no-magic map), shopping resumes after the wait.
             return False
         last_check = float(getattr(
             client.state, "last_recall_shop_check_at", 0.0) or 0.0)
@@ -10724,6 +10741,9 @@ class FarmCircuitTask(BotTask):
                 per_copper=cure_funding_farm(client),
                 spend_share=(1.0 if cure_funding_farm(client) else
                              self.HEAL_RESTOCK_SPEND_SHARE),
+                # The cap never leaves her below the low mark she could pay
+                # for (which would back the restock off for a day).
+                min_quantity=self.HEAL_RESTOCK_LOW - heal_consumables(client),
                 cash_reserve=self.HEAL_RESTOCK_RESERVE,
                 observation_key=HEAL_QUOTE_KEY),
             destination_xy=(vendor.x, vendor.y), combat_approach=True,
@@ -11247,7 +11267,8 @@ class FarmCircuitTask(BotTask):
                         # (FarmTask.check_recall_wand) the note stays, and
                         # a wand still empty or destroyed lets shopping
                         # run again without its daily interval.
-                        pass
+                        self._recharge_read_until = (
+                            self.clock() + self.RECHARGE_READ_WAIT_SECONDS)
                     else:
                         setter = getattr(
                             client, "set_last_recall_shop_check", None)
@@ -11898,8 +11919,7 @@ class FarmCircuitTask(BotTask):
                 (named_spawn_empty or patrol_swept_empty) and
                 live_targets == 0 and elapsed >= 15.0 and
                 not self._busy_finishing_fight_or_loot(client, farm) and
-                not farm.training_rest_active() and
-                not farm.pull_rest_due(client) and
+                not self._farm_resting(client, farm) and
                 not self._unprepared_hold.holding()):
             if not self._empty_spawn_since:
                 self._empty_spawn_since = now
@@ -11934,8 +11954,7 @@ class FarmCircuitTask(BotTask):
         # Nor mid-rest for mana, or she sets off with a partial bar, nor
         # mid-rest between pulls (FarmTask.pull_rest_due), or she walks
         # to the next map hurt. Services may still detour during a rest.
-        if isinstance(farm, FarmTask) and (
-                farm.training_rest_active() or farm.pull_rest_due(client)):
+        if isinstance(farm, FarmTask) and self._farm_resting(client, farm):
             return
         # Nor while she rests without a heal or a recall: no unprepared
         # walk to another map; the hold's cap still runs.

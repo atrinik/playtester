@@ -5201,6 +5201,11 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(visit(spend_share=0.5), "buy 2 balm of greater healing")
         # Saving for the cure: the most heal per copper.
         self.assertEqual(visit(per_copper=True), "buy 5 balm of minor healing")
+        # A cap of 10% (200 copper) would buy no greater balm, but she
+        # still reaches her low mark of two, with what she can pay for.
+        self.assertEqual(visit(spend_share=0.1, min_quantity=2),
+                         "buy 2 balm of greater healing")
+        self.assertEqual(visit(spend_share=0.1), "buy 2 balm of minor healing")
 
     def test_dynamic_merchant_buys_distinct_utility_groups_in_one_visit(self):
         class FakeClient:
@@ -9526,17 +9531,33 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             [entry for entry in client.recorded if entry[0] == "pull-rest"],
             [("pull-rest", "hp=60/100 sp=0/0")])
         self.assertEqual(client.combat, [False])
-        # Interrupted (a fight, a detour) for more than a second: a new
-        # rest, with combat off again and its full limit.
+        # Interrupted (a fight, a detour) for more than a second: combat
+        # off and logged again, but the limit still counts from the first
+        # rest since the kill.
         task._pull_rest_at -= 5
-        task._pull_rest_since -= FarmTask.PULL_REST_LIMIT_SECONDS
+        first = task._pull_rest_first
         task._last_action = 0
         asyncio.run(task.tick(client))
         self.assertTrue(task.pull_rest_active())
+        self.assertEqual(task._pull_rest_first, first)
         self.assertEqual(client.combat, [False, False])
         self.assertEqual(
             len([entry for entry in client.recorded if entry[0] == "pull-rest"]),
             2)
+        # Between rest ticks the circuit's dwell still waits; given up at
+        # the limit (interruptions or not), it no longer does.
+        task._pull_rest_at -= 5
+        self.assertFalse(task.pull_rest_active())
+        self.assertTrue(FarmCircuitTask._farm_resting(client, task))
+        task._pull_rest_first -= FarmTask.PULL_REST_LIMIT_SECONDS
+        self.assertFalse(FarmCircuitTask._farm_resting(client, task))
+        self.assertTrue(task._pull_rest_given_up)
+        # The next kill brings a new rest and limit.
+        client.state.stats["hp"] = 60
+        task.note_kill_cost(client)
+        task._costly_kill = True
+        self.assertEqual(task._pull_rest_first, 0.0)
+        self.assertTrue(FarmCircuitTask._farm_resting(client, task))
         client.state.stats["hp"] = 96
         task._last_action = 0
         asyncio.run(task.tick(client))
@@ -9568,13 +9589,12 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         # A rest that cannot finish ends at its limit, until the next kill.
         client.state.stats["hp"] = 50
         self.assertTrue(task.pull_rest_due(client))
-        task._pull_rest_at = time.monotonic()
-        task._pull_rest_since = (
+        task._pull_rest_first = (
             time.monotonic() - FarmTask.PULL_REST_LIMIT_SECONDS)
         self.assertFalse(task.pull_rest_due(client))
         self.assertFalse(task.pull_rest_due(client))
         task.note_kill_cost(client)
-        self.assertEqual(task._pull_rest_since, 0.0)
+        self.assertEqual(task._pull_rest_first, 0.0)
         self.assertTrue(task.pull_rest_due(client))
 
     def test_farm_reads_a_recharge_scroll_on_an_empty_recall_wand(self):
@@ -9674,6 +9694,9 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         say("The oak wand of firestorm (lvl 2) glows with power.")
         asyncio.run(task.recharge_recall_wand(client))
         self.assertIsNotNone(task._recharge)
+        # The server destroys the wand before its answer is read.
+        client.state.inventory.remove(wand)
+        client.state.items.pop(77)
         say("The pine wand of word of recall (lvl 17) vibrates violently, "
             "then explodes!")
         asyncio.run(task.recharge_recall_wand(client))
@@ -9682,13 +9705,15 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                       client.recorded)
         # No answer: it backs off, doubling, and gives the scroll up.
         client.state.messages = []
+        client.state.inventory.insert(0, wand)
+        client.state.items[77] = wand
         waits = []
         for attempt in range(RECHARGE_SCROLL_ATTEMPTS):
             task._recharge_retry_at = 0.0
             asyncio.run(task.recharge_recall_wand(client))
             self.assertIsNotNone(task._recharge)
-            wand_tag, scroll_tag, stage, sent_at = task._recharge
-            task._recharge = (wand_tag, scroll_tag, stage,
+            *step, sent_at = task._recharge
+            task._recharge = (*step,
                               sent_at - FarmTask.RECHARGE_ANSWER_SECONDS - 1)
             before = time.time()
             asyncio.run(task.recharge_recall_wand(client))
@@ -23932,6 +23957,12 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             name="paper scroll of recharge (lvl 1)"), client.state.player_tag)
         circuit._recall_shopping_retry_at = 0.0
         self.assertFalse(circuit._needs_recall_shopping(client))
+        # Unread for three hours (a no-magic map): shopping resumes, for
+        # recall stock only.
+        circuit._recharge_read_until = circuit.clock() - 1
+        self.assertTrue(circuit._needs_recall_shopping(client))
+        self.assertFalse(circuit._new_recall_shopping(
+            client).task.item_pattern.search("scroll of recharge"))
         # Read, and the wand still empty (or gone): shopping again at once.
         client.state.inventory.remove(client.state.items[95])
         client.state.items.pop(95)
@@ -37262,6 +37293,10 @@ class HealsLandInMeleeTests(unittest.TestCase):
         client.state.add_message(
             2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
         self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 28)
+        # Broken away at 30% with no SP: the potion too.
+        client, server = self.melee(minor, self.spell(), greater, hp=100,
+                                    sp=0)
+        self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 28)
 
     def test_one_attacker_on_an_adapted_margin_gets_the_spell(self):
         # The Burnt Forest's adapted flee threshold is 89%: one treant at
@@ -37276,6 +37311,15 @@ class HealsLandInMeleeTests(unittest.TestCase):
         # Two kinds hitting her: the potion goes first.
         client.state.add_message(
             2, "ffffff", "singed sapling hit you for 28 (-33) cleave damage.")
+        self.assertEqual(policy._usable_heal(client).tag, 27)
+        # Three treants of one name beside her: three attackers, not one.
+        client, server = self.melee(minor, self.spell(), hp=280)
+        for tag, (x, y) in enumerate(((9, 8), (7, 8), (8, 9)), start=300):
+            client.state.map.tile(x, y).objects[3] = MapObject(
+                3, tag, 0, 0, name="charred treant", target_id=tag,
+                target_hp=100)
+        client.state.add_message(
+            2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
         self.assertEqual(policy._usable_heal(client).tag, 27)
         # One attacker but at 60%: truly critical.
         client, server = self.melee(minor, self.spell(), hp=198)

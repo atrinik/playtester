@@ -999,6 +999,8 @@ def usable_heal_item(client: AtrinikClient, item: Item,
 # Below this share of her health (or her flee threshold, if lower) under
 # attack, a potion comes before a healing spell (SafetyPolicy.potions_first).
 POTION_FIRST_HEALTH = 0.60
+# Hostiles this close to her count as attackers on her (potions_first).
+POTION_FIRST_REACH = 2
 
 
 @dataclass(slots=True)
@@ -1102,9 +1104,11 @@ class SafetyPolicy:
         """Whether a fight is critical enough to drink before casting:
         under attack (recent_hostile_contact) at or below
         min(flee_below, POTION_FIRST_HEALTH), or at or below flee_below
-        with two or more kinds hitting her (recent_hostile_attackers).
-        An adapted flee threshold can reach 89%; one attacker there is
-        what the spell is for."""
+        with two or more attackers on her: hostiles within
+        POTION_FIRST_REACH tiles (each counted, so three treants of one
+        name are three), or two or more kinds in the hits
+        (recent_hostile_attackers). An adapted flee threshold can reach
+        89%; one attacker there is what the spell is for."""
         if not recent_hostile_contact(client):
             return False
         stats = client.state.stats
@@ -1112,7 +1116,13 @@ class SafetyPolicy:
         ratio = int(stats.get("hp", 0) or 0) / maxhp
         if ratio <= min(self.flee_below, POTION_FIRST_HEALTH):
             return True
-        return (ratio <= self.flee_below and
+        if ratio > self.flee_below:
+            return False
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        near = sum(1 for x, y, _ in m.targets(friendly=False)
+                   if max(abs(x - cx), abs(y - cy)) <= POTION_FIRST_REACH)
+        return (near >= 2 or
                 len(recent_hostile_attackers(client, seconds=5.0)) >= 2)
 
     def _heals(self, client: AtrinikClient) -> list[Item]:
@@ -1152,12 +1162,16 @@ class SafetyPolicy:
 
     def _usable_heal(self, client: AtrinikClient) -> Item | None:
         """The first of her heals (_heals) she can use now: an item, or a
-        healing spell she can afford. Under attack a spell short of SP
-        gives way to the next heal, a carried potion among them; out of
-        combat it does not, and she regenerates instead."""
-        sp = int(client.state.stats.get("sp", 0) or 0)
+        healing spell she can afford. Under attack, or at or below her
+        flee threshold, a spell short of SP gives way to the next heal, a
+        carried potion among them; otherwise it does not, and she
+        regenerates instead."""
+        stats = client.state.stats
+        sp = int(stats.get("sp", 0) or 0)
+        maxhp = max(1, int(stats.get("maxhp", 1) or 1))
         heals = self._heals(client)
-        if not recent_hostile_contact(client):
+        if (not recent_hostile_contact(client) and
+                int(stats.get("hp", 0) or 0) / maxhp > self.flee_below):
             heals = heals[:1]
         return next((
             heal for heal in heals
@@ -2471,10 +2485,13 @@ class FarmTask(BotTask):
         self._pull_rest_since = 0.0
         self._pull_rest_at = 0.0
         self._pull_rest_given_up = False
-        # A recharge under way: (wand tag, scroll tag, "mark" or "read",
-        # when that step was sent, wall clock), and no new one before this
-        # (wall clock).
-        self._recharge: tuple[int, int, str, float] | None = None
+        # When the first rest since the last kill began (monotonic, 0
+        # none yet): the limit counts from it.
+        self._pull_rest_first = 0.0
+        # A recharge under way: (wand tag, wand name, scroll tag, "mark" or
+        # "read", when that step was sent, wall clock), and no new one
+        # before this (wall clock).
+        self._recharge: tuple[int, str, int, str, float] | None = None
         self._recharge_retry_at = 0.0
         # Resting for want of a usable heal or a ready recall
         # (unprepared_for_trips), recorded once per rest, and its cap: its
@@ -2867,8 +2884,9 @@ class FarmTask(BotTask):
         (pull_rest_due); recorded as ``costly-kill``."""
         start, self._fight_start_hp = self._fight_start_hp, None
         self._pull_rest_given_up = False
-        # A rest after this kill is a new one, with its full limit.
+        # The rests after this kill get a new limit.
         self._pull_rest_since = 0.0
+        self._pull_rest_first = 0.0
         if start is None:
             return
         stats = client.state.stats
@@ -2885,9 +2903,11 @@ class FarmTask(BotTask):
         """Whether she rests before the next pull: after a costly kill
         (note_kill_cost) or on a dangerous spot (spot_danger), until she
         is back to PULL_REST_HEALTH and, with a healing spell, has
-        PULL_REST_MANA of her SP (at least healing_mana_reserve). A rest
-        that reaches PULL_REST_LIMIT_SECONDS is given up until the next
-        kill, so a spot where she cannot regenerate never holds her."""
+        PULL_REST_MANA of her SP (at least healing_mana_reserve). Resting
+        PULL_REST_LIMIT_SECONDS after the first rest since the last kill
+        (_pull_rest_first; interruptions do not restart it) gives it up
+        until the next kill, so a spot where she cannot regenerate never
+        holds her, nor the circuit's dwell."""
         stats = client.state.stats
         maxhp = max(1, int(stats.get("maxhp", 1) or 1))
         dangerous = (self._costly_kill or
@@ -2902,8 +2922,8 @@ class FarmTask(BotTask):
                 int(stats.get("sp", 0) or 0) >= mana):
             self._costly_kill = False
             return False
-        if (self.pull_rest_active() and
-                time.monotonic() - self._pull_rest_since >=
+        if (self._pull_rest_first and
+                time.monotonic() - self._pull_rest_first >=
                 self.PULL_REST_LIMIT_SECONDS):
             self._costly_kill = False
             self._pull_rest_given_up = True
@@ -2940,9 +2960,9 @@ class FarmTask(BotTask):
         now = time.time()
         pending = self._recharge
         if pending is not None:
-            wand_tag, scroll_tag, stage, sent_at = pending
-            wand = (getattr(client.state, "items", None) or {}).get(wand_tag)
-            wand_name = (wand.name if wand is not None else "").casefold()
+            # The wand's name as it was marked: an exploded wand is gone
+            # before its answer is read.
+            wand_tag, wand_name, scroll_tag, stage, sent_at = pending
             answers = [
                 str(entry[-1]).strip()
                 for entry in getattr(client.state, "messages", ())
@@ -2961,12 +2981,14 @@ class FarmTask(BotTask):
             if stage == "mark":
                 if about_wand(r"Marked item (.+?)\.?$"):
                     await client.apply(scroll_tag)
-                    self._recharge = (wand_tag, scroll_tag, "read", now)
+                    self._recharge = (wand_tag, wand_name, scroll_tag,
+                                      "read", now)
                     return
                 if about_wand(r"Unmarked item (.+?)\.?$"):
                     # It was marked already: mark it again.
                     await client.mark_item(wand_tag)
-                    self._recharge = (wand_tag, scroll_tag, "mark", now)
+                    self._recharge = (wand_tag, wand_name, scroll_tag,
+                                      "mark", now)
                     return
                 if now - sent_at <= self.RECHARGE_ANSWER_SECONDS:
                     return
@@ -3007,7 +3029,8 @@ class FarmTask(BotTask):
         if scroll is None or wand is None:
             return
         await client.mark_item(wand.tag)
-        self._recharge = (wand.tag, scroll.tag, "mark", now)
+        self._recharge = (wand.tag, wand.name.casefold(), scroll.tag,
+                          "mark", now)
 
     def remember_engagement(self, client: AtrinikClient, x: int, y: int,
                             target_id: int) -> None:
@@ -6994,8 +7017,10 @@ class FarmTask(BotTask):
                 # rest to near full before the next pull, combat off.
                 now = time.monotonic()
                 # A rest is new unless confirmed just now: one interrupted
-                # by a fight or a detour starts over (clears, combat off,
-                # logged, its full limit).
+                # by a fight or a detour clears, turns combat off and is
+                # logged again; its limit still counts from the first.
+                if not self._pull_rest_first:
+                    self._pull_rest_first = now
                 if not self.pull_rest_active():
                     self._pull_rest_since = now
                     stats = client.state.stats
@@ -8248,7 +8273,8 @@ class BuyHealingStockTask(BotTask):
     def __init__(self, merchant: str, *, quantity: int,
                  cash_reserve: int = 1_000, observation_key: str = "",
                  safety: SafetyPolicy | None = None,
-                 per_copper: bool = False, spend_share: float = 1.0):
+                 per_copper: bool = False, spend_share: float = 1.0,
+                 min_quantity: int = 0):
         super().__init__(f"buy-healing-stock:{merchant}")
         self.merchant = merchant
         self.quantity = max(1, int(quantity))
@@ -8259,6 +8285,8 @@ class BuyHealingStockTask(BotTask):
         # heals in one visit, though always enough for the cheapest one.
         self.per_copper = bool(per_copper)
         self.spend_share = min(1.0, max(0.0, float(spend_share)))
+        # At least this many whatever spend_share leaves, if she can pay.
+        self.min_quantity = max(0, int(min_quantity))
         self._budget: int | None = None
         self._spent = 0
         self.observation_key = observation_key
@@ -8309,9 +8337,13 @@ class BuyHealingStockTask(BotTask):
         spare = max(0, wallet - self.cash_reserve)
         if self._budget is None:
             self._budget = max(int(spare * self.spend_share), cheapest[1])
-        spare = min(spare, self._budget - self._spent)
+        capped = min(spare, self._budget - self._spent)
+        # Below min_quantity the cap gives way: she reaches the low mark
+        # with what she can pay for.
+        needed = max(0, self.min_quantity - self.bought)
         affordable = [entry for entry in self.quotes.items()
-                      if entry[1] <= spare and
+                      if (entry[1] <= capped or
+                          (needed and entry[1] <= spare)) and
                       entry[0].casefold() not in self._bought_names]
         if not affordable:
             if self._bought_names:
@@ -8330,7 +8362,8 @@ class BuyHealingStockTask(BotTask):
             0.0 if self.per_copper else heal_estimate(entry[0]),
             heal_estimate(entry[0]) / entry[1],
             -entry[1], entry[0].casefold()))
-        count = min(self.quantity - self.bought, spare // cost)
+        count = min(self.quantity - self.bought,
+                    max(capped // cost, min(needed, spare // cost)))
         self._buying, self._count = name, count
         self._quantity_before = self._same_name(client)
         self._heals_before = heal_consumables(client, self.safety)
