@@ -4919,7 +4919,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(task.status, TaskStatus.FAILED)
         self.assertEqual(client.quotes, [])
 
-    def test_healing_stock_buys_the_best_heal_per_copper_she_can_use(self):
+    def test_healing_stock_buys_the_biggest_heal_she_can_use(self):
         from .tasks import BuyHealingStockTask
 
         class FakeClient:
@@ -4979,21 +4979,23 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         quote(client, "balm of minor healing", "1 silver")
         asyncio.run(task.tick(client))
         # Greater healing: about 31 health for 400 copper; minor: about 14.5
-        # for 100. The minor balm heals more per copper, and 2,000 above
-        # the reserve buys the five she wants.
+        # for 100. The bigger heal comes first, though the minor balm heals
+        # more per copper, and 2,000 above the reserve buys the five she
+        # wants.
         self.assertEqual(client.talks[-1],
-                         ("buy 5 balm of minor healing", "merchant"))
+                         ("buy 5 balm of greater healing", "merchant"))
+        # The cheapest price is what the next trip's funds check needs.
         self.assertEqual(client.quotes, [
             ("heal-restock", "balm of minor healing", 100)])
-        self.assertEqual(client.state.bank_balance, 2_500)
+        self.assertEqual(client.state.bank_balance, 1_000)
         client.state.place_item(Item(
             30, item_type=c.TYPE_POTION, quality=80, quantity=5,
-            name="balm of minor healing"), 7)
+            name="balm of greater healing"), 7)
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)
         self.assertTrue(task.purchased)
         self.assertEqual((task.bought, task.bought_name),
-                         (5, "balm of minor healing"))
+                         (5, "balm of greater healing"))
         self.assertEqual(client.decisions[-1][0], "heal-restock-buy")
         # Only what the reserve leaves: 250 copper above it buys two.
         client, task = visit(1_250)
@@ -5028,7 +5030,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task._sent_at -= 6.0
         asyncio.run(task.tick(client))
         self.assertEqual(client.talks[-1],
-                         ("buy 5 balm of minor healing", "merchant"))
+                         ("buy 5 balm of greater healing", "merchant"))
         # She cannot carry them: it fails at once with the merchant's reason.
         client.state.interface = InterfaceState(
             title="merchant", text="You can't carry that much weight...")
@@ -5099,6 +5101,118 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(task.status, TaskStatus.COMPLETE)
         self.assertTrue(task.checked)
         self.assertFalse(task.purchased)
+
+    def test_healing_stock_buys_greater_healing_first_then_tops_up(self):
+        # Live, 2026-11-25: with the Asteria merchant's minor-healing
+        # scrolls beside its rolled potions she bought five scrolls (heal
+        # per copper) and fought the Burnt Forest with no potion.
+        from .tasks import BuyHealingStockTask
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance = 3_000
+                self.state.bank_balance_known = True
+                self.talks = []
+                self.decisions = []
+
+            async def talk(self, message, npc):
+                self.talks.append((message, npc))
+
+            def record_action(self, action, detail):
+                self.decisions.append((action, detail))
+
+        def quote(client, name, price):
+            client.state.interface = InterfaceState(
+                title="merchant", objects=[Item(
+                    20, name=name, extra={"message": f"{name} for {price}"})],
+                links=[f"[a=:buy 1 {name}]One[/a]"])
+
+        client = FakeClient()
+        for tag, skill in ((8, "literacy"), (9, "wizardry spells")):
+            client.state.place_item(Item(
+                tag, item_type=c.TYPE_SKILL, name=skill), 7)
+        task = BuyHealingStockTask("merchant", quantity=5)
+        asyncio.run(task.tick(client))
+        client.state.interface = InterfaceState(title="merchant", links=[
+            "[a=:buy scroll of minor healing]Scroll[/a]",
+            "[a=:buy potion of greater healing]Potion[/a]"])
+        asyncio.run(task.tick(client))
+        quote(client, "potion of greater healing", "4 silver")
+        asyncio.run(task.tick(client))
+        quote(client, "scroll of minor healing", "1 silver")
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.talks[-1],
+                         ("buy 5 potion of greater healing", "merchant"))
+        # A rolled potion: the merchant had one. The reservation for the
+        # other four is given back, and the scrolls make up the rest.
+        client.state.place_item(Item(
+            30, item_type=c.TYPE_POTION, quality=80,
+            name="potion of greater healing"), 7)
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.talks[-1],
+                         ("buy 4 scroll of minor healing", "merchant"))
+        self.assertEqual(task.status, TaskStatus.RUNNING)
+        client.state.place_item(Item(
+            31, item_type=c.TYPE_SCROLL, quality=80, quantity=4,
+            name="paper scrolls of minor healing (lvl 20)"), 7)
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertEqual((task.bought, task.bought_name),
+                         (5, "potion of greater healing"))
+        self.assertEqual(
+            [detail for action, detail in client.decisions
+             if action == "heal-restock-buy"],
+            ["1 potion of greater healing at 4s each",
+             "4 scroll of minor healing at 1s each"])
+
+    def test_healing_stock_spend_share_and_per_copper(self):
+        from .tasks import BuyHealingStockTask
+
+        class FakeClient:
+            def __init__(self):
+                self.state = GameState(phase="playing", player_tag=7)
+                self.state.bank_balance = 3_000
+                self.state.bank_balance_known = True
+                self.talks = []
+
+            async def talk(self, message, npc):
+                self.talks.append((message, npc))
+
+        def visit(greater="4 silver", wallet=3_000, **kwargs):
+            client = FakeClient()
+            client.state.bank_balance = wallet
+            task = BuyHealingStockTask("merchant", quantity=5, **kwargs)
+            asyncio.run(task.tick(client))
+            client.state.interface = InterfaceState(title="merchant", links=[
+                "[a=:buy balm of greater healing]Balm[/a]",
+                "[a=:buy balm of minor healing]Minor[/a]"])
+            asyncio.run(task.tick(client))
+            for name, price in (("balm of greater healing", greater),
+                                ("balm of minor healing", "1 silver")):
+                client.state.interface = InterfaceState(
+                    title="merchant", objects=[Item(
+                        20, name=name,
+                        extra={"message": f"{name} for {price}"})],
+                    links=[f"[a=:buy 1 {name}]One[/a]"])
+                asyncio.run(task.tick(client))
+            return client.talks[-1][0]
+
+        # Half of the 2,000 above the reserve: two greater balms, not five.
+        self.assertEqual(visit(spend_share=0.5), "buy 2 balm of greater healing")
+        # Saving for the cure: the most heal per copper.
+        self.assertEqual(visit(per_copper=True), "buy 5 balm of minor healing")
+        # A cap of 1% (20 copper) still leaves enough for her low mark of
+        # two at the cheapest price, and no more.
+        self.assertEqual(visit(spend_share=0.01, min_quantity=2),
+                         "buy 2 balm of minor healing")
+        self.assertEqual(visit(spend_share=0.01), "buy 1 balm of minor healing")
+        # 10,000 above the reserve, a 9,000-copper balm: the low mark never
+        # lets it past the cap; minor balms instead.
+        self.assertEqual(
+            visit(greater="90 silver", wallet=11_000, spend_share=0.5,
+                  min_quantity=2),
+            "buy 5 balm of minor healing")
 
     def test_dynamic_merchant_buys_distinct_utility_groups_in_one_visit(self):
         class FakeClient:
@@ -9358,6 +9472,275 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             [entry for entry in client.decisions if entry[0] == "training-rest"],
             [("training-rest", "sp=30/62")] * 3)
         self.assertTrue(client.moves or client.direct_moves or client.fired)
+
+    def test_farm_pulls_an_isolated_target_before_a_nearer_pair(self):
+        # Burnt Forest, 2026-11-25: a pull beside other treants brought
+        # them all. One at least four tiles from the others comes first.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        # A pair three tiles east, and a lone kobold six tiles south.
+        client.state.map.tile(11, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
+        client.state.map.tile(12, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold", target_id=102, target_hp=100)
+        client.state.map.tile(8, 14).objects[3] = MapObject(
+            3, 3, 0, 0, name="kobold", target_id=103, target_hp=100)
+        task = FarmTask(zone="/test", target="kobold", neutral_targets=True)
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._engaged_target[0], 103)
+        # With none isolated (three tiles apart), the nearest as before.
+        client.state.map.tiles.clear()
+        client.state.map.tile(11, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
+        client.state.map.tile(11, 11).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold", target_id=102, target_hp=100)
+        task = FarmTask(zone="/test", target="kobold", neutral_targets=True)
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._engaged_target[0], 101)
+        # One already within two tiles of her is fought first.
+        client.state.map.tiles.clear()
+        client.state.map.tile(10, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
+        client.state.map.tile(11, 9).objects[3] = MapObject(
+            3, 2, 0, 0, name="kobold", target_id=102, target_hp=100)
+        client.state.map.tile(8, 14).objects[3] = MapObject(
+            3, 3, 0, 0, name="kobold", target_id=103, target_hp=100)
+        task = FarmTask(zone="/test", target="kobold", neutral_targets=True)
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._engaged_target[0], 101)
+
+    def test_farm_rests_to_near_full_after_a_costly_kill(self):
+        # Burnt Forest, 2026-11-25: one treant cost her about 150 of 356
+        # health, and she pulled the next one hurt.
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.stats.update(hp=100, maxhp=100)
+        self._record_actions(client)
+        task = FarmTask(zone="/test", target="kobold", neutral_targets=True)
+        # A fight from full health, won at 60%: it cost 40%.
+        task.remember_engagement(client, 9, 8, 100)
+        client.state.stats["hp"] = 60
+        task.note_kill_cost(client)
+        task.release_engagement(100)
+        self.assertIn(("costly-kill", "cost=40% of her health"),
+                      client.recorded)
+        # The next kobold, six tiles off: no pull until she is back to 95%.
+        client.state.map.tile(14, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
+        for hp in (60, 80, 94):
+            client.state.stats["hp"] = hp
+            task._last_action = 0
+            asyncio.run(task.tick(client))
+            self.assertIsNone(task._engaged_target)
+            self.assertEqual(client.targets, [])
+            self.assertTrue(task.pull_rest_active())
+        self.assertEqual(
+            [entry for entry in client.recorded if entry[0] == "pull-rest"],
+            [("pull-rest", "hp=60/100 sp=0/0")])
+        self.assertEqual(client.combat, [False])
+        # Interrupted (a fight, a detour) for more than a second: combat
+        # off and logged again, but the limit still counts from the first
+        # rest since the kill.
+        task._pull_rest_at -= 5
+        first = task._pull_rest_first
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertTrue(task.pull_rest_active())
+        self.assertEqual(task._pull_rest_first, first)
+        self.assertEqual(client.combat, [False, False])
+        self.assertEqual(
+            len([entry for entry in client.recorded if entry[0] == "pull-rest"]),
+            2)
+        # Between rest ticks the circuit's dwell still waits; given up at
+        # the limit (interruptions or not), it no longer does.
+        task._pull_rest_at -= 5
+        self.assertFalse(task.pull_rest_active())
+        self.assertTrue(FarmCircuitTask._farm_resting(client, task))
+        task._pull_rest_first -= FarmTask.PULL_REST_LIMIT_SECONDS
+        self.assertFalse(FarmCircuitTask._farm_resting(client, task))
+        self.assertTrue(task._pull_rest_given_up)
+        # The next kill brings a new rest and limit.
+        client.state.stats["hp"] = 60
+        task.note_kill_cost(client)
+        task._costly_kill = True
+        self.assertEqual(task._pull_rest_first, 0.0)
+        self.assertTrue(FarmCircuitTask._farm_resting(client, task))
+        client.state.stats["hp"] = 96
+        task._last_action = 0
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._engaged_target[0], 101)
+        # A fight that ends without a kill is not measured.
+        task = FarmTask(zone="/test", target="kobold", neutral_targets=True)
+        client.state.stats["hp"] = 100
+        task.remember_engagement(client, 9, 8, 100)
+        task.release_engagement(100)
+        self.assertIsNone(task._fight_start_hp)
+        # A cheap kill (20%) on an ordinary spot needs no rest.
+        task.remember_engagement(client, 9, 8, 100)
+        client.state.stats["hp"] = 80
+        task.note_kill_cost(client)
+        task.release_engagement(100)
+        self.assertFalse(task.pull_rest_due(client))
+        # On a spot whose kills cost 30% or more she rests before every
+        # pull, and with a healing spell until half her SP is back too.
+        task.spot_danger = 30.0
+        self.assertTrue(task.pull_rest_due(client))
+        client.state.stats["hp"] = 95
+        client.state.inventory.append(Item(
+            24, item_type=c.TYPE_SPELL, name="minor healing",
+            extra={"cost": 4}))
+        client.state.stats.update(sp=20, maxsp=60)
+        self.assertTrue(task.pull_rest_due(client))
+        client.state.stats["sp"] = 30
+        task._pull_rest_first = time.monotonic() - 200
+        self.assertFalse(task.pull_rest_due(client))
+        # Rested: a later rest (after a kill-less fight) gets its full limit.
+        self.assertEqual(task._pull_rest_first, 0.0)
+        # A rest that cannot finish ends at its limit, until the next kill.
+        client.state.stats["hp"] = 50
+        self.assertTrue(task.pull_rest_due(client))
+        task._pull_rest_first = (
+            time.monotonic() - FarmTask.PULL_REST_LIMIT_SECONDS)
+        self.assertFalse(task.pull_rest_due(client))
+        self.assertFalse(task.pull_rest_due(client))
+        task.note_kill_cost(client)
+        self.assertEqual(task._pull_rest_first, 0.0)
+        self.assertTrue(task.pull_rest_due(client))
+
+    def test_farm_reads_a_recharge_scroll_on_an_empty_recall_wand(self):
+        from .tasks import wand_charges
+
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        self._record_actions(client)
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    name="pine wand of word of recall (lvl 17)")
+        scroll = Item(78, item_type=c.TYPE_SCROLL, quality=80, condition=80,
+                      name="paper scroll of recharge (lvl 1)")
+        client.state.inventory = [
+            wand, scroll,
+            Item(8, item_type=c.TYPE_SKILL, name="literacy"),
+            Item(9, item_type=c.TYPE_SKILL, name="wizardry spells")]
+        client.state.items[77] = wand
+        wand_charges(client)[77] = 0
+        client.marked, client.applied = [], []
+
+        async def mark_item(tag):
+            client.marked.append(tag)
+
+        async def apply(tag, apply_action=0):
+            client.applied.append(tag)
+
+        client.mark_item, client.apply = mark_item, apply
+        task = FarmTask(zone="/test")
+        task._wand_examined.add(77)
+        asyncio.run(task.recharge_recall_wand(client))
+        self.assertEqual(client.marked, [77])
+        self.assertEqual(client.applied, [])
+        # Marking toggles: it was marked already, so mark it again.
+        client.state.messages.append(
+            (time.time() + 0.1, 2, "ffffff",
+             "Unmarked item pine wand of word of recall (lvl 17)."))
+        asyncio.run(task.recharge_recall_wand(client))
+        self.assertEqual(client.marked, [77, 77])
+        client.state.messages.append(
+            (time.time() + 0.2, 2, "ffffff",
+             "Marked item pine wand of word of recall (lvl 17)."))
+        asyncio.run(task.recharge_recall_wand(client))
+        self.assertEqual(client.applied, [78])
+        client.state.messages.append(
+            (time.time() + 0.3, 2, "ffffff",
+             "The pine wand of word of recall (lvl 17) glows with power."))
+        asyncio.run(task.recharge_recall_wand(client))
+        # Its charges are read again by examine.
+        self.assertNotIn(77, wand_charges(client))
+        self.assertNotIn(77, task._wand_examined)
+        self.assertIn(("recall-wand-recharge", "tag=77 recharged"),
+                      client.recorded)
+        # Without the skills to read it, nothing.
+        client.state.inventory = [wand, scroll]
+        wand_charges(client)[77] = 0
+        asyncio.run(task.recharge_recall_wand(client))
+        self.assertEqual(client.marked, [77, 77])
+
+    def test_a_recharge_that_explodes_or_gets_no_answer(self):
+        from .tasks import (RECHARGE_SCROLL_ATTEMPTS, usable_recharge_scroll,
+                            wand_charges)
+
+        client = self._combat_client()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        self._record_actions(client)
+        wand = Item(77, item_type=c.TYPE_WAND, quality=80, condition=80,
+                    name="pine wand of word of recall (lvl 17)")
+        scroll = Item(78, item_type=c.TYPE_SCROLL, quality=80, condition=80,
+                      name="paper scroll of recharge (lvl 1)")
+        client.state.inventory = [
+            wand, scroll,
+            Item(8, item_type=c.TYPE_SKILL, name="literacy"),
+            Item(9, item_type=c.TYPE_SKILL, name="wizardry spells")]
+        client.state.items[77] = wand
+        wand_charges(client)[77] = 0
+        client.marked, client.applied = [], []
+
+        async def mark_item(tag):
+            client.marked.append(tag)
+
+        async def apply(tag, apply_action=0):
+            client.applied.append(tag)
+
+        client.mark_item, client.apply = mark_item, apply
+        task = FarmTask(zone="/test")
+
+        def say(text):
+            client.state.messages.append(
+                (time.time() + 0.1, 2, "ffffff", text))
+
+        asyncio.run(task.recharge_recall_wand(client))
+        say("Marked item pine wand of word of recall (lvl 17).")
+        asyncio.run(task.recharge_recall_wand(client))
+        # Another wand's answer is not this one's.
+        say("The oak wand of firestorm (lvl 2) glows with power.")
+        asyncio.run(task.recharge_recall_wand(client))
+        self.assertIsNotNone(task._recharge)
+        # The server destroys the wand before its answer is read.
+        client.state.inventory.remove(wand)
+        client.state.items.pop(77)
+        say("The pine wand of word of recall (lvl 17) vibrates violently, "
+            "then explodes!")
+        asyncio.run(task.recharge_recall_wand(client))
+        self.assertIsNone(task._recharge)
+        self.assertIn(("recall-wand-recharge", "tag=77 exploded"),
+                      client.recorded)
+        # No answer: it backs off, doubling, and gives the scroll up.
+        client.state.messages = []
+        client.state.inventory.insert(0, wand)
+        client.state.items[77] = wand
+        waits = []
+        for attempt in range(RECHARGE_SCROLL_ATTEMPTS):
+            task._recharge_retry_at = 0.0
+            asyncio.run(task.recharge_recall_wand(client))
+            self.assertIsNotNone(task._recharge)
+            *step, sent_at = task._recharge
+            task._recharge = (*step,
+                              sent_at - FarmTask.RECHARGE_ANSWER_SECONDS - 1)
+            before = time.time()
+            asyncio.run(task.recharge_recall_wand(client))
+            waits.append(round((task._recharge_retry_at - before) / 60))
+        self.assertEqual(waits, [1, 2, 4])
+        self.assertIsNone(usable_recharge_scroll(client))
+        task._recharge_retry_at = 0.0
+        marked = list(client.marked)
+        asyncio.run(task.recharge_recall_wand(client))
+        self.assertEqual(client.marked, marked)
+        # Never on a square that blocks spells.
+        other = Item(79, item_type=c.TYPE_SCROLL, quality=80, condition=80,
+                     name="paper scroll of recharge (lvl 1)")
+        client.state.inventory.append(other)
+        with patch("atrinik_bot.tasks.spell_blocked_here", return_value=True):
+            asyncio.run(task.recharge_recall_wand(client))
+        self.assertEqual(client.marked, marked)
 
     @staticmethod
     def _crystal_farm_client(sp, maxsp, x, *, capacity=100, stored=0):
@@ -23841,6 +24224,102 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(shopper.observation_key, "recall-source")
         self.assertTrue(shopper.try_alternatives)
 
+    def test_a_dangerous_spot_raises_the_heal_restock_target(self):
+        client, _ = self.client(level=36)
+        circuit = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        # Kills costing under 30% of her health: the usual five.
+        circuit.spot = {"danger": 30.0}
+        self.assertEqual(circuit._heal_restock_target(client),
+                         FarmCircuitTask.HEAL_RESTOCK_TARGET)
+        # 41 of her 134: ten.
+        circuit.spot = {"danger": 41.0}
+        self.assertEqual(circuit._heal_restock_target(client),
+                         FarmCircuitTask.HEAL_RESTOCK_DANGER_TARGET)
+        # Unknown danger: the usual five.
+        circuit.spot = {}
+        self.assertEqual(circuit._heal_restock_target(client),
+                         FarmCircuitTask.HEAL_RESTOCK_TARGET)
+
+    def test_recall_restock_runs_and_looks_for_a_recharge_at_zero_charges(self):
+        # Live, 2026-11-25: all three recall wands at 0 charges and no
+        # recall wand she could afford; a scroll of recharge refills one.
+        client, _ = self.client(bank=2_413, level=36, recall=False)
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        for tag, skill in ((8, "literacy"), (9, "wizardry spells")):
+            client.state.place_item(Item(
+                tag, item_type=c.TYPE_SKILL, name=skill),
+                client.state.player_tag)
+        circuit = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        self.empty_wands(client, 77, 78, 79)
+        self.assertTrue(circuit._needs_recall_shopping(client))
+        shopper = circuit._new_recall_shopping(client).task
+        self.assertTrue(shopper.item_pattern.search("scroll of recharge"))
+        self.assertTrue(shopper.item_pattern.search("wand of word of recall"))
+        self.assertFalse(shopper.item_pattern.search("spellbook of recharge"))
+        # A recall device still ranks before the scroll.
+        self.assertEqual(shopper._select_stock(client, [
+            "buy scroll of recharge", "buy wand of word of recall (lvl 12)"]),
+            "wand of word of recall (lvl 12)")
+        # Carrying a scroll of recharge already: only recall stock.
+        client.state.place_item(Item(
+            95, item_type=c.TYPE_SCROLL, quality=80,
+            name="paper scroll of recharge (lvl 1)"), client.state.player_tag)
+        shopper = circuit._new_recall_shopping(client).task
+        self.assertFalse(shopper.item_pattern.search("scroll of recharge"))
+
+    def test_a_recharge_scroll_purchase_is_not_a_recall_purchase(self):
+        from .tasks import wand_charges
+
+        client, _ = self.client(bank=2_413, level=36, recall=False)
+        client.state.place_item(Item(
+            90, name="Morg'eean's Ship Key"), client.state.player_tag)
+        for tag, skill in ((8, "literacy"), (9, "wizardry spells")):
+            client.state.place_item(Item(
+                tag, item_type=c.TYPE_SKILL, name=skill),
+                client.state.player_tag)
+        self.empty_wands(client, 77)
+        circuit = FarmCircuitTask(built_graph(), [("/recovery", "")])
+        client.state.recall_unavailable = "recall shopping found nothing"
+        client.state.recall_unavailable_at = time.time()
+        shopper = BuyDialogueStockTask("sage", r"word of recall|scroll of recharge")
+        shopper.purchased = True
+        shopper._bought_names.add("scroll of recharge")
+        circuit._recall_shopping = _DoneErrand(task=shopper)
+        asyncio.run(circuit._tick_running_service(client))
+        # No daily check started and the note stays.
+        self.assertEqual(client.state.last_recall_shop_check_at, 0.0)
+        self.assertEqual(client.state.recall_unavailable,
+                         "recall shopping found nothing")
+        # The scroll in her pack: the farm reads it, no shopping meanwhile.
+        client.state.place_item(Item(
+            95, item_type=c.TYPE_SCROLL, quality=80,
+            name="paper scroll of recharge (lvl 1)"), client.state.player_tag)
+        circuit._recall_shopping_retry_at = 0.0
+        self.assertFalse(circuit._needs_recall_shopping(client))
+        # Unread for three hours (a no-magic map): shopping resumes, for
+        # recall stock only.
+        circuit._recharge_read_until = circuit.clock() - 1
+        self.assertTrue(circuit._needs_recall_shopping(client))
+        self.assertFalse(circuit._new_recall_shopping(
+            client).task.item_pattern.search("scroll of recharge"))
+        # Read, and the wand still empty (or gone): shopping again at once.
+        client.state.inventory.remove(client.state.items[95])
+        client.state.items.pop(95)
+        self.assertTrue(circuit._needs_recall_shopping(client))
+        # A wand that shows charges clears the note.
+        wand_charges(client).pop(77)
+        task = FarmTask(zone="/test")
+
+        async def examine(tag):
+            pass
+
+        client.examine = examine
+        asyncio.run(task.check_recall_wand(client))
+        client.state.add_message(2, "ffffff", "It has 5 charges left.")
+        asyncio.run(task.check_recall_wand(client))
+        self.assertEqual(client.state.recall_unavailable, "")
+
     def test_a_fresh_run_without_a_ranking_starts_the_cure_while_depleted(self):
         from .alerts import STUCK_SECONDS, ProgressWatch, active
         from .navigation import RecoveryTask
@@ -37193,6 +37672,88 @@ class HealsLandInMeleeTests(unittest.TestCase):
         self.assertEqual(client.combat, [])
         self.assertEqual(client.applied, [27, 27, 27])
         self.assertEqual(len(server.landed), 3)
+
+    def test_a_critical_heal_drinks_the_biggest_potion_before_casting(self):
+        # Below her flee threshold a potion goes at once, while a cast
+        # waits for her swing; greater healing before minor. Above it the
+        # spell comes first and the potions are kept.
+        minor = Item(27, item_type=c.TYPE_POTION, quality=100,
+                     name="potion of minor healing (lvl 20)", quantity=2)
+        greater = Item(28, item_type=c.TYPE_POTION, quality=100,
+                       name="potion of greater healing (lvl 10)")
+        client, server = self.melee(minor, self.spell(), greater, hp=150)
+        policy = SafetyPolicy()
+        # Not under attack (say, resting after the fight): the spell.
+        self.assertEqual(policy._usable_heal(client).tag, 24)
+        client.state.add_message(
+            2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
+        asyncio.run(policy.enforce(client))
+        self.assertEqual(client.applied, [28])
+        self.assertEqual(server.fires, [])
+        self.assertEqual(client.combat, [])
+        client, server = self.melee(minor, self.spell(), greater, hp=210)
+        self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 24)
+        # Out of SP for the spell and out of combat, no potion: she
+        # regenerates. Under attack the potion heals.
+        client.state.stats["sp"] = 0
+        self.assertIsNone(SafetyPolicy()._usable_heal(client))
+        client.state.add_message(
+            2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
+        self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 28)
+        # A rest on an adapted margin (flee 89%), no SP and no contact:
+        # from 60% up no potion, she regenerates.
+        for hp in (200, 290):
+            client, server = self.melee(minor, self.spell(), greater, hp=hp,
+                                        sp=0)
+            self.assertIsNone(SafetyPolicy(
+                heal_below=0.98, flee_below=0.89)._usable_heal(client))
+        # Broken away at 30% with no SP: the potion too.
+        client, server = self.melee(minor, self.spell(), greater, hp=100,
+                                    sp=0)
+        self.assertEqual(SafetyPolicy()._usable_heal(client).tag, 28)
+
+    def test_one_attacker_on_an_adapted_margin_gets_the_spell(self):
+        # The Burnt Forest's adapted flee threshold is 89%: one treant at
+        # 85% is what the spell is for, or she drinks four potions a kill.
+        minor = Item(27, item_type=c.TYPE_POTION, quality=100,
+                     name="potion of minor healing (lvl 20)", quantity=2)
+        client, server = self.melee(minor, self.spell(), hp=280)
+        policy = SafetyPolicy(heal_below=0.98, flee_below=0.89)
+        client.state.add_message(
+            2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
+        self.assertEqual(policy._usable_heal(client).tag, 24)
+        # Two kinds hitting her: the potion goes first.
+        client.state.add_message(
+            2, "ffffff", "singed sapling hit you for 28 (-33) cleave damage.")
+        self.assertEqual(policy._usable_heal(client).tag, 27)
+        # A bystander of another kind beside her (not hitting her), and
+        # the attacker's tile listed twice: still one attacker.
+        client, server = self.melee(minor, self.spell(), hp=280)
+        client.state.map.tile(9, 8).objects[3] = MapObject(
+            3, 300, 0, 0, name="charred treant", target_id=300,
+            target_hp=100)
+        client.state.map.tile(9, 8).objects[4] = MapObject(
+            3, 300, 0, 0, name="charred treant", target_id=300,
+            target_hp=100)
+        client.state.map.tile(7, 8).objects[3] = MapObject(
+            3, 301, 0, 0, name="kobold", target_id=301, target_hp=100)
+        client.state.add_message(
+            2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
+        self.assertEqual(policy._usable_heal(client).tag, 24)
+        # Three treants of one name beside her: three attackers, not one.
+        client, server = self.melee(minor, self.spell(), hp=280)
+        for tag, (x, y) in enumerate(((9, 8), (7, 8), (8, 9)), start=300):
+            client.state.map.tile(x, y).objects[3] = MapObject(
+                3, tag, 0, 0, name="charred treant", target_id=tag,
+                target_hp=100)
+        client.state.add_message(
+            2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
+        self.assertEqual(policy._usable_heal(client).tag, 27)
+        # One attacker but at 60%: truly critical.
+        client, server = self.melee(minor, self.spell(), hp=198)
+        client.state.add_message(
+            2, "ffffff", "charred treant hit you for 30 (-26) impact damage.")
+        self.assertEqual(policy._usable_heal(client).tag, 27)
 
     def test_a_used_up_potion_counts_without_a_message(self):
         from .tasks import heal_landed
