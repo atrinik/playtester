@@ -22828,6 +22828,158 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         circuit.child = circuit._new_child()
         return circuit
 
+    BURNT_16_74 = "/shattered_islands/world_16_74"
+    BURNT_17_74 = "/shattered_islands/world_17_74"
+    BURNT_17_72 = "/shattered_islands/world_17_72"
+
+    def test_a_death_across_the_spots_seam_counts_for_the_spot(self):
+        """Live, on 2026-11-25: a retreat from world_16_74 stepped across
+        the seam onto world_17_74, and she died there at 16:15:19. Only a
+        leg map or the walk's destination counted, so it taught nothing."""
+        spot = analyzer_spot("Burnt Forest", [self.BURNT_16_74],
+                             ["charred treant L33"])
+        client = self.client({"xp": [spot]})
+        client.farm_analyzer.profile = self.kit()
+        circuit = self.circuit(client, spot)
+        circuit._failure_epoch = 0.0
+        # At the spot: the farm walk is complete.
+        circuit.child.navigation.status = TaskStatus.COMPLETE
+        now = time.time()
+        client.map_arrivals = [(now - 300, self.BURNT_16_74),
+                               (now - 8, self.BURNT_17_74)]
+        for offset, text in enumerate((
+                "charred treant hit you for 40 (-40) impact damage.",
+                "singed bear hit you for 26 (-25) cleave damage.")):
+            client.state.messages.append((now - 4 + offset, 2, "ff0000", text))
+        client.decision_history.append({
+            "time": now, "action": "death", "detail": "YOU HAVE DIED.",
+            "task": "", "map": self.BURNT_17_74})
+        circuit._observe_farm_death(client)
+        record = client.state.farm_adaptations[spot["path"]]
+        failure = record["kit_failures"][-1]
+        # The spot's own fight: its cause is judged as on the spot.
+        self.assertEqual((failure["map"], failure["cause"]),
+                         (self.BURNT_17_74, "pack"))
+        self.assertTrue(failure["kit"])
+        self.assertIn("farm-failure-review",
+                      [entry["action"] for entry in client.decision_history])
+        # Not a death on the way: no route hazard on the seam map.
+        self.assertNotIn(self.BURNT_17_74, client.state.route_hazards)
+
+        # Long after she left the spot, a death on an unrelated map does
+        # not count for it.
+        far = analyzer_spot("Burnt Forest", [self.BURNT_16_74],
+                            ["charred treant L33"])
+        other = self.client({"xp": [far]})
+        circuit = self.circuit(other, far)
+        circuit._failure_epoch = 0.0
+        circuit.child.navigation.status = TaskStatus.COMPLETE
+        other.map_arrivals = [(now - 900, self.BURNT_16_74),
+                              (now - 600, self.TREES)]
+        other.decision_history.append({
+            "time": now, "action": "death", "detail": "YOU HAVE DIED.",
+            "task": "", "map": self.TREES})
+        self.assertFalse(circuit._observe_farm_death(other))
+        self.assertEqual(other.state.farm_adaptations, {})
+
+    def test_kit_failures_count_for_every_spot_of_one_area(self):
+        """Failures on a world_17_72 circuit make a world_16_74 spot, of the
+        same Burnt Forest but no shared map, hazardous for her kit; a spot
+        of another area stays usable."""
+        from . import self_improvement as si
+        from .navigation import analyzer_farm_selection, kit_hazardous_spot
+
+        graph = built_graph()
+        circuit_spot = analyzer_spot("Burnt Forest circuit", [self.BURNT_17_72],
+                                     ["charred treant L39"])
+        single = analyzer_spot("Burnt Forest", [self.BURNT_16_74],
+                               ["charred treant L33"])
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [circuit_spot, single, trees]})
+        client.farm_analyzer.profile = self.kit()
+        circuit = self.circuit(client, circuit_spot)
+        circuit._failure_epoch = 0.0
+        base = time.time() - 600
+        for death in range(si.KIT_HAZARD_FAILURES):
+            when = base + 100 * death
+            for offset, text in enumerate((
+                    "charred treant hit you for 40 (-40) impact damage.",
+                    "singed sapling hit you for 30 (-30) cleave damage.")):
+                client.state.messages.append(
+                    (when - 5 + offset, 2, "ff0000", text))
+            client.decision_history.append({
+                "time": when, "action": "death", "detail": "",
+                "task": "", "map": self.BURNT_17_72})
+            circuit._observe_farm_death(client)
+        record = client.state.farm_adaptations[circuit_spot["path"]]
+        self.assertEqual(record["areas"], ["eld_woods_island|Burnt Forest"])
+        self.assertTrue(kit_hazardous_spot(
+            client, single, ((self.BURNT_16_74, "charred treant"),), graph))
+        self.assertFalse(kit_hazardous_spot(
+            client, trees, ((self.TREES, "evil treant"),), graph))
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"],
+                         "Trees")
+
+    def test_a_pause_quarantines_the_whole_bounded_area(self):
+        from . import self_improvement as si
+        from .navigation import area_maps
+
+        graph = built_graph()
+        spot = analyzer_spot("Burnt Forest", [self.BURNT_16_74],
+                             ["charred treant L33"])
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [spot, trees]})
+        circuit = self.circuit(client, spot)
+        circuit._failure_epoch = 0.0
+        now = time.time()
+        client.state.farm_adaptations[spot["path"]] = {
+            "level": si.MAX_LEVEL,
+            "failures": [now - 20.0] * (si.PAUSE_FAILURES - 1)}
+        client.state.messages.append(
+            (now - 1, 2, "ff0000", "charred treant hit you for 90 (-90) impact damage."))
+        client.decision_history.append({
+            "time": now, "action": "death", "detail": "",
+            "task": "", "map": self.BURNT_16_74})
+        self.assertTrue(circuit._observe_farm_death(client))
+        forest = area_maps(graph)["eld_woods_island|Burnt Forest"]
+        self.assertEqual(len(forest), 25)
+        quarantine = client.state.farm_zone_quarantine
+        self.assertTrue(all(quarantine.get(path, 0.0) > now for path in forest))
+        # Another area, and one too large to quarantine whole, are untouched.
+        self.assertNotIn(self.TREES, quarantine)
+        self.assertIn("farm-area-quarantine",
+                      [entry["action"] for entry in client.decision_history])
+
+    def test_a_spot_whose_every_resident_kind_is_out_of_league_is_left(self):
+        """Live, on 2026-11-25: out-healed disengages marked the kinds of
+        world_16_74 out of her league, and she stayed there with nothing
+        she might pull until she was cornered."""
+        spot = analyzer_spot("Burnt Forest", [self.BURNT_16_74],
+                             ["charred treant L33"])
+        trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
+        client = self.client({"xp": [spot, trees]})
+        circuit = self.circuit(client, spot)
+        circuit.child.navigation.status = TaskStatus.COMPLETE
+        client.state.map.path = self.BURNT_16_74
+        farm = circuit.child.task
+        until = time.monotonic() + FarmTask.OUT_OF_LEAGUE_SECONDS
+        # The bear is not marked: she may still pull it.
+        client.out_of_league_kinds = {"charred treant": until,
+                                      "singed deer": until}
+        self.assertFalse(circuit._observe_out_of_league(client))
+        self.assertFalse(circuit._upgrade_progression(client, farm))
+        self.assertEqual(circuit.spot["name"], "Burnt Forest")
+        client.out_of_league_kinds["singed bear"] = until
+        self.assertTrue(circuit._observe_out_of_league(client))
+        self.assertGreater(
+            client.state.farm_zone_quarantine[self.BURNT_16_74], time.time())
+        self.assertIn("farm-out-of-league",
+                      [entry["action"] for entry in client.decision_history])
+        # The analyzer choice moves her on, by her ordinary walk.
+        self.assertTrue(circuit._upgrade_progression(client, farm))
+        self.assertEqual(circuit.spot["name"], "Trees")
+        self.assertEqual(circuit.child.navigation.destination, self.TREES)
+
     def test_failures_at_an_analyzer_spot_teach_instead_of_excluding_it(self):
         trees = analyzer_spot("Trees", [self.TREES], ["evil treant L13"])
         pocket = analyzer_spot("Pocket", [self.POCKET], ["evil treant L13"])
@@ -22870,11 +23022,12 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual((circuit.child.task._emergency_recall_cast_at,
                           circuit.child.task._emergency_recall_origin),
                          (123.0, self.TREES))
-        # Once the pick is reached, a failure elsewhere does not count.
+        # Once the pick is reached, a failure elsewhere, long after she was
+        # last at the spot and not beside it, does not count.
         circuit.child.navigation.complete()
         client.decision_history.append({
-            "time": time.time() + 3, "action": "death", "detail": "",
-            "task": "", "map": "/elsewhere"})
+            "time": time.time() + 3 + 2 * circuit.FARM_SEAM_FAILURE_SECONDS,
+            "action": "death", "detail": "", "task": "", "map": "/elsewhere"})
         self.assertFalse(circuit._observe_farm_death(client))
         self.assertEqual(client.state.farm_adaptations[trees["path"]]["level"], 2)
 
@@ -25971,7 +26124,8 @@ class UnsafeFarmingTests(RouteDeathReachIsolation, unittest.TestCase):
             return picked and picked[2]["name"]
 
         with patch("atrinik_bot.navigation.kit_hazardous_spot",
-                   lambda client, spot, legs: spot["name"].startswith("Burnt")):
+                   lambda client, spot, legs, graph=None:
+                   spot["name"].startswith("Burnt")):
             # Cut at TOP, as before: every ranked spot rejected, she waits.
             analyzer.report["rankings"]["safety"] = ranked[:FarmAnalyzer.TOP]
             self.assertIsNone(choice())

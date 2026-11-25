@@ -808,7 +808,12 @@ lessons are persisted per character, and the dashboard's Farming tab shows
 them, together with improvement goals aggregated across spots (area spells,
 protection types, offence, healing). Only when the spot keeps failing at the
 maximum level (three failures there within an hour) does autoplay pause it for an hour
-and farm the next-ranked spot meanwhile.
+and farm the next-ranked spot meanwhile; the pause covers every map of the
+spot's area when that area is small (the Burnt Forest's 25 maps), and kit
+hazards count failures across the whole area. A death or recall just
+across the spot's seam counts for the spot, and a spot whose every
+resident kind is out of her league is left for an hour (COMBAT.md,
+"Learning from deaths").
 
 A spot is still quarantined for six hours, and autoplay moves to the
 next-ranked spot, after:

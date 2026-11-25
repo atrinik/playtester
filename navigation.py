@@ -7040,14 +7040,63 @@ def seam_ranking(client: AtrinikClient, graph: "WorldGraph",
     return ranked
 
 
+# An area (the analyzer's region and map name: circuit_area for a circuit,
+# MapNode.region and .name for each map) with at most this many maps is one
+# place for kit hazards and pauses (map_areas). The Burnt Forest has 25
+# maps; a name used more widely names a whole island or sea (Eld Woods
+# Island 42, Strakewood Island 190, World 2115), where a hazard or a pause
+# for every map would be out of proportion, and those count by shared maps
+# alone, as before.
+AREA_HAZARD_MAX_MAPS = 30
+# Maps of each bounded area, per graph (area_maps).
+_area_maps_cache: dict[tuple[int, int], dict[str, frozenset[str]]] = {}
+
+
+def _area_key(node) -> str:
+    region = str(getattr(node, "region", "") or "")
+    name = str(getattr(node, "name", "") or "")
+    return f"{region}|{name}" if name else ""
+
+
+def area_maps(graph: "WorldGraph | None") -> dict[str, frozenset[str]]:
+    """Every bounded area's maps (at most AREA_HAZARD_MAX_MAPS), by area
+    key ("region|name"); cached per graph."""
+    nodes = getattr(graph, "nodes", None) or {}
+    key = (id(graph), len(nodes))
+    cached = _area_maps_cache.get(key)
+    if cached is not None:
+        return cached
+    if len(_area_maps_cache) > 8:
+        _area_maps_cache.clear()
+    grouped: dict[str, set[str]] = defaultdict(set)
+    for path, node in nodes.items():
+        area = _area_key(node)
+        if area:
+            grouped[area].add(path)
+    areas = {area: frozenset(paths) for area, paths in grouped.items()
+             if len(paths) <= AREA_HAZARD_MAX_MAPS}
+    _area_maps_cache[key] = areas
+    return areas
+
+
+def map_areas(graph: "WorldGraph | None", paths: Iterable[str]) -> set[str]:
+    """The bounded areas (area_maps) of ``paths``: those of a spot's legs
+    are the spot's own."""
+    nodes = getattr(graph, "nodes", None) or {}
+    bounded = area_maps(graph)
+    return {area for path in paths
+            if (area := _area_key(nodes.get(path))) in bounded}
+
+
 def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
-                       legs) -> bool:
+                       legs, graph: "WorldGraph | None" = None) -> bool:
     """Whether live failures rate this spot hazardous for her current kit.
 
     See self_improvement.kit_hazard: repeated pack or out-damaged failures,
-    or deaths on the way, at any spot sharing a map with this one, with a
-    kit she has not improved on since (CombatProfile.no_survivability_gain:
-    a weaker kit still counts them).
+    or deaths on the way, at any spot sharing a map or (with ``graph``) a
+    bounded area (map_areas) with this one, with a kit she has not
+    improved on since (CombatProfile.no_survivability_gain: a weaker kit
+    still counts them).
     """
     profile = current_combat_kit(client)
     if profile is None:
@@ -7060,7 +7109,8 @@ def kit_hazardous_spot(client: AtrinikClient, spot: dict | None,
 
     return self_improvement.kit_hazard(
         adaptations, self_improvement.spot_key(spot, legs),
-        (path for path, _ in legs), same_kit)
+        (path for path, _ in legs), same_kit,
+        areas=map_areas(graph, (path for path, _ in legs)))
 
 
 # Map transitions from a map to every map it reaches, per graph and map
@@ -7500,7 +7550,7 @@ def _analyzer_farm_choice(
                     not any(path in blocked for path, _ in legs)):
                 entry = (objective, legs, spot)
                 order[id(entry)] = (position, rank)
-                (hazardous if kit_hazardous_spot(client, spot, legs)
+                (hazardous if kit_hazardous_spot(client, spot, legs, graph)
                  else usable).append(entry)
     if not usable and hazardous and not funding:
         # Every usable spot is hazardous for her kit: farm the least
@@ -7535,7 +7585,7 @@ def _analyzer_farm_choice(
         for spot in analyzer.ranking("safety"):
             legs = analyzer_spot_legs(spot, graph)
             if (legs and _spot_danger(spot) < cap and
-                    kit_hazardous_spot(client, spot, legs)):
+                    kit_hazardous_spot(client, spot, legs, graph)):
                 cap = _spot_danger(spot)
         usable = [entry for entry in usable
                   if not plan.risky_approach(entry[2]) and
@@ -7690,7 +7740,7 @@ def farm_shadow_snapshot(client: AtrinikClient, graph: "WorldGraph",
                 farm_spot_key(objective, spot), str(spot.get("name") or ""), objective,
                 position, rank, route_costs.spot_rate(spot, objective))
             entry = (candidate, legs, spot)
-            (hazardous if kit_hazardous_spot(client, spot, legs) else usable).append(entry)
+            (hazardous if kit_hazardous_spot(client, spot, legs, graph) else usable).append(entry)
     if not usable and hazardous:
         usable = [min(hazardous, key=lambda entry: (
             farm_analyzer_plan.risky_spot(entry[2]),
@@ -8733,12 +8783,17 @@ class FarmCircuitTask(BotTask):
                 self.child.navigation.destination in active_paths and
                 self.child.navigation.status != TaskStatus.COMPLETE):
             path = self.child.navigation.destination
+        seam = False
+        if not path:
+            path = self._seam_failure_leg(client, failure)
+            seam = bool(path)
         if not path:
             return False
         what = "combat death" if failure.get("action") == "death" else "emergency recall"
         if self._analyzer_safety:
             # Analyzer spots are kept: review what happened and adapt.
-            return self._learn_from_failure(client, failure, path, what)
+            return self._learn_from_failure(client, failure, path, what,
+                                            seam=seam)
         self._quarantine_farm_path(
             client, path, f"{what} on {failure_map or 'unknown map'}")
         return True
@@ -8781,8 +8836,64 @@ class FarmCircuitTask(BotTask):
                 entered = stamp
         return entered
 
+    # A death or emergency recall off the spot's maps this soon after she
+    # was on one of them counts for the spot (_seam_failure_leg).
+    FARM_SEAM_FAILURE_SECONDS = 30.0
+
+    def _seam_failure_leg(self, client: AtrinikClient, failure: dict) -> str:
+        """The leg map a failure just off the spot's maps counts for, or "".
+
+        Once she is at the spot (the farm child's walk complete), a death
+        or emergency recall counts for it when it happened within
+        FARM_SEAM_FAILURE_SECONDS of her being on one of its maps (map
+        arrivals, else her records), or on a map tiled to one of them
+        (a seam neighbour) or of the same bounded area (map_areas): the
+        leg she was on last, else the first. Live, on 2026-11-25, a retreat
+        from world_16_74 stepped across the seam onto world_17_74 and she
+        died there at 16:15:19; the review, the kit failure and its cause
+        were never recorded, because only a leg map or the walk's
+        destination counted.
+        """
+        child = self.child
+        if child is None or child.navigation.status != TaskStatus.COMPLETE:
+            return ""
+        failure_map = str(failure.get("map", ""))
+        when = float(failure.get("time", 0.0) or 0.0)
+        legs = [path for path, _ in self.legs]
+        if not failure_map or not legs or failure_map in legs:
+            return ""
+        window = self.FARM_SEAM_FAILURE_SECONDS
+        recent = ""
+        arrivals = sorted((float(stamp), str(where)) for stamp, where in
+                          getattr(client, "map_arrivals", ()) if stamp <= when)
+        for index, (stamp, where) in enumerate(arrivals):
+            left = (arrivals[index + 1][0] if index + 1 < len(arrivals)
+                    else when)
+            if where in legs and when - left <= window:
+                recent = where
+        if not recent:
+            stamps = [(float(record.get("time", 0.0) or 0.0), record.get("map"))
+                      for record in (*getattr(client, "action_history", ()),
+                                     *getattr(client, "decision_history", ()))
+                      if isinstance(record, dict)]
+            recent = max(((stamp, where) for stamp, where in stamps
+                          if where in legs and 0.0 <= when - stamp <= window),
+                         default=(0.0, ""))[1]
+        if recent:
+            return recent
+        neighbours = getattr(self.graph, "_seam_neighbours", None)
+        nearby = neighbours is not None and any(
+            failure_map == neighbour
+            for leg in legs for neighbour, _, _ in neighbours(leg))
+        if not nearby and not (map_areas(self.graph, (failure_map,)) &
+                               map_areas(self.graph, legs)):
+            return ""
+        previous = [where for _, where in arrivals if where in legs]
+        return previous[-1] if previous else legs[0]
+
     def _learn_from_failure(self, client: AtrinikClient, failure: dict,
-                            path: str, what: str) -> bool:
+                            path: str, what: str, *,
+                            seam: bool = False) -> bool:
         """Review a failure at an analyzer spot and adapt instead of leaving it.
 
         Returns True only for the last resort, a short pause after repeated
@@ -8803,8 +8914,14 @@ class FarmCircuitTask(BotTask):
                     if float(entry[0]) > previous_death]
         this_life = [record for record in decisions if isinstance(record, dict) and
                      float(record.get("time", 0.0) or 0.0) > previous_death]
+        # A failure across the spot's seam (_seam_failure_leg) is the
+        # spot's own fight, not one on the way to it: its cause is judged
+        # as on the spot, and it teaches no route hazard.
+        spot_paths = [leg for leg, _ in self.legs]
+        if seam:
+            spot_paths.append(str(failure.get("map", "")))
         review = self_improvement.review_failure(
-            messages, this_life, failure, [leg for leg, _ in self.legs],
+            messages, this_life, failure, spot_paths,
             monster=self.graph.is_monster)
         # Hits stamped before she entered the death map were taken elsewhere:
         # only damage taken on it makes that map the hazard.
@@ -8837,7 +8954,8 @@ class FarmCircuitTask(BotTask):
         record, pause = self_improvement.learn(
             adaptations.get(key, {}), review,
             kit=kit.describe() if kit is not None else None,
-            maps=[leg for leg, _ in self.legs], map_damage=on_map)
+            maps=[leg for leg, _ in self.legs], map_damage=on_map,
+            areas=map_areas(self.graph, (leg for leg, _ in self.legs)))
         setter = getattr(client, "set_farm_adaptation", None)
         if setter is not None:
             setter(key, record)
@@ -8873,8 +8991,11 @@ class FarmCircuitTask(BotTask):
             self._quarantine_farm_path(
                 client, path, "repeated failures at the maximum adaptation level",
                 seconds=self_improvement.PAUSE_SECONDS)
+            self._quarantine_farm_area(
+                client, "repeated failures at the maximum adaptation level",
+                seconds=self_improvement.PAUSE_SECONDS)
             return True
-        if kit_hazardous_spot(client, self.spot, self.legs):
+        if kit_hazardous_spot(client, self.spot, self.legs, self.graph):
             # Her kit cannot hold this spot: choose again now. It stays
             # skipped while her survivability is the same
             # (analyzer_farm_choice).
@@ -8902,6 +9023,98 @@ class FarmCircuitTask(BotTask):
                      f"{path} until={int(until)} after {reason}")
         log.warning("autoplay quarantined farm map for %.1f hours: %s (%s)",
                     seconds / 3600, path, reason)
+
+    def _quarantine_farm_area(self, client: AtrinikClient, reason: str, *,
+                              seconds: float) -> None:
+        """Quarantine every map of the spot's bounded areas (map_areas) for
+        ``seconds``, as its pause quarantines the failure's leg map: a
+        sibling circuit or single map of the same area is the same fight.
+        Live, on 2026-11-25, the Burnt Forest pauses covered one map each,
+        and she died on three different Burnt Forest maps within 90
+        minutes. Recorded once (farm-area-quarantine); an area too large
+        for map_areas is never quarantined whole."""
+        areas = map_areas(self.graph, (path for path, _ in self.legs))
+        bounded = area_maps(self.graph)
+        maps = sorted(set().union(*(bounded[area] for area in areas))
+                      if areas else ())
+        if not maps:
+            return
+        until = time.time() + seconds
+        quarantine = client.state.farm_zone_quarantine
+        for path in maps:
+            quarantine[path] = max(float(quarantine.get(path, 0.0) or 0.0), until)
+        # One persist for the whole area: the setter saves every entry.
+        setter = getattr(client, "quarantine_farm_zone", None)
+        if setter is not None:
+            setter(maps[-1], quarantine[maps[-1]])
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("farm-area-quarantine",
+                     f"{', '.join(sorted(area.split('|', 1)[-1] for area in areas))}: "
+                     f"{len(maps)} maps until={int(until)} after {reason}")
+        log.warning("autoplay quarantined farm area for %.1f hours: %s (%d maps; %s)",
+                    seconds / 3600, ", ".join(sorted(areas)), len(maps), reason)
+
+    # How long a spot whose every resident kind is out of her league stays
+    # quarantined (_observe_out_of_league): the failure review's pause.
+    FARM_OUT_OF_LEAGUE_QUARANTINE_SECONDS = self_improvement.PAUSE_SECONDS
+
+    def _observe_out_of_league(self, client: AtrinikClient) -> bool:
+        """Leave a spot with nothing left she may pull.
+
+        Out-healed disengages mark the kinds that hit her out of her league
+        (FarmTask.out_healed, out_of_league_kinds) for
+        FarmTask.OUT_OF_LEAGUE_SECONDS: she neither pulls nor engages them.
+        Once every resident kind of the spot (the authored, not peaceful,
+        spawns of its maps, by name or archetype) is marked while she is
+        there (a spawn that can roll several kinds counts once all are),
+        the spot's maps are quarantined for
+        FARM_OUT_OF_LEAGUE_QUARANTINE_SECONDS (farm-out-of-league), so the
+        analyzer choice (_upgrade_progression) picks another spot and her
+        ordinary walk takes her off the map by its route; with none left,
+        the circuit ends as for any quarantined spot. Live, on 2026-11-25,
+        she stayed on world_16_74 with every kind there marked, ran its
+        edges from slow treants and was cornered at (19,23).
+        """
+        if not self.analyzer_driven or self.child is None:
+            return False
+        legs = [path for path, _ in self.legs]
+        if (self.child.navigation.status != TaskStatus.COMPLETE or
+                client.state.map.path not in legs):
+            return False
+        store = getattr(client, "out_of_league_kinds", None) or {}
+        now = time.monotonic()
+        marked = {FarmTask._kind_key(kind) for kind, until in store.items()
+                  if float(until) > now}
+        if not marked:
+            return False
+        quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
+        if all(float(quarantine.get(path, 0.0) or 0.0) > time.time()
+               for path in legs):
+            return False
+        residents = [spawn for path in legs
+                     for spawn in self.graph.named_spawns.get(path, ())
+                     if not spawn.peaceful]
+        if not residents:
+            return False
+        kinds = set()
+        for spawn in residents:
+            names = {FarmTask._kind_key(name)
+                     for name in (spawn.named, *spawn.candidates) if name}
+            if not names or not names <= marked:
+                return False
+            kinds.add(spawn.named)
+        detail = (f"{(self.spot or {}).get('name', self._spot_key())}: every "
+                  f"resident kind is out of her league "
+                  f"({', '.join(sorted(kinds))})")
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("farm-out-of-league", detail)
+        for path in legs:
+            self._quarantine_farm_path(
+                client, path, "every resident kind out of her league",
+                seconds=self.FARM_OUT_OF_LEAGUE_QUARANTINE_SECONDS)
+        return True
 
     def _observe_stalled_farm(self, client: AtrinikClient,
                               farm: FarmTask) -> bool:
@@ -11433,6 +11646,8 @@ class FarmCircuitTask(BotTask):
             if isinstance(farm, FarmTask) and self._upgrade_progression(
                     client, farm):
                 return
+        # Nothing left she may pull here: the choice below moves her on.
+        self._observe_out_of_league(client)
         if (self.level_until and
                 int(client.state.stats.get("level", 0)) >= self.level_until):
             self.complete()
