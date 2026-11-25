@@ -11472,6 +11472,9 @@ class FarmCircuitTask(BotTask):
             elif resupply is None and kind == "temple":
                 self._temple_food_retry_at = (
                     self.clock() + self.TEMPLE_FOOD_RETRY_SECONDS)
+            elif resupply is None and kind == "shop":
+                # Its ranking gave no answer (planner-timeout).
+                self._resupply_retry_at = self.clock() + 1800.0
             if resupply is not None:
                 await client.clear_actions()
                 await client.set_combat(False)
@@ -11556,7 +11559,7 @@ class FarmCircuitTask(BotTask):
         # rests meanwhile.
         if isinstance(farm, FarmTask):
             farm.rest_for_departure = self._heal_restock_waiting(client, farm)
-        if (isinstance(farm, FarmTask) and not survival_pending and
+        if (isinstance(farm, FarmTask) and
                 self._needs_heal_restock(client) and
                 not self._busy_finishing_fight_or_loot(client, farm) and
                 self._heal_restock_may_leave(client, unprepared)):
@@ -11642,7 +11645,7 @@ class FarmCircuitTask(BotTask):
             # farm carries on meanwhile.
             shopping = self._plans.get("recall-shopping", self.graph, client,
                                        self._new_recall_shopping)
-            if shopping is not PLANNING:
+            if shopping is not PLANNING and shopping is not None:
                 await client.clear_actions()
                 await client.set_combat(False)
                 self._recall_shopping = shopping

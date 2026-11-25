@@ -235,11 +235,13 @@ class LoopWatchdog:
         recorder = getattr(self.client, "record_action", None)
         if recorder is not None:
             try:
-                parameters = inspect.signature(recorder).parameters
+                parameters = inspect.signature(recorder).parameters.values()
             except (TypeError, ValueError):
-                parameters = {}
-            options = ({"save_timeout": self.SAVE_TIMEOUT}
-                       if "save_timeout" in parameters else {})
+                parameters = ()
+            timed = any(parameter.name == "save_timeout" or
+                        parameter.kind is parameter.VAR_KEYWORD
+                        for parameter in parameters)
+            options = {"save_timeout": self.SAVE_TIMEOUT} if timed else {}
             try:
                 recorder(STALL_ACTION, detail, **options)
             except Exception:

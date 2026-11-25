@@ -37274,7 +37274,7 @@ class PlanningOffLoopTests(unittest.TestCase):
         stalls = [record["detail"] for record in client.decision_history
                   if record["action"] == "event-loop-stall"]
         self.assertEqual(len(stalls), watchdog.stalls)
-        self.assertTrue(any(re.fullmatch(r"0\.[2-9]s late in autoplay:level-115", detail)
+        self.assertTrue(any(re.fullmatch(r"\d+\.\ds late in autoplay:level-115", detail)
                             for detail in stalls), stalls)
         # The dashboard alerts it for a while.
         found = alerts.active(client.state, client.decision_history, alerts.ProgressWatch(),

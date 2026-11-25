@@ -193,6 +193,7 @@ class AutoplayTask(BotTask):
         if priest:
             self._failed_priests[priest] = (
                 time.monotonic() + self.TEMPLE_PRIEST_RETRY)
+        self.food_planner.forget()
         if not self._hunger_fallback_used and hungry(client):
             self._hunger_fallback_used = True
             if await self._start_temple_food(client):
@@ -881,10 +882,13 @@ class IdleSurvival:
         """
         trip, self.child = self.child, None
         self._generation += 1
-        # The operator took over: the next trip ranks from where she is then.
-        self.food_planner.forget()
         now = time.monotonic()
         food = int(client.state.stats.get("food", 1000) or 0)
+        if food >= self.safety_min_food:
+            # The operator took over: the next trip ranks from where she
+            # is then. Below the eating threshold nothing is held, and a
+            # ranking under way is kept.
+            self.food_planner.forget()
         if self._hold_started is None or food >= HUNGRY_FOOD:
             # Fed: a new hunger episode starts its own hold budget.
             self._hold_started = now
@@ -1036,6 +1040,7 @@ class IdleSurvival:
             if priest:
                 self._failed_priests[priest] = (
                     time.monotonic() + self.PRIEST_RETRY)
+            self.food_planner.forget()
             self._give_up(client, f"{trip.name}: {trip.error}")
             try:
                 # Stop the rest of an abandoned route.

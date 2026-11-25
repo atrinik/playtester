@@ -494,9 +494,10 @@ starvations.
   collects it, as the ranking itself raised it before. A ranking with no
   answer after `MAX_PENDING_SECONDS` (5 minutes) is given up
   (`planner-timeout`) and counts as no route, so the caller's retry and
-  alert run. While the food or heal ranking runs, the circuit starts no
-  later errand (storage, selling, banking, shopping) in its place: survival
-  trips keep their priority.
+  alert run. While the food ranking runs, the circuit starts no later
+  errand (storage, selling, banking, shopping) in its place, the heal
+  restock aside; while the heal ranking runs, no optional shopping trip:
+  survival trips keep their priority.
 - **The worker never reads live state.** `planning_client` gives it
   `planner.PlanningClient`: a copy of her game state taken on the loop
   (each container field copied one level deep, each item with its own
@@ -535,10 +536,10 @@ starvations.
   ranking, unless that priest is passed over by then (its trip failed).
   The trip itself is rebuilt, not resumed: a temple dialogue cut by a
   reconnect is not continued. A ranking under way survives the reconnect
-  too. Autoplay's farm circuits share its planner, so a rebuilt circuit
-  keeps the priest as well. A completed trip and an operator hold forget
-  the priest; a priest whose trip failed is passed over, so it is never
-  reused.
+  too. Autoplay's adaptive-farming circuits share its planner, so a
+  rebuilt circuit keeps the priest as well. A completed or failed trip,
+  and an operator hold while she is not starving, forget the priest; a
+  failed priest is also passed over for an hour.
 - **Stalls are visible.** `planner.LoopWatchdog` sleeps 0.5 s at a time
   and measures the overshoot. A stall over 1 s logs a warning and records
   `event-loop-stall` ("2.3s late in autoplay:level-115 > adaptive-farming
