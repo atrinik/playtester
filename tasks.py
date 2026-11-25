@@ -585,6 +585,47 @@ def wand_known_empty(client: AtrinikClient, item: Item) -> bool:
             wand_charges(client).get(item.tag) == 0)
 
 
+# Attempts without an answer after which a scroll of recharge is given up
+# (FarmTask.recharge_recall_wand).
+RECHARGE_SCROLL_ATTEMPTS = 3
+_BAD_ITEM_FLAGS = c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED
+
+
+def recharge_failures(client: AtrinikClient) -> dict[int, int]:
+    """Attempts without an answer per scroll-of-recharge tag."""
+    failures = getattr(client, "recharge_failures", None)
+    if failures is None:
+        failures = client.recharge_failures = {}
+    return failures
+
+
+def usable_recharge_scroll(client: AtrinikClient) -> Item | None:
+    """A scroll of recharge she can read on a wand: identified, paid,
+    neither cursed nor damned, and not given up after
+    RECHARGE_SCROLL_ATTEMPTS. The one test behind reading one
+    (FarmTask.recharge_recall_wand) and recall shopping's
+    (FarmCircuitTask._empty_recall_wand)."""
+    policy = InventoryPolicy()
+    failures = recharge_failures(client)
+    return next((
+        item for item in client.state.inventory
+        if item.item_type == c.TYPE_SCROLL and
+        re.search(r"\brecharge\b", item.name, re.I) and
+        policy.identified(item) and not item.flags & _BAD_ITEM_FLAGS and
+        failures.get(item.tag, 0) < RECHARGE_SCROLL_ATTEMPTS), None)
+
+
+def empty_recall_wand(client: AtrinikClient) -> Item | None:
+    """An identified, paid, uncursed recall wand known to be empty."""
+    policy = InventoryPolicy()
+    return next((
+        item for item in client.state.inventory
+        if item.item_type == c.TYPE_WAND and
+        re.search(r"\bword of recall\b", item.name, re.I) and
+        policy.identified(item) and not item.flags & _BAD_ITEM_FLAGS and
+        wand_known_empty(client, item)), None)
+
+
 def recall_waiting(client: AtrinikClient) -> bool:
     """Whether a recall is waiting for her action timer to run out.
 
@@ -955,6 +996,11 @@ def usable_heal_item(client: AtrinikClient, item: Item,
     return item.item_type != c.TYPE_SCROLL or reads_scrolls(client)
 
 
+# Below this share of her health (or her flee threshold, if lower) under
+# attack, a potion comes before a healing spell (SafetyPolicy.potions_first).
+POTION_FIRST_HEALTH = 0.60
+
+
 @dataclass(slots=True)
 class SafetyPolicy:
     heal_below: float = 0.70
@@ -1036,17 +1082,14 @@ class SafetyPolicy:
     def _heal_order(self, client: AtrinikClient,
                     items: list[Item]) -> list[Item]:
         """Her heals in the order she uses them. A spell, rod or wand
-        comes first, saving potions, balms and scrolls, except at or below
-        her flee threshold under attack (recent_hostile_contact): then the
-        consumables come first, since applying one waits for no action
-        timer, while in melee a cast waits for her swing (COMBAT.md,
-        "Heals in melee"). Consumables go by the most health one use
-        restores (heal_estimate), so greater healing before minor;
-        otherwise inventory order."""
-        stats = client.state.stats
-        maxhp = max(1, int(stats.get("maxhp", 1) or 1))
-        critical = (int(stats.get("hp", 0) or 0) / maxhp <= self.flee_below
-                    and recent_hostile_contact(client))
+        comes first, saving potions, balms and scrolls, except when it is
+        truly critical (potions_first): then the consumables come first,
+        since applying one waits for no action timer, while in melee a
+        cast waits for her swing (COMBAT.md, "Heals in melee").
+        Consumables go by the most health one use restores
+        (heal_estimate), so greater healing before minor; otherwise
+        inventory order."""
+        critical = self.potions_first(client)
 
         def rank(item: Item) -> tuple[bool, float]:
             consumable = item.item_type in (c.TYPE_POTION, c.TYPE_SCROLL)
@@ -1054,6 +1097,23 @@ class SafetyPolicy:
                     -heal_estimate(item.name) if consumable else 0.0)
 
         return sorted(items, key=rank)
+
+    def potions_first(self, client: AtrinikClient) -> bool:
+        """Whether a fight is critical enough to drink before casting:
+        under attack (recent_hostile_contact) at or below
+        min(flee_below, POTION_FIRST_HEALTH), or at or below flee_below
+        with two or more kinds hitting her (recent_hostile_attackers).
+        An adapted flee threshold can reach 89%; one attacker there is
+        what the spell is for."""
+        if not recent_hostile_contact(client):
+            return False
+        stats = client.state.stats
+        maxhp = max(1, int(stats.get("maxhp", 1) or 1))
+        ratio = int(stats.get("hp", 0) or 0) / maxhp
+        if ratio <= min(self.flee_below, POTION_FIRST_HEALTH):
+            return True
+        return (ratio <= self.flee_below and
+                len(recent_hostile_attackers(client, seconds=5.0)) >= 2)
 
     def _heals(self, client: AtrinikClient) -> list[Item]:
         """Healing items and healing spells she may use where she stands,
@@ -1092,11 +1152,15 @@ class SafetyPolicy:
 
     def _usable_heal(self, client: AtrinikClient) -> Item | None:
         """The first of her heals (_heals) she can use now: an item, or a
-        healing spell she can afford. A spell short of SP gives way to
-        the next heal, a carried potion among them."""
+        healing spell she can afford. Under attack a spell short of SP
+        gives way to the next heal, a carried potion among them; out of
+        combat it does not, and she regenerates instead."""
         sp = int(client.state.stats.get("sp", 0) or 0)
+        heals = self._heals(client)
+        if not recent_hostile_contact(client):
+            heals = heals[:1]
         return next((
-            heal for heal in self._heals(client)
+            heal for heal in heals
             if heal.item_type != c.TYPE_SPELL or
             int(heal.extra.get("cost", 0) or 0) <= sp), None)
 
@@ -2408,7 +2472,8 @@ class FarmTask(BotTask):
         self._pull_rest_at = 0.0
         self._pull_rest_given_up = False
         # A recharge under way: (wand tag, scroll tag, "mark" or "read",
-        # sent at, wall clock), and no new one before this (wall clock).
+        # when that step was sent, wall clock), and no new one before this
+        # (wall clock).
         self._recharge: tuple[int, int, str, float] | None = None
         self._recharge_retry_at = 0.0
         # Resting for want of a usable heal or a ready recall
@@ -2748,6 +2813,9 @@ class FarmTask(BotTask):
         self._engaged_target = None
         if kill_confirmed:
             self.note_kill_cost(client)
+        else:
+            # Vanished without a kill: the fight is not measured.
+            self._fight_start_hp = None
         if (client.state.map.path != path or now - last_seen > 6.0):
             return
         if kill_confirmed:
@@ -2799,6 +2867,8 @@ class FarmTask(BotTask):
         (pull_rest_due); recorded as ``costly-kill``."""
         start, self._fight_start_hp = self._fight_start_hp, None
         self._pull_rest_given_up = False
+        # A rest after this kill is a new one, with its full limit.
+        self._pull_rest_since = 0.0
         if start is None:
             return
         stats = client.state.stats
@@ -2832,8 +2902,9 @@ class FarmTask(BotTask):
                 int(stats.get("sp", 0) or 0) >= mana):
             self._costly_kill = False
             return False
-        if (self._pull_rest_since and time.monotonic() - self._pull_rest_since
-                >= self.PULL_REST_LIMIT_SECONDS):
+        if (self.pull_rest_active() and
+                time.monotonic() - self._pull_rest_since >=
+                self.PULL_REST_LIMIT_SECONDS):
             self._costly_kill = False
             self._pull_rest_given_up = True
             return False
@@ -2854,66 +2925,85 @@ class FarmTask(BotTask):
             if other[3].target_id != entry[3].target_id)
 
     async def recharge_recall_wand(self, client: AtrinikClient) -> None:
-        """Recharge an empty recall wand with a carried scroll of recharge
-        while nothing threatens. The recharge spell works on the marked
-        wand (spell_effect.c recharge; 1 in 6 the wand explodes), and
-        marking toggles (socket_command_item_mark): she marks the wand,
-        and once the server says "Marked item", reads the scroll. A
-        recharged wand's charges are forgotten, so check_recall_wand
-        examines it again. Anything else waits RECHARGE_RETRY_SECONDS."""
+        """Recharge an empty recall wand (empty_recall_wand) with a carried
+        scroll of recharge (usable_recharge_scroll) while nothing
+        threatens, never on a square that blocks spells. The recharge
+        spell works on the marked wand (spell_effect.c recharge; 1 in 6
+        the wand explodes), and marking toggles
+        (socket_command_item_mark): she marks the wand, and once the
+        server says "Marked item", reads the scroll. A recharged wand's
+        charges are forgotten, so check_recall_wand examines it again.
+        An attempt with no answer about that wand counts against the
+        scroll (recharge_failures) and waits RECHARGE_RETRY_SECONDS,
+        doubled each time; after RECHARGE_SCROLL_ATTEMPTS the scroll is
+        given up, and recall shopping may buy another."""
         now = time.time()
         pending = self._recharge
         if pending is not None:
             wand_tag, scroll_tag, stage, sent_at = pending
+            wand = (getattr(client.state, "items", None) or {}).get(wand_tag)
+            wand_name = (wand.name if wand is not None else "").casefold()
             answers = [
                 str(entry[-1]).strip()
                 for entry in getattr(client.state, "messages", ())
                 if float(entry[0]) >= sent_at and
                 self_improvement.from_server(entry)]
+
+            def about_wand(pattern: str) -> bool:
+                for text in answers:
+                    match = re.match(pattern, text, re.I)
+                    if match and match.group(1).casefold() in wand_name:
+                        return True
+                return False
+
             recorder = getattr(client, "record_action", None)
+            failed = False
             if stage == "mark":
-                if any(text.startswith("Marked item") for text in answers):
+                if about_wand(r"Marked item (.+?)\.?$"):
                     await client.apply(scroll_tag)
                     self._recharge = (wand_tag, scroll_tag, "read", now)
-                elif any(text.startswith("Unmarked item") for text in answers):
+                    return
+                if about_wand(r"Unmarked item (.+?)\.?$"):
                     # It was marked already: mark it again.
                     await client.mark_item(wand_tag)
                     self._recharge = (wand_tag, scroll_tag, "mark", now)
-                elif now - sent_at > self.RECHARGE_ANSWER_SECONDS:
-                    self._recharge = None
-                    self._recharge_retry_at = now + self.RECHARGE_RETRY_SECONDS
-                return
-            glowed = any("glows with power" in text for text in answers)
-            exploded = any("explodes" in text for text in answers)
-            if not (glowed or exploded):
+                    return
                 if now - sent_at <= self.RECHARGE_ANSWER_SECONDS:
                     return
-                self._recharge_retry_at = now + self.RECHARGE_RETRY_SECONDS
-            elif glowed:
-                wand_charges(client).pop(wand_tag, None)
-                self._wand_examined.discard(wand_tag)
-            if recorder is not None:
-                recorder("recall-wand-recharge",
-                         f"tag={wand_tag} " + (
-                             "recharged" if glowed else
-                             "exploded" if exploded else "no answer"))
+                failed = True
+            else:
+                glowed = about_wand(r"The (.+?) glows with power\.?$")
+                exploded = about_wand(r"The (.+?) vibrates violently, "
+                                      r"then explodes!?$")
+                if glowed:
+                    wand_charges(client).pop(wand_tag, None)
+                    self._wand_examined.discard(wand_tag)
+                elif not exploded:
+                    if now - sent_at <= self.RECHARGE_ANSWER_SECONDS:
+                        return
+                    failed = True
+                if recorder is not None and not failed:
+                    recorder("recall-wand-recharge",
+                             f"tag={wand_tag} " +
+                             ("recharged" if glowed else "exploded"))
             self._recharge = None
+            if failed:
+                failures = recharge_failures(client)
+                failures[scroll_tag] = failures.get(scroll_tag, 0) + 1
+                self._recharge_retry_at = now + (
+                    self.RECHARGE_RETRY_SECONDS *
+                    2 ** (failures[scroll_tag] - 1))
+                if recorder is not None:
+                    recorder("recall-wand-recharge",
+                             f"tag={wand_tag} no answer "
+                             f"({failures[scroll_tag]}/"
+                             f"{RECHARGE_SCROLL_ATTEMPTS})")
             return
-        if now < self._recharge_retry_at or not reads_scrolls(client):
+        if (now < self._recharge_retry_at or not reads_scrolls(client) or
+                spell_blocked_here(client)):
             return
-        policy = InventoryPolicy()
-        bad = c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED
-        scroll = next((
-            item for item in client.state.inventory
-            if item.item_type == c.TYPE_SCROLL and
-            re.search(r"\brecharge\b", item.name, re.I) and
-            policy.identified(item) and not item.flags & bad), None)
-        wand = next((
-            item for item in client.state.inventory
-            if item.item_type == c.TYPE_WAND and
-            re.search(r"\bword of recall\b", item.name, re.I) and
-            policy.identified(item) and not item.flags & bad and
-            wand_known_empty(client, item)), None)
+        scroll = usable_recharge_scroll(client)
+        wand = empty_recall_wand(client)
         if scroll is None or wand is None:
             return
         await client.mark_item(wand.tag)
@@ -4350,6 +4440,7 @@ class FarmTask(BotTask):
             await client.set_combat(False)
             await client.clear_target()
             self._engaged_target = None
+            self._fight_start_hp = None
             self._last_action = time.monotonic()
             recorder = getattr(client, "record_action", None)
             if recorder is not None:
@@ -6155,6 +6246,14 @@ class FarmTask(BotTask):
             self._wand_examine = None
             if charges == 0:
                 self.note_recall_wand_empty(client)
+            elif charges:
+                # A recall wand with charges (bought or recharged): no
+                # recall note any more.
+                setter = getattr(client, "set_recall_unavailable", None)
+                if setter is not None:
+                    setter("")
+                elif hasattr(client.state, "recall_unavailable"):
+                    client.state.recall_unavailable = ""
             if charges is not None:
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
@@ -6427,6 +6526,8 @@ class FarmTask(BotTask):
         if (self._engaged_target is not None and
                 self._engaged_target[0] == target_id):
             self._engaged_target = None
+            # A fight that ends without a kill is not measured.
+            self._fight_start_hp = None
 
     def target_temporarily_unreachable(self, target_id: int) -> bool:
         now = time.monotonic()
@@ -6450,6 +6551,7 @@ class FarmTask(BotTask):
         if (self._engaged_target is not None and
                 self._engaged_target[0] == target_id):
             self._engaged_target = None
+            self._fight_start_hp = None
         self._lure_target_id = 0
         self._lure_target_world = None
         self._lure_progress_at = 0.0
@@ -6891,7 +6993,10 @@ class FarmTask(BotTask):
                 # A kill cost much of her health (or the spot's kills do):
                 # rest to near full before the next pull, combat off.
                 now = time.monotonic()
-                if not self._pull_rest_since:
+                # A rest is new unless confirmed just now: one interrupted
+                # by a fight or a detour starts over (clears, combat off,
+                # logged, its full limit).
+                if not self.pull_rest_active():
                     self._pull_rest_since = now
                     stats = client.state.stats
                     recorder = getattr(client, "record_action", None)
@@ -8142,11 +8247,20 @@ class BuyHealingStockTask(BotTask):
 
     def __init__(self, merchant: str, *, quantity: int,
                  cash_reserve: int = 1_000, observation_key: str = "",
-                 safety: SafetyPolicy | None = None):
+                 safety: SafetyPolicy | None = None,
+                 per_copper: bool = False, spend_share: float = 1.0):
         super().__init__(f"buy-healing-stock:{merchant}")
         self.merchant = merchant
         self.quantity = max(1, int(quantity))
         self.cash_reserve = max(0, int(cash_reserve))
+        # ``per_copper``: the most heal per copper first, not the biggest
+        # heal (the cure-funding farm saves for the cure). ``spend_share``:
+        # at most this share of what she has above the reserve goes on
+        # heals in one visit, though always enough for the cheapest one.
+        self.per_copper = bool(per_copper)
+        self.spend_share = min(1.0, max(0.0, float(spend_share)))
+        self._budget: int | None = None
+        self._spent = 0
         self.observation_key = observation_key
         self.safety = safety
         # Price per item, by stock name.
@@ -8193,6 +8307,9 @@ class BuyHealingStockTask(BotTask):
             recorder(self.observation_key, *cheapest)
         wallet = BuyShopUpgradeTask.wallet_value(client)
         spare = max(0, wallet - self.cash_reserve)
+        if self._budget is None:
+            self._budget = max(int(spare * self.spend_share), cheapest[1])
+        spare = min(spare, self._budget - self._spent)
         affordable = [entry for entry in self.quotes.items()
                       if entry[1] <= spare and
                       entry[0].casefold() not in self._bought_names]
@@ -8210,7 +8327,8 @@ class BuyHealingStockTask(BotTask):
         # several minor ones (live, 2026-11-25, five minor-healing
         # scrolls at heal per copper could not keep up with a treant).
         name, cost = max(affordable, key=lambda entry: (
-            heal_estimate(entry[0]), heal_estimate(entry[0]) / entry[1],
+            0.0 if self.per_copper else heal_estimate(entry[0]),
+            heal_estimate(entry[0]) / entry[1],
             -entry[1], entry[0].casefold()))
         count = min(self.quantity - self.bought, spare // cost)
         self._buying, self._count = name, count
@@ -8295,6 +8413,7 @@ class BuyHealingStockTask(BotTask):
                         BuyShopUpgradeTask._set_bank_balance(
                             client, int(client.state.bank_balance) + refund)
                 self.bought += arrived
+                self._spent += arrived * self.quotes[self._buying]
                 self.bought_name = self.bought_name or self._buying
                 self._bought_names.add(self._buying.casefold())
                 recorder = getattr(client, "record_action", None)

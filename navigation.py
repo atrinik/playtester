@@ -68,7 +68,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     recent_hostile_contact,
                     retreat_mobility, unresolved_hostile_contact,
                     combat_allowed, heal_waiting, out_of_heals_and_recall,
-                    UnpreparedHold, wand_known_empty,
+                    UnpreparedHold, empty_recall_wand,
+                    usable_recharge_scroll, wand_known_empty,
                     area_caster_identities, tiled_neighbours)
 from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
 log = logging.getLogger(__name__)
@@ -8465,6 +8466,9 @@ class FarmCircuitTask(BotTask):
     # farm rests to near full between pulls (FarmTask.spot_danger).
     DANGEROUS_SPOT_SHARE = FarmTask.PULL_REST_KILL_SHARE
     HEAL_RESTOCK_DANGER_TARGET = 10
+    # The share of her money above HEAL_RESTOCK_RESERVE one heal restock
+    # may spend (BuyHealingStockTask.spend_share), off the cure-funding farm.
+    HEAL_RESTOCK_SPEND_SHARE = 0.5
     HEAL_RESTOCK_RESERVE = 1_000
     HEAL_RESTOCK_MINIMUM_WALLET = 1_250
     HEAL_RESTOCK_INTERVAL = 24 * 60 * 60
@@ -10375,20 +10379,11 @@ class FarmCircuitTask(BotTask):
 
     @staticmethod
     def _empty_recall_wand(client: AtrinikClient) -> bool:
-        """Whether she carries an identified recall wand known to be empty
-        (a scroll of recharge would refill it) and no scroll of recharge
-        yet."""
-        policy = InventoryPolicy()
-        inventory = client.state.inventory
-        if any(item.item_type == c.TYPE_SCROLL and
-               re.search(r"\brecharge\b", item.name, re.I)
-               for item in inventory):
-            return False
-        return any(
-            item.item_type == c.TYPE_WAND and
-            "word of recall" in item.name.casefold() and
-            policy.identified(item) and wand_known_empty(client, item)
-            for item in inventory)
+        """Whether she carries a recall wand known to be empty
+        (empty_recall_wand) that a scroll of recharge would refill, and
+        no usable scroll of recharge for it (usable_recharge_scroll)."""
+        return (empty_recall_wand(client) is not None and
+                usable_recharge_scroll(client) is None)
 
     @staticmethod
     def _owned_recall_spellbook(client: AtrinikClient) -> bool:
@@ -10428,6 +10423,11 @@ class FarmCircuitTask(BotTask):
             self._known_recall_spell(client) or
             self._owned_recall_spellbook(client))
         if has_immediate and (wizardry < 12 or has_permanent):
+            return False
+        if (reads_scrolls(client) and empty_recall_wand(client) is not None
+                and usable_recharge_scroll(client) is not None):
+            # A scroll of recharge in her pack: the farm reads it first
+            # (FarmTask.recharge_recall_wand).
             return False
         last_check = float(getattr(
             client.state, "last_recall_shop_check_at", 0.0) or 0.0)
@@ -10717,6 +10717,13 @@ class FarmCircuitTask(BotTask):
                 vendor.name,
                 quantity=self._heal_restock_target(client) -
                 heal_consumables(client),
+                # On the cure-funding farm the most heal per copper, at
+                # the least cost to the cure's savings; elsewhere the
+                # biggest heal, with at most half her spare money, so a
+                # later depletion cure stays affordable.
+                per_copper=cure_funding_farm(client),
+                spend_share=(1.0 if cure_funding_farm(client) else
+                             self.HEAL_RESTOCK_SPEND_SHARE),
                 cash_reserve=self.HEAL_RESTOCK_RESERVE,
                 observation_key=HEAL_QUOTE_KEY),
             destination_xy=(vendor.x, vendor.y), combat_approach=True,
@@ -11225,21 +11232,32 @@ class FarmCircuitTask(BotTask):
                         client, "recall shopping failed: "
                         f"{self._recall_shopping.error}")
                 else:
-                    setter = getattr(
-                        client, "set_last_recall_shop_check", None)
-                    if setter is not None:
-                        setter(time.time())
-                    else:
-                        client.state.last_recall_shop_check_at = time.time()
                     purchased = bool(
                         isinstance(shopper, BuyDialogueStockTask) and
                         shopper.purchased)
+                    recall_bought = purchased and any(
+                        "word of recall" in name
+                        for name in shopper._bought_names)
                     log.info(
                         "recall stock check complete%s; returning to farm",
                         " with purchase" if purchased else "")
-                    self.note_recall_unavailable(client, "" if purchased else
-                                                 "recall shopping found no "
-                                                 "recall source to buy")
+                    if purchased and not recall_bought:
+                        # Only a scroll of recharge: no recall yet. The
+                        # farm reads it; until a wand shows charges
+                        # (FarmTask.check_recall_wand) the note stays, and
+                        # a wand still empty or destroyed lets shopping
+                        # run again without its daily interval.
+                        pass
+                    else:
+                        setter = getattr(
+                            client, "set_last_recall_shop_check", None)
+                        if setter is not None:
+                            setter(time.time())
+                        else:
+                            client.state.last_recall_shop_check_at = time.time()
+                        self.note_recall_unavailable(
+                            client, "" if purchased else
+                            "recall shopping found no recall source to buy")
                     self._recall_shopping_retry_at = self.clock() + 60.0
                 self._recall_shopping = None
             return True
@@ -11881,7 +11899,7 @@ class FarmCircuitTask(BotTask):
                 live_targets == 0 and elapsed >= 15.0 and
                 not self._busy_finishing_fight_or_loot(client, farm) and
                 not farm.training_rest_active() and
-                not farm.pull_rest_active() and
+                not farm.pull_rest_due(client) and
                 not self._unprepared_hold.holding()):
             if not self._empty_spawn_since:
                 self._empty_spawn_since = now
@@ -11917,7 +11935,7 @@ class FarmCircuitTask(BotTask):
         # mid-rest between pulls (FarmTask.pull_rest_due), or she walks
         # to the next map hurt. Services may still detour during a rest.
         if isinstance(farm, FarmTask) and (
-                farm.training_rest_active() or farm.pull_rest_active()):
+                farm.training_rest_active() or farm.pull_rest_due(client)):
             return
         # Nor while she rests without a heal or a recall: no unprepared
         # walk to another map; the hold's cap still runs.

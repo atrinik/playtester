@@ -1106,8 +1106,12 @@ so she is rarely without a heal:
   heal she can pay for (`heal_estimate`: the server's minor and greater
   healing rolls at the item's level), then of the most heal per copper,
   as many as the reserve leaves: greater healing before minor
-  ([heals and pulls](#heals-and-pulls-2026-11-25)). On a dangerous spot
-  she buys up to `HEAL_RESTOCK_DANGER_TARGET` (10). The merchant sells at
+  ([heals and pulls](#heals-and-pulls-2026-11-25)), spending at most half
+  of her money above the reserve (`HEAL_RESTOCK_SPEND_SHARE`; always
+  enough for the cheapest one), so a later depletion cure stays
+  affordable. On the cure-funding farm it buys the most heal per copper
+  instead, with no cap. On a dangerous spot she buys up to
+  `HEAL_RESTOCK_DANGER_TARGET` (10). The merchant sells at
   most what it stocks, so what arrives is counted: each purchase record
   says that many, the bank reservation for the rest is given back, and
   the next best choice she can still pay for makes up the rest. The
@@ -1166,14 +1170,20 @@ another one beside it.
   to `HEAL_RESTOCK_DANGER_TARGET` (10) instead of 5.
 - **Potions in melee.** Her safety policy orders her heals
   (`SafetyPolicy._heal_order`). A spell, rod or wand comes first,
-  saving the consumables, except at or below her flee threshold under
-  attack (a hit or miss in the last 5 s): then potions, balms and
-  scrolls come first, the biggest heal first: applying one
+  saving the consumables, except when it is truly critical
+  (`potions_first`): under attack (a hit or miss in the last 5 s) at or
+  below the lower of her flee threshold and 60% (`POTION_FIRST_HEALTH`),
+  or at or below the flee threshold with two or more kinds hitting her.
+  An adapted flee threshold reaches 89%, and one treant there is what
+  the spell is for; drinking from 89% would use about four potions a
+  kill. Then potions, balms and scrolls come first, the biggest heal
+  first: applying one
   waits for no action timer, while a cast waits for her swing
-  ([heals in melee](#heals-in-melee-2026-11-23)). A healing spell she
-  lacks the SP for gives way to the next heal, so a carried potion is
-  used when her SP runs out; before, the spell's place in her inventory
-  decided, and an unaffordable spell first meant no heal at all.
+  ([heals in melee](#heals-in-melee-2026-11-23)). Under attack, a
+  healing spell she lacks the SP for gives way to the next heal, so a
+  carried potion is used when her SP runs out; before, the spell's place
+  in her inventory decided, and an unaffordable spell first meant no
+  heal at all. Out of combat it does not: she regenerates.
 - **Recall charges.** Word of Recall comes only on wands and rods
   (`spellist.h`), and only the Asteria sage rolls wands; at about 96
   silver she could not afford one. The recharge spell works from a
@@ -1182,11 +1192,21 @@ another one beside it.
   Greyton's Nuzem). With an identified recall wand known empty, and the
   skills to read a scroll, recall shopping now also buys a scroll of
   recharge, after any recall device the merchant has
-  (`_empty_recall_wand`). On a quiet farm tick she marks the empty wand,
-  waits for "Marked item" (marking toggles, so "Unmarked item" marks it
-  again), and reads the scroll (`FarmTask.recharge_recall_wand`,
-  recorded as `recall-wand-recharge`). A wand that glows has its charges
-  read again by examine; one in six explodes. Recall stays an
+  (`_empty_recall_wand`). Buying only the scroll is not buying a recall:
+  it starts no daily check and keeps the recall note, and while she
+  carries a usable scroll for an empty wand recall shopping waits for
+  the farm to read it. On a quiet farm tick, never on a square that
+  blocks spells, she marks the empty wand, waits for "Marked item"
+  (marking toggles, so "Unmarked item" marks it again), and reads the
+  scroll (`FarmTask.recharge_recall_wand`, recorded as
+  `recall-wand-recharge`). Only answers naming that wand count. A wand
+  that glows has its charges read again by examine, and once it shows
+  charges the recall note clears; one in six explodes, and a wand still
+  empty or gone lets recall shopping run again. An attempt with no
+  answer waits 1, 2, then 4 minutes, and after three the scroll is given
+  up (`RECHARGE_SCROLL_ATTEMPTS`), so another may be bought. Reading and
+  buying use the same test for a usable scroll (identified, paid,
+  neither cursed nor damned: `usable_recharge_scroll`). Recall stays an
   opportunity, never a precondition
   ([owner decision, 2026-11-22](#a-working-recall-is-never-a-blocker-owner-decision-2026-11-22)).
 - **Rest between pulls.** A kill that cost at least
@@ -1197,16 +1217,21 @@ another one beside it.
   until she is back to `PULL_REST_HEALTH` (95%) and, with a healing
   spell, half her SP (at least three casts). She rests where she stands
   with combat off (`pull-rest`, once per rest); whatever comes at her is
-  still fought, and the circuit's dwell does not move her to the next
-  leg mid-rest (maintenance trips may still go). A rest ends after `PULL_REST_LIMIT_SECONDS` (5 minutes)
-  whatever she has regenerated, and is then given up until the next
-  kill.
+  still fought, and while a rest is due (`pull_rest_due`) the circuit's
+  dwell does not move her to the next leg (maintenance trips may still
+  go). A rest interrupted for more than a second starts over, with
+  combat off again and its full limit. A rest ends after
+  `PULL_REST_LIMIT_SECONDS` (5 minutes) whatever she has regenerated, and
+  is then given up until the next kill. A fight that ends without a
+  kill (released, abandoned or vanished) is not measured.
 - **One at a time.** When she chooses whom to pull (nothing engaged and
   nothing within two tiles of her), a target at least
   `PULL_ISOLATION_TILES` (4) from every other monster in view comes
   before a nearer one beside others (`FarmTask.isolated_target`); named
   priority targets still come first, and a farm casting Firestorm,
-  which strikes a pack, keeps picking the nearest.
+  which strikes a pack, keeps picking the nearest. Accepted: the walk to
+  an isolated target may pass near others; the pull squares and the
+  lone-pull checks still apply.
 
 Accepted limits: the kill cost is net of the heals in the fight, so a
 fight her heals kept even is not costly; a recharge scroll is a rare
