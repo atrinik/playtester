@@ -5770,26 +5770,38 @@ class NavigateThenTask(BotTask):
         # below would restart the timer it waits for.
         safety_hold = not safe and (not starving_without_food(client) or
                                     heal_waiting(client))
-        if (safety_hold and seam_contact and not hold_fire and
-                not heal_waiting(client) and
-                any(threat[0] <= 1 for threat in nearby) and
-                not (ratio <= FarmTask.STAND_HEALTH_FLOOR and
-                     await self._retreat_step(client, nearby, gain_only=True,
-                                              probe=True))):
+        beside = [threat for threat in nearby if threat[0] <= 1]
+        if (seam_contact and not hold_fire and beside and
+                not heal_waiting(client)):
             # Under contact after the farm retreat's seam step, with an
-            # attacker beside her: she fights back between heals, as the
-            # farm does (the heal itself went out above, or waits for its
-            # cooldown), rather than a combat-off step every tick. Live at
-            # 16:15 she was at 130/356. Only critical, with a step that
-            # gains distance, does she still step away. She fights the
-            # attacker beside her: the committed one if it is, else the
-            # weakest.
+            # attacker beside her. Above the farm's own pack flee line
+            # (FarmTask.pack_flee) she fights it, combat on and target
+            # kept, healing first (a heal sent this tick has returned
+            # above), rather than hold fire or a combat-off step. Live at
+            # 16:15 the walk's hold-fire dropped her target there with
+            # three attackers on her. At or below that line she steps
+            # away, combat off, by a step that gains distance, as the
+            # farm's retreat would; with none she is cornered and fights.
+            line = FarmTask.pack_flee(
+                getattr(getattr(self.task, "safety", None), "flee_below",
+                        self.safety.flee_below), len(nearby))
+            if (ratio <= line and
+                    await self._retreat_step(client, nearby, gain_only=True,
+                                             probe=True)):
+                self._defending = True
+                await client.clear_actions()
+                await client.set_combat(False)
+                if time.monotonic() - self._last_defense_action >= 0.30:
+                    await self._retreat_step(
+                        client, nearby, avoid_backtrack=True, gain_only=True)
+                    self._last_defense_action = time.monotonic()
+                return True
             safety_hold = False
             if nearest is None or nearest[0] > 1:
-                nearest = min((threat for threat in nearby if threat[0] <= 1),
-                              key=lambda threat: (
-                                  int(getattr(threat[3], "target_hp", 0)
-                                      or 100), threat[3].target_id))
+                # The attacker beside her, not a committed one farther off.
+                nearest = min(beside, key=lambda threat: (
+                    int(getattr(threat[3], "target_hp", 0) or 100),
+                    threat[3].target_id))
         split = (overwhelmed and not hold_fire and not safety_hold and
                  not seam_contact)
         cornered = None
@@ -5828,12 +5840,7 @@ class NavigateThenTask(BotTask):
                 # A split takes only a step that gains distance, the kind
                 # whose absence makes her cornered (_cornered_split).
                 await self._retreat_step(
-                    client, nearby, avoid_backtrack=True,
-                    # Critical under a seam fight: only the gaining step
-                    # its probe found, never an equal-distance shuffle.
-                    gain_only=split or (
-                        seam_contact and
-                        ratio <= FarmTask.STAND_HEALTH_FLOOR))
+                    client, nearby, avoid_backtrack=True, gain_only=split)
             return True
         if hold_fire and nearby:
             # Keep walking; mark their squares so the route steers around.

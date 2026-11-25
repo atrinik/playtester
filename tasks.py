@@ -2314,14 +2314,8 @@ class FarmTask(BotTask):
         self._recall_wand_fired: tuple[int, float] | None = None
         self._wand_examine: tuple[int, float] | None = None
         self._wand_examined: set[int] = set()
-        # Until when healing that cannot keep up makes her disengage, and
-        # until when a winnable fight kept on in its place is not logged
-        # again (fight_winnable).
+        # Until when healing that cannot keep up makes her disengage.
         self._outpaced_until = 0.0
-        self._winnable_logged_until = 0.0
-        # Whether the latched stand is one only a winnable fight allowed
-        # (pursued-stand against two while healing is outpaced).
-        self._winnable_stand = False
         # The farm map's seam neighbours (path, by direction), and until
         # when a step behind cover holds her there (monotonic).
         self._seam_cache: tuple[str, dict, frozenset] | None = None
@@ -5228,11 +5222,6 @@ class FarmTask(BotTask):
     # A spawn whose radius held a trail square this recently is no hazard
     # (retreat_hazards).
     TRAIL_QUIET_SECONDS = 60.0
-    # A fight kept on above the flee line while heals lose (fight_winnable)
-    # must be won with this share to spare, judged on hits over this window.
-    WINNABLE_MARGIN = 1.5
-    WINNABLE_WINDOW_SECONDS = 8.0
-
     def under_hostile_contact(self, client: AtrinikClient,
                               seconds: float = 3.0) -> bool:
         """Whether something is on her: a hit or miss within ``seconds``
@@ -5346,58 +5335,6 @@ class FarmTask(BotTask):
         return max(flee_below,
                    0.94 if near >= 3 else 0.80 if near >= 2 else 0.0)
 
-    def fight_winnable(self, client: AtrinikClient, reach,
-                       flee: float) -> bool:
-        """Whether she wins this fight before the flee line.
-
-        ``reach`` holds view entries (distance, x, y, object) of the
-        attackers on her. Her health above ``flee`` must exceed, by
-        WINNABLE_MARGIN, the damage she takes meanwhile: the hits of the
-        last WINNABLE_WINDOW_SECONDS (from the first of them, at least
-        3 s) as a rate, times the time to kill every one of them at her
-        observed damage per swing (observed_target_hp: two swings at least,
-        the last within the window) and weapon speed. Heals are left out.
-        An attacker without such a sample, or no hits at all, makes it
-        unknown: not winnable. Live, one charred
-        treant out-damaged chained minor healing from 89% to death, so an
-        outpaced heal from full health is no reason by itself to fight on.
-        """
-        if not reach:
-            return False
-        stats = client.state.stats
-        hp = int(stats.get("hp", 0) or 0)
-        maxhp = max(1, int(stats.get("maxhp", 1) or 1))
-        spare = hp - flee * maxhp
-        if spare <= 0:
-            return False
-        now = time.time()
-        hits = [
-            (float(entry[0]), hit[1])
-            for entry in getattr(client.state, "messages", ())
-            if float(entry[0]) >= now - self.WINNABLE_WINDOW_SECONDS and
-            self_improvement.from_server(entry) and
-            (hit := self_improvement.parse_hit(str(entry[-1])))]
-        if not hits:
-            return False
-        span = max(3.0, now - min(stamp for stamp, _ in hits))
-        incoming = sum(amount for _, amount in hits) / span
-        interval = max(0.5, float(stats.get("weapon_speed", 2) or 2))
-        kill_seconds = 0.0
-        for entry in reach:
-            obj = entry[3]
-            observation = self._target_damage.get(obj.target_id)
-            # At least two swings measured, the last within the window: one
-            # delta may be a burst or someone else's hit, an old one another
-            # weapon's.
-            if (observation is None or observation[3] < 2 or
-                    observation[2] <= 0 or
-                    time.monotonic() - observation[1] >
-                    self.WINNABLE_WINDOW_SECONDS):
-                return False
-            target_hp = int(obj.target_hp or observation[0] or 0)
-            kill_seconds += target_hp / (observation[2] / interval)
-        return spare > incoming * kill_seconds * self.WINNABLE_MARGIN
-
     async def low_health_retreat(self, client: AtrinikClient,
                                  gain_only: bool = False) -> bool:
         """Run one tile away from the visible pack, learning blocked steps.
@@ -5441,23 +5378,8 @@ class FarmTask(BotTask):
         out_healed = self.out_healed_running(client, now)
         # A gaining gain-only step normally clears the stand latch first;
         # out_healed here only guards against one left over.
-        # A stand only a winnable fight allowed ends once heals are
-        # outpaced (or there is none left to cast) and it is winnable no
-        # more (at the flee line, say).
-        lost_winnable = (
-            breakout is not None and self._stand_latch and
-            self._winnable_stand and (
-                healing_outpaced(client) or
-                self.safety._usable_heal(client) is None) and
-            not self.fight_winnable(client, [
-                (1, x, y, obj) for x, y, obj in visible_threats
-                if max(abs(x - cx), abs(y - cy)) <= 1],
-                self.pack_flee(self.safety.flee_below, sum(
-                    max(abs(x - cx), abs(y - cy)) <= 4
-                    for x, y, _ in visible_threats))))
         if (breakout is not None and self._stand_latch and
-                (ratio <= self.STAND_HEALTH_FLOOR or out_healed or
-                 lost_winnable)):
+                (ratio <= self.STAND_HEALTH_FLOOR or out_healed)):
             # A stand chosen over a failing retreat ends at the critical
             # floor: run again rather than fight to the death. The
             # engagement stays, so recovery cannot rebind to a bystander.
@@ -5465,7 +5387,6 @@ class FarmTask(BotTask):
             breakout = None
             self._cornered_breakout_target = 0
             self._stand_latch = False
-            self._winnable_stand = False
         if breakout is not None and self.caster_rank(client, breakout[2]):
             # A caster beside her is fought first, latched fight or not.
             caster = next((
@@ -5780,14 +5701,7 @@ class FarmTask(BotTask):
             not (gain_only or out_healed) and
             self._pursued_retreats >= self.PURSUIT_STAND_STEPS and
             ratio > self.STAND_HEALTH_FLOOR)
-        # A fight she wins before the flee line (fight_winnable) is no
-        # losing one, outpaced heals or not.
-        winnable_stand = bool(
-            stand_due and len(adjacent) >= 2 and not emergency_disengage and
-            healing_outpaced(client) and self.fight_winnable(
-                client, [(1, x, y, obj) for x, y, obj in adjacent],
-                self.pack_flee(self.safety.flee_below, near)))
-        if stand_due and len(adjacent) >= 2 and not winnable_stand and (
+        if stand_due and len(adjacent) >= 2 and (
                 emergency_disengage or healing_outpaced(client)):
             # Losing against two or more beside her (the disengage below,
             # or heals that no longer keep up), a stand only trades blows
@@ -5812,7 +5726,6 @@ class FarmTask(BotTask):
             self._pursued_retreats = 0
             self._cornered_breakout_target = obj.target_id
             self._stand_latch = True
-            self._winnable_stand = winnable_stand
             self.remember_engagement(client, x, y, obj.target_id)
             await client.clear_actions()
             if await select_target(client, x, y, obj.target_id):
@@ -6732,17 +6645,7 @@ class FarmTask(BotTask):
             ratio > dynamic_flee)
         finish_before_healing = self.should_finish_before_healing(
             client, initial_threats, nearby_count, ratio)
-        # A fight she wins before the flee line (fight_winnable) is kept
-        # on: no out-healed or outpaced run with combat off, which live on
-        # world_16_74 at 90% dragged the treants around the map. Otherwise
-        # she disengages as before, by the hazard-aware retreat. The
-        # out-healed learning (out_of_league) is kept either way.
-        winnable = (
-            ratio > dynamic_flee and (outpaced or out_healed) and
-            self.fight_winnable(client, [
-                entry for entry in initial_threats
-                if entry[0] <= 2 and active_threat(entry)], dynamic_flee))
-        if (out_healed and not finish_before_healing and not winnable and
+        if (out_healed and not finish_before_healing and
                 self.safety._usable_heal(client) is not None and any(
                 entry[0] <= 2 and active_threat(entry)
                 for entry in initial_threats)):
@@ -6760,16 +6663,7 @@ class FarmTask(BotTask):
                 await self.break_caster_sight(client)):
             # Shot at by a caster she is not going for: out of its line.
             return
-        if (outpaced and winnable and
-                self.safety.flee_below < ratio <= self.safety.heal_below):
-            now = time.monotonic()
-            if self._winnable_logged_until <= now:
-                recorder = getattr(client, "record_action", None)
-                if recorder is not None:
-                    recorder("winnable-fight", f"hp={ratio:.0%}")
-            self._winnable_logged_until = (
-                now + self.OUTPACED_DISENGAGE_SECONDS)
-        elif (outpaced and
+        if (outpaced and
                 self.safety.flee_below < ratio <= self.safety.heal_below):
             # Heals no longer keep up with the damage (healing_outpaced):
             # chaining more of them only spends the health she needs to

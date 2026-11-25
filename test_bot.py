@@ -10956,7 +10956,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.map.tile(12, 8)  # its square now in view, empty
         self.assertEqual(task.retreat_hazards(client, {100}), [])
 
-    def _winnable_client(self, *targets, hp=320):
+    def _outpaced_client(self, *targets, hp=320):
         """Her at world (12, 12) on an open 25x25 farm map, 356 maximum
         health, heals outpaced (_outpaced_messages), with the given
         (view x, view y, name, target id, target HP %) attackers."""
@@ -10982,7 +10982,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.map.world_x = client.state.map.world_y = 12
         return client
 
-    def _winnable_task(self, target=r"charred treant|goblin"):
+    def _outpaced_task(self, target="charred treant"):
         task = FarmTask(zone="/test", target=target,
                         safety=SafetyPolicy(heal_below=0.95, flee_below=0.80))
         node = MapNode(path="/test", width=25, height=25)
@@ -10991,73 +10991,17 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task.map_bounds = (25, 25)
         return task
 
-    def test_winnable_fight_at_ninety_percent_is_fought_not_run_from(self):
-        # Live on world_16_74, healing outpaced at 90% turned into an
-        # emergency disengage, combat off. When she wins the fight before
-        # the flee line (fight_winnable: 35 HP to spare against 12 a
-        # second for the 1 s the treant at 10% has left), she fights on.
-        client = self._winnable_client((9, 8, "charred treant", 100, 10))
-        task = self._winnable_task()
-        task.remember_engagement(client, 9, 8, 100)
-        task._target_damage[100] = (10, time.monotonic(), 20.0, 3)
-        client.state.target_id = 100
-        client.state.combat = True
-        for _ in range(3):
-            task._last_action = 0.0
-            asyncio.run(task.tick(client))
-        actions = [action for action, _ in client.recorded]
-        self.assertEqual(client.direct_moves, [])
-        self.assertNotIn("healing-outpaced", actions)
-        self.assertNotIn("emergency-disengage", actions)
-        self.assertIn("winnable-fight", actions)
-        self.assertEqual(task._outpaced_until, 0.0)
-        self.assertIn((0, 43), client.fired)
-        self.assertEqual(client.combat[-1], True)
-
-    def test_unwinnable_fight_still_disengages_whatever_the_kind(self):
-        # A goblin (speed 0.06, as slow as a treant on paper) or a treant
-        # at full health: 35 HP to spare cannot outlast 12 a second for a
-        # 10 s kill, so the outpaced disengage stands (pull request 86).
-        for name in ("goblin", "charred treant"):
-            with self.subTest(name=name):
-                client = self._winnable_client((9, 8, name, 100, 100))
-                client.state.stats["speed"] = 0.8
-                task = self._winnable_task()
-                # Authored speeds play no part: a speed-based rule called
-                # both slow melee and fought on.
-                task.monster_speeds = {"goblin": 0.06, "charred treant": 0.048}
-                task.remember_engagement(client, 9, 8, 100)
-                task._target_damage[100] = (100, time.monotonic(), 20.0, 3)
-                asyncio.run(task.tick(client))
-                self.assertEqual(len(client.direct_moves), 1)
-                self.assertIn("healing-outpaced",
-                              [action for action, _ in client.recorded])
-                self.assertNotIn(True, client.combat)
-        # No damage sample for the attacker, a single swing measured, or a
-        # stale sample: unknown, not winnable. Two fresh ones: winnable.
-        client = self._winnable_client((9, 8, "goblin", 100, 10))
-        task = self._winnable_task()
-        reach = [(1, 9, 8, client.state.map.tile(9, 8).objects[3])]
-        self.assertFalse(task.fight_winnable(client, reach, 0.80))
-        task._target_damage[100] = (10, time.monotonic(), 20.0, 1)
-        self.assertFalse(task.fight_winnable(client, reach, 0.80))
-        task._target_damage[100] = (10, time.monotonic() - 60.0, 20.0, 3)
-        self.assertFalse(task.fight_winnable(client, reach, 0.80))
-        task._target_damage[100] = (10, time.monotonic(), 20.0, 2)
-        self.assertTrue(task.fight_winnable(client, reach, 0.80))
-
     def test_two_treants_outpacing_heals_disengage_along_the_trail(self):
-        # Two treants beside her out-damage her heals at 90%: not
-        # winnable, so she disengages as before, but back along the
-        # cleared trail she came in on (east) rather than anywhere.
+        # Two treants beside her out-damage her heals at 90%: she
+        # disengages as before (healing-outpaced), but back along the
+        # cleared trail she came in on rather than anywhere.
         from . import tasks as tasks_module
 
-        client = self._winnable_client(
+        client = self._outpaced_client(
             (7, 8, "charred treant", 100, 100),
             (7, 9, "charred treant", 101, 100))
-        task = self._winnable_task()
+        task = self._outpaced_task()
         task.remember_engagement(client, 7, 8, 100)
-        task._target_damage[100] = (100, time.monotonic(), 15.0, 3)
         now = time.monotonic()
         # East, north-east and south-east all get two tiles clear of both;
         # the trail runs north-east.
@@ -11068,48 +11012,6 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
                       [action for action, _ in client.recorded])
         self.assertEqual(client.direct_moves, [(2, False)])
         self.assertNotIn(True, client.combat)
-
-    def test_winnable_stand_against_two_ends_when_it_is_winnable_no_more(self):
-        # A due pursued stand against two beside her is not declined for
-        # outpaced heals while she wins before the flee line; once she no
-        # longer would, the stand ends at once rather than at the 35%
-        # stand floor: with heals outpaced, or with none left to cast.
-        for no_heal in (False, True):
-            with self.subTest(no_heal=no_heal):
-                self._winnable_stand_ends(no_heal)
-
-    def _winnable_stand_ends(self, no_heal):
-        client = self._winnable_client(
-            (7, 8, "charred treant", 100, 5),
-            (8, 7, "charred treant", 101, 5))
-        task = self._winnable_task()
-        task.remember_engagement(client, 7, 8, 100)
-        now = time.monotonic()
-        task._target_damage[100] = (5, now, 20.0, 3)
-        task._target_damage[101] = (5, now, 20.0, 3)
-        task._pursued_retreats = task.PURSUIT_STAND_STEPS
-        task._pursuit_ids = {100, 101}
-        task._pursuit_last_at = now
-        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
-        actions = [action for action, _ in client.recorded]
-        self.assertIn("pursued-stand", actions)
-        self.assertNotIn("pursued-stand-declined", actions)
-        self.assertTrue(task._stand_latch and task._winnable_stand)
-        self.assertEqual(client.combat[-1], True)
-
-        # At 290 of 356 (81%, the two-threat flee line 80%), 5 HP to spare.
-        client.state.stats["hp"] = 290
-        if no_heal:
-            # Out of mana: no heal to cast, so none outpaced either.
-            client.state.stats["sp"] = 0
-            client.state.messages = [
-                entry for entry in client.state.messages
-                if "heals you" not in entry[-1]]
-        client.direct_moves.clear()
-        task._last_action = 0.0
-        self.assertTrue(asyncio.run(task.low_health_retreat(client)))
-        self.assertFalse(task._stand_latch)
-        self.assertEqual(len(client.direct_moves), 1)
 
     def test_seam_retreat_under_contact_keeps_combat_and_target(self):
         # Live at 16:15 a farm retreat stepped across the seam onto
@@ -11159,6 +11061,19 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIn((9, 8, engaged.target_id), client.targets)
         self.assertEqual(client.direct_moves, [])
 
+        # With the committed target two tiles off, she fights the one
+        # beside her rather than walking to it.
+        client.state.map.tiles.clear()
+        client.state.map.tile(10, 8).objects[3] = engaged
+        client.state.map.tile(8, 9).objects[3] = other
+        task._last_defense_action = 0.0
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.targets[-1], (8, 9, other.target_id))
+        self.assertEqual(client.direct_moves, [])
+        client.state.map.tiles.clear()
+        client.state.map.tile(9, 8).objects[3] = engaged
+        client.state.map.tile(8, 9).objects[3] = other
+
         # The walk's own tick, back on its way off the farm map, sends no
         # combat off either.
         task.navigation.status = TaskStatus.COMPLETE
@@ -11183,77 +11098,74 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIn("navigation-transit-hold-fire",
                       [action for action, _ in client.recorded])
 
-    def test_seam_fight_at_low_health_fights_back_between_heals(self):
-        # At 16:15 she was at about 130 of 356 with attackers beside her
-        # after the seam step. Under that contact she fights back between
-        # heals, combat on and target kept, as the farm does, rather than
-        # a combat-off step every tick; only critical with a step that
-        # gains distance does she step away.
-        client = self._combat_client()
-        client.state.map.tiles.clear()
-        client.state.map.world_x = client.state.map.world_y = 10
-        engaged = MapObject(
-            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=55)
-        other = MapObject(
-            3, 2, 0, 0, name="singed bear", target_id=101, target_hp=100)
-        client.state.map.tile(9, 8).objects[3] = engaged
-        client.state.map.tile(8, 9).objects[3] = other
-        client.state.stats.update(hp=130, maxhp=356, sp=60, maxsp=71)
-        client.state.inventory.append(Item(
-            43, item_type=c.TYPE_SPELL, name="minor healing",
-            extra={"cost": 4}))
-        client.state.target_id = engaged.target_id
-        client.state.combat = True
-        now = time.time()
-        client.state.messages = [
-            (now - 1.0, 2, "ff0000",
-             "charred treant hit you for 25 (-20) impact damage."),
-            (now - 0.5, 2, "ff0000",
-             "singed bear hit you for 22 (-21) cleave damage.")]
-        self._record_actions(client)
-        transit = MapNode(path="/test", width=25, height=25)
-        transit.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
-        graph = WorldGraph()
-        graph.nodes = {"/test": transit,
-                       "/farm": MapNode(path="/farm", width=24, height=24)}
-        farm = FarmTask(zone="/farm", target="charred treant")
-        farm.remember_engagement(client, 9, 8, engaged.target_id)
-        farm._seam_step_at = time.monotonic() - 1.0
-        task = NavigateThenTask(
-            graph, "/farm", farm, combat_approach=True,
-            safety=SafetyPolicy(heal_below=0.95, flee_below=0.80))
-        task._last_pull_target = engaged.target_id
-        task._last_moved_at = time.monotonic()
-        # Between heals: the last one just went out.
-        task.safety._last_heal = time.monotonic()
+    def test_seam_fight_below_the_pack_flee_line_steps_away_or_fights(self):
+        # Under contact after the farm retreat's seam step, below the
+        # farm's own pack flee line (80% with two near), she does what the
+        # farm's retreat does: a step that gains distance, combat off; with
+        # none she is cornered and fights the attacker beside her.
+        def setup(walkable):
+            client = self._combat_client()
+            client.state.map.tiles.clear()
+            client.state.map.world_x = client.state.map.world_y = 10
+            engaged = MapObject(
+                3, 1, 0, 0, name="charred treant", target_id=100,
+                target_hp=55)
+            other = MapObject(
+                3, 2, 0, 0, name="singed bear", target_id=101,
+                target_hp=40)
+            client.state.map.tile(9, 8).objects[3] = engaged
+            client.state.map.tile(8, 9).objects[3] = other
+            client.state.stats.update(hp=130, maxhp=356, sp=60, maxsp=71)
+            client.state.inventory.append(Item(
+                43, item_type=c.TYPE_SPELL, name="minor healing",
+                extra={"cost": 4}))
+            client.state.target_id = engaged.target_id
+            client.state.combat = True
+            now = time.time()
+            client.state.messages = [
+                (now - 1.0, 2, "ff0000",
+                 "charred treant hit you for 25 (-20) impact damage."),
+                (now - 0.5, 2, "ff0000",
+                 "singed bear hit you for 22 (-21) cleave damage.")]
+            self._record_actions(client)
+            transit = MapNode(path="/test", width=25, height=25)
+            transit.terrain = {
+                (x, y): 1 for x in range(25) for y in range(25)
+                if walkable(x, y)}
+            graph = WorldGraph()
+            graph.nodes = {"/test": transit,
+                           "/farm": MapNode(path="/farm", width=24,
+                                            height=24)}
+            farm = FarmTask(zone="/farm", target="charred treant",
+                            safety=SafetyPolicy(heal_below=0.95,
+                                                flee_below=0.60))
+            farm.remember_engagement(client, 9, 8, engaged.target_id)
+            farm._seam_step_at = time.monotonic() - 1.0
+            task = NavigateThenTask(
+                graph, "/farm", farm, combat_approach=True,
+                safety=farm.safety)
+            task._last_pull_target = engaged.target_id
+            task._last_moved_at = time.monotonic()
+            # Between heals: the last one just went out.
+            farm.safety._last_heal = time.monotonic()
+            return client, task, farm
 
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertEqual(client.direct_moves, [])
-        self.assertEqual(client.combat[-1], True)
-        self.assertIn((9, 8, engaged.target_id), client.targets)
-        self.assertEqual(farm._engaged_target[0], engaged.target_id)
-
-        # With the committed target two tiles off, she fights the one
-        # beside her instead of walking to it.
-        client.state.map.tiles.clear()
-        client.state.map.tile(10, 8).objects[3] = engaged
-        client.state.map.tile(8, 9).objects[3] = other
-        client.targets.clear()
-        task._last_defense_action = 0.0
-        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
-        self.assertEqual(client.targets[-1], (8, 9, other.target_id))
-        self.assertEqual(client.direct_moves, [])
-        client.state.map.tiles.clear()
-        client.state.map.tile(9, 8).objects[3] = engaged
-        client.state.map.tile(8, 9).objects[3] = other
-
-        # Critical, with a step that gains distance: she steps away.
-        client.state.stats["hp"] = 100
-        client.combat.clear()
-        task._last_defense_action = 0.0
+        # Open ground: a step that gains distance, combat off.
+        client, task, farm = setup(lambda x, y: True)
         self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
         self.assertEqual(len(client.direct_moves), 1)
         self.assertNotIn(True, client.combat)
+        self.assertNotIn("navigation-transit-hold-fire",
+                         [action for action, _ in client.recorded])
+
+        # Walled in (only her square and the attackers'): cornered, she
+        # fights her committed target beside her.
+        client, task, farm = setup(
+            lambda x, y: (x, y) in {(10, 10), (11, 10), (10, 11)})
+        self.assertTrue(asyncio.run(task._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertEqual(client.combat[-1], True)
+        self.assertEqual(client.targets[-1], (9, 8, 100))
 
     def test_no_corpse_probe_while_under_hostile_contact(self):
         # Live at 16:15 two corpse probes were queued while three attackers

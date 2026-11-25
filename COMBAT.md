@@ -1826,7 +1826,7 @@ never with a recall. On `world_16_74` a `farm-pack-split`
 from two treants turned into a pack of eight within 23 s of retreating:
 her steps ran past the other spawns, which acquire her within 3 tiles.
 `healing-outpaced` at 90% then made each retreat an `emergency-disengage`
-(combat off), and she ran a loop around the map with the treants
+(combat off), and her retreat ran a loop around the map with the treants
 following until she was cornered at a map edge. At 16:15 a retreat's seam
 step onto `world_17_74` put her under the walk's transit hold-fire
 (`navigation-transit-hold-fire`): combat off and target dropped with three
@@ -1870,60 +1870,52 @@ attackers on her, and two corpse probes were queued mid-fight.
   is cleared trail, kept `TRAIL_SECONDS` (5 minutes), at most
   `TRAIL_SQUARES` (200). The retreat prefers a trail step over another
   equally safe one.
-- **Fight on only when winnable** (`fight_winnable`). Above the tick's
-  flee threshold (`dynamic_flee`), outpaced or losing heals no longer
-  start a combat-off run when she wins the fight before that line: her
-  health above it must exceed, by `WINNABLE_MARGIN` (1.5 times), the
-  damage she takes meanwhile. That damage is the rate of the hits of the
-  last `WINNABLE_WINDOW_SECONDS` (8 s, counted from the first of them and
-  over at least 3 s) times the time to kill every attacker within 2 tiles
-  at her observed damage per swing (`observed_target_hp`, at least two
-  swings measured, the last within that window) and weapon speed. Heals
-  are left out, and an attacker without such a sample makes it unknown,
-  so not winnable. Then:
-  - healing outpaced starts no disengage: she fights on, healing as usual
-    (`winnable-fight`, once per 4 s);
-  - an out-healed hold runs no gain-only retreat. Its learning is kept:
-    the kinds still become out of her league;
-  - a due pursued stand against two beside her is not declined for
-    healing outpaced. That stand ends as soon as heals are outpaced, or
-    she has no heal left to cast, and the fight is no longer winnable (at
-    the flee line, say), not at the 35% stand floor.
+- **The disengage decisions are unchanged.** When she disengages is
+  still decided as on main: healing outpaced ([pull request
+  86](https://github.com/atrinik/playtester/pull/86)), heals losing
+  ([pull request 124](https://github.com/atrinik/playtester/pull/124)),
+  the flee thresholds and the pursued-stand rules. Only where she steps
+  changed. Two attempts to keep her fighting at high health, first on
+  authored monster speed and then on a kill-time estimate, kept
+  spawning edge cases and were dropped. Nearly every melee archetype is
+  authored as slow, and her damage samples count landed hits only.
+- **Seam steps come last, and the fight is not dropped across the
+  seam.** A seam step is still only a last resort (every farm step a
+  dead end). Off the farm map, the seam contact
+  (`NavigateThenTask._seam_retreat_contact`) holds while she is under
+  contact (an unresolved hit or miss in the last 3 s, or an attacker
+  beside her). It starts within `SEAM_RETREAT_FIGHT_SECONDS` (20 s) of
+  the farm's seam step, lasts as long as the contact does, and ends
+  `SEAM_RETREAT_FIGHT_CAP_SECONDS` (90 s) after the step at the latest.
+  While it holds:
+  - there is no transit hold-fire, so her engagement and target are not
+    dropped; the walk does not split the pack or turn it into a pack
+    avoidance, and its return to the farm map sends no combat off;
+  - with an attacker beside her, above the farm's own pack flee line
+    (`FarmTask.pack_flee`: the flee threshold, at least 80% with two
+    within 4 tiles, 94% with three), she fights it, combat on, healing
+    first. She fights the committed target if it is beside her, otherwise
+    the weakest attacker beside her;
+  - at or below that line she takes a step that gains distance, combat
+    off, as the farm's retreat would. With none she is cornered and
+    fights the attacker beside her.
 
-  Otherwise she disengages as before ([pull request
-  86](https://github.com/atrinik/playtester/pull/86): one charred treant
-  out-damaged chained minor healing from 89% to death), now by the
-  hazard- and trail-aware retreat above. Monster kind and authored speed
-  play no part: nearly every melee archetype is authored as slow, and
-  engaged monsters move several times faster than their base speed.
-- **Seam steps come last, and the fight goes on across the seam.** A seam
-  step is still only a last resort (every farm step a dead end). Off the
-  farm map, within `SEAM_RETREAT_FIGHT_SECONDS` (20 s) of the farm's seam
-  step, and for as long as contact lasts once it started
-  (`NavigateThenTask._seam_retreat_contact`), but never more than
-  `SEAM_RETREAT_FIGHT_CAP_SECONDS` (90 s) after the step, the walk's
-  defence does not
-  hold fire: combat stays on and the engaged target is kept. It neither
-  splits the pack there (the retreat already ran) nor turns a pack at
-  range into a pack avoidance, and fights the committed attacker. Its
-  return to the farm map does not turn combat off meanwhile. Below the
-  heal threshold, with an attacker beside her, she fights back between
-  heals as the farm does, instead of the safety hold's combat-off step:
-  the heal itself still goes first, and a heal waiting for her action
-  timer still holds. She fights the attacker beside her (the committed
-  one if it is, else the weakest), not one farther off. Only at or below
-  the 35% stand floor, with a step that gains distance, does she step
-  away, and then only by such a step. A care crossing still holds fire.
+  A care crossing still holds fire. At 16:15 this mainly means the
+  walk's hold-fire no longer drops her target or turns combat off above
+  the flee line. At about 130 of 356 with three attackers on her she was
+  below the line, so she would now step away, or fight cornered as she
+  did, rather than walk on with combat off. It would not by itself have
+  saved her.
 - **No corpse probe under contact.** `loot_nearby` does nothing while
   something is on her (`under_hostile_contact`), the walk's corpse
   detour waits too, and a target that vanishes under contact without a
   kill queues no probe (`corpse-probe-skip ... under hostile contact`).
 
 Accepted limits: a spawn out of view whose resident is dead is avoided
-needlessly; the winnability judgement leaves heals out and needs a damage
-sample for each attacker, so it errs towards disengaging; the trail is
-per farm task and starts again on a new leg; transit hold-fire after
-anything other than the farm's own seam step is unchanged.
+needlessly; she still disengages at high health when heals are outpaced,
+now along safer steps; the trail is per farm task and starts again on a
+new leg; transit hold-fire after anything other than the farm's own seam
+step is unchanged.
 
 ## Approach danger: known limitations
 
