@@ -139,10 +139,6 @@ class NamedSpawn:
     level: int = 0
     peaceful: bool = False
     aggro_radius: int = 0
-    # The fastest candidate's authored movement speed (archetype ``speed``,
-    # without its sign); 0 when unknown. A charred treant moves at 0.048,
-    # Sera at about 0.8 (FarmTask.slow_melee).
-    speed: float = 0.0
 
     def available_at(self, minute: float) -> bool:
         if self.start_minute is None or self.end_minute is None:
@@ -902,7 +898,6 @@ class WorldGraph:
                          obj_type == "83")):
                     candidates = []
                     aggro_radii = []
-                    speeds = []
                     for sibling in parent["children"]:
                         sibling_base = archetypes.get(
                             sibling["arch"], {}).get("attrs", {})
@@ -919,12 +914,6 @@ class WorldGraph:
                         aggro_radii.append(int(one(
                             sibling["attrs"], "item_power",
                             sibling_base.get("item_power")) or 0))
-                        try:
-                            speeds.append(abs(float(one(
-                                sibling["attrs"], "speed",
-                                sibling_base.get("speed")) or 0)))
-                        except (TypeError, ValueError):
-                            speeds.append(0.0)
                     schedule = one(
                         attrs, "spawn_time", base.get("spawn_time")) or ""
                     schedule_match = re.fullmatch(
@@ -940,10 +929,7 @@ class WorldGraph:
                         tuple(dict.fromkeys(candidates)),
                         start_minute, end_minute,
                         int(one(attrs, "level", base.get("level")) or 0),
-                        authored_peaceful, max(aggro_radii, default=0),
-                        # One candidate of unknown speed makes it unknown.
-                        (0.0 if not speeds or min(speeds) <= 0 else
-                         max(speeds)))
+                        authored_peaceful, max(aggro_radii, default=0))
                     if spawn not in self.named_spawns[source]:
                         self.named_spawns[source].append(spawn)
                 destination = one(attrs, "slaying", base.get("slaying"))
@@ -5703,7 +5689,7 @@ class NavigateThenTask(BotTask):
         if (safe and nearest is not None and nearest[0] > 2 and
                 len(pull_pack) >= 2 and
                 (pack_offensive is None or hold_fire) and
-                not self._cornered_target):
+                not self._cornered_target and not seam_contact):
             # A cornered fight at range is not turned into a pack avoidance
             # (combat off, replan) between its own ticks.
             if await self._bypass_pack_blocked_exit(client):
@@ -5784,6 +5770,18 @@ class NavigateThenTask(BotTask):
         # below would restart the timer it waits for.
         safety_hold = not safe and (not starving_without_food(client) or
                                     heal_waiting(client))
+        if (safety_hold and seam_contact and not heal_waiting(client) and
+                any(threat[0] <= 1 for threat in nearby) and
+                not (ratio <= FarmTask.STAND_HEALTH_FLOOR and
+                     await self._retreat_step(client, nearby, gain_only=True,
+                                              probe=True))):
+            # Under contact after the farm retreat's seam step, with an
+            # attacker beside her: she fights back between heals, as the
+            # farm does (the heal itself went out above, or waits for its
+            # cooldown), rather than a combat-off step every tick. Live at
+            # 16:15 she was at 130/356. Only critical, with a step that
+            # gains distance, does she still step away.
+            safety_hold = False
         split = (overwhelmed and not hold_fire and not safety_hold and
                  not seam_contact)
         cornered = None
@@ -9451,17 +9449,6 @@ class FarmCircuitTask(BotTask):
                         aggressive_detection_ranges[semantic] = max(
                             aggressive_detection_ranges.get(semantic, 0),
                             spawn.aggro_radius)
-        # Authored movement speeds of the map's residents, for the farm's
-        # slow-melee rule (FarmTask.slow_melee).
-        monster_speeds: dict[str, float] = {}
-        for spawn in residents:
-            if spawn.speed <= 0:
-                continue
-            for identity in (spawn.named, *spawn.candidates):
-                semantic = self.graph._semantic_name(identity)
-                if semantic:
-                    monster_speeds[semantic] = max(
-                        monster_speeds.get(semantic, 0.0), spawn.speed)
         farm = FarmTask(
             zone=zone, target=target, combat_skill=self.combat_skill,
             combat_spell=self.combat_spell, patrol=patrol,
@@ -9477,7 +9464,6 @@ class FarmCircuitTask(BotTask):
             # "Retreat tactics").
             resident_spawns=[(spawn.x, spawn.y, spawn.pull_clearance_radius)
                              for spawn in residents],
-            monster_speeds=monster_speeds,
             allow_launchers=(
                 not self._auto_combat_build and not bool(self.combat_spell)))
         farm._lore_book_attempts = self._lore_book_attempts
