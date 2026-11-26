@@ -22098,7 +22098,7 @@ class FarmAnalyzerTests(unittest.TestCase):
             for flag, value in (("--combat-style", "melee"),
                                 ("--healing-per-second", "5.1"),
                                 ("--character-speed", "0.8"),
-                                ("--top", str(analyzer.ENCOUNTER_TOP))):
+                                ("--top", "5000")):
                 self.assertEqual(styled[styled.index(flag) + 1], value, flag)
             self.assertEqual(analyzer.profile.describe()["healing_per_second"], 5.1)
             # The ranking run passes no style, so the fields she ranks by
@@ -22116,9 +22116,29 @@ class FarmAnalyzerTests(unittest.TestCase):
             self.assertFalse(analyzer.running)
             self.assertEqual(analyzer.ranking("xp")[0]["name"], "grind")
             self.assertTrue(analyzer.snapshot("xp")["encounter_running"])
-            await analyzer.close()
-            self.assertFalse(analyzer.encounter_running)
+            # A ranking that falls due stops it: the two never run at once,
+            # and nothing is attached to the new ranking.
+            hung, generation = analyzer._encounter_task, analyzer.report_generation
+            analyzer._last_attempt_at -= analyzer.REFRESH_SECONDS
+            analyzer.reported_at -= analyzer.REFRESH_SECONDS
+            self.assertTrue(analyzer.poll(client))
+            self.assertTrue(analyzer.running)
+            await analyzer._task
+            with self.assertRaises(asyncio.CancelledError):
+                await hung
+            self.assertTrue(hung.cancelled())
+            self.assertEqual(analyzer.report_generation, generation + 1)
+            self.assertFalse(any(spot.get("encounter_applied")
+                                 for spot in analyzer._spots(analyzer.report)))
+            self.assertTrue(analyzer.encounter_due(analyzer.profile))
+            grind = analyzer.ranking("xp")[0]
             (package / "HANG").unlink()
+            # An encounter run that outlives its ranking attaches nothing.
+            await analyzer._run_encounters(analyzer.profile, generation)
+            self.assertFalse(any(spot.get("encounter_applied")
+                                 for spot in analyzer._spots(analyzer.report)))
+            self.assertEqual(analyzer.encounter_generation, -1)
+            self.assertTrue(analyzer.encounter_due(analyzer.profile))
             # Then the encounter run merges its fields onto her spots.
             analyzer._encounter_attempt_at = 0.0
             self.assertTrue(analyzer.poll(client))

@@ -2016,8 +2016,10 @@ unchanged.
   onto the ranking's spots of the same identity (`spot_key`: the path,
   which for a circuit names only its maps' basenames, and the map paths)
   and stamped with its `schema_version` (`analyzer_schema_version`); an
-  identity it rates two ways is skipped. A ranking replaced meanwhile drops
-  the result. A failed encounter run is logged, shown on the Farming tab
+  identity it rates two ways is skipped. A ranking that falls due kills a
+  running encounter run first (`_cancel_encounters`), so the two never
+  share her host's cores, and a result that outlives its ranking is
+  dropped. A failed encounter run is logged, shown on the Farming tab
   and retried after `RETRY_SECONDS` (15 minutes). Each run takes about 15
   to 30 seconds.
 - **Warn only.** `farm-spot-selected` stays as on main. The farm circuit

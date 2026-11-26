@@ -941,6 +941,9 @@ class FarmAnalyzer:
         origin = self.approach_origin(client.state)
         if not self.due(profile, origin):
             return self._poll_encounters(profile)
+        # A new ranking would drop an encounter run's result anyway: stop it
+        # so the two never share her host's cores.
+        self._cancel_encounters()
         self._last_attempt_at = self.clock()
         # Report the run as soon as it is scheduled, not when it first runs.
         self.status = "running"
@@ -973,6 +976,14 @@ class FarmAnalyzer:
             return True
         return (elapsed >= self.MIN_INTERVAL_SECONDS and
                 profile.encounters_differ(self.encounter_profile))
+
+    def _cancel_encounters(self) -> None:
+        """Kill a running encounter run's process and cancel its task."""
+        process = self._encounter_process
+        if process is not None and process.returncode is None:
+            process.kill()
+        if self.encounter_running:
+            self._encounter_task.cancel()
 
     def _poll_encounters(self, profile: CombatProfile) -> bool:
         if not self.encounter_due(profile):

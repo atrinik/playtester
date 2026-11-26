@@ -741,7 +741,7 @@ her measured healing (`--healing-per-second`, below) and her displayed
 speed (`--character-speed`), and its encounter fields (`encounter_safety`,
 `expected_pack`, `worst_pack`, `encounter_reasons` and the rest) are copied
 onto the ranked spots with the same path and map paths. Her ranking never
-waits for it. It does not run until one heal has landed: with no healing
+waits for it, and a ranking that falls due stops it first. It does not run until one heal has landed: with no healing
 every pull would rate as unhealed. A new ranking, another style or a 15%
 change in her healing re-runs only the encounter run; a failed one keeps the
 ranking, shows on the Farming tab and is retried after 15 minutes. Each run
