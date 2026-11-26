@@ -39391,6 +39391,9 @@ class PlanningOffLoopTests(unittest.TestCase):
             self.assertFalse(task.planning)
             self.assertEqual(task.route[-1].destination,
                              "/shattered_islands/world_8_78")
+            # Her trip sees the route for one tick before she walks it.
+            self.assertEqual(moves(), [])
+            asyncio.run(task.tick(client))
             self.assertTrue(moves())
             # A replan runs there too, and stops the path she was walking.
             release.clear()

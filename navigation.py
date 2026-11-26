@@ -2913,7 +2913,7 @@ class NavigateTask(BotTask):
 
     def _drop_plan(self) -> None:
         """Drop the route plan under way (it never runs, or stops early)."""
-        self._planning = ""
+        self._planning, self._planning_stop = "", False
         if self._route_plans is not None:
             self._route_plans.forget("route")
 
@@ -4737,8 +4737,9 @@ class NavigateTask(BotTask):
                 await client.clear_actions()
                 self._issued_goal = self._issued_click = None
             self._replan(client)
-            if self._planning or self.status != TaskStatus.RUNNING:
-                return
+            # Collected or not, she takes no step on this tick: her trip
+            # (a route-death hold) sees the new route before she walks it.
+            return
         # Her route events: a crossing since the last tick, the edge ahead.
         route_events.note_tick(client, self)
         if self.care is not None:

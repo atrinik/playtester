@@ -604,7 +604,8 @@ starvations.
   collected, what the plan sets on the trip (`PLAN_STATE`: owner walls,
   the dialogue offer, care crossings, the learned plan, threat maps, the
   fallback flags) is copied back, its recorded actions are replayed and
-  its shadow report is made on the loop; its error fails or waits as it
+  its shadow report is made on the loop, and she takes her first step on
+  the next tick, so her trip (a route-death hold) sees the route first; its error fails or waits as it
   did on the loop. An edge excluded meanwhile drops the plan, which is
   planned again with it. Essential trips plan at `PRIORITY_HEAL`. A trip
   waits behind a ranking already running on the worker (the worker runs
