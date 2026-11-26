@@ -31,6 +31,7 @@ from .equipment import (MAGIC_HIDDEN_TYPES, BaseStats, GearScorer, base_to_json,
                         gear_style, parse_description)
 from . import route_shadow, terrain
 from . import owner_watch
+from . import storage
 from .observations import is_player, plain
 from .model import STARTER_APARTMENT, Item, MapObject
 from .hunger import food_obsolete
@@ -8839,15 +8840,30 @@ class JunkPolicy:
     # (InventoryPolicy.sellable_junk). Off for an operator's targeted sale,
     # which sells only what its patterns or tags name.
     sell_identified_junk: bool = False
+    # Sold although preserve() would keep them: cursed or damned potions,
+    # spare empty recall wands, duplicate plain containers
+    # (FarmCircuitTask._identified_junk). Still never a ring, an amulet or
+    # anything unidentified.
+    sell_tags: frozenset[int] = frozenset()
+    # Never sold, whatever else matches: the best item of some build
+    # (storage.best_sets).
+    keep_tags: frozenset[int] = frozenset()
 
     def junk(self, item: Item) -> bool:
         name = item.name.casefold()
-        if item.flags & (c.ITEM_APPLIED | c.ITEM_LOCKED):
+        if item.flags & c.ITEM_APPLIED:
+            return False
+        # A locked item only when named for sale: SellJunkTask unlocks it.
+        if item.flags & c.ITEM_LOCKED and item.tag not in self.sell_tags:
             return False
         if not InventoryPolicy().identified(item):
             return False
+        if item.tag in self.keep_tags or item.item_type in (c.TYPE_RING, c.TYPE_AMULET):
+            return False
         if any(re.search(pattern, name) for pattern in self.keep_patterns):
             return False
+        if item.tag in self.sell_tags:
+            return True
         if self.sell_identified_junk and InventoryPolicy().sellable_junk(item):
             return True
         if InventoryPolicy().preserve(item):
@@ -8868,6 +8884,11 @@ class SellJunkTask(BotTask):
         self._last_action = 0.0
         self._pending: int | None = None
         self._feedback_start = 0
+        # The item whose lock she toggled off, and when.
+        self._unlocking: tuple[int, float] | None = None
+
+    # A lock toggle not shown within this long leaves that item unsold.
+    UNLOCK_SECONDS = 3.0
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -8888,7 +8909,18 @@ class SellJunkTask(BotTask):
             return
         if time.monotonic() - self._last_action < 0.6:
             return
-        item = client.state.items[self._queue.pop(0)]
+        item = client.state.items[self._queue[0]]
+        if item.flags & c.ITEM_LOCKED:
+            # Only an item the policy names for sale is queued locked
+            # (JunkPolicy.sell_tags): unlock it first.
+            if self._unlocking is None or self._unlocking[0] != item.tag:
+                self._unlocking = (item.tag, time.monotonic())
+                await client.lock_item(item.tag)
+                self._last_action = time.monotonic()
+            elif time.monotonic() - self._unlocking[1] > self.UNLOCK_SECONDS:
+                self._queue.pop(0)
+            return
+        self._queue.pop(0)
         if item.location != client.state.player_tag:
             self.fail(f"{item.name} is no longer in inventory")
             return
@@ -9240,12 +9272,18 @@ class DepositItemsTask(BotTask):
     def __init__(self, container_name: str, patterns: tuple[str, ...] = (),
                  *, unidentified_only: bool = False,
                  valuable_only: bool = False,
+                 predicate: Callable[[Item], bool] | None = None,
+                 indexer: "storage.ChestIndexer | None" = None,
                  then_retrieve: "RetrieveItemsTask | None" = None):
         super().__init__(f"deposit:{container_name}")
         self.container_name = container_name.casefold()
         self.patterns = tuple(re.compile(pattern, re.I) for pattern in patterns)
         self.unidentified_only = unidentified_only
         self.valuable_only = valuable_only
+        # Items matching it are deposited too (the apartment's storable set).
+        self.predicate = predicate
+        # Keeps her apartment index current (storage.ChestIndexer).
+        self.indexer = indexer
         # Run in the same visit once everything is deposited.
         self.then_retrieve = then_retrieve
         self._opened = False
@@ -9271,6 +9309,8 @@ class DepositItemsTask(BotTask):
             await client.apply(container.tag)
             self._opened = True
             return
+        if self.indexer is not None:
+            self.indexer.observe(client, container)
         for entry in client.state.messages_since(self._feedback_start):
             match = self.WONT_FIT.search(entry[3]) if len(entry) > 3 else None
             if match and self.container_name in match.group(1).casefold():
@@ -9282,6 +9322,7 @@ class DepositItemsTask(BotTask):
             if (self.unidentified_only and
                 policy.apartment_unidentified(item)) or
                (self.valuable_only and policy.apartment_valuable(item)) or
+               (self.predicate is not None and self.predicate(item)) or
                (not self.unidentified_only and not self.valuable_only and
                 any(pattern.search(item.name) for pattern in self.patterns))
         ]
@@ -9300,6 +9341,8 @@ class DepositItemsTask(BotTask):
         if fresh:
             for item in fresh[:5]:
                 self._sent[item.tag] = now
+                if self.indexer is not None:
+                    self.indexer.deposit_sent(item)
                 await client.move_item(container.tag, item.tag, item.quantity)
             return
         if any(now - self._sent[item.tag] < self.MOVE_CONFIRM_SECONDS
@@ -9340,6 +9383,8 @@ class RetrieveItemsTask(BotTask):
     def __init__(self, container_name: str, patterns: tuple[str, ...] = (), *,
                  require_match: bool = False,
                  predicate: Callable[[Item], bool] | None = None,
+                 select: Callable[[AtrinikClient, list[Item]], set[int]] | None = None,
+                 indexer: "storage.ChestIndexer | None" = None,
                  max_weight_ratio: float | None = None):
         super().__init__(f"retrieve:{container_name}")
         self.container_name = container_name.casefold()
@@ -9347,6 +9392,11 @@ class RetrieveItemsTask(BotTask):
         self.require_match = bool(require_match)
         # Items matching either a name pattern or this predicate are taken.
         self.predicate = predicate
+        # Or chosen from all the container holds at once (the tags to take):
+        # the best of her active build's set, say.
+        self.select = select
+        # Keeps her apartment index current (storage.ChestIndexer).
+        self.indexer = indexer
         # Stop taking more once carrying this share of the weight limit.
         self.max_weight_ratio = max_weight_ratio
         # Tags moved out of the container (requested; the server confirms).
@@ -9418,11 +9468,16 @@ class RetrieveItemsTask(BotTask):
             return
         if now - self._opened_at < 0.5:
             return
+        if self.indexer is not None:
+            self.indexer.observe(client, container)
+        contents = [item for tag in client.state.inventories.get(container.tag, [])
+                    if (item := client.state.items.get(tag)) is not None]
+        selected = self.select(client, contents) if self.select is not None else set()
         items = [
-            item for tag in client.state.inventories.get(container.tag, [])
-            if (item := client.state.items.get(tag)) is not None and
-            (any(pattern.search(item.name) for pattern in self.patterns) or
-             (self.predicate is not None and self.predicate(item)))
+            item for item in contents
+            if (any(pattern.search(item.name) for pattern in self.patterns) or
+                (self.predicate is not None and self.predicate(item)) or
+                item.tag in selected)
         ]
         limit = float(client.state.stats.get("weight_limit", 0) or 0)
         if self.max_weight_ratio is not None and limit > 0:
@@ -9459,6 +9514,8 @@ class RetrieveItemsTask(BotTask):
         for item in items[:5]:
             self.retrieved.add(item.tag)
             self._sent_at.setdefault(item.tag, now)
+            if self.indexer is not None:
+                self.indexer.retrieval_sent(item)
             await client.move_item(
                 client.state.player_tag, item.tag, item.quantity)
 

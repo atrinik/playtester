@@ -442,6 +442,54 @@ carries: what she wears and the best candidate, with both scores, the
 effective stats, per-stat differences and notes such as "+2 on a cape adds
 no AC", and the recent shadow log.
 
+## Inventory and home storage
+
+She carries only her active set (`storage.py`, `FarmCircuitTask`): worn
+gear and her active build's best gear, heals, recall (one recall wand),
+identify devices, the mana crystal, quest items, keys, money and other
+consumables. The rest goes to her apartment chest, and some is sold:
+
+- **Sets per build.** `GearScorer` ranks everything she owns once per build
+  (melee, caster, bow): the best item per slot (two rings) is that build's
+  set. The other builds' sets and other spare gear go home. A storage trip
+  also takes back out her active build's best stored items that beat what
+  she wears by the equip loop's margin.
+- **The index.** The chest's contents are not in the dashboard state and
+  are sent only while she has it open, so her character memory keeps
+  what it holds (`GameState.apartment_storage`): each item she deposits or
+  retrieves, replaced by the real contents whenever she opens the chest.
+  Each stored gear row names the sets it belongs to (`melee:weapon`,
+  `caster:ring`), for a later build change.
+- **Trips.** A storage trip leaves at once for a valuable, else once 8
+  items wait or she carries more than half her weight limit. A junk sale
+  likewise waits for 8 items, a cure shortfall or 85% of her limit.
+- **Containers.** The key ring stays. A bag of holding is known by its "of
+  ... holding" title or its examine ("It decreases the weight of items
+  inside by N%"); bags rank by the server's multiplier (minor 0.85 down to
+  weightless 0.30). She carries her best bag only while what she carries
+  would weigh more than half her limit without it (it goes home again
+  below 40%), and puts gems and the ammunition her build does not shoot
+  in it, never coins or heals. Other containers go home; a duplicate plain
+  container (same name, empty weight) is sold.
+- **Sold.** The worst duplicates (gear the equip loop would never wear
+  that is no build's best), cursed or damned potions, spare recall wands
+  known to be empty, identified books and worthless-plus items. Never a
+  ring, an amulet, anything unidentified, or the best item of any build.
+- **Recall wands.** She keeps one: one not known empty, else the most
+  charges, else the highest level. An empty kept wand is recharged with a
+  scroll of recharge (recall shopping buys one). A spare that may still
+  hold charges goes home.
+- **Identify-all.** Any unknown gear, carried or stored, sends her to the
+  cheapest smith she can reach once her wallet pays him plus a 1,000
+  copper reserve: Kulgar (world_8_79, 1,450), John Markor (world_5_58,
+  2,200) or Conbran Strongfist (world_0_69, 3,200); a smith she cannot
+  reach is passed over for 6 hours. Stored unknown gear is taken out of
+  the chest first, and the next storage trip puts it back. Unknown gear
+  stays carried while identify-all is affordable, and goes home while it
+  is not. She never wears an unidentified item. While she cannot pay, the
+  dashboard shows `identify-unfunded` ("Identify needs N copper ...; drop
+  gold to help"): the owner may drop gold at her feet (operator assist).
+
 ## Fights by terrain
 
 She records where she stood in each fight (`terrain.py`, `memory.py`; the

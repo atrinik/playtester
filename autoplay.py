@@ -16,7 +16,7 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          NavigateThenTask, RecoveryTask,
                          cure_funding_farm, cure_funding_farm_alerts,
                          cure_funding_farm_home,
-                         has_working_recall, heal_restock_alerts,
+                         has_working_recall, heal_restock_alerts, identify_alerts,
                          recall_alerts, route_death_origin,
                          settle_cure_funding_farm,
                          WorldGraph, analyzer_farm_selection,
@@ -569,17 +569,18 @@ class AutoplayTask(BotTask):
         """Dashboard alerts while farming is unsafe, from live state, and
         whether she is waiting at her savebed on an alerted blocker (then
         the stuck alert would say nothing new). Also, in any phase, the
-        recall note (recall_alerts) and the heal-restock note
-        (heal_restock_alerts), neither of which blocks farming, and while
-        she farms to fund her cure, its cure-unfunded warning
-        (cure_funding_farm_alerts).
+        recall note (recall_alerts), the heal-restock note
+        (heal_restock_alerts) and the identify note (identify_alerts), none
+        of which blocks farming, and while she farms to fund her cure, its
+        cure-unfunded warning (cure_funding_farm_alerts).
 
         The farming-suspended warning follows the live reason in any phase;
         the specific blockers come from the recovery phase.
         """
         if self.status != TaskStatus.RUNNING:
             return [], False
-        recall = recall_alerts(client) + heal_restock_alerts(client)
+        recall = (recall_alerts(client) + heal_restock_alerts(client) +
+                  identify_alerts(client))
         reason = farming_unsafe_reason(client)
         if not reason:
             # Farming to fund the cure: its cure-unfunded warning, critical

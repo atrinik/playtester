@@ -36,6 +36,7 @@ from .owner_watch import OwnerWatchRecorder, name_digest
 from .owner_watch import capture as owner_watch_capture
 from .terrain import FightRecorder
 from . import route_events, route_shadow
+from . import storage
 from .self_improvement import PLAYER_CHANNELS, from_server
 from .trends import Trends
 from .protocol import Cursor, Event, Packet, ProtocolError, decompress_frame, read_frame
@@ -587,6 +588,8 @@ class AtrinikClient:
             except (TypeError, ValueError):
                 self.state.heal_restock_note = ""
                 self.state.heal_restock_retry_until = 0.0
+            self.state.apartment_storage = storage.load_index(
+                record.get("apartment_storage", []))
             try:
                 self.state.paid_restoration_retry_until = max(
                     0.0, float(record.get(
@@ -727,6 +730,7 @@ class AtrinikClient:
             self.state.last_utility_shop_check_at = 0.0
             self.state.heal_restock_note = ""
             self.state.heal_restock_retry_until = 0.0
+            self.state.apartment_storage = []
             self.state.paid_restoration_retry_until = 0.0
             self.state.cure_funding_farm_since = 0.0
             self.state.cure_funding_farm_deaths = 0
@@ -1045,6 +1049,16 @@ class AtrinikClient:
         memory["heal_restock_note"] = self.state.heal_restock_note
         memory["heal_restock_retry_until"] = (
             self.state.heal_restock_retry_until)
+        self._persist_character_memory()
+
+    def set_apartment_storage(self, rows: list[dict]) -> None:
+        """Persist what her apartment chest holds (storage.py)."""
+        self.state.apartment_storage = storage.load_index(rows)
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})[
+            "apartment_storage"] = self.state.apartment_storage
         self._persist_character_memory()
 
     def defer_paid_restoration(self, until: float) -> None:

@@ -995,7 +995,9 @@ class GearExaminer:
     @staticmethod
     def wanted(item: Item, policy: Any) -> bool:
         examined = item.extra.get("gear_examine")
-        return (item.item_type in GEAR_LABELS and
+        # Containers too: examine shows a bag of holding's reduction
+        # (storage.read_bag_examine), even under a name she gave it.
+        return ((item.item_type in GEAR_LABELS or item.item_type == c.TYPE_CONTAINER) and
                 item.item_type != c.TYPE_LIGHT_APPLY and
                 policy.identified(item) and
                 not item.flags & c.ITEM_UNPAID and
@@ -1017,12 +1019,19 @@ class GearExaminer:
         prefix = f"That is {name}"
         # Only lines after this examine was sent; only server game lines,
         # never one with a player's name link (messages_since drops those).
-        for entry in client.state.messages_since(start):
+        entries = list(client.state.messages_since(start))
+        for index, entry in enumerate(entries):
             if len(entry) < 4 or entry[1] != c.CHAT_TYPE_GAME:
                 continue
             text = str(entry[3]).strip()
             if not _answers(text, name):
                 continue
+            if item is not None and item.item_type == c.TYPE_CONTAINER:
+                # A container's weight lines follow its name line.
+                from .storage import read_bag_examine
+                for line in entries[index + 1:index + 6]:
+                    if len(line) >= 4 and line[1] == c.CHAT_TYPE_GAME:
+                        read_bag_examine(item, str(line[3]))
             text = re.sub(r"^That is an? ", "That is ", text)
             rest = text[len(prefix):]
             if item is not None:

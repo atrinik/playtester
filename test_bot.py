@@ -15633,10 +15633,10 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
 
         client = self._combat_client()
         client.state.stats.update({"level": 34, "exp": 30_000_000, "food": 500})
-        ring = Item(81, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
-                    quality=90, condition=100, name="ring of the ghost")
-        client.state.inventory.append(ring)
-        client.state.items[ring.tag] = ring
+        gem = Item(81, flags=c.ITEM_MAGICAL, item_type=c.TYPE_TRINKET,
+                   quality=90, condition=100, name="silver idol")
+        client.state.inventory.append(gem)
+        client.state.items[gem.tag] = gem
         client.farm_analyzer = StubAnalyzer({"xp": [analyzer_spot(
             "Eld Woods trees", ["/shattered_islands/world_14_79"],
             ["evil treant L13×2", "quickwood L11"])]})
@@ -16719,12 +16719,12 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
     def test_economy_trips_route_strictly_and_storage_brings_back_sellable_stock(self):
         circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
         client = self._depleted_client(100_000)
-        for trip in (circuit._new_apartment_storage(), circuit._new_junk_sale(client),
-                     circuit._new_mass_identification(), circuit._new_bank_sync(),
+        for trip in (circuit._new_apartment_storage(client), circuit._new_junk_sale(client),
+                     circuit._new_mass_identification(client), circuit._new_bank_sync(),
                      circuit._new_bank_deposit(client), circuit._new_cure_funding(client),
                      circuit._new_depletion_service(client)):
             self.assertTrue(trip.navigation.strict_safety, trip.name)
-        follow = circuit._new_apartment_storage().task.then_retrieve
+        follow = circuit._new_apartment_storage(client).task.then_retrieve
         self.assertIsInstance(follow, RetrieveItemsTask)
         self.assertEqual(follow.max_weight_ratio, circuit.STOCK_RETRIEVAL_WEIGHT)
         book = Item(1, item_type=c.TYPE_BOOK, quality=80, name="book of tales")
@@ -17006,8 +17006,9 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertTrue(circuit._cure_identify_due(client))
         self.assertTrue(circuit._needs_mass_identification(client))
         self.assertFalse(circuit._needs_apartment_storage(client))
-        self.assertTrue(circuit._new_mass_identification().navigation.strict_safety)
-        self.assertFalse(circuit._new_apartment_storage(keep_unknown=True).task.unidentified_only)
+        self.assertTrue(circuit._new_mass_identification(client).navigation.strict_safety)
+        kept = circuit._new_apartment_storage(client, keep_unknown=True).task
+        self.assertFalse(any(kept.predicate(client.state.items[tag]) for tag in range(40, 61)))
         self.assertFalse(circuit._needs_cure_funding(client))
         # Unaffordable: nothing is due and the next chest trip may run.
         client.state.bank_balance = 1_000
@@ -17568,26 +17569,23 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         asyncio.run(task.tick(client))
         self.assertEqual(task.status, TaskStatus.COMPLETE)
 
-    def test_farm_circuit_batches_unknown_gear_at_economical_smith(self):
+    def test_farm_circuit_identifies_unknown_gear_at_economical_smith(self):
         client = type("Client", (), {})()
         client.state = GameState(phase="playing", player_tag=7)
         client.state.bank_balance = 3_000
         client.state.bank_balance_known = True
-        for tag in range(19):
-            client.state.place_item(Item(
-                900 + tag, item_type=c.TYPE_WEAPON, quality=255,
-                name=f"unknown weapon {tag}", weight=3.5), 7)
         client.state.stats["weight_limit"] = 100
         graph = WorldGraph()
         graph.nodes["/shattered_islands/world_8_79"] = MapNode(
             "/shattered_islands/world_8_79", width=24, height=24)
         circuit = FarmCircuitTask(graph, [("/farm", "rat")])
         self.assertFalse(circuit._needs_mass_identification(client))
+        # One unknown piece of gear is enough (owner decision, 2026-11-26).
         client.state.place_item(Item(
             999, item_type=c.TYPE_WEAPON, quality=255,
             name="unknown final weapon", weight=3.5), 7)
         self.assertTrue(circuit._needs_mass_identification(client))
-        service = circuit._new_mass_identification()
+        service = circuit._new_mass_identification(client)
         self.assertEqual(service.navigation.destination,
                          "/shattered_islands/world_8_79")
         self.assertEqual(service.navigation.destination_xy, (4, 9))
@@ -17613,6 +17611,9 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state.place_item(Item(
             91, item_type=c.TYPE_WAND, quality=80, condition=80,
             name="wand of word of recall (lvl 12)"), 7)
+        # Any unknown gear is identified once she can pay for it.
+        self.assertTrue(circuit._needs_mass_identification(client))
+        client.state.bank_balance = 2_449
         self.assertFalse(circuit._needs_mass_identification(client))
 
     def test_farm_circuit_sells_only_identified_common_junk_batches(self):
@@ -17634,12 +17635,12 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(
             {item.tag for item in junk},
             set(range(800, 820)))
+        # A batch of STORE_BATCH or more is sold without carrying pressure.
+        self.assertTrue(circuit._needs_junk_sale(client))
+        for tag in range(800 + circuit.STORE_BATCH - 1, 820):
+            client.state.remove_item(tag)
         self.assertFalse(circuit._needs_junk_sale(client))
-        client.state.items[800].weight = 4.0
-        for tag in range(801, 820):
-            client.state.items[tag].weight = 3.5
-        self.assertFalse(circuit._needs_junk_sale(client))
-        client.state.items[800].weight = 19.0
+        client.state.items[800].weight = 86.0
         self.assertTrue(circuit._needs_junk_sale(client))
         sale = circuit._new_junk_sale(client)
         self.assertEqual(sale.navigation.destination,
@@ -17903,33 +17904,37 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client.state = GameState(phase="playing", player_tag=7)
         client.state.stats["weight_limit"] = 100
         for tag, name in enumerate((
-                "skinned lychee", "wholemeal bread", "tournedos steak",
-                "pine arrow"), 680):
-            item_type = (c.TYPE_ARROW if "arrow" in name else c.TYPE_FOOD)
+                "skinned lychee", "wholemeal bread", "tournedos steak"), 680):
             client.state.place_item(Item(
-                tag, item_type=item_type, quality=255, name=name), 7)
+                tag, item_type=c.TYPE_FOOD, quality=255, name=name), 7)
         circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        # Unknown food is no reason for a trip.
         self.assertFalse(circuit._needs_apartment_storage(client))
-        for tag in range(19):
+        for tag in range(circuit.STORE_BATCH - 1):
             client.state.place_item(Item(
                 700 + tag, item_type=c.TYPE_WEAPON, quality=255,
                 name=f"unknown weapon {tag}"), 7)
-        graph = WorldGraph()
-        graph.nodes[
-            "/shattered_islands/strakewood_island/apartments/apartment_cheap"
-        ] = MapNode("apartment", width=6, height=6)
-        circuit = FarmCircuitTask(graph, [("/farm", "rat")])
+        # Unknown gear she cannot pay to identify goes home in batches.
         self.assertFalse(circuit._needs_apartment_storage(client))
         client.state.place_item(Item(
             799, item_type=c.TYPE_WEAPON, quality=255,
             name="unknown final weapon"), 7)
-        self.assertFalse(circuit._needs_apartment_storage(client))
-        client.state.items[799].weight = 86.0
         self.assertTrue(circuit._needs_apartment_storage(client))
-        storage = circuit._new_apartment_storage()
-        self.assertEqual(storage.navigation.destination_xy, (1, 3))
-        self.assertTrue(storage.task.unidentified_only)
-        self.assertTrue(storage.task.valuable_only)
+        storage_trip = circuit._new_apartment_storage(client)
+        self.assertEqual(storage_trip.navigation.destination_xy, (1, 3))
+        self.assertTrue(storage_trip.task.predicate(client.state.items[799]))
+        self.assertFalse(storage_trip.task.predicate(client.state.items[680]))
+        # Once identify-all is affordable it stays carried for the smith.
+        client.state.bank_balance = 2_450
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        self.assertTrue(circuit._needs_mass_identification(client))
+        client.state.bank_balance = 0
+        # A few items wait, unless she carries much.
+        for tag in range(700, 700 + circuit.STORE_BATCH - 1):
+            client.state.remove_item(tag)
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        client.state.items[799].weight = 51.0
+        self.assertTrue(circuit._needs_apartment_storage(client))
 
         rare_client = type("Client", (), {})()
         rare_client.state = GameState(phase="playing", player_tag=7)
@@ -17937,6 +17942,12 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         rare_client.state.place_item(Item(
             800, flags=c.ITEM_MAGICAL, item_type=c.TYPE_RING,
             quality=90, condition=100, name="ring of the ghost"), 7)
+        # Her best ring is worn, not stored ...
+        self.assertFalse(circuit._needs_apartment_storage(rare_client))
+        # ... but a valuable goes home at once.
+        rare_client.state.place_item(Item(
+            801, flags=c.ITEM_MAGICAL, item_type=c.TYPE_TRINKET,
+            quality=90, condition=100, name="silver idol"), 7)
         self.assertTrue(circuit._needs_apartment_storage(rare_client))
 
     def test_savebed_confirmation_cannot_be_forged_by_players(self):
@@ -40836,6 +40847,298 @@ class PlanningOffLoopTests(unittest.TestCase):
         client.action_context = "safety"
         self.assertEqual(engine.running_context(),
                          "autoplay:level-115 > temple-food (safety)")
+
+
+class InventoryStorageTests(unittest.TestCase):
+    """She carries her active set; the rest goes home, sorted into a set
+    per build (storage.py, FarmCircuitTask._storable_items)."""
+
+    @staticmethod
+    def _client(bank: int = 0):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats.update(level=38, weight_limit=100, pow=15, int=15, maxsp=100)
+        client.state.bank_balance = bank
+        client.state.bank_balance_known = True
+        return client
+
+    @staticmethod
+    def _circuit():
+        return FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+
+    def test_apartment_index_persists_what_she_stored_and_follows_the_chest(self):
+        from . import storage
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.state.player_tag = 7
+            client.load_character_memory("Sera")
+            belt = Item(31, item_type=c.TYPE_GIRDLE, quality=80, condition=80, weight=2.0,
+                        name="forged meteoric steel belt")
+            client.state.place_item(belt, 7)
+            chest = Item(90, name="chest")
+            client.state.place_item(chest, 0)
+            labels = lambda client, items: {item.tag: ["caster:girdle"] for item in items}
+            indexer = storage.ChestIndexer(labels, InventoryPolicy().identified)
+            indexer.deposit_sent(belt)
+            indexer.observe(client, chest)
+            self.assertEqual(client.state.apartment_storage, [])
+            # Moved: no longer carried, and the chest's contents not sent.
+            client.state.place_item(belt, chest.tag)
+            client.state.inventories.pop(chest.tag)
+            indexer.observe(client, chest)
+            self.assertEqual([(row["name"], row["sets"]) for row in client.state.apartment_storage],
+                             [("forged meteoric steel belt", ["caster:girdle"])])
+            # Kept in her character memory across a restart.
+            restored = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            restored.state.player_name = "Sera"
+            restored.load_character_memory("Sera")
+            self.assertEqual([row["name"] for row in restored.state.apartment_storage],
+                             ["forged meteoric steel belt"])
+            # Opened, the chest's real contents replace the index.
+            unknown = Item(32, item_type=c.TYPE_BOOTS, quality=255, name="boots")
+            client.state.place_item(unknown, chest.tag)
+            storage.ChestIndexer(labels, InventoryPolicy().identified).observe(client, chest)
+            self.assertEqual([(row["name"], row["identified"])
+                              for row in client.state.apartment_storage],
+                             [("boots", False)])
+            # Retrieved while the contents are not sent: its row goes.
+            client.state.inventories.pop(chest.tag)
+            client.state.place_item(unknown, 7)
+            taker = storage.ChestIndexer(labels, InventoryPolicy().identified)
+            taker.retrieval_sent(unknown)
+            taker.observe(client, chest)
+            self.assertEqual(client.state.apartment_storage, [])
+            restored.load_character_memory("Sera")
+            self.assertEqual(restored.state.apartment_storage, [])
+
+    def test_the_best_set_per_build_is_kept_and_never_sold(self):
+        from . import storage
+        client = self._client()
+        worn = Item(1, flags=c.ITEM_APPLIED, item_type=c.TYPE_GIRDLE, quality=80,
+                    condition=80, name="soft leather girdle +3")
+        caster = Item(2, item_type=c.TYPE_GIRDLE, quality=80, condition=80,
+                      name="soft leather girdle (Pow+2)")
+        spare = Item(3, item_type=c.TYPE_GIRDLE, quality=60, condition=60,
+                     name="soft leather girdle")
+        for item in (worn, caster, spare):
+            client.state.place_item(item, 7)
+        client.state.equipment[c.EQUIP_BELT] = worn.tag
+        from .equipment import GEAR_STYLES
+        self.assertEqual(storage.BUILDS, GEAR_STYLES)
+        circuit = self._circuit()
+        sets = circuit._owned_sets(client)
+        self.assertEqual(sets["melee"][c.TYPE_GIRDLE], [worn])
+        self.assertEqual(sets["caster"][c.TYPE_GIRDLE], [caster])
+        labels = storage.set_labels(sets)
+        self.assertIn("caster:girdle", labels[caster.tag])
+        self.assertNotIn(spare.tag, labels)
+        # The caster's girdle goes home as that set's; the worst duplicate
+        # is sold, never the best of some build.
+        self.assertEqual({item.tag for item in circuit._identified_junk(client)}, {spare.tag})
+        self.assertEqual([item.tag for item in circuit._storable_items(client)], [caster.tag])
+        policy = circuit._sale_policy(client)
+        self.assertFalse(policy.junk(caster))
+        self.assertFalse(policy.junk(worn))
+        self.assertEqual(circuit._set_labels(client, [caster]),
+                         {caster.tag: labels[caster.tag]})
+        # Rings, amulets and unknown items are never sold, whatever names them.
+        ring = Item(4, item_type=c.TYPE_RING, quality=50, name="brass ring")
+        unknown = Item(5, item_type=c.TYPE_POTION, quality=255, name="potion")
+        for item in (ring, unknown):
+            self.assertFalse(JunkPolicy(sell_tags=frozenset({item.tag})).junk(item))
+
+    def test_a_stored_better_item_of_her_build_comes_back(self):
+        client = self._client()
+        worn = Item(1, flags=c.ITEM_APPLIED, item_type=c.TYPE_GIRDLE, quality=50,
+                    condition=50, name="soft leather girdle")
+        better = Item(2, item_type=c.TYPE_GIRDLE, quality=90, condition=90,
+                      name="soft leather girdle +4")
+        caster = Item(3, item_type=c.TYPE_GIRDLE, quality=50, condition=50,
+                      name="soft leather girdle (Pow+2)")
+        client.state.place_item(worn, 7)
+        client.state.equipment[c.EQUIP_BELT] = worn.tag
+        chest = Item(90, name="chest")
+        client.state.place_item(chest, 0)
+        client.state.place_item(better, chest.tag)
+        client.state.place_item(caster, chest.tag)
+        circuit = self._circuit()
+        self.assertEqual(circuit._chest_wants(client, [better, caster]), {better.tag})
+
+    def test_bag_of_holding_is_carried_only_above_half_her_limit(self):
+        from . import storage
+        client = self._client()
+        bag = Item(10, item_type=c.TYPE_CONTAINER, quality=80, condition=80, weight=0.2,
+                   flags=c.ITEM_MAGICAL, name="wool bag of medium holding")
+        fine = Item(11, item_type=c.TYPE_CONTAINER, quality=80, condition=80, weight=0.05,
+                    flags=c.ITEM_MAGICAL, name="dark leather pouch of fine holding")
+        gem = Item(12, item_type=c.TYPE_GEM, quality=80, condition=80, weight=0.5,
+                   quantity=10, name="jade gems")
+        for item in (bag, fine, gem):
+            client.state.place_item(item, 7)
+        self.assertEqual(storage.bag_factor(bag), 0.65)
+        self.assertEqual(storage.best_bag([bag, fine]), fine)
+        # Ranked by multiplier, which examine shows as well as the title.
+        renamed = Item(13, item_type=c.TYPE_CONTAINER, name="Sera's sack")
+        self.assertTrue(storage.read_bag_examine(
+            renamed, "It decreases the weight of items inside by 70.0%."))
+        self.assertAlmostEqual(storage.bag_factor(renamed), 0.30)
+        self.assertEqual(storage.best_bag([bag, fine, renamed]), renamed)
+        circuit = self._circuit()
+        # Light: both bags go home.
+        self.assertEqual({item.tag for item in circuit._storable_items(client)},
+                         {bag.tag, fine.tag})
+        self.assertFalse(asyncio.run(circuit._fill_bag(client)))
+        # Above half her limit she keeps the best one, and fills it with gems.
+        client.state.place_item(Item(14, item_type=c.TYPE_FOOD, quality=80,
+                                     weight=50.0, name="anvil cake"), 7)
+        self.assertEqual({item.tag for item in circuit._storable_items(client)}, {bag.tag})
+        client.move_item = AsyncMock()
+        self.assertTrue(asyncio.run(circuit._fill_bag(client)))
+        client.move_item.assert_awaited_once_with(fine.tag, gem.tag, 10)
+        # A pouch takes only gems: food is never offered to it.
+        self.assertFalse(storage.holds(fine, client.state.items[14]))
+        # Heavy with no bag carried but one stored: a trip fetches it.
+        for tag in (10, 11):
+            client.state.remove_item(tag)
+        self.assertFalse(circuit._bag_fetch_due(client))
+        client.state.apartment_storage = [storage.entry(bag)]
+        self.assertTrue(circuit._bag_fetch_due(client))
+        self.assertTrue(circuit._needs_apartment_storage(client))
+        self.assertEqual(circuit._chest_wants(client, [bag]), {bag.tag})
+
+    def test_identify_all_triggers_on_any_unknown_gear_or_alerts_for_gold(self):
+        from . import storage
+        from .navigation import identify_alerts, smith_unreachable
+        client = self._client()
+        client.state.place_item(Item(20, item_type=c.TYPE_WEAPON, quality=255,
+                                     name="small axe"), 7)
+        circuit = self._circuit()
+        # One unknown piece is enough, once the wallet covers it.
+        self.assertFalse(circuit._needs_mass_identification(client))
+        [alert] = identify_alerts(client)
+        self.assertEqual(alert["id"], "identify-unfunded")
+        self.assertIn("Identify needs 2450 copper", alert["text"])
+        self.assertIn("drop gold to help", alert["text"])
+        client.state.bank_balance = 2_450
+        self.assertTrue(circuit._needs_mass_identification(client))
+        self.assertEqual(identify_alerts(client), [])
+        trip = circuit._new_mass_identification(client)
+        self.assertEqual((trip.task.smith, trip.task.cost, trip.navigation.destination),
+                         ("Kulgar", 1_450, "/shattered_islands/world_8_79"))
+        # Kulgar out of reach: the next cheapest smith, at its own price.
+        smith_unreachable(client)["Kulgar"] = time.time() + 3600
+        self.assertFalse(circuit._needs_mass_identification(client))
+        client.state.bank_balance = 3_200
+        trip = circuit._new_mass_identification(client)
+        self.assertEqual((trip.task.smith, trip.task.cost, trip.navigation.destination_xy),
+                         ("John Markor", 2_200, (2, 18)))
+        smith_unreachable(client).clear()
+        # Unknown gear stored at home: fetched first, then identified.
+        client.state.remove_item(20)
+        self.assertFalse(circuit._needs_mass_identification(client))
+        client.state.apartment_storage = [storage.entry(
+            Item(21, item_type=c.TYPE_BOOTS, quality=255, name="boots"), identified=False)]
+        self.assertTrue(circuit._needs_mass_identification(client))
+        fetch = circuit._new_mass_identification(client)
+        self.assertTrue(fetch.identify_fetch)
+        self.assertEqual(fetch.navigation.destination, circuit.APARTMENT)
+        self.assertTrue(fetch.task.predicate(Item(22, item_type=c.TYPE_BOOTS, quality=255)))
+        self.assertFalse(fetch.task.predicate(Item(23, item_type=c.TYPE_BOOTS, quality=80)))
+        # Unknown gear is no longer stored while she can pay to identify it.
+        client.state.place_item(Item(24, item_type=c.TYPE_BOOTS, quality=255, name="boots"), 7)
+        self.assertEqual(circuit._storable_items(client, keep_unknown=circuit._keep_unknown(client)),
+                         [])
+
+    def test_the_fetch_leads_on_to_the_smith(self):
+        class Done:
+            status = TaskStatus.COMPLETE
+            error = ""
+            identify_fetch = True
+            navigation = types.SimpleNamespace(essential="")
+
+            async def tick(self, client):
+                return None
+
+        client = self._client(bank=5_000)
+        client.state.place_item(Item(20, item_type=c.TYPE_WEAPON, quality=255,
+                                     name="small axe"), 7)
+        circuit = self._circuit()
+        circuit._identification = Done()
+        self.assertTrue(asyncio.run(circuit._tick_running_service(client)))
+        self.assertIsInstance(circuit._identification.task, MassIdentifyTask)
+        # Nothing came back: no smith.
+        client.state.remove_item(20)
+        circuit._identification = Done()
+        asyncio.run(circuit._tick_running_service(client))
+        self.assertIsNone(circuit._identification)
+
+    def test_recall_wands_keep_one_and_sell_or_store_the_rest(self):
+        from .tasks import empty_recall_wand, wand_charges
+        client = self._client()
+        wands = [Item(30 + index, item_type=c.TYPE_WAND, quality=80, condition=80,
+                      weight=0.45, name=f"pine wand of word of recall (lvl {level})")
+                 for index, level in enumerate((17, 21, 17))]
+        for wand in wands:
+            client.state.place_item(wand, 7)
+            wand_charges(client)[wand.tag] = 0
+        circuit = self._circuit()
+        # The best one is kept (and recharged on the #139 path) ...
+        self.assertEqual(circuit._recall_wands(client)[0], wands[1])
+        self.assertEqual(empty_recall_wand(client), wands[0])
+        junk = {item.tag for item in circuit._identified_junk(client)}
+        # ... the empty spares are sold, never stored.
+        self.assertEqual(junk, {wands[0].tag, wands[2].tag})
+        self.assertEqual(circuit._storable_items(client), [])
+        # Recharged, the best is kept; a spare that may still hold charges
+        # goes home instead of to the shop.
+        wand_charges(client)[wands[1].tag] = 3
+        wand_charges(client).pop(wands[2].tag)
+        self.assertEqual(circuit._recall_wands(client)[0], wands[1])
+        self.assertEqual({item.tag for item in circuit._identified_junk(client)},
+                         {wands[0].tag})
+        self.assertEqual([item.tag for item in circuit._storable_items(client)],
+                         [wands[2].tag])
+
+    def test_the_sale_unlocks_what_it_names_and_nothing_else(self):
+        client = self._client()
+        spare = Item(50, flags=c.ITEM_LOCKED | c.ITEM_MAGICAL, item_type=c.TYPE_WAND,
+                     quality=80, condition=80, name="pine wand of word of recall (lvl 17)")
+        locked = Item(51, flags=c.ITEM_LOCKED, item_type=c.TYPE_WEAPON, quality=80,
+                      condition=80, name="iron short sword")
+        for item in (spare, locked):
+            client.state.place_item(item, 7)
+        client.lock_item = AsyncMock()
+        client.move_item = AsyncMock()
+        task = SellJunkTask("shop", JunkPolicy((r"sword",), sell_tags=frozenset({spare.tag})))
+        asyncio.run(task.tick(client))
+        self.assertEqual(task._queue, [spare.tag])
+        client.lock_item.assert_awaited_once_with(spare.tag)
+        client.move_item.assert_not_awaited()
+        spare.flags &= ~c.ITEM_LOCKED
+        task._last_action = 0.0
+        asyncio.run(task.tick(client))
+        client.move_item.assert_awaited_once_with(0, spare.tag, 1)
+
+    def test_cursed_potions_and_spare_plain_containers_are_sold(self):
+        client = self._client()
+        cursed = Item(40, flags=c.ITEM_CURSED | c.ITEM_MAGICAL, item_type=c.TYPE_POTION,
+                      quality=80, condition=80, name="potion of evil liquid (lvl 11)")
+        heal = Item(41, item_type=c.TYPE_POTION, quality=80, condition=80,
+                    name="potion of minor healing")
+        pouches = [Item(42 + index, item_type=c.TYPE_CONTAINER, quality=80, condition=80,
+                        weight=0.05, name="soft leather pouch") for index in range(3)]
+        key_ring = Item(46, item_type=c.TYPE_CONTAINER, quality=80, condition=80,
+                        weight=0.05, name="forged meteoric steel key ring")
+        for item in (cursed, heal, *pouches, key_ring):
+            client.state.place_item(item, 7)
+        circuit = self._circuit()
+        self.assertEqual({item.tag for item in circuit._identified_junk(client)},
+                         {cursed.tag, pouches[1].tag, pouches[2].tag})
+        # One pouch goes home; the key ring and the heal stay carried.
+        self.assertEqual([item.tag for item in circuit._storable_items(client)],
+                         [pouches[0].tag])
 
 
 if __name__ == "__main__":
