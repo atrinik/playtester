@@ -42099,6 +42099,11 @@ class BuildPerSpotTests(unittest.TestCase):
         circuit._storage_retry_at = 0.0
         self.assertFalse(circuit._swap_build)
         self.assertFalse(circuit._review_combat_build(client, circuit.child.task))
+        # A build change while a routine trip runs keeps its own swap.
+        circuit._storage_swap, circuit._swap_build = "", "bow"
+        circuit._end_swap(client)
+        self.assertEqual(circuit._swap_build, "bow")
+        circuit._swap_build = ""
         # A new circuit takes over the build she fields: no needless swap.
         successor = self._circuit(client)
         successor.child = successor._new_child()

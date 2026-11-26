@@ -9662,6 +9662,7 @@ class FarmCircuitTask(BotTask):
         self._build_choice: builds.Choice | None = None
         self._build_noted: tuple = ()
         self._swap_build = ""
+        self._storage_swap = ""
         self._spell_shortfall = ""
         # What the shortfall is for (spell, price), for the decision record.
         self._spell_shortfall_key: tuple = ()
@@ -11191,6 +11192,9 @@ class FarmCircuitTask(BotTask):
         items), her active build's best stored items that beat what she
         wears, and her best bag of holding while she needs one
         (_chest_wants)."""
+        # The build this trip swaps to ("" for a routine visit): a build
+        # change while it runs keeps its own swap.
+        self._storage_swap = self._swap_build
         if self._swap_build:
             return self._new_swap_trip(client)
         tags = {item.tag for item in self._storable_items(client, keep_unknown=keep_unknown)}
@@ -11225,6 +11229,14 @@ class FarmCircuitTask(BotTask):
         return (build == "aoe" and item.item_type in (c.TYPE_WAND, c.TYPE_ROD) and
                 any(spell in name for spell in builds.AREA_SPELLS))
 
+    def _end_swap(self, client: AtrinikClient) -> None:
+        """After a storage trip: the swap it made is done, failed or not
+        (one trip per build change); a later change keeps its own."""
+        if self._swap_build == self._storage_swap:
+            self._swap_build = ""
+            _set_attr(client, "pending_swap_build", "")
+        self._storage_swap = ""
+
     def _plan_swap(self, client: AtrinikClient) -> None:
         """After a build change, one apartment visit swaps her set
         (SwapSetTask) when the chest holds part of the new build's set or
@@ -11237,6 +11249,7 @@ class FarmCircuitTask(BotTask):
             label.startswith(style + ":") for label in row.get("sets", ())) or
             consumable(row)]
         if not wanted:
+            self._swap_build = ""
             return
         self._swap_build = self._build_name
         # A build change is worth a visit now, not after the routine wait,
@@ -13557,14 +13570,12 @@ class FarmCircuitTask(BotTask):
                 self._storage_backoff_until = self._storage_retry_at
                 self._strict_trip_refused(
                     client, "apartment storage", self._storage.error)
-                self._swap_build = ""
-                _set_attr(client, "pending_swap_build", "")
+                self._end_swap(client)
                 self._storage = None
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
                 # One swap trip per build change.
-                self._swap_build = ""
-                _set_attr(client, "pending_swap_build", "")
+                self._end_swap(client)
                 note_cure_funding_errand(client)
                 # One visit per STORAGE_VISIT_SECONDS at most: what it could
                 # not settle (a bag over the weight cap) waits.
