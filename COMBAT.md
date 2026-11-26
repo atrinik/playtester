@@ -2437,7 +2437,9 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
   2 s old took it 2 or more tiles nearer where she stands now (so her own
   walk towards a creature that stands or wanders makes none), or she
   changed maps and it is no farther off, or it is beside her and hitting
-  her. Outclassed creatures do not count.
+  her. Once a pursuer, it stays one while in view within 9 tiles, so a
+  train holding off at range still counts. Outclassed creatures do not
+  count.
 - **Before arrival** (`_approach_mode`), only on a farm trip and off the
   farm map, on the last leg or within about 25 tiles of the farm map
   along her route (`_near_spot`), and never under the seam contact after
@@ -2466,7 +2468,7 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
     in reach farthest from them, the nearest of those beyond 9 tiles, a
     cleared-trail square first among those. The walk keeps out of the
     detection radius of every spawn none of the train came from (a train
-    member first seen within a spawn's radius makes it theirs) and pays 6
+    member first seen, this trip, within a spawn's radius makes it theirs) and pays 6
     a square to cross any spawn's radius plus margin, so a dense map does
     not wall it in. Beyond 9 tiles of them all she waits. It ends
     (`approach-lead-done`) once none of the train is in view within 9

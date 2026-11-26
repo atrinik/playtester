@@ -5177,6 +5177,8 @@ class NavigateThenTask(BotTask):
         # (_near_spot's last answer, by map); and the terrain features
         # looked up.
         self._pursuit_samples: dict[int, deque] = {}
+        self._pursuit_origins: dict[int, tuple[str, int, int]] = {}
+        self._pursuer_ids: set[int] = set()
         self._lead: dict[str, Any] | None = None
         self._leads = 0
         self._stand_since = 0.0
@@ -5945,7 +5947,10 @@ class NavigateThenTask(BotTask):
         movement took it 2 or more tiles nearer where she stands now (or
         she changed maps and it is no farther off); or it is beside her
         and hitting her. A creature that sits on its spawn or wanders,
-        however she walks, is none."""
+        however she walks, is none. Once a pursuer, a creature stays one
+        while it is in view within MAX_AGGRO_RANGE (_pursuer_ids), so a
+        train that holds off at range still counts. Where each creature
+        was first seen is kept while it is sampled (_pursuit_origins)."""
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
         now = time.monotonic()
@@ -5956,6 +5961,10 @@ class NavigateThenTask(BotTask):
                 samples.popleft()
             if not samples:
                 del self._pursuit_samples[target_id]
+                self._pursuit_origins.pop(target_id, None)
+        self._pursuer_ids &= {
+            threat[3].target_id for threat in threats
+            if threat[0] <= MAX_AGGRO_RANGE}
         pursuers = []
         for threat in threats:
             distance, x, y, obj = threat
@@ -5966,7 +5975,12 @@ class NavigateThenTask(BotTask):
                 obj.target_id, deque(maxlen=self.APPROACH_PURSUIT_SAMPLES))
             oldest = samples[0] if samples else None
             samples.append((now, m.path, world[0], world[1], distance))
+            self._pursuit_origins.setdefault(
+                obj.target_id, (m.path, world[0], world[1]))
             if distance > MAX_AGGRO_RANGE:
+                continue
+            if obj.target_id in self._pursuer_ids:
+                pursuers.append(threat)
                 continue
             if distance <= 1 and self._hit_by(client, obj):
                 pursuers.append(threat)
@@ -5984,6 +5998,7 @@ class NavigateThenTask(BotTask):
             if max(abs(oldest[2] - m.world_x),
                    abs(oldest[3] - m.world_y)) - distance >= 2:
                 pursuers.append(threat)
+        self._pursuer_ids.update(threat[3].target_id for threat in pursuers)
         return pursuers
 
     def _edge_arrival(self, edge: MapEdge) -> tuple[int, int]:
@@ -6163,10 +6178,8 @@ class NavigateThenTask(BotTask):
         radius."""
         lead = self._lead
         origins = [
-            (samples[0][2], samples[0][3])
-            for target_id, samples in self._pursuit_samples.items()
-            if target_id in lead["ids"] and samples and
-            samples[0][1] == m.path]
+            (x, y) for target_id, (path, x, y) in self._pursuit_origins.items()
+            if target_id in lead["ids"] and path == m.path]
         hard, soft = [], []
         for x, y, radius in self._spawn_hazards(node):
             soft.append((x, y, radius, self.LEAD_SPAWN_COST))
@@ -6224,10 +6237,11 @@ class NavigateThenTask(BotTask):
         trail.update((x, y) for path, x, y in self._trail if path == m.path)
         blocked = {(x, y) for path, x, y in self._retreat_blocked
                    if path == m.path}
-        key = (m.path, here, tuple(sorted(threat_world)), frozenset(blocked))
+        hard, soft = self._lead_spawns(node, m)
+        key = (m.path, here, tuple(sorted(threat_world)), frozenset(blocked),
+               tuple(hard), frozenset(trail))
         route = None
         if key != lead.get("miss"):
-            hard, soft = self._lead_spawns(node, m)
             clear = MAX_AGGRO_RANGE + 1
             route = safe_square_route(
                 node, here, (), threats=threat_world, hazards=hard,

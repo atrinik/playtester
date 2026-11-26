@@ -43384,6 +43384,34 @@ class SafeRetreatTests(unittest.TestCase):
             [(then, "/road", 19, 12, 6)], maxlen=64)
         self.assertEqual(len(walk._track_pursuers(client, threats)), 1)
 
+    def test_a_train_holding_off_at_range_stays_counted(self):
+        # Pursuers that stop closing while she stands still count while in
+        # view within 9: the stand's clocks see them.
+        client, walk = self._approach()
+        m = client.state.map
+        m.world_x, m.world_y = 20, 12
+        monsters = [(100, 14, 12), (101, 14, 13), (102, 14, 11)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+
+        def threats():
+            return [(max(abs(x - 20), abs(y - 12)), 8 + x - 20, 8 + y - 12,
+                     next(iter(m.tiles[(8 + x - 20, 8 + y - 12)]
+                               .objects.values())))
+                    for _, x, y in monsters]
+
+        self.assertEqual(len(walk._track_pursuers(client, threats())), 3)
+        # 20 s on, they have not moved: still pursuers.
+        then = time.monotonic() - 20.0
+        for target_id, x, y in monsters:
+            walk._pursuit_samples[target_id] = collections.deque(
+                [(then, "/road", x, y, 6)], maxlen=64)
+        self.assertEqual(len(walk._track_pursuers(client, threats())), 3)
+        # Out of view, they are dropped.
+        self._place(client, [])
+        self.assertEqual(walk._track_pursuers(client, []), [])
+        self.assertEqual(walk._pursuer_ids, set())
+
     # world_16_74's aggressive residents (spawns.txt): eight treants, a
     # bear and a deer on 24x24, each acquiring her within 3.
     WORLD_16_74_SPAWNS = [
@@ -43482,6 +43510,26 @@ class SafeRetreatTests(unittest.TestCase):
                            time.time() + 29 * 60)
         self.assertEqual(len(chosen), 2)  # the tick's own, then the backoff
         self.assertEqual(circuit.status, TaskStatus.FAILED)
+        # With another spot chosen, the circuit goes on with its new walk.
+        client2, walk2 = self._approach()
+        client2.state.farm_zone_quarantine = {}
+        walk2.train_held = True
+        walk2.status = TaskStatus.FAILED
+        circuit2 = FarmCircuitTask(walk2.navigation.graph,
+                                   [("/farm", "charred treant")])
+        circuit2.child = walk2
+        circuit2.status = TaskStatus.RUNNING
+        replacement = object()
+
+        def switch(client_, farm):
+            circuit2.child = replacement
+            return True
+
+        circuit2._upgrade_progression = switch
+        asyncio.run(circuit2._leave_train_held_spot(client2, walk2.task))
+        self.assertIs(circuit2.child, replacement)
+        self.assertEqual(circuit2.status, TaskStatus.RUNNING)
+        self.assertIn("/farm", client2.state.farm_zone_quarantine)
         # Latched: the walk starts no stand again.
         walk._stand_since = 0.0
         self.assertEqual(walk._approach_mode(client, [
