@@ -171,7 +171,7 @@ function spotLine(r) {
   const pack = encounter
     ? `${esc(r.encounter_style || "")} pack ${(+r.expected_pack || 0).toFixed(1)}, bad pull ${Math.round(+r.worst_pack || 0)}`
     : `pack ${Math.round(+r.max_aggro_pack || 0)}`;
-  const reasons = encounter ? (r.encounter_reasons || []).map(String).join("\n") : "";
+  const reasons = encounter ? (Array.isArray(r.encounter_reasons) ? r.encounter_reasons : []).map(String).join("\n") : "";
   const title = r.spot_risky
     ? `${encounter ? "Its encounters rate below her safety floor" : "One encounter is expected to cost more than her health bar"}: farmed only when no safe spot is usable`
     : encounter ? "The analyzer's encounter model" : "Neighbouring maps across a seam";

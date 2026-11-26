@@ -146,7 +146,10 @@ ENCOUNTER_SCHEMA = 2
 ENCOUNTER_SAFETY_FLOOR = 0.8
 # A spot's bad pull (the analyzer's worst_pack: the engaged radius plus
 # every wanderer and ally call more likely than not to join) may hold at
-# most this many times the profile's max_aggro_pack. Live, on 2026-11-25,
+# most this many times SINGLE_TARGET_MAX_AGGRO_PACK whenever the profile
+# caps its pack. While Wizardry trains (cap 1) the same bad-pull cap
+# applies: ranged-kite's wider bad-pull footprint would leave almost no
+# spot under three. Live, on 2026-11-25,
 # she died on Burnt Forest maps of bad pull 7 and 8 (one treant is about
 # break-even for her heals, three are lethal without a recall).
 BAD_PULL_PACK_FACTOR = 3
@@ -245,9 +248,13 @@ def spot_pack(spot: dict) -> float:
 
 def pack_cap(spot: dict, profile: "CombatProfile | None") -> int:
     """The largest spot_pack the profile accepts; 0 allows any. A bad pull
-    (worst_pack) may hold BAD_PULL_PACK_FACTOR times the direct pack."""
+    (worst_pack, when spot_pack reads it) may hold BAD_PULL_PACK_FACTOR
+    times SINGLE_TARGET_MAX_AGGRO_PACK; a direct pack, the profile's
+    max_aggro_pack."""
     cap = int(getattr(profile, "max_aggro_pack", 0) or 0)
-    return cap * BAD_PULL_PACK_FACTOR if cap and encounter_rated(spot) else cap
+    if cap and encounter_rated(spot) and _number(spot.get("worst_pack")) is not None:
+        return BAD_PULL_PACK_FACTOR * SINGLE_TARGET_MAX_AGGRO_PACK
+    return cap
 
 
 def risky_spot(spot: dict) -> bool:
@@ -655,14 +662,17 @@ def combat_profile(client, spell_damage: float = 0.0,
                     item.item_type == c.TYPE_SKILL and
                     item.name.casefold() == "meditation"
                     for item in state.inventory))
-    swing = SPELL_CAST_DELAY if caster else weapon_speed
+    # Training with spells, she casts from range even before a hit of the
+    # spell has been sampled (caster_kite).
+    spells_only = trained_level >= 1
+    swing = SPELL_CAST_DELAY if spells_only else weapon_speed
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
         character_level=character_level, max_health=max_health,
         speed=round(speed, 3), armour_class=armour_class, protections=protections,
         max_aggro_pack=max_aggro_pack,
-        combat_style=RANGED_KITE_STYLE if caster else MELEE_STYLE,
+        combat_style=RANGED_KITE_STYLE if spells_only else MELEE_STYLE,
         healing_per_second=healing_rate(state, heal, swing), **caster)
 
 
@@ -845,13 +855,15 @@ class FarmAnalyzer:
         # Her FIREs and APPLYs, newest last: a heal answer belongs to the
         # latest one before it, and counts only if that FIRE cast a
         # healing spell (an applied potion or scroll does not).
+        oldest = min((float(entry[0]) for entry in entries), default=0.0)
         orders = [(float(record.get("time", 0) or 0), record.get("action"),
                    str(record.get("detail", "")).casefold())
-                  for record in list(getattr(client, "action_history", ()) or ())[-50:]
+                  for record in list(getattr(client, "action_history", ()) or ())
                   if isinstance(record, dict) and
-                  record.get("action") in ("fire", "apply")]
+                  record.get("action") in ("fire", "apply") and
+                  float(record.get("time", 0) or 0) >= oldest - HEAL_ATTRIBUTION_SECONDS]
         for timestamp, _, _, text in entries:
-            healed = HEALED_TEXT.match(text)
+            healed = HEALED_TEXT.match(str(text).strip())
             if healed and heal_spells:
                 order = next((entry for entry in reversed(orders)
                               if 0.0 <= timestamp - entry[0] <= HEAL_ATTRIBUTION_SECONDS),

@@ -21313,6 +21313,8 @@ class FarmAnalyzerTests(unittest.TestCase):
         args = profile.arguments()
         self.assertEqual(args[0], "10")
         self.assertEqual(args[args.index("--max-aggro-pack") + 1], "1")
+        # She casts from range from the start, before any spell hit is sampled.
+        self.assertEqual(args[args.index("--combat-style") + 1], "ranged-kite")
         # Until a cast has been observed, the weapon stands in.
         self.assertEqual(args[args.index("--melee-damage") + 1], "44")
         # At the target, training ends: main weapon spots, capped at the
@@ -21590,6 +21592,9 @@ class FarmAnalyzerTests(unittest.TestCase):
             # Long after any heal she sent.
             (now - 1, 0, "", "The spell heals you for 50 hp!"),
         ]
+        # A busy fight's other orders never push a heal's FIRE out.
+        client.action_history[2:2] = [
+            {"time": now - 14.9, "action": "step", "detail": "1"}] * 600
         analyzer.observe_spells(client)
         self.assertEqual(analyzer.heal_samples, [17, 20, 14])
 
@@ -22414,6 +22419,14 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
                                 client.farm_analyzer.profile)
         self.assertEqual((exposed["spot_safety_score"], exposed["max_aggro_pack"],
                           exposed["seam_casters"]), (0.88, 1.0, 1))
+        # While Wizardry trains (direct cap 1) the bad-pull cap stays 6.
+        training = self.kit(max_health=333, max_aggro_pack=1)
+        self.assertIsNotNone(seam_adjusted(dict(dense, worst_pack=6.0), SeamExposure(), training))
+        self.assertIsNone(seam_adjusted(dict(dense, worst_pack=7.0), SeamExposure(), training))
+        # Without a bad pull reported, the direct pack meets the direct cap.
+        bare = {key: value for key, value in dense.items() if key != "worst_pack"}
+        self.assertIsNone(seam_adjusted(dict(bare, max_aggro_pack=3.0), SeamExposure(),
+                                        client.farm_analyzer.profile))
         # An older report's spot (no schema version) keeps the direct pack.
         old = {key: value for key, value in dense.items()
                if key != "analyzer_schema_version"}

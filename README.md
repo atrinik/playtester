@@ -740,8 +740,9 @@ material change in her healing (15%) calls for a new run. When the report
 carries `"schema_version": 2`, the spot's own safety is the analyzer's
 encounter-aware `spot_safety_score` and a spot counts as risky below 0.8
 rather than 1, since that score is never saturated; the pack cap above
-reads the bad pull (`worst_pack`), up to three times the cap (6, or 3 while
-Wizardry trains), instead of the direct pack (`max_aggro_pack`). A report
+reads the bad pull (`worst_pack`), at most 6 (three times the single-target
+pack of 2, also while Wizardry trains), instead of the direct pack
+(`max_aggro_pack`). A report
 without a schema version is read by its older fields as before. The
 decision record of a chosen spot (`farm-spot-selected`) and the Farming
 tab's spot line show the encounter safety, the expected and bad pull's

@@ -7022,8 +7022,9 @@ def seam_ranking(client: AtrinikClient, graph: "WorldGraph",
                  objective: str) -> list[dict]:
     """The analyzer's ranking for an objective, each spot with its seam
     exposure folded in (farm_analyzer.seam_adjusted), in the analyzer's
-    order. A spot whose exposed pack exceeds the ranked profile's
-    max_aggro_pack is left out, as the analyzer leaves out its own; a spot
+    order. A spot whose exposed pack (farm_analyzer.spot_pack: the bad
+    pull for an encounter-rated spot) exceeds the ranked profile's
+    farm_analyzer.pack_cap is left out, as the analyzer leaves out its own; a spot
     with a map the graph lacks is kept as ranked (analyzer_spot_legs skips
     it anyway)."""
     analyzer = getattr(client, "farm_analyzer", None)
