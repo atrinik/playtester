@@ -330,8 +330,11 @@ G9.
   (`navigation.py:5172-5197`) retries a failed farm trip once with
   `allow_ranged_hazard_fallback` when the combat level is 18 or more,
   starting at the fallback tier (1.12). Quest trips set it from the same
-  level before they start (`catalog_quest_tasks.allow_quest_transit`:
-  every dialogue trip, and quest farm and kill trips): live, on
+  level before they start (`catalog_quest_tasks.allow_quest_transit`),
+  always as a defended leg: a dialogue trip's walk becomes a
+  `NavigateThenTask` (pack split, retreat, cornered fight) that heals at
+  85% and flees at 70%, as the quest farm and kill trips, which take it
+  too, then do. Live, on
   2026-11-26, the Fort Sether Illness quest could not route at all from
   the Burnt Forest, which pack-hazard maps ring; with the flag the route
   from world_16_74 is 48 edges.
@@ -391,14 +394,17 @@ Dungeon maps are never pack hazards, however dense: Underground City
   are no occupants (`_passable_player`): outside PvP areas players share
   squares, while monsters and NPCs (`FLAG_MONSTER`) block every living
   thing (server `map.c` `blocked()`), and in a PvP area, where players
-  block, the server names them red. The server names weaker creatures
+  block, the server names them red; on a map marked PvP her party
+  members (green) block her too. The server names weaker creatures
   green as well, so a green name counts as a player only when it is no
   authored name (without her authored names, only white does). Live, on 2026-11-26 on world_0_67,
   the owner's character on the next square kept her stepping off her
   route and back four times a second. A square an occupant newly blocks
   `OCCUPANT_BLOCK_REPEATS` (3) times within 10 s starts a 3 s hold
   (`navigation-occupant-hold`): she stands still instead of stepping
-  round it and back. Only squares within two of her count.
+  round it and back. Only a friendly occupant (a townsperson, a guard)
+  within two squares of her counts, and never while something hits her
+  or on an essential or critical trip: a hostile one is fled or fought.
 
 None of this persists, or reaches another trip or task.
 
@@ -597,28 +603,45 @@ starvations.
   the fallback. `NavigateTask.start` and `_replan` now plan through
   `_plan_off_loop`: a `BackgroundPlans` plan of the trip's own, on a copy
   of the trip (`_planning_copy`: its own containers and care crossing)
-  with her `PlanningClient`. Until it is done the route stays empty,
-  `NavigateTask.planning` is true and the trip's tick returns before any
-  step: she does not move (a path she was walking is stopped), while her trip's defence (fights, heals,
-  retreats) carries on as for any other `PLANNING` answer. When it is
-  collected, what the plan sets on the trip (`PLAN_STATE`: owner walls,
-  the dialogue offer, care crossings, the learned plan, threat maps, the
-  fallback flags) is copied back, its recorded actions are replayed and
-  its shadow report is made on the loop, and she takes her first step on
-  the next tick, so her trip (a route-death hold) sees the route first; its error fails or waits as it
-  did on the loop. An edge excluded meanwhile drops the plan, which is
-  planned again with it. Essential trips plan at `PRIORITY_HEAL`. A trip
-  waits behind a ranking already running on the worker (the worker runs
-  one job at a time): she stands still that long.
+  with her `PlanningClient`, keyed by the map she stood on (planned again
+  from another map; a step on the same map in a fight does not restart
+  it, and the route still leaves that map).
+  - Until it is done the route stays empty, `NavigateTask.planning` is
+    true and the trip's tick returns before any step: she does not move,
+    and a path the server still walks for her is stopped. Her trip's
+    defence (fights, heals, retreats) carries on as for any other
+    `PLANNING` answer.
+  - When it is collected, what the plan sets on the trip (`PLAN_STATE`:
+    owner walls, the dialogue offer, care crossings, the learned plan,
+    threat maps, the fallback flags) is copied back; a care crossing
+    finished on the loop meanwhile stays finished. Its recorded actions
+    are replayed, and what it would write to her client (the shadow
+    report, the live learned plan's metrics, a care-wait record) is
+    written then, on the loop (`_defer`): the worker writes nothing the
+    loop reads. Its error fails or waits as it did on the loop. She takes
+    her first step on the next tick, so her trip (a route-death hold)
+    sees the route first.
+  - An edge excluded meanwhile drops the plan, which is planned again
+    with it. A trip dropped with its plan under way cancels it
+    (`weakref.finalize`): queued it never runs, running it stops at its
+    next tier (`_check_cancelled` in `_route_points`).
+  - Essential and critical trips (`critical`: an aborted expedition's
+    retreat) plan at `PRIORITY_HEAL`, and while the worker runs or queues
+    another job (`planner.busy`; a ranking can take 45 s) they plan on
+    the loop, as before. An optional trip waits behind such a job, and
+    she stands still that long.
 - **Plans made before a trip serve its start.** `NavigateTask.prepare`
-  plans a trip that has not started, off the loop; its start takes that
-  plan while she stands where it was made and for `PREPARED_SECONDS`
-  (60 s). The recovery walk home's hazard-fallback check
-  (`RecoveryTask._judge_home_walk`) is that plan: one plan, not a probe
-  and then the walk's own, and she holds still, defending, while it runs.
-  The checkout-mat ranking (`ShopUpgradeSweepTask._new_settlement`) runs
-  on the worker as a ranking, and the walk it picks starts with its
-  ranked route (`preplanned`).
+  plans a trip that has not started, off the loop, as the trip itself (a
+  live plan, with its care and learned-cost decisions, not a ranking's
+  probe); its start takes that plan while she stands where it was made
+  and for `PREPARED_SECONDS` (60 s). The recovery walk home's
+  hazard-fallback check (`RecoveryTask._judge_home_walk`) is that plan:
+  one plan, not a probe and then the walk's own, and she holds still,
+  defending, while it runs. The farm circuit's route-death check
+  (`_route_crosses`) uses the leg's own plan the same way (holding while
+  a leg not started is planned) and never plans on the loop. The
+  checkout-mat ranking (`ShopUpgradeSweepTask._new_settlement`) runs on
+  the worker as a ranking; the walk it picks plans its own live route.
 - **A retry with the fallback starts at it.** When every hazard tier
   short of the fallback fails, `_plan_avoiding` keeps the inputs it
   failed for (`_tiers_failed_at`: origin, goal, exclusions, hazard sets,
@@ -629,13 +652,13 @@ starvations.
 
 Still on the loop, each measured offline from `world_7_79` and visible to
 the watchdog when it runs long: a care crossing's walk to her savebed
-(`_begin_care_staging`); the farm circuit's `_route_crosses` check and
-the other direct `_plan` probes outside a trip's start and replan; the
-first dialogue offer after her keys or journal change (0.7 s cold,
-cached on her client after); `town_safely_reachable`, which caps its new
-strict plans per call; `graph_route_open` in `_wait_for_exclusions`
-(cooperative only in `graph_route_open_async`); and the farm choice's
-reach checks.
+(`_begin_care_staging`); an essential or critical trip's plan while the
+worker is busy; the other direct `_plan` probes outside a trip's start
+and replan; the first dialogue offer after her keys or journal change
+(0.7 s cold, cached on her client after); `town_safely_reachable`, which
+caps its new strict plans per call; `graph_route_open` in
+`_wait_for_exclusions` (cooperative only in `graph_route_open_async`);
+and the farm choice's reach checks.
 
 ## 2. The 2026-11-14 incident
 

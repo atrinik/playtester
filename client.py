@@ -1630,8 +1630,13 @@ class AtrinikClient:
                     await self._read_loop()
                 finally:
                     keepalive.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await keepalive
+                    # Its outcome never replaces the read loop's: a failure
+                    # of its own is only logged.
+                    outcome, = await asyncio.gather(
+                        keepalive, return_exceptions=True)
+                    if (isinstance(outcome, BaseException) and
+                            not isinstance(outcome, asyncio.CancelledError)):
+                        log.warning("keepalive task failed: %r", outcome)
             except asyncio.CancelledError:
                 raise
             except (ConnectionError, asyncio.IncompleteReadError, OSError, ProtocolError) as exc:

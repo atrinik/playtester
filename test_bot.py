@@ -393,6 +393,42 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_a_failing_keepalive_never_hides_the_read_loops_error(self):
+        async def run():
+            client = AtrinikClient(ClientConfig(reconnect=False))
+            client.KEEPALIVE_SECONDS = (0.0, 0.0)
+            ended = []
+
+            class Writer:
+                def close(self):
+                    pass
+
+                async def wait_closed(self):
+                    pass
+
+            async def connect():
+                client.writer = Writer()
+                client.state.phase = "playing"
+
+            async def keepalive():
+                raise RuntimeError("bug")
+
+            async def read_loop():
+                await asyncio.sleep(0.05)
+                raise ConnectionError("dropped")
+
+            async def emit(event, *args):
+                ended.append(event)
+
+            client.connect = connect
+            client.send_keepalive = keepalive
+            client._read_loop = read_loop
+            client.emit = emit
+            await client.run()
+            self.assertIn("disconnected", ended)
+
+        asyncio.run(run())
+
     def test_no_keepalive_before_she_plays(self):
         async def run():
             client = AtrinikClient(ClientConfig())
@@ -14937,6 +14973,14 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client = client_at(37)
         task = DialogAtTask(graph, NPC["Gwenty"], "Gwenty", ())
         asyncio.run(task.tick(client))
+        # Only as a defended leg (pack split, retreat, early heal and flee),
+        # never a bare navigation.
+        self.assertIsInstance(task._leg, NavigateThenTask)
+        self.assertIs(task._leg.navigation, task.navigation)
+        self.assertTrue(task._leg.combat_approach)
+        self.assertEqual((task._leg.safety.heal_below, task._leg.safety.flee_below),
+                         (0.85, 0.70))
+        self.assertEqual(task.navigation.tolerance, 1)
         self.assertTrue(task.navigation.allow_ranged_hazard_fallback)
         self.assertEqual(task.navigation.status, TaskStatus.RUNNING)
         self.assertEqual(task.navigation.route[-1].destination,
@@ -14947,6 +14991,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task = DialogAtTask(graph, NPC["Gwenty"], "Gwenty", ())
         asyncio.run(task.tick(client))
         self.assertFalse(task.navigation.allow_ranged_hazard_fallback)
+        self.assertIsNone(task._leg)
         # A quest farm or kill trip too.
         policy = POLICIES["Fort Sether Illness"]
         quest = CatalogQuestTask(graph, policy)
@@ -14954,6 +14999,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         trip = quest._action_task(action, "The Kobold Delicacy",
                                   client=client_at(37))
         self.assertTrue(trip.navigation.allow_ranged_hazard_fallback)
+        self.assertEqual(trip.safety.flee_below, 0.70)
         trip = quest._action_task(action, "The Kobold Delicacy",
                                   client=client_at(12))
         self.assertFalse(trip.navigation.allow_ranged_hazard_fallback)
@@ -19797,6 +19843,15 @@ class NavigationTests(unittest.TestCase):
             self.assertEqual(client.steps, [], obj.name)
             self.assertEqual(task._temporary_blocked, {(1, 2)})
             self.assertIn(("navigation-occupant-blocked", "1,2"), client.actions)
+        # On a PvP map even her party blocks her (server blocked()).
+        graph, node, client = self._corridor_with_occupant(
+            MapObject(5, 0, 0, 0, name="Zoey", name_color="00ff00",
+                      target_id=99))
+        node.pvp = True
+        client.authored_content = types.SimpleNamespace(names={"rat"})
+        task = NavigateTask(graph, node.path, (1, 2))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.steps, [])
         # Without her authored names a green name may be a weaker
         # creature (the server's level colour): it blocks.
         graph, node, client = self._corridor_with_occupant(
@@ -19807,10 +19862,10 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(client.steps, [])
 
     def test_an_occupant_that_comes_and_goes_makes_her_hold_still(self):
-        # Blocked again and again on one square, she waits rather than
-        # stepping round it and back.
-        monster = MapObject(5, 0, 0, 0, name="rat", name_color="ffff00",
-                            target_id=99)
+        # Blocked again and again on one square by a townsperson, she waits
+        # rather than stepping round it and back.
+        monster = MapObject(5, 0, 0, 0, name="Guard", name_color="ffff00",
+                            target_id=99, is_friend=True)
         graph, node, client = self._corridor_with_occupant(None)
         task = NavigateTask(graph, node.path, (1, 2))
         objects = client.state.map.tile(8, 9).objects
@@ -19824,6 +19879,26 @@ class NavigationTests(unittest.TestCase):
         holds = [detail for action, detail in client.actions
                  if action == "navigation-occupant-hold"]
         self.assertEqual(len(holds), 1)
+        # A hostile pack trailing her, an essential trip, or a fight never
+        # holds her still: she flees or fights.
+        hostile = MapObject(5, 0, 0, 0, name="rat", name_color="ffff00",
+                            target_id=99)
+        for occupant, essential, hit in ((hostile, "", False),
+                                         (monster, "home", False),
+                                         (monster, "", True)):
+            graph2, node2, other = self._corridor_with_occupant(None)
+            if hit:
+                other.state.add_message(2, "ff0000", "rat hit you for 3 (-3) impact damage.")
+            trip = NavigateTask(graph2, node2.path, (1, 2))
+            trip.essential = essential
+            tile = other.state.map.tile(8, 9).objects
+            for _ in range(trip.OCCUPANT_BLOCK_REPEATS + 1):
+                tile[5] = occupant
+                trip._movement_blockers(other)
+                tile.clear()
+                trip._movement_blockers(other)
+            self.assertEqual(trip._occupant_hold_until, 0.0,
+                             (occupant.name, essential, hit))
         self.assertTrue(holds[0].startswith("1,2 "))
         moves = len(client.steps)
         self.assertLess(moves, task.OCCUPANT_BLOCK_REPEATS)
@@ -37986,6 +38061,20 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         task._plan(self.client)
         self.assertTrue(task.care.cleared)
 
+    def test_with_the_flag_on_a_prepared_plan_is_her_live_plan(self):
+        # The walk home's plan made before it departs (prepare) serves its
+        # start: it must be the live plan, with its care and decisions,
+        # not a ranking's probe that takes an over-budget candidate as is.
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        self.client.state.stats.update(hp=10)
+        task = self.trip("cure")
+        self.assertEqual(task.status, TaskStatus.READY)
+        self.assertEqual(self.maps(task.prepare(self.client)), ["/blocked", "/goal"])
+        self.assertEqual((task.care.mode, task.care.subjects), ("bounded", ("map:/blocked",)))
+        self.assertIn("route-budget-override", self.client.actions())
+
     def test_with_the_flag_on_a_strict_essential_trip_overrides_with_care(self):
         self.client.config.learned_route_costs = True
         self.graph = blocks_graph(detour=False)
@@ -39382,9 +39471,12 @@ class PlanningOffLoopTests(unittest.TestCase):
             self.assertEqual(task.status, TaskStatus.RUNNING)
             self.assertTrue(task.planning)
             self.assertEqual(task.route, [])
-            # Still planning: she does not move.
+            # Still planning: she does not move, and a path the server
+            # may still walk for her is stopped.
             asyncio.run(task.tick(client))
             self.assertEqual(moves(), [])
+            self.assertEqual([packet.packet_type for packet in client.sent],
+                             [c.S_CLEAR])
             release.set()
             self.wait_for(lambda: task._route_plans._plans["route"].future.done())
             asyncio.run(task.tick(client))
@@ -39414,6 +39506,76 @@ class PlanningOffLoopTests(unittest.TestCase):
         self.assertEqual(len(threads), 2)
         self.assertTrue(all(thread is not threading.main_thread()
                             for thread in threads))
+
+    def test_an_essential_or_critical_walk_never_waits_behind_a_ranking(self):
+        # The worker runs one job at a time and a ranking can take 45 s:
+        # a walk home or an expedition's retreat plans on the loop instead.
+        import threading
+        from . import planner as planner_module
+
+        release = threading.Event()
+        planner_module.submit(lambda: release.wait(5))
+        try:
+            self.wait_for(planner_module.busy)
+            for essential, critical in (("home", False), ("", True)):
+                client = self.client()
+                walk = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                                    (4, 9), tolerance=1)
+                walk.essential, walk.critical = essential, critical
+                asyncio.run(walk.tick(client))
+                self.assertFalse(walk.planning)
+                self.assertTrue(walk.route)
+            # An optional trip queues as before.
+            trip = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                                (4, 9), tolerance=1)
+            asyncio.run(trip.tick(self.client()))
+            self.assertTrue(trip.planning)
+        finally:
+            release.set()
+
+    def test_a_care_crossing_finished_meanwhile_stays_finished(self):
+        import threading
+        from . import navigation as navigation_module
+        from .navigation import CareCrossing
+
+        release = threading.Event()
+
+        def plan(task, client, *, origin=None):
+            release.wait(2)
+            return []
+
+        client = self.client()
+        task = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                            (4, 9), tolerance=1)
+        task.care = CareCrossing("owner_block", ("map:/x",), 0.0, key=("", "map:/x"))
+        with patch.object(navigation_module.NavigateTask, "_plan", plan):
+            asyncio.run(task.tick(client))
+            self.assertTrue(task.planning)
+            task.care.finished = True
+            release.set()
+            self.wait_for(lambda: task._route_plans._plans["route"].future.done())
+            asyncio.run(task.tick(client))
+        self.assertFalse(task.planning)
+        self.assertTrue(task.care.finished)
+
+    def test_a_dropped_trip_forgets_its_plan(self):
+        import gc
+        import threading
+        from . import planner as planner_module
+
+        release = threading.Event()
+        planner_module.submit(lambda: release.wait(5))
+        try:
+            trip = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                                (4, 9), tolerance=1)
+            asyncio.run(trip.tick(self.client()))
+            self.assertTrue(trip.planning)
+            future = trip._route_plans._plans["route"].future
+            del trip
+            gc.collect()
+            self.assertTrue(future.cancelled())
+        finally:
+            release.set()
 
     def test_a_plan_made_before_the_trip_serves_its_start(self):
         # The recovery walk home judged its route by a probe and then
