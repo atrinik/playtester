@@ -9435,16 +9435,16 @@ class FarmCircuitTask(BotTask):
         return True
 
     def _note_encounter(self, client: AtrinikClient, spot: dict) -> None:
-        """Record her spot's encounter rating when it changes: on the spot
-        she starts on, after a switch, and when a new analysis re-rates the
-        same spot. Warn only (owner decision, 2026-11-25): a
-        farm-spot-encounter decision with the rating, a
-        farm-spot-encounter-warning (farm_analyzer.encounter_warning) that
-        alerts.farm_encounter_warning raises, and a
-        farm-spot-encounter-clear when a spot does not warn: a new circuit's
-        first spot (a warning from an earlier circuit's spot must not
-        linger), or a warned spot re-rated safe. A spot left unrated (a
-        failed encounter run) keeps what was recorded for it."""
+        """Keep her spot's encounter warning current: on the spot she starts
+        on, after a switch, and when a new analysis re-rates the same spot.
+        Warn only (owner decision, 2026-11-25). The warning
+        (farm_analyzer.encounter_warning) is kept on the client as
+        ``farm_encounter_warning`` with this circuit, for the dashboard's
+        farm-encounter alert while autoplay farms this circuit; a spot left
+        unrated (no encounter run yet, or a failed one) keeps what was noted
+        for it. Each change is recorded too: farm-spot-encounter (the
+        rating), farm-spot-encounter-warning, or farm-spot-encounter-clear
+        once a warned spot no longer warns."""
         summary = farm_analyzer_plan.encounter_summary(spot)
         warning = farm_analyzer_plan.encounter_warning(spot)
         noted = (str(spot.get("path", "")), summary, warning)
@@ -9453,6 +9453,8 @@ class FarmCircuitTask(BotTask):
                 not summary and previous is not None and previous[0] == noted[0]):
             return
         self._encounter_noted = noted
+        client.farm_encounter_warning = (
+            {"text": warning, "circuit": self} if warning else None)
         recorder = getattr(client, "record_action", None)
         if recorder is None:
             return
@@ -9461,7 +9463,7 @@ class FarmCircuitTask(BotTask):
         if warning:
             log.warning("farm spot encounter warning: %s", warning)
             recorder("farm-spot-encounter-warning", warning)
-        elif previous is None or previous[2]:
+        elif previous is not None and previous[2]:
             recorder("farm-spot-encounter-clear", f"{spot.get('name', '?')}")
 
     async def _recover_failed_navigation(

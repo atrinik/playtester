@@ -21689,6 +21689,12 @@ rankings = {key: [spot("grind", 900.0, 5.0, 0.85), spot("gold", 100.0, 50.0, Non
             for key in ("balanced", "xp", "safety", "maneuverability", "loot")}
 rankings["money"] = [spot("gold", 100.0, 50.0, None), spot("grind", 900.0, 5.0, 0.85)]
 report = {"results": rankings["xp"], "rankings": rankings, "args": args}
+here = os.path.dirname(sys.argv[0])
+if "--combat-style" in args and os.path.exists(os.path.join(here, "FAIL_STYLED")):
+    raise SystemExit(4)
+if "--combat-style" in args and os.path.exists(os.path.join(here, "HANG")):
+    import time
+    time.sleep(60)
 if "--healing-per-second" in args:
     # Analyzer v3.11.0: schema 2, encounter fields applied only with a style,
     # which also lowers the safety she ranks by (min with encounter safety).
@@ -22077,8 +22083,12 @@ class FarmAnalyzerTests(unittest.TestCase):
         analyzer.observe_spells(client)
         self.assertEqual(analyzer.heal_samples, [17, 20, 14])
 
+        package = analyzer.analyzer_root / "farming_analyzer"
+
         async def scenario():
+            # The ranking run comes first and alone.
             self.assertTrue(analyzer.poll(client))
+            self.assertIsNone(analyzer._encounter_task)
             await analyzer._task
             self.assertEqual(analyzer.status, "ready", analyzer.error)
             # A 17 HP median: 17 / (2.25 s swing + 1 s cast) = 5.23 HP/s,
@@ -22087,54 +22097,83 @@ class FarmAnalyzerTests(unittest.TestCase):
             styled = analyzer.command(analyzer.profile, styled=True)
             for flag, value in (("--combat-style", "melee"),
                                 ("--healing-per-second", "5.1"),
-                                ("--character-speed", "0.8")):
+                                ("--character-speed", "0.8"),
+                                ("--top", str(analyzer.ENCOUNTER_TOP))):
                 self.assertEqual(styled[styled.index(flag) + 1], value, flag)
             self.assertEqual(analyzer.profile.describe()["healing_per_second"], 5.1)
             # The ranking run passes no style, so the fields she ranks by
             # stay the pre-encounter estimate (the fake lowers them under a
-            # style, as v3.11.0 does)...
-            args = analyzer.report["args"]
-            self.assertNotIn("--combat-style", args)
+            # style, as v3.11.0 does).
+            self.assertNotIn("--combat-style", analyzer.report["args"])
             self.assertNotIn("--combat-style", analyzer.command(analyzer.profile))
             grind = analyzer.ranking("xp")[0]
             self.assertEqual((grind["safety_score"], grind["spot_safety_score"]), (0.85, 1.0))
-            # ...and the encounter run's fields are merged onto her spots.
+            self.assertFalse(grind["encounter_applied"])
+            # A hung encounter run never holds up her ranking or a new one.
+            (package / "HANG").write_text("")
+            self.assertTrue(analyzer.poll(client))
+            self.assertTrue(analyzer.encounter_running)
+            self.assertFalse(analyzer.running)
+            self.assertEqual(analyzer.ranking("xp")[0]["name"], "grind")
+            self.assertTrue(analyzer.snapshot("xp")["encounter_running"])
+            await analyzer.close()
+            self.assertFalse(analyzer.encounter_running)
+            (package / "HANG").unlink()
+            # Then the encounter run merges its fields onto her spots.
+            analyzer._encounter_attempt_at = 0.0
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertEqual(analyzer.encounter_error, "")
             self.assertEqual((grind["encounter_applied"], grind["encounter_style"],
                               grind["encounter_reasons"], grind["analyzer_schema_version"]),
                              (True, "melee", ["styled"], 2))
+            self.assertEqual((grind["safety_score"], grind["spot_safety_score"]), (0.85, 1.0))
+            # Rated, nothing more is due until her ranking or healing changes.
+            self.assertFalse(analyzer.poll(client))
+            report, generation = analyzer.report, analyzer.report_generation
+            ranking_runs = analyzer.runs
+            # A healing change re-runs the encounter run alone, onto the
+            # same ranking report (main would not re-rank for it).
+            analyzer.heal_samples = [25, 25, 25]
+            analyzer._encounter_attempt_at -= analyzer.MIN_INTERVAL_SECONDS
+            for spot in analyzer._spots(report):
+                spot["encounter_reasons"] = []
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertEqual((analyzer.runs, analyzer.report_generation), (ranking_runs, generation))
+            self.assertIs(analyzer.report, report)
+            self.assertEqual(grind["encounter_reasons"], ["styled"])
+            self.assertEqual(analyzer.encounter_profile.healing_per_second,
+                             7.5)
+            # A failed encounter run keeps the ranking and is retried on the
+            # failure backoff.
+            (package / "FAIL_STYLED").write_text("")
+            analyzer._encounter_attempt_at = 0.0
+            analyzer.heal_samples = [17, 20, 14]
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertTrue(analyzer.encounter_error)
+            self.assertIs(analyzer.report, report)
+            self.assertFalse(analyzer.poll(client))
+            analyzer._encounter_attempt_at -= analyzer.RETRY_SECONDS
+            (package / "FAIL_STYLED").unlink()
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertEqual(analyzer.encounter_error, "")
             await analyzer.close()
 
         asyncio.run(scenario())
-        # A failed encounter run kept the ranking: it is retried on the
-        # failure backoff, not after six hours.
-        analyzer.encounter_error = "exited with status 3"
-        analyzer._last_attempt_at = time.time() - analyzer.RETRY_SECONDS - 1
-        analyzer.runs = 1
-        self.assertTrue(analyzer.due(analyzer.profile))
-        # The retry runs the encounter run alone onto her ranking.
-        ranked = analyzer.ranking("xp")
-        reported = analyzer.reported_at
-
-        async def retry():
-            for spot in analyzer._spots(analyzer.report):
-                spot.update(encounter_applied=False, encounter_reasons=[])
-            self.assertTrue(analyzer.poll(client))
-            await analyzer._task
-            self.assertEqual((analyzer.status, analyzer.encounter_error), ("ready", ""))
-            self.assertIs(analyzer.ranking("xp")[0], ranked[0])
-            self.assertEqual(ranked[0]["encounter_reasons"], ["styled"])
-            self.assertEqual(analyzer.reported_at, reported)
-            await analyzer.close()
-
-        asyncio.run(retry())
-        self.assertFalse(analyzer.due(analyzer.profile))
-        # No heal landed yet: no healing is assumed.
+        # No heal landed yet: no healing is assumed, and no encounter run is
+        # due (it would rate every pull as unhealed).
         fresh = combat_profile(self.client())
         args = fresh.arguments()
         self.assertEqual(args[args.index("--healing-per-second") + 1], "0")
-        # A material change in her healing calls for a new ranking.
-        self.assertTrue(combat_profile(client, heal=17).materially_differs(fresh))
-        self.assertFalse(combat_profile(client, heal=17).materially_differs(
+        self.assertFalse(analyzer.encounter_due(fresh))
+        # Her healing and style never call for a new ranking, only for a
+        # new encounter run.
+        self.assertFalse(combat_profile(client, heal=17).materially_differs(fresh))
+        self.assertTrue(combat_profile(client, heal=17).encounters_differ(fresh))
+        self.assertFalse(combat_profile(client, heal=17).encounters_differ(
             combat_profile(client, heal=18)))
 
     def test_encounter_fields_are_read_only_from_a_schema_2_report(self):
@@ -22177,6 +22216,29 @@ class FarmAnalyzerTests(unittest.TestCase):
         # Without a combat style the model did not rate the spot.
         self.assertFalse(encounter_rated(dict(
             encounter, analyzer_schema_version=2, encounter_applied=False)))
+
+    def test_encounter_ratings_attach_only_to_the_same_spot(self):
+        from .farm_analyzer import FarmAnalyzer
+
+        # A circuit's path names only its maps' basenames, so two circuits
+        # can share one; the merge keys on the map paths too, and skips an
+        # identity the encounter run rates two ways.
+        def ranked(maps, **fields):
+            return {"path": "circuit[a + b]", "map_paths": maps, **fields}
+
+        east, west = ["maps/east/a", "maps/east/b"], ["maps/west/a", "maps/west/b"]
+        report = {"rankings": {"xp": [ranked(east), ranked(west), ranked(["maps/x"])]}}
+        styled = {"schema_version": 2, "rankings": {"xp": []}, "results": [
+            ranked(west, encounter_applied=True, encounter_safety=0.3),
+            ranked(east, encounter_applied=True, encounter_safety=0.9),
+            ranked(["maps/x"], encounter_applied=True, encounter_safety=0.5),
+            ranked(["maps/x"], encounter_applied=True, encounter_safety=0.6)]}
+        FarmAnalyzer._merge_encounters(report, styled)
+        first, second, ambiguous = report["rankings"]["xp"]
+        self.assertEqual((first["encounter_safety"], second["encounter_safety"]), (0.9, 0.3))
+        self.assertEqual(first["analyzer_schema_version"], 2)
+        self.assertNotIn("encounter_safety", ambiguous)
+        self.assertNotIn("analyzer_schema_version", ambiguous)
 
     def test_risky_approach_reads_unknown_and_lethal_ways_there(self):
         from .farm_analyzer import risky_approach
@@ -22945,14 +23007,24 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertTrue(encounter_warning(dense))
         self.assertEqual(encounter_warning(sparse), "")
 
-    def test_the_selected_spot_records_its_encounter_reasons_and_warning(self):
+    def farm_encounter_alerts(self, client, child):
+        """The dashboard's farm-encounter alerts while autoplay runs ``child``."""
+        from types import SimpleNamespace
         from .alerts import ProgressWatch, active
+        from .web_server import DashboardState
 
+        dashboard = DashboardState(client, TaskEngine(client), built_graph(), {})
+        text = dashboard.farm_encounter_warning(SimpleNamespace(child=child))
+        return [alert["text"] for alert in active(
+            client.state, client.decision_history, ProgressWatch(),
+            autoplay_started_at=time.time() - 60, farm_encounter=text)
+            if alert["id"] == "farm-encounter"]
+
+    def test_the_selected_spot_records_its_encounter_reasons_and_warning(self):
         sparse = self.encounter_spot("Sparse", self.POCKET, worst=3.0, safety=0.88,
                                      xp=0.5e6)
         dense = self.encounter_spot("Dense", self.TREES, worst=9.0, safety=0.79,
                                     xp=2.1e6, expected=1.7)
-        started = time.time() - 60
         for spot, warned in ((sparse, False), (dense, True)):
             client = self.client({"xp": [spot]})
             other = self.POCKET if spot is dense else self.TREES
@@ -22970,37 +23042,31 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
                           f"{spot['name']}: bad pull", rated[-1])
             warnings = [entry["detail"] for entry in client.decision_history
                         if entry["action"] == "farm-spot-encounter-warning"]
-            alerts = active(client.state, client.decision_history, ProgressWatch(),
-                            autoplay_started_at=started)
-            shown = [alert["text"] for alert in alerts if alert["id"] == "farm-encounter"]
+            shown = self.farm_encounter_alerts(client, circuit)
             if warned:
                 self.assertEqual(warnings, ["Dense: encounter safety 0.79 < 0.8, bad pull 9 > 6: "
                                             "Dense: bad pull 9"])
                 self.assertEqual(len(shown), 1)
                 self.assertIn("Dense: encounter safety 0.79", shown[0])
-                # A later selection without a warning clears it.
-                client.record_action("farm-spot-selected", "Sparse (xp): elsewhere")
-                self.assertFalse([alert for alert in active(
-                    client.state, client.decision_history, ProgressWatch(),
-                    autoplay_started_at=started) if alert["id"] == "farm-encounter"])
+                # Once autoplay leaves this circuit (another circuit, or no
+                # farming at all), the alert is gone, whatever the history.
+                self.assertEqual(self.farm_encounter_alerts(client, object()), [])
+                self.assertEqual(self.farm_encounter_alerts(client, None), [])
+                client.decision_history.clear()
+                self.assertEqual(len(self.farm_encounter_alerts(client, circuit)), 1)
             else:
                 self.assertEqual((warnings, shown), ([], []))
 
     def test_the_spot_she_starts_on_is_warned_about_and_re_rated(self):
-        from .alerts import ProgressWatch, active
-
         # Autoplay creates the circuit on the spot it chose, so no
         # selection follows; a new analysis can re-rate the same spot.
         dense = self.encounter_spot("Dense", self.TREES, worst=9.0, safety=0.79,
                                     xp=2.1e6, expected=1.7)
         client = self.client({"xp": [dense]})
         circuit = self.circuit(client, dense)
-        started = time.time() - 60
 
-        def alerted():
-            return [alert["text"] for alert in active(
-                client.state, client.decision_history, ProgressWatch(),
-                autoplay_started_at=started) if alert["id"] == "farm-encounter"]
+        def alerted(child=None):
+            return self.farm_encounter_alerts(client, child or circuit)
 
         self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
         actions = [entry["action"] for entry in client.decision_history]
@@ -23035,8 +23101,8 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         client.farm_analyzer.rankings["xp"] = [sparse]
         second = self.circuit(client, sparse)
         self.assertFalse(second._upgrade_progression(client, second.child.task))
-        self.assertEqual(client.decision_history[-1]["action"], "farm-spot-encounter-clear")
-        self.assertEqual(alerted(), [])
+        self.assertIsNone(client.farm_encounter_warning)
+        self.assertEqual(alerted(second), [])
 
     def test_repeated_pack_deaths_rate_a_spot_hazardous_for_her_kit(self):
         from . import self_improvement as si

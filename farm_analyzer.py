@@ -462,15 +462,17 @@ class CombatProfile:
         return args
 
     def materially_differs(self, other: "CombatProfile | None") -> bool:
-        """Whether a new analysis could rank spots differently."""
+        """Whether a new analysis could rank spots differently. Her combat
+        style and healing feed only the encounter run (encounters_differ),
+        never the ranking."""
         if other is None:
             return True
         if (self.skill, self.skill_level, self.attack, self.character_level,
                 self.max_aggro_pack, self.spell_attack, self.mana_cost,
-                self.meditation, self.combat_style) != (
+                self.meditation) != (
                 other.skill, other.skill_level, other.attack, other.character_level,
                 other.max_aggro_pack, other.spell_attack, other.mana_cost,
-                other.meditation, other.combat_style):
+                other.meditation):
             return True
         if (self.spell_damage > 0) != (other.spell_damage > 0):
             return True
@@ -484,7 +486,6 @@ class CombatProfile:
                 relative(self.damage, other.damage, 0.10) or
                 relative(self.weapon_speed, other.weapon_speed, 0.05) or
                 relative(self.speed, other.speed, 0.05) or
-                relative(self.healing_per_second, other.healing_per_second, 0.15) or
                 relative(self.max_health, other.max_health, 0.10) or
                 abs(self.weapon_class - other.weapon_class) >= 2 or
                 abs(self.armour_class - other.armour_class) >= 2):
@@ -493,6 +494,15 @@ class CombatProfile:
         new = dict(self.protections)
         return any(abs(new.get(name, 0) - old.get(name, 0)) >= 5
                    for name in set(old) | set(new))
+
+    def encounters_differ(self, other: "CombatProfile | None") -> bool:
+        """Whether the encounter run could rate spots differently: another
+        style, or healing more than 15% off."""
+        if other is None:
+            return True
+        return (self.combat_style != other.combat_style or
+                abs(self.healing_per_second - other.healing_per_second) >
+                0.15 * max(abs(other.healing_per_second), 1.0))
 
     def no_survivability_gain(self, earlier: "CombatProfile") -> bool:
         """Whether a failure she had with ``earlier`` still applies to her now.
@@ -723,6 +733,10 @@ class FarmAnalyzer:
     # does not ensure that a kept circuit avoids a map that failed (live,
     # every Burnt Forest circuit shared one).
     AREA_CIRCUITS = 3
+    # The encounter run lists every scored candidate in ``results`` (each
+    # view and the results are cut at --top), so every ranked spot finds
+    # its rating: about 200 candidates at her level.
+    ENCOUNTER_TOP = 5000
 
     def __init__(self, analyzer_root: Path, content_root: Path, server_root: Path, *,
                  python: str = sys.executable,
@@ -755,8 +769,17 @@ class FarmAnalyzer:
         self.spell_samples: list[int] = []
         self.spell_attack = ""
         self.spell_name = ""
-        # Why the last encounter run failed ("" when it did not).
+        # The encounter run (warn only): its task and process, why it last
+        # failed ("" when it did not), when it last started, the profile it
+        # rated and the ranking (report_generation) it was merged into.
+        self._encounter_task: asyncio.Task | None = None
+        self._encounter_process: asyncio.subprocess.Process | None = None
         self.encounter_error = ""
+        self._encounter_attempt_at = 0.0
+        self.encounter_profile: CombatProfile | None = None
+        self.encounter_generation = -1
+        # Bumped each time a ranking run replaces the report.
+        self.report_generation = 0
         # HP of her recent landed heal-spell casts (healing_rate).
         self.heal_samples: list[int] = []
         self._message_position = 0
@@ -812,7 +835,8 @@ class FarmAnalyzer:
             *profile.arguments(styled),
             "--content-root", str(self.content_root),
             "--server-root", str(self.server_root),
-            "--ranking", "all", "--top", str(max(self.TOP, self.SAFETY_TOP)),
+            "--ranking", "all",
+            "--top", str(self.ENCOUNTER_TOP if styled else max(self.TOP, self.SAFETY_TOP)),
             "--json",
             "--unreachable-approach-safety", f"{UNREACHABLE_APPROACH_SAFETY:g}",
         ]
@@ -832,10 +856,6 @@ class FarmAnalyzer:
             # profile of the report it failed to replace.
             return now - self._last_attempt_at >= self.RETRY_SECONDS
         if self.report is None:
-            return True
-        if (self.encounter_error and profile.combat_style and
-                now - self._last_attempt_at >= self.RETRY_SECONDS):
-            # A failed encounter run kept the ranking; retry on the backoff.
             return True
         return (profile.materially_differs(self.profile) or
                 origin != self.origin or
@@ -920,7 +940,7 @@ class FarmAnalyzer:
             return False
         origin = self.approach_origin(client.state)
         if not self.due(profile, origin):
-            return False
+            return self._poll_encounters(profile)
         self._last_attempt_at = self.clock()
         # Report the run as soon as it is scheduled, not when it first runs.
         self.status = "running"
@@ -930,25 +950,86 @@ class FarmAnalyzer:
         self._task = asyncio.get_running_loop().create_task(self._run(profile, origin))
         return True
 
-    async def _analyze(self, command: list[str]) -> dict:
-        """One analyzer process's validated report, or RuntimeError."""
-        self._process = await asyncio.create_subprocess_exec(
+    @property
+    def encounter_running(self) -> bool:
+        return self._encounter_task is not None and not self._encounter_task.done()
+
+    def encounter_due(self, profile: CombatProfile | None) -> bool:
+        """Whether the warn-only encounter run should rate the current
+        ranking: never while either run is running, for a profile without a
+        style, or before one heal has landed (healing_per_second 0 would
+        rate every pull as unhealed and warn about nearly every spot). Then
+        a new ranking, another style or healing 15% off (at most every
+        MIN_INTERVAL_SECONDS) calls for one; a failed one is retried after
+        RETRY_SECONDS."""
+        if (profile is None or self.report is None or self.running or
+                self.encounter_running or not profile.combat_style or
+                profile.healing_per_second <= 0):
+            return False
+        elapsed = self.clock() - self._encounter_attempt_at
+        if self.encounter_error:
+            return elapsed >= self.RETRY_SECONDS
+        if self.encounter_generation != self.report_generation:
+            return True
+        return (elapsed >= self.MIN_INTERVAL_SECONDS and
+                profile.encounters_differ(self.encounter_profile))
+
+    def _poll_encounters(self, profile: CombatProfile) -> bool:
+        if not self.encounter_due(profile):
+            return False
+        self._encounter_attempt_at = self.clock()
+        self._encounter_task = asyncio.get_running_loop().create_task(
+            self._run_encounters(profile, self.report_generation))
+        return True
+
+    async def _run_encounters(self, profile: CombatProfile, generation: int) -> None:
+        """One encounter run, merged into the ranking it was started for.
+        Her ranking never waits for it; a ranking replaced meanwhile drops
+        the result, and the next poll rates the new one."""
+        try:
+            styled = await self._analyze(
+                self.command(profile, self.origin, styled=True), encounter=True)
+        except asyncio.CancelledError:
+            if (self._encounter_process is not None and
+                    self._encounter_process.returncode is None):
+                self._encounter_process.kill()
+            raise
+        except Exception as error:  # Warn only: the ranking stands.
+            self.encounter_error = str(error)
+            log.warning("farming analyzer encounter run failed: %s", error)
+        else:
+            self.encounter_error = ""
+            if generation == self.report_generation and self.report is not None:
+                self._merge_encounters(self.report, styled)
+                self.encounter_profile = profile
+                self.encounter_generation = generation
+        finally:
+            self._encounter_process = None
+
+    async def _analyze(self, command: list[str], *, encounter: bool = False) -> dict:
+        """One analyzer process's validated report, or RuntimeError. The
+        encounter run keeps its process apart (_encounter_process)."""
+        process = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        if encounter:
+            self._encounter_process = process
+        else:
+            self._process = process
         try:
             stdout, stderr = await asyncio.wait_for(
-                self._process.communicate(), self.TIMEOUT_SECONDS)
+                process.communicate(), self.TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            self._process.kill()
-            await self._process.wait()
+            process.kill()
+            await process.wait()
             raise RuntimeError(f"timed out after {self.TIMEOUT_SECONDS:.0f}s")
-        if self._process.returncode != 0:
+        if process.returncode != 0:
             text = stderr.decode(errors="replace")
             detail = text.strip().splitlines()[-1:] or [""]
             error = (_OriginRejected if ORIGIN_REJECTED_TEXT in text
                      else RuntimeError)
             raise error(
-                f"exited with status {self._process.returncode}: {detail[0][:300]}")
+                f"exited with status {process.returncode}: {detail[0][:300]}")
         report = await asyncio.to_thread(json.loads, stdout)
         rankings = report.get("rankings") if isinstance(report, dict) else None
         if not isinstance(rankings, dict) or not all(
@@ -957,27 +1038,40 @@ class FarmAnalyzer:
         return report
 
     @staticmethod
+    def spot_key(spot: dict) -> tuple[str, tuple[str, ...]]:
+        """A spot's identity across runs: its path (a circuit's names only
+        its maps' basenames) and its content-relative map paths."""
+        return (str(spot.get("path", "")),
+                tuple(str(path) for path in spot.get("map_paths") or ()))
+
+    @staticmethod
     def _merge_encounters(report: dict, styled: dict) -> dict:
-        """Copy the encounter run's ENCOUNTER_FIELDS onto the ranking run's
-        spots with the same path, and its schema_version onto the report.
-        Nothing else of the ranking changes. A spot the encounter run did not
-        list keeps the ranking run's unapplied (encounter_applied false)
-        fields."""
+        """Copy the encounter run's ENCOUNTER_FIELDS onto the ranking's
+        spots of the same identity (spot_key), stamping each with the
+        encounter run's schema_version. Nothing the ranking chooses by
+        changes. An identity the encounter run gives two different ratings
+        is skipped rather than attached to the wrong spot; a spot it did not
+        rate keeps the ranking run's unapplied (encounter_applied false)
+        fields, which encounter_rated ignores."""
         version = styled.get("schema_version")
         if not (isinstance(version, int) and not isinstance(version, bool)):
             return report
-        found: dict[str, dict] = {}
-        for spot in [*(spot for ranked in styled["rankings"].values()
-                       if isinstance(ranked, list) for spot in ranked),
-                     *(styled.get("results") or ())]:
-            if isinstance(spot, dict) and isinstance(spot.get("path"), str):
-                found.setdefault(spot["path"], spot)
+        found: dict[tuple, dict | None] = {}
+        for spot in [*(styled.get("results") or ()),
+                     *(spot for ranked in styled["rankings"].values()
+                       if isinstance(ranked, list) for spot in ranked)]:
+            if not isinstance(spot, dict):
+                continue
+            key = FarmAnalyzer.spot_key(spot)
+            fields = {name: spot[name] for name in ENCOUNTER_FIELDS if name in spot}
+            if key in found and found[key] != fields:
+                found[key] = None
+            else:
+                found.setdefault(key, fields)
         for spot in FarmAnalyzer._spots(report):
-            source = found.get(spot.get("path"))
-            if source is not None:
-                spot.update({key: source[key] for key in ENCOUNTER_FIELDS
-                             if key in source})
-        report["schema_version"] = version
+            fields = found.get(FarmAnalyzer.spot_key(spot))
+            if fields:
+                spot.update(fields, analyzer_schema_version=version)
         return report
 
     @staticmethod
@@ -1039,29 +1133,6 @@ class FarmAnalyzer:
 
     async def _run(self, profile: CombatProfile, origin: str = "") -> None:
         log.info("farming analyzer started for %s %d", profile.skill, profile.skill_level)
-        if (self.encounter_error and self.report is not None and profile.combat_style and
-                origin == self.origin and self.profile is not None and
-                not profile.materially_differs(self.profile)):
-            # Only the encounter run failed and nothing she ranks by changed:
-            # retry that run alone, onto the ranking she already has.
-            try:
-                styled = await self._analyze(self.command(profile, origin, styled=True))
-            except asyncio.CancelledError:
-                if self._process is not None and self._process.returncode is None:
-                    self._process.kill()
-                raise
-            except Exception as error:
-                self.encounter_error = str(error)
-                log.warning("farming analyzer encounter retry failed: %s", error)
-            else:
-                self.encounter_error = ""
-                self.report = self._bounded(self._merge_encounters(self.report, styled))
-            finally:
-                self._process = None
-                self.status = "ready"
-                self.finished_at = self.clock()
-                self.duration = self.finished_at - self.started_at
-            return
         try:
             try:
                 report = await self._analyze(self.command(profile, origin))
@@ -1076,21 +1147,6 @@ class FarmAnalyzer:
                 self.rejected_origins.add(origin)
                 origin = ""
                 report = await self._analyze(self.command(profile))
-            if profile.combat_style:
-                # Warn only: a failed encounter run keeps the ranking.
-                try:
-                    styled = await self._analyze(
-                        self.command(profile, origin, styled=True))
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    self.encounter_error = str(error)
-                    log.warning("farming analyzer encounter run failed: %s", error)
-                else:
-                    self.encounter_error = ""
-                    report = self._merge_encounters(report, styled)
-            else:
-                self.encounter_error = ""
             report = self._bounded(report)
         except asyncio.CancelledError:
             if self._process is not None and self._process.returncode is None:
@@ -1102,6 +1158,7 @@ class FarmAnalyzer:
             log.warning("farming analyzer failed: %s", error)
         else:
             self.report = report
+            self.report_generation += 1
             self.profile = profile
             self.origin = origin
             self.status = "ready"
@@ -1144,6 +1201,7 @@ class FarmAnalyzer:
             "approach_origin": self.origin or None,
             "rejected_origins": sorted(self.rejected_origins),
             "encounter_error": self.encounter_error,
+            "encounter_running": self.encounter_running,
             "ranking": [
                 {**{key: item.get(key) for key in SUMMARY_FIELDS},
                  "approach_risky": risky_approach(item),
@@ -1154,12 +1212,13 @@ class FarmAnalyzer:
         }
 
     async def close(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._task, self._encounter_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
 
 async def run_periodically(analyzer: FarmAnalyzer, client, *, interval: float = 30.0) -> None:

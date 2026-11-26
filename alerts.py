@@ -4,8 +4,8 @@ Raised for repeated deaths, starvation, an idle character that cannot reach
 food, a character that is stuck while autoplay runs, a lost connection, a
 task engine whose steps keep failing, and an event loop that stalled. Autoplay adds its own while farming
 is unsafe, and its non-blocking recall note (AutoplayTask.recovery_alerts),
-and a warn-only note when the farm spot it chose rates dangerous by the
-analyzer's encounter model (farm_encounter_warning).
+and a warn-only note while the farm spot it farms rates dangerous by the
+analyzer's encounter model (``farm_encounter``).
 The client keeps a ``ProgressWatch`` current; the dashboard serves the active
 alerts on every live poll.
 """
@@ -35,10 +35,7 @@ ENGINE_ERROR_CRITICAL_SECONDS = 10 * 60.0
 # safety or the connection) stays alerted this long.
 LOOP_STALL_ACTION = "event-loop-stall"
 LOOP_STALL_ALERT_SECONDS = 15 * 60.0
-# The farm circuit's warn-only encounter warning for the spot it chose
-# (farm_analyzer.encounter_warning), recorded right after its selection.
-ENCOUNTER_WARNING_ACTION = "farm-spot-encounter-warning"
-ENCOUNTER_RESET_ACTIONS = ("farm-spot-selected", "farm-spot-encounter-clear")
+
 
 
 class ProgressWatch:
@@ -120,28 +117,11 @@ def loop_stall(decisions: Iterable[dict], now: float) -> tuple[dict | None, int]
     return latest, count
 
 
-def farm_encounter_warning(decisions: Iterable[dict], since: float) -> dict | None:
-    """The encounter warning for the spot autoplay farms now: the latest
-    farm-spot-encounter-warning, if no later spot was selected and no
-    later farm-spot-encounter-clear came, and it came after ``since``
-    (this autoplay run's start); else None."""
-    latest = None
-    for decision in decisions:
-        action = decision.get("action")
-        when = float(decision.get("time", 0) or 0)
-        if when < since:
-            continue
-        if action in ENCOUNTER_RESET_ACTIONS:
-            latest = None
-        elif action == ENCOUNTER_WARNING_ACTION:
-            latest = decision
-    return latest
-
-
 def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
            autoplay_started_at: float | None, task_running: bool = False,
            engine_error: dict | None = None,
            waiting_explained: bool = False,
+           farm_encounter: str = "",
            now: float | None = None) -> list[dict[str, str]]:
     """The alerts that apply right now, most severe first.
 
@@ -151,7 +131,9 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
     (``error``, ``count``, ``since``), or None. ``waiting_explained``:
     autoplay's recovery phase waits at her savebed on a blocker it alerts
     itself (cure-unfunded and the like), so no stuck alert; a stalled
-    errand still raises one.
+    errand still raises one. ``farm_encounter``: the encounter warning for
+    the circuit autoplay farms now (farm_analyzer.encounter_warning, kept
+    by FarmCircuitTask._note_encounter), "" for none; warn only.
     """
     now = time.time() if now is None else now
     alerts: list[dict[str, str]] = []
@@ -201,9 +183,8 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
             alerts.append({"id": "stuck", "level": "warn",
                            "text": f"No XP or movement for {int((now - since) // 60)} min"})
         # Warn only (owner decision, 2026-11-25): the pick stands.
-        warning = farm_encounter_warning(decisions, autoplay_started_at)
-        if warning is not None:
+        if farm_encounter:
             alerts.append({"id": "farm-encounter", "level": "warn",
                            "text": "Farm spot rated dangerous by the encounter model: "
-                                   f"{warning.get('detail', '')}"})
+                                   + farm_encounter})
     return alerts

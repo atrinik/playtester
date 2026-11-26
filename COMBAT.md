@@ -1977,12 +1977,14 @@ estimated XP from 6.1 to 0.76 million an hour: **keep the XP choice, warn
 only.** Her spot choice, risky floor, #130 pack cap and seam exposure are
 unchanged.
 
-- **Two runs** (`FarmAnalyzer._run`). With `--combat-style` the analyzer
-  lowers `spot_safety_score` to the lower of its older estimate and the
-  encounter safety, and with it `safety_score`, the balanced and safety
-  scores and those views' order; the older estimate is not reported
-  separately. So the ranking run, which she chooses by, passes no style.
-  A second, encounter run passes:
+- **Two runs.** With `--combat-style` the analyzer lowers
+  `spot_safety_score` to the lower of its older estimate and the encounter
+  safety, and with it `safety_score`, the balanced and safety scores and
+  those views' order; the older estimate is not reported separately. So
+  the ranking run (`FarmAnalyzer._run`), which she chooses by, passes no
+  style and is re-run only when main would re-run it (`materially_differs`,
+  her savebed, six hours). Once it is in, a separate encounter run
+  (`_run_encounters`, its own task and process) passes:
   - `--combat-style`: `melee` with a weapon, since she fights one target in
     place and `melee_kite` steps away only from a lone pursuer, standing when
     another hostile is close; `ranged-kite` while Wizardry trains with
@@ -1992,44 +1994,51 @@ unchanged.
   - `--healing-per-second` (`healing_rate`): the median HP of her landed
     heal-spell casts (`FarmAnalyzer.heal_samples`, from "The spell heals
     you for N hp!" within 2 s of her FIRE of a healing spell she knows; an
-    applied potion or scroll does not count, as it runs out). A cast waits
-    for her action timer ([heals in melee](#heals-in-melee-2026-11-23)), so
-    one lands about every swing (her weapon speed, or one second while she
-    trains with spells, when the same SP also pays for her damage casts,
-    so that estimate is optimistic) plus a one-second cast, and no faster
-    than her SP regeneration pays for. Until one heal lands it is 0. Her
-    live heals had a median of 12 HP (8 to 26), so with a 3 s weapon she
-    passes 3 HP/s. The ranking run passes it too; without a style it
-    changes no field she ranks by.
-  - `--character-speed`: her displayed speed, as both runs always did.
+    applied potion or scroll does not count, as it runs out), over one
+    swing (her weapon speed, or one second while she trains with spells)
+    plus a one-second cast, since a cast waits for her action timer
+    ([heals in melee](#heals-in-melee-2026-11-23)). That is an upper bound:
+    casts also wait out other actions, and while she trains with spells
+    the same SP pays for her damage casts. It is also capped by her SP
+    regeneration at her cheapest heal spell's cost, which overstates it
+    when a dearer spell is the one that lands. Her live heals had a median
+    of 12 HP (8 to 26), so with a 3 s weapon she passes 3 HP/s. The ranking
+    run passes it too; without a style it changes no field she ranks by.
+  - `--character-speed`: her displayed speed, as the ranking run does.
+  - `--top` `ENCOUNTER_TOP` (5000), so its `results` hold every scored
+    candidate and every ranked spot finds its rating.
 
-  A 15% change in her healing, or another style, calls for a new analysis.
-  Its encounter fields (`ENCOUNTER_FIELDS`) are copied onto the ranking
-  run's spots with the same path (`_merge_encounters`), and the report's
-  `schema_version` is stamped on each spot (`analyzer_schema_version`);
-  `encounter_rated` reads them only from schema 2 with `encounter_applied`.
-  A failed encounter run is logged, shown on the Farming tab and keeps the
-  ranking. It is retried on the failure backoff (15 minutes), the
-  encounter run alone onto the ranking she has while nothing she ranks by
-  changed.
+  It runs only once a heal has landed (with 0 HP/s every pull would rate
+  as unhealed and nearly every spot would warn), then for each new ranking,
+  and for another style or a 15% change in her healing at most every ten
+  minutes (`encounter_due`, `encounters_differ`): none of these re-runs the
+  ranking. Her ranking never waits for it. Its `ENCOUNTER_FIELDS` are copied
+  onto the ranking's spots of the same identity (`spot_key`: the path,
+  which for a circuit names only its maps' basenames, and the map paths)
+  and stamped with its `schema_version` (`analyzer_schema_version`); an
+  identity it rates two ways is skipped. A ranking replaced meanwhile drops
+  the result. A failed encounter run is logged, shown on the Farming tab
+  and retried after `RETRY_SECONDS` (15 minutes). Each run takes about 15
+  to 30 seconds.
 - **Warn only.** `farm-spot-selected` stays as on main. The farm circuit
   (`FarmCircuitTask._note_encounter`) records a `farm-spot-encounter`
   decision with the style, encounter safety, expected and bad pull's packs
   and the first three `encounter_reasons` whenever that rating changes: for
   the spot it starts on, after a switch, and when a new analysis re-rates
-  the same spot (a spot left unrated by a failed encounter run keeps its
-  record). When her spot's encounter safety is under
-  `ENCOUNTER_WARN_SAFETY` (0.8) or its bad pull (`worst_pack`) over
-  `ENCOUNTER_WARN_WORST_PACK` (6), `encounter_warning` names it, the causes
-  and its first two reasons in a `farm-spot-encounter-warning` decision.
-  While autoplay runs, the dashboard raises a `farm-encounter` warning
-  alert from it until another spot is selected or a
-  `farm-spot-encounter-clear` records that her spot does not warn (a new
-  circuit's first spot, or a warned spot re-rated safe). The
-  Farming tab adds an "Encounters" line to each spot, flagged on the same
-  thresholds, with the reasons in its tooltip. Every map she died on rated
-  0.40 to 0.77 with bad pulls of 7 and 8; the maps whose bad pull stays
-  under four health bars rated 0.80 and up.
+  the same spot (a spot left unrated keeps what was noted for it). When her
+  spot's encounter safety is under `ENCOUNTER_WARN_SAFETY` (0.8) or its bad
+  pull (`worst_pack`) over `ENCOUNTER_WARN_WORST_PACK` (6),
+  `encounter_warning` names it, the causes and its first two reasons in a
+  `farm-spot-encounter-warning` decision, and keeps it on the client
+  (`farm_encounter_warning`) with the circuit. The dashboard raises a
+  `farm-encounter` warning alert from that state only while autoplay's
+  child is that circuit, so it ends when autoplay farms another circuit,
+  leaves farming or stops, and does not depend on the decision history. A
+  `farm-spot-encounter-clear` records a warned spot re-rated safe. The
+  Farming tab adds an "Encounters" line to each spot, flagged when it
+  warns, with the reasons in its tooltip. Every map she died on rated 0.40
+  to 0.77 with bad pulls of 7 and 8; the maps whose bad pull stays under
+  four health bars rated 0.80 and up.
 
 A replay of her live state (savebed `world_7_79`, content v1.14.0, her kit
 at 3 HP/s) with the encounter model:
@@ -2045,8 +2054,8 @@ She keeps farming the circuits, now with the warning.
 
 Accepted limits:
 
-- An analysis costs two analyzer processes (about 30 s each, `nice`d, at
-  most every ten minutes).
+- The encounter run is a second `nice`d analyzer process (about 15 to 30
+  s) after each ranking and on healing or style changes.
 - The thresholds are calibrated on one character and one zone, as is the
   analyzer's model.
 - A heal near full health reports what it healed, not what it could, so
