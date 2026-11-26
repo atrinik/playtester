@@ -412,12 +412,13 @@ to sell:
   her (encumbrance starts at 65%), but only where the decision changes
   what she carries: a purchase adds the stock's weight and a sale sheds a
   spare's; swapping between carried items costs nothing. An empty slot
-  always takes an item that adds AC or protection, whatever its speed cap.
-  A shield's cap does not count under a two-handed weapon or launcher, as
-  the server ignores the shield then.
+  always takes armour that is a net gain apart from speed, whatever its
+  speed cap. A shield gives nothing under a two-handed weapon or launcher
+  (the server's two-handed flag), and a two-handed one is charged the worn
+  shield it switches off.
 - **Surplus** is spare gear that no style she can field would put on:
-  melee always, caster once she knows a spell, bow once an archery skill
-  is above level 1.
+  her current build's, melee always, caster once she knows a spell, bow
+  once an archery skill is above level 1.
 - **Girdles and belts** are worn like any other slot (the belt slot).
 - **Fallback.** Two items are compared on the effective scale only when
   both have examine data; otherwise both use the old name-based score

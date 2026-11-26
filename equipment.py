@@ -264,20 +264,6 @@ def archetypes_by_face() -> dict[tuple[str, int], tuple[tuple[str, BaseStats], .
     return {key: tuple(values) for key, values in index.items()}
 
 
-@lru_cache(maxsize=1)
-def two_handed_faces() -> frozenset[tuple[str, int]]:
-    """(face, type) of weapons and launchers whose archetypes sharing that
-    face are all two-handed (``two_handed 1``)."""
-    seen: dict[tuple[str, int], set[bool]] = {}
-    for record in load_archetypes().values():
-        attrs = record.get("attrs", {})
-        item_type = _number(attrs, "type")
-        face = str(attrs.get("face", "") or "").casefold()
-        if item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and face:
-            seen.setdefault((face, item_type), set()).add(bool(_number(attrs, "two_handed")))
-    return frozenset(key for key, flags in seen.items() if flags == {True})
-
-
 def archetype_for(face: str, item_type: int) -> tuple[str, BaseStats] | None:
     """The archetype a carried item's face and type name, if unambiguous.
 
@@ -557,6 +543,8 @@ OFF_STYLE_SHARE = 0.25
 # Arrow damage is taken per second over the launcher's delay, its examine
 # "(delay+N.Ns)"; this stands in when it is not known.
 BOW_REFERENCE_DELAY = 1.0
+# A plain arrow's own delay (last_grace 7 ticks), added to the launcher's.
+ARROW_REFERENCE_DELAY = 7 / TICKS_PER_SECOND
 
 
 def _table(values: tuple, stat: int) -> Any:
@@ -622,8 +610,8 @@ class GearScorer:
     data, both take the fallback (``compare``).
 
     Context terms are the real change on her: an item is valued against her
-    worn set without whatever it would replace (its slot; for a ring, only
-    itself when worn), so speed (with the armour cap clamp), the stat tables
+    worn set without whatever it would replace (its slot; for a ring, see
+    ``_rest``), so speed (with the armour cap clamp), the stat tables
     and caster gains count only what they add at her stats.
     """
 
@@ -723,13 +711,27 @@ class GearScorer:
             return list(self.worn.values())
         # A worn ring's value depends only on itself, so this never recurses.
         replaced = min(rings, key=lambda ring: (self.value(ring) is None,
-                                                self.value(ring) or 0))
+                                                self.value(ring) or 0, ring.tag))
         return [worn for worn in self.worn.values() if worn.tag != replaced.tag]
 
-    def _two_handed(self, item: Item) -> bool:
-        faces = getattr(self.client, "faces", {}) or {}
-        face = str(faces.get(item.face, "") or "").casefold()
-        return (face, item.item_type) in two_handed_faces()
+    @staticmethod
+    def _two_handed(item: Item) -> bool:
+        """A two-handed weapon or launcher: the server's CS_FLAG_WEAPON_2H."""
+        return (item.item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and
+                bool(item.flags & c.ITEM_WEAPON_2H))
+
+    def _shield_off(self, items: list[Item]) -> bool:
+        """Whether a shield gives nothing with these items worn: a
+        two-handed weapon or launcher among them (living_update_player)."""
+        return any(self._two_handed(item) for item in items)
+
+    def _shield_worth(self, rest: list[Item]) -> int:
+        """What the worn shield among ``rest`` gives her apart from speed
+        (which _speed_stats handles), as if nothing two-handed were worn."""
+        shield = next((item for item in rest if item.item_type == c.TYPE_SHIELD), None)
+        if shield is None:
+            return 0
+        return self._value(shield, speed=False, shield_rule=False) or 0
 
     def _speed_stats(self, items: list[Item], extra: Item | None = None,
                      extra_stats: EffectiveStats | None = None
@@ -738,9 +740,7 @@ class GearScorer:
         ``extra``, with ``extra_stats``) worn: a shield counts for nothing
         while a two-handed weapon or launcher is wielded
         (living_update_player)."""
-        everything = [*items, *([extra] if extra is not None else [])]
-        two_handed = any(item.item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and
-                         self._two_handed(item) for item in everything)
+        two_handed = self._shield_off([*items, *([extra] if extra is not None else [])])
 
         def counts(item: Item) -> bool:
             return not (two_handed and item.item_type == c.TYPE_SHIELD)
@@ -806,7 +806,11 @@ class GearScorer:
             self._values[item.tag] = self._value(item)
         return self._values[item.tag]
 
-    def _value(self, item: Item) -> int | None:
+    def _value(self, item: Item, *, speed: bool = True,
+               shield_rule: bool = True) -> int | None:
+        """``speed``: count the speed and weight terms. ``shield_rule``:
+        a shield gives nothing under a two-handed weapon or launcher, and a
+        two-handed one is charged the worn shield it switches off."""
         # A light is chosen for its light, which no stat shows.
         if (item.item_type not in getattr(self.policy, "equipment_types", GEAR_LABELS) or
                 item.item_type == c.TYPE_LIGHT_APPLY):
@@ -815,6 +819,8 @@ class GearScorer:
         if stats is None:
             return None
         rest = self._rest(item)
+        if shield_rule and item.item_type == c.TYPE_SHIELD and self._shield_off(rest):
+            return 0
         own = self._rest_stats(rest)
         new = {name: own[name] + _stat_total(stats, name) for name in STAT_NAMES}
         melee_share = OFF_STYLE_SHARE if self.style == "caster" else (
@@ -833,8 +839,9 @@ class GearScorer:
         dps_without = rest_dam * level_factor * strength(own["Str"]) / self.weapon_delay
         damage = (dps_with - dps_without) * DPS_WEIGHT * melee_share
         # Arrows: the launcher's (or arrow's) WC and damage per shot.
+        # Time between shots: the launcher's delay plus an arrow's (bow.c).
         shot = (stats.delay if stats.item_type == c.TYPE_BOW and stats.delay is not None
-                else BOW_REFERENCE_DELAY)
+                else BOW_REFERENCE_DELAY) + ARROW_REFERENCE_DELAY
         missile = (stats.missile_wc * WC_WEIGHT + stats.missile_dam * DPS_WEIGHT *
                    level_factor * strength(new["Str"]) / max(0.125, shot)) * missile_share
         wc_share = max(melee_share, missile_share)
@@ -862,11 +869,14 @@ class GearScorer:
         attacks = (max(0.0, physical - 100) + sum(
             value for name, value in stats.attacks if name not in PHYSICAL_ATTACKS)
                    ) * (melee_share if item.item_type == c.TYPE_WEAPON else 1.0)
-        speed = (self.speed_delta(item, stats) - self.weight_cost(item)) * self._speed_weight()
+        speed_term = ((self.speed_delta(item, stats) - self.weight_cost(item)) *
+                      self._speed_weight() if speed else 0.0)
+        shield = (self._shield_worth(rest) if shield_rule and self._two_handed(item)
+                  else 0)
         total = (damage + missile + wc + stats.ac * 20 + stats.block * 2 + stats.absorb * 2 +
                  sum(value for _, value in stats.protections) * PROTECTION_WEIGHT +
                  attacks + hp + floor + maxsp + regen + stats.regen_hp +
-                 len(stats.specials) * SPECIAL_WEIGHT + caster + speed)
+                 len(stats.specials) * SPECIAL_WEIGHT + caster + speed_term - shield)
         return round(total)
 
     def score(self, item: Item) -> int:
@@ -918,26 +928,26 @@ class GearScorer:
 
     def fills(self, candidate: Item) -> bool:
         """Whether a free slot takes this item: anything that is not a net
-        loss, and always one that adds AC or protection, whatever its
+        loss, and armour that is a net gain apart from speed, whatever its
         speed cap costs (a body slot is never left empty for its cap)."""
         value = self.value(candidate)
         if value is None or value >= 0:
             return True
-        stats = self.effective(candidate)
-        return stats is not None and (
-            stats.ac > 0 or sum(value for _, value in stats.protections) > 0)
+        apart_from_speed = self._value(candidate, speed=False)
+        return (candidate.item_type in ARMOUR_TYPES and
+                apart_from_speed is not None and apart_from_speed > 0)
 
     def beats(self, candidate: Item, current: list[Item], slots: int = 1
               ) -> tuple[bool, Item | None]:
         """Whether the candidate should replace the weakest of what she
         wears in its slot, and that weakest item: it must beat it by
         CHOICE_MARGIN plus the caster displacement margin. A free slot (one
-        of ``slots``, such as the second ring) takes any item that is not a
-        net loss on the effective scale."""
+        of ``slots``, such as the second ring) takes what ``fills`` takes."""
         if len(current) < slots:
             return self.fills(candidate), None
         mine, theirs, effective = self.compare(candidate, current)
-        index = min(range(len(current)), key=theirs.__getitem__)
+        # Ties go to the lower tag, as _rest picks the ring it replaces.
+        index = min(range(len(current)), key=lambda i: (theirs[i], current[i].tag))
         worst = current[index]
         margin = CHOICE_MARGIN + self.displacement_margin(worst, effective)
         return mine > theirs[index] + margin, worst

@@ -561,7 +561,7 @@ def working_recall(client: AtrinikClient,
         now_working = True
     now = clock()
     held = getattr(client, "gear_recall", None)
-    if held is None:
+    if not isinstance(held, dict):
         held = {"value": now_working, "pending": None, "since": now}
         with contextlib.suppress(AttributeError):
             client.gear_recall = held
@@ -8022,16 +8022,22 @@ class BuyShopUpgradeTask(BotTask):
         scorer = gear_scorer(client, self.policy,
                              lambda item: self._gear_score(client, item),
                              weight_for=WEIGHT_UNOWNED)
-        if len(current) < len(slots):
-            # A free slot (the second ring): nothing is displaced.
-            current = []
+        free = len(current) < len(slots)
+        if free:
+            # A free slot (the second ring): nothing worn is displaced; a
+            # spare she already carries is the baseline, so she never buys
+            # what the equip loop declined to wear.
+            current = [item for item in client.state.inventory
+                       if item.item_type == candidate.item_type and
+                       not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID) and
+                       self.policy.identified(item)]
         mine, theirs, effective = scorer.compare(candidate, current)
         scored = list(zip(theirs, current))
-        baseline = ((max if len(slots) == 1 else min)(
+        baseline = ((max if len(slots) == 1 or free else min)(
             scored, key=lambda value: value[0]) if scored else None)
         improvement = mine - (baseline[0] if baseline is not None else 0)
-        # Once she is loaded, GearScorer charges each item's weight
-        # (weight_cost) on both sides, so the weight difference counts.
+        # Once she is loaded, GearScorer charges the stock's weight
+        # (weight_cost): a purchase adds it; what she owns stays carried.
         margin = (scorer.displacement_margin(baseline[1], effective)
                   if baseline is not None else 0)
         return (improvement if improvement >= self.min_improvement + margin

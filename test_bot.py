@@ -29529,9 +29529,17 @@ class GearScorerTests(unittest.TestCase):
         # An item adding nothing but slowness still stays off.
         lead = self.examined(3, c.TYPE_BOOTS, "lead boots", "lead boots (speed-1)")
         self.assertFalse(gear_scorer(self.client(lead), InventoryPolicy()).beats(lead, [])[0])
+        # The override is for armour that is a net gain apart from speed:
+        # never a ring whose AC hides a stat loss.
+        ring = self.examined(4, c.TYPE_RING, "ring (ac+1) (Dex-3)", "ring (ac+1) (Dex-3)")
+        scorer = gear_scorer(self.client(ring), InventoryPolicy())
+        self.assertLess(scorer.value(ring), 0)
+        self.assertFalse(scorer.beats(ring, [], 2)[0])
 
     def test_gear_scoring_follows_recall_only_once_it_holds(self):
         from .tasks import GEAR_RECALL_HOLD_SECONDS, working_recall
+        with patch("atrinik_bot.navigation.has_working_recall", lambda client: False):
+            self.assertFalse(working_recall(Mock()))      # no state to keep
         client = self.client()
         now = [0.0]
         states = iter([True, False, True, False, False, False])
@@ -29564,28 +29572,50 @@ class GearScorerTests(unittest.TestCase):
         self.assertEqual({item.tag for item in scorer._rest(weak)}, {1})
         # The shop: with a ring slot free, nothing is displaced.
         client.state.equipment.pop(c.EQUIP_RING_LEFT)
-        weak.flags &= ~c.ITEM_APPLIED
         client.state.remove_item(weak.tag)
+        client.state.remove_item(candidate.tag)
         stock = Item(5, flags=c.ITEM_UNPAID, item_type=c.TYPE_RING, quality=80,
                      condition=100, name="ring (Protections: acid +9%)")
         client.state.place_item(stock, 0)
         task = BuyShopUpgradeTask()
         self.assertEqual(task._upgrade_score(client, stock), 9 * 8)
+        # A carried spare ring she declined to wear is the baseline.
+        spare = Item(6, item_type=c.TYPE_RING, quality=80, condition=100,
+                     name="ring (Protections: acid +9%)")
+        client.state.place_item(spare, 1)
+        self.assertLess(task._upgrade_score(client, stock), 0)
 
-    def test_a_shield_under_a_two_handed_weapon_caps_no_speed(self):
+    def test_a_shield_gives_nothing_under_a_two_handed_weapon(self):
+        # living.c skips the shield while a two-handed weapon or launcher
+        # is wielded (the server's CS_FLAG_WEAPON_2H on the item).
         from .tasks import InventoryPolicy, gear_scorer
         halberd = self.examined(1, c.TYPE_WEAPON, "halberd", "halberd (dam+9) (3.00 sec)",
                                 worn=True)
-        halberd.face = 40
+        halberd.flags |= c.ITEM_WEAPON_2H
         shield = self.examined(2, c.TYPE_SHIELD, "tower shield",
                                "tower shield (speed cap 0.50) (ac+4)", worn=True)
         client = self.client(halberd, shield,
                              equipment={c.EQUIP_WEAPON: 1, c.EQUIP_SHIELD: 2})
-        client.faces = {40: "halberd.101"}
         scorer = gear_scorer(client, InventoryPolicy())
         self.assertEqual(scorer.speed_delta(shield), 0.0)
-        client.faces = {40: "longsword.101"}
-        self.assertLess(gear_scorer(client, InventoryPolicy()).speed_delta(shield), 0.0)
+        self.assertEqual(scorer.value(shield), 0)
+        halberd.flags &= ~c.ITEM_WEAPON_2H
+        one_handed = gear_scorer(client, InventoryPolicy())
+        self.assertLess(one_handed.speed_delta(shield), 0.0)
+        # Counted again: AC +4 against its 0.50 cap (no recall here: the
+        # speed weight is 1.5 times SPEED_WEIGHT).
+        weight = one_handed._speed_weight()
+        self.assertEqual(weight, 2250)
+        self.assertEqual(one_handed.value(shield), round(80 - (0.875 - 0.5) * weight))
+        # A two-handed candidate is charged the shield it switches off
+        # (AC +4, 80) and credited the cap it lifts.
+        two = self.examined(3, c.TYPE_WEAPON, "glaive", "glaive (dam+9) (3.00 sec)")
+        two.flags |= c.ITEM_WEAPON_2H
+        client.state.place_item(two, 1)
+        scorer = gear_scorer(client, InventoryPolicy())
+        lifted = (0.875 - 0.5) * weight
+        self.assertAlmostEqual(scorer.value(two) - scorer.value(halberd), lifted - 80,
+                               delta=1)
 
     def test_a_family_is_ordered_on_one_scale(self):
         from .tasks import InventoryPolicy, carried_gear_score, gear_scorer
