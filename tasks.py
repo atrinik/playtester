@@ -4164,16 +4164,18 @@ class FarmTask(BotTask):
     DRY_RETREAT_RADIUS = 3
     DRY_RESUME_SP = 0.5
 
-    async def dry_caster_step(self, client: AtrinikClient, active: list) -> bool:
+    async def dry_caster_step(self, client: AtrinikClient, active: list,
+                              in_view: list | None = None) -> bool:
         """A fielded caster out of SP disengages for real: once her spell
         is unaffordable with an attacking hostile in contact (adjacent,
         recent hostile contact), the dry episode begins (one
         ``caster-out-of-mana`` record). Until her SP is back to
         DRY_RESUME_SP she retreats while any active hostile (``active``,
         the tick's (distance, x, y, obj) entries) is within
-        DRY_RETREAT_RADIUS and waits while one is in view farther off: no
-        spell-only kite. With none in view the farm's other paths run.
-        True while it took the tick."""
+        DRY_RETREAT_RADIUS and waits while any monster (``in_view``, the
+        tick's threats) is in view: no spell-only kite, no target. With
+        none in view the farm's other paths run. True while it took the
+        tick."""
         if not self.fielded_caster or not self.spell_only_training(client):
             self._caster_dry = False
             return False
@@ -4197,10 +4199,11 @@ class FarmTask(BotTask):
             self._caster_dry = False
             return False
         if nearest is None:
-            # Nothing active in view: the farm's own paths (an unseen
-            # attacker's retreat, loot, the training rest, which pulls
-            # nothing until her SP is back) run, the episode kept.
-            return False
+            # Nothing active, but a monster in view (passive or not yet
+            # roused): hold, so no target is chosen or pulled. With none in
+            # view the farm's own paths (an unseen attacker's retreat, loot,
+            # the training rest) run, the episode kept.
+            return bool(in_view)
         if nearest <= self.DRY_RETREAT_RADIUS:
             await self.low_health_retreat(client)
         return True
@@ -7359,7 +7362,7 @@ class FarmTask(BotTask):
         engaged = next((entry for entry in threats
                         if entry[3].target_id == engaged_id), None)
         if await self.dry_caster_step(client, [
-                entry for entry in threats if active_threat(entry)]):
+                entry for entry in threats if active_threat(entry)], in_view=threats):
             return
         nearby_pack = [
             entry for entry in threats

@@ -1152,8 +1152,10 @@ class FarmAnalyzer:
             raw = int(match.group(1)) - int(match.group(2))
             if raw > 0:
                 self.spell_samples = (self.spell_samples + [raw])[-SPELL_SAMPLES:]
+                # Re-inserted, so the most recently cast spells are last
+                # (her memory keeps the newest, builds.load_spell_samples).
                 self.samples_by_spell[spell] = (
-                    self.samples_by_spell.get(spell, []) + [raw])[-SPELL_SAMPLES:]
+                    self.samples_by_spell.pop(spell, []) + [raw])[-SPELL_SAMPLES:]
                 self.attack_by_spell[spell] = attack
                 self.spell_attack = attack
 

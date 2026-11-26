@@ -42104,6 +42104,9 @@ class BuildPerSpotTests(unittest.TestCase):
             self.assertTrue(asyncio.run(farm.dry_caster_step(
                 client, [(6, 0, 0, hostile[3])])))
             self.assertEqual(len(retreats), 2)
+            # ... holds while a passive monster is in view (no target) ...
+            self.assertTrue(asyncio.run(farm.dry_caster_step(
+                client, [], in_view=[(2, 0, 0, hostile[3])])))
             # ... and with none in view lets the farm's own paths (loot,
             # the rest that pulls nothing until her SP is back) run.
             self.assertFalse(asyncio.run(farm.dry_caster_step(client, [])))

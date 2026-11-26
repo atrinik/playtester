@@ -2115,7 +2115,8 @@ gap says so.
   a fielded caster disengages (`FarmTask.dry_caster_step`, one
   `caster-out-of-mana` decision per episode): until her SP is back to half
   her bar she retreats while any active hostile is within 3 tiles and
-  waits while one is in view farther off, never kiting; with none in view
+  waits while any monster is in view, never kiting or choosing a target;
+  with none in view
   the farm's other paths run (an unseen attacker's retreat, loot, and the
   training rest, which pulls nothing until her SP is back).
 - **Spell damage.** A caster build's damage per hit is the median of her
