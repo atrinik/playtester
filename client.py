@@ -461,6 +461,10 @@ class AtrinikClient:
         # Switching characters on a long-lived client: the previous one's
         # vitals, messages and actions must not explain this one's death.
         same_character = self._memory_character == character
+        # Her counts since their last write, before the record is reloaded
+        # (a reconnect) or another character's replaces it.
+        self._flush_route_visits()
+        self._route_visits_saved_at = -math.inf
         if self._memory_character and not same_character:
             self.vitals.clear()
             self.review_messages.clear()
@@ -637,8 +641,12 @@ class AtrinikClient:
                 str(path): float(until)
                 for path, until in (hazards.items() if isinstance(hazards, dict) else ())
                 if isinstance(until, (int, float))}
-            self.state.route_map_visits, self.state.route_edge_uses = \
-                route_variety.load(record.get("route_visits"))
+            try:
+                self.state.route_map_visits, self.state.route_edge_uses = \
+                    route_variety.load(record.get("route_visits"))
+            except Exception as error:  # Never fails a login.
+                log.warning("route visits not loaded: %s", error)
+                self.state.route_map_visits, self.state.route_edge_uses = {}, {}
             quotes = record.get("vendor_quotes", {})
             self.state.vendor_quotes = {
                 str(key): dict(value)
@@ -1184,12 +1192,15 @@ class AtrinikClient:
         self._persist_character_memory()
 
     def remember_route_visits(self, *, now: float | None = None,
-                              force: bool = False) -> None:
+                              force: bool = False, character: str = "") -> None:
         """Keep her route-variety counts (route_variety.py) in her character
         memory next to her route hazards: in the record at once, written at
         most every route_variety.PERSIST_SECONDS (any other save of her
-        character memory writes them too), or now with ``force``."""
-        character = self.state.player_name or self.config.character
+        character memory writes them too), or now with ``force`` (a
+        disconnect, a character switch, a clean shutdown). Every write
+        waits at most route_events.WRITE_TIMEOUT; a failed one waits for
+        the next window."""
+        character = character or self.state.player_name or self.config.character
         if not character:
             return
         self._runtime_memory.setdefault(character, {})["route_visits"] = \
@@ -1197,16 +1208,23 @@ class AtrinikClient:
         monotonic = time.monotonic()
         if not force and monotonic - self._route_visits_saved_at < route_variety.PERSIST_SECONDS:
             return
+        # A failed save waits for the next window too: a locked database
+        # is never retried at every crossing.
+        self._route_visits_saved_at = monotonic
         try:
-            # From a tick: never SQLite's usual 10 s wait. A failed save is
-            # tried again at the next crossing.
+            # From a tick: never SQLite's usual 10 s wait.
             self._memory_store().save(
                 character, "state", self._runtime_memory.get(character, {}),
                 timeout=route_events.WRITE_TIMEOUT)
         except Exception as error:  # A count never fails a tick.
             log.warning("route visits not saved: %s", error)
-            return
-        self._route_visits_saved_at = monotonic
+
+    def _flush_route_visits(self) -> None:
+        """Write the loaded character's route-variety counts now, if any
+        (a disconnect, a character switch or reload, a clean shutdown)."""
+        character = self._memory_character
+        if character and (self.state.route_map_visits or self.state.route_edge_uses):
+            self.remember_route_visits(force=True, character=character)
 
     def record_vendor_quote(
             self, key: str, item: str, unit_cost: int) -> None:
@@ -1764,6 +1782,7 @@ class AtrinikClient:
             if reports:
                 self._save_post_mortems(character, reports)
         route_shadow.close(self)
+        self._flush_route_visits()
         self._closed = True
         await self._close_transport()
         self.state.phase = "disconnected"
@@ -1813,6 +1832,7 @@ class AtrinikClient:
                     await self._close_transport()
                 except OSError:
                     pass
+                self._flush_route_visits()
                 self.state.phase = "disconnected"
                 self.progress_watch.observe(self.state)
             if not self.config.reconnect or self._closed:

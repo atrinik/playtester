@@ -3481,6 +3481,16 @@ class NavigateTask(BotTask):
                 self.care is not None or
                 [search.edges[index] for index in search.transitions] != route):
             return route
+        if (self.hazard_fallback_taken or self._threat_fallback or
+                self._route_threat_maps - {self.destination}):
+            # Only a route clean at every tier varies: a fallback or threat
+            # tier's alternative could spend longer among the hazards. The
+            # destination (a farm spot is often a pack map) is entered by
+            # every route alike.
+            self._record(client, route_variety.ROUTE_VARIETY,
+                         f"{self.destination}: best route kept; it takes a "
+                         "hazard tier")
+            return route
         deadline = time.monotonic() + route_variety.SEARCH_SECONDS
         try:
             choice = self._variety_choice(client, route, search, deadline)
@@ -3518,6 +3528,23 @@ class NavigateTask(BotTask):
         of its most used edges (up to route_variety.MAX_CANDIDATES), one
         priced by her counts; each a native search over the kept graph.
         Then their walking cost (spawn costs included) and the choice."""
+        source = client.state.map.path
+        danger = (self._known_ranged_hazard_maps(client, any_level=True) |
+                  self._known_overlevel_hazard_maps(client) |
+                  self._known_pack_hazard_maps(source) |
+                  set(self.KNOWN_LETHAL_TRANSIT) |
+                  self._learned_route_hazards(client) |
+                  set(self._variety_avoid or ()))
+        if source in danger or any(edge.destination in danger and
+                                   edge.destination != self.destination
+                                   for edge in route):
+            # She starts on, or the best route crosses, a hazard, a route
+            # death or a quarantined spot: only clean routes vary. Every
+            # route enters the destination alike.
+            self._record(client, route_variety.ROUTE_VARIETY,
+                         f"{self.destination}: best route kept; it starts on "
+                         "or enters a hazard")
+            return None
         now = time.time()
         uses = getattr(client.state, "route_edge_uses", {}) or {}
         subjects = [route_blocks.edge_subject(edge) for edge in search.edges]
@@ -3529,9 +3556,13 @@ class NavigateTask(BotTask):
         # More than any route that avoids it: the edge is left out unless
         # no route can avoid it.
         avoid = sum(base) + 1
+        ways = route_variety.pair_uses(uses, now)
+
+        def use(subject: str) -> float:
+            return ways.get(route_variety.pair(subject), 0.0)
+
         best_subjects = [route_blocks.edge_subject(edge) for edge in route]
-        ordered = sorted(dict.fromkeys(best_subjects),
-                         key=lambda subject: -route_variety.decayed(uses.get(subject), now))
+        ordered = sorted(dict.fromkeys(best_subjects), key=lambda subject: -use(subject))
         routes: list[list[MapEdge]] = []
         for subject in ordered[:route_variety.MAX_CANDIDATES]:
             self._variety_check(client, deadline)
@@ -3543,7 +3574,7 @@ class NavigateTask(BotTask):
                     route_blocks.edge_subject(edge) for edge in alternative}:
                 routes.append(alternative)
         self._variety_check(client, deadline)
-        priced = [cost + math.ceil(min(3.0, route_variety.decayed(uses.get(subject), now)))
+        priced = [cost + math.ceil(min(3.0, use(subject)))
                   for cost, subject in zip(base, subjects)]
         alternative = search.search(priced)
         if alternative:
@@ -3566,17 +3597,21 @@ class NavigateTask(BotTask):
         candidates = [route_variety.candidate(
             candidate, self._walk_cost(client, candidate, deadline, memo))
             for candidate in routes]
-        source = client.state.map.path
-        danger = (self._known_ranged_hazard_maps(client, any_level=True) |
-                  self._known_overlevel_hazard_maps(client) |
-                  self._known_pack_hazard_maps(source) |
-                  set(self.KNOWN_LETHAL_TRANSIT) |
-                  self._learned_route_hazards(client) |
-                  set(self._variety_avoid or ()))
         return route_variety.choose(
             best, candidates, edge_uses=uses, danger=danger,
             tolerance=route_variety.tolerance(client), now=now,
             rng=self.variety_rng)
+
+    def _took_exit(self, client: AtrinikClient, edge: MapEdge) -> bool:
+        """Whether where she arrived shows she took ``edge`` itself: an
+        exit's authored arrival square (another exit between the same maps,
+        or a displaced arrival, lands elsewhere). Seams and voyages are
+        counted by their maps anyway."""
+        if edge.kind != "exit":
+            return True
+        m = client.state.map
+        return (m.path == edge.destination and
+                (m.world_x, m.world_y) == _edge_arrival(self.graph, edge))
 
     @staticmethod
     def _save_timeout(client: AtrinikClient) -> float | None:
@@ -5293,7 +5328,8 @@ class NavigateTask(BotTask):
                 self._voyage = None
                 self._record(client, "navigation-voyage-arrived",
                              route_blocks.edge_subject(arrived))
-            route_variety.note_crossing(client, arrived, save_timeout=self._save_timeout(client))
+            route_variety.note_crossing(client, arrived, exact=self._took_exit(client, arrived),
+                                        save_timeout=self._save_timeout(client))
         if not self.route or self.route[0].source != client.state.map.path:
             if self._voyage is not None:
                 self._voyage_landed_elsewhere(client)
@@ -5353,8 +5389,9 @@ class NavigateTask(BotTask):
                      edge.destination,
                      (edge.destination_x, edge.destination_y),
                      allow_locked=self._allow_locked(client)))):
-            route_variety.note_crossing(client, self.route.pop(0),
+            route_variety.note_crossing(client, edge, exact=self._took_exit(client, edge),
                                         save_timeout=self._save_timeout(client))
+            self.route.pop(0)
 
 
 class NavigateThenTask(BotTask):

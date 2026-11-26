@@ -103,7 +103,10 @@ def _valid(raw: Any, now: float, limit: int) -> dict[str, tuple[float, float]]:
                 not isinstance(count, (int, float)) or
                 not isinstance(at, (int, float))):
             continue
-        count, at = float(count), float(at)
+        try:
+            count, at = float(count), float(at)
+        except (OverflowError, ValueError, TypeError):
+            continue
         if (not math.isfinite(count) or not math.isfinite(at) or count <= 0 or
                 at > now + 60.0 or now - at > FORGET_SECONDS):
             continue
@@ -131,18 +134,49 @@ def dump(maps: dict[str, tuple[float, float]],
             "edges": {key: [round(count, 3), at] for key, (count, at) in edges.items()}}
 
 
-def note_crossing(client: Any, edge: Any, *, now: float | None = None,
+def pair(subject: str) -> str:
+    """The (source, destination) maps of an edge subject, as
+    "pair:SOURCE>DESTINATION": the twin doors of one entrance, or an exit
+    and a seam between the same two maps, are one way."""
+    kind, _, rest = subject.partition(":")
+    if kind == PAIR:
+        return subject
+    head, _, destination = rest.rpartition(">")
+    return f"{PAIR}:{head.split(':', 1)[0]}>{destination}"
+
+
+PAIR = "pair"
+
+
+def pair_uses(edge_uses: dict[str, tuple[float, float]], now: float) -> dict[str, float]:
+    """Her decayed use of each (source, destination) pair: the sum over
+    its subjects (route_variety's counts)."""
+    uses: dict[str, float] = {}
+    for subject, entry in edge_uses.items():
+        value = decayed(entry, now)
+        if value > 0:
+            key = pair(subject)
+            uses[key] = uses.get(key, 0.0) + value
+    return uses
+
+
+def note_crossing(client: Any, edge: Any, *, exact: bool = True,
+                  now: float | None = None,
                   save_timeout: float | None = None) -> None:
     """She crossed ``edge`` on a trip (on the loop): count the edge and the
     map it entered, record a first visit for the dashboard, and keep the
-    counts in her memory. ``save_timeout`` bounds the decision ledger's
-    save (a tick never waits SQLite's usual 10 s for it).
+    counts in her memory. ``exact`` is False when where she arrived does
+    not show she took that very exit (another of its maps' exits, a
+    displaced arrival): only the pair of maps is counted, and no exit is
+    recorded. ``save_timeout`` bounds the decision ledger's save (a tick
+    never waits SQLite's usual 10 s for it).
 
-    A first exit is a secret one (SECRET_EXIT) when it is authored
-    invisible and leaves a map she already knew: a new way out of a
-    familiar place. ``invis_exit`` also authors ordinary cave mouths and
-    house doors, so a hidden exit from a map new to her is only a new
-    exit."""
+    An exit is new only when its pair of maps is (the second square of a
+    double door is no new way). A new exit is a secret one (SECRET_EXIT)
+    when it is authored invisible and leaves a map she already knew: a new
+    way out of a familiar place. ``invis_exit`` also authors ordinary cave
+    mouths and house doors, so a hidden exit from a map new to her is only
+    a new exit."""
     state = getattr(client, "state", None)
     edges = getattr(state, "route_edge_uses", None)
     maps = getattr(state, "route_map_visits", None)
@@ -150,8 +184,10 @@ def note_crossing(client: Any, edge: Any, *, now: float | None = None,
         return
     now = time.time() if now is None else now
     subject = edge_subject(edge)
+    way = pair(subject)
     known_source = decayed(maps.get(edge.source), now) > 0.0
-    new_edge = bump(edges, subject, now, MAX_EDGES)
+    new_pair = way not in pair_uses(edges, now)
+    bump(edges, subject if exact else way, now, MAX_EDGES)
     new_map = (edge.destination != edge.source and
                bump(maps, edge.destination, now, MAX_MAPS))
     recorder = getattr(client, "record_action", None)
@@ -159,7 +195,7 @@ def note_crossing(client: Any, edge: Any, *, now: float | None = None,
         timeout = {} if save_timeout is None else {"save_timeout": save_timeout}
         if new_map:
             recorder(NEW_MAP, f"{edge.destination} (from {edge.source})", **timeout)
-        if new_edge and getattr(edge, "kind", "exit") == "exit":
+        if exact and new_pair and getattr(edge, "kind", "exit") == "exit":
             secret = bool(getattr(edge, "hidden", False)) and known_source
             recorder(SECRET_EXIT if secret else NEW_EXIT,
                      f"{subject} ({edge.label or 'exit'})", **timeout)
@@ -185,11 +221,12 @@ def tolerance(client: Any) -> float:
 @dataclass(frozen=True, slots=True)
 class Candidate:
     """A route (its edges), its walking cost in steps, the edge subjects
-    it crosses and the maps it enters."""
+    it crosses, the maps it enters, in order and as a set."""
     edges: tuple
     cost: float
     subjects: tuple[str, ...]
     maps: frozenset[str]
+    sequence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,11 +240,10 @@ class Choice:
     best_cost: float
 
 
-def usage(edge_uses: dict[str, tuple[float, float]], subjects: Iterable[str],
-          now: float) -> tuple[int, float, float]:
-    """(unvisited edges, their share, mean decayed use) of a route's
-    subjects."""
-    values = [decayed(edge_uses.get(subject), now) for subject in subjects]
+def usage(uses: dict[str, float], subjects: Iterable[str]) -> tuple[int, float, float]:
+    """(unvisited ways, their share, mean decayed use) of a route's
+    subjects, each counted by its pair of maps (``pair_uses``)."""
+    values = [uses.get(pair(subject), 0.0) for subject in subjects]
     if not values:
         return 0, 0.0, 0.0
     unvisited = sum(value < UNVISITED_BELOW for value in values)
@@ -222,8 +258,10 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
     ``candidates``.
 
     A candidate is eligible when its cost is at most ``tolerance`` above
-    the best route's and it enters no ``danger`` map (a hazard of any tier,
-    a route death, a quarantined spot) that the best route does not.
+    the best route's, it enters no ``danger`` map (a hazard of any tier,
+    a route death, a quarantined spot) that the best route does not, and
+    it crosses other maps than the best route (another square of the same
+    doors is no other way).
     Among the best route and the eligible ones, the largest share of
     unvisited edges wins (a share, so a route is never preferred only for
     having more edges), then the least mean use, then a random draw."""
@@ -231,13 +269,13 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
     danger = frozenset(danger)
     allowed = best.maps & danger
     limit = best.cost * (1.0 + tolerance)
-    seen = {best.subjects}
+    seen = {best.sequence}
     eligible = [best]
     longer = dangerous = 0
     for candidate in candidates:
-        if candidate.subjects in seen:
+        if candidate.sequence in seen:
             continue
-        seen.add(candidate.subjects)
+        seen.add(candidate.sequence)
         if candidate.cost > limit:
             longer += 1
             continue
@@ -246,12 +284,14 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
             continue
         eligible.append(candidate)
 
+    uses = pair_uses(edge_uses, now)
+
     def key(candidate: Candidate) -> tuple:
-        _, share, mean = usage(edge_uses, candidate.subjects, now)
+        _, share, mean = usage(uses, candidate.subjects)
         return (round(share, 3), -round(mean, 2), rng.random())
 
     chosen = max(eligible, key=key)
-    unvisited, _, mean = usage(edge_uses, chosen.subjects, now)
+    unvisited, _, mean = usage(uses, chosen.subjects)
     reason = (f"{len(eligible) - 1} alternative(s) within {tolerance:.0%}"
               f" ({longer} longer, {dangerous} more dangerous left out);"
               f" {unvisited} unvisited edge(s), mean use {mean:.1f}")
@@ -261,4 +301,5 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
 def candidate(edges: Sequence[Any], cost: float) -> Candidate:
     return Candidate(tuple(edges), float(cost),
                      tuple(edge_subject(edge) for edge in edges),
-                     frozenset(edge.destination for edge in edges))
+                     frozenset(edge.destination for edge in edges),
+                     tuple(edge.destination for edge in edges))

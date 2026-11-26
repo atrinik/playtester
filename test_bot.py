@@ -44348,10 +44348,10 @@ class RouteVarietyTests(unittest.TestCase):
         from . import route_variety as rv
 
         now = 1_000_000.0
-        best = rv.Candidate(("a",), 10.0, ("exit:a", "exit:b"), frozenset())
+        best = rv.Candidate(("a",), 10.0, ("exit:a", "exit:b"), frozenset(), ("/a",))
         # Three unvisited edges of six against one of two: the same share.
         longer = rv.Candidate(("b",), 10.0, tuple(f"exit:{i}" for i in range(6)),
-                              frozenset())
+                              frozenset(), ("/b",))
         uses = {"exit:a": (5.0, now), **{f"exit:{i}": (5.0, now) for i in range(3)}}
         picks = {rv.choose(best, [longer], edge_uses=uses, danger=(), tolerance=0.15,
                            now=now, rng=__import__("random").Random(seed)).varied
@@ -44374,6 +44374,102 @@ class RouteVarietyTests(unittest.TestCase):
         self.assertEqual(task._walk_cost(client, [seam], deadline, {}), 16 + 1)
         self.assertEqual(task._walk_cost(client, [door], deadline, {}), 1 + 4)
 
+    def test_a_route_that_takes_a_hazard_tier_or_crosses_a_hazard_keeps_the_best(self):
+        from . import navigation as navigation_module
+
+        cases = {
+            # Over-level spawns on both ways: only the fallback tier routes.
+            "fallback tier": lambda graph, client: graph.map_monster_levels.update(
+                {"/a": {"dragon": 99}, "/b": {"dragon": 99}}),
+            # A ranged map she may cross at her level is still a hazard.
+            "ranged map": lambda graph, client: graph.map_monster_levels.update(
+                {"/a": {"skeleton archer": 1}}),
+            "start map": lambda graph, client: client.state.farm_zone_quarantine.update(
+                {"/s": time.time() + 3600}),
+        }
+        for name, make in cases.items():
+            with self.subTest(name):
+                graph, client = self.graph(), self.client()
+                self.used(client, *self.A_EDGES, count=20.0)
+                make(graph, client)
+                route, actions, _ = self.plan(self.trip(graph), client)
+                self.assertEqual(self.maps(route)[-1], "/d")
+                self.assertIn("best route kept", actions[-1][1])
+                self.assertNotIn("took", actions[-1][1])
+        # A pack map on the best route (only world_* maps rate as packs).
+        graph, client = self.graph(), self.client()
+        self.used(client, *self.A_EDGES, count=20.0)
+        with patch.object(navigation_module.NavigateTask, "_known_pack_hazard_maps",
+                          return_value={"/a"}):
+            route, actions, _ = self.plan(self.trip(graph), client)
+        self.assertIn("best route kept", actions[-1][1])
+
+    def test_twin_door_squares_are_one_way(self):
+        # An entrance of two adjacent exit squares to the same map: the
+        # other square is no other route, and no new exit.
+        from . import route_variety as rv
+
+        graph = WorldGraph()
+        for path in ("/s", "/a", "/d"):
+            graph.nodes[path] = self.open_node(path)
+        graph.nodes["/s"].edges += [
+            MapEdge("/s", "/a", 2, 10, 10, 10, "exit", "door"),
+            MapEdge("/s", "/a", 2, 11, 10, 11, "exit", "door")]
+        graph.nodes["/a"].edges.append(MapEdge("/a", "/d", 10, 0, 10, 10, "exit", "stairs"))
+        client = self.client()
+        self.used(client, *self.A_EDGES, count=20.0)
+        route, actions, _ = self.plan(self.trip(graph), client)
+        self.assertEqual(self.maps(route), ["/a", "/d"])
+        self.assertIn("best route kept; 0 alternative(s)", actions[-1][1])
+        recorded = []
+        client.record_action = lambda action, detail="", **_: recorded.append(action)
+        rv.note_crossing(client, graph.nodes["/s"].edges[1])
+        self.assertNotIn(rv.NEW_EXIT, recorded)
+
+    def test_only_the_exit_she_took_is_counted_as_that_exit(self):
+        from . import route_variety as rv
+
+        client = self.client()
+        recorded = []
+        client.record_action = lambda action, detail="", **_: recorded.append(action)
+        door = MapEdge("/s", "/a", 2, 10, 10, 10, "exit", "door")
+        task = self.trip(self.graph())
+        client.state.map.path = "/a"
+        client.state.map.world_x, client.state.map.world_y = 4, 4
+        self.assertFalse(task._took_exit(client, door))
+        rv.note_crossing(client, door, exact=task._took_exit(client, door))
+        self.assertEqual(set(client.state.route_edge_uses), {"pair:/s>/a"})
+        self.assertEqual(recorded, [rv.NEW_MAP])
+        client.state.map.world_x, client.state.map.world_y = 10, 10
+        self.assertTrue(task._took_exit(client, door))
+
+    def test_counts_are_written_on_a_switch_and_a_failed_write_backs_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.load_character_memory("Sera")
+            client.state.player_name = "Sera"
+            from . import route_variety as rv
+            rv.note_crossing(client, MapEdge("/s", "/a", 2, 10, 10, 10, "exit", "door"))
+            rv.note_crossing(client, MapEdge("/a", "/d", 10, 0, 10, 10, "exit", "stairs"))
+            # Another character: hers are written first.
+            client.load_character_memory("Mallory")
+            client.load_character_memory("Sera")
+            self.assertIn("/d", client.state.route_map_visits)
+            saves = []
+
+            class Locked:
+                def save(self, *args, **kwargs):
+                    saves.append(kwargs.get("timeout"))
+                    raise sqlite3.OperationalError("database is locked")
+
+            client._memory_store = lambda: Locked()
+            with self.assertLogs("atrinik_bot.client", "WARNING"):
+                client.remember_route_visits()
+            client.remember_route_visits()
+            client.remember_route_visits()
+            self.assertEqual(saves, [0.25])
+
     def test_stored_counts_are_validated(self):
         from . import route_variety as rv
 
@@ -44382,7 +44478,8 @@ class RouteVarietyTests(unittest.TestCase):
             "maps": {"/a": [3, now - 60], "/future": [1, now + 3600],
                      "/old": [1, now - rv.FORGET_SECONDS - 1], "/nan": [float("nan"), now],
                      "/neg": [-1, now], "/bool": [True, now], "/huge": [1e9, now],
-                     "": [1, now], "/x" * 400: [1, now], "/short": [1]},
+                     "": [1, now], "/x" * 400: [1, now], "/short": [1],
+                     "/overflow": [10 ** 400, now]},
             "edges": ["not", "a", "dict"]}, now)
         self.assertEqual(maps, {"/a": (3.0, now - 60), "/huge": (rv.COUNT_CAP, now)})
         self.assertEqual(edges, {})

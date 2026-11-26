@@ -1575,16 +1575,24 @@ alternate between routes about as good as the best (`route_variety.py`).
   memory as `route_visits`, next to `route_hazards`. A count halves every
   24 h, is forgotten after a week without use and is capped at 20; the
   tables keep the 500 maps and 1,000 edges used last. A load drops a
-  malformed, non-finite, future or forgotten entry. The record is updated
-  at each crossing and written at most every 5 minutes (sooner with any
-  other save of her character memory).
+  malformed, non-finite, overflowing, future or forgotten entry. An exit
+  is counted as that exit only when she arrives on its authored arrival
+  square (`_took_exit`); otherwise, as a seam always is, by its pair of
+  maps (`pair:SOURCE>DESTINATION`). The record is updated at each crossing
+  and written at most every 5 minutes, and at once on a disconnect, a
+  character switch or reload and a clean shutdown, each write waiting at
+  most 0.25 s; a failed write waits for the next window. A crash loses the
+  counts since the last write (at most about 5 minutes).
 - **Optional trips** (`optional_trip`, `NavigateTask.vary_route`): the farm
   circuit's walk to a spot, and the maintenance errands: the junk sale,
   the bank balance and deposit, apartment storage and set swaps, mass
   identification, upgrade and utility shopping, and spell purchases. A
   trip marked essential or critical, a care crossing or its walk home,
   learned-cost plans, and a character below 70 % HP, hungry, starving or
-  depleted never vary. Critical escapes, recall walks, survival and cure
+  depleted never vary; nor does a route that took a hazard fallback or
+  threat tier, crosses a threat map, or starts on or crosses a danger map
+  (below) other than the destination, which every route enters alike: only
+  routes clean at every tier vary. Critical escapes, recall walks, survival and cure
   trips and timed quest steps are never marked. Only the trip's first
   plan varies (`start`, `prepare`): never a replan, and a trip that failed
   (`fail`, so the farm return's fallback retry) never again.
@@ -1593,8 +1601,9 @@ alternate between routes about as good as the best (`route_variety.py`).
   its avoided and penalized maps, exclusions, owner walls and offer). On
   that graph, with no new expansion of the world, one native search
   avoids each of the best route's most used edges (up to 8), and one
-  prices every edge by her counts. A candidate that adds a voyage is
-  dropped.
+  prices every edge by her counts. A candidate that adds a voyage, or
+  crosses the same maps as the best route (another square of the same
+  doors), is dropped.
 - **Cost.** Each route's walk in steps: each map's authored path
   (`local_path`) with the walk's spawn-radius cost (`_spawn_costs`, 1.6) on
   a farm trip's maps, plus 4 steps an exit or voyage (a load), one step a
@@ -1612,11 +1621,15 @@ alternate between routes about as good as the best (`route_variety.py`).
   `KNOWN_LETHAL_TRANSIT`, learned route hazards), her counting route
   deaths and her quarantined spots: the same hazard tier or a safer one.
   Among the best route and the eligible ones she takes the one with the
-  largest share of unvisited edges (a count under 0.5; a share, so a
-  route never wins only for having more edges), then the least mean use,
-  a random draw breaking ties. The shadow report (route_shadow.py) still
-  compares the planner's best route. Once a road is the more used, the other wins
-  the next trip.
+  largest share of unvisited ways (each edge counted by its pair of maps,
+  so the twin squares of one entrance are one way; under 0.5 is
+  unvisited; a share, so a route never wins only for having more edges),
+  then the least mean use,
+  a random draw breaking ties. Once a road is the more used, the other
+  wins the next trip. The shadow report (route_shadow.py) still compares
+  the planner's best route. The walk cost ignores live blockers (threat
+  halos, occupants): they change by the second, and the walk itself
+  steps round them as on any route.
 - **Bounds.** The search runs once a trip, in the trip's own plan on the
   planner worker (1.12, `_plan_on_copy`); a plan made on the loop
   (`_plan_here`) never runs it. It gives up after 2 s and keeps the
@@ -1629,13 +1642,13 @@ alternate between routes about as good as the best (`route_variety.py`).
   the best route kept), its cost against the best route's and how many
   alternatives were left out as longer or more dangerous. A map she
   enters for the first time in her memory records `route-new-map`; an exit
-  taken for the first time `route-new-exit`, or `route-secret-exit` when
+  she took (`_took_exit`) between a pair of maps new to her records
+  `route-new-exit` (never the other square of a known door), or `route-secret-exit` when
   it is authored invisible (`sys_object` or `invisible`, `MapEdge.hidden`)
   and leaves a map she already knew: a new way out of a familiar place.
   `invis_exit` also authors ordinary cave mouths and house doors, so a
   hidden exit from a map new to her counts only as new. Their ledger saves
-  wait at most 0.25 s, as the tick's other records do; counts made since
-  the last write are lost on a crash (at most 5 minutes).
+  wait at most 0.25 s, as the tick's other records do.
   These are decision records (the decision list and `actions_total`), not
   the observation ledger, which keeps only her authored readings.
 
