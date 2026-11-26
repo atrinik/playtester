@@ -748,9 +748,11 @@ recovery phase:
   again; the next walk, after `HOME_RETRY_SECONDS`, is checked afresh.
   Quest trips take the same fallback from the same level (the Fort
   Sether Illness quest had no route out of the Burnt Forest), only as a
-  defended leg that heals below 85% and steps away below 70%: a
-  dialogue trip's walk becomes a `NavigateThenTask`, never a bare
-  navigation.
+  defended leg. From level 18 every dialogue trip's walk is a defended
+  `combat_approach` leg (`NavigateThenTask`, never a bare navigation),
+  and from level 18 dialogue walks and quest farm and kill legs carry a
+  leg policy that heals below 85% and steps away below 70% for the whole
+  leg, not only where it crosses a hazard map. Both are intended.
   Already home (a death during the rest respawns her there), she does
   not rest. The rest, its record and the home-unreachable streak are the
   recovery task's own memory: a rebuilt task (autoplay's handover, Stop

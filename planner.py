@@ -58,6 +58,16 @@ PRIORITY_OTHER = 2
 # Jobs for whichever worker is current, in priority, then submission, order.
 _jobs: queue.PriorityQueue = queue.PriorityQueue()
 _order = itertools.count()
+# The futures of the jobs submitted and not yet finished, queued or
+# running (busy): added on submit, removed when a job ends or is skipped as
+# cancelled, or when its worker is abandoned (unstick).
+_outstanding: set[concurrent.futures.Future] = set()
+_outstanding_lock = threading.Lock()
+
+
+def _settle(future: concurrent.futures.Future) -> None:
+    with _outstanding_lock:
+        _outstanding.discard(future)
 
 
 class _Worker:
@@ -90,6 +100,8 @@ class _Worker:
                priority: int = PRIORITY_OTHER,
                **kwargs: Any) -> concurrent.futures.Future:
         future: concurrent.futures.Future = concurrent.futures.Future()
+        with _outstanding_lock:
+            _outstanding.add(future)
         _jobs.put((priority, next(_order), (future, fn, args, kwargs)))
         return future
 
@@ -103,6 +115,7 @@ class _Worker:
                 return
             future, fn, args, kwargs = item[2]
             if not future.set_running_or_notify_cancel():
+                _settle(future)
                 continue
             self.future, self.started_at = future, time.monotonic()
             try:
@@ -113,6 +126,7 @@ class _Worker:
                 future.set_result(result)
             finally:
                 self.future = None
+                _settle(future)
 
 
 _worker: _Worker | None = None
@@ -150,6 +164,10 @@ def unstick(limit: float) -> str:
         _generation += 1
         _worker = _Worker(_generation)
         _worker.start()
+        # Its job's result is never read: it no longer makes the planner
+        # busy.
+        if current.future is not None:
+            _settle(current.future)
     note = (f"planner worker {current.generation} ran one job for more than "
             f"{limit:.0f} s; worker {_generation} started")
     log.warning("%s", note)
@@ -173,11 +191,12 @@ def on_worker() -> bool:
 
 
 def busy() -> bool:
-    """Whether the worker is running a job or has jobs queued: a plan
-    submitted now would wait for them."""
-    current = _worker
-    return ((current is not None and current.future is not None) or
-            not _jobs.empty())
+    """Whether a job is running or queued that a plan submitted now would
+    wait for: a dropped (cancelled) job still queued does not count. A job
+    counts from its submission until it ends, with no gap while the
+    worker takes it from the queue."""
+    with _outstanding_lock:
+        return any(not future.cancelled() for future in _outstanding)
 
 
 def submit(fn: Callable[..., Any], /, *args: Any,

@@ -2459,8 +2459,8 @@ class FarmTask(BotTask):
         # every rotation.
         self._lore_book_attempts: set[int] = set()
         # Obsolete food drops by casefolded name (drop_obsolete_food):
-        # (drops sent, no drop before, given up and recorded).
-        self._food_drops: dict[str, tuple[int, float, bool]] = {}
+        # (drops sent, no drop before, given up and recorded, tag dropped).
+        self._food_drops: dict[str, tuple[int, float, bool, int]] = {}
         self._spellbook_attempts: set[int] = set()
         self._engaged_target: tuple[int, str, int, int, float] | None = None
         self._last_threat_origin: tuple[str, int, int, float] | None = None
@@ -4647,26 +4647,29 @@ class FarmTask(BotTask):
         needs a quiet square too: no target and no hostile contact for
         FOOD_DROP_QUIET_SECONDS.
 
-        Stacks are matched by name, so loot that merges into a stack after a
-        drop is handled as that stack. A name still carried after a drop is
-        dropped again after FOOD_DROP_RETRY_SECONDS, doubled each time; after
-        FOOD_DROP_TRIES drops it is kept, recorded once
-        (``obsolete-food-kept``). A name no longer carried starts afresh.
+        Drops are kept per name, with the tag last dropped. A drop failed
+        only while that same tag is still carried (loot merged into it is
+        dropped with it): then the name is dropped again after
+        FOOD_DROP_RETRY_SECONDS, doubled each time, and after FOOD_DROP_TRIES
+        drops it is kept, recorded once (``obsolete-food-kept``). Once the
+        dropped tag is gone the drop worked, and a new stack of that name
+        (fresh loot) starts afresh.
         """
         junk = obsolete_food(client)
-        carried = {item.name.casefold() for item in junk}
+        carried = {item.tag for item in junk}
         self._food_drops = {name: entry for name, entry in self._food_drops.items()
-                            if name in carried}
+                            if entry[3] in carried}
         now = time.monotonic()
         due = []
         for item in junk:
             name = item.name.casefold()
-            tries, retry_at, kept = self._food_drops.get(name, (0, 0.0, False))
+            tries, retry_at, kept, tag = self._food_drops.get(
+                name, (0, 0.0, False, 0))
             if now < retry_at:
                 continue
             if tries >= self.FOOD_DROP_TRIES:
                 if not kept:
-                    self._food_drops[name] = (tries, retry_at, True)
+                    self._food_drops[name] = (tries, retry_at, True, tag)
                     log.warning("%s stays in her pack after %d drops", item.name, tries)
                     recorder = getattr(client, "record_action", None)
                     if recorder is not None:
@@ -4680,9 +4683,10 @@ class FarmTask(BotTask):
             return False
         item = due[0]
         name = item.name.casefold()
-        tries = self._food_drops.get(name, (0, 0.0, False))[0] + 1
+        tries = self._food_drops.get(name, (0, 0.0, False, 0))[0] + 1
         self._food_drops[name] = (
-            tries, now + self.FOOD_DROP_RETRY_SECONDS * 2 ** (tries - 1), False)
+            tries, now + self.FOOD_DROP_RETRY_SECONDS * 2 ** (tries - 1), False,
+            item.tag)
         await client.move_item(0, item.tag, item.quantity)
         recorder = getattr(client, "record_action", None)
         if recorder is not None:

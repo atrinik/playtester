@@ -189,9 +189,10 @@ which rules apply (`hunger.py`):
   map, a map with a shop floor or mat, a savebed, merchant or priest, or
   her apartment), on a quiet square: no target and no hit for 10 seconds
   (`obsolete-food-drop`). Food never triggers a junk sale or holds back cure
-  funding. A stack still carried after a drop, matched by name, is dropped
-  again after 1, then 2 minutes; after three drops it is kept and
-  `obsolete-food-kept` says why. Junk food is only ordinary server-typed
+  funding. A drop failed only while the same stack is still
+  carried; it is then dropped again after 1, then 2 minutes, and after
+  three drops kept, with `obsolete-food-kept` saying why. Fresh loot of a
+  name already dropped starts afresh. Junk food is only ordinary server-typed
   food: quest food (any item a formal quest's objectives name), named food
   (a capital letter or a possessive, such as Gimli's lembas), food whose
   name has a reserve word (quest, key, talisman, artifact, unique,
