@@ -3513,7 +3513,11 @@ class FarmTask(BotTask):
             # cast again (a caster-out-of-mana record at most every
             # DRY_RECORD_SECONDS, not one per regenerated cast).
             sp = int(client.state.stats.get("sp", 0) or 0)
-            dry = (cost > sp - self.healing_mana_reserve(client) and
+            reserve = self.healing_mana_reserve(client)
+            # Only a bar that can ever pay a cast is "dry"; one that never
+            # can is the ordinary weapon path below, with no rests for SP.
+            castable = maxsp <= 0 or cost <= maxsp - reserve
+            dry = (castable and cost > sp - reserve and
                    not ManaCrystal.has_charge(client))
             now = time.monotonic()
             if dry and not self._caster_dry and now - self._caster_dry_at >= self.DRY_RECORD_SECONDS:

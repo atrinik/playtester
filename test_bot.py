@@ -42169,6 +42169,13 @@ class BuildPerSpotTests(unittest.TestCase):
         client.state.stats["sp"] = 0
         self.assertFalse(task.spell_only_training(client))
         self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 2)
+        # A bar that can never pay a cast beyond her healing reserve is not
+        # "dry": the ordinary weapon path, with no rests for SP.
+        client.state.inventory.append(Item(60, item_type=c.TYPE_SPELL, name="minor healing",
+                                           extra={"cost": 40}))
+        self.assertFalse(task.spell_only_training(client))
+        self.assertFalse(task._caster_dry)
+        client.state.inventory.pop()
         # A charged mana crystal to draw from: not dry, the spell routine
         # (which draws) stays.
         from .tasks import ManaCrystal
