@@ -623,7 +623,10 @@ starvations.
     her first step on the next tick, so her trip (a route-death hold)
     sees the route first.
   - An edge excluded meanwhile drops the plan, which is planned again
-    with it. A trip dropped with its plan under way cancels it
+    with it. Expired exclusions are pruned on the trip itself when a plan
+    is asked for, not only on its copy. A worker thread blocks every
+    signal but the faults, so a signal the main thread holds blocked
+    (the feedback filer's SIGTERM during cleanup) never goes to it. A trip dropped with its plan under way cancels it
     (`weakref.finalize`): queued it never runs, running it stops at its
     next tier (`_check_cancelled` in `_route_points`).
   - Essential and critical trips (`critical`: an aborted expedition's

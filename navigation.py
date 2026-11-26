@@ -2935,6 +2935,9 @@ class NavigateTask(BotTask):
         (the loop may change the trip's meanwhile) and care crossing; the
         rest is shared and only read. ``live`` plans a trip not started yet
         as the trip itself (prepare): a live plan, not a probe."""
+        # Expired exclusions are pruned here, on the trip itself: the copy
+        # prunes only its own.
+        self._excluded_edges
         twin = copy.copy(self)
         if live:
             twin.status = TaskStatus.RUNNING

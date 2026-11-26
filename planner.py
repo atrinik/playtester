@@ -40,6 +40,7 @@ import inspect
 import itertools
 import logging
 import queue
+import signal
 import threading
 import time
 from collections.abc import Callable
@@ -68,6 +69,25 @@ _outstanding_lock = threading.Lock()
 def _settle(future: concurrent.futures.Future) -> None:
     with _outstanding_lock:
         _outstanding.discard(future)
+
+
+# Signals the process receives from outside: a worker thread never takes
+# one. A process-directed signal goes to any thread that does not block it,
+# so with a worker alive, a SIGTERM the main thread holds blocked (the
+# feedback filer's cleanup, pthread_sigmask) was taken by the worker
+# instead and handled early. Faults raised by the thread itself stay
+# unblocked.
+_FAULTS = {"SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGABRT", "SIGTRAP", "SIGSYS"}
+
+
+def _block_signals() -> None:
+    """Block every signal but the faults on the calling (worker) thread:
+    they are the main thread's to take."""
+    if not hasattr(signal, "pthread_sigmask"):
+        return
+    signal.pthread_sigmask(signal.SIG_BLOCK, {
+        number for number in signal.valid_signals()
+        if getattr(number, "name", "") not in _FAULTS})
 
 
 class _Worker:
@@ -106,6 +126,7 @@ class _Worker:
         return future
 
     def _run(self) -> None:
+        _block_signals()
         _local.generation = self.generation
         while _worker is self:
             item = _jobs.get()
