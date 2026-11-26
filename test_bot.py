@@ -42155,8 +42155,10 @@ class BuildPerSpotTests(unittest.TestCase):
         client.state.messages = []
         task.release_engagement(100)
         client.combat.clear()
-        kobold = client.state.map.tile(9, 8).objects.pop(3)
-        client.state.map.tile(12, 8).objects[3] = kobold
+        client.state.map.tile(9, 8).objects.pop(3)
+        client.state.map.tile(12, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
+        client.state.target_id = 101
         for _ in range(3):
             tick(client, task)
         self.assertTrue(client.fired)
@@ -42200,6 +42202,12 @@ class BuildPerSpotTests(unittest.TestCase):
         self.assertFalse(task.spell_only_training(client))
         self.assertTrue(client.combat and all(client.combat))
         self.assertEqual(client.direct_moves, [])
+        # A full bar ends the latch even in the fight.
+        client.state.stats["sp"] = 100
+        self.assertTrue(task.spell_only_training(client))
+        client.state.stats["sp"] = 0
+        self.assertFalse(task.spell_only_training(client))
+        client.state.stats["sp"] = 4
         client.state.messages = []
         task.release_engagement(100)
         client.state.map.tiles.clear()
@@ -42218,6 +42226,14 @@ class BuildPerSpotTests(unittest.TestCase):
         tick(client, task)
         self.assertTrue(task._caster_dry)
         self.assertIn("training-rest", [action for action, _ in client.actions])
+        self.assertTrue(task._training_resting)
+        # A fight between rests restarts the clock: only quiet rest counts.
+        task._dry_rest_since -= task.DRY_REST_STALL_SECONDS
+        client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+        self.assertFalse(task.spell_only_training(client))
+        self.assertIsNone(task._dry_rest_sp)
+        client.state.messages = []
+        tick(client, task)
         self.assertTrue(task._training_resting)
         task._dry_rest_since -= task.DRY_REST_STALL_SECONDS
         tick(client, task)
@@ -42635,6 +42651,10 @@ class BuildPerSpotTests(unittest.TestCase):
                          {"ok": True, "retried": ["firestorm"]})
         self.assertEqual((real.learn_errand_failed, real.learn_errand_failures,
                           real.learn_errand_retry), ({}, {}, {"firestorm"}))
+        # A second retry before the circuit sees the first keeps both.
+        real.learn_errand_failed = {"icestorm": "gave up"}
+        asyncio.run(server._action({"type": "retry_learn"}))
+        self.assertEqual(real.learn_errand_retry, {"firestorm", "icestorm"})
         # The retry ends the retried spell's route backoff only, never a
         # seller's money refusal; backoffs are per spell.
         client.learn_errand_failed, client.learn_errand_retry = {}, {"firestorm"}

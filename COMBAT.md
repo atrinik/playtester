@@ -2115,11 +2115,12 @@ gap says so.
   charged mana crystal to draw from, fights with her wielded weapon by the
   ordinary melee rules (pack split with the melee pack cap, heals,
   retreat, flee and recall). Dry stays latched for the rest of the fight
-  (an engaged target or recent hostile contact), so one regenerated cast
+  (an engaged target or recent hostile contact, short of a full bar), so
+  one regenerated cast
   does not send her back to kiting; out of the fight she rests for mana as
   the spell routine does, rather than pulling with her weapon, while her
-  SP rises (after 60 s without a point gained she stops resting and the
-  ordinary farm goes on). Before her stats arrive she is not dry. A
+  SP rises (after 60 s of quiet rest without a point gained she stops
+  resting and the ordinary farm goes on). Before her stats arrive she is not dry. A
   `caster-out-of-mana` decision is recorded at most once a minute.
   Without a weapon she keeps the spell-only routine. The spot was rated
   for the caster build (owner decision, 2026-11-26): her melee fallback

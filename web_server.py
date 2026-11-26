@@ -1804,7 +1804,8 @@ class WebControlServer:
             self.client.learn_errand_failures = failures
             # The retried spells' route or dialogue backoffs end too
             # (_needs_learn_spell), never a seller's money refusal.
-            self.client.learn_errand_retry = set(retried)
+            self.client.learn_errand_retry = set(
+                getattr(self.client, "learn_errand_retry", None) or ()) | set(retried)
             return {"ok": True, "retried": retried}
         if kind == "chat":
             text = str(data.get("text", "")).strip()
