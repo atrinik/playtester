@@ -5133,6 +5133,10 @@ class NavigateThenTask(BotTask):
     # A stand lasts at most this long, then the walk goes on for at least
     # APPROACH_STAND_COOLDOWN_SECONDS: wanderers must not hold her for ever.
     APPROACH_STAND_SECONDS = 45.0
+    # A stand against three or more has no such limit, but one that none
+    # of them reaches (across water, at range, wanderers) for this long
+    # ends the trip rather than hold her for ever or take them in.
+    APPROACH_TRAIN_STAND_SECONDS = 180.0
     APPROACH_STAND_COOLDOWN_SECONDS = 30.0
     # How far she looks for a doorway, corridor or safe square to stand at.
     DEFENSIBLE_RADIUS = 6
@@ -6019,9 +6023,12 @@ class NavigateThenTask(BotTask):
         APPROACH_STAND_PURSUERS or more pursuers she stands; with more
         than APPROACH_PACK_CAP, or heals outpaced, she leads them away
         while she has leads left (LEAD_AWAY_LIMIT a trip). A stand against
-        two lasts at most APPROACH_STAND_SECONDS, then the walk goes on
-        for APPROACH_STAND_COOLDOWN_SECONDS; against three or more it has
-        no limit, so she never walks onto the farm map with them.
+        two lasts at most APPROACH_STAND_SECONDS (a pursuer reaching her
+        restarts it), then the walk goes on for
+        APPROACH_STAND_COOLDOWN_SECONDS; against three or more it has no
+        such limit, so she never walks onto the farm map with them: one
+        none of them reaches for APPROACH_TRAIN_STAND_SECONDS fails the
+        trip instead.
         Nothing runs under seam contact (_seam_retreat_contact).
         """
         m = client.state.map
@@ -6067,10 +6074,22 @@ class NavigateThenTask(BotTask):
                 recorder("approach-lead-away",
                          f"pursuers={len(pursuers)} lead={self._leads}")
             return "lead"
-        if not self._stand_since:
-            self._stand_since = now
-            if recorder is not None:
+        if not self._stand_since or any(
+                threat[0] <= 1 for threat in pursuers):
+            # A pursuer reaching her keeps the stand fresh.
+            if not self._stand_since and recorder is not None:
                 recorder("approach-stand", f"pursuers={len(pursuers)}")
+            self._stand_since = now
+        elif train and (now - self._stand_since >=
+                        self.APPROACH_TRAIN_STAND_SECONDS):
+            self._stand_since = 0.0
+            if recorder is not None:
+                recorder("approach-train-held",
+                         f"pursuers={len(pursuers)}")
+            self.fail(f"{len(pursuers)} followers held the approach to "
+                      f"{self.navigation.destination} for "
+                      f"{self.APPROACH_TRAIN_STAND_SECONDS:.0f}s")
+            return ""
         elif (now - self._stand_since >= self.APPROACH_STAND_SECONDS and
               not train):
             self._stand_since = 0.0
@@ -6702,7 +6721,7 @@ class NavigateThenTask(BotTask):
         # A stand holding a doorway, corridor or safe square fights there:
         # the split's retreat step would give the square up.
         holding = bool(approach_stand and node is not None and node.terrain
-                       and self._defensible(
+                       and not healing_outpaced(client) and self._defensible(
                            client, node, (m.world_x, m.world_y)))
         split = (overwhelmed and not hold_fire and not safety_hold and
                  not seam_beside and not holding)

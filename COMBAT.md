@@ -2444,8 +2444,11 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
     defensible square the pack split and cornered rules still apply; on
     one the split's retreat step is skipped, so two closing in do not
     move her off it. A stand against two lasts at most 45 s, then the
-    walk goes on for at least 30 s, so wanderers cannot hold her; against
-    three or more it has no limit;
+    walk goes on for at least 30 s, so wanderers cannot hold her (a
+    pursuer reaching her restarts it); against three or more it has no
+    such limit, but one that none of them reaches for 180 s fails the trip
+    (`approach-train-held`) rather than take them in. On a defensible
+    square with heals outpaced the split's step is kept;
   - with more than 2 (the pack cap), or heals outpaced, she **leads them
     away** (`approach-lead-away`), combat off, on this map: to the nearest
     cleared-trail square more than 9 tiles from all of them, else to the

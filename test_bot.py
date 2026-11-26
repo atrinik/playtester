@@ -43295,6 +43295,7 @@ class SafeRetreatTests(unittest.TestCase):
         self.assertEqual(client.direct_moves, [])
         self.assertNotIn("navigation-retreat-choice",
                          [a for a, _ in client.recorded])
+        self.assertNotIn(False, client.combat)
 
     def test_three_followers_are_never_taken_onto_the_spot(self):
         client, walk = self._approach()
@@ -43309,6 +43310,17 @@ class SafeRetreatTests(unittest.TestCase):
         walk._stand_since = time.monotonic() - walk.APPROACH_STAND_SECONDS - 1
         self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
         self.assertEqual(walk._stand_cooldown_until, 0.0)
+        self.assertNotEqual(walk.status, TaskStatus.FAILED)
+        # None of them reaching her for APPROACH_TRAIN_STAND_SECONDS: the
+        # trip fails rather than take them in.
+        walk._stand_since = (time.monotonic() -
+                             walk.APPROACH_TRAIN_STAND_SECONDS - 1)
+        walk._last_defense_action = 0.0
+        asyncio.run(walk._defend_while_navigating(client))
+        self.assertEqual(walk.status, TaskStatus.FAILED)
+        self.assertIn("approach-train-held", [a for a, _ in client.recorded])
+        walk.status = TaskStatus.RUNNING
+        walk._stand_since = time.monotonic() - walk.APPROACH_STAND_SECONDS - 1
         # Two past the limit: the walk goes on.
         monsters = monsters[:2]
         self._place(client, monsters)
