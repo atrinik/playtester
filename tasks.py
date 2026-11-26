@@ -8,7 +8,6 @@ import logging
 import random
 import re
 import time
-import xml.etree.ElementTree as ET
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -974,14 +973,17 @@ def obsolete_food(client: AtrinikClient) -> list[Item]:
     """
     if not food_obsolete(client):
         return []
+    global _quest_catalog_warned
     try:
         from .quests import quest_item_names
-        wanted = quest_item_names()
-    except (ImportError, OSError, ET.ParseError) as exc:
-        global _quest_catalog_warned
+    except ImportError as exc:
         if not _quest_catalog_warned:
             _quest_catalog_warned = True
-            log.warning("quest catalog unreadable (%s); keeping carried food", exc)
+            log.warning("quest catalog unavailable (%s); keeping carried food", exc)
+        return []
+    wanted = quest_item_names()
+    if wanted is None:
+        # Unreadable quest data (warned once, and cached): keep it all.
         return []
     reserve = InventoryPolicy().reserve_words + JunkPolicy().keep_patterns
     junk = []
@@ -2455,8 +2457,9 @@ class FarmTask(BotTask):
         # most once per live item tag instead of reopening the same book on
         # every rotation.
         self._lore_book_attempts: set[int] = set()
-        # Obsolete food stacks already dropped (drop_obsolete_food): one try each.
-        self._food_drop_attempts: set[int] = set()
+        # Obsolete food drops by casefolded name (drop_obsolete_food):
+        # (drops sent, no drop before, given up and recorded).
+        self._food_drops: dict[str, tuple[int, float, bool]] = {}
         self._spellbook_attempts: set[int] = set()
         self._engaged_target: tuple[int, str, int, int, float] | None = None
         self._last_threat_origin: tuple[str, int, int, float] | None = None
@@ -4629,35 +4632,62 @@ class FarmTask(BotTask):
 
     # Seconds without hostile contact before she drops obsolete food.
     FOOD_DROP_QUIET_SECONDS = 10.0
+    # A stack still carried after a drop is tried again after this, doubled
+    # each time, and given up after FOOD_DROP_TRIES drops.
+    FOOD_DROP_RETRY_SECONDS = 60.0
+    FOOD_DROP_TRIES = 3
 
     async def drop_obsolete_food(self, client: AtrinikClient) -> bool:
-        """Drop one stack of obsolete food no shop would buy; True if sent.
+        """Drop one stack of obsolete food; True if the drop was sent.
 
         Where food is obsolete (hunger.food_obsolete) carried food is junk
-        (obsolete_food). Identified food goes with the next junk sale
-        (JunkPolicy.food_tags); unidentified food, which no shop buys
-        (JunkPolicy sells only identified items), is dropped here, on a
-        safe square: no target, no hostile contact for
-        FOOD_DROP_QUIET_SECONDS, and outside an apartment, whose floor
-        keeps what is dropped on it. Each stack is tried once.
+        (obsolete_food). The caller picks the map (navigation.food_drop_map:
+        open country or a dungeon, never a town, shop or unique map); this
+        needs a quiet square too: no target and no hostile contact for
+        FOOD_DROP_QUIET_SECONDS.
+
+        Stacks are matched by name, so loot that merges into a stack after a
+        drop is handled as that stack. A name still carried after a drop is
+        dropped again after FOOD_DROP_RETRY_SECONDS, doubled each time; after
+        FOOD_DROP_TRIES drops it is kept, recorded once
+        (``obsolete-food-kept``). A name no longer carried starts afresh.
         """
-        unsellable = [item for item in obsolete_food(client)
-                      if item.tag not in self._food_drop_attempts and
-                      not self.inventory_policy.identified(item)]
+        junk = obsolete_food(client)
+        carried = {item.name.casefold() for item in junk}
+        self._food_drops = {name: entry for name, entry in self._food_drops.items()
+                            if name in carried}
+        now = time.monotonic()
+        due = []
+        for item in junk:
+            name = item.name.casefold()
+            tries, retry_at, kept = self._food_drops.get(name, (0, 0.0, False))
+            if now < retry_at:
+                continue
+            if tries >= self.FOOD_DROP_TRIES:
+                if not kept:
+                    self._food_drops[name] = (tries, retry_at, True)
+                    log.warning("%s stays in her pack after %d drops", item.name, tries)
+                    recorder = getattr(client, "record_action", None)
+                    if recorder is not None:
+                        recorder("obsolete-food-kept",
+                                 f"{item.name}: still carried after {tries} drops")
+                continue
+            due.append(item)
         state = client.state
-        if (not unsellable or getattr(state, "target_id", 0) or
-                "/apartments/" in getattr(getattr(state, "map", None), "path", "") or
+        if (not due or getattr(state, "target_id", 0) or
                 recent_hostile_contact(client, self.FOOD_DROP_QUIET_SECONDS)):
             return False
-        for item in unsellable:
-            self._food_drop_attempts.add(item.tag)
-            await client.move_item(0, item.tag, item.quantity)
-            recorder = getattr(client, "record_action", None)
-            if recorder is not None:
-                recorder("obsolete-food-drop", f"{item.quantity} {item.name}")
-            self._last_action = time.monotonic()
-            return True
-        return False
+        item = due[0]
+        name = item.name.casefold()
+        tries = self._food_drops.get(name, (0, 0.0, False))[0] + 1
+        self._food_drops[name] = (
+            tries, now + self.FOOD_DROP_RETRY_SECONDS * 2 ** (tries - 1), False)
+        await client.move_item(0, item.tag, item.quantity)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("obsolete-food-drop", f"{item.quantity} {item.name}")
+        self._last_action = now
+        return True
 
     async def maintain_inventory(self, client: AtrinikClient) -> bool:
         """Protect rare loot and apply only clear, usable gear upgrades."""
@@ -4667,8 +4697,6 @@ class FarmTask(BotTask):
         # spellbook, lock, or upgrade work so a long optional-maintenance queue
         # cannot postpone shield-safe combat readiness.
         if await self.restore_combat_loadout(client):
-            return True
-        if await self.drop_obsolete_food(client):
             return True
         self.inventory_policy.caster_stats = bool(
             "wizardry" in self.combat_skill and self.training_active(client))
@@ -8801,9 +8829,6 @@ class JunkPolicy:
     # (InventoryPolicy.sellable_junk). Off for an operator's targeted sale,
     # which sells only what its patterns or tags name.
     sell_identified_junk: bool = False
-    # Carried food that is junk where food is obsolete (obsolete_food),
-    # sold whatever its quality.
-    food_tags: frozenset[int] = frozenset()
 
     def junk(self, item: Item) -> bool:
         name = item.name.casefold()
@@ -8813,8 +8838,6 @@ class JunkPolicy:
             return False
         if any(re.search(pattern, name) for pattern in self.keep_patterns):
             return False
-        if item.tag in self.food_tags:
-            return True
         if self.sell_identified_junk and InventoryPolicy().sellable_junk(item):
             return True
         if InventoryPolicy().preserve(item):

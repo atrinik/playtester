@@ -17,6 +17,8 @@ QUIC_ALPN = "atrinik/2"
 GAME_STREAM_PREFACE = b"ATRN\x01\x00\x00\x01"
 # Public alias retained for callers predating the typed-stream naming.
 QUIC_GAME_STREAM_PREFACE = GAME_STREAM_PREFACE
+# The longest a connection's close is waited for (aioquic's wait_closed).
+CLOSE_TIMEOUT = 5.0
 
 
 def normalize_certificate_sha256(value: str) -> str:
@@ -119,9 +121,15 @@ class QuicStream:
             return cls(context, reader, writer)
         except BaseException:
             if protocol is not None:
-                await context.__aexit__(None, None, None)
+                # Bounded: a close that never completes never holds the
+                # caller's error (and her reconnect) back.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        context.__aexit__(None, None, None), CLOSE_TIMEOUT)
             raise
 
     async def close(self) -> None:
         self.writer.close()
-        await self.context.__aexit__(None, None, None)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                self.context.__aexit__(None, None, None), CLOSE_TIMEOUT)

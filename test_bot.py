@@ -393,6 +393,42 @@ class ProtocolTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_a_failing_keepalive_never_hides_the_read_loops_error(self):
+        async def run():
+            client = AtrinikClient(ClientConfig(reconnect=False))
+            client.KEEPALIVE_SECONDS = (0.0, 0.0)
+            ended = []
+
+            class Writer:
+                def close(self):
+                    pass
+
+                async def wait_closed(self):
+                    pass
+
+            async def connect():
+                client.writer = Writer()
+                client.state.phase = "playing"
+
+            async def keepalive():
+                raise RuntimeError("bug")
+
+            async def read_loop():
+                await asyncio.sleep(0.05)
+                raise ConnectionError("dropped")
+
+            async def emit(event, *args):
+                ended.append(event)
+
+            client.connect = connect
+            client.send_keepalive = keepalive
+            client._read_loop = read_loop
+            client.emit = emit
+            await client.run()
+            self.assertIn("disconnected", ended)
+
+        asyncio.run(run())
+
     def test_no_keepalive_before_she_plays(self):
         async def run():
             client = AtrinikClient(ClientConfig())
@@ -14941,6 +14977,14 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         client = client_at(37)
         task = DialogAtTask(graph, NPC["Gwenty"], "Gwenty", ())
         asyncio.run(task.tick(client))
+        # Only as a defended leg (pack split, retreat, early heal and flee),
+        # never a bare navigation.
+        self.assertIsInstance(task._leg, NavigateThenTask)
+        self.assertIs(task._leg.navigation, task.navigation)
+        self.assertTrue(task._leg.combat_approach)
+        self.assertEqual((task._leg.safety.heal_below, task._leg.safety.flee_below),
+                         (0.85, 0.70))
+        self.assertEqual(task.navigation.tolerance, 1)
         self.assertTrue(task.navigation.allow_ranged_hazard_fallback)
         self.assertEqual(task.navigation.status, TaskStatus.RUNNING)
         self.assertEqual(task.navigation.route[-1].destination,
@@ -14951,6 +14995,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         task = DialogAtTask(graph, NPC["Gwenty"], "Gwenty", ())
         asyncio.run(task.tick(client))
         self.assertFalse(task.navigation.allow_ranged_hazard_fallback)
+        self.assertIsNone(task._leg)
         # A quest farm or kill trip too.
         policy = POLICIES["Fort Sether Illness"]
         quest = CatalogQuestTask(graph, policy)
@@ -14958,6 +15003,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         trip = quest._action_task(action, "The Kobold Delicacy",
                                   client=client_at(37))
         self.assertTrue(trip.navigation.allow_ranged_hazard_fallback)
+        self.assertEqual(trip.safety.flee_below, 0.70)
         trip = quest._action_task(action, "The Kobold Delicacy",
                                   client=client_at(12))
         self.assertFalse(trip.navigation.allow_ranged_hazard_fallback)
@@ -19801,6 +19847,15 @@ class NavigationTests(unittest.TestCase):
             self.assertEqual(client.steps, [], obj.name)
             self.assertEqual(task._temporary_blocked, {(1, 2)})
             self.assertIn(("navigation-occupant-blocked", "1,2"), client.actions)
+        # On a PvP map even her party blocks her (server blocked()).
+        graph, node, client = self._corridor_with_occupant(
+            MapObject(5, 0, 0, 0, name="Zoey", name_color="00ff00",
+                      target_id=99))
+        node.pvp = True
+        client.authored_content = types.SimpleNamespace(names={"rat"})
+        task = NavigateTask(graph, node.path, (1, 2))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.steps, [])
         # Without her authored names a green name may be a weaker
         # creature (the server's level colour): it blocks.
         graph, node, client = self._corridor_with_occupant(
@@ -19811,10 +19866,10 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(client.steps, [])
 
     def test_an_occupant_that_comes_and_goes_makes_her_hold_still(self):
-        # Blocked again and again on one square, she waits rather than
-        # stepping round it and back.
-        monster = MapObject(5, 0, 0, 0, name="rat", name_color="ffff00",
-                            target_id=99)
+        # Blocked again and again on one square by a townsperson, she waits
+        # rather than stepping round it and back.
+        monster = MapObject(5, 0, 0, 0, name="Guard", name_color="ffff00",
+                            target_id=99, is_friend=True)
         graph, node, client = self._corridor_with_occupant(None)
         task = NavigateTask(graph, node.path, (1, 2))
         objects = client.state.map.tile(8, 9).objects
@@ -19828,6 +19883,26 @@ class NavigationTests(unittest.TestCase):
         holds = [detail for action, detail in client.actions
                  if action == "navigation-occupant-hold"]
         self.assertEqual(len(holds), 1)
+        # A hostile pack trailing her, an essential trip, or a fight never
+        # holds her still: she flees or fights.
+        hostile = MapObject(5, 0, 0, 0, name="rat", name_color="ffff00",
+                            target_id=99)
+        for occupant, essential, hit in ((hostile, "", False),
+                                         (monster, "home", False),
+                                         (monster, "", True)):
+            graph2, node2, other = self._corridor_with_occupant(None)
+            if hit:
+                other.state.add_message(2, "ff0000", "rat hit you for 3 (-3) impact damage.")
+            trip = NavigateTask(graph2, node2.path, (1, 2))
+            trip.essential = essential
+            tile = other.state.map.tile(8, 9).objects
+            for _ in range(trip.OCCUPANT_BLOCK_REPEATS + 1):
+                tile[5] = occupant
+                trip._movement_blockers(other)
+                tile.clear()
+                trip._movement_blockers(other)
+            self.assertEqual(trip._occupant_hold_until, 0.0,
+                             (occupant.name, essential, hit))
         self.assertTrue(holds[0].startswith("1,2 "))
         moves = len(client.steps)
         self.assertLess(moves, task.OCCUPANT_BLOCK_REPEATS)
@@ -30872,63 +30947,170 @@ class FoodObsoleteTests(unittest.TestCase):
         client = self.junk_client()
         self.assertEqual([item.tag for item in obsolete_food(client)], [1, 2])
         self.assertEqual(obsolete_food(self.junk_client("off")), [])
-        # Identified food goes with the circuit's junk sale.
+        # Unreadable quest data keeps every food.
+        with patch("atrinik_bot.quests.quest_item_names", return_value=None):
+            self.assertEqual(obsolete_food(client), [])
+
+    def test_food_never_starts_a_junk_sale_or_blocks_cure_funding(self):
+        # Short of the cure with only food carried: no Brynknot trip for
+        # it, and the cure-funding chest trip is not held back by it.
+        client = self.junk_client()
         circuit = FarmCircuitTask(WorldGraph(), [("/a", "treant")],
                                   clock=lambda: 10.0)
-        self.assertEqual([item.tag for item in circuit._identified_junk(client)],
-                         [1])
-        self.assertEqual(circuit._identified_junk(self.junk_client("off")), [])
-        sale = circuit._new_junk_sale(client).task
-        self.assertTrue(sale.policy.junk(client.state.items[1]))
-        self.assertFalse(sale.policy.junk(client.state.items[3]))
+        circuit._cure_shortfall = lambda client: True
+        self.assertEqual(circuit._identified_junk(client), [])
+        self.assertFalse(circuit._needs_junk_sale(client))
+        self.assertTrue(circuit._needs_cure_funding(client))
 
-    def test_unsellable_food_is_dropped_on_a_safe_square_once(self):
+    def drop_graph(self):
+        graph = WorldGraph()
+        for path, flags in (("/wild", {}), ("/unique", {"unique": True}),
+                            ("/town", {"no_harm": True}), ("/shop", {"shop": True}),
+                            ("/bed", {}), ("/vendor", {}),
+                            ("/a/apartments/cheap", {})):
+            graph.nodes[path] = MapNode(path=path, width=10, height=10)
+            for name, value in flags.items():
+                setattr(graph.nodes[path], name, value)
+        graph.savebeds["/bed"].append((1, 1))
+        graph.dialogue_vendors = [types.SimpleNamespace(map_path="/vendor")]
+        return graph
+
+    def test_food_is_dropped_only_on_open_country_or_dungeon_maps(self):
+        from .navigation import food_drop_map
+
+        graph = self.drop_graph()
+        self.assertTrue(food_drop_map(graph, "/wild"))
+        for path in ("/unique", "/town", "/shop", "/bed", "/vendor",
+                     "/a/apartments/cheap", "/unknown"):
+            with self.subTest(path):
+                self.assertFalse(food_drop_map(graph, path))
+        # The circuit drops between pulls only there.
         farm = FarmTask(zone="/test", target="kobold")
-        # Not while she has a target, nor in her apartment, which keeps it.
+
+        async def maintain_inventory(client):
+            return False
+
+        farm.maintain_inventory = maintain_inventory
+        circuit = FarmCircuitTask(graph, [("/a", "treant")], clock=lambda: 10.0)
+        circuit._busy_finishing_fight_or_loot = lambda client, farm: False
+        for path, dropped in (("/town", []), ("/wild", [(0, 1, 26)])):
+            with self.subTest(path):
+                client = self.junk_client()
+                client.state.map.path = path
+                asyncio.run(circuit._maintain_safe_inventory(client, farm))
+                self.assertEqual(client.dropped[:1], dropped)
+
+    def test_built_graph_knows_towns_shops_and_unique_maps(self):
+        graph = built_graph()
+        brynknot = graph.nodes["/shattered_islands/world_0_69"]
+        self.assertTrue(brynknot.no_harm)
+        self.assertTrue(brynknot.shop)
+        from .navigation import food_drop_map
+
+        self.assertFalse(food_drop_map(graph, "/shattered_islands/world_0_69"))
+        # Thrakir's map, an early farm in open country.
+        self.assertTrue(food_drop_map(graph, "/shattered_islands/world_3_69"))
+
+    def test_food_drops_retry_by_name_then_give_up(self):
+        farm = FarmTask(zone="/test", target="kobold")
         client = self.junk_client()
+        # Not while she has a target, nor right after a hit.
         client.state.target_id = 9
         self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
         client.state.target_id = 0
-        client.state.map.path = "/shattered_islands/apartments/cheap_apartment"
-        self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
-        client.state.map.path = "/shattered_islands/world_0_69"
-        # Nor right after a hit.
         client.state.add_message(c.CHAT_TYPE_GAME, "ff0000",
                                  "The kobold hit you for 3 (3) damage.")
         self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
         client.state.messages = []
-        # The unidentified apples (no shop buys them) go, once.
-        self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
-        self.assertEqual(client.dropped, [(0, 2, 3)])
-        self.assertEqual(client.decisions, [("obsolete-food-drop", "3 apple")])
-        self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
-        self.assertEqual(client.dropped, [(0, 2, 3)])
+        now = [1000.0]
+        with patch("atrinik_bot.tasks.time.monotonic", lambda: now[0]):
+            # Identified and unidentified food alike, a stack a tick.
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(client.dropped, [(0, 1, 26), (0, 2, 3)])
+            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            # The legs stayed (the drop failed) and loot merged into a new
+            # tag: matched by name, retried after the backoff.
+            client.state.remove_item(1)
+            client.state.place_item(Item(11, item_type=c.TYPE_FOOD, quality=100,
+                                         name="chicken leg", quantity=27), 7)
+            client.state.remove_item(2)
+            now[0] += farm.FOOD_DROP_RETRY_SECONDS
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(client.dropped[-1], (0, 11, 27))
+            now[0] += farm.FOOD_DROP_RETRY_SECONDS * 2
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            # After FOOD_DROP_TRIES drops it is kept, recorded once.
+            now[0] += farm.FOOD_DROP_RETRY_SECONDS * 4
+            dropped = len(client.dropped)
+            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(len(client.dropped), dropped)
+            kept = [d for a, d in client.decisions if a == "obsolete-food-kept"]
+            self.assertEqual(kept, ["chicken leg: still carried after 3 drops"])
+            # Gone, and later loot of the name starts afresh.
+            client.state.remove_item(11)
+            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            client.state.place_item(Item(12, item_type=c.TYPE_FOOD, quality=100,
+                                         name="chicken leg"), 7)
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
         # Where food matters she keeps it all.
         client = self.junk_client("off")
         self.assertFalse(asyncio.run(FarmTask(
             zone="/test", target="kobold").drop_obsolete_food(client)))
         self.assertEqual(client.dropped, [])
 
+    def test_unreadable_quest_data_keeps_all_food_and_is_read_once(self):
+        from . import quests
+
+        quests.quest_item_names.cache_clear()
+        self.addCleanup(quests.quest_item_names.cache_clear)
+        with self.assertLogs("atrinik_bot.quests", "WARNING"):
+            self.assertIsNone(quests.quest_item_names(Path("/nonexistent/quests")))
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (directory / "broken").mkdir()
+        (directory / "broken" / "quest.xml").write_text("<quest")
+        with patch.object(quests, "load_catalog",
+                          wraps=quests.load_catalog) as load:
+            with self.assertLogs("atrinik_bot.quests", "WARNING"):
+                self.assertIsNone(quests.quest_item_names(directory))
+            self.assertIsNone(quests.quest_item_names(directory))
+            self.assertEqual(load.call_count, 1)
+        self.assertIn("wild white mushroom", quests.quest_item_names())
+
     def test_settings_and_observed_obsolete_food(self):
-        from .hunger import OBSERVE_SECONDS, FoodWatch, food_obsolete, parse_setting
+        from .hunger import food_obsolete, parse_setting
 
         self.assertEqual(parse_setting(""), "on")
         self.assertEqual(parse_setting("Off"), "off")
         self.assertEqual(parse_setting("0"), "off")
         self.assertEqual(parse_setting("auto"), "auto")
-        self.assertEqual(parse_setting("bogus"), "on")
+        # An unknown value is an error, and decides from observation.
+        with self.assertLogs("atrinik_bot.hunger", "ERROR"):
+            self.assertEqual(parse_setting("bogus"), "auto")
         self.assertFalse(food_obsolete(GameState()))
         self.assertTrue(food_obsolete(GameState(food_obsolete="on")))
         self.assertEqual(AtrinikClient(ClientConfig(
             food_obsolete="on")).state.food_obsolete, "on")
 
-        def played(food_after, *, move=True, fight=True, seconds=OBSERVE_SECONDS):
-            state = GameState(phase="playing", food_obsolete="auto")
-            state.map = MapState(path="/a", world_x=1, world_y=1)
-            state.stats.update(food=500, exp=100)
-            watch = state.food_watch = FoodWatch()
+    @staticmethod
+    def auto_state(food=500):
+        state = GameState(phase="playing", player_tag=7, food_obsolete="auto")
+        state.map = MapState(path="/a", world_x=1, world_y=1)
+        state.stats.update(food=food, exp=100, hp=100)
+        state.place_item(Item(1, item_type=c.TYPE_FOOD, quality=100,
+                              name="chicken leg", quantity=5), 7)
+        return state
+
+    def test_auto_needs_a_whole_window_of_unchanged_food_moving_and_fighting(self):
+        from .hunger import OBSERVE_SECONDS
+
+        def played(food_after=500, *, move=True, fight=True,
+                   seconds=OBSERVE_SECONDS):
+            state = self.auto_state()
+            watch = state.food_watch
             watch.observe(state, now=0.0)
-            self.assertFalse(watch.obsolete(now=0.0))
+            self.assertFalse(watch.obsolete(state, now=0.0))
             if move:
                 state.map.world_x = 2
             if fight:
@@ -30936,26 +31118,113 @@ class FoodObsoleteTests(unittest.TestCase):
             state.stats["food"] = food_after
             watch.observe(state, now=seconds / 2)
             watch.observe(state, now=seconds)
-            return watch.obsolete(now=seconds)
+            return watch.obsolete(state, now=seconds)
 
-        # Unchanged for half an hour of moving and fighting: obsolete.
-        self.assertTrue(played(500))
-        # Draining, too soon, or never moving or fighting: not yet.
+        self.assertTrue(played())
         self.assertFalse(played(480))
-        self.assertFalse(played(500, seconds=OBSERVE_SECONDS - 60))
-        self.assertFalse(played(500, move=False))
-        self.assertFalse(played(500, fight=False))
+        self.assertFalse(played(seconds=OBSERVE_SECONDS - 60))
+        self.assertFalse(played(move=False))
+        self.assertFalse(played(fight=False))
+        # A meal restarts the window, and the moving and fighting before it
+        # no longer count.
+        state = self.auto_state()
+        watch = state.food_watch
+        watch.observe(state, now=0.0)
+        state.map.world_x, state.stats["exp"] = 2, 150
+        watch.observe(state, now=10.0)
+        state.stats["food"] = 600
+        watch.observe(state, now=20.0)
+        self.assertFalse(watch.obsolete(state, now=20.0 + OBSERVE_SECONDS))
+        state.map.world_x, state.stats["exp"] = 3, 200
+        watch.observe(state, now=30.0)
+        self.assertFalse(watch.obsolete(state, now=OBSERVE_SECONDS))
+        self.assertTrue(watch.obsolete(state, now=20.0 + OBSERVE_SECONDS))
         # A fall seen once keeps the hunger rules for the run.
-        state = GameState(phase="playing", food_obsolete="auto")
-        state.map = MapState(path="/a", world_x=1, world_y=1)
-        state.stats.update(food=500, exp=100)
+        state = self.auto_state()
         state.food_watch.observe(state, now=0.0)
         state.stats["food"] = 499
         state.food_watch.observe(state, now=1.0)
         state.stats.update(food=600, exp=900)
         state.map.world_x = 5
-        state.food_watch.observe(state, now=10 * OBSERVE_SECONDS)
-        self.assertFalse(state.food_watch.obsolete(now=10 * OBSERVE_SECONDS))
+        state.food_watch.observe(state, now=2.0)
+        self.assertFalse(state.food_watch.obsolete(state, now=10 * OBSERVE_SECONDS))
+
+    def test_auto_never_turns_on_while_an_old_server_starves_her(self):
+        from .hunger import OBSERVE_SECONDS, food_obsolete
+
+        # Old server, food 0 and nothing to eat: food stays 0 while
+        # starvation drains her health, as she walks and fights for an hour.
+        state = self.auto_state(food=0)
+        state.remove_item(1)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            watch.observe(state, now=now)
+        self.assertFalse(watch.obsolete(state, now=now))
+        with patch("atrinik_bot.hunger.time.time", lambda: now):
+            self.assertFalse(food_obsolete(state))
+        # Health lost to attacks at food 0 is no starvation, but hungry with
+        # nothing to eat she keeps the old rules even so.
+        state = self.auto_state(food=0)
+        state.remove_item(1)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            state.messages = [(now, c.CHAT_TYPE_GAME, "ff0000",
+                               "The kobold hit you for 1 (1) damage.")]
+            watch.observe(state, now=now)
+        self.assertFalse(watch.obsolete(state, now=now))
+        # With food on her that window counts.
+        state.place_item(Item(2, item_type=c.TYPE_FOOD, quality=100,
+                              name="apple"), 7)
+        self.assertTrue(watch.obsolete(state, now=now))
+
+    def test_turning_obsolete_mid_trip_ends_the_food_trips(self):
+        # The farm circuit's food resupply.
+        circuit = FarmCircuitTask(WorldGraph(), [("/a", "treant")],
+                                  clock=lambda: 10.0)
+        circuit._resupply = TempleTrip("Friar Marcus")
+        circuit._resupply.status = TaskStatus.RUNNING
+        client = self.circuit_client("on", food=500)
+
+        async def clear_actions():
+            pass
+
+        client.clear_actions = clear_actions
+        self.assertFalse(asyncio.run(circuit._tick_running_service(client)))
+        self.assertIsNone(circuit._resupply)
+        # Autoplay's temple-food phase.
+        client = AtrinikClient(ClientConfig(food_obsolete="on"))
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 23, "hp": 100, "maxhp": 100,
+                                   "food": 0})
+
+        async def send(packet):
+            pass
+
+        client.send = send
+        autoplay = AutoplayTask(WorldGraph(), target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay._intro_complete = True
+        trip = TempleTrip("Friar Marcus")
+        trip.status = TaskStatus.RUNNING
+        autoplay.phase, autoplay.child = "temple-food", trip
+        ticks = []
+
+        async def tick(client):
+            ticks.append(1)
+
+        trip.tick = tick
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(ticks, [])
+        self.assertEqual(trip.status, TaskStatus.COMPLETE)
+        self.assertIsNot(autoplay.child, trip)
 
 
 class FakeOperatorSession:
@@ -38533,6 +38802,20 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         task._plan(self.client)
         self.assertTrue(task.care.cleared)
 
+    def test_with_the_flag_on_a_prepared_plan_is_her_live_plan(self):
+        # The walk home's plan made before it departs (prepare) serves its
+        # start: it must be the live plan, with its care and decisions,
+        # not a ranking's probe that takes an over-budget candidate as is.
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        self.client.state.stats.update(hp=10)
+        task = self.trip("cure")
+        self.assertEqual(task.status, TaskStatus.READY)
+        self.assertEqual(self.maps(task.prepare(self.client)), ["/blocked", "/goal"])
+        self.assertEqual((task.care.mode, task.care.subjects), ("bounded", ("map:/blocked",)))
+        self.assertIn("route-budget-override", self.client.actions())
+
     def test_with_the_flag_on_a_strict_essential_trip_overrides_with_care(self):
         self.client.config.learned_route_costs = True
         self.graph = blocks_graph(detour=False)
@@ -39929,9 +40212,12 @@ class PlanningOffLoopTests(unittest.TestCase):
             self.assertEqual(task.status, TaskStatus.RUNNING)
             self.assertTrue(task.planning)
             self.assertEqual(task.route, [])
-            # Still planning: she does not move.
+            # Still planning: she does not move, and a path the server
+            # may still walk for her is stopped.
             asyncio.run(task.tick(client))
             self.assertEqual(moves(), [])
+            self.assertEqual([packet.packet_type for packet in client.sent],
+                             [c.S_CLEAR])
             release.set()
             self.wait_for(lambda: task._route_plans._plans["route"].future.done())
             asyncio.run(task.tick(client))
@@ -39961,6 +40247,76 @@ class PlanningOffLoopTests(unittest.TestCase):
         self.assertEqual(len(threads), 2)
         self.assertTrue(all(thread is not threading.main_thread()
                             for thread in threads))
+
+    def test_an_essential_or_critical_walk_never_waits_behind_a_ranking(self):
+        # The worker runs one job at a time and a ranking can take 45 s:
+        # a walk home or an expedition's retreat plans on the loop instead.
+        import threading
+        from . import planner as planner_module
+
+        release = threading.Event()
+        planner_module.submit(lambda: release.wait(5))
+        try:
+            self.wait_for(planner_module.busy)
+            for essential, critical in (("home", False), ("", True)):
+                client = self.client()
+                walk = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                                    (4, 9), tolerance=1)
+                walk.essential, walk.critical = essential, critical
+                asyncio.run(walk.tick(client))
+                self.assertFalse(walk.planning)
+                self.assertTrue(walk.route)
+            # An optional trip queues as before.
+            trip = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                                (4, 9), tolerance=1)
+            asyncio.run(trip.tick(self.client()))
+            self.assertTrue(trip.planning)
+        finally:
+            release.set()
+
+    def test_a_care_crossing_finished_meanwhile_stays_finished(self):
+        import threading
+        from . import navigation as navigation_module
+        from .navigation import CareCrossing
+
+        release = threading.Event()
+
+        def plan(task, client, *, origin=None):
+            release.wait(2)
+            return []
+
+        client = self.client()
+        task = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                            (4, 9), tolerance=1)
+        task.care = CareCrossing("owner_block", ("map:/x",), 0.0, key=("", "map:/x"))
+        with patch.object(navigation_module.NavigateTask, "_plan", plan):
+            asyncio.run(task.tick(client))
+            self.assertTrue(task.planning)
+            task.care.finished = True
+            release.set()
+            self.wait_for(lambda: task._route_plans._plans["route"].future.done())
+            asyncio.run(task.tick(client))
+        self.assertFalse(task.planning)
+        self.assertTrue(task.care.finished)
+
+    def test_a_dropped_trip_forgets_its_plan(self):
+        import gc
+        import threading
+        from . import planner as planner_module
+
+        release = threading.Event()
+        planner_module.submit(lambda: release.wait(5))
+        try:
+            trip = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                                (4, 9), tolerance=1)
+            asyncio.run(trip.tick(self.client()))
+            self.assertTrue(trip.planning)
+            future = trip._route_plans._plans["route"].future
+            del trip
+            gc.collect()
+            self.assertTrue(future.cancelled())
+        finally:
+            release.set()
 
     def test_a_plan_made_before_the_trip_serves_its_start(self):
         # The recovery walk home judged its route by a probe and then

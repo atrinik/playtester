@@ -355,36 +355,68 @@ class DialogAtTask(BotTask):
             graph, place.map_path, (place.x, place.y), tolerance=1)
         self.dialog = DialogTask(npc, choices=choices)
         self._dialogue_prepared = False
+        # The defended walk (NavigateThenTask) a trip that may cross hazard
+        # maps takes instead of a bare navigation (_defended_walk).
+        self._leg: NavigateThenTask | None = None
+
+    # A walk that may cross hazard maps heals and steps away early, as the
+    # other defended quest legs do (apply_ground_trip).
+    HAZARD_SAFETY = (0.85, 0.70)
+
+    def _defended_walk(self, client: AtrinikClient) -> None:
+        """From FarmCircuitTask.SWAMP_TRANSIT_LEVEL a walk not started yet
+        may cross hazard maps (allow_quest_transit), but only as a defended
+        leg: a NavigateThenTask with its pack split, retreat, cornered
+        fight and early heal and flee, never a bare navigation."""
+        if (self._leg is not None or self.navigation.status != TaskStatus.READY or
+                quest_transit_level(client) < FarmCircuitTask.SWAMP_TRANSIT_LEVEL):
+            return
+        heal, flee = self.HAZARD_SAFETY
+        leg = NavigateThenTask(
+            self.graph, self.place.map_path, ArrivedTask(),
+            destination_xy=(self.place.x, self.place.y), combat_approach=True,
+            safety=SafetyPolicy(heal_below=heal, flee_below=flee))
+        leg.navigation.tolerance = self.navigation.tolerance
+        allow_quest_transit(leg.navigation, client)
+        self.navigation, self._leg = leg.navigation, leg
+
+    def _walked(self) -> bool:
+        if self._leg is not None:
+            return self._leg.status == TaskStatus.COMPLETE
+        return self.navigation.status == TaskStatus.COMPLETE
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
             await self.start(client)
-        if self.navigation.status != TaskStatus.COMPLETE:
-            allow_quest_transit(self.navigation, client)
+        if not self._walked():
+            self._defended_walk(client)
+            walker = self._leg or self.navigation
             try:
-                await self.navigation.tick(client)
+                await walker.tick(client)
             except ValueError as exc:
                 if (self.navigation.tolerance == 1 and
                         "no component route" in str(exc)):
                     self.navigation = NavigateTask(
                         self.graph, self.place.map_path,
                         (self.place.x, self.place.y), tolerance=2)
+                    self._leg = None
                     recorder = getattr(client, "record_action", None)
                     if recorder is not None:
                         recorder("dialog-approach-expand", self.dialog.npc)
                     return
                 raise
-            if self.navigation.status == TaskStatus.FAILED:
+            if walker.status == TaskStatus.FAILED:
                 if (self.navigation.tolerance == 1 and
-                        "no component route" in self.navigation.error):
+                        "no component route" in walker.error):
                     self.navigation = NavigateTask(
                         self.graph, self.place.map_path,
                         (self.place.x, self.place.y), tolerance=2)
+                    self._leg = None
                     recorder = getattr(client, "record_action", None)
                     if recorder is not None:
                         recorder("dialog-approach-expand", self.dialog.npc)
                 else:
-                    self.fail(self.navigation.error)
+                    self.fail(walker.error)
             return
         if not self._dialogue_prepared:
             await client.clear_actions()
@@ -1163,6 +1195,9 @@ class CatalogQuestTask(BotTask):
         if (client is not None and isinstance(task, NavigateThenTask) and
                 action.kind in ("farm", "kill")):
             allow_quest_transit(task.navigation, client)
+            if task.navigation.allow_ranged_hazard_fallback:
+                heal, flee = DialogAtTask.HAZARD_SAFETY
+                task.safety = SafetyPolicy(heal_below=heal, flee_below=flee)
         return task
 
     def _new_action_task(self, action: Action, part_name: str) -> BotTask:

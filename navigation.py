@@ -15,6 +15,7 @@ import threading
 import dataclasses
 import functools
 import re
+import weakref
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
@@ -63,7 +64,6 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyHealingStockTask, BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
-                    obsolete_food,
                     RANGED_RESIDENT_MARKERS, RANGED_RESIDENT_RADIUS,
                     RetrieveItemsTask, SellJunkTask, TaskStatus,
                     TempleFoodTask, TempleServiceTask,
@@ -281,6 +281,12 @@ class MapNode:
     caster_identities: set[str] = field(default_factory=set)
     # The map header's ``pvp 1``: players may attack each other here.
     pvp: bool = False
+    # The map header's ``unique 1`` (per-player maps that keep what is
+    # dropped) and ``no_harm 1`` (towns), and whether a shop floor or shop
+    # mat lies on it: no map to drop junk food on (food_drop_map).
+    unique: bool = False
+    no_harm: bool = False
+    shop: bool = False
 
     def lock_allowed(self, point: tuple[int, int], access=False) -> bool:
         """Check one gated tile against an access set (requirements.py)."""
@@ -642,6 +648,8 @@ class WorldGraph:
                 int(one(attrs, "enter_y", 0) or 0),
             )
             self.nodes[key].pvp = str(one(attrs, "pvp", "0") or "0").strip() not in ("", "0")
+            self.nodes[key].unique = str(one(attrs, "unique", "0") or "0").strip() not in ("", "0")
+            self.nodes[key].no_harm = str(one(attrs, "no_harm", "0") or "0").strip() not in ("", "0")
             parsed_maps[key] = (path, parsed)
 
         auto_exits: dict[str, list[tuple[int, int, int, str, bool]]] = defaultdict(list)
@@ -692,6 +700,8 @@ class WorldGraph:
                     obj["arch"].startswith("shop_floor") and
                     one(attrs, "auto_apply", base.get("auto_apply")) == "1" and
                     one(attrs, "randomitems", base.get("randomitems")))
+                if obj["arch"].startswith(("shop_floor", "shop_mat")):
+                    node.shop = True
                 if authored_unpaid or dynamic_shop_stock:
                     point = (x, y)
                     if point not in self.shop_stocks[source]:
@@ -2868,18 +2878,23 @@ class NavigateTask(BotTask):
         # The inputs whose every hazard tier failed in the last plan
         # (_plan_avoiding): a retry with the fallback starts at it.
         self._tiers_failed_at: tuple | None = None
-        # A plan on the worker's shadow report, made on the loop once the
-        # plan is collected (_shadow).
-        self._deferred_shadow: tuple | None = None
-        # A replan went to the worker while a path may still be walking.
+        # What a plan on the worker leaves for the loop to do with her
+        # real client once it is collected: its shadow report, the live
+        # learned plan's metrics, a care-wait record (_defer).
+        self._deferred: list[Callable[[Any], None]] = []
+        # A plan went to the worker while a path may still be walking.
         self._planning_stop = False
+        # A trip that must never wait behind a ranking on the worker (an
+        # aborted expedition's retreat): with the worker busy it plans on
+        # the loop, as essential trips do.
+        self.critical = False
 
     # What a plan sets on the task that plans (_plan), copied back from the
     # planning copy a plan on the worker ran on (_plan_off_loop).
     PLAN_STATE = ("_walls", "_offer", "_crossed", "_bounded", "care",
                   "learned_plan", "_route_threat_maps", "_threat_fallback",
                   "hazard_fallback_taken", "_tiers_failed_at",
-                  "_deferred_shadow")
+                  "_deferred")
     # A prepared plan (prepare) serves the trip's start this long, while
     # she still stands where it was made.
     PREPARED_SECONDS = 60.0
@@ -2893,8 +2908,10 @@ class NavigateTask(BotTask):
             self._approach = self._approach_candidates()
         route = self._plan_off_loop(client)
         if route is PLANNING:
-            # She stands still, defended by her trip, until it is done.
+            # She stands still, defended by her trip, until it is done; a
+            # path the server still walks for her is stopped next tick.
             self._planning, self.route = "start", []
+            self._planning_stop = True
         else:
             self.route = route
         self._last_progress = time.monotonic()
@@ -2924,20 +2941,39 @@ class NavigateTask(BotTask):
         m = client.state.map
         return m.path, m.world_x, m.world_y
 
-    def _planning_copy(self) -> "NavigateTask":
+    def _planning_copy(self, *, live: bool = False) -> "NavigateTask":
         """A copy of the trip for the worker to plan on: its own containers
         (the loop may change the trip's meanwhile) and care crossing; the
-        rest is shared and only read."""
+        rest is shared and only read. ``live`` plans a trip not started yet
+        as the trip itself (prepare): a live plan, not a probe."""
         twin = copy.copy(self)
+        if live:
+            twin.status = TaskStatus.RUNNING
         for name, value in vars(self).items():
             if isinstance(value, (list, dict, set)):
                 setattr(twin, name, copy.copy(value))
         if self.care is not None:
             twin.care = copy.copy(self.care)
         twin._route_plans = None
+        twin._deferred = []
         return twin
 
-    def _plan_off_loop(self, client: AtrinikClient) -> "list[MapEdge] | _Planning":
+    def _defer(self, client: AtrinikClient, effect: Callable[[Any], None]) -> None:
+        """Apply ``effect`` to her client now, or, planning on the worker,
+        once the plan is collected on the loop (_plan_off_loop): the
+        worker writes nothing the loop reads."""
+        if isinstance(client, planner.PlanningClient):
+            self._deferred.append(effect)
+        else:
+            effect(client)
+
+    def _urgent(self) -> bool:
+        """An essential or critical trip: planned first on the worker,
+        and on the loop while the worker runs another job."""
+        return bool(self.essential) or self.critical
+
+    def _plan_off_loop(self, client: AtrinikClient, *,
+                       live: bool = False) -> "list[MapEdge] | _Planning":
         """The trip's route from where she stands, planned on the planner
         worker (ROUTING 1.12): PLANNING until it is done, then the route,
         or its ValueError raised here, as _plan would have raised it.
@@ -2959,17 +2995,31 @@ class NavigateTask(BotTask):
                 raise prepared[2]
             return prepared[2]
         if self._route_plans is None:
-            self._route_plans = BackgroundPlans()
+            plans = self._route_plans = BackgroundPlans()
+            # A trip dropped with its plan under way (its owner moved on)
+            # cancels it: queued it never runs, running it stops at its
+            # next tier (_check_cancelled).
+            weakref.finalize(self, plans.forget, "route")
         plans = self._route_plans
+        if (self._urgent() and not plans.planning("route") and
+                planner.busy()):
+            # The worker runs another job (a ranking can take 45 s): an
+            # essential or critical trip never waits behind it.
+            return self._plan(client)
         # The care-wait record lives on her client: made here, the
         # worker's copy of her client reads it through. A copy is made on
         # every poll (cheap): a plan under way never uses it, and a result
         # that went stale meanwhile is planned again with it.
         _care_waits(client)
-        build = functools.partial(_plan_on_copy, self._planning_copy())
+        build = functools.partial(_plan_on_copy, self._planning_copy(live=live))
         result = plans.get(
             "route", self._graph, client, build,
-            priority=(planner.PRIORITY_HEAL if self.essential
+            # From another map the result is planned again (her origin
+            # when it was asked for is the key; a step on the same map in
+            # a fight does not restart it, and the route still leaves the
+            # map she stands on).
+            key=client.state.map.path,
+            priority=(planner.PRIORITY_HEAL if self._urgent()
                       else planner.PRIORITY_OTHER))
         if result is PLANNING:
             return PLANNING
@@ -2978,11 +3028,16 @@ class NavigateTask(BotTask):
                 f"no route to {self.destination}: the planner gave no answer "
                 f"in {BackgroundPlans.MAX_PENDING_SECONDS:.0f} s")
         route, error, state = result
+        care = state.get("care")
+        if (care is not None and self.care is not None and self.care.finished and
+                care.key == self.care.key):
+            # Finished on the loop while the plan ran: it stays finished.
+            care.finished = True
         for name, value in state.items():
             setattr(self, name, value)
-        deferred, self._deferred_shadow = self._deferred_shadow, None
-        if deferred is not None:
-            route_shadow.request_trip(client, self, *deferred)
+        deferred, self._deferred = self._deferred, []
+        for effect in deferred:
+            effect(client)
         if error is not None:
             raise error
         return route
@@ -2993,7 +3048,7 @@ class NavigateTask(BotTask):
         then uses this plan (_plan_off_loop) rather than planning again."""
         origin = self._origin(client)
         try:
-            route = self._plan_off_loop(client)
+            route = self._plan_off_loop(client, live=True)
         except ValueError as exc:
             self._prepared = (origin, time.monotonic(), exc)
             raise
@@ -3001,10 +3056,6 @@ class NavigateTask(BotTask):
             self._prepared = (origin, time.monotonic(), route)
         return route
 
-    def preplanned(self, client: AtrinikClient, route: "list[MapEdge]") -> None:
-        """Start the trip with ``route``, planned for it from where she
-        stands (a ranking's probe on this task): no second plan."""
-        self._prepared = (self._origin(client), time.monotonic(), route)
 
     def _allow_locked(self, client: AtrinikClient):
         """Her access set: the unlock state's, unless the task overrides it."""
@@ -3112,6 +3163,8 @@ class NavigateTask(BotTask):
         does its ValueError reach the tier, which then relaxes as it always
         did.
         """
+        # A dropped plan stops between tiers.
+        _check_cancelled(self._plan_client)
         try:
             route = self.graph.route_points(
                 *args, walls=self._walls, offer=self._offer, **kwargs)
@@ -3236,7 +3289,9 @@ class NavigateTask(BotTask):
                 previous = waits.get(key)
                 if previous is not None and since - previous[1] <= CARE_WAIT_RESUME_SECONDS:
                     since, alerted = previous[0], previous[2]
-                waits[key] = (since, clock(), alerted)
+                record = (since, clock(), alerted)
+                self._defer(client, lambda real: _care_waits(real).__setitem__(
+                    key, record))
             care = self.care = CareCrossing(mode, tuple(subjects), since, clock=clock,
                                             key=key, alerted=alerted)
         else:
@@ -3669,7 +3724,7 @@ class NavigateTask(BotTask):
         # over its budget; the trip it ranks for decides when it runs.
         live = self.status == TaskStatus.RUNNING
         if live:
-            route_shadow.note_live_plan(client, plan)
+            self._defer(client, lambda real: route_shadow.note_live_plan(real, plan))
         if plan.outcome == route_costs.BLOCKED:
             raise OwnerBlockRefusal(plan.reason)
         # The threat fields describe the route returned, a probe's
@@ -3708,12 +3763,10 @@ class NavigateTask(BotTask):
         for care. Never raises."""
         if self.status != TaskStatus.RUNNING or self._care_staging is not None:
             return
-        if isinstance(client, planner.PlanningClient):
-            # A trip's plan on the worker: reported on the loop when it is
-            # collected (_plan_off_loop).
-            self._deferred_shadow = (origin, route, error)
-            return
-        route_shadow.request_trip(client, self, origin, route, error)
+        # A trip's plan on the worker is reported on the loop when it is
+        # collected (_plan_off_loop).
+        self._defer(client, lambda real: route_shadow.request_trip(
+            real, self, origin, route, error))
 
     def _plan_strict(self, client: AtrinikClient, learned: set[str],
                      origin: tuple[str, tuple[int, int]] | None = None,
@@ -4015,11 +4068,23 @@ class NavigateTask(BotTask):
         return min(self.STALL_RETRY_MAX_SECONDS,
                    max(self.STALL_RETRY_SECONDS, movement_ack_timeout(client)))
 
+    def _passable(self, client: AtrinikClient, obj) -> bool:
+        """_passable_player, knowing her own graph's PvP maps."""
+        node = self.graph.nodes.get(client.state.map.path)
+        if (node is not None and node.pvp and
+                str(obj.name_color).casefold() != WHITE_NAME):
+            # On a PvP map party members (green) block her too.
+            return False
+        return self._passable_player(client, obj)
+
     @classmethod
     def _passable_player(cls, client: AtrinikClient, obj) -> bool:
         """Another player she may walk onto: outside PvP areas players share
         squares, while a monster or NPC (FLAG_MONSTER) blocks every living
-        thing (server map.c blocked()). Her party members are players too.
+        thing (server map.c blocked()). Her party members are players too
+        (on a PvP map they block: _passable). A green name is also the
+        server's colour for a weaker creature: only one no authored object
+        carries counts as a player.
         Live, on 2026-11-26 on world_0_67, the owner's character beside her
         route kept her stepping off it and back four times a second."""
         state = client.state
@@ -4045,14 +4110,17 @@ class NavigateTask(BotTask):
         cx, cy = m.width // 2, m.height // 2
         targets = getattr(m, "targets", None)
         temporary = set()
+        friendly = set()
         if callable(targets):
             for view_x, view_y, obj in targets():
-                if not obj.target_id or self._passable_player(client, obj):
+                if not obj.target_id or self._passable(client, obj):
                     continue
                 point = (m.world_x + view_x - cx,
                          m.world_y + view_y - cy)
                 if point != (m.world_x, m.world_y):
                     temporary.add(point)
+                    if obj.is_friend:
+                        friendly.add(point)
         newly_blocked = temporary - self._temporary_blocked
         self._temporary_blocked = temporary
         if newly_blocked:
@@ -4061,10 +4129,14 @@ class NavigateTask(BotTask):
                 recorder(
                     "navigation-occupant-blocked",
                     ", ".join(f"{x},{y}" for x, y in sorted(newly_blocked)))
-            self._note_occupant_blocks(client, m.path, {
-                (x, y) for x, y in newly_blocked
-                if max(abs(x - m.world_x), abs(y - m.world_y)) <=
-                self.OCCUPANT_HOLD_RADIUS})
+            # Only a friendly occupant (a townsperson, a guard) beside her
+            # makes her hold, and never under attack or on an essential or
+            # critical trip: a hostile one is fled or fought.
+            if not self._urgent() and not recent_hostile_contact(client, 5.0):
+                self._note_occupant_blocks(client, m.path, {
+                    (x, y) for x, y in newly_blocked & friendly
+                    if max(abs(x - m.world_x), abs(y - m.world_y)) <=
+                    self.OCCUPANT_HOLD_RADIUS})
         return (self._runtime_blocked | self._threat_blocked |
                 self._temporary_blocked |
                 self._rejected_departures_on(m.path, (m.world_x, m.world_y)))
@@ -6531,7 +6603,7 @@ class ShopUpgradeSweepTask(BotTask):
         """Route across a shop mat so acquired stock becomes paid: the mat
         with the shortest route (_checkout_goals), ranked on the planner
         worker (ROUTING 1.12). PLANNING while that runs; None when no mat
-        is reachable. The chosen trip starts with its ranked route."""
+        is reachable. The chosen walk plans its own route as it starts."""
         goals = self._checkout_goals(client)
         if not goals:
             return None
@@ -6559,8 +6631,9 @@ class ShopUpgradeSweepTask(BotTask):
             return PLANNING
         if best is None:
             return None
-        _, navigation, route = best
-        navigation.preplanned(client, route)
+        # The walk plans its own, live route when it starts: a ranking's
+        # probe is no live plan (no care, metrics or learned decisions).
+        _, navigation, _ = best
         return navigation
 
     def _begin_settlement(self, client: AtrinikClient, inherited: bool) -> bool:
@@ -8371,6 +8444,21 @@ def unidentified_food(client: AtrinikClient) -> list:
             not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID)]
 
 
+def food_drop_map(graph: "WorldGraph", path: str) -> bool:
+    """Whether junk food may be dropped on ``path``
+    (FarmTask.drop_obsolete_food): a known map of open country or a
+    dungeon. Never a unique map or an apartment (their floors keep it), a
+    town (``no_harm``, a savebed, a merchant or a priest) or a map with a
+    shop floor or mat (dropping there sells or litters a shop)."""
+    node = graph.nodes.get(path)
+    return bool(
+        node is not None and not node.unique and not node.no_harm and
+        not node.shop and "/apartments/" not in path and
+        not graph.savebeds.get(path) and
+        not any(getattr(vendor, "map_path", None) == path for vendor in
+                (*graph.dialogue_vendors, *graph.temple_priests)))
+
+
 def starving_without_food(client: AtrinikClient) -> bool:
     """Food 0 and no safe food carried (food_reserve: edible items only):
     no rest can help, only food. Never where food is obsolete
@@ -9927,13 +10015,23 @@ class FarmCircuitTask(BotTask):
         if client.state.map.path == navigation.destination:
             return False
         if navigation.planning:
-            # Its plan runs on the worker and she stands still: the route
-            # it brings is checked on a later tick.
+            # Its plan runs on the worker and she stands still; the tick
+            # that collects it takes no step, so the route it brings is
+            # checked here before she walks it.
             return False
         if not navigation.route or navigation.route[0].source != client.state.map.path:
-            try:
-                navigation.route = navigation._plan(client)
-            except ValueError:
+            # Never planned on the loop: the leg's own plan, on the worker.
+            if navigation.status == TaskStatus.READY:
+                try:
+                    route = navigation.prepare(client)
+                except ValueError:
+                    return False
+                if route is PLANNING:
+                    # Not started, it walks nowhere: hold until it is known.
+                    return True
+                return any(edge.destination in maps for edge in route)
+            navigation._replan(client)
+            if navigation.planning or navigation.status != TaskStatus.RUNNING:
                 return False
         return any(edge.destination in maps for edge in navigation.route)
 
@@ -10817,12 +10915,11 @@ class FarmCircuitTask(BotTask):
                  len(task.task.retrieved))
 
     @staticmethod
-    def _junk_policy(tags=(), food=()) -> JunkPolicy:
+    def _junk_policy(tags=()) -> JunkPolicy:
         return JunkPolicy((
             r"^paper ",
             r"^(?:iron|bronze|steel|wooden|spruce|soft leather) .*(?:sword|axe|mace|club|spear|bow|shield|armour|skirt|sandals|boots|gloves|helmet)$",
-        ), tags=frozenset(tags), sell_identified_junk=True,
-            food_tags=frozenset(food))
+        ), tags=frozenset(tags), sell_identified_junk=True)
 
     @staticmethod
     def _surplus_equipment(client: AtrinikClient) -> list[Item]:
@@ -10867,9 +10964,7 @@ class FarmCircuitTask(BotTask):
 
     def _identified_junk(self, client: AtrinikClient) -> list[Item]:
         surplus = self._surplus_equipment(client)
-        policy = self._junk_policy(
-            (item.tag for item in surplus),
-            (item.tag for item in obsolete_food(client)))
+        policy = self._junk_policy(item.tag for item in surplus)
         return [item for item in client.state.inventory if policy.junk(item)]
 
     def _needs_junk_sale(self, client: AtrinikClient) -> bool:
@@ -10886,9 +10981,7 @@ class FarmCircuitTask(BotTask):
             self.graph, "/shattered_islands/world_0_69",
             SellJunkTask(
                 "Brynknot shop floor",
-                self._junk_policy(
-                    (item.tag for item in surplus),
-                    (item.tag for item in obsolete_food(client)))),
+                self._junk_policy(item.tag for item in surplus)),
             destination_xy=(15, 7), combat_approach=True)
         task.navigation.strict_safety = True
         return task
@@ -11117,6 +11210,9 @@ class FarmCircuitTask(BotTask):
         """Reconcile loot between pulls even on continuously respawning maps."""
         if self._busy_finishing_fight_or_loot(client, farm):
             return False
+        if (food_drop_map(self.graph, client.state.map.path) and
+                await farm.drop_obsolete_food(client)):
+            return True
         return await farm.maintain_inventory(client)
 
     async def _progress_checkpoint(self, client: AtrinikClient) -> bool:
@@ -11876,6 +11972,7 @@ class FarmCircuitTask(BotTask):
             self._expedition_abort_reason = reason
             self._expedition_return = NavigateTask(
                 self.graph, path, (x, y), tolerance=1)
+            self._expedition_return.critical = True
             await client.clear_actions()
             await client.set_combat(False)
             recorder = getattr(client, "record_action", None)
@@ -12298,6 +12395,12 @@ class FarmCircuitTask(BotTask):
                          target[0], target[1], target[2])
                 self._bed_binding = None
             return True
+        if self._resupply is not None and food_obsolete(client):
+            # Food turned out obsolete (``auto``) during the trip: end it.
+            log.info("food is obsolete; ending %s", self._resupply.name)
+            await client.clear_actions()
+            self._resupply = None
+            self._food_planner.forget()
         if self._resupply is not None:
             await self._resupply.tick(client)
             self._settle_resupply(client)

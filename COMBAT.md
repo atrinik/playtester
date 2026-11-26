@@ -735,7 +735,9 @@ recovery phase:
   hazard maps when no hazard-free route exists
   (`navigation-threat-fallback`): pack-hazard maps, and with them learned
   ranged and over-level maps; only `KNOWN_LETHAL_TRANSIT` stays closed.
-  Once, when such a walk is created, its plan is checked: if it takes
+  Once, when such a walk is created, its plan (made on the planner
+  worker, and the one the walk then follows; she holds still, defending,
+  while it runs) is checked: if it takes
   that fallback, the walk heals below 85% and, below 70%, stops and steps
   away from what hits her, as the recall shopping and cure trips do. If
   she stands on a map without hostile spawns she first rests there, with
@@ -744,6 +746,11 @@ recovery phase:
   `recovery-home-hazard-rest`. On a map with hostile spawns she goes at
   once, since staying is worse. A replan during the walk never rests
   again; the next walk, after `HOME_RETRY_SECONDS`, is checked afresh.
+  Quest trips take the same fallback from the same level (the Fort
+  Sether Illness quest had no route out of the Burnt Forest), only as a
+  defended leg that heals below 85% and steps away below 70%: a
+  dialogue trip's walk becomes a `NavigateThenTask`, never a bare
+  navigation.
   Already home (a death during the rest respawns her there), she does
   not rest. The rest, its record and the home-unreachable streak are the
   recovery task's own memory: a rebuilt task (autoplay's handover, Stop
