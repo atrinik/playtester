@@ -29338,12 +29338,15 @@ class GearScorerTests(unittest.TestCase):
         heavy = self.examined(1, c.TYPE_ARMOUR, "plate", "plate (ac+6)", weight=20.0)
         light = self.examined(2, c.TYPE_ARMOUR, "plate", "plate (ac+6)", weight=2.0)
         policy = InventoryPolicy()
+        from .equipment import WEIGHT_UNWORN
         for load, costs in ((40.0, False), (75.0, True), (95.0, True)):
             with self.subTest(load=load):
                 sack = Item(9, item_type=c.TYPE_CONTAINER, name="sack",
                             weight=load - 22.0)
                 client = self.client(heavy, light, sack, stats={"weight_limit": 140.0})
-                scorer = GearScorer(client, policy, carried_gear_score(client, policy))
+                # As the surplus sale sees them: selling sheds an unworn item.
+                scorer = GearScorer(client, policy, carried_gear_score(client, policy),
+                                    weight_for=WEIGHT_UNWORN)
                 self.assertEqual(scorer.weight_cost(heavy) > 0, costs)
                 if costs:
                     self.assertLess(scorer.value(heavy), scorer.value(light))
@@ -29439,8 +29442,8 @@ class GearScorerTests(unittest.TestCase):
         self.assertGreater(scorer.value(plate), scorer.value(worn) + 15)
         self.assertTrue(asyncio.run(FarmTask().maintain_inventory(client)))
         self.assertEqual(client.applied, [4])
-        # Into an empty slot a net loss is not put on.
-        self.assertFalse(scorer.beats(plate, [])[0])
+        # An empty body slot still takes it: it adds AC and protection.
+        self.assertTrue(scorer.beats(plate, [])[0])
 
     def test_a_second_ring_fills_the_free_ring_slot(self):
         from .tasks import InventoryPolicy, gear_scorer
@@ -29481,6 +29484,160 @@ class GearScorerTests(unittest.TestCase):
         client = self.client(slow, quick)
         scorer = gear_scorer(client, InventoryPolicy(gear_style="bow"))
         self.assertGreater(scorer.value(quick), scorer.value(slow))
+
+    def test_the_equip_loop_charges_no_weight_for_a_swap(self):
+        # Coordinator review repro: at 65% load the plate's 20 kg made the
+        # leather "better", though swapping sheds nothing she carries.
+        from .equipment import WEIGHT_UNOWNED, GearScorer
+        from .tasks import InventoryPolicy, carried_gear_score, gear_scorer
+        plate = self.examined(1, c.TYPE_ARMOUR, "magical plate +3",
+                              "magical plate +3 (ac+6) (Protections: slash +10%)",
+                              worn=True, weight=20.0)
+        leather = self.examined(2, c.TYPE_ARMOUR, "leather armour",
+                                "leather armour (ac+4)", weight=4.0)
+        sack = Item(9, item_type=c.TYPE_CONTAINER, name="sack", weight=91.0 - 24.0)
+        client = self.client(plate, leather, sack, equipment={c.EQUIP_ARMOUR: 1})
+        policy = InventoryPolicy()
+        scorer = gear_scorer(client, policy)
+        self.assertEqual(scorer.weight_cost(plate), 0)
+        self.assertFalse(scorer.beats(leather, [plate])[0])
+        task = FarmTask()
+        for _ in range(5):           # it locks the sack first
+            if not asyncio.run(task.maintain_inventory(client)):
+                break
+        self.assertEqual(client.applied, [])
+        # A purchase still pays for the weight it adds.
+        stock = self.examined(3, c.TYPE_ARMOUR, "plate", "plate (ac+9)", weight=20.0)
+        client.state.place_item(stock, 0)
+        buyer = GearScorer(client, policy, carried_gear_score(client, policy),
+                           weight_for=WEIGHT_UNOWNED)
+        self.assertGreater(buyer.weight_cost(stock), 0)
+        self.assertEqual(buyer.weight_cost(plate), 0)
+
+    def test_an_empty_body_slot_takes_armour_whatever_its_cap(self):
+        from .equipment import NO_RECALL_SPEED_FACTOR, SPEED_WEIGHT
+        from .tasks import InventoryPolicy, gear_scorer
+        self.assertEqual((SPEED_WEIGHT, NO_RECALL_SPEED_FACTOR), (1500, 1.5))
+        mail = self.examined(2, c.TYPE_ARMOUR, "heavy mail",
+                             "heavy mail (speed cap 0.40) (ac+2) (Protections: slash +5%)")
+        client = self.client(mail)
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertLess(scorer.value(mail), 0)
+        self.assertTrue(scorer.beats(mail, [])[0])
+        self.assertTrue(asyncio.run(FarmTask().maintain_inventory(client)))
+        self.assertEqual(client.applied, [2])
+        # An item adding nothing but slowness still stays off.
+        lead = self.examined(3, c.TYPE_BOOTS, "lead boots", "lead boots (speed-1)")
+        self.assertFalse(gear_scorer(self.client(lead), InventoryPolicy()).beats(lead, [])[0])
+
+    def test_gear_scoring_follows_recall_only_once_it_holds(self):
+        from .tasks import GEAR_RECALL_HOLD_SECONDS, working_recall
+        client = self.client()
+        now = [0.0]
+        states = iter([True, False, True, False, False, False])
+        with patch("atrinik_bot.navigation.has_working_recall",
+                   lambda client: next(states)):
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))
+            now[0] = 10
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))   # flip pending
+            now[0] = 20
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))   # back: cleared
+            now[0] = 30
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))   # pending again
+            now[0] = 30 + GEAR_RECALL_HOLD_SECONDS - 1
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))
+            now[0] = 30 + GEAR_RECALL_HOLD_SECONDS
+            self.assertFalse(working_recall(client, clock=lambda: now[0]))  # held
+
+    def test_a_ring_is_valued_against_the_ring_it_replaces(self):
+        from .tasks import InventoryPolicy, gear_scorer
+        strong = self.examined(1, c.TYPE_RING, "ring (Protections: fire +20%)",
+                               "ring (Protections: fire +20%)", worn=True)
+        weak = self.examined(2, c.TYPE_RING, "ring (Protections: cold +2%)",
+                             "ring (Protections: cold +2%)", worn=True)
+        candidate = self.examined(3, c.TYPE_RING, "ring (Protections: acid +9%)",
+                                  "ring (Protections: acid +9%)")
+        client = self.client(strong, weak, candidate,
+                             equipment={c.EQUIP_RING_RIGHT: 1, c.EQUIP_RING_LEFT: 2})
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertEqual({item.tag for item in scorer._rest(candidate)}, {1})
+        self.assertEqual({item.tag for item in scorer._rest(weak)}, {1})
+        # The shop: with a ring slot free, nothing is displaced.
+        client.state.equipment.pop(c.EQUIP_RING_LEFT)
+        weak.flags &= ~c.ITEM_APPLIED
+        client.state.remove_item(weak.tag)
+        stock = Item(5, flags=c.ITEM_UNPAID, item_type=c.TYPE_RING, quality=80,
+                     condition=100, name="ring (Protections: acid +9%)")
+        client.state.place_item(stock, 0)
+        task = BuyShopUpgradeTask()
+        self.assertEqual(task._upgrade_score(client, stock), 9 * 8)
+
+    def test_a_shield_under_a_two_handed_weapon_caps_no_speed(self):
+        from .tasks import InventoryPolicy, gear_scorer
+        halberd = self.examined(1, c.TYPE_WEAPON, "halberd", "halberd (dam+9) (3.00 sec)",
+                                worn=True)
+        halberd.face = 40
+        shield = self.examined(2, c.TYPE_SHIELD, "tower shield",
+                               "tower shield (speed cap 0.50) (ac+4)", worn=True)
+        client = self.client(halberd, shield,
+                             equipment={c.EQUIP_WEAPON: 1, c.EQUIP_SHIELD: 2})
+        client.faces = {40: "halberd.101"}
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertEqual(scorer.speed_delta(shield), 0.0)
+        client.faces = {40: "longsword.101"}
+        self.assertLess(gear_scorer(client, InventoryPolicy()).speed_delta(shield), 0.0)
+
+    def test_a_family_is_ordered_on_one_scale(self):
+        from .tasks import InventoryPolicy, carried_gear_score, gear_scorer
+        worn = self.examined(1, c.TYPE_BOOTS, "boots", "boots (ac+1)", worn=True)
+        examined = self.examined(2, c.TYPE_BOOTS, "good boots", "good boots (ac+5)")
+        unknown = self.examined(3, c.TYPE_BOOTS, "odd boots", None)
+        client = self.client(worn, examined, unknown, equipment={c.EQUIP_BOOTS: 1})
+        policy = InventoryPolicy()
+        scorer = gear_scorer(client, policy)
+        name = carried_gear_score(client, policy)
+        self.assertFalse(scorer.family_effective(c.TYPE_BOOTS))
+        self.assertEqual(scorer.order(examined), name(examined))
+        client.state.remove_item(unknown.tag)
+        scorer = gear_scorer(client, policy)
+        self.assertEqual(scorer.order(examined), scorer.value(examined))
+
+    def test_the_shop_reads_its_answer_from_the_game_channel_only(self):
+        client, girdle, belt = self.belt_client()
+        client.state.remove_item(belt.tag)
+        stock = Item(5, flags=c.ITEM_UNPAID, item_type=c.TYPE_GIRDLE,
+                     name="leather belt", weight=1.0)
+        client.state.place_item(stock, 0)
+        task = BuyShopUpgradeTask()
+        task._feedback_start = client.state.message_count
+        client.state.add_message(c.CHAT_TYPE_LOCAL, "ffffff", "That is leather belt (ac+9)")
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff", "That is leather belt")
+        lines = [str(entry[3]) for entry in client.state.messages_since(task._feedback_start)
+                 if len(entry) > 3 and entry[1] == c.CHAT_TYPE_GAME]
+        feedback = "\n".join(str(entry[3]) for entry in
+                             client.state.messages_since(task._feedback_start))
+        task._apply_examine_metadata(client, stock, feedback, lines)
+        from .equipment import base_from_json
+        self.assertEqual(base_from_json(stock.extra["gear_examine"]["base"]).ac, 0)
+
+    def test_a_zero_launcher_delay_is_real(self):
+        from .tasks import InventoryPolicy, gear_scorer
+        instant = self.examined(1, c.TYPE_BOW, "quick bow", "quick bow (dam+5) (delay+0.0s)")
+        second = self.examined(2, c.TYPE_BOW, "plain bow", "plain bow (dam+5) (delay+1.0s)")
+        scorer = gear_scorer(self.client(instant, second), InventoryPolicy(gear_style="bow"))
+        self.assertEqual(scorer.effective(instant).delay, 0.0)
+        self.assertGreater(scorer.value(instant), scorer.value(second))
+
+    def test_the_surplus_sale_keeps_gear_for_any_style_she_can_field(self):
+        helm = self.examined(1, c.TYPE_HELMET, "iron helm", "iron helm (ac+3)", worn=True)
+        mind = self.examined(3, c.TYPE_HELMET, "wizard hat", "wizard hat (Pow+2) (mana+30)")
+        client = self.client(helm, mind, stats={"pow": 15, "int": 15},
+                             equipment={c.EQUIP_HELM: 1})
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")],
+                                  combat_skill="slash weapons")
+        self.assertIn(mind.tag, {item.tag for item in circuit._surplus_equipment(client)})
+        client.state.place_item(Item(9, item_type=c.TYPE_SPELL, name="magic bullet"), 1)
+        self.assertNotIn(mind.tag, {item.tag for item in circuit._surplus_equipment(client)})
 
     def test_gear_without_examine_data_falls_back_to_the_name_score(self):
         from .tasks import InventoryPolicy, carried_gear_score, gear_scorer
