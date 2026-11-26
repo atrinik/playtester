@@ -61,6 +61,43 @@ from . import constants as c
 from .autoplay import AutoplayTask
 
 
+# Two rows of the server's spell table (include/spellist.h) as laid out:
+# id, name, sp, time, scrolls, charges, range, value_mul, bdam, bdur, ...
+SPELLIST_ROWS = """
+spell_struct spells[NROFREALSPELLS] = {
+    {"spell_firestorm",
+     "firestorm",
+     5,
+     8,
+     3,
+     6,
+     0,
+     1.0,
+     3,
+     5,
+     4,
+     4,
+     9,
+     "magic_fire.ogg",
+     SPELL_USE_CAST | SPELL_USE_WAND,
+     SPELL_DESC_DIRECTION,
+     PATH_FIRE,
+     "firebreath",
+     NULL},
+
+    {"spell_magic_bullet",
+     "magic bullet",
+     4, 8, 3, 6, 0, 1.0, 7, 5, 4, 4, 9,
+     "magic_bullet1.ogg",
+     SPELL_USE_CAST,
+     SPELL_DESC_DIRECTION,
+     PATH_MISSILE,
+     "bullet",
+     NULL},
+};
+"""
+
+
 @lru_cache(maxsize=1)
 def built_graph():
     return WorldGraph().build()
@@ -22129,6 +22166,7 @@ if "--healing-per-second" in args:
                                            if styled else "melee"),
                           encounter_safety=0.4, expected_pack=1.5, worst_pack=8.0,
                           encounter_reasons=["styled" if styled else "unstyled"],
+                          avg_kill_seconds=30.0,
                           # Echoes the profile a styled run rated with.
                           encounter_need=" ".join(
                               " ".join(args[args.index(flag):args.index(flag) + 2])
@@ -42064,7 +42102,9 @@ class BuildPerSpotTests(unittest.TestCase):
             self.assertEqual(analyzer.samples_by_spell["magic bullet"], [10, 12, 14])
             analyzer.samples_by_spell["firestorm"] = [12]
             analyzer.attack_by_spell["firestorm"] = "fire"
-            # Saved at most once a minute.
+            analyzer._sample_count += 1
+            # Saved at most once a minute, whenever a hit was added (even
+            # one equal to the last).
             analyzer._load_samples(restored)
             self.assertNotIn("firestorm", restored.state.spell_samples)
             analyzer._samples_saved_at -= analyzer.SAMPLE_SAVE_SECONDS
@@ -42074,65 +42114,60 @@ class BuildPerSpotTests(unittest.TestCase):
             for cleanup, args, kwargs in reversed(helper._cleanups):
                 cleanup(*args, **kwargs)
 
-    def test_a_fielded_caster_out_of_sp_disengages_until_it_recovers(self):
+    def test_a_dry_fielded_caster_fights_with_her_weapon(self):
         from .tasks import FarmTask
-        client = self._client()
-        client.state.stats.update(sp=2, maxsp=100)
-        for item in client.state.inventory:
-            if item.name == "magic bullet":
-                item.extra["cost"] = 4
-        farm = FarmTask(zone="/farm", combat_skill="wizardry spells",
-                        combat_spell="magic bullet")
-        farm.fielded_caster = True
-        retreats = []
 
-        async def retreat(client, gain_only=False):
-            retreats.append(True)
-            return True
-        farm.low_health_retreat = retreat
-        hostile = (1, 0, 0, types.SimpleNamespace(target_id=5))
-        contact = [True]
-        with patch("atrinik_bot.tasks.recent_hostile_contact", lambda client: contact[0]):
-            # Out of SP with a hostile attacking in contact: the episode
-            # begins, recorded once.
-            self.assertTrue(asyncio.run(farm.dry_caster_step(client, [hostile])))
-            # It keeps retreating while one is within 3 tiles ...
-            self.assertTrue(asyncio.run(farm.dry_caster_step(
-                client, [(3, 0, 0, hostile[3])])))
-            # ... waits (no kite) while one is in view farther off ...
-            contact[0] = False
-            self.assertTrue(asyncio.run(farm.dry_caster_step(
-                client, [(6, 0, 0, hostile[3])])))
-            self.assertEqual(len(retreats), 2)
-            # ... holds while a passive monster is in view (no target) ...
-            self.assertTrue(asyncio.run(farm.dry_caster_step(
-                client, [], in_view=[(2, 0, 0, hostile[3])])))
-            self.assertEqual(len(retreats), 2)
-            # ... but an attacker hitting her from out of view still makes
-            # her retreat ...
-            contact[0] = True
-            self.assertTrue(asyncio.run(farm.dry_caster_step(
-                client, [], in_view=[(2, 0, 0, hostile[3])])))
-            self.assertEqual(len(retreats), 3)
-            contact[0] = False
-            # ... and with none in view lets the farm's own paths (loot,
-            # the rest that pulls nothing until her SP is back) run.
-            self.assertFalse(asyncio.run(farm.dry_caster_step(client, [])))
-            self.assertTrue(farm._caster_dry)
-            # One cast's SP is not enough to come back; half her bar is.
-            client.state.stats["sp"] = 10
-            self.assertTrue(asyncio.run(farm.dry_caster_step(
-                client, [(6, 0, 0, hostile[3])])))
-            client.state.stats["sp"] = 50
-            self.assertFalse(asyncio.run(farm.dry_caster_step(
-                client, [(6, 0, 0, hostile[3])])))
-            self.assertFalse(farm._caster_dry)
-        self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 1)
-        # Not a fielded caster (ordinary melee or Wizardry training): never.
-        farm.fielded_caster = False
+        def farm(weapon=True):
+            client = QuestTests._wizard_training_client(100, x=9, y=8)
+            if weapon:
+                sword = Item(50, flags=c.ITEM_APPLIED, item_type=c.TYPE_WEAPON,
+                             name="long sword")
+                client.state.inventory.append(sword)
+                client.state.items[50] = sword
+                client.state.equipment[c.EQUIP_WEAPON] = 50
+            client.state.stats.update(hp=100, maxhp=100, sp=0, maxsp=100, target_hp=100)
+            client.state.target_id = 100
+            client.state.messages = [(time.time(), 2, "cc66ff",
+                                      "kobold hit you for 4 damage.")]
+            client.actions = []
+            client.record_action = lambda action, detail="": client.actions.append(
+                (action, detail))
+            task = FarmTask(zone="/test", target="kobold", combat_skill="wizardry spells",
+                            combat_spell="cause light wounds")
+            task.fielded_caster = True
+            return client, task
+
+        def tick(client, task):
+            task._last_action = 0
+            asyncio.run(task.tick(client))
+
+        # Out of SP with the kobold attacking beside her: she melees it with
+        # her sword, by the ordinary rules, and walks after nothing.
+        client, task = farm()
+        tick(client, task)
+        tick(client, task)
+        self.assertTrue(client.combat and all(client.combat))
+        self.assertEqual((client.fired, client.moves, client.direct_moves), ([], [], []))
+        self.assertEqual([action for action, _ in client.actions], ["caster-out-of-mana"])
+        # Her SP back for a cast: she casts again (the kobold stepped off).
+        client.state.stats["sp"] = 20
+        client.combat.clear()
+        kobold = client.state.map.tile(9, 8).objects.pop(3)
+        client.state.map.tile(12, 8).objects[3] = kobold
+        for _ in range(3):
+            tick(client, task)
+        self.assertEqual(client.fired, [(3, 42)])
+        self.assertNotIn(True, client.combat)
+        # Dry again, a second episode is recorded.
         client.state.stats["sp"] = 0
-        with patch("atrinik_bot.tasks.recent_hostile_contact", lambda client: True):
-            self.assertFalse(asyncio.run(farm.dry_caster_step(client, [hostile])))
+        self.assertFalse(task.spell_only_training(client))
+        self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 2)
+        # Without a weapon she keeps the spell-only routine: no melee.
+        client, task = farm(weapon=False)
+        tick(client, task)
+        self.assertNotIn(True, client.combat)
+        self.assertTrue(task.spell_only_training(client))
+        self.assertEqual(client.actions[-1][0], "caster-kite")
 
     def test_a_fielded_spell_never_resets_the_training_spells_samples(self):
         helper = FarmAnalyzerTests()
@@ -42269,7 +42304,6 @@ class BuildPerSpotTests(unittest.TestCase):
         # the pending swap and its backoffs over.
         self.assertEqual(client.pending_swap_build, "single")
         self.assertIn("_storage_backoff_until", FarmCircuitTask.BACKOFF_ATTRIBUTES)
-        self.assertIn("_learn_retry_at", FarmCircuitTask.BACKOFF_ATTRIBUTES)
         rebuilt = self._circuit(client)
         rebuilt.child = rebuilt._new_child()
         self.assertTrue(rebuilt._review_combat_build(client, rebuilt.child.task))
@@ -42476,14 +42510,16 @@ class BuildPerSpotTests(unittest.TestCase):
         circuit = self._errand_circuit(client)
         circuit._choose_build(client)
         for attempt in range(3):
-            circuit._learn_retry_at = 0.0
+            client.learn_retry_until = {}
             self.assertTrue(circuit._needs_learn_spell(client), attempt)
             task = LearnSpellTask("Dunowen", "firestorm")
             task.fail("Dunowen offered no firestorm")
             circuit._spell_purchase = types.SimpleNamespace(
                 status=TaskStatus.FAILED, task=task, error=task.error, tick=AsyncMock())
             self.assertTrue(asyncio.run(circuit._tick_running_service(client)))
-        circuit._learn_retry_at = 0.0
+            # The failed spell waits on its own backoff.
+            self.assertGreater(client.learn_retry_until["firestorm"][0], circuit.clock())
+        client.learn_retry_until = {}
         self.assertEqual(client.learn_errand_failed,
                          {"firestorm": "firestorm from Dunowen: Dunowen offered no firestorm"})
         self.assertFalse(circuit._needs_learn_spell(client))
@@ -42512,15 +42548,17 @@ class BuildPerSpotTests(unittest.TestCase):
                          {"ok": True, "retried": ["firestorm"]})
         self.assertEqual((real.learn_errand_failed, real.learn_errand_failures,
                           real.learn_errand_retry), ({}, {}, True))
-        # The retry ends the circuit's route backoff, never a seller's
-        # money refusal.
+        # The retry ends a spell's route backoff, never a seller's money
+        # refusal; backoffs are per spell.
         client.learn_errand_failed, client.learn_errand_retry = {}, True
-        circuit._learn_retry_at = circuit.clock() + 3600.0
+        client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, False)}
         self.assertTrue(circuit._needs_learn_spell(client))
         client.learn_errand_retry = True
-        circuit._shortfall_from_seller = True
-        circuit._learn_retry_at = circuit.clock() + 3600.0
+        client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, True)}
         self.assertFalse(circuit._needs_learn_spell(client))
+        # Another spell's backoff does not hold this one.
+        client.learn_retry_until = {"icestorm": (circuit.clock() + 3600.0, False)}
+        self.assertTrue(circuit._needs_learn_spell(client))
 
     def test_her_live_state_keeps_melee_on_a_melee_rated_spot(self):
         from . import builds
@@ -42592,12 +42630,16 @@ class BuildPerSpotTests(unittest.TestCase):
         for item in client.state.inventory:
             if item.name == "minor healing":
                 item.extra["cost"] = 4
-        # The pinned server's table (include/spellist.h): Firestorm bdam 3,
-        # its cone 5 deep; magic bullet bdam 7.
-        table = spell_table(str(Path("/home/zoey/dev/atrinik/classic/server/src")))
-        fake = {"firestorm": (3, 5), "magic bullet": (7, 5)}
-        if table:
-            self.assertEqual((table["firestorm"], table["magic bullet"][0]), ((3, 5), 7))
+        # The server's table (include/spellist.h), as its rows are laid
+        # out: Firestorm bdam 3, its cone 5 deep; magic bullet bdam 7.
+        with tempfile.TemporaryDirectory() as directory:
+            include = Path(directory) / "include"
+            include.mkdir()
+            (include / "spellist.h").write_text(SPELLIST_ROWS)
+            table = spell_table(directory)
+        self.assertEqual(table, {"firestorm": (3, 5), "magic bullet": (7, 5)})
+        self.assertEqual(spell_table(str(Path(directory) / "missing")), {})
+        fake = table
         # 3 x (0.75 + 15 / 4) = 13.5 at Pow 15 (no bonus), rolled from
         # int(11.3) to int(13.5): 12 on average (server/spell_util.c
         # SP_level_dam_adjust).
@@ -42619,8 +42661,11 @@ class BuildPerSpotTests(unittest.TestCase):
         aoe = build_profile(client, "aoe", "firestorm", base, {}, {}, fake)
         self.assertEqual((aoe.spell_damage, aoe.spell_attack, aoe.damage_estimated),
                          (12.0, "fire", True))
-        # Without the table, nothing to estimate from: no profile.
+        # Without the table, nothing to estimate from, and an area spell's
+        # reach is unknown even when sampled: no profile.
         self.assertIsNone(build_profile(client, "aoe", "firestorm", base, {}, {}, {}))
+        self.assertIsNone(build_profile(client, "aoe", "firestorm", base,
+                                        {"firestorm": [12]}, {"firestorm": "fire"}, {}))
 
     def test_a_caster_must_kill_a_monster_on_one_bar(self):
         from .farm_analyzer import CombatProfile, spot_affordable
@@ -42641,6 +42686,51 @@ class BuildPerSpotTests(unittest.TestCase):
                                                   "avg_player_attacks_second": 0.0}))
         self.assertIsNone(spot_affordable(profile, {}))
         self.assertIsNone(spot_affordable(profile, {"avg_kill_seconds": float("inf")}))
+        # Her regeneration between casts, over one delay fewer than the
+        # casts: at 1.5 SP/s, 10 casts get 8 + 9 x 1.5 / 13 = 9.04.
+        regen = dataclasses.replace(profile, mana_regen=1.5)
+        self.assertFalse(spot_affordable(regen, {"avg_kill_seconds": 10.0}))
+        regen = dataclasses.replace(profile, mana_regen=3.0)
+        # 8 + 9 x 3 / 13 = 10.08 >= 10 casts.
+        self.assertTrue(spot_affordable(regen, {"avg_kill_seconds": 10.0}))
+        self.assertFalse(spot_affordable(regen, {"avg_kill_seconds": 11.0}))
+        # 16 casts at 6.5 SP/s: 8 + 15 x 0.5 = 15.5, not 8 + 16 x 0.5.
+        regen = dataclasses.replace(profile, mana_regen=6.5)
+        self.assertFalse(spot_affordable(regen, {"avg_kill_seconds": 16.0}))
+        self.assertTrue(spot_affordable(regen, {"avg_kill_seconds": 15.0}))
+
+    def test_only_a_caster_build_is_gated_on_her_bar(self):
+        from .farm_analyzer import CombatProfile
+        helper = FarmAnalyzerTests()
+        helper._cleanups = []
+        analyzer = helper.analyzer()
+        client = helper.client()
+        analyzer.heal_samples = [17]
+        # Melee while her Wizardry trains carries the spell model (a cost,
+        # no bar_casts): never gated. A caster with the same numbers is.
+        trained = CombatProfile(skill="wizardry spells", skill_level=10, attack="slash",
+                                damage=44, weapon_class=31, weapon_speed=2.25,
+                                character_level=22, max_health=188, speed=0.8,
+                                armour_class=37, protections=(), spell_damage=12.0,
+                                cast_delay=1.0, mana_cost=4, mana_regen=1.0, max_mana=60,
+                                spell_attack="magic", combat_style="ranged-kite",
+                                healing_per_second=5.0)
+
+        async def scenario():
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            generation = analyzer.report_generation
+            await analyzer._run_encounters(trained, generation, merge=False, key="melee")
+            await analyzer._run_encounters(trained, generation, merge=False, key="single")
+            grind = analyzer.ranking("xp")[0]
+            ratings = analyzer.spot_ratings(grind)
+            self.assertEqual(ratings["melee"]["avg_kill_seconds"], 30.0)
+            self.assertIs(ratings["melee"]["build_affordable"], True)
+            self.assertIs(ratings["single"]["build_affordable"], False)
+            await analyzer.close()
+        asyncio.run(scenario())
+        for cleanup, args, kwargs in reversed(helper._cleanups):
+            cleanup(*args, **kwargs)
         from .navigation import _build_rated
         rated = self._rating("aoe-kite", 0.9, 1000.0)
         self.assertTrue(_build_rated(rated))

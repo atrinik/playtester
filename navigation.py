@@ -7249,6 +7249,17 @@ def _set_attr(client: AtrinikClient, name: str, value) -> None:
         pass
 
 
+def _learn_retries(client: AtrinikClient) -> dict[str, tuple[float, bool]]:
+    """Per spell, until when a failed "get this build" trip waits (on the
+    circuit clock) and whether the seller refused it for money; on the
+    client, so a rebuilt circuit keeps them."""
+    retries = getattr(client, "learn_retry_until", None)
+    if retries is None:
+        retries = {}
+        _set_attr(client, "learn_retry_until", retries)
+    return retries
+
+
 def _build_rated(rating: dict) -> bool:
     """A build's rating counts when the encounter model applied it and her
     bar kills the spot's monsters with it (farm_analyzer.spot_affordable;
@@ -9688,10 +9699,8 @@ class FarmCircuitTask(BotTask):
         # What the shortfall is for (spell, price), for the decision record.
         self._spell_shortfall_key: tuple = ()
         # Until when a failed storage trip waits (a build change's swap
-        # never cuts it short), and the errand's own retry time.
+        # never cuts it short).
         self._storage_backoff_until = 0.0
-        self._learn_retry_at = 0.0
-        self._shortfall_from_seller = False
         # Whether this circuit took over the build she was fielding.
         self._build_seeded = False
         self._cure: NavigateThenTask | None = None
@@ -9741,7 +9750,7 @@ class FarmCircuitTask(BotTask):
         "_shopping_retry_at", "_recall_shopping_retry_at",
         "_utility_shopping_retry_at", "_ship_key_retry_at", "_spell_retry_at",
         "_cure_retry_at", "_restoration_retry_at", "_heal_restock_retry_at",
-        "_recharge_read_until", "_storage_backoff_until", "_learn_retry_at",
+        "_recharge_read_until", "_storage_backoff_until",
     )
 
     def backoffs(self) -> dict[str, float]:
@@ -12975,13 +12984,15 @@ class FarmCircuitTask(BotTask):
         (_spending_reserve). Until then the shortfall is shown on the
         dashboard ("need N for <spell> from <seller>"); the owner can drop
         gold on her. Given up after LEARN_ATTEMPTS failed trips."""
+        retry = _learn_retries(client)
         if getattr(client, "learn_errand_retry", False):
             # The operator retried a given-up errand from the dashboard: its
-            # route or dialogue backoff ends; a seller's money refusal
-            # keeps its own.
+            # spells' route or dialogue backoffs end; a seller's money
+            # refusal keeps its own.
             _set_attr(client, "learn_errand_retry", False)
-            if not self._shortfall_from_seller:
-                self._learn_retry_at = 0.0
+            for spell, (until, money) in list(retry.items()):
+                if not money:
+                    retry.pop(spell)
         offer = self._learn_offer(client)
         if offer is None:
             self._spell_shortfall = ""
@@ -12995,13 +13006,15 @@ class FarmCircuitTask(BotTask):
                 f"{format_money(reserve)} reserves)")
             self._spell_shortfall_key = (offer.spell, offer.price)
             return False
-        if self.clock() < self._learn_retry_at:
-            # The seller's own refusal stands for its backoff.
-            if not self._shortfall_from_seller:
+        until, money = retry.get(offer.spell, (0.0, False))
+        if self.clock() < until:
+            # This spell's failed trip waits (per spell); a seller's own
+            # money refusal stays shown for it.
+            if not money:
                 self._spell_shortfall = ""
             return False
+        retry.pop(offer.spell, None)
         self._spell_shortfall = ""
-        self._shortfall_from_seller = False
         return True
 
     def _new_learn_spell(self, client: AtrinikClient) -> NavigateThenTask:
@@ -13360,9 +13373,9 @@ class FarmCircuitTask(BotTask):
                         isinstance(learn, LearnSpellTask)):
                     log.warning("learning %s failed: %s", learn.spell,
                                 self._spell_purchase.error)
-                    self._learn_retry_at = self.clock() + self.failure_backoff(
-                        self._spell_purchase.error, 1800.0)
-                    self._shortfall_from_seller = bool(learn.shortfall)
+                    _learn_retries(client)[learn.spell] = (
+                        self.clock() + self.failure_backoff(self._spell_purchase.error, 1800.0),
+                        bool(learn.shortfall))
                     if learn.shortfall:
                         self._spell_shortfall = self._spell_purchase.error
                         self._spell_shortfall_key = (learn.spell, learn.shortfall)
@@ -13390,7 +13403,7 @@ class FarmCircuitTask(BotTask):
                     if recorder is not None:
                         recorder("build-spell-learned", f"{learn.spell} from {learn.npc}")
                     # The next build review can field it at once.
-                    self._learn_retry_at = 0.0
+                    _learn_retries(client).pop(learn.spell, None)
                     failures = dict(getattr(client, "learn_errand_failures", None) or {})
                     failures.pop(learn.spell, None)
                     _set_attr(client, "learn_errand_failures", failures)

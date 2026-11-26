@@ -824,6 +824,9 @@ def build_profile(client, build: str, spell: str, base: "CombatProfile",
         if level < 1:
             return None
         area = build == "aoe"
+        if area and spell not in table:
+            # Without the server's table its reach is unknown: not rated.
+            return None
         reach = table.get(spell, (0, 0))[1] if area else 0
         return dataclasses.replace(
             base, skill="wizardry spells", skill_level=level,
@@ -887,7 +890,9 @@ def spot_affordable(profile: "CombatProfile", rating: dict) -> bool | None:
             profile.cast_delay <= 0):
         return None
     needed = math.ceil(seconds / profile.cast_delay - 1e-9)
-    regenerated = profile.mana_regen * needed * max(profile.cast_delay, 0.1) / profile.mana_cost
+    # Her SP regenerates between the casts: over needed - 1 delays.
+    regenerated = (profile.mana_regen * max(0, needed - 1) * profile.cast_delay /
+                   profile.mana_cost)
     return profile.bar_casts + regenerated >= needed
 
 
@@ -997,7 +1002,9 @@ class FarmAnalyzer:
         # Loaded from and saved to her character memory (_load_samples).
         # The character whose samples are loaded ("" before any).
         self._samples_loaded = ""
-        self._samples_saved: tuple = ()
+        self._samples_saved = -1
+        # Hits observed so far (saved when it moves).
+        self._sample_count = 0
         self._samples_saved_at = float("-inf")
         # The encounter model's rating of every spot for each build she can
         # field, with that build's own profile (build_profile; the farm
@@ -1156,6 +1163,7 @@ class FarmAnalyzer:
                 # (her memory keeps the newest, builds.load_spell_samples).
                 self.samples_by_spell[spell] = (
                     self.samples_by_spell.pop(spell, []) + [raw])[-SPELL_SAMPLES:]
+                self._sample_count += 1
                 self.attack_by_spell[spell] = attack
                 self.spell_attack = attack
 
@@ -1244,7 +1252,7 @@ class FarmAnalyzer:
         if self._samples_loaded != character:
             self._samples_loaded = character
             self.samples_by_spell, self.attack_by_spell = {}, {}
-            self._samples_saved = ()
+            self._samples_saved = -1
             saved = getattr(state, "spell_samples", None) or {}
             for spell, entry in saved.items():
                 self.samples_by_spell[spell] = list(entry.get("hits", ()))
@@ -1252,8 +1260,7 @@ class FarmAnalyzer:
         if not save:
             return
         saver = getattr(client, "set_spell_samples", None)
-        signature = tuple(sorted((spell, len(hits), hits[-1:] and hits[-1])
-                                 for spell, hits in self.samples_by_spell.items()))
+        signature = self._sample_count
         if (saver is not None and signature != self._samples_saved and
                 self.clock() - self._samples_saved_at >= self.SAMPLE_SAVE_SECONDS):
             self._samples_saved, self._samples_saved_at = signature, self.clock()
@@ -1354,7 +1361,11 @@ class FarmAnalyzer:
                     self.encounter_generation = generation
                 ratings = self._rated(styled)
                 for rating in ratings.values():
-                    rating["build_affordable"] = spot_affordable(profile, rating)
+                    # Only a caster build is gated on her bar; melee (even
+                    # with her Wizardry training's spell model) never.
+                    rating["build_affordable"] = (
+                        spot_affordable(profile, rating) if style in ("single", "aoe")
+                        else True)
                     rating["damage_estimated"] = profile.damage_estimated
                 self.style_ratings[style] = ratings
                 self.style_generation[style] = generation

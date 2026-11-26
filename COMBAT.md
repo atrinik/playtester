@@ -2110,15 +2110,12 @@ gap says so.
 - **Fielding is not training.** A fielded caster build makes the farm
   child cast its spell with spells only (`FarmCircuitTask._build_spell`,
   `FarmTask.fielded_caster`); the circuit's training plan and its until
-  levels stay as they were, and leaving the build ends it. Out of SP with
-  an attacking hostile in contact (adjacent, and recent hostile contact),
-  a fielded caster disengages (`FarmTask.dry_caster_step`, one
-  `caster-out-of-mana` decision per episode): until her SP is back to half
-  her bar she retreats while any active hostile is within 3 tiles and
-  waits while any monster is in view, never kiting or choosing a target;
-  with none in view
-  the farm's other paths run (an unseen attacker's retreat, loot, and the
-  training rest, which pulls nothing until her SP is back).
+  levels stay as they were, and leaving the build ends it. A fielded
+  caster who cannot afford a cast above her healing reserve fights with
+  her wielded weapon by the ordinary melee rules (pack split, heals,
+  retreat, flee and recall) and casts again as soon as she can, one
+  `caster-out-of-mana` decision each time she runs dry. Without a weapon
+  she keeps the spell-only routine.
 - **Spell damage.** A caster build's damage per hit is the median of her
   sampled hits with its spell, kept per spell (a fielded spell never
   resets her training spell's) and saved in her character memory (at
@@ -2131,12 +2128,15 @@ gap says so.
   path is taken as neutral. Swarms (bullet storm and swarm, meteor swarm,
   frost nova) fire copies of a child spell and get no estimate: they are
   rated only from sampled hits, with a reach of 3. No estimate is made
-  before her stats arrive.
+  before her stats arrive, and without the server's table an area spell
+  is not rated at all.
 - **One bar must kill.** A caster build is rated on a spot only when one
   kill there (the rating's average kill time over her cast delay, rounded
   up; an area cast hits the whole pack, so the same for a pack) takes no
   more casts than her bar beyond the healing reserve pays, plus what her
-  SP regenerates over them (`spot_affordable`). The analyzer reports the
+  SP regenerates between them (`spot_affordable`). Only the caster builds
+  are gated: melee never is, even with her Wizardry training's spell
+  model. The analyzer reports the
   average monster's kill, not the toughest's.
 - **Choosing.** The operator picks a build for the farmed spot (or a ranked
   one) or for every spot on the Farming tab ("Combat build"), kept in her
@@ -2182,7 +2182,8 @@ gap says so.
   (and a `build-errand-funds` decision) until the owner drops gold on her.
   "You don't have enough money..." is handled the same way. The trip uses
   the strict route policy of the other optional errands. A failed trip
-  waits on its own backoff (30 minutes, longer for a refused strict route);
+  waits on its spell's own backoff (30 minutes, longer for a refused strict
+  route);
   after three failed trips for one spell the errand gives that spell up
   (another that fields the build may still be learnt), with a "Learn
   errand failed" alert until the operator retries it (the Farming tab's

@@ -2444,7 +2444,7 @@ class FarmTask(BotTask):
         # disengages), and a build's gear style replaces her training's.
         self.fielded_caster = False
         self.gear_style_override = ""
-        # Whether a fielded caster's dry episode runs (dry_caster_step).
+        # Whether a fielded caster is out of SP for a cast (spell_only_training).
         self._caster_dry = False
         self.allow_launchers = (
             not bool(self.combat_spell)
@@ -3499,8 +3499,28 @@ class FarmTask(BotTask):
         spell = self.combat_spell_item(client)
         maxsp = int(client.state.stats.get("maxsp", 0) or 0)
         cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
+        if spell is not None and self.fielded_caster and self._wields_weapon(client):
+            # A fielded caster who cannot afford a cast above her healing
+            # reserve fights with her weapon, by the ordinary melee rules,
+            # until she can again (one caster-out-of-mana record each time).
+            sp = int(client.state.stats.get("sp", 0) or 0)
+            dry = cost > sp - self.healing_mana_reserve(client)
+            if dry and not self._caster_dry:
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("caster-out-of-mana", f"{spell.name}: fighting with her weapon")
+            self._caster_dry = dry
+            if dry:
+                return False
         return spell is not None and (
             maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
+
+    @staticmethod
+    def _wields_weapon(client: AtrinikClient) -> bool:
+        state = client.state
+        weapon = state.items.get(state.equipment.get(c.EQUIP_WEAPON, 0))
+        return (weapon is not None and weapon.item_type == c.TYPE_WEAPON and
+                bool(weapon.flags & c.ITEM_APPLIED))
 
     # Without a usable heal or a ready recall, she pulls only from this
     # share of her health up (owner decision, 2026-11-22: a recall is not
@@ -4157,61 +4177,6 @@ class FarmTask(BotTask):
         return await self.melee_kite(
             client, x, y, obj, map_node=self.map_node,
             preserve_spell_line=spell)
-
-    # A fielded caster that ran dry (dry_caster_step) keeps away from any
-    # hostile within DRY_RETREAT_RADIUS and pulls nothing until her SP is
-    # back to DRY_RESUME_SP of her maximum.
-    DRY_RETREAT_RADIUS = 3
-    DRY_RESUME_SP = 0.5
-
-    async def dry_caster_step(self, client: AtrinikClient, active: list,
-                              in_view: list | None = None) -> bool:
-        """A fielded caster out of SP disengages for real: once her spell
-        is unaffordable with an attacking hostile in contact (adjacent,
-        recent hostile contact), the dry episode begins (one
-        ``caster-out-of-mana`` record). Until her SP is back to
-        DRY_RESUME_SP she retreats while any active hostile (``active``,
-        the tick's (distance, x, y, obj) entries) is within
-        DRY_RETREAT_RADIUS and waits while any monster (``in_view``, the
-        tick's threats) is in view: no spell-only kite, no target. With
-        none in view the farm's other paths run. True while it took the
-        tick."""
-        if not self.fielded_caster or not self.spell_only_training(client):
-            self._caster_dry = False
-            return False
-        spell = self.combat_spell_item(client)
-        if spell is None:
-            return False
-        stats = client.state.stats
-        sp = int(stats.get("sp", 0) or 0)
-        maxsp = max(1, int(stats.get("maxsp", 0) or 0))
-        nearest = min((entry[0] for entry in active), default=None)
-        if not self._caster_dry:
-            if (nearest is None or nearest > 1 or not recent_hostile_contact(client) or
-                    self.offensive_spell_affordable(client, spell)):
-                return False
-            self._caster_dry = True
-            recorder = getattr(client, "record_action", None)
-            if recorder is not None:
-                recorder("caster-out-of-mana", f"{spell.name}: disengaging until "
-                         f"{self.DRY_RESUME_SP:.0%} SP")
-        if sp >= maxsp * self.DRY_RESUME_SP and self.offensive_spell_affordable(client, spell):
-            self._caster_dry = False
-            return False
-        if nearest is None:
-            if recent_hostile_contact(client):
-                # Hit by an attacker out of view (a heal retargeted her, the
-                # view scrolled): keep retreating.
-                await self.low_health_retreat(client)
-                return True
-            # Nothing active, but a monster in view (passive or not yet
-            # roused): hold, so no target is chosen or pulled. With none in
-            # view the farm's own paths (loot, the training rest) run, the
-            # episode kept.
-            return bool(in_view)
-        if nearest <= self.DRY_RETREAT_RADIUS:
-            await self.low_health_retreat(client)
-        return True
 
     async def caster_kite(self, client: AtrinikClient, x: int, y: int,
                           obj, spell: Item) -> bool:
@@ -7366,9 +7331,6 @@ class FarmTask(BotTask):
         engaged_id = self._engaged_target[0] if self._engaged_target else 0
         engaged = next((entry for entry in threats
                         if entry[3].target_id == engaged_id), None)
-        if await self.dry_caster_step(client, [
-                entry for entry in threats if active_threat(entry)], in_view=threats):
-            return
         nearby_pack = [
             entry for entry in threats
             if entry[0] <= 4 and active_threat(entry)]
