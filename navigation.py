@@ -54,7 +54,8 @@ from .targeting import select_target, target_set_aside
 
 from .alerts import HUNGRY_FOOD
 from .hunger import food_obsolete
-from .client import AtrinikClient, format_money, map_object_visual_name
+from . import builds
+from .client import AtrinikClient, format_money, map_object_visual_name, parse_money_value
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import farm_analyzer as farm_analyzer_plan
 from . import self_improvement
@@ -179,6 +180,19 @@ class DialogueVendor:
     stock: tuple[str, ...] = ()
     treasure_lists: tuple[str, ...] = ()
     level: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class SpellOffer:
+    """One spell an authored spell seller sells (WorldGraph.spell_offers)."""
+
+    seller: str
+    map_path: str
+    x: int
+    y: int
+    spell: str
+    level: int
+    price: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -504,6 +518,9 @@ class WorldGraph:
         # such as the free food a starving character can ask for.
         self.temple_priests: list[DialogueVendor] = []
         self.food_profiles: dict[str, FoodProfile] = {}
+        # Every spell's (level, price in copper) by name, from its
+        # archetype: what a spell seller asks and the Wizardry it needs.
+        self.spell_info: dict[str, tuple[int, int]] = {}
         self.shop_stocks: dict[str, list[tuple[int, int]]] = defaultdict(list)
         # Savebed ("bed to reality") tiles per map, public and private.
         self.savebeds: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -615,6 +632,15 @@ class WorldGraph:
                     profile = None
                 if profile is not None and profile.nutrition > 0:
                     self.food_profiles[name.casefold()] = profile
+            if (archetype.startswith("spell_") and
+                    str(one(attrs, "type", "")) == str(c.TYPE_SPELL)):
+                try:
+                    self.spell_info[str(one(
+                        attrs, "name", archetype[6:].replace("_", " "))).casefold()] = (
+                        max(1, int(one(attrs, "level", 1) or 1)),
+                        max(0, int(one(attrs, "value", 0) or 0)))
+                except (TypeError, ValueError):
+                    pass
             if one(attrs, "monster") != "1":
                 continue
             try:
@@ -2002,6 +2028,27 @@ class WorldGraph:
             (not treasures or treasures.intersection(
                 value.casefold() for value in vendor.treasure_lists))
         ]
+
+    def spell_levels(self) -> dict[str, int]:
+        levels = self.__dict__.get("_spell_levels")
+        if levels is None or len(levels) != len(self.spell_info):
+            levels = self._spell_levels = {
+                name: level for name, (level, _) in self.spell_info.items()}
+        return levels
+
+    def spell_offers(self) -> list["SpellOffer"]:
+        """What every authored spell seller sells (the spells in its
+        generic/spell_seller.py event's ``slaying`` list), with each
+        spell's level and price from its archetype."""
+        offers = []
+        for vendor in self.dialogue_vendors:
+            if not vendor.script.endswith("/generic/spell_seller.py"):
+                continue
+            for spell in vendor.stock:
+                level, price = self.spell_info.get(spell.casefold(), (1, 0))
+                offers.append(SpellOffer(vendor.name, vendor.map_path, vendor.x,
+                                         vendor.y, spell.casefold(), level, price))
+        return offers
 
     def dialogue_food_stock(
             self, vendor: DialogueVendor) -> tuple[FoodProfile, ...]:
@@ -6878,6 +6925,164 @@ class BuySpellTask(BotTask):
             self.fail(f"could not buy {self.spell}; check funds and seller")
 
 
+class SwapSetTask(DepositItemsTask):
+    """One chest visit for a build change (FarmCircuitTask._plan_swap):
+    take out the new build's set and consumables (``retrieve``), wear the
+    pieces that beat what she wears (``wear``; the server takes off what a
+    slot held, types/common/apply.c), then deposit what is no longer her
+    active set (``storable``), as a storage visit does."""
+
+    WEAR_SECONDS = 3.0
+
+    def __init__(self, container_name: str, *, retrieve: RetrieveItemsTask,
+                 wear: Callable[[AtrinikClient], list[Item]],
+                 storable: Callable[[AtrinikClient], list[Item]],
+                 indexer: "storage.ChestIndexer | None" = None):
+        super().__init__(container_name, predicate=lambda item: False, indexer=indexer)
+        self.retrieve = retrieve
+        self.wear = wear
+        self.storable = storable
+        self.phase = "retrieve"
+        # When each piece's apply was sent (by tag).
+        self.worn: dict[int, float] = {}
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        if self.phase == "retrieve":
+            await self.retrieve.tick(client)
+            if self.retrieve.status == TaskStatus.FAILED:
+                self.fail(self.retrieve.error)
+                return
+            if self.retrieve.status != TaskStatus.COMPLETE:
+                return
+            self.phase = "wear"
+        now = time.monotonic()
+        if self.phase == "wear":
+            pending = [item for item in self.wear(client)
+                       if not item.flags & c.ITEM_APPLIED]
+            fresh = [item for item in pending if item.tag not in self.worn]
+            if fresh:
+                for item in fresh[:3]:
+                    self.worn[item.tag] = now
+                    await client.apply(item.tag)
+                return
+            if any(now - self.worn[item.tag] < self.WEAR_SECONDS for item in pending):
+                return
+            self.phase = "deposit"
+            tags = {item.tag for item in self.storable(client)}
+            self.predicate = lambda item: item.tag in tags
+            # The chest is open from the retrieval.
+            self._opened = True
+            self._feedback_start = client.state.message_count
+        await super().tick(client)
+
+
+class LearnSpellTask(BotTask):
+    """Learn one spell from an authored spell seller (content
+    maps/python/Merchant.py, SpellSeller): greet him, follow the spell's
+    link, read its requirement and price, and confirm only when she can
+    cast it and pay it beyond ``cash_reserve`` (her cure reserve).
+
+    ``shortfall`` is the price she could not pay (0 otherwise): the circuit
+    shows it as a dashboard alert, and the owner can drop gold on her.
+    """
+
+    LINK = BuyDialogueStockTask.LINK
+    # The seller's lines (Merchant.py SpellSeller), exact.
+    KNOWN = re.compile(r"but you already know ", re.I)
+    REQUIREMENT = re.compile(
+        r"requires level (\d+) to use\. Your wizardry spells skill is level (\d+)\.", re.I)
+    PRICE = re.compile(r"will cost you (.+?)\. Is that okay\?", re.I)
+    NO_MONEY = re.compile(r"You don't have enough money", re.I)
+    PAID = re.compile(r"You pay (.+?)\.", re.I)
+    REPLY_SECONDS = 5.0
+    LEARN_SECONDS = 8.0
+
+    def __init__(self, npc: str, spell: str, *, cash_reserve: int = 0):
+        super().__init__(f"learn-spell:{spell}")
+        self.npc = npc
+        self.spell = spell.casefold()
+        self.cash_reserve = max(0, int(cash_reserve))
+        self.price = 0
+        self.level = 0
+        self.shortfall = 0
+        self._stage = ""
+        self._sent_at = 0.0
+
+    def known(self, client: AtrinikClient) -> bool:
+        return self.spell in builds.known_spells(client.state)
+
+    @classmethod
+    def read_quote(cls, text: str) -> tuple[int, int, int] | None:
+        """(spell level, her Wizardry level, price) from the seller's
+        answer to the spell's link, or None until it came."""
+        price = cls.PRICE.search(text)
+        requirement = cls.REQUIREMENT.search(text)
+        if price is None or requirement is None:
+            return None
+        return (int(requirement.group(1)), int(requirement.group(2)),
+                parse_money_value(price.group(1)) or 0)
+
+    async def _say(self, client: AtrinikClient, text: str, stage: str) -> None:
+        client.state.interface = None
+        await client.talk(text, self.npc)
+        self._stage = stage
+        self._sent_at = time.monotonic()
+
+    async def tick(self, client: AtrinikClient) -> None:
+        if self.status == TaskStatus.READY:
+            await self.start(client)
+        if self.known(client):
+            self.complete()
+            return
+        now = time.monotonic()
+        interface = client.state.interface
+        text = BuyDialogueStockTask._interface_payload(client)
+        if not self._stage:
+            await self._say(client, "hello", "menu")
+            return
+        if self._stage == "menu":
+            links = [match.group(2).casefold() for markup in
+                     (interface.links if interface is not None else ())
+                     if (match := self.LINK.search(markup)) is not None]
+            if self.spell in links:
+                await self._say(client, self.spell, "quote")
+            elif now - self._sent_at > self.REPLY_SECONDS:
+                self.fail(f"{self.npc} offered no {self.spell}")
+            return
+        if self._stage == "quote":
+            if self.KNOWN.search(text):
+                self.complete()
+                return
+            quote = self.read_quote(text)
+            if quote is None:
+                if now - self._sent_at > self.REPLY_SECONDS:
+                    self.fail(f"{self.npc} gave no price for {self.spell}")
+                return
+            self.level, wizardry, self.price = quote
+            if wizardry < self.level:
+                self.fail(f"{self.spell} needs Wizardry {self.level}, she has {wizardry}")
+                return
+            spare = BuyShopUpgradeTask.wallet_value(client) - self.cash_reserve
+            if self.price > spare:
+                self.shortfall = self.price
+                self.fail(f"need {format_money(self.price)} for {self.spell} "
+                          f"from {self.npc}")
+                return
+            client.state.interface = None
+            await BuyShopUpgradeTask.send_purchase(
+                client, self.price, lambda: client.talk(f"buy {self.spell}", self.npc))
+            self._stage = "buy"
+            self._sent_at = now
+            return
+        if self.NO_MONEY.search(text):
+            self.shortfall = self.price
+            self.fail(f"need {format_money(self.price)} for {self.spell} from {self.npc}")
+        elif now - self._sent_at > self.LEARN_SECONDS:
+            self.fail(f"{self.spell} was not learnt from {self.npc}")
+
+
 _MONSTER_LABEL = re.compile(r"\s+L\d+(?:\u00d7\d+)?$")
 
 
@@ -9449,6 +9654,15 @@ class FarmCircuitTask(BotTask):
         self._ship_key_retry_at = 0.0
         self._spell_purchase: NavigateThenTask | None = None
         self._spell_retry_at = 0.0
+        # The combat build she fields (builds.py), the last choice and
+        # what was recorded of it, the build a pending swap trip fetches
+        # (one apartment visit, SwapSetTask), and why she cannot buy the
+        # spell her wanted build needs ("" when she can).
+        self._build_name = "melee"
+        self._build_choice: builds.Choice | None = None
+        self._build_noted: tuple = ()
+        self._swap_build = ""
+        self._spell_shortfall = ""
         self._cure: NavigateThenTask | None = None
         self._cure_retry_at = 0.0
         self._cure_apply_at = 0.0
@@ -9967,12 +10181,71 @@ class FarmCircuitTask(BotTask):
 
     def _automatic_combat_plan(
             self, client: AtrinikClient) -> tuple[str, str, int]:
-        """Choose the next bounded secondary-combat milestone."""
+        """Choose the next bounded secondary-combat milestone: the build
+        for her spot (_choose_build); melee keeps the automatic Wizardry
+        training plan."""
         if not self._auto_combat_build:
             return (self.combat_skill, self.combat_spell,
                     self.combat_skill_until_level)
         # Shared with the farming analyzer's profile (farm_analyzer.py).
-        return farm_analyzer_plan.automatic_training_plan(client.state)
+        default = farm_analyzer_plan.automatic_training_plan(client.state)
+        choice = self._choose_build(client)
+        if choice is None:
+            return default
+        return builds.plan(choice.build, client.state, self.graph.spell_levels(), default)
+
+    def _choose_build(self, client: AtrinikClient) -> builds.Choice | None:
+        """The build for her spot (builds.choose): the operator's choice,
+        else the safest she can field by the analyzer's per-style
+        encounter ratings, ranked by XP. Keeps the styles she can field on
+        the client (``build_styles``) for the analyzer's encounter runs,
+        and the choice for the dashboard (_publish_build)."""
+        state = client.state
+        levels = self.graph.spell_levels()
+        analyzer = getattr(client, "farm_analyzer", None)
+        rate = getattr(analyzer, "spot_ratings", None)
+        ratings = rate(self.spot) if callable(rate) else {}
+        spot = str((self.spot or {}).get("path", ""))
+        choice = builds.choose(
+            state, spot, ratings, getattr(state, "build_choices", {}) or {}, levels,
+            warn=farm_analyzer_plan.encounter_warning)
+        _set_attr(client, "build_styles", builds.fieldable_styles(state, levels))
+        self._build_choice = choice
+        self._publish_build(client, choice)
+        return choice
+
+    def _publish_build(self, client: AtrinikClient, choice: builds.Choice | None) -> None:
+        """The build for the dashboard (``build_status``, with this circuit,
+        as farm_encounter_warning), and each change recorded: build-choice,
+        and build-gap while the operator's build cannot be fielded."""
+        spot = self.spot or {}
+        status = {
+            "circuit": self, "spot": str(spot.get("path", "")),
+            "spot_name": str(spot.get("name", "")),
+            "build": choice.build if choice else "", "active": self._build_name,
+            "chosen": choice.chosen if choice else builds.AUTO,
+            "reason": choice.reason if choice else "she can field no build",
+            "gaps": dict(choice.gaps) if choice else {},
+            "fallback": bool(choice and choice.fallback),
+            "wanted": choice.wanted if choice else "",
+            "shortfall": self._spell_shortfall,
+        }
+        _set_attr(client, "build_status", status)
+        noted = (status["spot"], status["build"], status["chosen"], status["fallback"],
+                 status["shortfall"])
+        if noted == self._build_noted:
+            return
+        self._build_noted = noted
+        recorder = getattr(client, "record_action", None)
+        if recorder is None or choice is None:
+            return
+        recorder("build-choice", f"{status['spot_name'] or '?'}: "
+                 f"{builds.BUILDS[choice.build].label} ({choice.reason})")
+        if choice.fallback:
+            log.warning("build gap: %s", choice.reason)
+            recorder("build-gap", choice.reason)
+        if self._spell_shortfall:
+            recorder("build-errand-funds", self._spell_shortfall)
 
     def _review_combat_build(self, client: AtrinikClient,
                              farm: FarmTask) -> bool:
@@ -9987,6 +10260,14 @@ class FarmCircuitTask(BotTask):
             return False
         self.combat_skill, self.combat_spell, target = desired
         self.combat_skill_until_level = target
+        previous = self._build_name
+        choice = self._build_choice
+        self._build_name = choice.build if choice is not None else "melee"
+        _set_attr(client, "active_build_style",
+                  "" if self._build_name == "melee"
+                  else builds.BUILDS[self._build_name].encounter_style)
+        if self._build_name != previous:
+            self._plan_swap(client)
         self.child = self._new_child()
         self._farm_started_at = 0.0
         self._empty_spawn_since = 0.0
@@ -10466,7 +10747,8 @@ class FarmCircuitTask(BotTask):
             resident_spawns=[(spawn.x, spawn.y, spawn.pull_clearance_radius)
                              for spawn in residents],
             allow_launchers=(
-                not self._auto_combat_build and not bool(self.combat_spell)))
+                (not self._auto_combat_build and not bool(self.combat_spell)) or
+                self._build_name == "bow"))
         farm._lore_book_attempts = self._lore_book_attempts
         farm._spellbook_attempts = self._spellbook_attempts
         farm._unreachable_targets = self._unreachable_targets
@@ -10725,7 +11007,7 @@ class FarmCircuitTask(BotTask):
         STORE_WEIGHT on purpose: the bag is what keeps her below it."""
         if self.clock() < self._storage_retry_at:
             return False
-        if self._bag_fetch_due(client):
+        if self._swap_build or self._bag_fetch_due(client):
             return True
         policy = InventoryPolicy()
         items = self._storable_items(client, keep_unknown=self._keep_unknown(client))
@@ -10874,6 +11156,8 @@ class FarmCircuitTask(BotTask):
         items), her active build's best stored items that beat what she
         wears, and her best bag of holding while she needs one
         (_chest_wants)."""
+        if self._swap_build:
+            return self._new_swap_trip(client)
         tags = {item.tag for item in self._storable_items(client, keep_unknown=keep_unknown)}
         indexer = self._chest_indexer()
         # Only what _storable_items chose: never her active set, even a
@@ -10890,6 +11174,124 @@ class FarmCircuitTask(BotTask):
             destination_xy=self.APARTMENT_CHEST_XY, combat_approach=True)
         task.navigation.strict_safety = True
         return task
+
+    # --- Swapping gear sets on a build change (builds.py) ------------------
+
+    def _consumable(self, item: Item, build: str | None = None) -> bool:
+        """Whether an item is a consumable of a build's kit: ammunition for
+        her launcher (bow), an area-spell wand or rod (AoE caster)."""
+        build = build or self._build_name
+        name = item.name.casefold()
+        if build == "bow" and item.item_type == c.TYPE_ARROW:
+            return True
+        return (build == "aoe" and item.item_type in (c.TYPE_WAND, c.TYPE_ROD) and
+                any(spell in name for spell in builds.AREA_SPELLS))
+
+    def _plan_swap(self, client: AtrinikClient) -> None:
+        """After a build change, one apartment visit swaps her set
+        (SwapSetTask) when the chest holds part of the new build's set or
+        its consumables, as her index knows it."""
+        style = self._build(client)
+        rows = storage.stored(client.state)
+        consumable = lambda row: self._consumable(
+            Item(0, item_type=row["type"], name=row["name"]))
+        wanted = [row for row in rows if any(
+            label.startswith(style + ":") for label in row.get("sets", ())) or
+            consumable(row)]
+        if not wanted:
+            return
+        self._swap_build = self._build_name
+        # A build change is worth a visit now, not after the routine wait.
+        self._storage_retry_at = 0.0
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("build-swap", f"{builds.BUILDS[self._build_name].label}: fetching "
+                     + ", ".join(row["name"] for row in wanted[:5]))
+
+    def _set_upgrades(self, client: AtrinikClient, build: str,
+                      sets: dict[str, dict[int, list[Item]]], pool: set[int], *,
+                      launchers: bool = True) -> set[int]:
+        """The items of ``pool`` in ``build``'s best set that beat what she
+        wears in their slot (by the equip loop's margin). The equip loop
+        never switches her trained weapon school."""
+        state = client.state
+        scorer = self._scorer_for(client)(build)
+        policy = InventoryPolicy()
+        worn = [item for item in state.inventory if item.flags & c.ITEM_APPLIED]
+        wants: set[int] = set()
+        for item_type, members in sets[build].items():
+            if not launchers and item_type in (c.TYPE_BOW, c.TYPE_ARROW):
+                continue
+            slots = len(policy.equipment_slots.get(item_type, ())) or 1
+            current = [item for item in worn if item.item_type == item_type]
+            for item in members:
+                other_school = bool(
+                    item.item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and item.required_skill_tag and
+                    any(worn_item.required_skill_tag and
+                        worn_item.required_skill_tag != item.required_skill_tag
+                        for worn_item in current))
+                if (item.tag in pool and not other_school and
+                        scorer.beats(item, current, slots)[0]):
+                    wants.add(item.tag)
+        return wants
+
+    def _swap_wear(self, client: AtrinikClient) -> list[Item]:
+        """What she puts on at the chest: carried pieces of her build's
+        set that beat what she wears (a launcher is readied by the farm)."""
+        build = self._build(client)
+        pool = {item.tag for item in client.state.inventory
+                if not item.flags & c.ITEM_APPLIED}
+        wants = self._set_upgrades(client, build, self._owned_sets(client, builds=(build,)),
+                                   pool, launchers=False)
+        return [item for item in client.state.inventory if item.tag in wants]
+
+    def _new_swap_trip(self, client: AtrinikClient) -> NavigateThenTask:
+        """One chest visit: take out the new build's set and consumables
+        (_chest_wants), wear it, then put away what is no longer her
+        active set (_storable_items)."""
+        indexer = self._chest_indexer()
+        swap = SwapSetTask(
+            "chest",
+            retrieve=RetrieveItemsTask(
+                "chest", select=self._chest_wants, indexer=indexer,
+                max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT),
+            wear=self._swap_wear,
+            storable=lambda client: self._storable_items(
+                client, keep_unknown=self._keep_unknown(client)),
+            indexer=indexer)
+        self._storage_deposit = swap
+        task = NavigateThenTask(
+            self.graph, self.APARTMENT, swap,
+            destination_xy=self.APARTMENT_CHEST_XY, combat_approach=True)
+        task.navigation.strict_safety = True
+        return task
+
+    def build_suggestion(self, client: AtrinikClient) -> dict[str, Any]:
+        """The best set for her spot's build from everything she owns, per
+        slot: what she carries (her build's best by the gear scorer) first,
+        then what her chest holds for that build (her index's set labels).
+        Shop items are not listed: no examined shop stock is cached."""
+        build = (self._build_choice.build if self._build_choice is not None
+                 else self._build_name)
+        style = builds.BUILDS[build].gear_style
+        sets = self._owned_sets(client, builds=(style,))[style]
+        slots: dict[str, list[dict[str, str]]] = {}
+        for item_type, members in sets.items():
+            label = storage.slot_label(item_type)
+            for item in members:
+                slots.setdefault(label, []).append({
+                    "name": item.name,
+                    "where": "worn" if item.flags & c.ITEM_APPLIED else "carried"})
+        for row in storage.stored(client.state):
+            for label in row.get("sets", ()):
+                name, _, slot = label.partition(":")
+                if name == style:
+                    slots.setdefault(slot, []).append({"name": row["name"], "where": "stored"})
+        consumables = [row["name"] for row in storage.stored(client.state)
+                       if self._consumable(Item(0, item_type=row["type"], name=row["name"]),
+                                           build)]
+        return {"build": build, "label": builds.BUILDS[build].label, "style": style,
+                "slots": slots, "consumables": consumables, "shop": []}
 
     # --- What she carries and what goes home (storage.py) ------------------
 
@@ -10944,7 +11346,8 @@ class FarmCircuitTask(BotTask):
                 "weight_limit", "regen_sp")),
             tuple(sorted(wand_charges(client).items())),
             len(storage.stored(state)), id(getattr(state, "apartment_storage", None)),
-            self.combat_skill, self.combat_spell, len(self._storage_refused))
+            self.combat_skill, self.combat_spell, self._build_name,
+            len(self._storage_refused))
 
     def _cached(self, client: AtrinikClient, key: tuple, compute: Callable[[], Any]) -> Any:
         """One computation per inventory state: the storage and sale
@@ -11051,6 +11454,8 @@ class FarmCircuitTask(BotTask):
                     item.item_type == c.TYPE_CONTAINER):
                 stored.append(item)
             elif item.item_type in (c.TYPE_WAND, c.TYPE_ROD):
+                if not unknown and self._consumable(item):
+                    continue
                 if not unknown and any(word in name for word in (
                         "heal", "cure", "identify", "restoration", "recall")) and not (
                         item.item_type == c.TYPE_WAND and "word of recall" in name):
@@ -11072,8 +11477,11 @@ class FarmCircuitTask(BotTask):
     def _chest_wants(self, client: AtrinikClient, contents: list[Item]) -> set[int]:
         """What a storage visit takes out of the chest besides sellable
         stock: her active build's best stored items that beat what she
-        wears in their slot (by the equip loop's margin), and her best
-        bag of holding while she needs one and carries none."""
+        wears in their slot (by the equip loop's margin), its consumables
+        (_consumable), and her best bag of holding while she needs one and
+        carries none. On a build change's swap trip, items deposited
+        earlier this session may come back too: the build that put them
+        away no longer applies."""
         state = client.state
         build = self._build(client)
         level = int(state.stats.get("level", 0) or 0)
@@ -11082,7 +11490,7 @@ class FarmCircuitTask(BotTask):
             if self._storage_deposit is not None and item.tag in self._storage_deposit.sent_tags:
                 return True
             reason = self._deposited_tags.get(item.tag)
-            if reason is None:
+            if reason is None or self._swap_build:
                 return False
             at_level, name = reason
             changed = (name != item.name or
@@ -11090,23 +11498,11 @@ class FarmCircuitTask(BotTask):
             return not changed
         chest = {item.tag for item in contents if not stays(item)}
         sets = self._owned_sets(client, contents, builds=(build,))
-        scorer = self._scorer_for(client)(build)
-        policy = InventoryPolicy()
-        worn = {item.tag: item for item in state.inventory if item.flags & c.ITEM_APPLIED}
-        wants: set[int] = set()
-        for item_type, members in sets[build].items():
-            slots = len(policy.equipment_slots.get(item_type, ())) or 1
-            current = [item for item in worn.values() if item.item_type == item_type]
-            for item in members:
-                # The equip loop never switches her trained weapon school.
-                other_school = bool(
-                    item.item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and item.required_skill_tag and
-                    any(worn_item.required_skill_tag and
-                        worn_item.required_skill_tag != item.required_skill_tag
-                        for worn_item in current))
-                if (item.tag in chest and not other_school and
-                        scorer.beats(item, current, slots)[0]):
-                    wants.add(item.tag)
+        wants = self._set_upgrades(client, build, sets, chest)
+        # Her build's consumables (ammunition, area-spell wands) come too.
+        wants.update(item.tag for item in contents
+                     if item.tag in chest and self._consumable(item) and
+                     InventoryPolicy().identified(item))
         if storage.best_bag(state.inventory) is None and storage.bag_wanted(state):
             bag = storage.best_bag(contents)
             if bag is not None:
@@ -12430,6 +12826,46 @@ class FarmCircuitTask(BotTask):
                 BuyShopUpgradeTask.wallet_value(client) >= 7_000 and
                 self.clock() >= self._spell_retry_at)
 
+    def _learn_offer(self, client: AtrinikClient) -> "SpellOffer | None":
+        """The spell her wanted build needs (builds.Choice.wanted) from a
+        known seller, or None."""
+        choice = self._build_choice
+        if not self._auto_combat_build or choice is None or not choice.wanted:
+            return None
+        return builds.learn_target(choice.wanted, client.state, self.graph.spell_offers())
+
+    def _needs_learn_spell(self, client: AtrinikClient) -> bool:
+        """The "get this build" errand: learn the spell her wanted build
+        needs from its seller once she can pay it without touching her
+        cure reserve (the depletion service's cost). Until then the
+        shortfall is shown on the dashboard ("need N for <spell> from
+        <seller>"); the owner can drop gold on her."""
+        offer = self._learn_offer(client)
+        if offer is None or self.clock() < self._spell_retry_at:
+            self._spell_shortfall = "" if offer is None else self._spell_shortfall
+            return False
+        reserve = self._depletion_service_cost(client)
+        spare = BuyShopUpgradeTask.wallet_value(client) - reserve
+        if offer.price > spare:
+            self._spell_shortfall = (
+                f"need {format_money(offer.price)} for {offer.spell.title()} from "
+                f"{offer.seller} ({format_money(max(0, spare))} spare above her "
+                f"{format_money(reserve)} cure reserve)")
+            return False
+        self._spell_shortfall = ""
+        return True
+
+    def _new_learn_spell(self, client: AtrinikClient) -> NavigateThenTask:
+        offer = self._learn_offer(client)
+        assert offer is not None
+        task = NavigateThenTask(
+            self.graph, offer.map_path,
+            LearnSpellTask(offer.seller, offer.spell,
+                           cash_reserve=self._depletion_service_cost(client)),
+            destination_xy=(offer.x, offer.y), combat_approach=True)
+        task.navigation.tolerance = 1
+        return task
+
     def _new_spell_purchase(self) -> NavigateThenTask:
         task = NavigateThenTask(
             self.graph, "/shattered_islands/world_1_69",
@@ -12768,10 +13204,21 @@ class FarmCircuitTask(BotTask):
             await self._spell_purchase.tick(client)
             if self._spell_purchase.status in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
+                learn = self._spell_purchase.task
                 if self._spell_purchase.status == TaskStatus.FAILED:
                     log.warning("spell purchase failed: %s",
                                 self._spell_purchase.error)
                     self._spell_retry_at = self.clock() + 1800.0
+                    if isinstance(learn, LearnSpellTask) and learn.shortfall:
+                        self._spell_shortfall = self._spell_purchase.error
+                elif isinstance(learn, LearnSpellTask):
+                    log.info("%s learned from %s; returning to farm",
+                             learn.spell, learn.npc)
+                    recorder = getattr(client, "record_action", None)
+                    if recorder is not None:
+                        recorder("build-spell-learned", f"{learn.spell} from {learn.npc}")
+                    # The next build review can field it at once.
+                    self._spell_retry_at = 0.0
                 else:
                     log.info("magic bullet learned; returning to farm")
                     self._spell_retry_at = self.clock() + 86400.0
@@ -13055,9 +13502,12 @@ class FarmCircuitTask(BotTask):
                     self._storage.error, 1800.0)
                 self._strict_trip_refused(
                     client, "apartment storage", self._storage.error)
+                self._swap_build = ""
                 self._storage = None
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
+                # One swap trip per build change.
+                self._swap_build = ""
                 note_cure_funding_errand(client)
                 # One visit per STORAGE_VISIT_SECONDS at most: what it could
                 # not settle (a bag over the weight cap) waits.
@@ -13397,6 +13847,14 @@ class FarmCircuitTask(BotTask):
             await client.clear_actions()
             await client.set_combat(False)
             self._spell_purchase = self._new_spell_purchase()
+            await self._spell_purchase.tick(client)
+            return
+        if (isinstance(farm, FarmTask) and not held and not cure_funding_farm(client) and
+                self._needs_learn_spell(client) and
+                not self._busy_finishing_fight_or_loot(client, farm)):
+            await client.clear_actions()
+            await client.set_combat(False)
+            self._spell_purchase = self._new_learn_spell(client)
             await self._spell_purchase.tick(client)
             return
         if (isinstance(farm, FarmTask) and

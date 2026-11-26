@@ -2008,7 +2008,8 @@ unchanged.
     another hostile is close; `ranged-kite` while Wizardry trains with
     spells only (`caster_kite` holds one target at range; as
     `FarmTask.spell_only_training`, once the spell fits beyond her healing
-    reserve). She casts no area spell, so never `aoe-kite`.
+    reserve); her fielded build's style when she fields another build
+    ([combat builds](#combat-builds-per-spot-2026-11-26)).
   - `--healing-per-second` (`healing_rate`): the median HP of her landed
     heal-spell casts (`FarmAnalyzer.heal_samples`, from "The spell heals
     you for N hp!" within 2 s of her FIRE of a healing spell she knows; an
@@ -2080,6 +2081,73 @@ Accepted limits:
   analyzer's model.
 - A heal near full health reports what it healed, not what it could, so
   the median understates her healing.
+
+## Combat builds per spot (2026-11-26)
+
+Live on 2026-11-26 she fought several monsters at once in melee on a spot
+better suited to an area spell. The owner asked for a build per location,
+chosen automatically or by the operator, with the matching gear set worn.
+`builds.py` holds the builds; `FarmCircuitTask._choose_build` picks one for
+the spot autoplay farms. The spot itself is still chosen as before
+([encounter warnings](#encounter-warnings-2026-11-25) stay warn only): the
+build is chosen for the spot, never the spot for a build.
+
+| Build | Requirement | Routine (FarmTask) | Gear style | Encounter style |
+| --- | --- | --- | --- | --- |
+| Melee | a weapon and a weapon school | her weapon, with the automatic Wizardry training plan | melee | `melee` |
+| AoE caster | a known area spell (firestorm, icestorm, ...) her Wizardry can cast | the Wizardry spell kite, packs allowed (`casts_firestorm` covers every area spell) | caster | `aoe-kite` |
+| Single-target caster | a known damage spell (magic bullet, ...) her Wizardry can cast | the Wizardry spell kite, one target | caster | `ranged-kite` |
+| Bow | a launcher, its archery skill and 20 ammunition | the launcher pull, then her weapon | bow | `ranged-kite` |
+
+The server refuses a spell above her Wizardry level
+(`types/common/apply.c`), so a spell's level is its archetype's. A wand or
+rod of an area spell is carried with the AoE set as a consumable but
+fields no build: the farm casts, it does not fire wands (her firestorm L2
+and icestorm L5 wands with Magic Devices 1 would be weak anyway), and the
+gap says so.
+
+- **Choosing.** The operator picks a build for the farmed spot or for every
+  spot on the Farming tab ("Combat build"), kept in her character memory
+  (`GameState.build_choices`; "auto" for a spot clears its own choice). On
+  auto, the analyzer rates her spot in the encounter style of every build
+  she can field (`FarmAnalyzer.style_ratings`: after the warn-only run of
+  her own style, one more `--combat-style` run per other style, once per
+  ranking, kept apart from the ranking), and she fields the safest: a build
+  without an encounter warning before one with, then the most XP; among
+  warned builds the highest encounter safety. Until a style is rated, she
+  keeps her default plan (melee). The rating uses her current damage
+  profile with only the style changed.
+- **Unmet requirement.** An operator's build she cannot field falls back to
+  the auto choice among those she can, with a `build-gap` decision and a
+  "Build gap" warning alert. The "get this build" errand works towards the
+  operator's unmet build, else the AoE build while she cannot field it.
+- **Learning a spell** (`LearnSpellTask`). Spell sellers and their spells
+  are indexed from content at graph build (`WorldGraph.spell_offers`: each
+  `generic/spell_seller.py` event's `slaying` list, with each spell's level
+  and price from its archetype). The first target is Firestorm from
+  Dunowen (`world_17_2_2` (5,9), level 15, 5 gold). She greets the seller,
+  follows the spell's link, reads "X requires level N to use. Your wizardry
+  spells skill is level M." and "X will cost you P. Is that okay?"
+  (`Merchant.py` `SpellSeller`), and confirms only when she can cast it and
+  pay it beyond her cure reserve (the depletion service's cost). Short, she
+  does not go: the dashboard shows "Get this build: need 5g for Firestorm
+  from Dunowen" (and a `build-errand-funds` decision) until the owner drops
+  gold on her. "You don't have enough money..." is handled the same way.
+- **Swapping sets.** A build change whose set or consumables her chest
+  holds (her index's set labels, ammunition for the bow, area-spell wands
+  for the AoE caster) makes one apartment trip (`SwapSetTask`): take out the
+  new build's pieces that beat what she wears and its consumables, wear
+  them (the server takes off what each slot held), then deposit what is no
+  longer her active set. Items deposited earlier in the session may come
+  back on that trip.
+- **Suggestion.** The Farming tab lists the best set for the spot's build
+  from what she owns: per slot what she wears or carries first (the gear
+  scorer's best), then what her chest holds for that build, and the stored
+  consumables.
+
+Not done: shop items that would improve the set (no examined shop stock is
+cached), choosing icestorm or another element per spot by monster
+protections, and fighting with wands.
 
 ## Packs on a walk: cornered and outclassed (2026-11-24)
 
@@ -2279,7 +2347,9 @@ savebed is known and fully safe (see the README's "Farming analyzer").
 At Wizardry 15 the single-target restriction should give way to area spells.
 
 - **Purchase.** Buy both firestorm and icestorm from Dunowen in the Wizards'
-  Tower (Daffodil, `world_17_2_2` at (5,9)), 5 gold each.
+  Tower (Daffodil, `world_17_2_2` at (5,9)), 5 gold each. Firestorm is now
+  learnt by the "get this build" errand
+  ([combat builds](#combat-builds-per-spot-2026-11-26)).
 - **Element choice.** Cast whichever spell the monsters are not immune to.
   Ice golems are cold-immune and fire-weak; lava golems are the reverse.
   Firestorm is the default.

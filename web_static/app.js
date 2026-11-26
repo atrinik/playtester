@@ -301,6 +301,45 @@ function renderTrends() {
     return `<div class="trend"><div class="spot-head"><small>${label}</small><b>${value === null || value === undefined ? "–" : esc(fmt(value))}</b></div>${trendLine(points, key)}</div>`;
   }).join("");
 }
+// Combat build per spot (builds.py): the operator's choice, the build she
+// fields and why, its gaps, and the best owned set for it.
+let lastBuildSig = "";
+function buildButtons(b, chosen, scope) {
+  return (b.choices || []).map(key => {
+    const label = key === "auto" ? "Auto" : (b.labels || {})[key] || key;
+    return `<button role="radio" aria-checked="${key === chosen}" class="${key === chosen ? "active" : ""}" data-build="${esc(key)}" data-scope="${esc(scope)}">${esc(label)}</button>`;
+  }).join("");
+}
+function renderCombatBuild() {
+  const fa = slow.farming_analysis;
+  const b = fa && fa.build;
+  if (!b) return;
+  const sig = JSON.stringify(b);
+  if (sig === lastBuildSig) return;
+  lastBuildSig = sig;
+  const st = b.status;
+  $("#build-spot").innerHTML = st ? buildButtons(b, b.spot_choice || "auto", st.spot) : '<span class="muted small">Not farming an analyzer spot.</span>';
+  $("#build-every").innerHTML = buildButtons(b, b.every_spot || "auto", "*");
+  if (!st) { $("#build-status").innerHTML = ""; return; }
+  const label = k => (b.labels || {})[k] || k;
+  const gaps = Object.entries(st.gaps || {}).map(([k, v]) => `<small class="muted">${esc(label(k))}: ${esc((v || []).join("; "))}</small>`).join("");
+  const sug = b.suggestion || {};
+  const slots = Object.entries(sug.slots || {}).map(([slot, items]) => `<small>${esc(slot)}: ${(items || []).map(i => `${esc(i.name)} <span class="muted">(${esc(i.where)})</span>`).join(", ")}</small>`).join("");
+  $("#build-status").innerHTML = `<div class="spot">
+    <div class="spot-head"><b>${esc(label(st.build) || "none")}</b>${st.active && st.active !== st.build ? `<span class="flag">fielding ${esc(label(st.active))}</span>` : ""}</div>
+    <small class="${st.fallback ? "warn-text" : "muted"}">${esc(st.reason || "")}</small>
+    ${st.shortfall ? `<small class="warn-text">Get this build: ${esc(st.shortfall)}</small>` : ""}
+    ${gaps}
+    ${slots ? `<small class="muted">Suggested ${esc(sug.label || "")} set (owned):</small>${slots}` : ""}
+    ${(sug.consumables || []).length ? `<small class="muted">Stored consumables: ${esc(sug.consumables.join(", "))}</small>` : ""}
+  </div>`;
+}
+document.addEventListener("click", e => {
+  const btn = e.target.closest("button[data-build]");
+  if (!btn || btn.classList.contains("active")) return;
+  action(btn, `Combat build: ${btn.textContent}`, { type: "build_choice", spot: btn.dataset.scope, build: btn.dataset.build })
+    .then(ok => { if (ok) { lastBuildSig = ""; pollSlow(); } });
+});
 $("#fa-objectives").addEventListener("click", e => {
   const b = e.target.closest("button[data-objective]");
   if (!b || b.classList.contains("active")) return;
@@ -1118,7 +1157,7 @@ async function pollSlow() {
   slowBusy = true;
   try {
     const r = await fetch(`/api/state?include=${SLOW_KEYS}`, { cache: "no-store" });
-    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderVoyages(); renderBlocks(); renderLearned(); renderShadow(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
+    if (r.ok) { slow = await r.json(); renderBuild(); renderFarming(); renderCombatBuild(); renderDeaths(); renderTrends(); renderSlowLists(); renderEquipment(); renderUnlocks(); renderVoyages(); renderBlocks(); renderLearned(); renderShadow(); if ($("#tab-activity").classList.contains("active")) renderActivity(); }
     if ($("#tab-knowledge").classList.contains("active")) pollKnowledge();
     if ($("#tab-farming").classList.contains("active")) { pollTerrain(); pollOwnerWatch(); }
     if ($("#tab-feedback").classList.contains("active")) pollFeedback();

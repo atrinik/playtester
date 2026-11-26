@@ -33,6 +33,7 @@ from .equipment import (MAGIC_HIDDEN_TYPES, WEIGHT_NONE, WEIGHT_UNOWNED, BaseSta
 from . import route_shadow, terrain
 from . import owner_watch
 from . import storage
+from .builds import AREA_SPELLS
 from .observations import is_player, plain
 from .model import STARTER_APARTMENT, Item, MapObject
 from .hunger import food_obsolete
@@ -3454,12 +3455,13 @@ class FarmTask(BotTask):
             self.combat_skill in item.name.casefold()), None)
 
     def casts_firestorm(self, client: AtrinikClient) -> bool:
-        """Whether this farm casts Firestorm, which strikes several at
-        once: configured and known. Merely knowing it is not enough."""
+        """Whether this farm casts an area spell (Firestorm and the
+        others of builds.AREA_SPELLS), which strikes several at once:
+        configured and known. Merely knowing one is not enough."""
         return (
-            self.combat_spell == "firestorm" and
+            self.combat_spell in AREA_SPELLS and
             any(item.item_type == c.TYPE_SPELL and
-                item.name.casefold() == "firestorm"
+                item.name.casefold() == self.combat_spell
                 for item in client.state.inventory))
 
     def single_target_wizardry(self, client: AtrinikClient) -> bool:

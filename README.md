@@ -454,6 +454,21 @@ carries: what she wears and the best candidate, with both scores, the
 effective stats, per-stat differences and notes such as "+2 on a cape adds
 no AC", and the recent shadow log.
 
+## Combat builds per spot
+
+She fields one of four builds on her farm spot (`builds.py`; COMBAT.md,
+"Combat builds per spot"): melee, AoE caster, single-target caster or bow,
+each with its requirements, a FarmTask routine, a gear style and an
+encounter style. The operator picks one for the farmed spot or for every
+spot on the Farming tab (kept in her character memory); on auto she fields
+the safest build she can by the analyzer's encounter rating of each
+fieldable style, ranked by XP. A build she cannot field falls back with a
+"Build gap" alert, and a "get this build" errand learns the spell it needs
+from a spell seller (first Firestorm from Dunowen) once she can pay it
+beyond her cure reserve; until then the dashboard shows what she needs. A
+build change makes one apartment trip to swap gear sets, and the Farming
+tab suggests the best owned set for the spot's build.
+
 ## Inventory and home storage
 
 She carries only her active set (`storage.py`, `FarmCircuitTask`): worn
@@ -882,7 +897,8 @@ The ranking run above is the one she chooses by and passes no
 a ranking is in, a separate encounter run passes her combat style
 (`--combat-style melee` with a weapon, `ranged-kite` while she trains
 Wizardry with spells only, which she casts from range once the spell fits
-beyond her healing reserve; never `aoe-kite`, as she has no area spell),
+beyond her healing reserve; the fielded build's style when she fields
+another, see "Combat builds per spot"),
 her measured healing (`--healing-per-second`, below) and her displayed
 speed (`--character-speed`), and its encounter fields (`encounter_safety`,
 `expected_pack`, `worst_pack`, `encounter_reasons` and the rest) are copied

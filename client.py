@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from . import builds
 from . import constants as c
 from .access_codes import normalize_access_code
 from .farm_analyzer import DEFAULT_OBJECTIVE, OBJECTIVES
@@ -697,6 +698,11 @@ class AtrinikClient:
             objective = record.get("farm_objective", DEFAULT_OBJECTIVE)
             self.state.farm_objective = (
                 objective if objective in OBJECTIVES else DEFAULT_OBJECTIVE)
+            choices = record.get("build_choices", {})
+            self.state.build_choices = {
+                str(spot)[:300]: value for spot, value in choices.items()
+                if isinstance(spot, str) and value in builds.CHOICES
+            } if isinstance(choices, dict) else {}
             try:
                 self.state.last_bank_deposit_at = max(
                     0.0, float(record.get("last_bank_deposit_at", 0.0)))
@@ -748,6 +754,7 @@ class AtrinikClient:
             self.state.savebed_xy = None
             self.state.apartment_returns = {}
             self.state.farm_objective = DEFAULT_OBJECTIVE
+            self.state.build_choices = {}
             self.state.farm_adaptations = {}
             self.state.bank_balance = 0
             self.state.bank_balance_known = False
@@ -1172,6 +1179,25 @@ class AtrinikClient:
         if not character:
             return
         self._runtime_memory.setdefault(character, {})["farm_objective"] = objective
+        self._persist_character_memory()
+
+    def set_build_choice(self, spot: str, choice: str) -> None:
+        """Persist the operator's combat build for a farm spot (its path)
+        or for every spot (builds.EVERY_SPOT); "auto" for a spot clears its
+        own choice, so every spot's applies again."""
+        if choice not in builds.CHOICES:
+            raise ValueError(f"unknown build {choice!r}")
+        spot = str(spot or builds.EVERY_SPOT)[:300]
+        choices = dict(self.state.build_choices)
+        if choice == builds.AUTO and spot != builds.EVERY_SPOT:
+            choices.pop(spot, None)
+        else:
+            choices[spot] = choice
+        self.state.build_choices = choices
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})["build_choices"] = dict(choices)
         self._persist_character_memory()
 
     def set_apartment_bed_bound(self, bound: bool = True) -> None:

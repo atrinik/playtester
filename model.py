@@ -344,6 +344,9 @@ class GameState:
     farm_zone_quarantine: dict[str, float] = field(default_factory=dict)
     # Which farming-analyzer ranking autoplay follows (see farm_analyzer.OBJECTIVES).
     farm_objective: str = "xp"
+    # The operator's combat build per farm spot (its path) or for every
+    # spot ("*"): a build name or "auto" (builds.py).
+    build_choices: dict[str, str] = field(default_factory=dict)
     # Per-spot lessons from deaths and emergency recalls (self_improvement.py).
     farm_adaptations: dict[str, dict] = field(default_factory=dict)
     farm_zone_last_checked: dict[str, float] = field(default_factory=dict)

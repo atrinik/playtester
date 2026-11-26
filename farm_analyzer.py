@@ -675,13 +675,17 @@ def combat_profile(client, spell_damage: float = 0.0,
                     item.name.casefold() == "meditation"
                     for item in state.inventory))
     swing = SPELL_CAST_DELAY if spells_only else weapon_speed
+    # The build the farm circuit fields (builds.py) rates her spot in its
+    # own style; without one, her kit's.
+    style = str(getattr(client, "active_build_style", "") or "") or (
+        RANGED_KITE_STYLE if spells_only else MELEE_STYLE)
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
         character_level=character_level, max_health=max_health,
         speed=round(speed, 3), armour_class=armour_class, protections=protections,
         max_aggro_pack=max_aggro_pack,
-        combat_style=RANGED_KITE_STYLE if spells_only else MELEE_STYLE,
+        combat_style=style,
         healing_per_second=healing_rate(state, heal, swing), **caster)
 
 
@@ -784,6 +788,17 @@ class FarmAnalyzer:
         # HP of her recent landed heal-spell casts (healing_rate).
         self.heal_samples: list[int] = []
         self._message_position = 0
+        # The encounter model's rating of every spot in each style a build
+        # she can field fights in (builds.fieldable_styles, kept on the
+        # client as ``build_styles`` by the farm circuit): style -> spot_key
+        # -> encounter fields and xp_hour. Only her current style's run is
+        # merged into the ranking (warn only); the others feed the build
+        # choice (builds.choose). Per style: the ranking it rated, when it
+        # last started and why it last failed.
+        self.style_ratings: dict[str, dict[tuple, dict]] = {}
+        self.style_generation: dict[str, int] = {}
+        self._style_attempt_at: dict[str, float] = {}
+        self.style_errors: dict[str, str] = {}
 
     @classmethod
     def from_bundle(cls, installed: dict, **kwargs) -> "FarmAnalyzer":
@@ -941,7 +956,8 @@ class FarmAnalyzer:
             return False
         origin = self.approach_origin(client.state)
         if not self.due(profile, origin):
-            return self._poll_encounters(profile)
+            return self._poll_encounters(
+                profile, tuple(getattr(client, "build_styles", ()) or ()))
         # A new ranking would drop an encounter run's result anyway: stop it
         # so the two never share her host's cores.
         self._cancel_encounters()
@@ -989,18 +1005,43 @@ class FarmAnalyzer:
         if self.encounter_running:
             self._encounter_task.cancel()
 
-    def _poll_encounters(self, profile: CombatProfile) -> bool:
-        if not self.encounter_due(profile):
+    def style_due(self, profile: CombatProfile | None, style: str) -> bool:
+        """Whether another build's style (not her current one) should rate
+        the current ranking: as encounter_due, once per ranking, after the
+        current style's run, a failed one after RETRY_SECONDS."""
+        if (profile is None or self.report is None or self.running or
+                self.encounter_running or not profile.combat_style or
+                profile.healing_per_second <= 0 or style == profile.combat_style or
+                self.encounter_generation != self.report_generation):
             return False
-        self._encounter_attempt_at = self.clock()
+        if self.style_generation.get(style) == self.report_generation:
+            return False
+        elapsed = self.clock() - self._style_attempt_at.get(style, float("-inf"))
+        return elapsed >= (self.RETRY_SECONDS if self.style_errors.get(style)
+                           else self.MIN_INTERVAL_SECONDS)
+
+    def _poll_encounters(self, profile: CombatProfile, styles: tuple[str, ...] = ()) -> bool:
+        if self.encounter_due(profile):
+            self._encounter_attempt_at = self.clock()
+            self._encounter_task = asyncio.get_running_loop().create_task(
+                self._run_encounters(profile, self.report_generation))
+            return True
+        style = next((style for style in styles if self.style_due(profile, style)), "")
+        if not style:
+            return False
+        self._style_attempt_at[style] = self.clock()
         self._encounter_task = asyncio.get_running_loop().create_task(
-            self._run_encounters(profile, self.report_generation))
+            self._run_encounters(dataclasses.replace(profile, combat_style=style),
+                                 self.report_generation, merge=False))
         return True
 
-    async def _run_encounters(self, profile: CombatProfile, generation: int) -> None:
-        """One encounter run, merged into the ranking it was started for.
-        Her ranking never waits for it; a ranking replaced meanwhile drops
-        the result, and the next poll rates the new one."""
+    async def _run_encounters(self, profile: CombatProfile, generation: int, *,
+                              merge: bool = True) -> None:
+        """One encounter run, merged into the ranking it was started for
+        (``merge``: her current style's), and kept as that style's ratings
+        (style_ratings). Her ranking never waits for it; a ranking replaced
+        meanwhile drops the result, and the next poll rates the new one."""
+        style = profile.combat_style
         try:
             styled = await self._analyze(
                 self.command(profile, self.origin, styled=True), encounter=True)
@@ -1011,14 +1052,21 @@ class FarmAnalyzer:
                     self._encounter_process.kill()
             raise
         except Exception as error:  # Warn only: the ranking stands.
-            self.encounter_error = str(error)
-            log.warning("farming analyzer encounter run failed: %s", error)
+            if merge:
+                self.encounter_error = str(error)
+            self.style_errors[style] = str(error)
+            log.warning("farming analyzer %s encounter run failed: %s", style, error)
         else:
-            self.encounter_error = ""
+            self.style_errors.pop(style, None)
+            if merge:
+                self.encounter_error = ""
             if generation == self.report_generation and self.report is not None:
-                self._merge_encounters(self.report, styled)
-                self.encounter_profile = profile
-                self.encounter_generation = generation
+                if merge:
+                    self._merge_encounters(self.report, styled)
+                    self.encounter_profile = profile
+                    self.encounter_generation = generation
+                self.style_ratings[style] = self._rated(styled)
+                self.style_generation[style] = generation
         finally:
             self._encounter_process = None
 
@@ -1073,23 +1121,50 @@ class FarmAnalyzer:
         version = styled.get("schema_version")
         if not (isinstance(version, int) and not isinstance(version, bool)):
             return report
-        found: dict[tuple, dict | None] = {}
-        for spot in [*(styled.get("results") or ()),
-                     *(spot for ranked in styled["rankings"].values()
-                       if isinstance(ranked, list) for spot in ranked)]:
-            if not isinstance(spot, dict):
-                continue
-            key = FarmAnalyzer.spot_key(spot)
-            fields = {name: spot[name] for name in ENCOUNTER_FIELDS if name in spot}
-            if key in found and found[key] != fields:
-                found[key] = None
-            else:
-                found.setdefault(key, fields)
+        found = FarmAnalyzer._found(styled, ENCOUNTER_FIELDS)
         for spot in FarmAnalyzer._spots(report):
             fields = found.get(FarmAnalyzer.spot_key(spot))
             if fields:
                 spot.update(fields, analyzer_schema_version=version)
         return report
+
+    @staticmethod
+    def _found(styled: dict, names: tuple[str, ...]) -> dict[tuple, dict | None]:
+        """Each spot identity's ``names`` fields in an encounter run; None
+        for an identity it rates twice differently."""
+        found: dict[tuple, dict | None] = {}
+        for spot in [*(styled.get("results") or ()),
+                     *(spot for ranked in (styled.get("rankings") or {}).values()
+                       if isinstance(ranked, list) for spot in ranked)]:
+            if not isinstance(spot, dict):
+                continue
+            key = FarmAnalyzer.spot_key(spot)
+            fields = {name: spot[name] for name in names if name in spot}
+            if key in found and found[key] != fields:
+                found[key] = None
+            else:
+                found.setdefault(key, fields)
+        return found
+
+    @staticmethod
+    def _rated(styled: dict) -> dict[tuple, dict]:
+        """One style's ratings by spot identity: its encounter fields and
+        XP rate, stamped like a merged spot (encounter_rated)."""
+        version = styled.get("schema_version")
+        if not (isinstance(version, int) and not isinstance(version, bool)):
+            return {}
+        return {key: {**fields, "analyzer_schema_version": version}
+                for key, fields in FarmAnalyzer._found(
+                    styled, (*ENCOUNTER_FIELDS, "name", "xp_hour")).items()
+                if fields}
+
+    def spot_ratings(self, spot: dict | None) -> dict[str, dict | None]:
+        """A spot's rating in each style rated for the current ranking."""
+        if not spot:
+            return {}
+        key = self.spot_key(spot)
+        return {style: ratings.get(key) for style, ratings in self.style_ratings.items()
+                if self.style_generation.get(style) == self.report_generation}
 
     @staticmethod
     def _spots(report: dict) -> list[dict]:

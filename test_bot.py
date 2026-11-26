@@ -41841,5 +41841,415 @@ class InventoryStorageTests(unittest.TestCase):
                          [pouches[0].tag])
 
 
+class BuildPerSpotTests(unittest.TestCase):
+    """A combat build per farm spot (builds.py): chosen by the operator or
+    by the encounter model's per-style ratings, a gap and a "get this
+    build" errand when she cannot field it, and one apartment trip to
+    swap gear sets on a change."""
+
+    LEVELS = {"firestorm": 15, "icestorm": 15, "magic bullet": 1,
+              "minor healing": 1, "cause light wounds": 1}
+
+    @staticmethod
+    def _client(gold: int = 0):
+        """Sera live, on 2026-11-26: Slash 36, Wizardry 15, Magic Devices 1;
+        she knows magic bullet, minor healing and cause light wounds and
+        carries firestorm (L2) and icestorm (L5) wands."""
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats.update(level=38, weight_limit=100, pow=15, int=15, maxsp=100)
+        client.state.bank_balance = 0
+        client.state.bank_balance_known = True
+        client.actions = []
+        client.record_action = lambda action, detail="": client.actions.append((action, detail))
+        tag = iter(range(100, 200))
+        for name, level in (("slash weapons", 36), ("wizardry spells", 15),
+                            ("magic devices", 1)):
+            client.state.place_item(Item(next(tag), item_type=c.TYPE_SKILL, name=name,
+                                         extra={"level": level}), 7)
+        for name in ("magic bullet", "minor healing", "cause light wounds"):
+            client.state.place_item(Item(next(tag), item_type=c.TYPE_SPELL, name=name), 7)
+        for name in ("wand of firestorm (lvl 2)", "wand of icestorm (lvl 5)"):
+            client.state.place_item(Item(next(tag), item_type=c.TYPE_WAND, quality=80,
+                                         name=name), 7)
+        client.state.place_item(Item(next(tag), item_type=c.TYPE_WEAPON, flags=c.ITEM_APPLIED,
+                                     quality=80, condition=80, name="long sword"), 7)
+        if gold:
+            client.state.place_item(Item(next(tag), item_type=c.TYPE_MONEY, quantity=gold,
+                                         name="gold coins"), 7)
+        return client
+
+    @staticmethod
+    def _rating(style, safety, xp, worst=2.0):
+        return {"analyzer_schema_version": 2, "encounter_applied": True,
+                "encounter_style": style, "encounter_safety": safety,
+                "worst_pack": worst, "xp_hour": xp, "name": "spot"}
+
+    def test_an_aoe_spot_without_an_area_spell_falls_back_with_a_gap(self):
+        from . import builds
+        from .farm_analyzer import encounter_warning
+        client = self._client()
+        self.assertEqual(builds.fieldable(client.state, self.LEVELS), ("melee", "single"))
+        gaps = builds.gaps("aoe", client.state, self.LEVELS)
+        self.assertIn("no area spell she can cast (Wizardry 15)", gaps[0])
+        # Her wands field no build: the farm casts, it does not fire wands.
+        self.assertIn("wand of firestorm (lvl 2)", gaps[0])
+        ratings = {"melee": self._rating("melee", 0.4, 900.0, worst=8.0),
+                   "ranged-kite": self._rating("ranged-kite", 0.85, 700.0)}
+        choice = builds.choose(client.state, "/burnt", ratings, {"/burnt": "aoe"},
+                               self.LEVELS, warn=encounter_warning)
+        self.assertEqual((choice.build, choice.chosen, choice.fallback, choice.wanted),
+                         ("single", "aoe", True, "aoe"))
+        self.assertIn("AoE caster needs: no area spell", choice.reason)
+        self.assertIn("falling back to Single-target caster", choice.reason)
+        # Learnt, Firestorm fields it.
+        client.state.place_item(Item(300, item_type=c.TYPE_SPELL, name="firestorm"), 7)
+        choice = builds.choose(client.state, "/burnt", ratings, {"/burnt": "aoe"},
+                               self.LEVELS, warn=encounter_warning)
+        self.assertEqual((choice.build, choice.fallback), ("aoe", False))
+        self.assertEqual(builds.plan("aoe", client.state, self.LEVELS, ("", "", 0)),
+                         ("wizardry spells", "firestorm", 0))
+
+    def test_auto_picks_the_safest_build_she_can_field(self):
+        from . import builds
+        from .farm_analyzer import encounter_warning
+        client = self._client()
+        # Melee would earn more, but its bad pulls warn; the safe single-
+        # target kite wins. The AoE build rates safest, but she cannot
+        # field it.
+        ratings = {"melee": self._rating("melee", 0.45, 1200.0, worst=8.0),
+                   "ranged-kite": self._rating("ranged-kite", 0.85, 700.0),
+                   "aoe-kite": self._rating("aoe-kite", 0.95, 1500.0)}
+        choice = builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                               warn=encounter_warning)
+        self.assertEqual((choice.build, choice.chosen, choice.fallback), ("single", "auto", False))
+        self.assertIn("ranged-kite encounter safety 0.85", choice.reason)
+        # Both safe: the one with more XP.
+        ratings["melee"] = self._rating("melee", 0.9, 1200.0)
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                       warn=encounter_warning).build, "melee")
+        # Neither safe: the safer one.
+        ratings["melee"] = self._rating("melee", 0.5, 1200.0, worst=9.0)
+        ratings["ranged-kite"] = self._rating("ranged-kite", 0.7, 700.0, worst=9.0)
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                       warn=encounter_warning).build, "single")
+        # Unrated, she keeps her default plan.
+        self.assertEqual(builds.choose(client.state, "/spot", {}, {}, self.LEVELS).build, "melee")
+        # The analyzer rates every style she can field.
+        self.assertEqual(builds.fieldable_styles(client.state, self.LEVELS),
+                         ("melee", "ranged-kite"))
+
+    def test_an_operator_build_choice_persists_and_sticks(self):
+        from . import builds
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.set_build_choice("/shattered_islands/world_17_72", "single")
+            client.set_build_choice(builds.EVERY_SPOT, "melee")
+            with self.assertRaises(ValueError):
+                client.set_build_choice("/x", "wizard")
+            restored = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            restored.state.player_name = "Sera"
+            restored.load_character_memory("Sera")
+            self.assertEqual(restored.state.build_choices,
+                             {"/shattered_islands/world_17_72": "single", "*": "melee"})
+            # The spot's choice sticks however the ratings go; elsewhere
+            # every spot's applies; "auto" for the spot clears its own.
+            sera = self._client()
+            ratings = {"melee": self._rating("melee", 0.99, 5000.0)}
+            for spot, build in (("/shattered_islands/world_17_72", "single"), ("/other", "melee")):
+                self.assertEqual(builds.choose(sera.state, spot, ratings,
+                                               restored.state.build_choices,
+                                               self.LEVELS).build, build)
+            restored.set_build_choice("/shattered_islands/world_17_72", "auto")
+            self.assertEqual(restored.state.build_choices, {"*": "melee"})
+
+    def test_the_dashboard_sets_the_build_choice(self):
+        client = AtrinikClient(ClientConfig())
+        engine = TaskEngine(client)
+        server = WebControlServer(client, engine, WorldGraph())
+        dashboard = DashboardState(client, engine, WorldGraph(), {})
+        result = asyncio.run(server._action(
+            {"type": "build_choice", "spot": "/farm", "build": "aoe"}))
+        self.assertEqual(result, {"ok": True, "spot": "/farm", "build": "aoe"})
+        self.assertEqual(client.state.build_choices, {"/farm": "aoe"})
+        with self.assertRaises(ValueError):
+            asyncio.run(server._action({"type": "build_choice", "build": "wizard"}))
+        snapshot = dashboard.build_snapshot()
+        self.assertEqual((snapshot["every_spot"], snapshot["status"]), ("auto", None))
+
+    def _circuit(self, client):
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], analyzer_driven=True,
+                                  spot={"path": "/farm", "name": "Farm"})
+        circuit.graph.spell_info = {name: (level, 50_000 if level == 15 else 6_000)
+                                    for name, level in self.LEVELS.items()}
+        return circuit
+
+    def test_a_build_change_makes_one_swap_trip(self):
+        from . import storage
+        from .navigation import SwapSetTask
+        client = self._client()
+        client.state.map.path = FarmCircuitTask.APARTMENT
+        worn = Item(1, flags=c.ITEM_APPLIED, item_type=c.TYPE_GIRDLE, quality=80,
+                    condition=80, name="soft leather girdle +6")
+        caster = Item(2, item_type=c.TYPE_GIRDLE, quality=80, condition=80,
+                      name="soft leather girdle (Pow+4)")
+        client.state.place_item(worn, 7)
+        client.state.equipment[c.EQUIP_BELT] = worn.tag
+        chest = Item(90, name="chest")
+        client.state.place_item(chest, 0)
+        client.state.place_item(caster, chest.tag)
+        client.state.apartment_storage = [storage.entry(caster, ["caster:girdle"])]
+        circuit = self._circuit(client)
+        circuit.child = circuit._new_child()
+        circuit._storage_retry_at = float("inf")
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        # The operator picks the single-target caster here: the build
+        # changes, and her chest holds that build's girdle.
+        client.state.build_choices = {"/farm": "single"}
+        self.assertTrue(circuit._review_combat_build(client, circuit.child.task))
+        self.assertEqual((circuit._build_name, circuit.combat_skill, circuit.combat_spell),
+                         ("single", "wizardry spells", "magic bullet"))
+        self.assertEqual(client.active_build_style, "ranged-kite")
+        self.assertIn("build-swap", [action for action, _ in client.actions])
+        self.assertTrue(circuit._needs_apartment_storage(client))
+        trip = circuit._new_apartment_storage(client)
+        swap = trip.task
+        self.assertIsInstance(swap, SwapSetTask)
+
+        class Chest:
+            def __init__(self, client):
+                self.client, self.log = client, []
+                client.apply, client.move_item = self.apply, self.move_item
+
+            async def apply(self, tag, apply_action=0):
+                item = client.state.items[tag]
+                self.log.append(("apply", tag))
+                if item.tag == chest.tag:
+                    item.flags |= c.ITEM_CONTAINER_OPEN
+                    return
+                for other in client.state.inventory:
+                    if other.item_type == item.item_type and other.flags & c.ITEM_APPLIED:
+                        other.flags &= ~c.ITEM_APPLIED
+                item.flags |= c.ITEM_APPLIED
+                if item.item_type == c.TYPE_GIRDLE:
+                    client.state.equipment[c.EQUIP_BELT] = item.tag
+                # The server's living_update: the girdle's Pow counts.
+                client.state.stats["pow"] = 15 + (4 if caster.flags & c.ITEM_APPLIED else 0)
+
+            async def move_item(self, to, tag, quantity):
+                self.log.append(("move", to, tag))
+                client.state.place_item(client.state.items[tag], to)
+
+        server = Chest(client)
+        for _ in range(40):
+            if swap.status in (TaskStatus.COMPLETE, TaskStatus.FAILED):
+                break
+            swap.worn = {tag: 0.0 for tag in swap.worn}
+            asyncio.run(swap.tick(client))
+        self.assertEqual(swap.status, TaskStatus.COMPLETE, swap.error)
+        # One visit: the caster girdle out and on, the melee one home, and
+        # the area-spell wands too (consumables of the AoE build only).
+        moves = [entry for entry in server.log if entry[0] != "apply" or
+                 entry[1] != chest.tag]
+        self.assertEqual(moves[:2], [("move", 7, caster.tag), ("apply", caster.tag)])
+        wands = {item.tag for item in client.state.items.values()
+                 if item.item_type == c.TYPE_WAND}
+        self.assertEqual({entry[1:] for entry in moves[2:]},
+                         {(chest.tag, tag) for tag in {worn.tag, *wands}})
+        self.assertEqual({row["name"] for row in client.state.apartment_storage},
+                         {"soft leather girdle +6", "wand of firestorm (lvl 2)",
+                          "wand of icestorm (lvl 5)"})
+        self.assertTrue(caster.flags & c.ITEM_APPLIED)
+        # The trip is the only one: done, no further swap is due.
+        circuit._storage = types.SimpleNamespace(
+            status=TaskStatus.COMPLETE, task=swap, error="", tick=AsyncMock())
+        self.assertTrue(asyncio.run(circuit._tick_running_service(client)))
+        self.assertIsNone(circuit._storage)
+        self.assertEqual(circuit._swap_build, "")
+        circuit._storage_retry_at = 0.0
+        self.assertFalse(circuit._swap_build)
+        self.assertFalse(circuit._review_combat_build(client, circuit.child.task))
+
+    def test_the_suggestion_lists_owned_items_first(self):
+        from . import storage
+        client = self._client()
+        belt = Item(1, flags=c.ITEM_APPLIED, item_type=c.TYPE_GIRDLE, quality=80,
+                    condition=80, name="soft leather girdle +3")
+        client.state.place_item(belt, 7)
+        client.state.equipment[c.EQUIP_BELT] = belt.tag
+        stored = Item(2, item_type=c.TYPE_GIRDLE, quality=80, condition=80,
+                      name="forged meteoric steel belt")
+        arrows = Item(3, item_type=c.TYPE_ARROW, quantity=50, name="arrows")
+        client.state.apartment_storage = [storage.entry(stored, ["melee:girdle"]),
+                                          storage.entry(arrows)]
+        circuit = self._circuit(client)
+        suggestion = circuit.build_suggestion(client)
+        self.assertEqual(suggestion["build"], "melee")
+        self.assertEqual(suggestion["slots"]["girdle"],
+                         [{"name": "soft leather girdle +3", "where": "worn"},
+                          {"name": "forged meteoric steel belt", "where": "stored"}])
+        self.assertEqual(suggestion["shop"], [])
+        # The bow build's ammunition is a stored consumable.
+        self.assertEqual(suggestion["consumables"], [])
+        circuit._build_name = "bow"
+        self.assertEqual(circuit.build_suggestion(client)["consumables"], ["arrows"])
+
+    def test_the_get_this_build_errand_learns_firestorm_from_dunowen(self):
+        from .navigation import LearnSpellTask, SpellOffer
+        client = self._client()
+        circuit = self._circuit(client)
+        circuit.graph.spell_offers = lambda: [
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "firestorm", 15, 50_000),
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "icestorm", 15, 50_000)]
+        circuit._choose_build(client)
+        self.assertEqual(circuit._build_choice.wanted, "aoe")
+        # Too poor beyond her cure reserve: an alert, no trip.
+        self.assertFalse(circuit._needs_learn_spell(client))
+        self.assertIn("need 5g for Firestorm from Dunowen", circuit._spell_shortfall)
+        circuit._choose_build(client)
+        self.assertIn(("build-errand-funds", circuit._spell_shortfall), client.actions)
+        # The dashboard shows it while autoplay farms this circuit.
+        dashboard = DashboardState(client, None, WorldGraph(), {})
+        alerts = dashboard.build_alerts(types.SimpleNamespace(child=circuit))
+        self.assertEqual([alert["id"] for alert in alerts], ["build-funds"])
+        self.assertIn("need 5g for Firestorm from Dunowen", alerts[0]["text"])
+        self.assertEqual(dashboard.build_alerts(types.SimpleNamespace(child=None)), [])
+        client.state.place_item(Item(400, item_type=c.TYPE_MONEY, quantity=10,
+                                     name="gold coins"), 7)
+        self.assertTrue(circuit._needs_learn_spell(client))
+        self.assertEqual(circuit._spell_shortfall, "")
+        trip = circuit._new_learn_spell(client)
+        self.assertEqual((trip.navigation.destination, trip.navigation.destination_xy),
+                         ("/shattered_islands/world_17_2_2", (5, 9)))
+        self.assertIsInstance(trip.task, LearnSpellTask)
+        self.assertEqual((trip.task.npc, trip.task.spell), ("Dunowen", "firestorm"))
+
+    def test_learn_spell_reads_the_seller_and_handles_too_little_money(self):
+        from .navigation import LearnSpellTask
+
+        def seller(client, gold):
+            """Dunowen's SpellSeller dialogue (content maps/python/Merchant.py)."""
+            said = []
+
+            async def talk(message, npc=None):
+                said.append((message, npc))
+                if message == "hello":
+                    client.state.interface = InterfaceState(
+                        text="Welcome, dear customer! I'm Dunowen.\nAre you here to buy one "
+                             "of my spells? I can offer you the following spells.",
+                        links=["[a=:firestorm]Firestorm[/a]", "[a=:icestorm]Icestorm[/a]",
+                               "[a=:forked lightning]Forked lightning[/a]"])
+                elif message == "firestorm":
+                    client.state.interface = InterfaceState(
+                        text="Ah, so you want to buy firestorm?\nA cone of fire you project "
+                             "in front of you.\n[c=#00ff00]Firestorm requires level 15 to "
+                             "use. Your wizardry spells skill is level 15.[/c]\nFirestorm "
+                             "will cost you 5 gold coins. Is that okay?",
+                        links=["[a=:buy firestorm]Confirm[/a]"])
+                elif message == "buy firestorm":
+                    if gold < 5:
+                        client.state.interface = InterfaceState(
+                            text="You don't have enough money...")
+                    else:
+                        client.state.interface = InterfaceState(
+                            text="You pay 5 gold coins.\nPleasure doing business with you!")
+                        client.state.place_item(Item(500, item_type=c.TYPE_SPELL,
+                                                     name="firestorm"), 7)
+            client.talk = talk
+            return said
+
+        self.assertEqual(LearnSpellTask.read_quote(
+            "Firestorm requires level 15 to use. Your wizardry spells skill is level 15.\n"
+            "Firestorm will cost you 5 gold coins. Is that okay?"), (15, 15, 50_000))
+        client = self._client(gold=6)
+        said = seller(client, 6)
+        task = LearnSpellTask("Dunowen", "firestorm", cash_reserve=5_000)
+        for _ in range(5):
+            asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE, task.error)
+        self.assertEqual([message for message, _ in said],
+                         ["hello", "firestorm", "buy firestorm"])
+        self.assertEqual((task.level, task.price), (15, 50_000))
+        # Short beyond her reserve: no purchase, the shortfall shown.
+        client = self._client(gold=5)
+        said = seller(client, 5)
+        task = LearnSpellTask("Dunowen", "firestorm", cash_reserve=5_000)
+        for _ in range(4):
+            asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual((task.error, task.shortfall),
+                         ("need 5g for firestorm from Dunowen", 50_000))
+        self.assertNotIn("buy firestorm", [message for message, _ in said])
+        # The seller's own refusal.
+        client = self._client(gold=6)
+        said = seller(client, 0)
+        task = LearnSpellTask("Dunowen", "firestorm")
+        for _ in range(5):
+            asyncio.run(task.tick(client))
+        self.assertEqual((task.status, task.shortfall), (TaskStatus.FAILED, 50_000))
+
+    def test_the_analyzer_rates_every_style_she_can_field(self):
+        helper = FarmAnalyzerTests()
+        helper._cleanups = []
+        analyzer = helper.analyzer()
+        client = helper.client()
+        analyzer.heal_samples = [17]
+        package = analyzer.analyzer_root / "farming_analyzer"
+
+        async def scenario():
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            # Her own style first, merged into the ranking (warn only).
+            client.build_styles = ("melee", "ranged-kite")
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            grind = analyzer.ranking("xp")[0]
+            self.assertEqual(grind["encounter_style"], "melee")
+            # Then each other style she can field, kept apart.
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertEqual(grind["encounter_style"], "melee")
+            ratings = analyzer.spot_ratings(grind)
+            self.assertEqual(sorted(ratings), ["melee", "ranged-kite"])
+            self.assertEqual((ratings["ranged-kite"]["encounter_style"],
+                              ratings["ranged-kite"]["xp_hour"]), ("ranged-kite", 900.0))
+            # Each style once per ranking.
+            self.assertFalse(analyzer.poll(client))
+            # A failed style run is retried on the failure backoff only.
+            analyzer.style_generation.pop("ranged-kite")
+            analyzer._style_attempt_at["ranged-kite"] -= analyzer.MIN_INTERVAL_SECONDS
+            (package / "FAIL_STYLED").write_text("")
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertTrue(analyzer.style_errors["ranged-kite"])
+            self.assertEqual(analyzer.encounter_error, "")
+            analyzer._style_attempt_at["ranged-kite"] -= analyzer.MIN_INTERVAL_SECONDS
+            self.assertFalse(analyzer.poll(client))
+            analyzer._style_attempt_at["ranged-kite"] -= analyzer.RETRY_SECONDS
+            (package / "FAIL_STYLED").unlink()
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertNotIn("ranged-kite", analyzer.style_errors)
+            await analyzer.close()
+            for cleanup, args, kwargs in reversed(helper._cleanups):
+                cleanup(*args, **kwargs)
+
+        asyncio.run(scenario())
+
+    def test_every_spell_seller_is_indexed_from_content(self):
+        offers = {(offer.seller, offer.spell): offer for offer in built_graph().spell_offers()}
+        firestorm = offers[("Dunowen", "firestorm")]
+        self.assertEqual((firestorm.map_path, firestorm.x, firestorm.y, firestorm.level,
+                          firestorm.price),
+                         ("/shattered_islands/world_17_2_2", 5, 9, 15, 50_000))
+        for seller, spell in (("Dunowen", "icestorm"), ("Dunowen", "forked lightning"),
+                              ("Galion", "frostbolt"), ("Olain", "bullet storm"),
+                              ("Quidton", "frost nova"), ("Krelnal", "magic missile")):
+            self.assertIn((seller, spell), offers)
+
+
 if __name__ == "__main__":
     unittest.main()
