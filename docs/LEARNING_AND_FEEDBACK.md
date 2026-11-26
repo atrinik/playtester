@@ -1908,16 +1908,38 @@ surplus sale (`_surplus_equipment`). Differences from the F4 text:
   `caster_value` and melee damage and WC at a quarter; anyone but an
   archer values arrow WC and damage at a quarter. Arrow damage is taken
   per second over the launcher's examine "(delay+N.Ns)" (1 second when not
-  known).
+  known) plus a plain arrow's delay.
 - **Context terms**, valued against her worn set without what the item
   would replace: Str, Dex and Con at the `living.c` tables (`dam_bonus`,
   `wc_bonus` and `speed_bonus`, `hp_bonus` on her base hit points), plus 5
   a point toward the next step; speed recomputed with the server formula
   (`living.c:1051-1096`), so a `(speed+N)` item (now parsed) and the armour
   speed cap count by her real gain, 1500 points per 1.0 speed and half as
-  much again with no working recall; and, above half her weight limit, the
-  speed an item's weight would cost her (ramping in to the real
-  encumbrance at 65%).
+  much again with no working recall (`working_recall` follows a change
+  only once it has held for 2 minutes); and, above half her weight limit,
+  the speed an item's weight would cost her (ramping in to the real
+  encumbrance at 65%). That weight is charged only where the decision
+  changes what she carries (`weight_for`): the shop charges the stock (a
+  purchase adds it), the surplus sale an unworn spare (selling sheds it),
+  and the equip loop nothing (a swap keeps both carried). The speed weights
+  are provisional, pending the owner.
+- **A ring** is valued against her worn set without the ring it would
+  replace: itself when worn, the weakest worn ring when both slots are
+  full (ties to the lower tag, as the equip loop takes off), none when one
+  is free. The shop's baseline for a free ring slot is her best carried
+  spare ring, else 0.
+- **The shield** gives nothing, speed cap included, while a two-handed
+  weapon or launcher (the server's `CS_FLAG_WEAPON_2H`, `ITEM_WEAPON_2H`)
+  is wielded, as the server skips it (`living.c` "No bonuses from the
+  shield"); a two-handed candidate is charged the worn shield's worth
+  apart from speed, and credited the speed cap it lifts.
+- **Ordering:** the equip loop and the panel order a gear family on the
+  effective scale only when every carried item of it has examine data,
+  else on the fallback for the whole family (`GearScorer.order`), as
+  `compare` compares.
+- **The surplus sale** sells a spare only when it loses under every style
+  she can field: her current build's, melee, caster once she knows a
+  spell, bow once an archery skill is above level 1.
 - **Examine data only.** The effective scale needs examine data (or a
   ring's, amulet's or trinket's description in its name); archetype values
   are context only. When either side of a comparison lacks it, both fall
@@ -1926,12 +1948,12 @@ surplus sale (`_surplus_equipment`). Differences from the F4 text:
 - **Signed values and free slots.** A value may be negative (a low speed
   cap can cost more than the armour gives), so two capped armours still
   rank. A free slot (an empty one, or the second ring slot) takes any item
-  that is not a net loss.
+  that is not a net loss, and always armour that is a net gain apart from
+  speed, so a speed cap never leaves a body slot empty.
 - **The shop reads only its stock's answer line** ("That is " and its
-  name), as GearExaminer does, and stores it even with no stats.
-- **Not modelled:** the server ignores a worn shield (its AC, protections
-  and speed cap) while a two-handed weapon or launcher is wielded; the
-  scorer still counts it.
+  name, on the game channel), as GearExaminer does, and stores it even with
+  no stats. Arrows are paced by the launcher's "(delay+N.Ns)" (a real 0
+  when it shows 0.0) plus a plain arrow's 7 ticks (bow.c).
 - **Girdles** are an equipment type with the belt slot. Before, the equip
   loop gave every girdle -1, so the forged meteoric steel belt (AC +1,
   +3.2% to the four physical protections over her soft leather girdle)

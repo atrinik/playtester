@@ -189,9 +189,10 @@ which rules apply (`hunger.py`):
   map, a map with a shop floor or mat, a savebed, merchant or priest, or
   her apartment), on a quiet square: no target and no hit for 10 seconds
   (`obsolete-food-drop`). Food never triggers a junk sale or holds back cure
-  funding. A stack still carried after a drop, matched by name, is dropped
-  again after 1, then 2 minutes; after three drops it is kept and
-  `obsolete-food-kept` says why. Junk food is only ordinary server-typed
+  funding. A drop failed only while the same stack is still
+  carried; it is then dropped again after 1, then 2 minutes, and after
+  three drops kept, with `obsolete-food-kept` saying why. Fresh loot of a
+  name already dropped starts afresh. Junk food is only ordinary server-typed
   food: quest food (any item a formal quest's objectives name), named food
   (a capital letter or a possessive, such as Gimli's lembas), food whose
   name has a reserve word (quest, key, talisman, artifact, unique,
@@ -405,9 +406,19 @@ to sell:
   faster or slower she really is, from the server's formula (`living.c`):
   0.85, plus the Dex bonus and N/30 per item, clamped to the lowest worn
   armour speed cap, plus (1 + N/3)/10 per item after the cap. Speed is
-  weighted up by half while she has no working recall. Once she carries
-  more than half her weight limit, an item's weight costs the speed it
-  would take off her (encumbrance starts at 65%).
+  weighted up by half while she has no working recall (a change in that
+  counts only once it has held for 2 minutes). Once she carries more than
+  half her weight limit, an item's weight costs the speed it would take off
+  her (encumbrance starts at 65%), but only where the decision changes
+  what she carries: a purchase adds the stock's weight and a sale sheds a
+  spare's; swapping between carried items costs nothing. An empty slot
+  always takes armour that is a net gain apart from speed, whatever its
+  speed cap. A shield gives nothing under a two-handed weapon or launcher
+  (the server's two-handed flag), and a two-handed one is charged the worn
+  shield it switches off.
+- **Surplus** is spare gear that no style she can field would put on:
+  her current build's, melee always, caster once she knows a spell, bow
+  once an archery skill is above level 1.
 - **Girdles and belts** are worn like any other slot (the belt slot).
 - **Fallback.** Two items are compared on the effective scale only when
   both have examine data; otherwise both use the old name-based score

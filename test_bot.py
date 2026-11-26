@@ -29347,12 +29347,15 @@ class GearScorerTests(unittest.TestCase):
         heavy = self.examined(1, c.TYPE_ARMOUR, "plate", "plate (ac+6)", weight=20.0)
         light = self.examined(2, c.TYPE_ARMOUR, "plate", "plate (ac+6)", weight=2.0)
         policy = InventoryPolicy()
+        from .equipment import WEIGHT_UNWORN
         for load, costs in ((40.0, False), (75.0, True), (95.0, True)):
             with self.subTest(load=load):
                 sack = Item(9, item_type=c.TYPE_CONTAINER, name="sack",
                             weight=load - 22.0)
                 client = self.client(heavy, light, sack, stats={"weight_limit": 140.0})
-                scorer = GearScorer(client, policy, carried_gear_score(client, policy))
+                # As the surplus sale sees them: selling sheds an unworn item.
+                scorer = GearScorer(client, policy, carried_gear_score(client, policy),
+                                    weight_for=WEIGHT_UNWORN)
                 self.assertEqual(scorer.weight_cost(heavy) > 0, costs)
                 if costs:
                     self.assertLess(scorer.value(heavy), scorer.value(light))
@@ -29448,8 +29451,8 @@ class GearScorerTests(unittest.TestCase):
         self.assertGreater(scorer.value(plate), scorer.value(worn) + 15)
         self.assertTrue(asyncio.run(FarmTask().maintain_inventory(client)))
         self.assertEqual(client.applied, [4])
-        # Into an empty slot a net loss is not put on.
-        self.assertFalse(scorer.beats(plate, [])[0])
+        # An empty body slot still takes it: it adds AC and protection.
+        self.assertTrue(scorer.beats(plate, [])[0])
 
     def test_a_second_ring_fills_the_free_ring_slot(self):
         from .tasks import InventoryPolicy, gear_scorer
@@ -29490,6 +29493,196 @@ class GearScorerTests(unittest.TestCase):
         client = self.client(slow, quick)
         scorer = gear_scorer(client, InventoryPolicy(gear_style="bow"))
         self.assertGreater(scorer.value(quick), scorer.value(slow))
+
+    def test_the_equip_loop_charges_no_weight_for_a_swap(self):
+        # Coordinator review repro: at 65% load the plate's 20 kg made the
+        # leather "better", though swapping sheds nothing she carries.
+        from .equipment import WEIGHT_UNOWNED, GearScorer
+        from .tasks import InventoryPolicy, carried_gear_score, gear_scorer
+        plate = self.examined(1, c.TYPE_ARMOUR, "magical plate +3",
+                              "magical plate +3 (ac+6) (Protections: slash +10%)",
+                              worn=True, weight=20.0)
+        leather = self.examined(2, c.TYPE_ARMOUR, "leather armour",
+                                "leather armour (ac+4)", weight=4.0)
+        sack = Item(9, item_type=c.TYPE_CONTAINER, name="sack", weight=91.0 - 24.0)
+        client = self.client(plate, leather, sack, equipment={c.EQUIP_ARMOUR: 1})
+        policy = InventoryPolicy()
+        scorer = gear_scorer(client, policy)
+        self.assertEqual(scorer.weight_cost(plate), 0)
+        self.assertFalse(scorer.beats(leather, [plate])[0])
+        task = FarmTask()
+        for _ in range(5):           # it locks the sack first
+            if not asyncio.run(task.maintain_inventory(client)):
+                break
+        self.assertEqual(client.applied, [])
+        # A purchase still pays for the weight it adds.
+        stock = self.examined(3, c.TYPE_ARMOUR, "plate", "plate (ac+9)", weight=20.0)
+        client.state.place_item(stock, 0)
+        buyer = GearScorer(client, policy, carried_gear_score(client, policy),
+                           weight_for=WEIGHT_UNOWNED)
+        self.assertGreater(buyer.weight_cost(stock), 0)
+        self.assertEqual(buyer.weight_cost(plate), 0)
+
+    def test_an_empty_body_slot_takes_armour_whatever_its_cap(self):
+        from .equipment import NO_RECALL_SPEED_FACTOR, SPEED_WEIGHT
+        from .tasks import InventoryPolicy, gear_scorer
+        self.assertEqual((SPEED_WEIGHT, NO_RECALL_SPEED_FACTOR), (1500, 1.5))
+        mail = self.examined(2, c.TYPE_ARMOUR, "heavy mail",
+                             "heavy mail (speed cap 0.40) (ac+2) (Protections: slash +5%)")
+        client = self.client(mail)
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertLess(scorer.value(mail), 0)
+        self.assertTrue(scorer.beats(mail, [])[0])
+        self.assertTrue(asyncio.run(FarmTask().maintain_inventory(client)))
+        self.assertEqual(client.applied, [2])
+        # An item adding nothing but slowness still stays off.
+        lead = self.examined(3, c.TYPE_BOOTS, "lead boots", "lead boots (speed-1)")
+        self.assertFalse(gear_scorer(self.client(lead), InventoryPolicy()).beats(lead, [])[0])
+        # The override is for armour that is a net gain apart from speed:
+        # never a ring whose AC hides a stat loss.
+        ring = self.examined(4, c.TYPE_RING, "ring (ac+1) (Dex-3)", "ring (ac+1) (Dex-3)")
+        scorer = gear_scorer(self.client(ring), InventoryPolicy())
+        self.assertLess(scorer.value(ring), 0)
+        self.assertFalse(scorer.beats(ring, [], 2)[0])
+
+    def test_gear_scoring_follows_recall_only_once_it_holds(self):
+        from .tasks import GEAR_RECALL_HOLD_SECONDS, working_recall
+        with patch("atrinik_bot.navigation.has_working_recall", lambda client: False):
+            self.assertFalse(working_recall(Mock()))      # no state to keep
+        client = self.client()
+        now = [0.0]
+        states = iter([True, False, True, False, False, False])
+        with patch("atrinik_bot.navigation.has_working_recall",
+                   lambda client: next(states)):
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))
+            now[0] = 10
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))   # flip pending
+            now[0] = 20
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))   # back: cleared
+            now[0] = 30
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))   # pending again
+            now[0] = 30 + GEAR_RECALL_HOLD_SECONDS - 1
+            self.assertTrue(working_recall(client, clock=lambda: now[0]))
+            now[0] = 30 + GEAR_RECALL_HOLD_SECONDS
+            self.assertFalse(working_recall(client, clock=lambda: now[0]))  # held
+
+    def test_a_ring_is_valued_against_the_ring_it_replaces(self):
+        from .tasks import InventoryPolicy, gear_scorer
+        strong = self.examined(1, c.TYPE_RING, "ring (Protections: fire +20%)",
+                               "ring (Protections: fire +20%)", worn=True)
+        weak = self.examined(2, c.TYPE_RING, "ring (Protections: cold +2%)",
+                             "ring (Protections: cold +2%)", worn=True)
+        candidate = self.examined(3, c.TYPE_RING, "ring (Protections: acid +9%)",
+                                  "ring (Protections: acid +9%)")
+        client = self.client(strong, weak, candidate,
+                             equipment={c.EQUIP_RING_RIGHT: 1, c.EQUIP_RING_LEFT: 2})
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertEqual({item.tag for item in scorer._rest(candidate)}, {1})
+        self.assertEqual({item.tag for item in scorer._rest(weak)}, {1})
+        # The shop: with a ring slot free, nothing is displaced.
+        client.state.equipment.pop(c.EQUIP_RING_LEFT)
+        client.state.remove_item(weak.tag)
+        client.state.remove_item(candidate.tag)
+        stock = Item(5, flags=c.ITEM_UNPAID, item_type=c.TYPE_RING, quality=80,
+                     condition=100, name="ring (Protections: acid +9%)")
+        client.state.place_item(stock, 0)
+        task = BuyShopUpgradeTask()
+        self.assertEqual(task._upgrade_score(client, stock), 9 * 8)
+        # A carried spare ring she declined to wear is the baseline.
+        spare = Item(6, item_type=c.TYPE_RING, quality=80, condition=100,
+                     name="ring (Protections: acid +9%)")
+        client.state.place_item(spare, 1)
+        self.assertLess(task._upgrade_score(client, stock), 0)
+
+    def test_a_shield_gives_nothing_under_a_two_handed_weapon(self):
+        # living.c skips the shield while a two-handed weapon or launcher
+        # is wielded (the server's CS_FLAG_WEAPON_2H on the item).
+        from .tasks import InventoryPolicy, gear_scorer
+        halberd = self.examined(1, c.TYPE_WEAPON, "halberd", "halberd (dam+9) (3.00 sec)",
+                                worn=True)
+        halberd.flags |= c.ITEM_WEAPON_2H
+        shield = self.examined(2, c.TYPE_SHIELD, "tower shield",
+                               "tower shield (speed cap 0.50) (ac+4)", worn=True)
+        client = self.client(halberd, shield,
+                             equipment={c.EQUIP_WEAPON: 1, c.EQUIP_SHIELD: 2})
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertEqual(scorer.speed_delta(shield), 0.0)
+        self.assertEqual(scorer.value(shield), 0)
+        halberd.flags &= ~c.ITEM_WEAPON_2H
+        one_handed = gear_scorer(client, InventoryPolicy())
+        self.assertLess(one_handed.speed_delta(shield), 0.0)
+        # Counted again: AC +4 against its 0.50 cap (no recall here: the
+        # speed weight is 1.5 times SPEED_WEIGHT).
+        weight = one_handed._speed_weight()
+        self.assertEqual(weight, 2250)
+        self.assertEqual(one_handed.value(shield), round(80 - (0.875 - 0.5) * weight))
+        # A two-handed candidate is charged the shield it switches off
+        # (AC +4, 80) and credited the cap it lifts.
+        two = self.examined(3, c.TYPE_WEAPON, "glaive", "glaive (dam+9) (3.00 sec)")
+        two.flags |= c.ITEM_WEAPON_2H
+        client.state.place_item(two, 1)
+        scorer = gear_scorer(client, InventoryPolicy())
+        lifted = (0.875 - 0.5) * weight
+        self.assertAlmostEqual(scorer.value(two) - scorer.value(halberd), lifted - 80,
+                               delta=1)
+
+    def test_a_family_is_ordered_on_one_scale(self):
+        from .tasks import InventoryPolicy, carried_gear_score, gear_scorer
+        worn = self.examined(1, c.TYPE_BOOTS, "boots", "boots (ac+1)", worn=True)
+        examined = self.examined(2, c.TYPE_BOOTS, "good boots", "good boots (ac+5)")
+        unknown = self.examined(3, c.TYPE_BOOTS, "odd boots", None)
+        client = self.client(worn, examined, unknown, equipment={c.EQUIP_BOOTS: 1})
+        policy = InventoryPolicy()
+        scorer = gear_scorer(client, policy)
+        name = carried_gear_score(client, policy)
+        self.assertFalse(scorer.family_effective(c.TYPE_BOOTS))
+        self.assertEqual(scorer.order(examined), name(examined))
+        client.state.remove_item(unknown.tag)
+        scorer = gear_scorer(client, policy)
+        self.assertEqual(scorer.order(examined), scorer.value(examined))
+
+    def test_the_shop_reads_its_answer_from_the_game_channel_only(self):
+        client, girdle, belt = self.belt_client()
+        client.state.remove_item(belt.tag)
+        stock = Item(5, flags=c.ITEM_UNPAID, item_type=c.TYPE_GIRDLE,
+                     name="leather belt", weight=1.0)
+        client.state.place_item(stock, 0)
+        task = BuyShopUpgradeTask()
+        task._feedback_start = client.state.message_count
+        client.state.add_message(c.CHAT_TYPE_LOCAL, "ffffff", "That is leather belt (ac+9)")
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff", "That is leather belt")
+        lines = [str(entry[3]) for entry in client.state.messages_since(task._feedback_start)
+                 if len(entry) > 3 and entry[1] == c.CHAT_TYPE_GAME]
+        feedback = "\n".join(str(entry[3]) for entry in
+                             client.state.messages_since(task._feedback_start))
+        task._apply_examine_metadata(client, stock, feedback, lines)
+        from .equipment import base_from_json
+        self.assertEqual(base_from_json(stock.extra["gear_examine"]["base"]).ac, 0)
+
+    def test_a_zero_launcher_delay_is_real(self):
+        from .tasks import InventoryPolicy, gear_scorer
+        instant = self.examined(1, c.TYPE_BOW, "quick bow", "quick bow (dam+5) (delay+0.0s)")
+        second = self.examined(2, c.TYPE_BOW, "plain bow", "plain bow (dam+5) (delay+1.0s)")
+        scorer = gear_scorer(self.client(instant, second), InventoryPolicy(gear_style="bow"))
+        self.assertEqual(scorer.effective(instant).delay, 0.0)
+        self.assertGreater(scorer.value(instant), scorer.value(second))
+
+    def test_the_surplus_sale_keeps_gear_for_any_style_she_can_field(self):
+        helm = self.examined(1, c.TYPE_HELMET, "iron helm", "iron helm (ac+3)", worn=True)
+        mind = self.examined(3, c.TYPE_HELMET, "wizard hat", "wizard hat (Pow+2) (mana+30)")
+        spare = self.examined(4, c.TYPE_HELMET, "wizard cap", "wizard cap (Pow+1)")
+        client = self.client(helm, mind, spare, stats={"pow": 15, "int": 15},
+                             equipment={c.EQUIP_HELM: 1})
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")],
+                                  combat_skill="slash weapons")
+        surplus = {item.tag for item in circuit._surplus_equipment(client)}
+        # The caster set's best is kept for that build (it goes home), a
+        # worse caster piece is surplus while she cannot field a caster ...
+        self.assertNotIn(mind.tag, surplus)
+        self.assertIn(spare.tag, surplus)
+        client.state.place_item(Item(9, item_type=c.TYPE_SPELL, name="magic bullet"), 1)
+        # ... and kept once she can.
+        self.assertNotIn(spare.tag, {item.tag for item in circuit._surplus_equipment(client)})
 
     def test_gear_without_examine_data_falls_back_to_the_name_score(self):
         from .tasks import InventoryPolicy, carried_gear_score, gear_scorer
@@ -31100,15 +31293,14 @@ class FoodObsoleteTests(unittest.TestCase):
             self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
             self.assertEqual(client.dropped, [(0, 1, 26), (0, 2, 3)])
             self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
-            # The legs stayed (the drop failed) and loot merged into a new
-            # tag: matched by name, retried after the backoff.
-            client.state.remove_item(1)
-            client.state.place_item(Item(11, item_type=c.TYPE_FOOD, quality=100,
-                                         name="chicken leg", quantity=27), 7)
+            # The apples went (their tag is gone). The legs stayed: that
+            # drop failed, and loot merged into the stack. Retried after the
+            # backoff, with what merged.
             client.state.remove_item(2)
+            client.state.items[1].quantity = 27
             now[0] += farm.FOOD_DROP_RETRY_SECONDS
             self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
-            self.assertEqual(client.dropped[-1], (0, 11, 27))
+            self.assertEqual(client.dropped[-1], (0, 1, 27))
             now[0] += farm.FOOD_DROP_RETRY_SECONDS * 2
             self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
             # After FOOD_DROP_TRIES drops it is kept, recorded once.
@@ -31120,11 +31312,28 @@ class FoodObsoleteTests(unittest.TestCase):
             kept = [d for a, d in client.decisions if a == "obsolete-food-kept"]
             self.assertEqual(kept, ["chicken leg: still carried after 3 drops"])
             # Gone, and later loot of the name starts afresh.
-            client.state.remove_item(11)
-            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            client.state.remove_item(1)
             client.state.place_item(Item(12, item_type=c.TYPE_FOOD, quality=100,
                                          name="chicken leg"), 7)
             self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(client.dropped[-1], (0, 12, 1))
+
+        # A drop that worked, then fresh loot of that name while she was busy
+        # (no call in between): dropped at once, never counted as kept.
+        farm = FarmTask(zone="/test", target="kobold")
+        client = self.junk_client()
+        client.state.remove_item(2)
+        with patch("atrinik_bot.tasks.time.monotonic", lambda: now[0]):
+            for tag in (21, 22, 23, 24):
+                self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+                dropped_tag = client.dropped[-1][1]
+                client.state.remove_item(dropped_tag)
+                client.state.place_item(Item(tag, item_type=c.TYPE_FOOD,
+                                             quality=100, name="chicken leg"), 7)
+            self.assertEqual([entry[1] for entry in client.dropped],
+                             [1, 21, 22, 23])
+        self.assertNotIn("obsolete-food-kept",
+                         [action for action, _ in client.decisions])
         # Where food matters she keeps it all.
         client = self.junk_client("off")
         self.assertFalse(asyncio.run(FarmTask(
@@ -31237,6 +31446,32 @@ class FoodObsoleteTests(unittest.TestCase):
         self.assertFalse(watch.obsolete(state, now=now))
         with patch("atrinik_bot.hunger.time.time", lambda: now):
             self.assertFalse(food_obsolete(state))
+        # Carried food that does not feed her (so the hungry test passes):
+        # the starvation damage alone, health lost with no hit, restarts
+        # the window each time and keeps the old rules.
+        state = self.auto_state(food=0)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            watch.observe(state, now=now)
+        self.assertFalse(watch.obsolete(state, now=now))
+        self.assertEqual(watch.since, now)
+        # The same window with each loss an attack's is not restarted.
+        state = self.auto_state(food=0)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            state.messages = [(now - 1.0, c.CHAT_TYPE_GAME, "ff0000",
+                               "The kobold hit you for 1 (1) damage.")]
+            watch.observe(state, now=now)
+        self.assertEqual(watch.since, 0.0)
+        self.assertTrue(watch.obsolete(state, now=now))
         # Health lost to attacks at food 0 is no starvation, but hungry with
         # nothing to eat she keeps the old rules even so.
         state = self.auto_state(food=0)
@@ -38887,6 +39122,23 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((task.care.mode, task.care.subjects), ("bounded", ("map:/blocked",)))
         self.assertIn("route-budget-override", self.client.actions())
 
+    def test_with_the_flag_on_a_prepared_plan_on_the_loop_is_live_too(self):
+        # With the worker busy an essential trip plans on the loop: a
+        # prepared plan there is the live plan as well.
+        from . import planner as planner_module
+
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        self.client.state.stats.update(hp=10)
+        task = self.trip("cure")
+        with patch.object(planner_module, "busy", lambda: True):
+            self.assertEqual(self.maps(task.prepare(self.client)),
+                             ["/blocked", "/goal"])
+        self.assertEqual(task.status, TaskStatus.READY)
+        self.assertEqual(task.care.mode, "bounded")
+        self.assertIn("route-budget-override", self.client.actions())
+
     def test_with_the_flag_on_a_strict_essential_trip_overrides_with_care(self):
         self.client.config.learned_route_costs = True
         self.graph = blocks_graph(detour=False)
@@ -40369,6 +40621,61 @@ class PlanningOffLoopTests(unittest.TestCase):
             asyncio.run(task.tick(client))
         self.assertFalse(task.planning)
         self.assertTrue(task.care.finished)
+
+    def test_a_dropped_ranking_never_makes_the_planner_busy(self):
+        import threading
+        from . import planner as planner_module
+
+        import queue
+
+        release = threading.Event()
+        self.wait_for(lambda: not planner_module.busy())
+        # A dropped ranking still queued (a queue the idle worker is not
+        # taking from yet) is no reason to plan on the loop.
+        with patch.object(planner_module, "_jobs", queue.PriorityQueue()):
+            queued = planner_module.submit(lambda: None)
+            self.assertTrue(planner_module.busy())
+            queued.cancel()
+            self.assertFalse(planner_module.busy())
+        planner_module._settle(queued)
+        # Submitted, a job counts at once, until it ends.
+        release.clear()
+        job = planner_module.submit(lambda: release.wait(5))
+        self.assertTrue(planner_module.busy())
+        release.set()
+        self.wait_for(job.done)
+        self.wait_for(lambda: not planner_module.busy())
+
+    def test_a_plan_from_another_part_of_the_map_is_planned_again(self):
+        import threading
+        from . import navigation as navigation_module
+
+        release = threading.Event()
+        real = navigation_module.NavigateTask._plan
+
+        def plan(task, client, *, origin=None):
+            release.wait(2)
+            return real(task, client, origin=origin)
+
+        client = self.client()
+        client.state.map.path = "/shattered_islands/world_10_67"
+        client.state.map.world_x, client.state.map.world_y = 0, 8
+        task = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                            (4, 9), tolerance=1)
+        with patch.object(navigation_module.NavigateTask, "_plan", plan):
+            try:
+                asyncio.run(task.tick(client))
+                first = task._route_plans._plans["route"].future
+                # A step within the same part keeps it.
+                client.state.map.world_y = 7
+                asyncio.run(task.tick(client))
+                self.assertIs(task._route_plans._plans["route"].future, first)
+                # Across the shop mat, another part: planned again.
+                client.state.map.world_x, client.state.map.world_y = 1, 11
+                asyncio.run(task.tick(client))
+                self.assertIsNot(task._route_plans._plans["route"].future, first)
+            finally:
+                release.set()
 
     def test_a_dropped_trip_forgets_its_plan(self):
         import gc

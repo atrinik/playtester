@@ -45,7 +45,7 @@ from . import planner
 from . import route_shadow
 from . import storage
 from . import unlocks
-from .equipment import abandon_gear_examine, gear_style
+from .equipment import WEIGHT_UNWORN, abandon_gear_examine, gear_style
 from .observations import WHITE as WHITE_NAME, is_player, plain
 from .route_blocks import NO_WALLS, OwnerWalls
 from .route_costs import drain
@@ -2989,7 +2989,7 @@ class NavigateTask(BotTask):
         if (planner.worker_generation() is not None or
                 isinstance(client, planner.PlanningClient) or
                 not hasattr(self._graph, "planner_view")):
-            return self._plan(client)
+            return self._plan_here(client, live=live)
         prepared, self._prepared = self._prepared, None
         if (prepared is not None and prepared[0] == self._origin(client) and
                 time.monotonic() - prepared[1] <= self.PREPARED_SECONDS):
@@ -3007,7 +3007,7 @@ class NavigateTask(BotTask):
                 planner.busy()):
             # The worker runs another job (a ranking can take 45 s): an
             # essential or critical trip never waits behind it.
-            return self._plan(client)
+            return self._plan_here(client, live=live)
         # The care-wait record lives on her client: made here, the
         # worker's copy of her client reads it through. A copy is made on
         # every poll (cheap): a plan under way never uses it, and a result
@@ -3016,11 +3016,10 @@ class NavigateTask(BotTask):
         build = functools.partial(_plan_on_copy, self._planning_copy(live=live))
         result = plans.get(
             "route", self._graph, client, build,
-            # From another map the result is planned again (her origin
-            # when it was asked for is the key; a step on the same map in
-            # a fight does not restart it, and the route still leaves the
-            # map she stands on).
-            key=client.state.map.path,
+            # From another map or another part of this one the result is
+            # planned again; a step within the same part in a fight does
+            # not restart it, and the route still leaves from there.
+            key=self._plan_key(client),
             priority=(planner.PRIORITY_HEAL if self._urgent()
                       else planner.PRIORITY_OTHER))
         if result is PLANNING:
@@ -3030,6 +3029,38 @@ class NavigateTask(BotTask):
                 f"no route to {self.destination}: the planner gave no answer "
                 f"in {BackgroundPlans.MAX_PENDING_SECONDS:.0f} s")
         route, error, state = result
+        self._adopt(client, state)
+        if error is not None:
+            raise error
+        return route
+
+    def _plan_key(self, client: AtrinikClient) -> tuple:
+        """Where a plan is from, for BackgroundPlans: her map and the part
+        of it she stands in (its static component, by its least square)."""
+        path, x, y = self._origin(client)
+        try:
+            component = self._graph._component(
+                path, (x, y), allow_locked=self._allow_locked(client))
+        except (AttributeError, KeyError):
+            component = frozenset()
+        return path, (min(component) if component else (x, y))
+
+    def _plan_here(self, client: AtrinikClient, *,
+                   live: bool = False) -> "list[MapEdge]":
+        """Plan now, here. A trip not started planned ``live`` (prepare)
+        plans as the trip itself, on its planning copy, as on the worker:
+        a live plan, never a probe."""
+        if not live or self.status == TaskStatus.RUNNING:
+            return self._plan(client)
+        route, error, state = _plan_on_copy(self._planning_copy(live=True), client)
+        self._adopt(client, state)
+        if error is not None:
+            raise error
+        return route
+
+    def _adopt(self, client: AtrinikClient, state: dict) -> None:
+        """Copy back what a plan on a planning copy set (PLAN_STATE), and
+        apply what it left for her client (_defer)."""
         care = state.get("care")
         if (care is not None and self.care is not None and self.care.finished and
                 care.key == self.care.key):
@@ -3040,9 +3071,6 @@ class NavigateTask(BotTask):
         deferred, self._deferred = self._deferred, []
         for effect in deferred:
             effect(client)
-        if error is not None:
-            raise error
-        return route
 
     def prepare(self, client: AtrinikClient) -> "list[MapEdge] | _Planning":
         """Plan a trip that has not started yet, off the loop: PLANNING
@@ -11328,13 +11356,36 @@ class FarmCircuitTask(BotTask):
         return self._junk_policy((item.tag for item in self._surplus_equipment(client)),
                                  sell_tags=self._sell_tags(client), keep_tags=best)
 
+    @staticmethod
+    def _fieldable_styles(client: AtrinikClient) -> list[str]:
+        """The gear styles she can field (equipment.GEAR_STYLES): melee
+        always, caster once she knows a spell, bow once an archery skill is
+        above level 1."""
+        inventory = getattr(client.state, "inventory", ())
+        styles = ["melee"]
+        if any(item.item_type == c.TYPE_SPELL for item in inventory):
+            styles.append("caster")
+        if any(item.item_type == c.TYPE_SKILL and "archery" in item.name.casefold() and
+               int(item.extra.get("level", 0) or 0) > 1 for item in inventory):
+            styles.append("bow")
+        return styles
+
     def _surplus_equipment(self, client: AtrinikClient) -> list[Item]:
-        """Return identified gear proven inferior to every occupied slot,
-        scored for her build as the equip loop scores it."""
-        caster = self._trains_wizardry(client)
-        policy = InventoryPolicy(
-            caster_stats=caster, gear_style=gear_style(self.combat_skill, caster),
-            caster_profile=CasterProfile.from_client(client) if caster else None)
+        """Return identified gear proven inferior to every occupied slot
+        under every style she can field (_fieldable_styles), so a spare
+        caster or bow piece is kept while she fights melee."""
+        policy = InventoryPolicy()
+        scorers = []
+        # Her current build's style always counts (a fresh archer's bow).
+        styles = dict.fromkeys([*self._fieldable_styles(client),
+                                gear_style(self.combat_skill, self._trains_wizardry(client))])
+        for style in styles:
+            styled = InventoryPolicy(
+                caster_stats=style == "caster", gear_style=style,
+                caster_profile=(CasterProfile.from_client(client)
+                                if style == "caster" else None))
+            # Selling sheds the spare's weight; what she wears stays.
+            scorers.append(gear_scorer(client, styled, weight_for=WEIGHT_UNWORN))
         level = int(client.state.stats.get("level", 0) or 0)
         equipped = {
             tag: client.state.items[tag]
@@ -11342,8 +11393,6 @@ class FarmCircuitTask(BotTask):
             if tag in client.state.items
         }
 
-        # The equip loop's decider: what it would never put on is surplus.
-        scorer = gear_scorer(client, policy)
         # The best of some build is kept for that build's set, never sold.
         best = storage.set_tags(self._owned_sets(client))
 
@@ -11371,8 +11420,11 @@ class FarmCircuitTask(BotTask):
                 any(equipped_item.required_skill_tag and
                     equipped_item.required_skill_tag != item.required_skill_tag
                     for equipped_item in current))
+            # The equip loop's decider: what it would put on under no
+            # style she can field is surplus.
             if (different_weapon_school or
-                    not scorer.beats(item, current, len(slots))[0]):
+                    not any(scorer.beats(item, current, len(slots))[0]
+                            for scorer in scorers)):
                 surplus.append(item)
         return surplus
 

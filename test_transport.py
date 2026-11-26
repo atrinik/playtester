@@ -118,6 +118,16 @@ class QuicHandshakeTimeoutTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args):
                 await asyncio.sleep(3600)
 
-        stream = QuicStream(Context(), None, Writer())
+        class Transport:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        protocol = type("Protocol", (), {})()
+        protocol._transport = Transport()
+        stream = QuicStream(Context(), None, Writer(), protocol)
         with patch.object(transport, "CLOSE_TIMEOUT", 0.05):
             await asyncio.wait_for(stream.close(), 2)
+        # Its UDP socket is closed all the same.
+        self.assertTrue(protocol._transport.closed)
