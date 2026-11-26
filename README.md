@@ -86,7 +86,7 @@ from already downloaded files without network access:
 atrinik-playtester dependencies \
   --source-archive /media/atrinik-content-1.14.0.tar.gz \
   --runtime-archive /media/atrinik-content-1.14.0-classic-runtime.tar.gz \
-  --analyzer-archive /media/atrinik-tools-farming-analyzer-3.10.0.tar.gz \
+  --analyzer-archive /media/atrinik-tools-farming-analyzer-3.11.0.tar.gz \
   --server-archive /media/atrinik-classic-server-5.99.0.tar.gz \
   --offline
 ```
@@ -728,8 +728,27 @@ simulated so far. She fights one target at a time and casts no area spell,
 so the profile passes `--max-aggro-pack 2` (1 while Wizardry trains): the
 analyzer drops a map whose likely simultaneous aggro is larger.
 
-The analyzer scores a spot from its own maps alone. Until it models tiled
-neighbours, the bot folds them in itself (`seam_ranking`, COMBAT.md "Safer
+Since analyzer v3.11.0 each run also turns on the analyzer's encounter
+model (COMBAT.md, "Encounter-aware spot choice"). It passes her combat
+style (`--combat-style melee` with a weapon, `ranged-kite` while she trains
+Wizardry with spells only, which she casts from range; never `aoe-kite`, as
+she has no area spell), her measured healing (`--healing-per-second`: the
+median of her landed heal-spell casts over a swing plus a one-second cast,
+within what her SP regeneration sustains; 0 until one has landed) and her
+displayed speed (`--character-speed`, which every run already passed). A
+material change in her healing (15%) calls for a new run. When the report
+carries `"schema_version": 2`, the spot's own safety is the analyzer's
+encounter-aware `spot_safety_score` and a spot counts as risky below 0.8
+rather than 1, since that score is never saturated; the pack cap above
+reads the bad pull (`worst_pack`), up to three times the cap (6, or 3 while
+Wizardry trains), instead of the direct pack (`max_aggro_pack`). A report
+without a schema version is read by its older fields as before. The
+decision record of a chosen spot (`farm-spot-selected`) and the Farming
+tab's spot line show the encounter safety, the expected and bad pull's
+packs and the analyzer's `encounter_reasons`.
+
+The older analyzer scores a spot from its own maps alone, so the bot folds
+tiled neighbours in itself (`seam_ranking`, COMBAT.md "Safer
 spot choice"): from its world graph, a neighbour map's aggressive spawns
 within their detection radius, and its casters within 10 tiles, of where
 she pulls raise the spot's pack, as do the circuit's own maps' spawns
@@ -738,7 +757,10 @@ own safety, and a spot whose pack then exceeds the cap is left out. The
 Farming tab, the farm picker and manual farm tasks use that same ranking:
 a spot seam exposure leaves out is not offered in the picker (an explicit
 `farm_circuit` task with its own legs still works), and the Farming tab
-marks a risky spot and its seam exposure under its approach.
+marks a risky spot and its seam exposure under its approach. A spot the
+encounter model rated already counts neighbour spawns within reach of a
+pull, casters included: seam exposure then only raises the pack the cap
+reads and adds its flags, never lowering the analyzer's safety again.
 
 A spot is only as safe as the way there. Once her savebed is known and exists
 in the locked content, each run passes it as `--approach-origin MAP
@@ -750,7 +772,8 @@ Otherwise the analyzer's default origins apply. A spot the analyzer finds no
 path to is capped at an approach safety of 0.5
 (`--unreachable-approach-safety`), because its walk does not model ships,
 scripts or keys. Autoplay farms spots with a known approach safety of 100%
-and a spot safety of 100% (seam exposure included) before any spot whose
+and a spot safety of 100% (80% for the encounter model; seam exposure
+included) before any spot whose
 approach is unknown or either is expected to cost more than her whole
 health bar, keeping the analyzer's order within each objective's ranking. A risky
 approach is taken only when nothing else is usable, and then the safest one

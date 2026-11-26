@@ -9336,9 +9336,11 @@ class FarmCircuitTask(BotTask):
                  ", ".join(path.rsplit("/", 1)[-1] for path, _ in self.legs))
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
+            encounter = farm_analyzer_plan.encounter_summary(spot)
             recorder("farm-spot-selected",
                      f"{spot.get('name', '?')} ({objective}): "
-                     + ", ".join(path for path, _ in self.legs))
+                     + ", ".join(path for path, _ in self.legs)
+                     + (f" · {encounter}" if encounter else ""))
         return True
 
     async def _recover_failed_navigation(

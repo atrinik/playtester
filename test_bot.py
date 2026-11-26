@@ -21400,7 +21400,9 @@ class FarmAnalyzerTests(unittest.TestCase):
                             ("--mana-cost", "8"), ("--mana-regen", "0.3"),
                             # 62 SP less three 4-SP heals held in reserve.
                             ("--max-mana", "50"), ("--attack-type", "magic"),
-                            ("--max-aggro-pack", "1"), ("--max-health", "188")):
+                            ("--max-aggro-pack", "1"), ("--max-health", "188"),
+                            # Spell-only, she holds one target at range.
+                            ("--combat-style", "ranged-kite")):
             self.assertEqual(args[args.index(flag) + 1], value, flag)
         # Without Meditation, no out-of-combat regeneration ramp.
         self.assertNotIn("--meditation", args)
@@ -21552,6 +21554,106 @@ class FarmAnalyzerTests(unittest.TestCase):
             await analyzer.close()
 
         asyncio.run(scenario())
+
+    def test_the_analyzer_runs_with_her_style_healing_and_speed(self):
+        from .farm_analyzer import combat_profile
+
+        # Live, on 2026-11-25 (level 37, melee, minor healing), the analyzer
+        # ran with neither style nor healing, so its encounter model was
+        # off and every Burnt Forest map rated 1.0. Her style comes from her
+        # kit, her healing from the heal-spell casts that landed, at the
+        # melee cadence (a swing plus a cast), within what her mana
+        # sustains, and her speed from her stats.
+        client = self.client()
+        state = client.state
+        state.player_tag = 7
+        state.stats["regen_sp"] = 1.2
+        state.place_item(state.items[10], 7)
+        state.place_item(Item(tag=14, name="minor healing", item_type=c.TYPE_SPELL,
+                              extra={"cost": 4}), 7)
+        state.place_item(Item(tag=15, name="potion of healing", item_type=c.TYPE_POTION), 7)
+        analyzer = self.analyzer()
+        now = time.time()
+        client.action_history = [
+            {"time": now - 30, "action": "fire", "detail": "minor healing direction=0"},
+            {"time": now - 20, "action": "fire", "detail": "minor healing direction=0"},
+            {"time": now - 15, "action": "apply", "detail": "potion of healing"},
+            {"time": now - 10, "action": "fire", "detail": "minor healing direction=0"},
+            {"time": now - 5, "action": "fire", "detail": "magic bullet direction=2"},
+        ]
+        state.messages = [
+            (now - 29.5, 0, "", "The spell heals you for 17 hp!"),
+            (now - 19.5, 0, "", "The spell heals you for 20 hp!"),
+            # A potion's heal runs out; it is not her sustained healing.
+            (now - 14.8, 0, "", "The spell heals you for 90 hp!"),
+            (now - 9.5, 0, "", "The spell heals you for 14 hp!"),
+            # Long after any heal she sent.
+            (now - 1, 0, "", "The spell heals you for 50 hp!"),
+        ]
+        analyzer.observe_spells(client)
+        self.assertEqual(analyzer.heal_samples, [17, 20, 14])
+
+        async def scenario():
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.status, "ready", analyzer.error)
+            args = analyzer.report["args"]
+            # A 17 HP median: 17 / (2.25 s swing + 1 s cast) = 5.23 HP/s,
+            # but 1.2 SP/s buys 0.3 casts of 4 SP: 5.1 HP/s.
+            for flag, value in (("--combat-style", "melee"),
+                                ("--healing-per-second", "5.1"),
+                                ("--character-speed", "0.8")):
+                self.assertEqual(args[args.index(flag) + 1], value, flag)
+            self.assertEqual(analyzer.profile.describe()["healing_per_second"], 5.1)
+            await analyzer.close()
+
+        asyncio.run(scenario())
+        # No heal landed yet: no healing is assumed.
+        fresh = combat_profile(self.client())
+        args = fresh.arguments()
+        self.assertEqual(args[args.index("--healing-per-second") + 1], "0")
+        # A material change in her healing calls for a new ranking.
+        self.assertTrue(combat_profile(client, heal=17).materially_differs(fresh))
+        self.assertFalse(combat_profile(client, heal=17).materially_differs(
+            combat_profile(client, heal=18)))
+
+    def test_encounter_fields_are_read_only_from_a_schema_2_report(self):
+        from .farm_analyzer import (encounter_rated, encounter_summary, risky_spot,
+                                    spot_pack)
+
+        analyzer = self.analyzer()
+        encounter = {"path": "/dense", "max_aggro_pack": 1.0, "worst_pack": 9.0,
+                     "expected_pack": 1.7, "encounter_applied": True,
+                     "encounter_style": "melee", "encounter_safety": 0.79,
+                     "spot_safety_score": 0.79, "safety_score": 0.79,
+                     "encounter_reasons": ["10 spawns on 24x24", "hardest pull: 9"]}
+        report = analyzer._bounded({
+            "schema_version": 2, "results": [dict(encounter)],
+            "groups": [{"representative": dict(encounter)}],
+            "rankings": {"xp": [dict(encounter)], "safety": [dict(encounter)]}})
+        spot = report["rankings"]["xp"][0]
+        self.assertEqual(spot["analyzer_schema_version"], 2)
+        self.assertEqual(report["groups"][0]["representative"]["analyzer_schema_version"], 2)
+        self.assertTrue(encounter_rated(spot))
+        self.assertEqual(spot_pack(spot), 9.0)
+        # Its safety is never saturated at 1: risky below the encounter floor.
+        self.assertTrue(risky_spot(spot))
+        self.assertFalse(risky_spot(dict(spot, spot_safety_score=0.85)))
+        self.assertEqual(
+            encounter_summary(spot),
+            "melee encounter safety 0.79, pack 1.7/9: 10 spawns on 24x24; hardest pull: 9")
+        # A report without schema_version (an analyzer before v3.11.0) is
+        # read by its older fields, whatever else a spot carries.
+        old = analyzer._bounded({"results": [], "rankings": {"xp": [dict(encounter)]}})
+        spot = old["rankings"]["xp"][0]
+        self.assertNotIn("analyzer_schema_version", spot)
+        self.assertFalse(encounter_rated(spot))
+        self.assertEqual(spot_pack(spot), 1.0)
+        self.assertEqual(encounter_summary(spot), "")
+        self.assertTrue(risky_spot(dict(spot, spot_safety_score=0.85)))
+        # Without a combat style the model did not rate the spot.
+        self.assertFalse(encounter_rated(dict(
+            encounter, analyzer_schema_version=2, encounter_applied=False)))
 
     def test_risky_approach_reads_unknown_and_lethal_ways_there(self):
         from .farm_analyzer import risky_approach
@@ -22265,6 +22367,69 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         # Capped at her single-target pack, it is left out.
         client.farm_analyzer.profile = self.kit(max_health=330, max_aggro_pack=2)
         self.assertIsNone(analyzer_farm_selection(client, built_graph()))
+
+    @staticmethod
+    def encounter_spot(name, path, *, worst, safety, xp, expected=1.0):
+        """A schema-2 analyzer result rated by its encounter model."""
+        spot = analyzer_spot(name, [path], ["charred treant L33"], aggressive=10)
+        spot.update(
+            analyzer_schema_version=2, encounter_applied=True, encounter_style="melee",
+            xp_hour=xp, danger=90.0, max_aggro_pack=1.0, worst_pack=worst,
+            expected_pack=expected, encounter_safety=safety,
+            spot_safety_score=safety, safety_score=safety,
+            approach_status="path", approach_safety_score=1.0, approach_unknown=False,
+            encounter_reasons=[f"{name}: bad pull {worst:g}"])
+        return spot
+
+    def test_a_dense_spot_ranks_below_a_sparse_one_by_its_encounters(self):
+        from .farm_analyzer import risky_spot, seam_adjusted, SeamExposure
+        from .navigation import analyzer_farm_selection, seam_ranking
+
+        # Live, on 2026-11-25, she died on world_16_74 (8 treants, a bear
+        # and a deer on 24x24): the analyzer rated its direct pack 1, so
+        # the #130 pack cap of 2 never applied, and its safety 1.0. Its
+        # encounter model rates the bad pull 9 and the spot 0.79.
+        graph = built_graph()
+        dense = self.encounter_spot("Dense", self.TREES, worst=9.0, safety=0.79,
+                                    xp=2.1e6, expected=1.7)
+        sparse = self.encounter_spot("Sparse", self.POCKET, worst=3.0, safety=0.88,
+                                     xp=0.5e6)
+        client = self.client({"xp": [dense, sparse]})
+        # Allowing any pack, the dense spot ranks first but is risky.
+        client.farm_analyzer.profile = self.kit(max_health=333)
+        self.assertTrue(risky_spot(dense))
+        self.assertFalse(risky_spot(sparse))
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Sparse")
+        # Her single-target kit's cap (2) reads the bad pull, three times
+        # the direct pack: the dense spot is left out altogether.
+        client.farm_analyzer.profile = self.kit(max_health=333, max_aggro_pack=2)
+        self.assertEqual([spot["name"] for spot in seam_ranking(client, graph, "xp")],
+                         ["Sparse"])
+        self.assertIsNone(seam_adjusted(dense, SeamExposure(), client.farm_analyzer.profile))
+        self.assertIsNotNone(seam_adjusted(dict(dense, worst_pack=6.0), SeamExposure(),
+                                           client.farm_analyzer.profile))
+        self.assertEqual(analyzer_farm_selection(client, graph)[1]["name"], "Sparse")
+        # The model counts seam neighbours itself: exposure only annotates.
+        exposed = seam_adjusted(sparse, SeamExposure(2, 3, 1, ("/x",)),
+                                client.farm_analyzer.profile)
+        self.assertEqual((exposed["spot_safety_score"], exposed["max_aggro_pack"],
+                          exposed["seam_casters"]), (0.88, 1.0, 1))
+        # An older report's spot (no schema version) keeps the direct pack.
+        old = {key: value for key, value in dense.items()
+               if key != "analyzer_schema_version"}
+        self.assertIs(seam_adjusted(old, SeamExposure(), client.farm_analyzer.profile), old)
+
+    def test_the_selected_spot_records_its_encounter_reasons(self):
+        sparse = self.encounter_spot("Sparse", self.POCKET, worst=3.0, safety=0.88,
+                                     xp=0.5e6)
+        client = self.client({"xp": [sparse]})
+        circuit = self.circuit(client, analyzer_spot("Trees", [self.TREES],
+                                                     ["evil treant L13"]))
+        self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
+        selected = [entry["detail"] for entry in client.decision_history
+                    if entry["action"] == "farm-spot-selected"]
+        self.assertIn("melee encounter safety 0.88, pack 1.0/3: Sparse: bad pull 3",
+                      selected[-1])
 
     def test_repeated_pack_deaths_rate_a_spot_hazardous_for_her_kit(self):
         from . import self_improvement as si

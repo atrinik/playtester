@@ -161,11 +161,21 @@ function approachLine(r, fromBed) {
   return `<small class="${r.approach_risky ? "warn-text" : "muted"}" title="Spot safety ${pct(r.spot_safety_score)} · overall ${pct(r.safety_score)}${r.approach_risky ? " · farmed only when no spot with a safe approach is usable" : ""}">${text}</small>`;
 }
 // The spot's own safety, seam exposure included (farm_analyzer.seam_adjusted).
+// Rated by the analyzer's encounter model (schema 2), the expected and bad
+// pull's packs, with its reasons in the tooltip.
 function spotLine(r) {
   const seam = +r.seam_casters || +r.seam_aggressive_spawns
     ? ` · seam ${+r.seam_aggressive_spawns || 0} aggressive, ${+r.seam_casters || 0} casters` : "";
-  if (!r.spot_risky && !seam) return "";
-  return `<small class="${r.spot_risky ? "warn-text" : "muted"}" title="${r.spot_risky ? "One encounter is expected to cost more than her health bar: farmed only when no safe spot is usable" : "Neighbouring maps across a seam"}">Spot ${pct(r.spot_safety_score)} safe · pack ${Math.round(+r.max_aggro_pack || 0)}${seam}</small>`;
+  const encounter = +r.analyzer_schema_version >= 2 && r.encounter_applied === true;
+  if (!r.spot_risky && !seam && !encounter) return "";
+  const pack = encounter
+    ? `${esc(r.encounter_style || "")} pack ${(+r.expected_pack || 0).toFixed(1)}, bad pull ${Math.round(+r.worst_pack || 0)}`
+    : `pack ${Math.round(+r.max_aggro_pack || 0)}`;
+  const reasons = encounter ? (r.encounter_reasons || []).map(String).join("\n") : "";
+  const title = r.spot_risky
+    ? `${encounter ? "Its encounters rate below her safety floor" : "One encounter is expected to cost more than her health bar"}: farmed only when no safe spot is usable`
+    : encounter ? "The analyzer's encounter model" : "Neighbouring maps across a seam";
+  return `<small class="${r.spot_risky ? "warn-text" : "muted"}" title="${esc(title + (reasons ? "\n" + reasons : ""))}">Spot ${pct(r.spot_safety_score)} safe · ${pack}${seam}</small>`;
 }
 function renderFarming() {
   const fa = slow.farming_analysis;
@@ -188,7 +198,7 @@ function renderFarming() {
     ? `Farming for ${(fa.objectives || {})[fa.objective] || fa.objective} while depleted (${fa.objective_override.points} points); back to ${(fa.objectives || {})[chosen] || chosen} once cured. `
     : "";
   $("#fa-profile").textContent = override + (p
-    ? `Simulating ${p.skill} ${p.skill_level}${p.max_aggro_pack ? ` (≤${p.max_aggro_pack} aggro)` : ''} · ${p.spell_damage > 0 ? `spells only: ${p.spell_damage} ${p.spell_attack}/cast · ${p.cast_delay}s/cast · ${p.mana_cost} of ${p.max_mana} SP · ${p.mana_regen} SP/s` : `DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing`} · HP ${p.max_health} · AC ${p.armour_class}`
+    ? `Simulating ${p.skill} ${p.skill_level}${p.max_aggro_pack ? ` (≤${p.max_aggro_pack} aggro)` : ''} · ${p.spell_damage > 0 ? `spells only: ${p.spell_damage} ${p.spell_attack}/cast · ${p.cast_delay}s/cast · ${p.mana_cost} of ${p.max_mana} SP · ${p.mana_regen} SP/s` : `DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing`} · HP ${p.max_health} · AC ${p.armour_class}${p.combat_style ? ` · ${p.combat_style}, heals ${p.healing_per_second} HP/s, speed ${p.speed}` : ""}`
     : "") + (fa.approach_origin ? ` · approach from ${String(fa.approach_origin).replace(/^.*\//, "")}` : "");
   // Mark the spot autoplay farms; list it first when it ranks below the top five.
   const farmed = fa.farmed_spot;

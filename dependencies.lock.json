@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "bundle_version": "protocol-v5.106.0-pathfinding-v5.48.0-content-v1.14.0-analyzer-v3.10.0-server-v5.99.0",
+  "bundle_version": "protocol-v5.106.0-pathfinding-v5.48.0-content-v1.14.0-analyzer-v3.11.0-server-v5.99.0",
   "inputs": {
     "content": {
       "repository": "atrinik/content",
@@ -67,14 +67,14 @@
     },
     "farming_analyzer": {
       "repository": "atrinik/tools",
-      "release": "v3.10.0",
-      "revision": "dcb1ef9e415e5c507fba409eb0440ebfc304004f",
+      "release": "v3.11.0",
+      "revision": "594c7591646ab4177824637fbe0c3219ed11c750",
       "license": "MIT",
       "disposition": "external farm-ranking tool run as a separate process; not distributed",
-      "artifact": "atrinik-tools-farming-analyzer-3.10.0.tar.gz",
-      "url": "https://github.com/atrinik/tools/releases/download/v3.10.0/atrinik-tools-farming-analyzer-3.10.0.tar.gz",
-      "sha256": "441db410150acc205e41f929d4c824d39ce47ef323e46015f97a92db3f7d0de9",
-      "root": "atrinik-tools-farming-analyzer-3.10.0",
+      "artifact": "atrinik-tools-farming-analyzer-3.11.0.tar.gz",
+      "url": "https://github.com/atrinik/tools/releases/download/v3.11.0/atrinik-tools-farming-analyzer-3.11.0.tar.gz",
+      "sha256": "650ad63727aee97cd3b4376e624241211f292c631f10591762ea6d25138e1afd",
+      "root": "atrinik-tools-farming-analyzer-3.11.0",
       "max_download_bytes": 1048576,
       "max_members": 200,
       "max_unpacked_bytes": 8388608,
@@ -89,7 +89,7 @@
       "release": "v5.99.0",
       "revision": "adcab31088a7ce02555d7a6f4f862034a982abbb",
       "license": "GPL-2.0-or-later",
-      "disposition": "external analyzer data input: experience and skill tables are read as text by the separate analyzer process; not distributed, linked or executed",
+      "disposition": "external analyzer data input: experience, skill, ally-call and spell tables and server constants are read as text by the separate analyzer process; not distributed, linked or executed",
       "artifact": "atrinik-classic-server-5.99.0.tar.gz",
       "url": "https://github.com/atrinik/classic/releases/download/v5.99.0/atrinik-classic-server-5.99.0.tar.gz",
       "sha256": "ea3fd518bacbad7b7f2ccc2ac1425cc32470abd1422ec91832dc07e7c63534e5",
@@ -98,7 +98,10 @@
       "max_members": 4000,
       "max_unpacked_bytes": 67108864,
       "required_paths": {
+        "src/include/config.h": "file",
+        "src/include/spellist.h": "file",
         "src/server/exp.c": "file",
+        "src/server/living.c": "file",
         "src/server/skill_util.c": "file"
       }
     }

@@ -127,7 +127,7 @@ class CompatibilityTests(unittest.TestCase):
                 },
                 "farming_analyzer": {
                     "repository": "atrinik/tools",
-                    "release": "v3.10.0",
+                    "release": "v3.11.0",
                     "revision": "d" * 40,
                     "license": "MIT",
                     "disposition": "external",
@@ -204,15 +204,20 @@ class CompatibilityTests(unittest.TestCase):
                          "d6567006ce0f815c6b1816fe19b5f3cc1739db755a6e77b899513359ad418368")
         analyzer = lock["inputs"]["farming_analyzer"]
         self.assertEqual((analyzer["repository"], analyzer["release"], analyzer["revision"]),
-                         ("atrinik/tools", "v3.10.0", "dcb1ef9e415e5c507fba409eb0440ebfc304004f"))
+                         ("atrinik/tools", "v3.11.0", "594c7591646ab4177824637fbe0c3219ed11c750"))
         self.assertEqual(analyzer["sha256"],
-                         "441db410150acc205e41f929d4c824d39ce47ef323e46015f97a92db3f7d0de9")
+                         "650ad63727aee97cd3b4376e624241211f292c631f10591762ea6d25138e1afd")
         server = lock["inputs"]["classic_server"]
         self.assertEqual((server["repository"], server["release"], server["revision"]),
                          ("atrinik/classic", "v5.99.0", "adcab31088a7ce02555d7a6f4f862034a982abbb"))
         self.assertEqual(server["sha256"],
                          "ea3fd518bacbad7b7f2ccc2ac1425cc32470abd1422ec91832dc07e7c63534e5")
         self.assertIn("src/server/exp.c", server["required_paths"])
+        # The analyzer's encounter model reads ally calls and caster spells
+        # from these; without them it warns and silently skips both.
+        for path in ("src/server/living.c", "src/include/spellist.h",
+                     "src/include/config.h"):
+            self.assertEqual(server["required_paths"].get(path), "file", path)
 
     def test_github_token_is_sent_only_to_the_github_api(self) -> None:
         seen = []
@@ -293,7 +298,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(
             [check["artifact"] for check in result["checks"]][-3:],
             ["atrinik_classic_protocol-5.106.0-py3-none-any.whl",
-             "atrinik-tools-farming-analyzer-3.10.0.tar.gz",
+             "atrinik-tools-farming-analyzer-3.11.0.tar.gz",
              "atrinik-classic-server-5.99.0.tar.gz"],
         )
 
@@ -352,7 +357,7 @@ class CompatibilityTests(unittest.TestCase):
             (lambda value: value["inputs"].pop("farming_analyzer"),
              "inputs are incomplete"),
             (lambda value: value["inputs"]["farming_analyzer"].__setitem__(
-                "revision", "v3.10.0"), "farming_analyzer revision is invalid"),
+                "revision", "v3.11.0"), "farming_analyzer revision is invalid"),
             (lambda value: value["inputs"]["classic_server"].__setitem__(
                 "url", "http://example.invalid/server.tar.gz"),
              "classic_server URL must use HTTPS"),
@@ -411,7 +416,7 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(reused["root"], installed["root"])
         marker = json.loads((installed["root"] / compatibility.MARKER_NAME).read_text())
         self.assertEqual(marker["content_revision"], "7" * 40)
-        self.assertEqual(marker["inputs"]["farming_analyzer"]["release"], "v3.10.0")
+        self.assertEqual(marker["inputs"]["farming_analyzer"]["release"], "v3.11.0")
         self.assertEqual(marker["inputs"]["classic_server"]["release"], "v5.99.0")
         self.assertEqual(
             sorted(path.name for path in (cache / "bundles").iterdir()),

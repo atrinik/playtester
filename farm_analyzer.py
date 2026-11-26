@@ -11,6 +11,12 @@ changes materially, her savebed moves, or the result ages out. A spot is
 judged from her savebed: the analyzer charges the maps crossed from there to
 the spot (approach danger) against her maximum health. One ``--ranking all`` run yields every objective, so switching the
 preferred objective never needs a new run.
+
+Since analyzer v3.11.0 (report ``schema_version`` 2) the run also names her
+combat style, measured healing and speed, so the analyzer's encounter model
+rates each spot by the packs a pull really brings (``spot_safety_score``,
+``expected_pack``, ``worst_pack``, ``encounter_reasons``). A report without a
+schema version (an older analyzer) is read by its older fields.
 """
 
 from __future__ import annotations
@@ -73,6 +79,14 @@ SPELL_HIT_WINDOW_SECONDS = 3.0
 # of whatever she did last (a sword swing included), and mana, not the cast
 # rate, bounds a spell-only kill rate, so a fixed second is used.
 SPELL_CAST_DELAY = 1.0
+# The server's answer to every heal that lands (tasks.HEALED_MESSAGE).
+HEALED_TEXT = re.compile(r"^The spell heals you for (\d{1,9}) hp", re.I)
+# A heal answer this soon after her FIRE of a healing spell is that spell's.
+HEAL_ATTRIBUTION_SECONDS = 2.0
+HEAL_SAMPLES = 30
+# The analyzer's combat styles (--combat-style) for her two kits.
+MELEE_STYLE = "melee"
+RANGED_KITE_STYLE = "ranged-kite"
 
 
 def owned_skill_level(state, name: str) -> int:
@@ -121,6 +135,21 @@ SINGLE_TARGET_MAX_AGGRO_PACK = 2
 SEAM_REACH_TILES = 10
 # Danger added per seam caster, the analyzer's own caster bonus.
 SEAM_CASTER_DANGER = 20.0
+# The analyzer report schema that carries the encounter model's fields.
+ENCOUNTER_SCHEMA = 2
+# Below this encounter-aware spot safety (the analyzer's blend of the
+# expected pull's and the bad pull's cost against her health, which is
+# never saturated at 1) a spot counts as risky. With analyzer v3.11.0 and
+# her live kit (2026-11-25: level 37, 333 health, melee, 4.25 HP/s), every
+# Burnt Forest map she died on rated 0.40 to 0.77, and the maps whose bad
+# pull stays under four health bars rated 0.82 and up.
+ENCOUNTER_SAFETY_FLOOR = 0.8
+# A spot's bad pull (the analyzer's worst_pack: the engaged radius plus
+# every wanderer and ally call more likely than not to join) may hold at
+# most this many times the profile's max_aggro_pack. Live, on 2026-11-25,
+# she died on Burnt Forest maps of bad pull 7 and 8 (one treant is about
+# break-even for her heals, three are lethal without a recall).
+BAD_PULL_PACK_FACTOR = 3
 
 # Fields copied from each ranked result into the dashboard snapshot.
 SUMMARY_FIELDS = (
@@ -134,6 +163,9 @@ SUMMARY_FIELDS = (
     "approach_danger_flags", "approach_unknown",
     # The bot's seam exposure (seam_adjusted).
     "seam_aggressive_spawns", "seam_casters", "seam_maps",
+    # The encounter model (analyzer v3.11.0, schema_version 2).
+    "analyzer_schema_version", "encounter_applied", "encounter_style",
+    "encounter_safety", "expected_pack", "worst_pack", "encounter_reasons",
 )
 # The approach safety an unreachable spot is capped at. The analyzer's walk
 # follows exits and tiled seams only (no ships, scripts or keys), so
@@ -179,9 +211,20 @@ def _number(value) -> float | None:
     return None
 
 
+def encounter_rated(spot: dict) -> bool:
+    """Whether a ranked spot carries the analyzer's encounter model: its
+    report has schema_version ENCOUNTER_SCHEMA or later (stamped on each
+    spot as analyzer_schema_version, FarmAnalyzer._bounded) and the model
+    ran for a combat style. Otherwise only the older fields are read."""
+    version = spot.get("analyzer_schema_version")
+    return (isinstance(version, int) and not isinstance(version, bool) and
+            version >= ENCOUNTER_SCHEMA and spot.get("encounter_applied") is True)
+
+
 def spot_safety(spot: dict) -> float:
     """A ranked spot's own safety, without its approach: the analyzer's
-    spot_safety_score (v3.10.0), else its safety_score, else 1."""
+    spot_safety_score (v3.10.0; encounter-aware under a combat style since
+    v3.11.0), else its safety_score, else 1."""
     for key in ("spot_safety_score", "safety_score"):
         value = _number(spot.get(key))
         if value is not None:
@@ -189,15 +232,53 @@ def spot_safety(spot: dict) -> float:
     return 1.0
 
 
+def spot_pack(spot: dict) -> float:
+    """The pack a ranked spot's pull may bring, as the #130 pack cap reads
+    it: the analyzer's bad pull (worst_pack) when the encounter model rated
+    the spot, else its largest direct aggro pack (max_aggro_pack)."""
+    if encounter_rated(spot):
+        worst = _number(spot.get("worst_pack"))
+        if worst is not None:
+            return worst
+    return _number(spot.get("max_aggro_pack")) or 0.0
+
+
+def pack_cap(spot: dict, profile: "CombatProfile | None") -> int:
+    """The largest spot_pack the profile accepts; 0 allows any. A bad pull
+    (worst_pack) may hold BAD_PULL_PACK_FACTOR times the direct pack."""
+    cap = int(getattr(profile, "max_aggro_pack", 0) or 0)
+    return cap * BAD_PULL_PACK_FACTOR if cap and encounter_rated(spot) else cap
+
+
 def risky_spot(spot: dict) -> bool:
     """Whether one encounter at a ranked spot is expected to cost more than
-    her whole health bar (its own safety below APPROACH_SAFETY_FLOOR).
+    her whole health bar (its own safety below APPROACH_SAFETY_FLOOR), or,
+    rated by the encounter model, its safety is below
+    ENCOUNTER_SAFETY_FLOOR.
 
     Autoplay prefers spots that are neither this nor risky_approach. Live,
     on 2026-11-23, she farmed the XP view's first spot, an Underground City
     circuit of spot safety 0.95, and died there to three attackers at once.
     """
-    return spot_safety(spot) < APPROACH_SAFETY_FLOOR
+    floor = ENCOUNTER_SAFETY_FLOOR if encounter_rated(spot) else APPROACH_SAFETY_FLOOR
+    return spot_safety(spot) < floor
+
+
+def encounter_summary(spot: dict, reasons: int = 3) -> str:
+    """A short account of the encounter model's rating for the decision
+    record, or "" for a spot it did not rate."""
+    if not encounter_rated(spot):
+        return ""
+    safety = _number(spot.get("encounter_safety"))
+    expected = _number(spot.get("expected_pack"))
+    worst = _number(spot.get("worst_pack"))
+    text = (f"{spot.get('encounter_style', '?')} encounter safety "
+            f"{safety if safety is not None else 0:.2f}, pack "
+            f"{expected if expected is not None else 0:.1f}/"
+            f"{worst if worst is not None else 0:g}")
+    listed = [str(reason) for reason in (spot.get("encounter_reasons") or ())
+              if isinstance(reason, str)][:reasons]
+    return text + (": " + "; ".join(listed) if listed else "")
 
 
 @dataclass(frozen=True)
@@ -222,7 +303,8 @@ class SeamExposure:
 def seam_adjusted(spot: dict, exposure: SeamExposure,
                   profile: "CombatProfile | None") -> dict | None:
     """A ranked spot with its seam exposure folded in, or None when its
-    pack, the exposed one included, exceeds the profile's max_aggro_pack.
+    pack (spot_pack), the exposed one included, exceeds the profile's
+    pack_cap.
 
     The analyzer scores a circuit from its own maps alone, and judges its
     pack per map. Live, on 2026-11-23, it rated the Underground City circuit
@@ -236,22 +318,31 @@ def seam_adjusted(spot: dict, exposure: SeamExposure,
     monster times the pack, plus SEAM_CASTER_DANGER per seam caster);
     ``safety_score`` is at most that. A spot nothing reaches is returned
     as it is.
+
+    A spot the encounter model rated (encounter_rated) is capped by its
+    bad pull (worst_pack) instead, and keeps the analyzer's safety: that
+    model already counts the spawns on tiled neighbour maps within reach
+    of a pull, casters included, so the exposure only annotates it.
     """
-    ranked_pack = _number(spot.get("max_aggro_pack")) or 0.0
+    encounter = encounter_rated(spot)
+    ranked_pack = spot_pack(spot)
     pack = max(ranked_pack, float(exposure.pack))
-    cap = int(getattr(profile, "max_aggro_pack", 0) or 0)
+    cap = pack_cap(spot, profile)
     if cap and pack > cap:
         return None
     if exposure.aggressive <= 0 and exposure.pack <= 0:
         return spot
     adjusted = dict(spot)
     adjusted.update(
-        max_aggro_pack=pack, analyzer_max_aggro_pack=ranked_pack,
         seam_aggressive_spawns=exposure.aggressive,
         seam_casters=exposure.casters, seam_maps=list(exposure.maps))
+    if not encounter:
+        adjusted.update(max_aggro_pack=pack, analyzer_max_aggro_pack=ranked_pack)
     if exposure.casters:
         adjusted["danger_flags"] = [
             *(spot.get("danger_flags") or ()), f"seam caster×{exposure.casters}"]
+    if encounter:
+        return adjusted
     danger = _number(spot.get("danger"))
     health = float(getattr(profile, "max_health", 0) or 0)
     if danger is not None and health > 0 and (
@@ -325,6 +416,11 @@ class CombatProfile:
     # She has Meditation: resting out of combat ramps regeneration up to
     # tenfold (types/player.c, player_do_some_living).
     meditation: bool = False
+    # The analyzer's encounter model (v3.11.0): how she fights (combat_style)
+    # and the HP per second her heal spell sustains in a fight
+    # (healing_rate); "" runs without the model.
+    combat_style: str = ""
+    healing_per_second: float = 0.0
 
     def arguments(self) -> list[str]:
         if self.spell_damage > 0:
@@ -357,6 +453,9 @@ class CombatProfile:
             args += ["--player-protection", f"{name}={value}"]
         if self.max_aggro_pack:
             args += ["--max-aggro-pack", str(self.max_aggro_pack)]
+        if self.combat_style:
+            args += ["--combat-style", self.combat_style,
+                     "--healing-per-second", f"{self.healing_per_second:g}"]
         return args
 
     def materially_differs(self, other: "CombatProfile | None") -> bool:
@@ -365,10 +464,10 @@ class CombatProfile:
             return True
         if (self.skill, self.skill_level, self.attack, self.character_level,
                 self.max_aggro_pack, self.spell_attack, self.mana_cost,
-                self.meditation) != (
+                self.meditation, self.combat_style) != (
                 other.skill, other.skill_level, other.attack, other.character_level,
                 other.max_aggro_pack, other.spell_attack, other.mana_cost,
-                other.meditation):
+                other.meditation, other.combat_style):
             return True
         if (self.spell_damage > 0) != (other.spell_damage > 0):
             return True
@@ -382,6 +481,7 @@ class CombatProfile:
                 relative(self.damage, other.damage, 0.10) or
                 relative(self.weapon_speed, other.weapon_speed, 0.05) or
                 relative(self.speed, other.speed, 0.05) or
+                relative(self.healing_per_second, other.healing_per_second, 0.15) or
                 relative(self.max_health, other.max_health, 0.10) or
                 abs(self.weapon_class - other.weapon_class) >= 2 or
                 abs(self.armour_class - other.armour_class) >= 2):
@@ -441,15 +541,53 @@ class CombatProfile:
             "mana_cost": self.mana_cost, "mana_regen": self.mana_regen,
             "max_mana": self.max_mana, "spell_attack": self.spell_attack,
             "meditation": self.meditation,
+            "combat_style": self.combat_style,
+            "healing_per_second": self.healing_per_second,
         }
 
 
+def healing_rate(state, heal: float, swing: float) -> float:
+    """The HP per second her healing spell sustains in a fight, for the
+    analyzer's --healing-per-second; 0 until a heal of it has landed.
+
+    ``heal`` is the median of her landed heal-spell casts
+    (FarmAnalyzer.observe_spells; potions and scrolls do not count: they
+    run out). In a fight a cast waits for her action timer (COMBAT.md,
+    heals in melee), so one lands about every ``swing`` (her weapon's
+    speed, or a cast while she trains with spells) plus SPELL_CAST_DELAY.
+    Her mana bounds it too: regen_sp over the spell's cost, casts a
+    second. Live, on 2026-11-25, minor healing landed 8 to 26 (median
+    about 17) with a 3 s weapon: about 4.25 HP/s, against at most 5.5 seen.
+    """
+    if heal <= 0 or swing <= 0:
+        return 0.0
+    rate = heal / (swing + SPELL_CAST_DELAY)
+    costs = [int(item.extra.get("cost", 0) or 0) for item in state.inventory
+             if item.item_type == c.TYPE_SPELL and "heal" in item.name.casefold()]
+    try:
+        regen = float(state.stats.get("regen_sp", 0) or 0)
+    except (TypeError, ValueError):
+        regen = 0.0
+    cost = min((value for value in costs if value > 0), default=0)
+    if cost and regen > 0:
+        rate = min(rate, heal * regen / cost)
+    return round(rate, 2)
+
+
 def combat_profile(client, spell_damage: float = 0.0,
-                   spell_attack: str = "") -> CombatProfile | None:
+                   spell_attack: str = "", heal: float = 0.0) -> CombatProfile | None:
     """Read the killing skill and player doll, or None if unsupported.
 
     ``spell_damage``/``spell_attack`` are the observed raw damage per hit of
-    her damage spell and its attack type (see FarmAnalyzer.observe_spells).
+    her damage spell and its attack type, ``heal`` the median of her landed
+    heal-spell casts (see FarmAnalyzer.observe_spells).
+
+    Her combat style for the analyzer's encounter model: ``ranged-kite``
+    while she trains with spells only (caster_kite holds one target at
+    range and steps away), else ``melee``: her weapon fights one target in
+    place, and melee_kite steps away only from a lone pursuer, standing
+    when another hostile is close (KITE_CROWD_RADIUS). She casts no area
+    spell, so never ``aoe-kite``.
     """
     state = client.state
     weapon = state.items.get(state.equipment.get(c.EQUIP_WEAPON, 0))
@@ -517,12 +655,15 @@ def combat_profile(client, spell_damage: float = 0.0,
                     item.item_type == c.TYPE_SKILL and
                     item.name.casefold() == "meditation"
                     for item in state.inventory))
+    swing = SPELL_CAST_DELAY if caster else weapon_speed
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
         character_level=character_level, max_health=max_health,
         speed=round(speed, 3), armour_class=armour_class, protections=protections,
-        max_aggro_pack=max_aggro_pack, **caster)
+        max_aggro_pack=max_aggro_pack,
+        combat_style=RANGED_KITE_STYLE if caster else MELEE_STYLE,
+        healing_per_second=healing_rate(state, heal, swing), **caster)
 
 
 class _OriginRejected(RuntimeError):
@@ -606,6 +747,8 @@ class FarmAnalyzer:
         self.spell_samples: list[int] = []
         self.spell_attack = ""
         self.spell_name = ""
+        # HP of her recent landed heal-spell casts (healing_rate).
+        self.heal_samples: list[int] = []
         self._message_position = 0
 
     @classmethod
@@ -683,16 +826,42 @@ class FarmAnalyzer:
                 now - self.reported_at >= self.REFRESH_SECONDS)
 
     def observe_spells(self, client) -> None:
-        """Record the raw damage of her damage spell from her own hit text.
+        """Record the raw damage of her damage spell from her own hit text,
+        and the HP of each heal-spell cast that lands (healing_rate).
 
         Only hit text within a few seconds of her own offensive cast counts,
         so elemental melee (rings of fire and the like) is never sampled.
+        A heal counts only when her latest FIRE or APPLY, at most
+        HEAL_ATTRIBUTION_SECONDS before the server's answer, fired a
+        healing spell she knows.
         """
         state = client.state
         entries = state.messages_since(self._message_position)
         self._message_position = state.message_count
         casts = list(getattr(client, "offensive_casts", ()))
+        heal_spells = {item.name.casefold() for item in state.inventory
+                       if item.item_type == c.TYPE_SPELL and
+                       "heal" in item.name.casefold()}
+        # Her FIREs and APPLYs, newest last: a heal answer belongs to the
+        # latest one before it, and counts only if that FIRE cast a
+        # healing spell (an applied potion or scroll does not).
+        orders = [(float(record.get("time", 0) or 0), record.get("action"),
+                   str(record.get("detail", "")).casefold())
+                  for record in list(getattr(client, "action_history", ()) or ())[-50:]
+                  if isinstance(record, dict) and
+                  record.get("action") in ("fire", "apply")]
         for timestamp, _, _, text in entries:
+            healed = HEALED_TEXT.match(text)
+            if healed and heal_spells:
+                order = next((entry for entry in reversed(orders)
+                              if 0.0 <= timestamp - entry[0] <= HEAL_ATTRIBUTION_SECONDS),
+                             None)
+                if (order is not None and order[1] == "fire" and
+                        any(order[2].startswith(name + " ") or order[2] == name
+                            for name in heal_spells) and int(healed.group(1)) > 0):
+                    self.heal_samples = (
+                        self.heal_samples + [int(healed.group(1))])[-HEAL_SAMPLES:]
+                continue
             spell = next((
                 name for cast_at, name in reversed(casts)
                 if 0.0 <= timestamp - cast_at <= SPELL_HIT_WINDOW_SECONDS), "")
@@ -723,7 +892,8 @@ class FarmAnalyzer:
         profile = combat_profile(
             client,
             statistics.median(self.spell_samples) if observed else 0.0,
-            self.spell_attack)
+            self.spell_attack,
+            statistics.median(self.heal_samples) if self.heal_samples else 0.0)
         if profile is None:
             if self.report is None and not self.running:
                 self.status = "unsupported"
@@ -796,7 +966,19 @@ class FarmAnalyzer:
         """The report with its safety view cut back to SAFETY_TOP, every
         other view to TOP spots with at most AREA_CIRCUITS circuits of one
         area (_distinct; the analyzer's --top, SAFETY_TOP, applies to all
-        of them), and its unranked results to TOP."""
+        of them), and its unranked results to TOP. Each spot is stamped
+        with the report's schema_version (analyzer_schema_version, absent
+        before v3.11.0), which encounter_rated checks before any encounter
+        field is read."""
+        version = report.get("schema_version")
+        if isinstance(version, int) and not isinstance(version, bool):
+            for spot in [*(spot for ranked in report["rankings"].values()
+                           if isinstance(ranked, list) for spot in ranked),
+                         *(report.get("results") or ()),
+                         *(group.get("representative") for group in report.get("groups") or ()
+                           if isinstance(group, dict))]:
+                if isinstance(spot, dict):
+                    spot["analyzer_schema_version"] = version
         rankings = report["rankings"]
         for name, ranked in list(rankings.items()):
             if isinstance(ranked, list):
