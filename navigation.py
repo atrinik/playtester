@@ -12985,13 +12985,14 @@ class FarmCircuitTask(BotTask):
         dashboard ("need N for <spell> from <seller>"); the owner can drop
         gold on her. Given up after LEARN_ATTEMPTS failed trips."""
         retry = _learn_retries(client)
-        if getattr(client, "learn_errand_retry", False):
-            # The operator retried a given-up errand from the dashboard: its
-            # spells' route or dialogue backoffs end; a seller's money
-            # refusal keeps its own.
-            _set_attr(client, "learn_errand_retry", False)
-            for spell, (until, money) in list(retry.items()):
-                if not money:
+        retried = getattr(client, "learn_errand_retry", None)
+        if retried:
+            # The operator retried given-up spells from the dashboard: those
+            # spells' route or dialogue backoffs end, no other's; a seller's
+            # money refusal keeps its own.
+            _set_attr(client, "learn_errand_retry", set())
+            for spell in set(retried) & set(retry):
+                if not retry[spell][1]:
                     retry.pop(spell)
         offer = self._learn_offer(client)
         if offer is None:

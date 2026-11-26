@@ -1802,9 +1802,9 @@ class WebControlServer:
                 failures.pop(name, None)
             self.client.learn_errand_failed = failed
             self.client.learn_errand_failures = failures
-            # The circuit's route or dialogue backoff ends too
+            # The retried spells' route or dialogue backoffs end too
             # (_needs_learn_spell), never a seller's money refusal.
-            self.client.learn_errand_retry = True
+            self.client.learn_errand_retry = set(retried)
             return {"ok": True, "retried": retried}
         if kind == "chat":
             text = str(data.get("text", "")).strip()

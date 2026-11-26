@@ -2448,6 +2448,10 @@ class FarmTask(BotTask):
         # (spell_only_training), and when that was last recorded.
         self._caster_dry = False
         self._caster_dry_at = float("-inf")
+        # A dry caster's rest out of a fight (_dry_rest_rising): her SP when
+        # it last rose and since when.
+        self._dry_rest_sp: int | None = None
+        self._dry_rest_since = 0.0
         self.allow_launchers = (
             not bool(self.combat_spell)
             if allow_launchers is None else bool(allow_launchers))
@@ -3516,9 +3520,16 @@ class FarmTask(BotTask):
             reserve = self.healing_mana_reserve(client)
             # Only a bar that can ever pay a cast is "dry"; one that never
             # can is the ordinary weapon path below, with no rests for SP.
-            castable = maxsp <= 0 or cost <= maxsp - reserve
+            # Before her stats arrive (no maximum yet) she is not dry.
+            castable = maxsp > 0 and cost <= maxsp - reserve
             dry = (castable and cost > sp - reserve and
                    not ManaCrystal.has_charge(client))
+            if (self._caster_dry and castable and
+                    (self._engaged_target is not None or recent_hostile_contact(client))):
+                # Dry stays latched for the rest of the fight: one
+                # regenerated cast does not flip her back to the spell and
+                # away from melee; the rest between pulls refills her bar.
+                dry = True
             now = time.monotonic()
             if dry and not self._caster_dry and now - self._caster_dry_at >= self.DRY_RECORD_SECONDS:
                 self._caster_dry_at = now
@@ -3526,12 +3537,27 @@ class FarmTask(BotTask):
                 if recorder is not None:
                     recorder("caster-out-of-mana", f"{spell.name}: fighting with her weapon")
             self._caster_dry = dry
+            if not dry:
+                self._dry_rest_sp = None
             if dry:
                 return False
         else:
             self._caster_dry = False
+            self._dry_rest_sp = None
         return spell is not None and (
             maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
+
+    # A dry caster rests for SP out of a fight only while it rises: after
+    # this long without a point gained (no regeneration: no food, a
+    # depletion) she fights with her weapon as the ordinary farm does.
+    DRY_REST_STALL_SECONDS = 60.0
+
+    def _dry_rest_rising(self, client: AtrinikClient) -> bool:
+        sp = int(client.state.stats.get("sp", 0) or 0)
+        now = time.monotonic()
+        if self._dry_rest_sp is None or sp > self._dry_rest_sp:
+            self._dry_rest_sp, self._dry_rest_since = sp, now
+        return now - self._dry_rest_since < self.DRY_REST_STALL_SECONDS
 
     @staticmethod
     def _wields_weapon(client: AtrinikClient) -> bool:
@@ -7401,7 +7427,8 @@ class FarmTask(BotTask):
             self.complete()
             return
         if (engaged is None and
-                (self.spell_only_training(client) or self._caster_dry) and
+                (self.spell_only_training(client) or
+                 (self._caster_dry and self._dry_rest_rising(client))) and
                 (nearest_threat is None or nearest_threat[0] > 2) and
                 not any(active_threat(entry) for entry in threats
                         if entry[3].target_id not in pulled_aside_ids) and

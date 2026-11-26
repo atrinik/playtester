@@ -42149,20 +42149,25 @@ class BuildPerSpotTests(unittest.TestCase):
         self.assertTrue(client.combat and all(client.combat))
         self.assertEqual((client.fired, client.moves, client.direct_moves), ([], [], []))
         self.assertEqual([action for action, _ in client.actions], ["caster-out-of-mana"])
-        # Her SP back for a cast: she casts again (the kobold stepped off).
+        # The fight over and her SP back for a cast: she casts again (at
+        # the next kobold, four tiles off).
         client.state.stats["sp"] = 20
+        client.state.messages = []
+        task.release_engagement(100)
         client.combat.clear()
         kobold = client.state.map.tile(9, 8).objects.pop(3)
         client.state.map.tile(12, 8).objects[3] = kobold
         for _ in range(3):
             tick(client, task)
-        self.assertEqual(client.fired, [(3, 42)])
+        self.assertTrue(client.fired)
+        self.assertEqual(set(client.fired), {(3, 42)})
         self.assertNotIn(True, client.combat)
         # Dry again after a cast: no new record within a minute (each
         # regenerated cast would start one), then another.
         client.state.stats["sp"] = 0
         self.assertFalse(task.spell_only_training(client))
         self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 1)
+        task._engaged_target = None
         client.state.stats["sp"] = 20
         self.assertTrue(task.spell_only_training(client))
         task._caster_dry_at -= task.DRY_RECORD_SECONDS
@@ -42181,12 +42186,75 @@ class BuildPerSpotTests(unittest.TestCase):
         from .tasks import ManaCrystal
         with patch.object(ManaCrystal, "has_charge", classmethod(lambda cls, client: True)):
             self.assertTrue(task.spell_only_training(client))
+        # Dry in a fight stays dry for the rest of it: one regenerated cast
+        # does not flip her back to the spell; out of the fight the latch
+        # lifts.
+        client, task = farm()
+        tick(client, task)
+        self.assertTrue(task._caster_dry)
+        client.state.stats["sp"] = 4
+        client.combat.clear()
+        tick(client, task)
+        # Still in melee (combat on, no kite away), whatever the one cast's
+        # SP pays for alongside it.
+        self.assertFalse(task.spell_only_training(client))
+        self.assertTrue(client.combat and all(client.combat))
+        self.assertEqual(client.direct_moves, [])
+        client.state.messages = []
+        task.release_engagement(100)
+        client.state.map.tiles.clear()
+        self.assertTrue(task.spell_only_training(client))
+        # No stats yet (no maximum SP): not dry.
+        client.state.stats.update(sp=0, maxsp=0)
+        self.assertTrue(task.spell_only_training(client))
+        self.assertFalse(task._caster_dry)
+        # Dry with nothing near: she rests for SP rather than fighting
+        # with her weapon, while her SP rises; after a minute without a
+        # point gained she stops resting.
+        client, task = farm()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        client.lock_item = AsyncMock()
+        tick(client, task)
+        self.assertTrue(task._caster_dry)
+        self.assertIn("training-rest", [action for action, _ in client.actions])
+        self.assertTrue(task._training_resting)
+        task._dry_rest_since -= task.DRY_REST_STALL_SECONDS
+        tick(client, task)
+        self.assertFalse(task._training_resting)
         # Without a weapon she keeps the spell-only routine: no melee.
         client, task = farm(weapon=False)
         tick(client, task)
         self.assertNotIn(True, client.combat)
         self.assertTrue(task.spell_only_training(client))
         self.assertEqual(client.actions[-1][0], "caster-kite")
+
+    def test_an_equal_hit_on_a_full_list_is_still_saved(self):
+        helper = FarmAnalyzerTests()
+        helper._cleanups = []
+        analyzer = helper.analyzer()
+        client = helper.client()
+        client.state.player_name = "Sera"
+        saved = []
+        client.set_spell_samples = lambda samples: saved.append(
+            {spell: list(entry["hits"]) for spell, entry in samples.items()})
+        analyzer.samples_by_spell["magic bullet"] = [12] * 30
+        analyzer.attack_by_spell["magic bullet"] = "magic"
+        analyzer._samples_loaded = "Sera"
+        analyzer._load_samples(client)
+        self.assertEqual(len(saved), 1)
+        # One more hit equal to the last: the list is still 30 long and
+        # ends the same, but it is new and is saved.
+        now = time.time()
+        client.offensive_casts = collections.deque([(now - 1, "magic bullet")])
+        client.state.messages = [(now, 0, "", "You hit kobold for 12 (0) with magic.")]
+        analyzer.observe_spells(client)
+        self.assertEqual(analyzer.samples_by_spell["magic bullet"], [12] * 30)
+        analyzer._samples_saved_at -= analyzer.SAMPLE_SAVE_SECONDS
+        analyzer._load_samples(client)
+        self.assertEqual(len(saved), 2)
+        for cleanup, args, kwargs in reversed(helper._cleanups):
+            cleanup(*args, **kwargs)
 
     def test_a_fielded_spell_never_resets_the_training_spells_samples(self):
         helper = FarmAnalyzerTests()
@@ -42566,14 +42634,20 @@ class BuildPerSpotTests(unittest.TestCase):
         self.assertEqual(asyncio.run(server._action({"type": "retry_learn"})),
                          {"ok": True, "retried": ["firestorm"]})
         self.assertEqual((real.learn_errand_failed, real.learn_errand_failures,
-                          real.learn_errand_retry), ({}, {}, True))
-        # The retry ends a spell's route backoff, never a seller's money
-        # refusal; backoffs are per spell.
-        client.learn_errand_failed, client.learn_errand_retry = {}, True
-        client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, False)}
+                          real.learn_errand_retry), ({}, {}, {"firestorm"}))
+        # The retry ends the retried spell's route backoff only, never a
+        # seller's money refusal; backoffs are per spell.
+        client.learn_errand_failed, client.learn_errand_retry = {}, {"firestorm"}
+        client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, False),
+                                    "icestorm": (circuit.clock() + 3600.0, False)}
         self.assertTrue(circuit._needs_learn_spell(client))
-        client.learn_errand_retry = True
+        self.assertIn("icestorm", client.learn_retry_until)
+        client.learn_errand_retry = {"firestorm"}
         client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, True)}
+        self.assertFalse(circuit._needs_learn_spell(client))
+        # Retrying another spell leaves this one's backoff.
+        client.learn_errand_retry = {"icestorm"}
+        client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, False)}
         self.assertFalse(circuit._needs_learn_spell(client))
         # Another spell's backoff does not hold this one.
         client.learn_retry_until = {"icestorm": (circuit.clock() + 3600.0, False)}

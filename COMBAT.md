@@ -2113,11 +2113,17 @@ gap says so.
   levels stay as they were, and leaving the build ends it. A fielded
   caster who cannot afford a cast above her healing reserve, with no
   charged mana crystal to draw from, fights with her wielded weapon by the
-  ordinary melee rules (pack split, heals, retreat, flee and recall) and
-  casts again as soon as she can; out of a fight she rests for mana as
-  the spell routine does, rather than pulling with her weapon. A
+  ordinary melee rules (pack split with the melee pack cap, heals,
+  retreat, flee and recall). Dry stays latched for the rest of the fight
+  (an engaged target or recent hostile contact), so one regenerated cast
+  does not send her back to kiting; out of the fight she rests for mana as
+  the spell routine does, rather than pulling with her weapon, while her
+  SP rises (after 60 s without a point gained she stops resting and the
+  ordinary farm goes on). Before her stats arrive she is not dry. A
   `caster-out-of-mana` decision is recorded at most once a minute.
-  Without a weapon she keeps the spell-only routine.
+  Without a weapon she keeps the spell-only routine. The spot was rated
+  for the caster build (owner decision, 2026-11-26): her melee fallback
+  there is judged by the melee rules alone, not by that rating.
 - **Spell damage.** A caster build's damage per hit is the median of her
   sampled hits with its spell, kept per spell (a fielded spell never
   resets her training spell's) and saved in her character memory (at
@@ -2189,8 +2195,8 @@ gap says so.
   after three failed trips for one spell the errand gives that spell up
   (another that fields the build may still be learnt), with a "Learn
   errand failed" alert until the operator retries it (the Farming tab's
-  Retry, refused when nothing gave up; it ends a route or dialogue
-  backoff, never a seller's money refusal) or the process restarts.
+  Retry, refused when nothing gave up; it ends the retried spells' route
+  or dialogue backoff only, never a seller's money refusal) or the process restarts.
 - **Swapping sets.** A build change that changes the gear style makes one
   apartment trip (`SwapSetTask`) when her chest holds, as her index knows
   it, a piece of the new style's set that beats what she wears, or the new
