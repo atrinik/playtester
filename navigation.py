@@ -5132,10 +5132,14 @@ class NavigateThenTask(BotTask):
     # A stand lasts at most this long, then the walk goes on for at least
     # APPROACH_STAND_COOLDOWN_SECONDS: wanderers must not hold her for ever.
     APPROACH_STAND_SECONDS = 45.0
-    # A stand against three or more has no such limit, but one that none
-    # of them reaches (across water, at range, wanderers) for this long
-    # ends the trip rather than hold her for ever or take them in.
+    # A stand against three or more has no such limit. Every walk counts
+    # the seconds she stands with none of them in contact, whatever the
+    # train and however it shrinks or regrows; at this many the trip ends
+    # rather than hold her for ever or take them in.
     APPROACH_TRAIN_STAND_SECONDS = 180.0
+    # One tick adds at most this much to that count (a gap between ticks
+    # is not standing).
+    APPROACH_STAND_TICK_CAP_SECONDS = 1.0
     APPROACH_STAND_COOLDOWN_SECONDS = 30.0
     # How far she looks for a doorway, corridor or safe square to stand at.
     DEFENSIBLE_RADIUS = 6
@@ -5187,6 +5191,10 @@ class NavigateThenTask(BotTask):
         self._train_ids: dict[int, float] = {}
         self._train_missing = 0
         self._was_train = False
+        # Seconds this walk has stood (approach "stand") with no pursuer in
+        # contact, and when the last such tick was (0: not standing).
+        self._stand_total = 0.0
+        self._stand_tick_at = 0.0
         self._lead: dict[str, Any] | None = None
         self._leads = 0
         self._stand_since = 0.0
@@ -5264,6 +5272,8 @@ class NavigateThenTask(BotTask):
         self._train_ids = {}
         self._train_missing = 0
         self._was_train = False
+        self._stand_total = 0.0
+        self._stand_tick_at = 0.0
         self._cornered_target = 0
         self._cornered_logged.clear()
         self._cornered_hold_since = 0.0
@@ -5970,10 +5980,12 @@ class NavigateThenTask(BotTask):
         one without that lapse while in view within MAX_AGGRO_RANGE, as
         the server keeps her as its enemy, and is still counted for
         TRAIN_MISSING_GRACE_SECONDS while out of view (_train_missing);
-        seen beyond MAX_AGGRO_RANGE, or out of view longer, it leaves.
-        When the train shrinks to two, those two stay latched until the
-        stand resets. A map change ends the samples, the latches and the
-        stand. Where each creature was first seen this trip is kept
+        out of view longer it leaves (her view reaches about 8 tiles, so
+        that is how one leaves in practice; one seen beyond
+        MAX_AGGRO_RANGE in a larger view leaves at once). When the train
+        shrinks to two, those two stay latched until the stand resets. A
+        map change ends the samples, the latches, the stand and its count
+        (_stand_total). Where each creature was first seen this trip is kept
         (_pursuit_origins, at most PURSUIT_ORIGINS)."""
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
@@ -5986,6 +5998,8 @@ class NavigateThenTask(BotTask):
             self._train_ids.clear()
             self._stand_since = 0.0
             self._was_train = False
+            self._stand_total = 0.0
+            self._stand_tick_at = 0.0
         horizon = now - self.APPROACH_PURSUIT_WINDOW_SECONDS
         for target_id in list(self._pursuit_samples):
             samples = self._pursuit_samples[target_id]
@@ -6097,16 +6111,22 @@ class NavigateThenTask(BotTask):
         than APPROACH_PACK_CAP, or heals outpaced, she leads them away
         while she has leads left (LEAD_AWAY_LIMIT a trip). A stand against
         two lasts at most APPROACH_STAND_SECONDS (a pursuer reaching her
-        restarts it), then the walk goes on for
-        APPROACH_STAND_COOLDOWN_SECONDS; against three or more it has no
-        such limit, so she never walks onto the farm map with them: one
-        none of them reaches for APPROACH_TRAIN_STAND_SECONDS fails the
-        trip instead.
+        restarts it, and so does the train shrinking to two), then the
+        walk goes on for APPROACH_STAND_COOLDOWN_SECONDS; against three or
+        more it has no such limit, so she never walks onto the farm map
+        with them. Train members briefly out of view still count
+        (_track_pursuers' grace). One bound covers it all: the seconds
+        this walk has stood with no pursuer in contact (_stand_total,
+        reset only by a new walk or a map change) reaching
+        APPROACH_TRAIN_STAND_SECONDS fail the trip (approach-train-held),
+        whatever the train and however it shrank and regrew.
         Nothing runs under seam contact (_seam_retreat_contact).
         """
         m = client.state.map
         now = time.monotonic()
         recorder = getattr(client, "record_action", None)
+        # Only a stand tick counts the time since the last stand tick.
+        last_stand_tick, self._stand_tick_at = self._stand_tick_at, 0.0
         if (not isinstance(self.task, FarmTask) or seam_contact or
                 self.train_held or m.path == self.navigation.destination):
             # Under contact after the farm's own seam retreat the fight
@@ -6163,20 +6183,8 @@ class NavigateThenTask(BotTask):
                 threat[0] <= 1 for threat in pursuers):
             # A pursuer reaching her keeps the stand fresh.
             if not self._stand_since and recorder is not None:
-                recorder("approach-stand", f"pursuers={len(pursuers)}")
+                recorder("approach-stand", f"pursuers={count}")
             self._stand_since = now
-        elif train and (now - self._stand_since >=
-                        self.APPROACH_TRAIN_STAND_SECONDS):
-            self._stand_since = 0.0
-            self._train_ids.clear()
-            self._was_train = False
-            self.train_held = True
-            if recorder is not None:
-                recorder("approach-train-held", f"pursuers={count}")
-            self.fail(f"{count} followers held the approach to "
-                      f"{self.navigation.destination} for "
-                      f"{self.APPROACH_TRAIN_STAND_SECONDS:.0f}s")
-            return ""
         elif (now - self._stand_since >= self.APPROACH_STAND_SECONDS and
               not train):
             self._stand_since = 0.0
@@ -6192,6 +6200,26 @@ class NavigateThenTask(BotTask):
             self._train_ids.update(
                 (threat[3].target_id, now) for threat in pursuers)
             self._was_train = True
+        if not any(threat[0] <= 1 for threat in (*pursuers, *threats)):
+            # Something beside her: she is fighting them as they come, and
+            # that is not counted.
+            if last_stand_tick:
+                self._stand_total += min(
+                    now - last_stand_tick,
+                    self.APPROACH_STAND_TICK_CAP_SECONDS)
+            self._stand_tick_at = now
+        if self._stand_total >= self.APPROACH_TRAIN_STAND_SECONDS:
+            self._stand_since = 0.0
+            self._stand_tick_at = 0.0
+            self._train_ids.clear()
+            self._was_train = False
+            self.train_held = True
+            if recorder is not None:
+                recorder("approach-train-held", f"pursuers={count}")
+            self.fail(f"{count} followers held the approach to "
+                      f"{self.navigation.destination} for "
+                      f"{self.APPROACH_TRAIN_STAND_SECONDS:.0f}s")
+            return ""
         return "stand"
 
     def _lead_done(self, client: AtrinikClient, pursuers, threats,

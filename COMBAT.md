@@ -2439,12 +2439,15 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
   qualified. A member of a stand against three or more stays one
   without that lapse while in view within 9 tiles, as the server keeps
   her as its enemy within `MAX_AGGRO_RANGE`, so a train holding off at
-  range keeps her stand (and its 180 s limit) going; out of view it still
-  counts for 3 s, so a one-tick gap in the view does not break the
-  train, and seen beyond 9 tiles or out of view longer it leaves. When
-  the train shrinks to two, those two stay latched until the stand
-  resets, and their stand's 45 s limit starts when it shrank. A map
-  change (a seam, an exit, a recall) ends the stand and every latch.
+  range keeps her stand going; out of view it still counts for 3 s, so
+  a one-tick gap in the view does not break the train, and out of view
+  longer it leaves (her view reaches about 8 tiles, so leaving view is
+  how one leaves; one seen beyond 9 tiles in a larger view leaves at
+  once). A member that comes back is counted again as soon as it
+  qualifies. When the train shrinks to two, those two stay latched until
+  the stand resets, and their stand's 45 s limit starts when it shrank.
+  A map change (a seam, an exit, a recall) ends the stand, every latch
+  and the stand count below.
   Outclassed creatures do not count. Because a map change starts the
   samples afresh, a
   creature that follows her over a seam qualifies again only after about
@@ -2469,8 +2472,12 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
     rules decide as anywhere. A stand against two lasts at most 45 s (a
     pursuer reaching her restarts it), then the walk goes on for at least
     30 s, so wanderers cannot hold her. Against three or more it has no
-    such limit; one that none of them reaches for 180 s fails the trip
-    (`approach-train-held`, latched). The farm circuit, on its transit or
+    such limit. One bound covers every stand of the walk: the seconds she
+    has stood with nothing beside her (`_stand_total`, at most 1 s a tick;
+    seconds fighting one beside her do not count), whatever the train
+    and however often it shrank and regrew, reset only by a new walk or a
+    map change. At 180 s the trip fails (`approach-train-held`, latched;
+    `approach-stand` and it log the same pursuer count). The farm circuit, on its transit or
     its farm branch, then quarantines that leg's map, its area and the
     map she stood on (`farm-zone-quarantine`, never shortening a longer
     one) for 30 minutes, 2 hours on the second such hold there within a

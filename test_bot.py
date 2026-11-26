@@ -43339,6 +43339,67 @@ class SafeRetreatTests(unittest.TestCase):
 
         return client, walk, run
 
+    def _clocked_walk(self, positions):
+        """She at (20, 12) on the last leg, no lead-aways left; each tick
+        of a 0.25 s fake clock puts the treants where ``positions(t)``
+        says ({id: (x, y)}) and ticks her defence. Returns (client, walk,
+        run): run(seconds) returns the time train-held fired, or None."""
+        from . import navigation as navigation_module
+
+        client, walk = self._approach()
+        m = client.state.map
+        m.world_x, m.world_y = 20, 12
+        walk._leads = walk.LEAD_AWAY_LIMIT
+        clock = [1000.0]
+
+        def run(seconds):
+            end = clock[0] + seconds
+            with patch.object(navigation_module.time, "monotonic",
+                              side_effect=lambda: clock[0]):
+                while clock[0] < end:
+                    elapsed = clock[0] - 1000.0
+                    self._place(client, [
+                        (k, x, y) for k, (x, y) in positions(elapsed).items()])
+                    walk._last_defense_action = 0.0
+                    asyncio.run(walk._defend_while_navigating(client))
+                    if walk.train_held:
+                        return elapsed
+                    clock[0] += 0.25
+            return None
+
+        return client, walk, run
+
+    def test_a_train_that_shrinks_and_regrows_is_still_bounded(self):
+        # The review's cycle: three close in and hold 6 off; every 120 s
+        # one drifts 10 off for 5 s (out of the train), then comes back.
+        # Each phase once restarted the clock and she stood 1000 s; the
+        # walk's total standing time ends it at about 180 s.
+        def positions(t):
+            x = min(14, 10 + int(t))
+            drift = t > 4 and 100 <= (t - 4) % 120 < 105
+            return {100: (x, 12), 101: (x, 13),
+                    102: (10 if drift else x, 11)}
+
+        client, walk, run = self._clocked_walk(positions)
+        held = run(400.0)
+        self.assertIsNotNone(held)
+        self.assertTrue(178.0 <= held <= 190.0, held)
+        self.assertEqual(walk.status, TaskStatus.FAILED)
+
+    def test_time_fighting_one_in_contact_does_not_count(self):
+        # From 60 s to 120 s a fourth treant stands beside her (she fights
+        # it, and it is gone after): those 60 s are not standing, so the
+        # trip ends about 60 s later than it would.
+        def positions(t):
+            x = min(14, 10 + int(t))
+            beside = {103: (19, 12)} if 60 <= t < 120 else {}
+            return {100: (x, 12), 101: (x, 13), 102: (x, 11), **beside}
+
+        client, walk, run = self._clocked_walk(positions)
+        held = run(400.0)
+        self.assertIsNotNone(held)
+        self.assertTrue(238.0 <= held <= 250.0, held)
+
     def test_a_train_holding_at_range_is_held_until_the_trip_fails(self):
         # Three treants close in, then stand 6 tiles off. The server keeps
         # her as their enemy within 9 tiles, so they stay a train: she
@@ -43802,8 +43863,9 @@ class SafeRetreatTests(unittest.TestCase):
         self._place(client, monsters)
         self._followed(walk, client, monsters)
         walk._leads = walk.LEAD_AWAY_LIMIT
-        walk._stand_since = (time.monotonic() -
-                             walk.APPROACH_TRAIN_STAND_SECONDS - 1)
+        # Her walk has stood its whole bound already.
+        walk._stand_since = time.monotonic() - 1.0
+        walk._stand_total = walk.APPROACH_TRAIN_STAND_SECONDS
         circuit = FarmCircuitTask(walk.navigation.graph,
                                   [("/farm", "charred treant")])
         circuit.child = walk
