@@ -1039,6 +1039,29 @@ class FarmAnalyzer:
 
     async def _run(self, profile: CombatProfile, origin: str = "") -> None:
         log.info("farming analyzer started for %s %d", profile.skill, profile.skill_level)
+        if (self.encounter_error and self.report is not None and profile.combat_style and
+                origin == self.origin and self.profile is not None and
+                not profile.materially_differs(self.profile)):
+            # Only the encounter run failed and nothing she ranks by changed:
+            # retry that run alone, onto the ranking she already has.
+            try:
+                styled = await self._analyze(self.command(profile, origin, styled=True))
+            except asyncio.CancelledError:
+                if self._process is not None and self._process.returncode is None:
+                    self._process.kill()
+                raise
+            except Exception as error:
+                self.encounter_error = str(error)
+                log.warning("farming analyzer encounter retry failed: %s", error)
+            else:
+                self.encounter_error = ""
+                self.report = self._bounded(self._merge_encounters(self.report, styled))
+            finally:
+                self._process = None
+                self.status = "ready"
+                self.finished_at = self.clock()
+                self.duration = self.finished_at - self.started_at
+            return
         try:
             try:
                 report = await self._analyze(self.command(profile, origin))
@@ -1066,6 +1089,8 @@ class FarmAnalyzer:
                 else:
                     self.encounter_error = ""
                     report = self._merge_encounters(report, styled)
+            else:
+                self.encounter_error = ""
             report = self._bounded(report)
         except asyncio.CancelledError:
             if self._process is not None and self._process.returncode is None:

@@ -22111,7 +22111,22 @@ class FarmAnalyzerTests(unittest.TestCase):
         analyzer._last_attempt_at = time.time() - analyzer.RETRY_SECONDS - 1
         analyzer.runs = 1
         self.assertTrue(analyzer.due(analyzer.profile))
-        analyzer.encounter_error = ""
+        # The retry runs the encounter run alone onto her ranking.
+        ranked = analyzer.ranking("xp")
+        reported = analyzer.reported_at
+
+        async def retry():
+            for spot in analyzer._spots(analyzer.report):
+                spot.update(encounter_applied=False, encounter_reasons=[])
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual((analyzer.status, analyzer.encounter_error), ("ready", ""))
+            self.assertIs(analyzer.ranking("xp")[0], ranked[0])
+            self.assertEqual(ranked[0]["encounter_reasons"], ["styled"])
+            self.assertEqual(analyzer.reported_at, reported)
+            await analyzer.close()
+
+        asyncio.run(retry())
         self.assertFalse(analyzer.due(analyzer.profile))
         # No heal landed yet: no healing is assumed.
         fresh = combat_profile(self.client())
@@ -22945,10 +22960,14 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
                                                          ["evil treant L13"]))
             self.assertTrue(circuit._upgrade_progression(client, circuit.child.task))
             self.assertEqual(circuit.spot["name"], spot["name"])
+            # The selection record is main's; the rating follows it.
             selected = [entry["detail"] for entry in client.decision_history
                         if entry["action"] == "farm-spot-selected"]
+            self.assertEqual(selected[-1], f"{spot['name']} (xp): {spot['map_paths'][0][4:]}")
+            rated = [entry["detail"] for entry in client.decision_history
+                     if entry["action"] == "farm-spot-encounter"]
             self.assertIn(f"pack {spot['expected_pack']:.1f}/{spot['worst_pack']:g}: "
-                          f"{spot['name']}: bad pull", selected[-1])
+                          f"{spot['name']}: bad pull", rated[-1])
             warnings = [entry["detail"] for entry in client.decision_history
                         if entry["action"] == "farm-spot-encounter-warning"]
             alerts = active(client.state, client.decision_history, ProgressWatch(),
@@ -23002,6 +23021,22 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
         client.farm_analyzer.rankings["xp"] = [dense]
         self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
         self.assertEqual(len(alerted()), 1)
+        # Left unrated (a failed encounter run), the warning stands.
+        unrated = {key: value for key, value in dense.items()
+                   if key != "analyzer_schema_version"}
+        client.farm_analyzer.rankings["xp"] = [unrated]
+        count = len(client.decision_history)
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(len(client.decision_history), count)
+        self.assertEqual(len(alerted()), 1)
+        # A new circuit on a spot that does not warn ends it.
+        sparse = self.encounter_spot("Sparse", self.POCKET, worst=3.0, safety=0.88,
+                                     xp=0.5e6)
+        client.farm_analyzer.rankings["xp"] = [sparse]
+        second = self.circuit(client, sparse)
+        self.assertFalse(second._upgrade_progression(client, second.child.task))
+        self.assertEqual(client.decision_history[-1]["action"], "farm-spot-encounter-clear")
+        self.assertEqual(alerted(), [])
 
     def test_repeated_pack_deaths_rate_a_spot_hazardous_for_her_kit(self):
         from . import self_improvement as si

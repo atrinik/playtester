@@ -9428,13 +9428,9 @@ class FarmCircuitTask(BotTask):
                  ", ".join(path.rsplit("/", 1)[-1] for path, _ in self.legs))
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
-            # Warn only: the encounter model's rating never changes the pick.
-            encounter = farm_analyzer_plan.encounter_summary(spot)
             recorder("farm-spot-selected",
                      f"{spot.get('name', '?')} ({objective}): "
-                     + ", ".join(path for path, _ in self.legs)
-                     + (f" · {encounter}" if encounter else ""))
-        self._encounter_noted = None
+                     + ", ".join(path for path, _ in self.legs))
         self._note_encounter(client, spot)
         return True
 
@@ -9445,13 +9441,17 @@ class FarmCircuitTask(BotTask):
         farm-spot-encounter decision with the rating, a
         farm-spot-encounter-warning (farm_analyzer.encounter_warning) that
         alerts.farm_encounter_warning raises, and a
-        farm-spot-encounter-clear once a warned spot no longer warns."""
+        farm-spot-encounter-clear when a spot does not warn: a new circuit's
+        first spot (a warning from an earlier circuit's spot must not
+        linger), or a warned spot re-rated safe. A spot left unrated (a
+        failed encounter run) keeps what was recorded for it."""
         summary = farm_analyzer_plan.encounter_summary(spot)
         warning = farm_analyzer_plan.encounter_warning(spot)
         noted = (str(spot.get("path", "")), summary, warning)
-        if noted == self._encounter_noted:
-            return
         previous = self._encounter_noted
+        if noted == previous or (
+                not summary and previous is not None and previous[0] == noted[0]):
+            return
         self._encounter_noted = noted
         recorder = getattr(client, "record_action", None)
         if recorder is None:
@@ -9461,7 +9461,7 @@ class FarmCircuitTask(BotTask):
         if warning:
             log.warning("farm spot encounter warning: %s", warning)
             recorder("farm-spot-encounter-warning", warning)
-        elif previous is not None and previous[2]:
+        elif previous is None or previous[2]:
             recorder("farm-spot-encounter-clear", f"{spot.get('name', '?')}")
 
     async def _recover_failed_navigation(
