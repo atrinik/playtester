@@ -4171,8 +4171,9 @@ class FarmTask(BotTask):
         ``caster-out-of-mana`` record). Until her SP is back to
         DRY_RESUME_SP she retreats while any active hostile (``active``,
         the tick's (distance, x, y, obj) entries) is within
-        DRY_RETREAT_RADIUS, and otherwise waits: no spell-only kite, no
-        pull. True while it took the tick."""
+        DRY_RETREAT_RADIUS and waits while one is in view farther off: no
+        spell-only kite. With none in view the farm's other paths run.
+        True while it took the tick."""
         if not self.fielded_caster or not self.spell_only_training(client):
             self._caster_dry = False
             return False
@@ -4195,7 +4196,12 @@ class FarmTask(BotTask):
         if sp >= maxsp * self.DRY_RESUME_SP and self.offensive_spell_affordable(client, spell):
             self._caster_dry = False
             return False
-        if nearest is not None and nearest <= self.DRY_RETREAT_RADIUS:
+        if nearest is None:
+            # Nothing active in view: the farm's own paths (an unseen
+            # attacker's retreat, loot, the training rest, which pulls
+            # nothing until her SP is back) run, the episode kept.
+            return False
+        if nearest <= self.DRY_RETREAT_RADIUS:
             await self.low_health_retreat(client)
         return True
 

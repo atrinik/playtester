@@ -706,9 +706,9 @@ class AtrinikClient:
             self.state.spell_samples = builds.load_spell_samples(
                 record.get("spell_samples", {}))
             self.state.build_state = builds.load_build_state(record.get("build_state", {}))
-            for name in ("active_build", "active_build_since", "pending_swap_build"):
-                if name in self.state.build_state:
-                    setattr(self, name, self.state.build_state[name])
+            for name, empty in (("active_build", ""), ("active_build_since", 0.0),
+                                ("pending_swap_build", "")):
+                setattr(self, name, self.state.build_state.get(name, empty))
             # The most recent spots, never the every-spot choice dropped.
             spots = [key for key in loaded if key != builds.EVERY_SPOT]
             kept = spots[-(builds.MAX_BUILD_CHOICES - (builds.EVERY_SPOT in loaded)):]
@@ -769,6 +769,9 @@ class AtrinikClient:
             self.state.build_choices = {}
             self.state.spell_samples = {}
             self.state.build_state = {}
+            for name in ("active_build", "pending_swap_build"):
+                setattr(self, name, "")
+            self.active_build_since = 0.0
             self.state.farm_adaptations = {}
             self.state.bank_balance = 0
             self.state.bank_balance_known = False

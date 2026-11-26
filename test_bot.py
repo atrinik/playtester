@@ -42099,15 +42099,23 @@ class BuildPerSpotTests(unittest.TestCase):
             # It keeps retreating while one is within 3 tiles ...
             self.assertTrue(asyncio.run(farm.dry_caster_step(
                 client, [(3, 0, 0, hostile[3])])))
-            # ... and holds (no kite, no pull) once none is.
+            # ... waits (no kite) while one is in view farther off ...
             contact[0] = False
-            self.assertTrue(asyncio.run(farm.dry_caster_step(client, [])))
+            self.assertTrue(asyncio.run(farm.dry_caster_step(
+                client, [(6, 0, 0, hostile[3])])))
             self.assertEqual(len(retreats), 2)
+            # ... and with none in view lets the farm's own paths (loot,
+            # the rest that pulls nothing until her SP is back) run.
+            self.assertFalse(asyncio.run(farm.dry_caster_step(client, [])))
+            self.assertTrue(farm._caster_dry)
             # One cast's SP is not enough to come back; half her bar is.
             client.state.stats["sp"] = 10
-            self.assertTrue(asyncio.run(farm.dry_caster_step(client, [])))
+            self.assertTrue(asyncio.run(farm.dry_caster_step(
+                client, [(6, 0, 0, hostile[3])])))
             client.state.stats["sp"] = 50
-            self.assertFalse(asyncio.run(farm.dry_caster_step(client, [])))
+            self.assertFalse(asyncio.run(farm.dry_caster_step(
+                client, [(6, 0, 0, hostile[3])])))
+            self.assertFalse(farm._caster_dry)
         self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 1)
         # Not a fielded caster (ordinary melee or Wizardry training): never.
         farm.fielded_caster = False
@@ -42579,12 +42587,19 @@ class BuildPerSpotTests(unittest.TestCase):
         fake = {"firestorm": (3, 5), "magic bullet": (7, 5)}
         if table:
             self.assertEqual((table["firestorm"], table["magic bullet"][0]), ((3, 5), 7))
-        # 3 x (0.75 + 15 / 4) = 13.5 at Pow 15 (no bonus), rolled 11.3 to
-        # 13.5: 12.4 on average (server/spell_util.c SP_level_dam_adjust).
-        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 12.4)
+        # 3 x (0.75 + 15 / 4) = 13.5 at Pow 15 (no bonus), rolled from
+        # int(11.3) to int(13.5): 12 on average (server/spell_util.c
+        # SP_level_dam_adjust).
+        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 12.0)
         client.state.stats["pow"] = 25
-        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 28.2)
+        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 28.0)
+        # Before her stats arrive, and for a swarm (copies of a child
+        # spell), no estimate.
+        client.state.stats["pow"] = 0
+        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 0.0)
         client.state.stats["pow"] = 15
+        self.assertEqual(estimated_spell_damage(
+            client.state, "frost nova", {"frost nova": (4, 10)}), 0.0)
         base = CombatProfile(skill="slash weapons", skill_level=36, attack="slash",
                              damage=60, weapon_class=40, weapon_speed=2.0,
                              character_level=38, max_health=333, speed=1.0,
@@ -42592,7 +42607,7 @@ class BuildPerSpotTests(unittest.TestCase):
                              combat_style="melee", healing_per_second=3.0)
         aoe = build_profile(client, "aoe", "firestorm", base, {}, {}, fake)
         self.assertEqual((aoe.spell_damage, aoe.spell_attack, aoe.damage_estimated),
-                         (12.4, "fire", True))
+                         (12.0, "fire", True))
         # Without the table, nothing to estimate from: no profile.
         self.assertIsNone(build_profile(client, "aoe", "firestorm", base, {}, {}, {}))
 
@@ -42610,7 +42625,11 @@ class BuildPerSpotTests(unittest.TestCase):
         # 12 casts: 8 plus 12 s x 1 SP/s / 13 is under 9: not here.
         self.assertFalse(spot_affordable(profile, {"avg_kill_seconds": 12.0,
                                                    "avg_player_attacks_second": 1.0}))
+        # The spell path reports no attack rate: the cast delay counts.
+        self.assertTrue(spot_affordable(profile, {"avg_kill_seconds": 6.0,
+                                                  "avg_player_attacks_second": 0.0}))
         self.assertIsNone(spot_affordable(profile, {}))
+        self.assertIsNone(spot_affordable(profile, {"avg_kill_seconds": float("inf")}))
         from .navigation import _build_rated
         rated = self._rating("aoe-kite", 0.9, 1000.0)
         self.assertTrue(_build_rated(rated))

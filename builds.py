@@ -325,7 +325,7 @@ def load_spell_samples(value: Any) -> dict[str, dict]:
     if not isinstance(value, dict):
         return {}
     samples: dict[str, dict] = {}
-    for spell, entry in list(value.items())[:MAX_SAMPLED_SPELLS]:
+    for spell, entry in list(value.items())[-MAX_SAMPLED_SPELLS:]:
         if not isinstance(spell, str) or not isinstance(entry, dict):
             continue
         hits = [int(hit) for hit in entry.get("hits", ()) or ()

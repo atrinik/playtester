@@ -714,6 +714,11 @@ SPELL_ATTACK_BY_NAME = {
     "bullet storm": "magic", "bullet swarm": "magic", "magic missile": "magic",
     "meteor": "fire", "meteor swarm": "fire", "asteroid": "cold",
 }
+# Swarms fire several copies of a child spell (server/spell_util.c
+# fire_swarm): no estimate from their own table entry, only sampled hits,
+# and the child's reach.
+SWARM_SPELLS = frozenset({"bullet storm", "bullet swarm", "meteor swarm", "frost nova"})
+SWARM_RADIUS = 3
 # Spells that strike every monster in their reach (builds.AREA_SPELLS).
 AREA_SPELL_NAMES = frozenset({"firestorm", "icestorm", "bullet storm", "bullet swarm",
                               "meteor swarm", "frost nova"})
@@ -749,14 +754,18 @@ def estimated_spell_damage(state, spell: str, table: dict[str, tuple[int, int]])
     a spell the table lacks."""
     bdam = table.get(spell, (0, 0))[0]
     level = owned_skill_level(state, "wizardry spells")
-    if bdam <= 0 or level < 1:
+    if bdam <= 0 or level < 1 or spell in SWARM_SPELLS:
         return 0.0
     try:
-        power = max(0, min(30, int(state.stats.get("pow", 0) or 0)))
+        power = min(30, int(state.stats.get("pow", 0) or 0))
     except (TypeError, ValueError):
         return 0.0
+    if power <= 0:
+        # Her stats have not arrived: no estimate yet.
+        return 0.0
     dam = max(1.0, bdam * (0.75 + level * 0.25) * (1.0 + SPELL_DAM_BONUS[power]))
-    return round(((dam * 0.8 + 0.5) + dam) / 2.0, 1)
+    # rndm(int(0.8 x dam + 0.5), int(dam)): both bounds truncate.
+    return round((int(dam * 0.8 + 0.5) + int(dam)) / 2.0, 1)
 
 
 def build_profile(client, build: str, spell: str, base: "CombatProfile",
@@ -825,7 +834,8 @@ def build_profile(client, build: str, spell: str, base: "CombatProfile",
                            other.name.casefold() == "meditation"
                            for other in state.inventory),
             combat_style="aoe-kite" if area else RANGED_KITE_STYLE,
-            aoe_radius=max(1, math.ceil(reach / 2)) if area else 0,
+            aoe_radius=(0 if not area else SWARM_RADIUS if spell in SWARM_SPELLS
+                        else max(1, math.ceil(reach / 2))),
             bar_casts=offence / cost, damage_estimated=not hits)
     if build == "bow":
         from . import builds
@@ -862,19 +872,21 @@ def build_profile(client, build: str, spell: str, base: "CombatProfile",
 
 def spot_affordable(profile: "CombatProfile", rating: dict) -> bool | None:
     """Whether her bar kills the spot's monsters with a caster build: the
-    casts one kill takes there (the rating's average kill time x her casts
-    a second, rounded up; an area cast hits the whole pack, so that is
+    casts one kill takes there (the rating's average kill time over her
+    cast delay, rounded up; an area cast hits the whole pack, so that is
     also the pack's) against the casts her bar beyond the healing reserve
     pays plus what her SP regenerates over those casts. The analyzer
     reports only the average monster's kill, not the toughest's. None
     when the rating lacks those fields; True for a build without spells."""
     if profile.mana_cost <= 0:
         return True
+    # The spell path's kill time is its casts x the cast delay (the
+    # analyzer reports no attack rate for it).
     seconds = _number(rating.get("avg_kill_seconds"))
-    rate = _number(rating.get("avg_player_attacks_second"))
-    if seconds is None or rate is None or seconds <= 0 or rate <= 0:
+    if (seconds is None or not math.isfinite(seconds) or seconds <= 0 or
+            profile.cast_delay <= 0):
         return None
-    needed = math.ceil(seconds * rate)
+    needed = math.ceil(seconds / profile.cast_delay - 1e-9)
     regenerated = profile.mana_regen * needed * max(profile.cast_delay, 0.1) / profile.mana_cost
     return profile.bar_casts + regenerated >= needed
 
@@ -983,7 +995,8 @@ class FarmAnalyzer:
         self.samples_by_spell: dict[str, list[int]] = {}
         self.attack_by_spell: dict[str, str] = {}
         # Loaded from and saved to her character memory (_load_samples).
-        self._samples_loaded = False
+        # The character whose samples are loaded ("" before any).
+        self._samples_loaded = ""
         self._samples_saved: tuple = ()
         self._samples_saved_at = float("-inf")
         # The encounter model's rating of every spot for each build she can
@@ -1146,6 +1159,7 @@ class FarmAnalyzer:
 
     def poll(self, client) -> bool:
         """Start a background analysis if the live profile calls for one."""
+        self._load_samples(client, save=False)
         self.observe_spells(client)
         self._load_samples(client)
         # Only samples of the spell the training plan casts describe it,
@@ -1216,14 +1230,25 @@ class FarmAnalyzer:
     # often (client.set_spell_samples), and loaded from it once.
     SAMPLE_SAVE_SECONDS = 60.0
 
-    def _load_samples(self, client) -> None:
-        if not self._samples_loaded:
-            self._samples_loaded = True
-            saved = getattr(getattr(client, "state", None), "spell_samples", None) or {}
+    def _load_samples(self, client, *, save: bool = True) -> None:
+        """Her saved per-spell samples, loaded once her character memory
+        is (her name known), before this poll's hits are added; a new
+        character starts from her own. Then saved at most every
+        SAMPLE_SAVE_SECONDS."""
+        state = getattr(client, "state", None)
+        character = str(getattr(state, "player_name", "") or "")
+        if not character:
+            return
+        if self._samples_loaded != character:
+            self._samples_loaded = character
+            self.samples_by_spell, self.attack_by_spell = {}, {}
+            self._samples_saved = ()
+            saved = getattr(state, "spell_samples", None) or {}
             for spell, entry in saved.items():
-                if spell not in self.samples_by_spell:
-                    self.samples_by_spell[spell] = list(entry.get("hits", ()))
-                    self.attack_by_spell[spell] = str(entry.get("attack", ""))
+                self.samples_by_spell[spell] = list(entry.get("hits", ()))
+                self.attack_by_spell[spell] = str(entry.get("attack", ""))
+        if not save:
+            return
         saver = getattr(client, "set_spell_samples", None)
         signature = tuple(sorted((spell, len(hits), hits[-1:] and hits[-1])
                                  for spell, hits in self.samples_by_spell.items()))

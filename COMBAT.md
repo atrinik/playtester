@@ -2113,20 +2113,26 @@ gap says so.
   levels stay as they were, and leaving the build ends it. Out of SP with
   an attacking hostile in contact (adjacent, and recent hostile contact),
   a fielded caster disengages (`FarmTask.dry_caster_step`, one
-  `caster-out-of-mana` decision per episode): she retreats while any
-  active hostile is within 3 tiles, otherwise waits, and neither kites nor
-  pulls until her SP is back to half her bar.
+  `caster-out-of-mana` decision per episode): until her SP is back to half
+  her bar she retreats while any active hostile is within 3 tiles and
+  waits while one is in view farther off, never kiting; with none in view
+  the farm's other paths run (an unseen attacker's retreat, loot, and the
+  training rest, which pulls nothing until her SP is back).
 - **Spell damage.** A caster build's damage per hit is the median of her
   sampled hits with its spell, kept per spell (a fielded spell never
   resets her training spell's) and saved in her character memory (at
   most 20 spells of 30 hits, once a minute). Before a hit is sampled it is
   the server's formula (`server/spell_util.c` `SP_level_dam_adjust`): the
   spell's base damage from the pinned server's `include/spellist.h` x
-  (0.75 + Wizardry / 4) x (1 + the Pow bonus), rolled from 80% to all of
-  it (Firestorm at Wizardry 15 and Pow 15: 12.4 on average), the rating
-  marked `damage_estimated`; her spell path is taken as neutral.
+  (0.75 + Wizardry / 4) x (1 + the Pow bonus), rolled between the whole
+  parts of 80% (plus a half) and all of it (Firestorm at Wizardry 15 and
+  Pow 15: 12 on average), the rating marked `damage_estimated`; her spell
+  path is taken as neutral. Swarms (bullet storm and swarm, meteor swarm,
+  frost nova) fire copies of a child spell and get no estimate: they are
+  rated only from sampled hits, with a reach of 3. No estimate is made
+  before her stats arrive.
 - **One bar must kill.** A caster build is rated on a spot only when one
-  kill there (the rating's average kill time x her casts a second, rounded
+  kill there (the rating's average kill time over her cast delay, rounded
   up; an area cast hits the whole pack, so the same for a pack) takes no
   more casts than her bar beyond the healing reserve pays, plus what her
   SP regenerates over them (`spot_affordable`). The analyzer reports the
