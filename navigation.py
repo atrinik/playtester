@@ -64,7 +64,6 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyHealingStockTask, BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
-                    obsolete_food,
                     RANGED_RESIDENT_MARKERS, RANGED_RESIDENT_RADIUS,
                     RetrieveItemsTask, SellJunkTask, TaskStatus,
                     TempleFoodTask, TempleServiceTask,
@@ -282,6 +281,12 @@ class MapNode:
     caster_identities: set[str] = field(default_factory=set)
     # The map header's ``pvp 1``: players may attack each other here.
     pvp: bool = False
+    # The map header's ``unique 1`` (per-player maps that keep what is
+    # dropped) and ``no_harm 1`` (towns), and whether a shop floor or shop
+    # mat lies on it: no map to drop junk food on (food_drop_map).
+    unique: bool = False
+    no_harm: bool = False
+    shop: bool = False
 
     def lock_allowed(self, point: tuple[int, int], access=False) -> bool:
         """Check one gated tile against an access set (requirements.py)."""
@@ -643,6 +648,8 @@ class WorldGraph:
                 int(one(attrs, "enter_y", 0) or 0),
             )
             self.nodes[key].pvp = str(one(attrs, "pvp", "0") or "0").strip() not in ("", "0")
+            self.nodes[key].unique = str(one(attrs, "unique", "0") or "0").strip() not in ("", "0")
+            self.nodes[key].no_harm = str(one(attrs, "no_harm", "0") or "0").strip() not in ("", "0")
             parsed_maps[key] = (path, parsed)
 
         auto_exits: dict[str, list[tuple[int, int, int, str, bool]]] = defaultdict(list)
@@ -693,6 +700,8 @@ class WorldGraph:
                     obj["arch"].startswith("shop_floor") and
                     one(attrs, "auto_apply", base.get("auto_apply")) == "1" and
                     one(attrs, "randomitems", base.get("randomitems")))
+                if obj["arch"].startswith(("shop_floor", "shop_mat")):
+                    node.shop = True
                 if authored_unpaid or dynamic_shop_stock:
                     point = (x, y)
                     if point not in self.shop_stocks[source]:
@@ -8432,6 +8441,21 @@ def unidentified_food(client: AtrinikClient) -> list:
             not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID)]
 
 
+def food_drop_map(graph: "WorldGraph", path: str) -> bool:
+    """Whether junk food may be dropped on ``path``
+    (FarmTask.drop_obsolete_food): a known map of open country or a
+    dungeon. Never a unique map or an apartment (their floors keep it), a
+    town (``no_harm``, a savebed, a merchant or a priest) or a map with a
+    shop floor or mat (dropping there sells or litters a shop)."""
+    node = graph.nodes.get(path)
+    return bool(
+        node is not None and not node.unique and not node.no_harm and
+        not node.shop and "/apartments/" not in path and
+        not graph.savebeds.get(path) and
+        not any(getattr(vendor, "map_path", None) == path for vendor in
+                (*graph.dialogue_vendors, *graph.temple_priests)))
+
+
 def starving_without_food(client: AtrinikClient) -> bool:
     """Food 0 and no safe food carried (food_reserve: edible items only):
     no rest can help, only food. Never where food is obsolete
@@ -10888,12 +10912,11 @@ class FarmCircuitTask(BotTask):
                  len(task.task.retrieved))
 
     @staticmethod
-    def _junk_policy(tags=(), food=()) -> JunkPolicy:
+    def _junk_policy(tags=()) -> JunkPolicy:
         return JunkPolicy((
             r"^paper ",
             r"^(?:iron|bronze|steel|wooden|spruce|soft leather) .*(?:sword|axe|mace|club|spear|bow|shield|armour|skirt|sandals|boots|gloves|helmet)$",
-        ), tags=frozenset(tags), sell_identified_junk=True,
-            food_tags=frozenset(food))
+        ), tags=frozenset(tags), sell_identified_junk=True)
 
     @staticmethod
     def _surplus_equipment(client: AtrinikClient) -> list[Item]:
@@ -10941,9 +10964,7 @@ class FarmCircuitTask(BotTask):
 
     def _identified_junk(self, client: AtrinikClient) -> list[Item]:
         surplus = self._surplus_equipment(client)
-        policy = self._junk_policy(
-            (item.tag for item in surplus),
-            (item.tag for item in obsolete_food(client)))
+        policy = self._junk_policy(item.tag for item in surplus)
         return [item for item in client.state.inventory if policy.junk(item)]
 
     def _needs_junk_sale(self, client: AtrinikClient) -> bool:
@@ -10960,9 +10981,7 @@ class FarmCircuitTask(BotTask):
             self.graph, "/shattered_islands/world_0_69",
             SellJunkTask(
                 "Brynknot shop floor",
-                self._junk_policy(
-                    (item.tag for item in surplus),
-                    (item.tag for item in obsolete_food(client)))),
+                self._junk_policy(item.tag for item in surplus)),
             destination_xy=(15, 7), combat_approach=True)
         task.navigation.strict_safety = True
         return task
@@ -11191,6 +11210,9 @@ class FarmCircuitTask(BotTask):
         """Reconcile loot between pulls even on continuously respawning maps."""
         if self._busy_finishing_fight_or_loot(client, farm):
             return False
+        if (food_drop_map(self.graph, client.state.map.path) and
+                await farm.drop_obsolete_food(client)):
+            return True
         return await farm.maintain_inventory(client)
 
     async def _progress_checkpoint(self, client: AtrinikClient) -> bool:
@@ -12372,6 +12394,12 @@ class FarmCircuitTask(BotTask):
                          target[0], target[1], target[2])
                 self._bed_binding = None
             return True
+        if self._resupply is not None and food_obsolete(client):
+            # Food turned out obsolete (``auto``) during the trip: end it.
+            log.info("food is obsolete; ending %s", self._resupply.name)
+            await client.clear_actions()
+            self._resupply = None
+            self._food_planner.forget()
         if self._resupply is not None:
             await self._resupply.tick(client)
             self._settle_resupply(client)

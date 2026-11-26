@@ -183,14 +183,29 @@ which rules apply (`hunger.py`):
   She makes no food or temple trips and no food restock, never eats, and
   rests and banks mana at food 0. The starving and idle-food alerts stay
   silent, and a low food stat neither makes a trip give way nor stops an
-  operator assist. Carried food is junk: identified food goes with the
-  next junk sale, and unidentified food, which no shop buys, is dropped on
-  a quiet square outside her apartment (`obsolete-food-drop`). Quest food,
-  named food (Gimli's lembas), locked food, flesh and drink are kept.
+  operator assist. A food trip under way when food turns out obsolete
+  ends. Carried food is junk, dropped between pulls on her farm map when
+  that is open country or a dungeon (never a town, a `no_harm` or unique
+  map, a map with a shop floor or mat, a savebed, merchant or priest, or
+  her apartment), on a quiet square: no target and no hit for 10 seconds
+  (`obsolete-food-drop`). Food never triggers a junk sale or holds back cure
+  funding. A stack still carried after a drop, matched by name, is dropped
+  again after 1, then 2 minutes; after three drops it is kept and
+  `obsolete-food-kept` says why. Junk food is only ordinary server-typed
+  food: quest food (any item a formal quest's objectives name), named food
+  (a capital letter or a possessive, such as Gimli's lembas), food whose
+  name has a reserve word (quest, key, talisman, artifact, unique,
+  exceptional, ring, amulet, spellbook, formula, recipe, mana crystal),
+  locked food, flesh and drink are kept. Unreadable quest data keeps all
+  food (one warning).
 - `off`: the hunger rules of an older server, unchanged.
 - `auto`: `off` until her food has stayed unchanged for 30 minutes in which
-  she moved and gained experience, then `on`; one fall of it keeps `off` for
-  the run.
+  she moved and gained experience; the window starts again whenever food
+  changes and, at food 0, whenever she loses health to something other than
+  an attack (the old server's starvation). It never turns on while she is
+  hungry with no food on her, and one fall of food keeps `off` for the run.
+- An unknown `ATRINIK_BOT_FOOD_OBSOLETE` value is logged as an error and
+  means `auto`.
 
 `atrinik-playtester --version`, the startup log line, and the dashboard header
 name the build: its release tag (with `+N` when the commit is N commits past

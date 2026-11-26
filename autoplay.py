@@ -692,8 +692,18 @@ class AutoplayTask(BotTask):
                     self.child.safe_for_progression_detour(client) and
                     await self._start_mana_crystal_detours(client)):
                 return
+            ended = (self.phase == "temple-food" and food_obsolete(client) and
+                     self.child.status not in (TaskStatus.COMPLETE,
+                                               TaskStatus.FAILED))
+            if ended:
+                # Food turned out obsolete (``auto``) during the trip: it
+                # ends as if she had eaten.
+                log.info("food is obsolete; ending %s", self.child.name)
+                await client.clear_actions()
+                self.child.complete()
             try:
-                await self.child.tick(client)
+                if not ended:
+                    await self.child.tick(client)
                 if isinstance(self.child, (FarmCircuitTask, RecoveryTask)):
                     self._circuit_backoffs = self.child.backoffs()
             except ConnectionError as exc:
