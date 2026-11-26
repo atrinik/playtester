@@ -293,8 +293,18 @@ G9.
   (`native/pathfinding_module.c:601-625`, `684`; `grid_search` chooses the
   same way at `379`). Overflow is reported as
   `"cost overflow"` (`test_pathfinding.py:104-110`). `grid_search` accepts a
-  per-tile `uint8` cost grid (`pathfinding.py:50-62`), which `local_path`
-  does not use yet. Learned costs therefore need no native change.
+  per-tile `uint8` cost grid (`pathfinding.py:50-62`). `local_path` passes
+  one only for the walk's spawn-radius cost (`extra_costs`, below).
+  Learned costs therefore need no native change.
+- **Spawn-radius cost on the walk (2026-11-26).** On an optional trip
+  (not essential or critical, no care staging) to a farm, the walk's step
+  path (`NavigateTask._click_path`) on the farm map and the maps tiled to
+  it (`spawn_cost_maps`) costs 3 extra steps for each square within an
+  aggressive spawn's detection radius (its authored radius, at least 3)
+  plus 1 (`_spawn_costs`, cached per map). The walk then skirts a spawn
+  when a route about as short goes round it, instead of waking a train of
+  followers on the way in (COMBAT.md, "Safe squares and approach
+  discipline"). Other maps, trips and searches are unchanged.
 - **Tile walks.** `_segment_steps` and `_route_walk`
   (`navigation.py:4344-4391`) estimate the tiles walked along a planned route.
   Only savebed selection uses them.

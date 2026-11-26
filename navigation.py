@@ -76,7 +76,9 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     combat_allowed, heal_waiting, out_of_heals_and_recall,
                     UnpreparedHold, empty_recall_wand,
                     usable_recharge_scroll, wand_charges, wand_known_empty, recall_wands,
-                    area_caster_identities, tiled_neighbours)
+                    area_caster_identities, tiled_neighbours,
+                    MAX_AGGRO_RANGE, safe_square_route)
+from .terrain import features as terrain_features, tile_directions
 from .tasks import (RECALL_REQUIRED_LEVEL, CasterProfile, gear_scorer, heal_consumables,
                     reads_scrolls)
 log = logging.getLogger(__name__)
@@ -1460,8 +1462,15 @@ class WorldGraph:
     def local_path(self, map_path: str, start: tuple[int, int],
                    goal: tuple[int, int], *,
                    allow_locked: bool = False,
-                   excluded: set[tuple[int, int]] | None = None) -> list[tuple[int, int]]:
-        """Find an authored-terrain path within one map for safe click legs."""
+                   excluded: set[tuple[int, int]] | None = None,
+                   extra_costs: dict[tuple[int, int], int] | None = None,
+                   ) -> list[tuple[int, int]]:
+        """Find an authored-terrain path within one map for safe click legs.
+
+        ``extra_costs`` adds to the cost of entering a square (each step
+        costs 1): the walk's spawn-radius cost (NavigateTask._spawn_costs).
+        Without it every step costs the same.
+        """
         node = self.nodes.get(map_path)
         if node is None:
             return []
@@ -1511,11 +1520,18 @@ class WorldGraph:
             y * node.width + x for x, y in (excluded or ())
             if 0 <= x < node.width and 0 <= y < node.height
         )
+        costs = None
+        if extra_costs:
+            cells = bytearray(b"\x01" * (node.width * node.height))
+            for (x, y), extra in extra_costs.items():
+                if 0 <= x < node.width and 0 <= y < node.height:
+                    cells[y * node.width + x] = max(1, min(255, 1 + int(extra)))
+            costs = bytes(cells)
         result = grid_search(
             node.width, node.height, walkability,
             start[1] * node.width + start[0],
             (point[1] * node.width + point[0] for point in candidates),
-            excluded=excluded_states,
+            excluded=excluded_states, costs=costs,
         )
         if result.status != "found":
             return []
@@ -2849,6 +2865,11 @@ class NavigateTask(BotTask):
         self._exclusion_wait_until = 0.0
         self._exclusion_waited = False
         self._runtime_blocked: set[tuple[int, int]] = set()
+        # Maps whose aggressive spawns the walk pays to skirt on an optional
+        # trip (_spawn_costs): a farm trip's destination and the maps tiled
+        # to it (NavigateThenTask). The squares and their costs, by map.
+        self.spawn_cost_maps: frozenset[str] = frozenset()
+        self._spawn_cost_cache: dict[str, dict[tuple[int, int], int]] = {}
         # When the current local route first disappeared (0.0 while one exists).
         # Separate from _last_progress, which approach-candidate rotation resets.
         self._no_route_since = 0.0
@@ -4355,7 +4376,7 @@ class NavigateTask(BotTask):
         path = self.graph.local_path(
             m.path, start, (world_x, world_y),
             allow_locked=self._allow_locked(client),
-            excluded=blocked)
+            excluded=blocked, extra_costs=self._spawn_costs(m.path))
         if path:
             self._no_route_since = 0.0
         elif not self._no_route_since:
@@ -4428,6 +4449,43 @@ class NavigateTask(BotTask):
         self._issued_click = (m.path, *next_point)
         self._last_action = now
         return True
+
+    # A square within an unengaged aggressive spawn's detection radius
+    # (its authored radius, at least SPAWN_COST_RADIUS) plus
+    # SPAWN_COST_MARGIN costs this many extra steps to enter.
+    SPAWN_COST = 3
+    SPAWN_COST_RADIUS = 3
+    SPAWN_COST_MARGIN = 1
+
+    def _spawn_costs(self, map_path: str) -> dict[tuple[int, int], int] | None:
+        """The extra cost of each square near an aggressive spawn of
+        ``map_path``, or None when the walk pays none there.
+
+        Only on an optional trip (not essential or critical, no care
+        staging) and only on spawn_cost_maps (a farm trip's destination
+        and its tiled neighbours), which bounds the work: one map's spawns,
+        computed once per map. The path then skirts a spawn when a route
+        about as short goes round it. Live (2026-11-26) she woke a train of
+        followers on her way to her farm spot and arrived with it.
+        """
+        if (map_path not in self.spawn_cost_maps or self._urgent() or
+                self._care_staging is not None):
+            return None
+        cached = self._spawn_cost_cache.get(map_path)
+        if cached is not None:
+            return cached
+        costs: dict[tuple[int, int], int] = {}
+        for spawn in (getattr(self.graph, "named_spawns", {}) or {}).get(
+                map_path, ()):
+            if spawn.peaceful:
+                continue
+            radius = (max(self.SPAWN_COST_RADIUS, int(spawn.aggro_radius)) +
+                      self.SPAWN_COST_MARGIN)
+            for x in range(spawn.x - radius, spawn.x + radius + 1):
+                for y in range(spawn.y - radius, spawn.y + radius + 1):
+                    costs[(x, y)] = self.SPAWN_COST
+        self._spawn_cost_cache[map_path] = costs
+        return costs
 
     async def _step_along_boundary(self, client: AtrinikClient, world_x: int,
                                    world_y: int, now: float) -> bool:
@@ -5054,6 +5112,31 @@ class NavigateThenTask(BotTask):
     SEAM_RETREAT_FIGHT_SECONDS = 20.0
     # ... and never longer than this after it: then the walk home wins.
     SEAM_RETREAT_FIGHT_CAP_SECONDS = 90.0
+    # Approach discipline (COMBAT.md, "Approach discipline"). A creature is
+    # a pursuer when, over at least APPROACH_PURSUIT_MIN_SECONDS of the
+    # last APPROACH_PURSUIT_WINDOW_SECONDS, it moved and kept up with her
+    # or closed in, and is within MAX_AGGRO_RANGE now.
+    APPROACH_PURSUIT_WINDOW_SECONDS = 12.0
+    APPROACH_PURSUIT_MIN_SECONDS = 2.0
+    APPROACH_PURSUIT_SAMPLES = 64
+    # Within this many tiles of the farm map (or on the last leg), this
+    # many pursuers make her stop and fight them at a defensible square;
+    # more than APPROACH_PACK_CAP, or heals outpaced, make her lead them
+    # away instead, more than MAX_AGGRO_RANGE tiles along her trail.
+    APPROACH_NEAR_TILES = 25
+    APPROACH_STAND_PURSUERS = 2
+    APPROACH_PACK_CAP = 2
+    LEAD_AWAY_STEPS = MAX_AGGRO_RANGE + 1
+    LEAD_AWAY_CAP_SECONDS = 90.0
+    # Lead-aways per trip; then she stands.
+    LEAD_AWAY_LIMIT = 3
+    # A stand lasts at most this long, then the walk goes on for at least
+    # APPROACH_STAND_COOLDOWN_SECONDS: wanderers must not hold her for ever.
+    APPROACH_STAND_SECONDS = 45.0
+    APPROACH_STAND_COOLDOWN_SECONDS = 30.0
+    # How far she looks for a doorway, corridor or safe square to stand at.
+    DEFENSIBLE_RADIUS = 6
+    DEFENSIBLE_ROUTE_NODES = 300
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -5071,7 +5154,29 @@ class NavigateThenTask(BotTask):
                 task.map_bounds = (node.width, node.height)
                 task.map_node = node
         self.combat_approach = combat_approach
+        if isinstance(task, FarmTask):
+            # On an optional trip the walk skirts the aggressive spawns of
+            # the farm map and the maps tiled to it (_spawn_costs).
+            node = getattr(graph, "nodes", {}).get(destination)
+            self.navigation.spawn_cost_maps = frozenset(
+                {destination, *(tile_directions(node).values()
+                                if node is not None else ())})
         self.safety = safety or SafetyPolicy()
+        # Approach discipline: per creature id, its recent (time, map,
+        # world x, world y, distance) samples (_track_pursuers); the
+        # lead-away under way (_lead: when it began, the steps taken, the
+        # train's ids, where she last stood, and whether it is stuck);
+        # how many this trip; since when the stand under way holds and
+        # the end of its cooldown; whether the farm map is near
+        # (_near_spot's last answer, by map); and the terrain features
+        # looked up.
+        self._pursuit_samples: dict[int, deque] = {}
+        self._lead: dict[str, Any] | None = None
+        self._leads = 0
+        self._stand_since = 0.0
+        self._stand_cooldown_until = 0.0
+        self._near_cache: tuple[str, bool] | None = None
+        self._feature_cache: dict[tuple[str, int, int], str] = {}
         self._defending = False
         self._last_defense_action = 0.0
         self._retreat_attempt: tuple[str, int, int, float] | None = None
@@ -5133,8 +5238,10 @@ class NavigateThenTask(BotTask):
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
-        # A new walk starts no escape of an earlier one.
+        # A new walk starts no escape, lead-away or stand of an earlier one.
         self._escaping = False
+        self._lead = None
+        self._stand_since = 0.0
         self._cornered_target = 0
         self._cornered_logged.clear()
         self._cornered_hold_since = 0.0
@@ -5822,6 +5929,328 @@ class NavigateThenTask(BotTask):
         self._seam_contact = True
         return True
 
+    def _track_pursuers(self, client: AtrinikClient, threats) -> list:
+        """The threats following her: each one sampled now, a pursuer when
+        within MAX_AGGRO_RANGE and, against its oldest sample at least
+        APPROACH_PURSUIT_MIN_SECONDS old (within the window), it moved 2
+        or more tiles (or she changed maps) and is no farther from her
+        than it was; or it is beside her and hitting her. A creature that
+        sits on its spawn, or one she walks away from, is none."""
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        now = time.monotonic()
+        horizon = now - self.APPROACH_PURSUIT_WINDOW_SECONDS
+        for target_id in list(self._pursuit_samples):
+            samples = self._pursuit_samples[target_id]
+            while samples and samples[0][0] < horizon:
+                samples.popleft()
+            if not samples:
+                del self._pursuit_samples[target_id]
+        pursuers = []
+        for threat in threats:
+            distance, x, y, obj = threat
+            if not obj.target_id:
+                continue
+            world = (m.world_x + x - cx, m.world_y + y - cy)
+            samples = self._pursuit_samples.setdefault(
+                obj.target_id, deque(maxlen=self.APPROACH_PURSUIT_SAMPLES))
+            oldest = samples[0] if samples else None
+            samples.append((now, m.path, world[0], world[1], distance))
+            if distance > MAX_AGGRO_RANGE:
+                continue
+            if distance <= 1 and self._hit_by(client, obj):
+                pursuers.append(threat)
+                continue
+            if (oldest is None or
+                    now - oldest[0] < self.APPROACH_PURSUIT_MIN_SECONDS):
+                continue
+            moved = oldest[1] != m.path or max(
+                abs(oldest[2] - world[0]), abs(oldest[3] - world[1])) >= 2
+            if moved and distance <= oldest[4]:
+                pursuers.append(threat)
+        return pursuers
+
+    def _edge_arrival(self, edge: MapEdge) -> tuple[int, int]:
+        """Where an edge of her route lands her on its destination map."""
+        if edge.kind != "tile":
+            return edge.destination_x, edge.destination_y
+        nodes = getattr(self.navigation.graph, "nodes", {})
+        source, target = nodes.get(edge.source), nodes.get(edge.destination)
+        x, y = edge.x, edge.y
+        if source is not None and target is not None:
+            x = (target.width - 1 if x < 0 else 0 if x >= source.width else x)
+            y = (target.height - 1 if y < 0 else 0 if y >= source.height
+                 else y)
+        return x, y
+
+    def _near_spot(self, client: AtrinikClient) -> bool:
+        """Whether she is on the last leg to the farm map (its next
+        transition enters it), or within about APPROACH_NEAR_TILES of it
+        along her route. A route cleared for a replan keeps the last
+        answer on this map."""
+        m = client.state.map
+        route = list(getattr(self.navigation, "route", None) or ())
+        if not route or route[0].source != m.path:
+            cached = self._near_cache
+            return bool(cached is not None and cached[0] == m.path and
+                        cached[1])
+        near = False
+        if route[-1].destination == self.navigation.destination:
+            near = len(route) == 1
+            tiles = max(abs(route[0].x - m.world_x),
+                        abs(route[0].y - m.world_y))
+            for previous, edge in zip(route, route[1:]):
+                arrival = self._edge_arrival(previous)
+                tiles += max(abs(edge.x - arrival[0]),
+                             abs(edge.y - arrival[1]))
+            near = near or tiles <= self.APPROACH_NEAR_TILES
+        self._near_cache = (m.path, near)
+        return near
+
+    def _approach_mode(self, client: AtrinikClient, pursuers,
+                       threats) -> str:
+        """The approach discipline for this tick: "lead" (lead the train
+        away, _lead_away_step), "stand" (stop at a defensible square and
+        fight them there one at a time) or "" (walk on).
+
+        Only on a farm trip, off the farm map. A lead-away under way goes
+        on until done (_lead_done), then the walk plans its way back.
+        Otherwise near the farm map (_near_spot) with
+        APPROACH_STAND_PURSUERS or more pursuers she stands; with more
+        than APPROACH_PACK_CAP, or heals outpaced, she leads them away
+        while she has leads left (LEAD_AWAY_LIMIT a trip). So she does not
+        walk onto the farm map with two or more in tow. A stand lasts at
+        most APPROACH_STAND_SECONDS, then the walk goes on for
+        APPROACH_STAND_COOLDOWN_SECONDS.
+        """
+        m = client.state.map
+        now = time.monotonic()
+        recorder = getattr(client, "record_action", None)
+        if (not isinstance(self.task, FarmTask) or
+                m.path == self.navigation.destination):
+            self._lead = None
+            self._stand_since = 0.0
+            return ""
+        if self._lead is not None:
+            if not self._lead_done(client, pursuers, threats, now):
+                return "lead"
+            if recorder is not None:
+                recorder("approach-lead-done",
+                         f"steps={self._lead['steps']} "
+                         f"pursuers={len(pursuers)}")
+            self._lead = None
+            # Re-approach: the walk plans its route again from here.
+            self.navigation.route = []
+            self.navigation._issued_goal = None
+            self.navigation._issued_click = None
+            self.navigation._last_progress = now
+        if (len(pursuers) < self.APPROACH_STAND_PURSUERS or
+                now < self._stand_cooldown_until or
+                not self._near_spot(client)):
+            self._stand_since = 0.0
+            return ""
+        if ((len(pursuers) > self.APPROACH_PACK_CAP or
+                healing_outpaced(client)) and
+                self._leads < self.LEAD_AWAY_LIMIT):
+            self._leads += 1
+            self._stand_since = 0.0
+            self._lead = {"since": now, "steps": 0, "stuck": False,
+                          "ids": {threat[3].target_id for threat in pursuers},
+                          "at": (m.path, m.world_x, m.world_y)}
+            if recorder is not None:
+                recorder("approach-lead-away",
+                         f"pursuers={len(pursuers)} lead={self._leads}")
+            return "lead"
+        if not self._stand_since:
+            self._stand_since = now
+            if recorder is not None:
+                recorder("approach-stand", f"pursuers={len(pursuers)}")
+        elif now - self._stand_since >= self.APPROACH_STAND_SECONDS:
+            self._stand_since = 0.0
+            self._stand_cooldown_until = (
+                now + self.APPROACH_STAND_COOLDOWN_SECONDS)
+            return ""
+        return "stand"
+
+    def _lead_done(self, client: AtrinikClient, pursuers, threats,
+                   now: float) -> bool:
+        """Whether the lead-away under way is over: LEAD_AWAY_STEPS taken
+        with none of the train (its pursuers, then and since) in view
+        within MAX_AGGRO_RANGE (the server drops a chase beyond it),
+        nowhere left to lead them (no more lead-aways this trip then), or
+        LEAD_AWAY_CAP_SECONDS gone."""
+        lead = self._lead
+        lead["ids"].update(threat[3].target_id for threat in pursuers)
+        m = client.state.map
+        here = (m.path, m.world_x, m.world_y)
+        if here != lead["at"]:
+            lead["at"] = here
+            lead["steps"] += 1
+        if lead["stuck"]:
+            self._leads = self.LEAD_AWAY_LIMIT
+            return True
+        following = any(threat[0] <= MAX_AGGRO_RANGE and
+                        threat[3].target_id in lead["ids"]
+                        for threat in threats)
+        return (now - lead["since"] >= self.LEAD_AWAY_CAP_SECONDS or
+                (lead["steps"] >= self.LEAD_AWAY_STEPS and not following))
+
+    def _spawn_hazards(self, node) -> list[tuple[int, int, int]]:
+        """Each aggressive spawn of ``node`` as (x, y, radius): its
+        detection radius, at least SPAWN_COST_RADIUS, plus the margin
+        (NavigateTask._spawn_costs' squares)."""
+        return [
+            (spawn.x, spawn.y,
+             max(NavigateTask.SPAWN_COST_RADIUS, int(spawn.aggro_radius)) +
+             NavigateTask.SPAWN_COST_MARGIN)
+            for spawn in (getattr(self.navigation.graph, "named_spawns", {})
+                          or {}).get(node.path, ())
+            if not spawn.peaceful]
+
+    async def _lead_away_step(self, client: AtrinikClient, threats) -> bool:
+        """One step of the lead-away, combat off, on this map, by a walk
+        that keeps out of every aggressive spawn's radius (_spawn_hazards)
+        and pays for passing beside a threat (safe_square_route): to the
+        nearest square of her cleared trail more than MAX_AGGRO_RANGE from
+        every threat, else to the square in reach farthest from them
+        (the nearest of those beyond MAX_AGGRO_RANGE). False, with the
+        lead marked stuck, when no square gains distance on where she
+        stands."""
+        lead = self._lead
+        m = client.state.map
+        now = time.monotonic()
+        self._defending = True
+        self.navigation._issued_goal = None
+        self.navigation._issued_click = None
+        self.navigation._last_progress = now
+        if (now - self._last_defense_action < 0.30 or
+                self._retreat_step_pending(client, now)):
+            return True
+        node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
+        if node is None or not node.terrain:
+            lead["stuck"] = True
+            return False
+        cx, cy = m.width // 2, m.height // 2
+        here = (m.world_x, m.world_y)
+        threat_world = [(m.world_x + x - cx, m.world_y + y - cy)
+                        for _, x, y, _ in threats]
+
+        def train_gap(point) -> int:
+            return min((max(abs(point[0] - x), abs(point[1] - y))
+                        for x, y in threat_world), default=99)
+
+        # A square of her cleared trail or her walk, else any square, the
+        # walk keeping out of every spawn's radius: the one farthest from
+        # the train (the nearer of equal ones). Only a square that gains on
+        # where she stands leads.
+        trail = set()
+        if isinstance(self.task, FarmTask):
+            trail = {(x, y) for path, x, y in self.task._cleared_trail
+                     if path == m.path}
+        trail.update((x, y) for path, x, y in self._trail if path == m.path)
+        blocked = {(x, y) for path, x, y in self._retreat_blocked
+                   if path == m.path}
+        here_gap = train_gap(here)
+        route = None
+        # A trail square serves only beyond MAX_AGGRO_RANGE of the train.
+        for goals, needed in ((trail, MAX_AGGRO_RANGE), ((), here_gap)):
+            if goals is trail and not trail:
+                continue
+            route = safe_square_route(
+                node, here, goals, threats=threat_world,
+                hazards=self._spawn_hazards(node), blocked=blocked,
+                allow_locked=self.navigation._allow_locked(client),
+                best=lambda point: min(train_gap(point),
+                                       MAX_AGGRO_RANGE + 1))
+            if (route is not None and len(route) >= 2 and
+                    train_gap(route[-1]) > needed):
+                break
+            route = None
+        if route is None:
+            lead["stuck"] = True
+            return False
+        dx, dy = route[1][0] - here[0], route[1][1] - here[1]
+        direction = next((value for value, delta in c.DIRECTION_DELTAS.items()
+                          if value and delta == (dx, dy)), 0)
+        if not direction:
+            lead["stuck"] = True
+            return False
+        await client.clear_actions()
+        if getattr(client.state, "combat", False):
+            await client.set_combat(False)
+        await client.move(direction)
+        self._send_retreat_step(client, *route[1], now)
+        self._last_defense_action = now
+        return True
+
+    def _defensible(self, client: AtrinikClient, node,
+                    point: tuple[int, int]) -> bool:
+        """Whether she can hold world square ``point``: a doorway or a
+        corridor (terrain.features, the fight records' terrain) or a safe
+        square remembered this trip (FarmTask.note_safe_square)."""
+        path = client.state.map.path
+        if (isinstance(self.task, FarmTask) and
+                (path, *point) in self.task._safe_squares):
+            return True
+        key = (path, *point)
+        feature = self._feature_cache.get(key)
+        if feature is None:
+            feature = terrain_features(node, *point).feature
+            if len(self._feature_cache) > 4096:
+                self._feature_cache.clear()
+            self._feature_cache[key] = feature
+        return feature in ("corridor", "doorway")
+
+    async def _hold_defensible(self, client: AtrinikClient, threats) -> bool:
+        """Hold for the approach stand: where she is when she can hold it
+        (_defensible), else a step towards the nearest such square within
+        DEFENSIBLE_RADIUS that keeps 2 tiles from every threat, else where
+        she is. The walk waits meanwhile; the defence fights each pursuer
+        as it reaches her."""
+        m = client.state.map
+        now = time.monotonic()
+        self._defending = True
+        self.navigation._issued_goal = None
+        self.navigation._issued_click = None
+        self.navigation._last_progress = now
+        if (now - self._last_defense_action < 0.30 or
+                self._retreat_step_pending(client, now)):
+            return True
+        node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
+        here = (m.world_x, m.world_y)
+        if node is None or not node.terrain or self._defensible(
+                client, node, here):
+            return True
+        cx, cy = m.width // 2, m.height // 2
+        threat_world = [(m.world_x + x - cx, m.world_y + y - cy)
+                        for _, x, y, _ in threats]
+        radius = self.DEFENSIBLE_RADIUS
+        goals = [
+            (x, y)
+            for x in range(here[0] - radius, here[0] + radius + 1)
+            for y in range(here[1] - radius, here[1] + radius + 1)
+            if node.walkable(x, y) and self._defensible(client, node, (x, y))]
+        route = safe_square_route(
+            node, here, goals, threats=threat_world,
+            blocked={(x, y) for path, x, y in self._retreat_blocked
+                     if path == m.path},
+            allow_locked=self.navigation._allow_locked(client),
+            max_nodes=self.DEFENSIBLE_ROUTE_NODES, radius=radius)
+        if route is None or len(route) < 2:
+            return True
+        dx, dy = route[1][0] - here[0], route[1][1] - here[1]
+        direction = next((value for value, delta in c.DIRECTION_DELTAS.items()
+                          if value and delta == (dx, dy)), 0)
+        if not direction:
+            return True
+        await client.clear_actions()
+        if getattr(client.state, "combat", False):
+            await client.set_combat(False)
+        await client.move(direction)
+        self._send_retreat_step(client, *route[1], now)
+        self._last_defense_action = now
+        return True
+
     async def _defend_while_navigating(self, client: AtrinikClient,
                                        *, own_walk: bool = False) -> bool:
         """Pause an encounter approach to heal or clear an aggroed pack.
@@ -5960,6 +6389,20 @@ class NavigateThenTask(BotTask):
         # before, so she never closes in on it.
         seam_beside = seam_contact and any(
             threat[0] <= 1 for threat in nearby)
+        # Approach discipline (COMBAT.md): near the farm map with a train
+        # behind her she stands at a defensible square and fights them as
+        # they come (no hold-fire), or leads a bigger one away first.
+        # Caught during a lead-away, the stand's rules fight it out.
+        pursuers = self._track_pursuers(client, [
+            threat for threat in threats
+            if threat[3].target_id not in outclassed])
+        approach = self._approach_mode(client, pursuers, threats)
+        if approach == "lead" and any(threat[0] <= 1 for threat in nearby):
+            approach = "stand"
+        approach_stand = (approach == "stand" and
+                          not self.navigation.care_holds_fire(m.path))
+        if approach_stand:
+            hold_fire = False
         combat_released = False
         if hold_fire:
             engaged = (self.task._engaged_target
@@ -6040,6 +6483,16 @@ class NavigateThenTask(BotTask):
             if getattr(client.state, "combat", False):
                 await client.set_combat(False)
             return True
+        if approach == "lead":
+            if safety_action_issued:
+                # A heal just sent: a step now would cancel it.
+                return True
+            if await self._lead_away_step(client, threats):
+                return True
+            # Nowhere to lead them: she stands instead.
+            approach = "stand"
+            approach_stand = not self.navigation.care_holds_fire(m.path)
+            hold_fire = hold_fire and not approach_stand
         player_level = int(client.state.stats.get("level", 0) or 0)
         resolver = getattr(self.navigation.graph, "monster_level", None)
         dangerous = []
@@ -6124,7 +6577,8 @@ class NavigateThenTask(BotTask):
         if (safe and nearest is not None and nearest[0] > 2 and
                 len(pull_pack) >= 2 and
                 (pack_offensive is None or hold_fire) and
-                not self._cornered_target and not seam_beside):
+                not self._cornered_target and not seam_beside and
+                not approach_stand):
             # A cornered fight at range is not turned into a pack avoidance
             # (combat off, replan) between its own ticks.
             if await self._bypass_pack_blocked_exit(client):
@@ -6368,6 +6822,10 @@ class NavigateThenTask(BotTask):
             # Cornered in an escape: the closest attacker, not a committed
             # one farther off.
             nearest = min(nearby, key=lambda value: value[0])
+        if approach_stand and (nearest is None or nearest[0] > 1):
+            # The approach stand closes no gap: she holds her square (or
+            # takes it) and lets each pursuer come to her.
+            return await self._hold_defensible(client, threats)
         if (nearest is not None and nearest[0] <= 4 and
                 not (self._escaping and nearest[0] > 2)):
             self._defending = True

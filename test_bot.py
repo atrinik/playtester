@@ -43038,5 +43038,361 @@ class BuildPerSpotTests(unittest.TestCase):
             self.assertIn((seller, spell), offers)
 
 
+class SafeRetreatTests(unittest.TestCase):
+    """Safe squares, the safe-square retreat and approach discipline
+    (COMBAT.md, "Safe squares and approach discipline")."""
+
+    TREANT_HIT = "charred treant hit you for 25 (-20) impact damage."
+
+    def _edge(self, safe=None, way_in=None):
+        """She at (23, 12) on the east edge of an open 24x24 farm map,
+        treants beside her at (22, 11) and (22, 13): no step gains
+        distance (the Burnt Forest corner, 2026-11-25)."""
+        client = QuestTests._combat_client()
+        client.state.map.tiles.clear()
+        client.state.stats.update(hp=30, maxhp=100, sp=0)
+        QuestTests._record_actions(client)
+        m = client.state.map
+        m.world_x, m.world_y = 23, 12
+        for view, target_id in (((7, 7), 100), ((7, 9), 101)):
+            m.tile(*view).objects[3] = MapObject(
+                3, target_id, 0, 0, name="charred treant",
+                target_id=target_id, target_hp=80)
+        client.state.messages = [(time.time(), 2, "ff0000", self.TREANT_HIT)]
+        task = FarmTask(zone="/test", target="charred treant")
+        node = MapNode(path="/test", width=24, height=24)
+        node.terrain = {(x, y): 1 for x in range(24) for y in range(24)}
+        task.map_node = node
+        task.map_bounds = (24, 24)
+        task.remember_engagement(client, 7, 7, 100)
+        if safe is not None:
+            task._safe_squares[("/test", *safe)] = time.monotonic()
+        task.way_in = way_in
+        return client, task
+
+    def _retreat(self, client, task):
+        from . import tasks as tasks_module
+
+        client.direct_moves.clear()
+        client.recorded.clear()
+        with patch.object(tasks_module.random, "random", return_value=0.5):
+            self.assertTrue(asyncio.run(task.low_health_retreat(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+        choice = dict(client.recorded)["retreat-choice"]
+        return c.DIRECTION_DELTAS[client.direct_moves[0][0]], choice
+
+    def test_cornered_at_an_edge_she_walks_back_to_a_safe_square(self):
+        # Live (2026-11-25) her one-step retreats ended cornered at map
+        # edges. With no step that gains distance she takes the first step
+        # of the walk to the nearest remembered safe square instead.
+        for safe, expected_dy in (((22, 3), -1), ((22, 21), 1)):
+            client, task = self._edge(safe=safe)
+            (dx, dy), choice = self._retreat(client, task)
+            self.assertIn(f"safe={safe[0]},{safe[1]}", choice)
+            self.assertEqual((dx, dy), (0, expected_dy), (safe, choice))
+
+    def test_with_no_safe_square_the_way_in_serves(self):
+        client, task = self._edge(way_in=("/test", 22, 23))
+        (_, dy), choice = self._retreat(client, task)
+        self.assertIn("exit=22,23", choice)
+        self.assertEqual(dy, 1)
+        # A remembered safe square comes first.
+        client, task = self._edge(safe=(22, 3), way_in=("/test", 22, 23))
+        (_, dy), choice = self._retreat(client, task)
+        self.assertIn("safe=22,3", choice)
+        self.assertEqual(dy, -1)
+
+    def test_a_gaining_step_keeps_the_ordinary_retreat(self):
+        # In the open, a step that gains distance exists: the ranking from
+        # #138 decides, unchanged.
+        client, task = self._edge(safe=(14, 3))
+        client.state.map.world_x = 12
+        self.assertNotIn("safe=", self._retreat(client, task)[1])
+
+    def test_the_safe_route_keeps_out_of_hazards_and_threats(self):
+        from .tasks import safe_square_route
+
+        node = MapNode(path="/test", width=24, height=24)
+        node.terrain = {(x, y): 1 for x in range(24) for y in range(24)}
+        # Straight west runs through a spawn's radius: the walk goes round.
+        route = safe_square_route(node, (20, 12), [(4, 12)],
+                                  hazards=[(12, 12, 3)])
+        self.assertEqual(route[0], (20, 12))
+        self.assertEqual(route[-1], (4, 12))
+        for x, y in route:
+            self.assertGreater(max(abs(x - 12), abs(y - 12)), 3)
+        # A hazard she stands in does not wall her in.
+        self.assertIsNotNone(safe_square_route(
+            node, (12, 12), [(2, 2)], hazards=[(12, 12, 3)]))
+        # A goal beside a threat is not safe now; threats are walls.
+        self.assertIsNone(safe_square_route(
+            node, (20, 12), [(4, 12)], threats=[(5, 12)]))
+        walled = MapNode(path="/w", width=5, height=1)
+        walled.terrain = {(x, 0): 1 for x in range(5)}
+        self.assertIsNone(safe_square_route(
+            walled, (0, 0), [(4, 0)], threats=[(2, 0)]))
+        # Bounded: no more squares than asked for.
+        self.assertIsNone(safe_square_route(
+            node, (0, 0), [(23, 23)], max_nodes=50))
+
+    def test_a_quiet_held_square_becomes_safe(self):
+        client = QuestTests._combat_client()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        client.state.map.world_x = client.state.map.world_y = 12
+        task = FarmTask(zone="/test", target="charred treant",
+                        aggressive_detection_ranges={"charred treant": 3})
+        node = MapNode(path="/test", width=24, height=24)
+        node.terrain = {(x, y): 1 for x in range(24) for y in range(24)}
+        task.map_node = node
+        task.note_trail(client)
+        self.assertEqual(task.way_in, ("/test", 12, 12))
+        self.assertEqual(task._safe_squares, {})
+        # Held for SAFE_HOLD_SECONDS: safe.
+        task._safe_hold = (("/test", 12, 12),
+                           time.monotonic() - task.SAFE_HOLD_SECONDS)
+        task.note_trail(client)
+        self.assertIn(("/test", 12, 12), task._safe_squares)
+        # A hostile within its detection radius restarts the hold.
+        client.state.map.world_x = 13
+        client.state.map.tile(11, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=100)
+        task._safe_hold = (("/test", 13, 12), time.monotonic() - 60.0)
+        task.note_trail(client)
+        self.assertIsNone(task._safe_hold)
+        self.assertNotIn(("/test", 13, 12), task._safe_squares)
+        # One farther off does not.
+        client.state.map.tiles.clear()
+        client.state.map.tile(13, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="charred treant", target_id=100, target_hp=100)
+        task._safe_hold = (("/test", 13, 12), time.monotonic() - 60.0)
+        task.note_trail(client)
+        self.assertIn(("/test", 13, 12), task._safe_squares)
+
+    def test_seam_squares_onto_maps_without_aggressive_spawns_are_safe(self):
+        client = QuestTests._combat_client()
+        node = terrain_node(["....."] * 5, tiled=((1, 0), (0, -1)))
+        east = MapNode("/next_1_0", width=5, height=5)
+        north = MapNode("/next_0_-1", width=5, height=5)
+        client.world_graph = types.SimpleNamespace(
+            nodes={"/t": node, "/next_1_0": east, "/next_0_-1": north},
+            named_spawns={"/next_0_-1": [NamedSpawn(
+                "/next_0_-1", 2, 2, "charred treant", (), aggro_radius=3)],
+                "/next_1_0": [NamedSpawn(
+                    "/next_1_0", 2, 2, "deer", (), peaceful=True)]})
+        task = FarmTask(zone="/t")
+        task.map_node = node
+        self.assertEqual(task.safe_seam_squares(client),
+                         {(4, y) for y in range(5)})
+
+    # The approach: a road map ("/road", 24x24) whose east seam enters
+    # the farm map ("/farm"); she walks its last leg.
+    def _approach(self, task=None, terrain=None, route=None):
+        client = QuestTests._combat_client()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        client.state.stats.update(hp=356, maxhp=356, sp=71, maxsp=71,
+                                  level=33)
+        client.state.map.path = "/road"
+        QuestTests._record_actions(client)
+        road = MapNode(path="/road", width=24, height=24)
+        road.terrain = terrain or {
+            (x, y): 1 for x in range(24) for y in range(24)}
+        road.edges.append(MapEdge("/road", "/farm", 24, 12, kind="tile"))
+        graph = WorldGraph()
+        graph.nodes = {"/road": road,
+                       "/farm": MapNode(path="/farm", width=24, height=24)}
+        farm = task or FarmTask(zone="/farm", target="charred treant")
+        walk = NavigateThenTask(graph, "/farm", farm, combat_approach=True,
+                                safety=SafetyPolicy(heal_below=0.80,
+                                                    flee_below=0.50))
+        walk.navigation.route = route or [
+            MapEdge("/road", "/farm", 24, 12, kind="tile")]
+        return client, walk
+
+    @staticmethod
+    def _place(client, monsters):
+        """Put (target id, world x, world y) treants in her view."""
+        m = client.state.map
+        m.tiles.clear()
+        for target_id, x, y in monsters:
+            m.tile(8 + x - m.world_x, 8 + y - m.world_y).objects[3] = (
+                MapObject(3, target_id, 0, 0, name="charred treant",
+                          target_id=target_id, target_hp=100))
+
+    @staticmethod
+    def _followed(walk, client, monsters, back=2):
+        """Seed each monster's pursuit: seen 3 s ago, ``back`` tiles
+        farther west than now (it has been closing in)."""
+        m = client.state.map
+        then = time.monotonic() - 3.0
+        for target_id, x, y in monsters:
+            distance = max(abs(x - back - m.world_x), abs(y - m.world_y))
+            walk._pursuit_samples[target_id] = collections.deque(
+                [(then, m.path, x - back, y, distance)], maxlen=64)
+
+    def test_two_followers_near_the_spot_are_fought_at_a_doorway(self):
+        # A wall at x 21 with a one-wide gap at (21, 12): a doorway on the
+        # last leg. Two treants follow her from the west.
+        terrain = {(x, y): 0 if x == 21 and y != 12 else 1
+                   for x in range(24) for y in range(24)}
+        client, walk = self._approach(terrain=terrain)
+        m = client.state.map
+        m.world_x, m.world_y = 20, 12
+        monsters = [(100, 15, 12), (101, 13, 12)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+        self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
+        self.assertIn("approach-stand", [a for a, _ in client.recorded])
+        # Not onward to the farm: into the doorway, and no fight yet.
+        self.assertEqual(len(client.direct_moves), 1)
+        self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]],
+                         (1, 0))
+        self.assertEqual(client.targets, [])
+
+        # In the doorway with the first one beside her and the second
+        # still on its way: she fights the first, combat on, and the walk
+        # waits.
+        m.world_x = 21
+        monsters = [(100, 20, 12), (101, 14, 12)]
+        self._place(client, monsters)
+        client.state.messages = [(time.time(), 2, "ff0000", self.TREANT_HIT)]
+        client.direct_moves.clear()
+        walk._last_defense_action = 0.0
+        walk._retreat_attempt = None
+        self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
+        self.assertIn((7, 8, 100), client.targets)
+        self.assertEqual(client.combat[-1], True)
+        self.assertEqual(client.direct_moves, [])
+        self.assertNotIn("navigation-transit-hold-fire",
+                         [a for a, _ in client.recorded])
+
+        # Without the train she walks on (the stand needs two).
+        client.recorded.clear()
+        client.state.messages = []
+        self._place(client, [])
+        walk._pursuit_samples.clear()
+        walk._stand_since = 0.0
+        asyncio.run(walk._defend_while_navigating(client))
+        self.assertNotIn("approach-stand", [a for a, _ in client.recorded])
+
+    def test_five_followers_are_led_away_beyond_aggro_range(self):
+        client, walk = self._approach()
+        m = client.state.map
+        m.world_x, m.world_y = 7, 12
+        monsters = [(100 + i, 5 - i, 12 + (i % 3) - 1) for i in range(5)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+        tick = 0
+        led = False
+        while tick < 60:
+            tick += 1
+            walk._last_defense_action = 0.0
+            client.direct_moves.clear()
+            asyncio.run(walk._defend_while_navigating(client))
+            if "approach-lead-done" in [a for a, _ in client.recorded]:
+                break
+            self.assertEqual(m.path, "/road")
+            led = led or "approach-lead-away" in [
+                a for a, _ in client.recorded]
+            if client.direct_moves:
+                dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+                m.world_x += dx
+                m.world_y += dy
+            # They follow at half her pace, one square every other tick.
+            if tick % 2 == 0:
+                monsters = [
+                    (target_id, x + (m.world_x > x) - (m.world_x < x),
+                     y + (m.world_y > y) - (m.world_y < y))
+                    for target_id, x, y in monsters]
+            self._place(client, monsters)
+        self.assertTrue(led, client.recorded)
+        self.assertIn("approach-lead-done", [a for a, _ in client.recorded],
+                      (tick, client.recorded))
+        self.assertGreater(min(max(abs(x - m.world_x), abs(y - m.world_y))
+                               for _, x, y in monsters), 9)
+        # Never onto the farm map, and never over 3 followers to it: the
+        # lead stayed on the road, combat off.
+        self.assertNotIn(True, client.combat)
+        self.assertLess(m.world_x, 24)
+
+    def test_no_fight_stop_on_other_trips_or_far_from_the_spot(self):
+        # A bank trip on the same road with two followers: she walks on
+        # under hold-fire, as before.
+        client, walk = self._approach(task=BankBalanceTask("Tolmir"))
+        m = client.state.map
+        m.world_x, m.world_y = 20, 12
+        monsters = [(100, 15, 12), (101, 14, 12)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+        self.assertFalse(asyncio.run(walk._defend_while_navigating(client)))
+        self.assertNotIn("approach-stand", [a for a, _ in client.recorded])
+        self.assertEqual(client.targets, [])
+        # A farm trip three maps out: no stand either.
+        far = [MapEdge("/road", "/a", 24, 12, kind="tile"),
+               MapEdge("/a", "/b", 24, 12, kind="tile"),
+               MapEdge("/b", "/farm", 24, 12, kind="tile")]
+        client, walk = self._approach(route=far)
+        m = client.state.map
+        m.world_x, m.world_y = 2, 12
+        monsters = [(100, 0, 12), (101, 0, 13)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters, back=0)
+        asyncio.run(walk._defend_while_navigating(client))
+        self.assertNotIn("approach-stand", [a for a, _ in client.recorded])
+        # Already in contact on the other trip, cornered by them for a
+        # while: the existing last resort fights back.
+        client, walk = self._approach(task=BankBalanceTask("Tolmir"))
+        m = client.state.map
+        m.world_x, m.world_y = 20, 12
+        monsters = [(100, 19, 12)]
+        self._place(client, monsters)
+        client.state.messages = [(time.time(), 2, "ff0000", self.TREANT_HIT)]
+        walk._last_moved_at = time.monotonic() - 10.0
+        walk._last_position = (m.path, m.world_x, m.world_y)
+        self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
+        self.assertIn((7, 8, 100), client.targets)
+
+    def test_the_walk_skirts_a_spawn_when_an_equal_route_goes_round(self):
+        # Two equal lanes from (1, 4) to (11, 4), round a wall block; a
+        # treant spawn on one. On an optional farm trip she takes the other.
+        rows = (["#############", "#...........#"] +
+                ["#.#########.#"] * 5 +
+                ["#...........#", "#############"])
+        down = next(d for d, delta in c.DIRECTION_DELTAS.items()
+                    if delta == (0, 1))
+        up = next(d for d, delta in c.DIRECTION_DELTAS.items()
+                  if delta == (0, -1))
+        for spawn_y, expected in ((1, down), (7, up)):
+            client = QuestTests._combat_client()
+            client.state.map.tiles.clear()
+            client.state.map.path = "/road"
+            client.state.map.world_x, client.state.map.world_y = 1, 4
+            graph = WorldGraph()
+            graph.nodes = {"/road": terrain_node(rows, path="/road"),
+                           "/farm": MapNode(path="/farm", width=5, height=5)}
+            graph.named_spawns["/road"] = [NamedSpawn(
+                "/road", 6, spawn_y, "charred treant", (), aggro_radius=3)]
+            walk = NavigateThenTask(
+                graph, "/farm", FarmTask(zone="/farm"), combat_approach=True)
+            # The farm's neighbours pay; here the road is one of them.
+            walk.navigation.spawn_cost_maps = frozenset({"/farm", "/road"})
+            self.assertTrue(asyncio.run(
+                walk.navigation._click_path(client, 11, 4)))
+            self.assertEqual(client.direct_moves[-1][0], expected, spawn_y)
+            # An essential trip pays nothing: the plain shortest walk.
+            walk.navigation.essential = "cure"
+            self.assertIsNone(walk.navigation._spawn_costs("/road"))
+        # The farm map and the maps tiled to it pay by default.
+        road = MapNode(path="/farm", width=5, height=5)
+        road.edges.append(MapEdge("/farm", "/east", 5, 2, kind="tile"))
+        graph = WorldGraph()
+        graph.nodes = {"/farm": road}
+        walk = NavigateThenTask(graph, "/farm", FarmTask(zone="/farm"),
+                                combat_approach=True)
+        self.assertEqual(walk.navigation.spawn_cost_maps,
+                         {"/farm", "/east"})
+
+
 if __name__ == "__main__":
     unittest.main()
