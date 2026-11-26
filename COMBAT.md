@@ -1796,7 +1796,10 @@ and learned too little from them. Three changes:
   and a spawn that can roll several kinds counts only once all of them
   are marked. The analyzer choice then picks another spot, and her
   ordinary walk takes her off the map along its route. With no spot left,
-  the circuit ends, as for any quarantined spot. Live, she stayed on
+  the circuit ends, as for any quarantined spot. While the marks last the
+  analyzer choice never picks such a spot to begin with
+  (`residents_out_of_league`): picked, it was quarantined as soon as she
+  arrived. Live, she stayed on
   world_16_74 with every kind there marked, ran along its edges away from
   slow treants and was cornered at (19,23).
 
