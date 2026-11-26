@@ -38,7 +38,7 @@ LOOP_STALL_ALERT_SECONDS = 15 * 60.0
 # The farm circuit's warn-only encounter warning for the spot it chose
 # (farm_analyzer.encounter_warning), recorded right after its selection.
 ENCOUNTER_WARNING_ACTION = "farm-spot-encounter-warning"
-FARM_SPOT_SELECTED_ACTION = "farm-spot-selected"
+ENCOUNTER_RESET_ACTIONS = ("farm-spot-selected", "farm-spot-encounter-clear")
 
 
 class ProgressWatch:
@@ -122,15 +122,16 @@ def loop_stall(decisions: Iterable[dict], now: float) -> tuple[dict | None, int]
 
 def farm_encounter_warning(decisions: Iterable[dict], since: float) -> dict | None:
     """The encounter warning for the spot autoplay farms now: the latest
-    farm-spot-encounter-warning, if no later spot was selected and it came
-    after ``since`` (this autoplay run's start); else None."""
+    farm-spot-encounter-warning, if no later spot was selected and no
+    later farm-spot-encounter-clear came, and it came after ``since``
+    (this autoplay run's start); else None."""
     latest = None
     for decision in decisions:
         action = decision.get("action")
         when = float(decision.get("time", 0) or 0)
         if when < since:
             continue
-        if action == FARM_SPOT_SELECTED_ACTION:
+        if action in ENCOUNTER_RESET_ACTIONS:
             latest = None
         elif action == ENCOUNTER_WARNING_ACTION:
             latest = decision

@@ -2008,14 +2008,20 @@ unchanged.
   run's spots with the same path (`_merge_encounters`), and the report's
   `schema_version` is stamped on each spot (`analyzer_schema_version`);
   `encounter_rated` reads them only from schema 2 with `encounter_applied`.
-  A failed encounter run is logged and keeps the ranking.
+  A failed encounter run is logged, shown on the Farming tab and keeps the
+  ranking; it is retried on the failure backoff (15 minutes).
 - **Warn only.** `farm-spot-selected` appends the style, encounter safety,
   expected and bad pull's packs and the first three `encounter_reasons`.
-  When the chosen spot's encounter safety is under `ENCOUNTER_WARN_SAFETY`
-  (0.8) or its bad pull (`worst_pack`) over `ENCOUNTER_WARN_WORST_PACK` (6),
-  `encounter_warning` names it, the causes and its first two reasons in a
-  `farm-spot-encounter-warning` decision, and the dashboard raises a
-  `farm-encounter` warning alert until another spot is selected. The
+  The farm circuit (`FarmCircuitTask._note_encounter`) also records a
+  `farm-spot-encounter` decision with that rating whenever it changes: for
+  the spot it starts on, after a switch, and when a new analysis re-rates
+  the same spot. When her spot's encounter safety is under
+  `ENCOUNTER_WARN_SAFETY` (0.8) or its bad pull (`worst_pack`) over
+  `ENCOUNTER_WARN_WORST_PACK` (6), `encounter_warning` names it, the causes
+  and its first two reasons in a `farm-spot-encounter-warning` decision.
+  While autoplay runs, the dashboard raises a `farm-encounter` warning
+  alert from it until another spot is selected or a
+  `farm-spot-encounter-clear` records that the spot no longer warns. The
   Farming tab adds an "Encounters" line to each spot, flagged on the same
   thresholds, with the reasons in its tooltip. Every map she died on rated
   0.40 to 0.77 with bad pulls of 7 and 8; the maps whose bad pull stays

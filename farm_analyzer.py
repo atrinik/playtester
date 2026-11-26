@@ -421,7 +421,7 @@ class CombatProfile:
     combat_style: str = ""
     healing_per_second: float = 0.0
 
-    def arguments(self, styled: bool = True) -> list[str]:
+    def arguments(self, styled: bool = False) -> list[str]:
         """The analyzer's profile arguments; without ``styled`` (the
         ranking run) no --combat-style, which would change the fields she
         ranks by."""
@@ -559,8 +559,8 @@ def healing_rate(state, heal: float, swing: float) -> float:
     heals in melee), so one lands about every ``swing`` (her weapon's
     speed, or a cast while she trains with spells) plus SPELL_CAST_DELAY.
     Her mana bounds it too: regen_sp over the spell's cost, casts a
-    second. Live, on 2026-11-25, minor healing landed 8 to 26 (median
-    about 17) with a 3 s weapon: about 4.25 HP/s, against at most 5.5 seen.
+    second. Live, on 2026-11-25, minor healing landed 8 to 26 (median 12)
+    with a 3 s weapon: 3 HP/s, against at most 5.5 seen.
     """
     if heal <= 0 or swing <= 0:
         return 0.0
@@ -832,6 +832,10 @@ class FarmAnalyzer:
             # profile of the report it failed to replace.
             return now - self._last_attempt_at >= self.RETRY_SECONDS
         if self.report is None:
+            return True
+        if (self.encounter_error and profile.combat_style and
+                now - self._last_attempt_at >= self.RETRY_SECONDS):
+            # A failed encounter run kept the ranking; retry on the backoff.
             return True
         return (profile.materially_differs(self.profile) or
                 origin != self.origin or
@@ -1118,7 +1122,8 @@ class FarmAnalyzer:
             "ranking": [
                 {**{key: item.get(key) for key in SUMMARY_FIELDS},
                  "approach_risky": risky_approach(item),
-                 "spot_risky": risky_spot(item)}
+                 "spot_risky": risky_spot(item),
+                 "encounter_warning": encounter_warning(item)}
                 for item in ranked[:5]
             ],
         }

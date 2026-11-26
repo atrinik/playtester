@@ -167,12 +167,12 @@ function spotLine(r) {
   if (!r.spot_risky && !seam) return "";
   return `<small class="${r.spot_risky ? "warn-text" : "muted"}" title="${r.spot_risky ? "One encounter is expected to cost more than her health bar: farmed only when no safe spot is usable" : "Neighbouring maps across a seam"}">Spot ${pct(r.spot_safety_score)} safe · pack ${Math.round(+r.max_aggro_pack || 0)}${seam}</small>`;
 }
-// Warn only (farm_analyzer.encounter_warning): the analyzer's encounter model
-// (schema 2) for her combat style, flagged below 0.8 encounter safety or
-// above a bad pull of 6 (ENCOUNTER_WARN_SAFETY, ENCOUNTER_WARN_WORST_PACK).
+// Warn only: the analyzer's encounter model (schema 2) for her combat style,
+// flagged when farm_analyzer.encounter_warning (below 0.8 encounter safety
+// or above a bad pull of 6) names the spot.
 function encounterLine(r) {
   if (!(+r.analyzer_schema_version >= 2 && r.encounter_applied === true)) return "";
-  const warn = (+r.encounter_safety || 0) < 0.8 || (+r.worst_pack || 0) > 6;
+  const warn = !!r.encounter_warning;
   const reasons = (Array.isArray(r.encounter_reasons) ? r.encounter_reasons : []).map(String).join("\n");
   const title = (warn ? "Warning only: the choice is unchanged\n" : "") + reasons;
   return `<small class="${warn ? "warn-text" : "muted"}" title="${esc(title)}">Encounters (${esc(r.encounter_style || "")}): ${pct(r.encounter_safety)} safe · pack ${(+r.expected_pack || 0).toFixed(1)}, bad pull ${Math.round(+r.worst_pack || 0)}${r.encounter_warning ? ` · ${esc(r.encounter_warning)}` : ""}</small>`;
@@ -184,7 +184,7 @@ function renderFarming() {
   const status = $("#fa-status");
   status.classList.toggle("warn-text", fa.status === "failed" || fa.status === "unsupported");
   status.textContent = fa.running ? "Analyzing…"
-    : fa.status === "ready" ? `Updated ${since(fa.finished_at)} ago · ${fa.duration}s run`
+    : fa.status === "ready" ? `Updated ${since(fa.finished_at)} ago · ${fa.duration}s run${fa.encounter_error ? ` · encounter run failed: ${fa.encounter_error}` : ""}`
     : fa.status === "failed" ? `Last run failed: ${fa.error}`
     : fa.status === "unsupported" ? `Not analyzed: ${fa.error}`
     : fa.status === "unavailable" ? "Analyzer unavailable" : "Waiting for the first run";

@@ -21785,8 +21785,11 @@ class FarmAnalyzerTests(unittest.TestCase):
         args = profile.arguments()
         self.assertEqual(args[0], "10")
         self.assertEqual(args[args.index("--max-aggro-pack") + 1], "1")
-        # She casts from range from the start, before any spell hit is sampled.
-        self.assertEqual(args[args.index("--combat-style") + 1], "ranged-kite")
+        # She casts from range from the start, before any spell hit is
+        # sampled; only the encounter run passes the style.
+        self.assertNotIn("--combat-style", args)
+        styled = profile.arguments(styled=True)
+        self.assertEqual(styled[styled.index("--combat-style") + 1], "ranged-kite")
         # Until a cast has been observed, the weapon stands in.
         self.assertEqual(args[args.index("--melee-damage") + 1], "44")
         # At the target, training ends: main weapon spots, capped at the
@@ -21875,9 +21878,11 @@ class FarmAnalyzerTests(unittest.TestCase):
                             # 62 SP less three 4-SP heals held in reserve.
                             ("--max-mana", "50"), ("--attack-type", "magic"),
                             ("--max-aggro-pack", "1"), ("--max-health", "188"),
-                            # Spell-only, she holds one target at range.
+                            # Spell-only, she holds one target at range
+                            # (the encounter run's style).
                             ("--combat-style", "ranged-kite")):
-            self.assertEqual(args[args.index(flag) + 1], value, flag)
+            source = profile.arguments(styled=True) if flag == "--combat-style" else args
+            self.assertEqual(source[source.index(flag) + 1], value, flag)
         # Without Meditation, no out-of-combat regeneration ramp.
         self.assertNotIn("--meditation", args)
         state.place_item(Item(tag=15, name="meditation", item_type=c.TYPE_SKILL,
@@ -22100,6 +22105,14 @@ class FarmAnalyzerTests(unittest.TestCase):
             await analyzer.close()
 
         asyncio.run(scenario())
+        # A failed encounter run kept the ranking: it is retried on the
+        # failure backoff, not after six hours.
+        analyzer.encounter_error = "exited with status 3"
+        analyzer._last_attempt_at = time.time() - analyzer.RETRY_SECONDS - 1
+        analyzer.runs = 1
+        self.assertTrue(analyzer.due(analyzer.profile))
+        analyzer.encounter_error = ""
+        self.assertFalse(analyzer.due(analyzer.profile))
         # No heal landed yet: no healing is assumed.
         fresh = combat_profile(self.client())
         args = fresh.arguments()
@@ -22953,6 +22966,42 @@ class AnalyzerFarmSelectionTests(RouteDeathReachIsolation, unittest.TestCase):
                     autoplay_started_at=started) if alert["id"] == "farm-encounter"])
             else:
                 self.assertEqual((warnings, shown), ([], []))
+
+    def test_the_spot_she_starts_on_is_warned_about_and_re_rated(self):
+        from .alerts import ProgressWatch, active
+
+        # Autoplay creates the circuit on the spot it chose, so no
+        # selection follows; a new analysis can re-rate the same spot.
+        dense = self.encounter_spot("Dense", self.TREES, worst=9.0, safety=0.79,
+                                    xp=2.1e6, expected=1.7)
+        client = self.client({"xp": [dense]})
+        circuit = self.circuit(client, dense)
+        started = time.time() - 60
+
+        def alerted():
+            return [alert["text"] for alert in active(
+                client.state, client.decision_history, ProgressWatch(),
+                autoplay_started_at=started) if alert["id"] == "farm-encounter"]
+
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
+        actions = [entry["action"] for entry in client.decision_history]
+        self.assertEqual(actions.count("farm-spot-encounter"), 1)
+        self.assertEqual(actions.count("farm-spot-encounter-warning"), 1)
+        self.assertNotIn("farm-spot-selected", actions)
+        self.assertEqual(len(alerted()), 1)
+        # Unchanged, nothing is recorded again.
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(len(client.decision_history), len(actions))
+        # Re-rated safe, the warning clears.
+        client.farm_analyzer.rankings["xp"] = [dict(dense, worst_pack=3.0,
+                                                    encounter_safety=0.88)]
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(client.decision_history[-1]["action"], "farm-spot-encounter-clear")
+        self.assertEqual(alerted(), [])
+        # Re-rated dangerous again, it alerts again.
+        client.farm_analyzer.rankings["xp"] = [dense]
+        self.assertFalse(circuit._upgrade_progression(client, circuit.child.task))
+        self.assertEqual(len(alerted()), 1)
 
     def test_repeated_pack_deaths_rate_a_spot_hazardous_for_her_kit(self):
         from . import self_improvement as si

@@ -746,11 +746,14 @@ encounter fields (`encounter_safety`, `expected_pack`, `worst_pack`,
 path; nothing she chooses by reads them. A material change in her healing
 (15%) or style calls for a new analysis. The decision record of a chosen
 spot (`farm-spot-selected`) and the Farming tab show the style, encounter
-safety, expected and bad pull's packs and reasons. When the chosen spot's
-encounter safety is under 0.8 or its bad pull over 6, a
-`farm-spot-encounter-warning` decision names it and its first reasons, and
-the dashboard raises a `farm-encounter` warning alert until another spot is
-chosen. A failed encounter run keeps the ranking.
+safety, expected and bad pull's packs and reasons; the farm circuit
+records a `farm-spot-encounter` decision whenever her spot's rating
+changes, the spot she starts on included. When her spot's encounter safety
+is under 0.8 or its bad pull over 6, a `farm-spot-encounter-warning`
+decision names it and its first reasons, and while autoplay runs the
+dashboard raises a `farm-encounter` warning alert until another spot is
+chosen or the spot no longer warns. A failed encounter run keeps the
+ranking, shows on the Farming tab and is retried after 15 minutes.
 
 The analyzer scores a spot's pack from its own maps alone, so the bot folds
 tiled neighbours in itself (`seam_ranking`, COMBAT.md "Safer
