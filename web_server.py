@@ -47,7 +47,7 @@ from .quests import QuestDefinition, QuestObjective, flatten_parts, load_catalog
 from .tasks import (BankTask, BotTask, BuyShopUpgradeTask, DepositItemsTask,
                     FarmTask, InventoryPolicy, JunkPolicy, RetrieveItemsTask,
                     SellItemsTask, SellJunkTask, TaskEngine, TaskStatus,
-                    carried_gear_score)
+                    carried_gear_score, working_recall)
 
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).with_name("web_static")
@@ -892,7 +892,8 @@ class DashboardState:
         policy = getattr(examiner, "policy", None) or InventoryPolicy()
         try:
             return equipment_report(self.client, policy,
-                                    carried_gear_score(self.client, policy))
+                                    carried_gear_score(self.client, policy),
+                                    recall=working_recall(self.client))
         except Exception as error:   # never let the panel break /api/state
             log.warning("equipment panel unavailable: %s", error)
             return {"families": [], "examined": 0, "shadow": [],

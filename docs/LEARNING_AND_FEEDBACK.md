@@ -1906,9 +1906,9 @@ surplus sale (`_surplus_equipment`). Differences from the F4 text:
   × (1 + `dam_bonus[Str]`/10) over the weapon delay, 10 points a damage per
   second. A caster values Int, Pow, mana and regeneration through
   `caster_value` and melee damage and WC at a quarter; anyone but an
-  archer values arrow WC and damage at a quarter. A launcher's delay is not
-  in its examine text, so arrow damage is taken per second at a 1-second
-  reference.
+  archer values arrow WC and damage at a quarter. Arrow damage is taken
+  per second over the launcher's examine "(delay+N.Ns)" (1 second when not
+  known).
 - **Context terms**, valued against her worn set without what the item
   would replace: Str, Dex and Con at the `living.c` tables (`dam_bonus`,
   `wc_bonus` and `speed_bonus`, `hp_bonus` on her base hit points), plus 5
@@ -1923,6 +1923,15 @@ surplus sale (`_surplus_equipment`). Differences from the F4 text:
   are context only. When either side of a comparison lacks it, both fall
   back to the name score, with the caster displacement margin; on the
   effective scale that margin is the item's condition-scaled protections.
+- **Signed values and free slots.** A value may be negative (a low speed
+  cap can cost more than the armour gives), so two capped armours still
+  rank. A free slot (an empty one, or the second ring slot) takes any item
+  that is not a net loss.
+- **The shop reads only its stock's answer line** ("That is " and its
+  name), as GearExaminer does, and stores it even with no stats.
+- **Not modelled:** the server ignores a worn shield (its AC, protections
+  and speed cap) while a two-handed weapon or launcher is wielded; the
+  scorer still counts it.
 - **Girdles** are an equipment type with the belt slot. Before, the equip
   loop gave every girdle -1, so the forged meteoric steel belt (AC +1,
   +3.2% to the four physical protections over her soft leather girdle)
