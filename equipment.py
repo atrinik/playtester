@@ -178,7 +178,9 @@ def parse_description(text: str) -> BaseStats | None:
     protections = re.search(r"\(Protections:\s*([^)]*)\)", text, re.I)
     attacks = re.search(r"\(Attacks:\s*([^)]*)\)", text, re.I)
     speed = re.search(r"\(speed cap (\d+(?:\.\d+)?)\)", text, re.I)
-    delay = re.search(r"\((\d+(?:\.\d+)?) sec\)", text, re.I)
+    delay = (re.search(r"\((\d+(?:\.\d+)?) sec\)", text, re.I) or
+             # A launcher's or arrow's: "(delay+1.0s)" (item.c).
+             re.search(r"\(delay\+(\d+(?:\.\d+)?)s\)", text, re.I))
     base = BaseStats(
         ac=one("ac"), wc=one("wc"), dam=one("dam"), block=one("block"),
         absorb=one("absorb", "%"),
@@ -532,7 +534,8 @@ STAT_FLOOR = 5
 # What melee damage and WC are worth to a caster, and arrow WC and damage
 # to anyone but an archer, as a share of their full worth.
 OFF_STYLE_SHARE = 0.25
-# A launcher's delay is not in its examine text: this stands in for it.
+# Arrow damage is taken per second over the launcher's delay, its examine
+# "(delay+N.Ns)"; this stands in when it is not known.
 BOW_REFERENCE_DELAY = 1.0
 
 
@@ -732,7 +735,8 @@ class GearScorer:
 
     def value(self, item: Item) -> int | None:
         """The item's worth on the effective scale, or None without examine
-        data. Never below 0, which marks a non-gear item. A scorer is made
+        data or for a non-gear item. It may be negative (a low armour speed
+        cap can cost more than the armour gives). A scorer is made
         per decision, so each item's value is kept for its lifetime."""
         if item.tag not in self._values:
             self._values[item.tag] = self._value(item)
@@ -765,8 +769,9 @@ class GearScorer:
         dps_without = rest_dam * level_factor * strength(own["Str"]) / self.weapon_delay
         damage = (dps_with - dps_without) * DPS_WEIGHT * melee_share
         # Arrows: the launcher's (or arrow's) WC and damage per shot.
+        shot = (stats.delay if stats.item_type == c.TYPE_BOW else None) or BOW_REFERENCE_DELAY
         missile = (stats.missile_wc * WC_WEIGHT + stats.missile_dam * DPS_WEIGHT *
-                   level_factor * strength(new["Str"]) / BOW_REFERENCE_DELAY) * missile_share
+                   level_factor * strength(new["Str"]) / max(0.125, shot)) * missile_share
         wc_share = max(melee_share, missile_share)
         wc = (stats.wc * melee_share +
               (_table(WC_BONUS, new["Dex"]) - _table(WC_BONUS, own["Dex"])) * wc_share
@@ -797,7 +802,7 @@ class GearScorer:
                  sum(value for _, value in stats.protections) * PROTECTION_WEIGHT +
                  attacks + hp + floor + maxsp + regen + stats.regen_hp +
                  len(stats.specials) * SPECIAL_WEIGHT + caster + speed)
-        return max(0, round(total))
+        return round(total)
 
     def score(self, item: Item) -> int:
         """For ordering: the effective value, else the fallback."""
@@ -826,13 +831,16 @@ class GearScorer:
         return round(sum(max(0.0, value) for _, value in stats.protections) *
                      PROTECTION_WEIGHT)
 
-    def beats(self, candidate: Item, current: list[Item]) -> tuple[bool, Item | None]:
+    def beats(self, candidate: Item, current: list[Item], slots: int = 1
+              ) -> tuple[bool, Item | None]:
         """Whether the candidate should replace the weakest of what she
         wears in its slot, and that weakest item: it must beat it by
-        CHOICE_MARGIN plus the caster displacement margin. An empty slot
-        takes any."""
-        if not current:
-            return True, None
+        CHOICE_MARGIN plus the caster displacement margin. A free slot (one
+        of ``slots``, such as the second ring) takes any item that is not a
+        net loss on the effective scale."""
+        if len(current) < slots:
+            value = self.value(candidate)
+            return value is None or value >= 0, None
         mine, theirs, effective = self.compare(candidate, current)
         index = min(range(len(current)), key=theirs.__getitem__)
         worst = current[index]
@@ -846,7 +854,8 @@ CHOICE_MARGIN = 15
 
 
 def equipment_report(client: Any, policy: Any,
-                     old_score: Callable[[Item], int]) -> dict[str, Any]:
+                     old_score: Callable[[Item], int], *,
+                     recall: bool = True) -> dict[str, Any]:
     """Per gear family: what she wears, the best carried candidate, both
     scores, the per-stat deltas and where the old name score would choose
     differently from ``GearScorer``, which decides (the shadow comparison;
@@ -855,7 +864,8 @@ def equipment_report(client: Any, policy: Any,
     state = client.state
     equipped = set(state.equipment.values())
     level = int(state.stats.get("level", 0) or 0)
-    scorer = GearScorer(client, policy, old_score)
+    # ``recall`` as the equip loop reads it (tasks.working_recall).
+    scorer = GearScorer(client, policy, old_score, recall=recall)
 
     def stats_of(item: Item) -> EffectiveStats | None:
         return scorer.context_stats(item)
@@ -908,8 +918,9 @@ def equipment_report(client: Any, policy: Any,
 
         def decided() -> Item | None:
             """The candidate GearScorer puts on, as the equip loop does."""
+            slots = len(policy.equipment_slots.get(item_type, ())) or 1
             return next((item for item in sorted(candidates, key=scorer.score, reverse=True)
-                         if scorer.score(item) >= 0 and scorer.beats(item, worn)[0]), None)
+                         if scorer.beats(item, worn, slots)[0]), None)
 
         # Only what the equip loop chooses is compared: a light is chosen
         # for its light, which no effective stat shows.
@@ -979,6 +990,7 @@ class GearExaminer:
         # abandoned examine's late answer comes before any new one is asked.
         self.paused_until = float("-inf")
         self.old_score: Callable[[Item], int] | None = None
+        self.recall = True
 
     @staticmethod
     def wanted(item: Item, policy: Any) -> bool:
@@ -1054,10 +1066,11 @@ class GearExaminer:
         log.info("gear examine of %s abandoned for a recall wand examine", name)
 
     async def tick(self, client: Any, policy: Any,
-                   old_score: Callable[[Item], int]) -> bool:
+                   old_score: Callable[[Item], int], *, recall: bool = True) -> bool:
         """Examine the next unexamined item, or settle the last one; True
-        while an examine waits for its answer."""
-        self.policy, self.old_score = policy, old_score
+        while an examine waits for its answer. ``recall``: whether a recall
+        source of hers works, as the equip loop weighs speed."""
+        self.policy, self.old_score, self.recall = policy, old_score, recall
         settling = self.pending is not None
         if not self.read_answer(client):
             return True
@@ -1099,7 +1112,8 @@ class GearExaminer:
             return
         self.shadow_at = now
         try:
-            report = equipment_report(client, self.policy, self.old_score)
+            report = equipment_report(client, self.policy, self.old_score,
+                                      recall=self.recall)
         except Exception as error:   # a diagnostic must never stop her farm
             log.warning("gear shadow comparison failed: %s", error)
             return
@@ -1142,6 +1156,10 @@ def _answers(text: str, name: str) -> bool:
     prefix = f"That is {name}"
     rest = text[len(prefix):]
     return text.startswith(prefix) and (not rest or rest.startswith((" (", " *")))
+
+
+# The examine-answer test, for the shop buyer's reader too.
+examine_answers = _answers
 
 
 def looks_renamed(content: Any, name: str) -> bool:

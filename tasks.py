@@ -26,8 +26,9 @@ from .targeting import select_target, target_set_aside
 from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      format_money, map_object_visual_name,
                      update_bank_balance)
-from .equipment import (GearScorer, base_to_json, gear_examine_pending,
-                        gear_examiner, gear_style, parse_description)
+from .equipment import (MAGIC_HIDDEN_TYPES, BaseStats, GearScorer, base_to_json,
+                        examine_answers, gear_examine_pending, gear_examiner,
+                        gear_style, parse_description)
 from . import route_shadow, terrain
 from . import owner_watch
 from .observations import is_player, plain
@@ -4814,8 +4815,7 @@ class FarmTask(BotTask):
                                        c.ITEM_CURSED | c.ITEM_DAMNED) or
                     candidate.required_level > level):
                 continue
-            score = score_item(candidate)
-            if score < 0:
+            if candidate.item_type not in self.inventory_policy.equipment_types:
                 continue
             slots = self.inventory_policy.equipment_slots.get(
                 candidate.item_type, ())
@@ -4834,7 +4834,7 @@ class FarmTask(BotTask):
                 continue
             # One scale for both: effective stats when all were examined,
             # else the name score (GearScorer.beats).
-            upgrade, worst = scorer.beats(candidate, current)
+            upgrade, worst = scorer.beats(candidate, current, len(slots))
             if not upgrade:
                 continue
             if worst is not None and len(current) >= len(slots) > 1:
@@ -7034,7 +7034,8 @@ class FarmTask(BotTask):
                 # a time behind any wand examine (equipment.GearExaminer).
                 await gear_examiner(client).tick(
                     client, self.inventory_policy,
-                    carried_gear_score(client, self.inventory_policy))
+                    carried_gear_score(client, self.inventory_policy),
+                    recall=working_recall(client))
         # A hit never commits her to a set-aside pull or to a packmate within
         # its reach: combat text cannot say which one attacked, and fighting
         # the packmate drags the set-aside monster in too. Within two tiles
@@ -7997,8 +7998,8 @@ class BuyShopUpgradeTask(BotTask):
         baseline = ((max if len(slots) == 1 else min)(
             scored, key=lambda value: value[0]) if scored else None)
         improvement = mine - (baseline[0] if baseline is not None else 0)
-        # Buying adds its weight: GearScorer counts that in the effective
-        # value once she is loaded (weight_cost).
+        # Once she is loaded, GearScorer charges each item's weight
+        # (weight_cost) on both sides, so the weight difference counts.
         margin = (scorer.displacement_margin(baseline[1], effective)
                   if baseline is not None else 0)
         return (improvement if improvement >= self.min_improvement + margin
@@ -8024,12 +8025,21 @@ class BuyShopUpgradeTask(BotTask):
 
     def _apply_examine_metadata(self, client: AtrinikClient, candidate: Item,
                                 feedback: str) -> bool:
-        # The examine's base stats, as GearExaminer stores carried gear's,
-        # so GearScorer values the stock exactly as the equip loop will.
-        base = parse_description(feedback)
-        if base is not None:
+        # The examine answer's base stats, read as GearExaminer reads
+        # carried gear's: only the line that answers for this item's name
+        # (never another item's answer or a chat line), its description in
+        # the name for a ring, amulet or trinket. A line with no stats is
+        # stored too, so the stock is on the same scale as her own gear.
+        answer = next((line for line in feedback.splitlines()
+                       if examine_answers(line.strip(), candidate.name)), None)
+        if answer is not None:
+            rest = re.sub(r"^That is an? ", "That is ", answer.strip())[
+                len(f"That is {candidate.name}"):]
+            shown = (candidate.name + rest
+                     if candidate.item_type in MAGIC_HIDDEN_TYPES else rest)
             candidate.extra["gear_examine"] = {
-                "name": candidate.name, "base": base_to_json(base),
+                "name": candidate.name,
+                "base": base_to_json(parse_description(shown) or BaseStats()),
                 "at": time.time()}
         quality = re.search(
             r"Qua:\s*(\d+)\s+Con:\s*(Indestructible|\d+)",

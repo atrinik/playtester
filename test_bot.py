@@ -7138,7 +7138,7 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         calls = []
 
         class Examiner:
-            async def tick(self, client, policy, score):
+            async def tick(self, client, policy, score, *, recall=True):
                 calls.append(score)
                 return False
 
@@ -29423,6 +29423,64 @@ class GearScorerTests(unittest.TestCase):
         self.assertEqual(task._upgrade_score(client, stock),
                          scorer.value(stock) - scorer.value(girdle))
         self.assertEqual(task._upgrade_score(client, stock), 174 - 51)
+
+    def test_capped_armours_still_rank_below_zero(self):
+        # A 0.60 cap costs more than either armour gives: values are signed,
+        # so the better plate still beats the scale mail.
+        from .tasks import InventoryPolicy, gear_scorer
+        worn = self.examined(3, c.TYPE_ARMOUR, "scale mail",
+                             "scale mail (speed cap 0.60) (ac+6) (Protections: slash +20%)",
+                             worn=True)
+        plate = self.examined(4, c.TYPE_ARMOUR, "plate mail",
+                              "plate mail (speed cap 0.60) (ac+8) (Protections: slash +30%)")
+        client = self.client(worn, plate, equipment={c.EQUIP_ARMOUR: 3})
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertLess(scorer.value(worn), 0)
+        self.assertGreater(scorer.value(plate), scorer.value(worn) + 15)
+        self.assertTrue(asyncio.run(FarmTask().maintain_inventory(client)))
+        self.assertEqual(client.applied, [4])
+        # Into an empty slot a net loss is not put on.
+        self.assertFalse(scorer.beats(plate, [])[0])
+
+    def test_a_second_ring_fills_the_free_ring_slot(self):
+        from .tasks import InventoryPolicy, gear_scorer
+        worn = self.examined(1, c.TYPE_RING, "ring (Protections: fire +20%)",
+                             "ring (Protections: fire +20%)", worn=True)
+        spare = self.examined(2, c.TYPE_RING, "ring (Protections: cold +5%)",
+                              "ring (Protections: cold +5%)")
+        worn.flags |= c.ITEM_LOCKED
+        spare.flags |= c.ITEM_LOCKED
+        client = self.client(worn, spare, equipment={c.EQUIP_RING_RIGHT: 1})
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertTrue(scorer.beats(spare, [worn], 2)[0])
+        self.assertTrue(asyncio.run(FarmTask().maintain_inventory(client)))
+        self.assertEqual(client.applied, [2])
+
+    def test_the_shop_reads_only_its_stocks_examine_answer(self):
+        client, girdle, belt = self.belt_client()
+        client.state.remove_item(belt.tag)
+        stock = Item(5, flags=c.ITEM_UNPAID, item_type=c.TYPE_GIRDLE,
+                     name="leather belt", weight=1.0)
+        client.state.place_item(stock, 0)
+        task = BuyShopUpgradeTask()
+        task._apply_examine_metadata(
+            client, stock,
+            "That is silk cape +2 (ac+9) (Protections: slash +40%)\n"
+            "Someone says: (ac+9) (speed+3)\n"
+            "That is leather belt\nQua: 70 Con: 70.")
+        from .equipment import base_from_json
+        self.assertEqual(base_from_json(stock.extra["gear_examine"]["base"]).ac, 0)
+        self.assertLess(task._upgrade_score(client, stock), 0)
+
+    def test_a_launchers_examine_delay_paces_its_arrows(self):
+        from .equipment import parse_description
+        from .tasks import InventoryPolicy, gear_scorer
+        self.assertEqual(parse_description("bow (wc+2) (dam+3) (delay+1.5s)").delay, 1.5)
+        slow = self.examined(1, c.TYPE_BOW, "slow bow", "slow bow (dam+6) (delay+2.0s)")
+        quick = self.examined(2, c.TYPE_BOW, "quick bow", "quick bow (dam+5) (delay+1.0s)")
+        client = self.client(slow, quick)
+        scorer = gear_scorer(client, InventoryPolicy(gear_style="bow"))
+        self.assertGreater(scorer.value(quick), scorer.value(slow))
 
     def test_gear_without_examine_data_falls_back_to_the_name_score(self):
         from .tasks import InventoryPolicy, carried_gear_score, gear_scorer

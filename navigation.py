@@ -75,7 +75,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     UnpreparedHold, empty_recall_wand,
                     usable_recharge_scroll, wand_known_empty,
                     area_caster_identities, tiled_neighbours)
-from .tasks import RECALL_REQUIRED_LEVEL, gear_scorer, heal_consumables, reads_scrolls
+from .tasks import (RECALL_REQUIRED_LEVEL, CasterProfile, gear_scorer, heal_consumables,
+                    reads_scrolls)
 log = logging.getLogger(__name__)
 
 
@@ -10952,10 +10953,13 @@ class FarmCircuitTask(BotTask):
             r"^(?:iron|bronze|steel|wooden|spruce|soft leather) .*(?:sword|axe|mace|club|spear|bow|shield|armour|skirt|sandals|boots|gloves|helmet)$",
         ), tags=frozenset(tags), sell_identified_junk=True)
 
-    @staticmethod
-    def _surplus_equipment(client: AtrinikClient) -> list[Item]:
-        """Return identified gear proven inferior to every occupied slot."""
-        policy = InventoryPolicy()
+    def _surplus_equipment(self, client: AtrinikClient) -> list[Item]:
+        """Return identified gear proven inferior to every occupied slot,
+        scored for her build as the equip loop scores it."""
+        caster = self._trains_wizardry(client)
+        policy = InventoryPolicy(
+            caster_stats=caster, gear_style=gear_style(self.combat_skill, caster),
+            caster_profile=CasterProfile.from_client(client) if caster else None)
         level = int(client.state.stats.get("level", 0) or 0)
         equipped = {
             tag: client.state.items[tag]
@@ -10989,7 +10993,8 @@ class FarmCircuitTask(BotTask):
                 any(equipped_item.required_skill_tag and
                     equipped_item.required_skill_tag != item.required_skill_tag
                     for equipped_item in current))
-            if different_weapon_school or not scorer.beats(item, current)[0]:
+            if (different_weapon_school or
+                    not scorer.beats(item, current, len(slots))[0]):
                 surplus.append(item)
         return surplus
 
