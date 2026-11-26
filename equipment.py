@@ -19,11 +19,17 @@ item descriptions (``server/item.c``), magic bonuses
   magic, while the name shows "+N" separately. Rings, amulets and
   trinkets never show "+N".
 
+- An item's ``(speed+N)`` (its ``stats.exp``) adds N/3 before the armour
+  speed cap and 1 + N/3 after it, a tenth each (``living_update_player``);
+  the lowest speed cap of her worn armour clamps the first part.
+
 Carried gear is examined once a session by ``GearExaminer``, on a quiet
-farm tick, one item at a time. The model does not change her choices: the
-current name-based ``InventoryPolicy.gear_score`` still decides, and
-``equipment_report`` logs where the two would differ (shadow logging, for
-phase F4).
+farm tick, one item at a time. ``GearScorer`` decides what she wears and
+buys (phase F4): the effective stats valued for her style (melee, caster or
+bow), with speed, the armour speed cap and encumbrance recomputed by the
+server's formula. An item with no examine data falls back to the name-based
+``InventoryPolicy.gear_score``; ``equipment_report`` still logs where that
+old score would choose differently (the shadow log).
 """
 
 from __future__ import annotations
@@ -50,8 +56,7 @@ log = logging.getLogger(__name__)
 # Server ticks a second (MAX_TICKS): weapon delays are in ticks.
 TICKS_PER_SECOND = 8
 
-# The gear types she can wear, with a family label for the panel. Girdles
-# are worn by the server but not chosen by InventoryPolicy; they are shown.
+# The gear types she can wear, with a family label for the panel.
 GEAR_LABELS: dict[int, str] = {
     c.TYPE_WEAPON: "Weapon",
     c.TYPE_BOW: "Launcher",
@@ -78,7 +83,7 @@ FAMILY_NAMES: dict[int, str] = {
     c.TYPE_AMULET: "amulet", c.TYPE_RING: "ring", c.TYPE_TRINKET: "trinket",
     c.TYPE_LIGHT_APPLY: "light",
 }
-# IS_ARMOR (include/define.h): the types with a speed cap and mana penalty.
+# IS_ARMOR (include/define.h): the types with a speed cap.
 ARMOUR_TYPES = frozenset((
     c.TYPE_ARMOUR, c.TYPE_SHIELD, c.TYPE_HELMET, c.TYPE_CLOAK, c.TYPE_BOOTS,
     c.TYPE_GLOVES, c.TYPE_BRACERS, c.TYPE_GIRDLE, c.TYPE_PANTS))
@@ -92,10 +97,9 @@ SPECIALS = ("see invisible", "makes ethereal", "ethereal", "makes invisible",
             "invisible", "xray-vision", "infravision", "lifesaving",
             "reflect spells", "reflect missiles", "stealth", "flying")
 PHYSICAL_ATTACKS = frozenset(("impact", "slash", "cleave", "pierce"))
-# Effective-score weights. They match the shop examine score
+# GearScorer's weights. They match the shop examine score
 # (BuyShopUpgradeTask._apply_examine_metadata) so the two scales compare.
 PROTECTION_WEIGHT = 8
-STAT_WEIGHT = 40
 SPECIAL_WEIGHT = 50
 
 
@@ -123,6 +127,8 @@ class BaseStats:
     regen_hp: int = 0
     specials: tuple[str, ...] = ()
     source: str = "examine"          # examine | archetype
+    # The item's "(speed+N)" (its stats.exp, item.c).
+    speed: int = 0
 
 
 def base_to_json(base: BaseStats) -> dict[str, Any]:
@@ -188,6 +194,7 @@ def parse_description(text: str) -> BaseStats | None:
         regen_sp=regen("mana"), regen_hp=regen("hp"),
         specials=tuple(name for name in SPECIALS
                        if f"({name})" in text.casefold()),
+        speed=one("speed"),
     )
     return None if base == BaseStats() else base
 
@@ -234,6 +241,7 @@ def archetype_base(attrs: dict[str, Any]) -> BaseStats:
         regen_sp=_number(attrs, "sp") if wearable else 0,
         regen_hp=_number(attrs, "hp") if wearable else 0,
         source="archetype",
+        speed=_number(attrs, "exp"),
     )
 
 
@@ -294,6 +302,8 @@ class EffectiveStats:
     specials: tuple[str, ...] = ()
     source: str = "examine"          # examine | archetype
     notes: tuple[str, ...] = ()
+    # "(speed+N)": counts unless the item is a launcher (living.c).
+    speed: int = 0
 
 
 def _plus(value: int) -> str:
@@ -382,7 +392,8 @@ def effective_stats(item_type: int, base: BaseStats, magic: int = 0,
         maxhp=base.maxhp if wearable else 0, maxsp=base.maxsp if wearable else 0,
         regen_sp=base.regen_sp if wearable else 0,
         regen_hp=base.regen_hp if wearable else 0,
-        specials=base.specials, source=base.source, notes=tuple(notes))
+        specials=base.specials, source=base.source, notes=tuple(notes),
+        speed=0 if ranged else base.speed)
 
 
 def item_base(client: Any, item: Item) -> tuple[str, BaseStats] | None:
@@ -416,39 +427,6 @@ def item_effective_stats(client: Any, item: Item) -> EffectiveStats | None:
                            item.condition, family)
 
 
-def effective_score(stats: EffectiveStats, caster_value: Callable[..., float] | None = None
-                    ) -> int:
-    """One number for the effective stats, on the shop examine score's scale.
-
-    ``caster_value`` is ``InventoryPolicy.caster_value`` when she scores gear
-    as a caster: Int, Pow, mana and regeneration then count by what they
-    add at her stats, as in ``gear_score``.
-    """
-    if stats.item_type == c.TYPE_WEAPON and stats.delay:
-        damage = stats.dam * 40 / max(0.125, stats.delay)
-    else:
-        damage = stats.dam * 20
-    physical = sum(value for name, value in stats.attacks if name in PHYSICAL_ATTACKS)
-    attacks = max(0.0, physical - 100) + sum(
-        value for name, value in stats.attacks if name not in PHYSICAL_ATTACKS)
-    plain_stats = dict(stats.stats)
-    caster = 0.0
-    maxsp, regen = stats.maxsp, stats.regen_sp
-    if caster_value is not None:
-        bonuses = {key: value for key, value in (
-            ("int", plain_stats.pop("Int", 0)), ("pow", plain_stats.pop("Pow", 0)),
-            ("mana", stats.maxsp), ("regen", stats.regen_sp)) if value}
-        caster = caster_value(bonuses) if bonuses else 0.0
-        maxsp = regen = 0
-    return round(
-        damage + stats.wc * 10 + stats.ac * 20 + stats.block * 2 + stats.absorb * 2 +
-        stats.missile_wc * 10 + stats.missile_dam * 20 +
-        sum(max(0.0, value) for _, value in stats.protections) * PROTECTION_WEIGHT +
-        attacks + sum(plain_stats.values()) * STAT_WEIGHT +
-        stats.maxhp + maxsp + regen + stats.regen_hp +
-        len(stats.specials) * SPECIAL_WEIGHT + caster)
-
-
 def stat_lines(stats: EffectiveStats) -> list[tuple[str, str]]:
     """Labelled values for the dashboard, nonzero only."""
     lines: list[tuple[str, str]] = []
@@ -469,6 +447,7 @@ def stat_lines(stats: EffectiveStats) -> list[tuple[str, str]]:
         lines.append(("Delay", f"{stats.delay:g} s"))
     if stats.speed_cap:
         lines.append(("Speed cap", f"{stats.speed_cap:.2f}"))
+    add("Speed", stats.speed, signed=True)
     for name, value in stats.protections:
         add(name.capitalize(), value, "%", signed=True)
     for name, value in stats.attacks:
@@ -492,7 +471,8 @@ def stat_deltas(new: EffectiveStats, old: EffectiveStats | None) -> list[tuple[s
                   "Block": stats.block, "Absorb %": stats.absorb,
                   "Arrow WC": stats.missile_wc, "Arrow damage": stats.missile_dam,
                   "HP": stats.maxhp, "Mana": stats.maxsp,
-                  "Mana regen": stats.regen_sp, "HP regen": stats.regen_hp}
+                  "Mana regen": stats.regen_sp, "HP regen": stats.regen_hp,
+                  "Speed": stats.speed, "Speed cap": stats.speed_cap or 0}
         values.update((f"{name.capitalize()} %", value) for name, value in stats.protections)
         values.update((f"Attack {name} %", value) for name, value in stats.attacks)
         values.update(stats.stats)
@@ -507,6 +487,359 @@ def stat_deltas(new: EffectiveStats, old: EffectiveStats | None) -> list[tuple[s
     return deltas
 
 
+# The server's per-stat tables (server/living.c), indexed by the stat (0-30).
+SPEED_BONUS = (
+    -0.4, -0.4, -0.3, -0.3, -0.2, -0.2, -0.2, -0.1, -0.1, -0.1,
+    -0.05, 0.0, 0.0, 0.0, 0.025, 0.05, 0.075, 0.1, 0.125, 0.15,
+    0.175, 0.2, 0.225, 0.25, 0.275, 0.3, 0.325, 0.35, 0.4, 0.45, 0.5)
+DAM_BONUS = (
+    -2.5, -2.0, -2.0, -1.5, -1.5, -1.5, -1.0, -1.0, -1.0, -0.5,
+    -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0,
+    1.5, 1.5, 1.5, 2.0, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0)
+WC_BONUS = (
+    -5, -4, -4, -3, -3, -3, -2, -2, -2, -1, -1, 0, 0, 0, 0, 0,
+    1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 5, 6, 7, 8)
+HP_BONUS = (
+    -0.8, -0.6, -0.5, -0.4, -0.35, -0.3, -0.25, -0.2, -0.15, -0.11,
+    -0.07, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.15, 0.2, 0.25,
+    0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 1.0)
+# weight_limit[Str] in kg (the server's grams / 1000, as the stat is sent).
+WEIGHT_LIMIT = (
+    20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150,
+    165, 180, 195, 210, 225, 240, 255, 270, 285, 300, 325, 350, 375, 400, 450)
+# A player's archetype speed, the speed cap with no armour (max_speed), the
+# floor (PLAYER_MIN_SPEED) and the encumbrance start (ENCUMBRANCE_LIMIT).
+PLAYER_BASE_SPEED = 0.85
+UNCAPPED_SPEED = 9.0
+PLAYER_MIN_SPEED = 0.10
+ENCUMBRANCE_START = 0.65
+# Above this share of her weight limit the scorer starts weighing an item's
+# weight, ahead of the real slowdown at ENCUMBRANCE_START.
+ENCUMBRANCE_SCORED = 0.50
+
+GEAR_STYLES = ("melee", "caster", "bow")
+# Scorer weights, on the shop examine score's scale (AC +1 = 20, a protection
+# percent = PROTECTION_WEIGHT). Damage per second counts DPS_WEIGHT a point
+# after LEVEL_DAMAGE and the Str bonus; a speed of 1.0 counts SPEED_WEIGHT
+# (+0.1, a tenth faster walking and commands, is worth an AC+7).
+DPS_WEIGHT = 10
+WC_WEIGHT = 10
+SPEED_WEIGHT = 1500
+# Speed is her only escape without a working recall.
+NO_RECALL_SPEED_FACTOR = 1.5
+# A stat point is worth at least this, for the next table step.
+STAT_FLOOR = 5
+# What melee damage and WC are worth to a caster, and arrow WC and damage
+# to anyone but an archer, as a share of their full worth.
+OFF_STYLE_SHARE = 0.25
+# A launcher's delay is not in its examine text: this stands in for it.
+BOW_REFERENCE_DELAY = 1.0
+
+
+def _table(values: tuple, stat: int) -> Any:
+    return values[max(0, min(len(values) - 1, int(stat)))]
+
+
+def level_damage(level: int) -> float:
+    """LEVEL_DAMAGE (include/living.h): the skill level's damage factor."""
+    return 0.75 + level * 0.25 if level > 0 else 1.0
+
+
+def player_speed(dex: int, worn: Any, carried: float = 0.0,
+                 limit: float = 0.0) -> float:
+    """Her speed as ``living_update_player`` computes it from the worn
+    items' effective stats: the Dex bonus and N/3 per "(speed+N)" item,
+    clamped to the lowest armour speed cap, then 1 + N/3 per item a tenth
+    after the cap, then encumbrance above 65% of her weight limit."""
+    speed = PLAYER_BASE_SPEED + _table(SPEED_BONUS, dex)
+    worn = [stats for stats in worn if stats is not None]
+    added = sum(stats.speed / 3.0 if stats.speed > 0 else float(stats.speed)
+                for stats in worn if stats.speed)
+    bonus = sum(1.0 + stats.speed / 3.0 for stats in worn if stats.speed > 0)
+    if added >= 0:
+        speed += added / 10.0
+    else:
+        speed /= 1.0 - added
+    cap = min((stats.speed_cap for stats in worn
+               if stats.speed_cap and stats.item_type in ARMOUR_TYPES),
+              default=UNCAPPED_SPEED)
+    speed = min(speed, cap) + bonus / 10.0
+    return max(PLAYER_MIN_SPEED, speed * encumbrance_factor(carried, limit))
+
+
+def encumbrance_factor(carried: float, limit: float) -> float:
+    """The server's encumbrance multiplier: 1 up to 65% of the limit, then
+    linearly down to 0 at the limit."""
+    if limit <= 0 or carried <= limit * ENCUMBRANCE_START:
+        return 1.0
+    if carried >= limit:
+        return 0.0
+    return (limit - carried) / (limit * (1.0 - ENCUMBRANCE_START))
+
+
+def gear_style(combat_skill: str, caster: bool) -> str:
+    """Her scoring style from her build: caster while Wizardry trains, bow
+    when she trains an archery skill, melee otherwise."""
+    if caster:
+        return "caster"
+    return "bow" if "archery" in (combat_skill or "").casefold() else "melee"
+
+
+def _stat_total(stats: EffectiveStats | None, name: str) -> int:
+    return 0 if stats is None else sum(value for key, value in stats.stats if key == name)
+
+
+class GearScorer:
+    """The one gear decider: the equip loop (``FarmTask.maintain_inventory``),
+    shop upgrades (``BuyShopUpgradeTask``) and the surplus sale use it.
+
+    An item with examine data is valued by its effective stats for her
+    style; one without falls back to ``fallback`` (the name-based score).
+    Two items are compared on one scale only: when either lacks examine
+    data, both take the fallback (``compare``).
+
+    Context terms are the real change on her: an item is valued against her
+    worn set without whatever it would replace (its slot; for a ring, only
+    itself when worn), so speed (with the armour cap clamp), the stat tables
+    and caster gains count only what they add at her stats.
+    """
+
+    def __init__(self, client: Any, policy: Any, fallback: Callable[[Item], int],
+                 *, style: str | None = None, recall: bool = True):
+        self.client, self.policy, self.fallback = client, policy, fallback
+        style = style or getattr(policy, "gear_style", "") or (
+            "caster" if getattr(policy, "caster_stats", False) else "melee")
+        self.style = style if style in GEAR_STYLES else "melee"
+        self.recall = bool(recall)
+        state = client.state
+        stats = getattr(state, "stats", {}) or {}
+
+        def stat(name: str, default: int) -> int:
+            try:
+                return int(stats.get(name, 0) or 0) or default
+            except (TypeError, ValueError):
+                return default
+
+        self.level = stat("level", 1)
+        self.stats = {name: stat(name.casefold(), 13) for name in STAT_NAMES}
+        inventory = list(getattr(state, "inventory", ()) or ())
+        items = getattr(state, "items", {}) or {}
+        equipment = getattr(state, "equipment", {}) or {}
+        worn = {tag: items[tag] for tag in equipment.values() if tag in items}
+        worn.update((item.tag, item) for item in inventory
+                    if item.flags & c.ITEM_APPLIED)
+        self.worn = {tag: item for tag, item in worn.items()
+                     if item.item_type in GEAR_LABELS and
+                     item.item_type != c.TYPE_LIGHT_APPLY}
+        self._context: dict[int, EffectiveStats | None] = {}
+        self._values: dict[int, int | None] = {}
+        self.carried = sum(float(item.weight or 0) * item.quantity for item in inventory)
+        try:
+            self.limit = float(stats.get("weight_limit", 0) or 0)
+        except (TypeError, ValueError):
+            self.limit = 0.0
+        if self.limit <= 0:
+            self.limit = float(_table(WEIGHT_LIMIT, self.stats["Str"]))
+        worn_hp = sum(stats.maxhp for stats in map(self.context_stats, self.worn.values())
+                      if stats is not None)
+        self.base_hp = max(0.0, (stat("maxhp", 0) - worn_hp) /
+                           (1.0 + _table(HP_BONUS, self.stats["Con"])))
+        weapon = next((item for item in self.worn.values()
+                       if item.item_type == c.TYPE_WEAPON), None)
+        launcher = next((item for item in self.worn.values()
+                         if item.item_type == c.TYPE_BOW), None)
+        weapon_stats = self.context_stats(weapon) if weapon is not None else None
+        try:
+            shown_delay = float(stats.get("weapon_speed", 0) or 0)
+        except (TypeError, ValueError):
+            shown_delay = 0.0
+        self.weapon_delay = ((weapon_stats.delay if weapon_stats is not None else None) or
+                             shown_delay or 2.0)
+        self.skill_level = self._skill_level(launcher if self.style == "bow" else weapon)
+
+    def _skill_level(self, item: Item | None) -> int:
+        """The level of the skill her weapon (or launcher) trains; her level
+        when that skill is not known."""
+        items = getattr(self.client.state, "items", {}) or {}
+        skill = items.get(item.required_skill_tag) if item is not None else None
+        if skill is None and self.style == "bow":
+            skill = max((entry for entry in getattr(self.client.state, "inventory", ())
+                         if entry.item_type == c.TYPE_SKILL and
+                         "archery" in entry.name.casefold()),
+                        key=lambda entry: int(entry.extra.get("level", 0) or 0),
+                        default=None)
+        level = int(skill.extra.get("level", 0) or 0) if skill is not None else 0
+        return level or self.level
+
+    def context_stats(self, item: Item) -> EffectiveStats | None:
+        """Effective stats from examine or archetype, for her worn set."""
+        if item.tag not in self._context:
+            self._context[item.tag] = item_effective_stats(self.client, item)
+        return self._context[item.tag]
+
+    def effective(self, item: Item) -> EffectiveStats | None:
+        """Effective stats from examine data only, else None."""
+        stats = self.context_stats(item)
+        return stats if stats is not None and stats.source == "examine" else None
+
+    def _rest(self, item: Item) -> list[Item]:
+        """Her worn set without what this item would replace."""
+        if item.item_type == c.TYPE_RING:
+            return [worn for tag, worn in self.worn.items() if tag != item.tag]
+        return [worn for worn in self.worn.values() if worn.item_type != item.item_type]
+
+    def _rest_stats(self, rest: list[Item]) -> dict[str, int]:
+        """Her stats without the worn items left out of ``rest``."""
+        stats = dict(self.stats)
+        kept = {item.tag for item in rest}
+        for tag, item in self.worn.items():
+            if tag not in kept:
+                for name in STAT_NAMES:
+                    stats[name] -= _stat_total(self.context_stats(item), name)
+        return stats
+
+    def speed_delta(self, item: Item, stats: EffectiveStats | None = None) -> float:
+        """How much faster (or slower) she is with this item worn in its
+        slot than with the slot empty."""
+        stats = stats if stats is not None else self.context_stats(item)
+        if stats is None:
+            return 0.0
+        rest = self._rest(item)
+        own = self._rest_stats(rest)
+        others = [self.context_stats(worn) for worn in rest]
+        return (player_speed(own["Dex"] + _stat_total(stats, "Dex"), [*others, stats],
+                             self.carried, self.limit) -
+                player_speed(own["Dex"], others, self.carried, self.limit))
+
+    def weight_cost(self, item: Item) -> float:
+        """The speed her carrying this item's weight costs, once she carries
+        more than ENCUMBRANCE_SCORED of her limit; ramps in up to the real
+        slowdown at ENCUMBRANCE_START."""
+        if self.limit <= 0:
+            return 0.0
+        ratio = self.carried / self.limit
+        if ratio <= ENCUMBRANCE_SCORED:
+            return 0.0
+        ramp = min(1.0, (ratio - ENCUMBRANCE_SCORED) /
+                   (ENCUMBRANCE_START - ENCUMBRANCE_SCORED))
+        unloaded = player_speed(self.stats["Dex"],
+                                [self.context_stats(worn) for worn in self.worn.values()])
+        per_kg = unloaded / (self.limit * (1.0 - ENCUMBRANCE_START))
+        return float(item.weight or 0) * per_kg * ramp
+
+    def _speed_weight(self) -> float:
+        return SPEED_WEIGHT * (1.0 if self.recall else NO_RECALL_SPEED_FACTOR)
+
+    def value(self, item: Item) -> int | None:
+        """The item's worth on the effective scale, or None without examine
+        data. Never below 0, which marks a non-gear item. A scorer is made
+        per decision, so each item's value is kept for its lifetime."""
+        if item.tag not in self._values:
+            self._values[item.tag] = self._value(item)
+        return self._values[item.tag]
+
+    def _value(self, item: Item) -> int | None:
+        # A light is chosen for its light, which no stat shows.
+        if (item.item_type not in getattr(self.policy, "equipment_types", GEAR_LABELS) or
+                item.item_type == c.TYPE_LIGHT_APPLY):
+            return None
+        stats = self.effective(item)
+        if stats is None:
+            return None
+        rest = self._rest(item)
+        own = self._rest_stats(rest)
+        new = {name: own[name] + _stat_total(stats, name) for name in STAT_NAMES}
+        melee_share = OFF_STYLE_SHARE if self.style == "caster" else (
+            OFF_STYLE_SHARE if self.style == "bow" else 1.0)
+        missile_share = 1.0 if self.style == "bow" else OFF_STYLE_SHARE
+        level_factor = level_damage(self.skill_level)
+
+        def strength(value: int) -> float:
+            return 1.0 + _table(DAM_BONUS, value) / 10.0
+
+        # Melee damage per second: dam x LEVEL_DAMAGE x Str bonus / delay.
+        rest_dam = sum(worn.dam for worn in map(self.context_stats, rest) if worn is not None)
+        delay = max(0.125, (stats.delay if stats.item_type == c.TYPE_WEAPON else None) or
+                    self.weapon_delay)
+        dps_with = (rest_dam + stats.dam) * level_factor * strength(new["Str"]) / delay
+        dps_without = rest_dam * level_factor * strength(own["Str"]) / self.weapon_delay
+        damage = (dps_with - dps_without) * DPS_WEIGHT * melee_share
+        # Arrows: the launcher's (or arrow's) WC and damage per shot.
+        missile = (stats.missile_wc * WC_WEIGHT + stats.missile_dam * DPS_WEIGHT *
+                   level_factor * strength(new["Str"]) / BOW_REFERENCE_DELAY) * missile_share
+        wc_share = max(melee_share, missile_share)
+        wc = (stats.wc * melee_share +
+              (_table(WC_BONUS, new["Dex"]) - _table(WC_BONUS, own["Dex"])) * wc_share
+              ) * WC_WEIGHT
+        hp = stats.maxhp + self.base_hp * (_table(HP_BONUS, new["Con"]) -
+                                           _table(HP_BONUS, own["Con"]))
+        floor = sum(value * STAT_FLOOR for name, value in stats.stats
+                    if name in ("Str", "Dex", "Con"))
+        caster = 0.0
+        maxsp, regen = stats.maxsp, stats.regen_sp
+        caster_value = getattr(self.policy, "caster_value", None)
+        if self.style == "caster" and caster_value is not None:
+            bonuses = {key: value for key, value in (
+                ("int", _stat_total(stats, "Int")), ("pow", _stat_total(stats, "Pow")),
+                ("mana", stats.maxsp), ("regen", stats.regen_sp)) if value}
+            caster = caster_value(bonuses, worn=bool(item.flags & c.ITEM_APPLIED),
+                                  weapon=item.item_type in WEAPON_TYPES) if bonuses else 0.0
+            maxsp = regen = 0
+        else:
+            floor += sum(value * STAT_FLOOR for name, value in stats.stats
+                         if name in ("Int", "Pow"))
+        physical = sum(value for name, value in stats.attacks if name in PHYSICAL_ATTACKS)
+        attacks = (max(0.0, physical - 100) + sum(
+            value for name, value in stats.attacks if name not in PHYSICAL_ATTACKS)
+                   ) * (melee_share if item.item_type == c.TYPE_WEAPON else 1.0)
+        speed = (self.speed_delta(item, stats) - self.weight_cost(item)) * self._speed_weight()
+        total = (damage + missile + wc + stats.ac * 20 + stats.block * 2 + stats.absorb * 2 +
+                 sum(value for _, value in stats.protections) * PROTECTION_WEIGHT +
+                 attacks + hp + floor + maxsp + regen + stats.regen_hp +
+                 len(stats.specials) * SPECIAL_WEIGHT + caster + speed)
+        return max(0, round(total))
+
+    def score(self, item: Item) -> int:
+        """For ordering: the effective value, else the fallback."""
+        value = self.value(item)
+        return value if value is not None else self.fallback(item)
+
+    def compare(self, candidate: Item, current: list[Item]
+                ) -> tuple[int, list[int], bool]:
+        """The candidate's and the current items' scores on one scale, and
+        whether that scale is the effective one: the fallback for all when
+        any of them has no examine data."""
+        values = [self.value(item) for item in (candidate, *current)]
+        if all(value is not None for value in values):
+            return values[0], values[1:], True
+        return (self.fallback(candidate), [self.fallback(item) for item in current], False)
+
+    def displacement_margin(self, item: Item, effective: bool) -> int:
+        """What a caster upgrade must beat by once more to take off this
+        item (``InventoryPolicy.displacement_margin``): its protections'
+        worth, from its effective stats on the effective scale."""
+        if not effective:
+            return int(self.policy.displacement_margin(item))
+        stats = self.effective(item)
+        if self.style != "caster" or stats is None:
+            return 0
+        return round(sum(max(0.0, value) for _, value in stats.protections) *
+                     PROTECTION_WEIGHT)
+
+    def beats(self, candidate: Item, current: list[Item]) -> tuple[bool, Item | None]:
+        """Whether the candidate should replace the weakest of what she
+        wears in its slot, and that weakest item: it must beat it by
+        CHOICE_MARGIN plus the caster displacement margin. An empty slot
+        takes any."""
+        if not current:
+            return True, None
+        mine, theirs, effective = self.compare(candidate, current)
+        index = min(range(len(current)), key=theirs.__getitem__)
+        worst = current[index]
+        margin = CHOICE_MARGIN + self.displacement_margin(worst, effective)
+        return mine > theirs[index] + margin, worst
+
+
 # Margin a candidate must beat, in either score, before the choice changes;
 # the same as InventoryPolicy's equip loop (maintain_inventory).
 CHOICE_MARGIN = 15
@@ -515,27 +848,20 @@ CHOICE_MARGIN = 15
 def equipment_report(client: Any, policy: Any,
                      old_score: Callable[[Item], int]) -> dict[str, Any]:
     """Per gear family: what she wears, the best carried candidate, both
-    scores, the per-stat deltas and where the two models would choose
-    differently (the shadow comparison; nothing here equips anything)."""
+    scores, the per-stat deltas and where the old name score would choose
+    differently from ``GearScorer``, which decides (the shadow comparison;
+    nothing here equips anything). A new score is None without examine
+    data; the equip loop then falls back to the old score."""
     state = client.state
     equipped = set(state.equipment.values())
     level = int(state.stats.get("level", 0) or 0)
-    caster = policy.caster_value if getattr(policy, "caster_stats", False) else None
-    effective: dict[int, EffectiveStats | None] = {}
+    scorer = GearScorer(client, policy, old_score)
 
     def stats_of(item: Item) -> EffectiveStats | None:
-        if item.tag not in effective:
-            effective[item.tag] = item_effective_stats(client, item)
-        return effective[item.tag]
+        return scorer.context_stats(item)
 
     def new_score(item: Item) -> int | None:
-        stats = stats_of(item)
-        if stats is None:
-            return None
-        value = None if caster is None else (
-            lambda bonuses: caster(bonuses, worn=bool(item.flags & c.ITEM_APPLIED),
-                                   weapon=item.item_type in WEAPON_TYPES))
-        return effective_score(stats, value)
+        return scorer.value(item)
 
     def row(item: Item) -> dict[str, Any]:
         stats = stats_of(item)
@@ -567,33 +893,34 @@ def equipment_report(client: Any, policy: Any,
                  any(w.required_skill_tag and w.required_skill_tag != item.required_skill_tag
                      for w in worn))]
 
-        def choice(score: Callable[[Item], int | None], margin: Callable[[Item], int]
-                   ) -> Item | None:
-            """The candidate this score would put on, or None to keep what
-            she wears: as the equip loop, the best candidate must beat the
-            weakest worn item by the margin; an empty slot takes any."""
+        def choice() -> Item | None:
+            """The candidate the old name score would put on, or None to
+            keep what she wears: the best candidate must beat the weakest
+            worn item by the margin; an empty slot takes any."""
             best = max(((value, item) for item in candidates
-                        if (value := score(item)) is not None and value >= 0),
+                        if (value := old_score(item)) >= 0),
                        key=lambda pair: pair[0], default=None)
             if best is None or not worn:
                 return best[1] if best is not None else None
-            values = [(score(item), item) for item in worn]
-            if any(value is None for value, _ in values):
-                return None              # it cannot value what she wears
-            worst = min(values, key=lambda pair: pair[0])
-            return (best[1] if best[0] > worst[0] + CHOICE_MARGIN + margin(worst[1])
-                    else None)
+            worst = min(worn, key=old_score)
+            return (best[1] if best[0] > old_score(worst) + CHOICE_MARGIN +
+                    policy.displacement_margin(worst) else None)
 
-        # Only what the equip loop chooses is compared: it never puts on a
-        # girdle, and a light is chosen for its light, which no score sees.
+        def decided() -> Item | None:
+            """The candidate GearScorer puts on, as the equip loop does."""
+            return next((item for item in sorted(candidates, key=scorer.score, reverse=True)
+                         if scorer.score(item) >= 0 and scorer.beats(item, worn)[0]), None)
+
+        # Only what the equip loop chooses is compared: a light is chosen
+        # for its light, which no effective stat shows.
         compared = (item_type in policy.equipment_types and
                     item_type != c.TYPE_LIGHT_APPLY)
-        old_pick = choice(old_score, policy.displacement_margin) if compared else None
-        new_pick = choice(new_score, lambda item: 0) if compared else None
-        known = [item for item in candidates if new_score(item) is not None]
-        candidate = max(known, key=lambda item: new_score(item) or 0, default=None)
+        old_pick = choice() if compared else None
+        new_pick = decided() if compared else None
+        known = [item for item in candidates if stats_of(item) is not None]
+        candidate = max(known, key=scorer.score, default=None)
         weakest = min((item for item in worn if stats_of(item) is not None),
-                      key=lambda item: new_score(item) or 0, default=None)
+                      key=scorer.score, default=None)
         families.append({
             "type": item_type, "label": label,
             "worn": [row(item) for item in worn],
@@ -601,7 +928,8 @@ def equipment_report(client: Any, policy: Any,
             "deltas": (stat_deltas(stats_of(candidate),
                                    stats_of(weakest) if weakest is not None else None)
                        if candidate is not None else []),
-            # The candidate each score would put on; None keeps what she wears.
+            # What the old name score and GearScorer (the decider) would
+            # put on; None keeps what she wears.
             "old_choice": row(old_pick) if old_pick is not None else None,
             "new_choice": row(new_pick) if new_pick is not None else None,
             "diverges": old_pick is not new_pick,
@@ -764,8 +1092,8 @@ class GearExaminer:
         return True
 
     def shadow(self, client: Any, *, force: bool = False) -> None:
-        """Log where the effective-stats model would choose differently from
-        the current score: the shadow phase before F4 switches scoring."""
+        """Log where the old name score would choose differently from
+        GearScorer, which decides (kept as a diagnostic after F4)."""
         now = self.clock()
         if self.old_score is None or (not force and now - self.shadow_at < self.SHADOW_INTERVAL):
             return
@@ -792,8 +1120,8 @@ class GearExaminer:
             return (f"puts on {entry['name']} (old {entry['old_score']}, "
                     f"new {entry['new_score']})")
 
-        details = [f"{family['label'].lower()}: current scoring "
-                   f"{describe(family, family['old_choice'])}; effective stats "
+        details = [f"{family['label'].lower()}: name scoring "
+                   f"{describe(family, family['old_choice'])}; gear scorer "
                    f"{describe(family, family['new_choice'])}" for family in divergent]
         if not details:
             details = ["no divergence"]

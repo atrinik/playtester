@@ -26,7 +26,8 @@ from .targeting import select_target, target_set_aside
 from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      format_money, map_object_visual_name,
                      update_bank_balance)
-from .equipment import gear_examine_pending, gear_examiner
+from .equipment import (GearScorer, base_to_json, gear_examine_pending,
+                        gear_examiner, gear_style, parse_description)
 from . import route_shadow, terrain
 from . import owner_watch
 from .observations import is_player, plain
@@ -78,7 +79,7 @@ def equipment_face_catalog() -> dict[str, tuple[EquipmentPrototype, ...]]:
         c.TYPE_WEAPON, c.TYPE_BOW, c.TYPE_ARMOUR, c.TYPE_SHIELD,
         c.TYPE_HELMET, c.TYPE_PANTS, c.TYPE_AMULET, c.TYPE_RING,
         c.TYPE_LIGHT_APPLY, c.TYPE_CLOAK, c.TYPE_BOOTS,
-        c.TYPE_GLOVES, c.TYPE_BRACERS,
+        c.TYPE_GLOVES, c.TYPE_BRACERS, c.TYPE_GIRDLE,
     }
     skill_names = {
         13: "bow archery", 14: "crossbow archery",
@@ -530,13 +531,32 @@ def heals_losing(client: AtrinikClient, ceiling: float,
 
 def carried_gear_score(client: AtrinikClient, policy: "InventoryPolicy"
                        ) -> Callable[[Item], int]:
-    """The score the equip loop (maintain_inventory) ranks carried gear by:
-    the name-based gear_score plus its archetype's base score."""
+    """The name-based score: gear_score plus its archetype's base score.
+    GearScorer falls back to it for gear with no examine data."""
     def score(item: Item) -> int:
         prototype = BuyShopUpgradeTask._prototype(client, item)
         return policy.gear_score(item) + (prototype.base_score
                                           if prototype is not None else 0)
     return score
+
+
+def working_recall(client: AtrinikClient) -> bool:
+    """Whether a recall source of hers works now (navigation's
+    has_working_recall); True when that cannot be read."""
+    try:
+        from .navigation import has_working_recall
+        return bool(has_working_recall(client))
+    except Exception:            # a scoring input must never stop her
+        return True
+
+
+def gear_scorer(client: AtrinikClient, policy: "InventoryPolicy",
+                fallback: Callable[[Item], int] | None = None) -> GearScorer:
+    """The one gear decider (equipment.GearScorer) for the equip loop, shop
+    upgrades and the surplus sale, styled by ``policy.gear_style``."""
+    return GearScorer(client, policy,
+                      fallback or carried_gear_score(client, policy),
+                      recall=working_recall(client))
 
 
 def wand_charges(client: AtrinikClient) -> dict[int, int]:
@@ -1625,6 +1645,8 @@ class InventoryPolicy:
     # rather than generically, against her stats in caster_profile.
     caster_stats: bool = False
     caster_profile: CasterProfile | None = None
+    # GearScorer's profile (equipment.GEAR_STYLES): melee, caster or bow.
+    gear_style: str = "melee"
 
     reserve_words: tuple[str, ...] = (
         "quest", "key", "talisman", "artifact", "unique", "exceptional",
@@ -1634,7 +1656,7 @@ class InventoryPolicy:
         c.TYPE_WEAPON, c.TYPE_BOW, c.TYPE_ARMOUR, c.TYPE_SHIELD,
         c.TYPE_HELMET, c.TYPE_PANTS, c.TYPE_AMULET, c.TYPE_RING,
         c.TYPE_LIGHT_APPLY, c.TYPE_CLOAK, c.TYPE_BOOTS,
-        c.TYPE_GLOVES, c.TYPE_BRACERS,
+        c.TYPE_GLOVES, c.TYPE_BRACERS, c.TYPE_GIRDLE,
     )
     equipment_slots: dict[int, tuple[int, ...]] = field(default_factory=lambda: {
         c.TYPE_WEAPON: (c.EQUIP_WEAPON,),
@@ -1650,6 +1672,7 @@ class InventoryPolicy:
         c.TYPE_BOOTS: (c.EQUIP_BOOTS,),
         c.TYPE_GLOVES: (c.EQUIP_GAUNTLETS,),
         c.TYPE_BRACERS: (c.EQUIP_BRACERS,),
+        c.TYPE_GIRDLE: (c.EQUIP_BELT,),
     })
 
     identification_types: tuple[int, ...] = (
@@ -4684,6 +4707,8 @@ class FarmTask(BotTask):
         self.inventory_policy.caster_profile = (
             CasterProfile.from_client(client)
             if self.inventory_policy.caster_stats else None)
+        self.inventory_policy.gear_style = gear_style(
+            self.combat_skill, self.inventory_policy.caster_stats)
         for item in client.state.inventory:
             lore_attempted = getattr(client, "lore_book_attempted", None)
             if (item.item_type == c.TYPE_BOOK and
@@ -4768,7 +4793,8 @@ class FarmTask(BotTask):
                     for tag in client.state.equipment.values()
                     if tag in client.state.items]
         equipped_by_tag = {item.tag: item for item in equipped}
-        score_item = carried_gear_score(client, self.inventory_policy)
+        scorer = gear_scorer(client, self.inventory_policy)
+        score_item = scorer.score
 
         for candidate in sorted(
                 client.state.inventory,
@@ -4806,10 +4832,10 @@ class FarmTask(BotTask):
                         item.required_skill_tag != candidate.required_skill_tag
                         for item in current)):
                 continue
-            worst = min(current, key=score_item) if current else None
-            if worst is not None and score <= (
-                    score_item(worst) + 15 +
-                    self.inventory_policy.displacement_margin(worst)):
+            # One scale for both: effective stats when all were examined,
+            # else the name score (GearScorer.beats).
+            upgrade, worst = scorer.beats(candidate, current)
+            if not upgrade:
                 continue
             if worst is not None and len(current) >= len(slots) > 1:
                 # Both ring slots are full. The server would take off the
@@ -7767,7 +7793,8 @@ class BuyShopUpgradeTask(BotTask):
                  cash_reserve: int = 1_000,
                  spend_fraction: float = 0.25,
                  allow_launchers: bool = True,
-                 caster_stats: bool = False):
+                 caster_stats: bool = False,
+                 style: str = ""):
         super().__init__("buy-shop-upgrade")
         self.min_improvement = max(1, int(min_improvement))
         self.cash_reserve = max(0, int(cash_reserve))
@@ -7776,6 +7803,9 @@ class BuyShopUpgradeTask(BotTask):
         # The owning circuit sets this while she trains Wizardry, as the
         # farm's maintain_inventory does for carried gear.
         self.policy = InventoryPolicy(caster_stats=bool(caster_stats))
+        # GearScorer's profile; caster while she trains Wizardry.
+        self.policy.gear_style = style or (
+            "caster" if caster_stats else "melee")
         self._candidate = 0
         self._feedback_start = 0
         self._examined_at = 0.0
@@ -7934,6 +7964,9 @@ class BuyShopUpgradeTask(BotTask):
         return self.policy.gear_score(item) + base
 
     def _upgrade_score(self, client: AtrinikClient, candidate: Item) -> int:
+        """The candidate's gain over what she owns for its slot, on
+        GearScorer's scale (the equip loop's), or -1 when it is no upgrade
+        by min_improvement."""
         if (not self._structurally_eligible(client, candidate) or
                 not self.policy.identified(candidate)):
             return -1
@@ -7954,12 +7987,19 @@ class BuyShopUpgradeTask(BotTask):
                 self.policy.identified(item)
             })
             current = list(current_by_tag.values())
-        scored = [(self._gear_score(client, item), item) for item in current]
+        # The same scorer as the equip loop, on one scale: effective stats
+        # when the stock and what she owns were all examined, else the
+        # name score (with this examine's score for the stock).
+        scorer = gear_scorer(client, self.policy,
+                             lambda item: self._gear_score(client, item))
+        mine, theirs, effective = scorer.compare(candidate, current)
+        scored = list(zip(theirs, current))
         baseline = ((max if len(slots) == 1 else min)(
             scored, key=lambda value: value[0]) if scored else None)
-        improvement = self._gear_score(client, candidate) - (
-            baseline[0] if baseline is not None else 0)
-        margin = (self.policy.displacement_margin(baseline[1])
+        improvement = mine - (baseline[0] if baseline is not None else 0)
+        # Buying adds its weight: GearScorer counts that in the effective
+        # value once she is loaded (weight_cost).
+        margin = (scorer.displacement_margin(baseline[1], effective)
                   if baseline is not None else 0)
         return (improvement if improvement >= self.min_improvement + margin
                 else -1)
@@ -7984,6 +8024,13 @@ class BuyShopUpgradeTask(BotTask):
 
     def _apply_examine_metadata(self, client: AtrinikClient, candidate: Item,
                                 feedback: str) -> bool:
+        # The examine's base stats, as GearExaminer stores carried gear's,
+        # so GearScorer values the stock exactly as the equip loop will.
+        base = parse_description(feedback)
+        if base is not None:
+            candidate.extra["gear_examine"] = {
+                "name": candidate.name, "base": base_to_json(base),
+                "at": time.time()}
         quality = re.search(
             r"Qua:\s*(\d+)\s+Con:\s*(Indestructible|\d+)",
             feedback, re.I)

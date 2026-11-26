@@ -44,7 +44,7 @@ from . import route_events
 from . import planner
 from . import route_shadow
 from . import unlocks
-from .equipment import abandon_gear_examine
+from .equipment import abandon_gear_examine, gear_style
 from .observations import WHITE as WHITE_NAME, is_player, plain
 from .route_blocks import NO_WALLS, OwnerWalls
 from .route_costs import drain
@@ -75,7 +75,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     UnpreparedHold, empty_recall_wand,
                     usable_recharge_scroll, wand_known_empty,
                     area_caster_identities, tiled_neighbours)
-from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
+from .tasks import RECALL_REQUIRED_LEVEL, gear_scorer, heal_consumables, reads_scrolls
 log = logging.getLogger(__name__)
 
 
@@ -6527,7 +6527,8 @@ class ShopUpgradeSweepTask(BotTask):
                  allow_launchers: bool = True,
                  allow_hostile_transit: bool = False,
                  start_index: int = 0,
-                 caster_stats: bool = False):
+                 caster_stats: bool = False,
+                 style: str = ""):
         super().__init__("shop-upgrade-sweep")
         self.graph = graph
         self.waypoints = [
@@ -6550,13 +6551,15 @@ class ShopUpgradeSweepTask(BotTask):
         self.allow_hostile_transit = bool(allow_hostile_transit)
         # Value stock as a Wizardry caster would (see InventoryPolicy).
         self.caster_stats = bool(caster_stats)
+        # GearScorer's profile for the stock (equipment.gear_style).
+        self.style = style
 
     def _new_child(self) -> NavigateThenTask:
         path, point = self.waypoints[self.index]
         child = NavigateThenTask(
             self.graph, path, BuyShopUpgradeTask(
                 allow_launchers=self.allow_launchers,
-                caster_stats=self.caster_stats),
+                caster_stats=self.caster_stats, style=self.style),
             destination_xy=point, combat_approach=True,
             # Regional stock is reached through one authored level-14/15
             # crocodile/frog road. At level 18+, permit the live defensive
@@ -10960,10 +10963,8 @@ class FarmCircuitTask(BotTask):
             if tag in client.state.items
         }
 
-        def score(item: Item) -> int:
-            prototype = BuyShopUpgradeTask._prototype(client, item)
-            return (policy.gear_score(item) +
-                    (prototype.base_score if prototype is not None else 0))
+        # The equip loop's decider: what it would never put on is surplus.
+        scorer = gear_scorer(client, policy)
 
         surplus = []
         for item in client.state.inventory:
@@ -10988,8 +10989,7 @@ class FarmCircuitTask(BotTask):
                 any(equipped_item.required_skill_tag and
                     equipped_item.required_skill_tag != item.required_skill_tag
                     for equipped_item in current))
-            if (different_weapon_school or
-                    score(item) <= min(score(value) for value in current) + 15):
+            if different_weapon_school or not scorer.beats(item, current)[0]:
                 surplus.append(item)
         return surplus
 
@@ -11786,7 +11786,8 @@ class FarmCircuitTask(BotTask):
                 not self._auto_combat_build and not bool(self.combat_spell)),
             allow_hostile_transit=level >= 18,
             start_index=cursor,
-            caster_stats=self._trains_wizardry(client))
+            caster_stats=self._trains_wizardry(client),
+            style=gear_style(self.combat_skill, self._trains_wizardry(client)))
 
     def _trains_wizardry(self, client: AtrinikClient) -> bool:
         """Whether her current build trains Wizardry, as FarmTask decides
