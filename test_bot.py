@@ -42033,6 +42033,15 @@ class BuildPerSpotTests(unittest.TestCase):
         self.assertEqual(client.active_build_style, "ranged-kite")
         self.assertIn("build-swap", [action for action, _ in client.actions])
         self.assertTrue(circuit._needs_apartment_storage(client))
+        # A circuit rebuilt before the trip (after a food trip, say) takes
+        # the pending swap and its backoffs over.
+        self.assertEqual(client.pending_swap_build, "single")
+        self.assertIn("_storage_backoff_until", FarmCircuitTask.BACKOFF_ATTRIBUTES)
+        self.assertIn("_learn_retry_at", FarmCircuitTask.BACKOFF_ATTRIBUTES)
+        rebuilt = self._circuit(client)
+        rebuilt.child = rebuilt._new_child()
+        self.assertTrue(rebuilt._review_combat_build(client, rebuilt.child.task))
+        self.assertEqual((rebuilt._build_name, rebuilt._swap_build), ("single", "single"))
         trip = circuit._new_apartment_storage(client)
         swap = trip.task
         self.assertIsInstance(swap, SwapSetTask)
@@ -42099,7 +42108,8 @@ class BuildPerSpotTests(unittest.TestCase):
         explicit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
         client.build_styles = ("melee", "ranged-kite")
         self.assertFalse(explicit._review_combat_build(client, successor.child.task))
-        self.assertEqual((client.active_build_style, client.build_styles), ("", ()))
+        self.assertEqual((client.active_build_style, client.build_styles,
+                          client.active_build), ("", (), ""))
 
     def test_the_suggestion_lists_owned_items_first(self):
         from . import storage

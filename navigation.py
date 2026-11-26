@@ -9669,6 +9669,7 @@ class FarmCircuitTask(BotTask):
         # never cuts it short), and the errand's own retry time.
         self._storage_backoff_until = 0.0
         self._learn_retry_at = 0.0
+        self._shortfall_from_seller = False
         # Whether this circuit took over the build she was fielding.
         self._build_seeded = False
         self._cure: NavigateThenTask | None = None
@@ -9718,7 +9719,7 @@ class FarmCircuitTask(BotTask):
         "_shopping_retry_at", "_recall_shopping_retry_at",
         "_utility_shopping_retry_at", "_ship_key_retry_at", "_spell_retry_at",
         "_cure_retry_at", "_restoration_retry_at", "_heal_restock_retry_at",
-        "_recharge_read_until",
+        "_recharge_read_until", "_storage_backoff_until", "_learn_retry_at",
     )
 
     def backoffs(self) -> dict[str, float]:
@@ -10266,6 +10267,8 @@ class FarmCircuitTask(BotTask):
                   "" if name == "melee" else builds.BUILDS[name].encounter_style)
         if name != previous:
             self._plan_swap(client)
+            # A successor circuit takes over a swap not yet made.
+            _set_attr(client, "pending_swap_build", self._swap_build)
 
     def _review_combat_build(self, client: AtrinikClient,
                              farm: FarmTask) -> bool:
@@ -10273,10 +10276,10 @@ class FarmCircuitTask(BotTask):
         if not self._auto_combat_build:
             # An explicit circuit fields no build: no build style rates her
             # spot, and no other style is run for it.
-            if getattr(client, "active_build_style", ""):
-                _set_attr(client, "active_build_style", "")
-            if getattr(client, "build_styles", ()):
-                _set_attr(client, "build_styles", ())
+            for name, empty in (("active_build_style", ""), ("build_styles", ()),
+                                ("active_build", ""), ("pending_swap_build", "")):
+                if getattr(client, name, empty):
+                    _set_attr(client, name, empty)
             return False
         if not self._build_seeded:
             # A new circuit starts with the build she already fields (and
@@ -10284,6 +10287,9 @@ class FarmCircuitTask(BotTask):
             self._build_seeded = True
             seeded = getattr(client, "active_build", "melee")
             self._build_name = seeded if seeded in builds.BUILDS else "melee"
+            pending = getattr(client, "pending_swap_build", "")
+            if pending == self._build_name:
+                self._swap_build = pending
         desired = self._automatic_combat_plan(client)
         current = (self.combat_skill, self.combat_spell,
                    self.combat_skill_until_level)
@@ -12886,8 +12892,14 @@ class FarmCircuitTask(BotTask):
                 f"{format_money(reserve)} cure reserve)")
             self._spell_shortfall_key = (offer.spell, offer.price)
             return False
+        if self.clock() < self._learn_retry_at:
+            # The seller's own refusal stands for its backoff.
+            if not self._shortfall_from_seller:
+                self._spell_shortfall = ""
+            return False
         self._spell_shortfall = ""
-        return self.clock() >= self._learn_retry_at
+        self._shortfall_from_seller = False
+        return True
 
     def _new_learn_spell(self, client: AtrinikClient) -> NavigateThenTask:
         offer = self._learn_offer(client)
@@ -13245,6 +13257,7 @@ class FarmCircuitTask(BotTask):
                                 self._spell_purchase.error)
                     self._learn_retry_at = self.clock() + self.failure_backoff(
                         self._spell_purchase.error, 1800.0)
+                    self._shortfall_from_seller = bool(learn.shortfall)
                     if learn.shortfall:
                         self._spell_shortfall = self._spell_purchase.error
                         self._spell_shortfall_key = (learn.spell, learn.shortfall)
@@ -13545,11 +13558,13 @@ class FarmCircuitTask(BotTask):
                 self._strict_trip_refused(
                     client, "apartment storage", self._storage.error)
                 self._swap_build = ""
+                _set_attr(client, "pending_swap_build", "")
                 self._storage = None
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
                 # One swap trip per build change.
                 self._swap_build = ""
+                _set_attr(client, "pending_swap_build", "")
                 note_cure_funding_errand(client)
                 # One visit per STORAGE_VISIT_SECONDS at most: what it could
                 # not settle (a bag over the weight cap) waits.
