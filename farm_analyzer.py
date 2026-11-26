@@ -1145,7 +1145,9 @@ class FarmAnalyzer:
         if self.encounter_due(own) or (
                 self.encounter_key != current and self.report is not None and
                 not self.running and not self.encounter_running and
-                own.healing_per_second > 0):
+                own.combat_style and own.healing_per_second > 0 and
+                (not self.encounter_error or
+                 self.clock() - self._encounter_attempt_at >= self.RETRY_SECONDS)):
             self._encounter_attempt_at = self.clock()
             self.encounter_key = current
             self._encounter_task = asyncio.get_running_loop().create_task(
