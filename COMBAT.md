@@ -228,7 +228,9 @@ Protections count 8 per percent everywhere: through the name's generic
 "+N", and in the shop examine score when the ground name lacks them. A
 caster upgrade takes off a protection item only when it wins clearly, by
 the protection's worth once more: one regeneration point does not displace
-her "slow +14%" ring, two do. Melee scoring has no such margin.
+her "slow +14%" ring, two do. Melee scoring has no such margin. On
+`GearScorer`'s effective scale (README, "Equipment") that worth is the
+item's protections scaled by its condition, as the server counts them.
 
 With both ring slots full, the server keeps whichever worn ring comes first
 in inventory order and takes off the other, which may be the better one.

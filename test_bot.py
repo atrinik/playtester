@@ -4410,9 +4410,10 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertEqual(stock.extra["examined_gear_detail"]["stats"], 0)
         # Its baseline is the weaker worn ring, the worthless Pow+1 one
         # (the force ring scores 136 more); inventory upkeep takes that one
-        # off explicitly. The gain is one regeneration point.
-        self.assertEqual(caster._upgrade_score(client, stock),
-                         210 + 333 - 240)
+        # off explicitly. The gain is one regeneration point: all three
+        # show their stats, so the effective scale (GearScorer) decides,
+        # with no name-score quality or condition terms.
+        self.assertEqual(caster._upgrade_score(client, stock), 333)
 
     def test_shop_upgrade_counts_unreadied_owned_bow_as_baseline(self):
         owned = Item(
@@ -10257,6 +10258,9 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             "brass ring (Protections: force +17%)",
             "iron ring (Protections: slow +14%)",
             "gold ring (mana reg.+0.4)")
+        # At full condition: the effective scale counts each protection as
+        # the server does, scaled by its condition.
+        client.state.items[61].condition = client.state.items[62].condition = 100
         task = FarmTask(zone="/test", combat_skill="wizardry spells")
         asyncio.run(task.maintain_inventory(client))
         # One regeneration point (235) beats the slow ring (112) but not
@@ -28811,19 +28815,31 @@ class EquipmentTests(unittest.TestCase):
         json.dumps(report)
 
     def test_shadow_logs_where_the_two_scores_disagree(self):
-        from .equipment import GearExaminer
+        from .equipment import GearExaminer, archetype_for, base_to_json
         from .tasks import InventoryPolicy, carried_gear_score
         client = self.section_two_client()
         policy = InventoryPolicy()
         examiner = GearExaminer(clock=lambda: 100.0)
         examiner.policy, examiner.old_score = policy, carried_gear_score(client, policy)
         examiner.shadow(client, force=True)
+        # Not examined: the gear scorer falls back to the name score, so
+        # both choose alike and nothing is logged.
+        self.assertEqual(client.recorded, [])
+        # Both body armours examined (their archetypes' values).
+        for tag in (10, 11):
+            item = client.state.items[tag]
+            _, base = archetype_for(client.faces[item.face], item.item_type)
+            item.extra["gear_examine"] = {
+                "name": item.name, "base": {**base_to_json(base), "source": "examine"}}
+        examiner.shadow(client, force=True)
         # Body armour: the name-based score values the chain mail's quality
         # and the ring mail's "+2" alike and keeps what she wears; effective
-        # stats count the ring mail's better impact protection.
+        # stats count the ring mail's better impact protection, and the
+        # chain mail's speed cap 0.80 slows her from 0.85 (-0.05, 75 points)
+        # where the ring mail's 0.90 does not.
         self.assertEqual(client.recorded, [("gear-shadow", (
-            "body armour: current scoring keeps silksteel chain mail +1 (old 463, new 740); "
-            "effective stats puts on black iron ring mail +2 (old 456, new 780)"))])
+            "body armour: name scoring keeps silksteel chain mail +1 (old 463, new 665); "
+            "gear scorer puts on black iron ring mail +2 (old 456, new 780)"))])
         # Logged once per change, not on every call.
         count = len(client.recorded)
         examiner.shadow(client, force=True)
@@ -29125,6 +29141,227 @@ class EquipmentTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(looks_renamed(content, name))
         self.assertTrue(looks_renamed(content, "Lucky Blade"))
+
+
+class GearScorerTests(unittest.TestCase):
+    """The one gear decider (equipment.GearScorer): effective stats by
+    style, speed by the server formula, and the name-score fallback."""
+
+    @staticmethod
+    def examined(tag, item_type, name, text, *, worn=False, weight=0.5,
+                 quality=80, condition=100, required_level=0):
+        from .equipment import base_to_json, parse_description
+        item = Item(tag, item_type=item_type, name=name, quality=quality,
+                    condition=condition, weight=weight, required_level=required_level,
+                    flags=c.ITEM_APPLIED if worn else 0)
+        if text is not None:
+            item.extra["gear_examine"] = {
+                "name": name, "base": base_to_json(parse_description(text)), "at": 0.0}
+        return item
+
+    @staticmethod
+    def client(*items, stats=None, equipment=None):
+        state = GameState(phase="playing", player_tag=1)
+        state.stats.update({"level": 37, "str": 14, "dex": 14, "con": 13, "int": 12,
+                            "pow": 12, "maxhp": 356, "maxsp": 82, "weight_limit": 140.0,
+                            "weapon_speed": 3.0, **(stats or {})})
+        for item in items:
+            state.place_item(item, 1)
+        state.equipment = dict(equipment or {})
+        client = type("Client", (), {})()
+        client.state, client.faces = state, {}
+        client.applied = []
+
+        async def apply(tag, apply_action=0):
+            client.applied.append(tag)
+
+        async def lock_item(tag):
+            pass
+
+        client.apply, client.lock_item = apply, lock_item
+        return client
+
+    def belt_client(self):
+        """Her girdle slot on 2026-11-26 (live /api/state): the soft leather
+        girdle worn, the forged meteoric steel belt carried, both examined."""
+        girdle = self.examined(
+            683030, c.TYPE_GIRDLE, "soft leather girdle",
+            "soft leather girdle (Protections: impact +2%, slash +2%, cleave +2%, "
+            "pierce +2%)", worn=True, weight=0.2, quality=80, condition=80)
+        belt = self.examined(
+            682976, c.TYPE_GIRDLE, "forged meteoric steel belt",
+            "forged meteoric steel belt (ac+1) (Protections: impact +5%, slash +5%, "
+            "cleave +5%, pierce +5%)", weight=2.0, quality=95, condition=95,
+            required_level=10)
+        belt.flags |= c.ITEM_LOCKED
+        girdle.flags |= c.ITEM_LOCKED
+        return self.client(girdle, belt, equipment={c.EQUIP_BELT: girdle.tag}), girdle, belt
+
+    def test_speed_follows_the_server_formula(self):
+        from .equipment import BaseStats, effective_stats, parse_description, player_speed
+        base = parse_description("boots of speed (ac+1) (speed+1) (speed cap 1.10)")
+        self.assertEqual((base.speed, base.speed_cap, base.ac), (1, 1.1, 1))
+        self.assertEqual(parse_description("mail (speed cap 0.80) (ac+5)").speed, 0)
+        boots = effective_stats(c.TYPE_BOOTS, BaseStats(speed=1))
+        cap = effective_stats(c.TYPE_ARMOUR, BaseStats(ac=5, speed_cap=0.8))
+        fast = effective_stats(c.TYPE_RING, BaseStats(speed=3))
+        # Her live speed: 0.85 + Dex 14's 0.025 (0.875), under the 1.10 cap.
+        self.assertAlmostEqual(player_speed(14, [effective_stats(
+            c.TYPE_ARMOUR, BaseStats(ac=10, speed_cap=1.1))]), 0.875)
+        # (speed+1): +1/30 before the cap, +(1 + 1/3)/10 after it.
+        self.assertAlmostEqual(player_speed(13, [boots]), 0.85 + 1 / 30 + 0.4 / 3)
+        # The cap clamps only the first part: 0.95 -> 0.80, then +0.2.
+        self.assertAlmostEqual(player_speed(13, [cap, fast]), 1.0)
+        # Encumbrance: linear from 65% of the limit to 0 at 100%.
+        self.assertAlmostEqual(player_speed(13, [], carried=82.5, limit=100), 0.425)
+        self.assertAlmostEqual(player_speed(13, [], carried=99.9, limit=100), 0.1)
+        # A launcher's "(speed+N)" does not count (ranged items, living.c).
+        self.assertEqual(effective_stats(c.TYPE_BOW, BaseStats(speed=2)).speed, 0)
+
+    def test_speed_items_and_armour_caps_are_scored_by_her_real_gain(self):
+        from .equipment import SPEED_WEIGHT, NO_RECALL_SPEED_FACTOR, GearScorer
+        from .tasks import InventoryPolicy, carried_gear_score
+        plain = self.examined(1, c.TYPE_BOOTS, "boots", "boots (ac+1)", worn=True)
+        fast = self.examined(2, c.TYPE_BOOTS, "boots of speed", "boots of speed (ac+1) (speed+1)")
+        client = self.client(plain, fast, equipment={c.EQUIP_BOOTS: 1})
+        policy = InventoryPolicy()
+        scorer = GearScorer(client, policy, carried_gear_score(client, policy))
+        gain = 1 / 30 + 0.4 / 3
+        self.assertAlmostEqual(scorer.speed_delta(fast), gain)
+        self.assertEqual(scorer.value(fast) - scorer.value(plain), round(gain * SPEED_WEIGHT))
+        # Without a working recall speed is her escape: weighted up.
+        hurried = GearScorer(client, policy, carried_gear_score(client, policy), recall=False)
+        self.assertEqual(hurried.value(fast) - hurried.value(plain),
+                         round(gain * SPEED_WEIGHT * NO_RECALL_SPEED_FACTOR))
+        # The armour speed cap: the same protection with a bigger cap wins
+        # by what the lower cap takes off her 0.875.
+        worn = self.examined(3, c.TYPE_ARMOUR, "chain mail",
+                             "chain mail (speed cap 0.80) (ac+6) "
+                             "(Protections: slash +20%)", worn=True)
+        light = self.examined(4, c.TYPE_ARMOUR, "elven mail",
+                              "elven mail (speed cap 1.10) (ac+6) (Protections: slash +20%)")
+        client = self.client(worn, light, equipment={c.EQUIP_ARMOUR: 3})
+        scorer = GearScorer(client, policy, carried_gear_score(client, policy))
+        self.assertAlmostEqual(scorer.speed_delta(worn), -0.075)
+        self.assertAlmostEqual(scorer.speed_delta(light), 0.0)
+        self.assertAlmostEqual(scorer.value(light) - scorer.value(worn),
+                               0.075 * SPEED_WEIGHT, delta=1)
+        upgrade, replaced = scorer.beats(light, [worn])
+        self.assertTrue(upgrade)
+        self.assertIs(replaced, worn)
+        task = FarmTask()
+        self.assertTrue(asyncio.run(task.maintain_inventory(client)))
+        self.assertEqual(client.applied, [4])
+
+    def test_a_heavy_item_costs_speed_once_she_is_loaded(self):
+        from .equipment import GearScorer
+        from .tasks import InventoryPolicy, carried_gear_score
+        heavy = self.examined(1, c.TYPE_ARMOUR, "plate", "plate (ac+6)", weight=20.0)
+        light = self.examined(2, c.TYPE_ARMOUR, "plate", "plate (ac+6)", weight=2.0)
+        policy = InventoryPolicy()
+        for load, costs in ((40.0, False), (75.0, True), (95.0, True)):
+            with self.subTest(load=load):
+                sack = Item(9, item_type=c.TYPE_CONTAINER, name="sack",
+                            weight=load - 22.0)
+                client = self.client(heavy, light, sack, stats={"weight_limit": 140.0})
+                scorer = GearScorer(client, policy, carried_gear_score(client, policy))
+                self.assertEqual(scorer.weight_cost(heavy) > 0, costs)
+                if costs:
+                    self.assertLess(scorer.value(heavy), scorer.value(light))
+                else:
+                    self.assertEqual(scorer.value(heavy), scorer.value(light))
+
+    def test_the_meteoric_belt_replaces_the_soft_leather_girdle(self):
+        # Live: the equip loop never wore it. Girdles were no equipment
+        # type with no belt slot, so gear_score gave both -1.
+        from .equipment import equipment_report
+        from .tasks import InventoryPolicy, carried_gear_score
+        client, girdle, belt = self.belt_client()
+        task = FarmTask(combat_skill="slash weapons")
+        self.assertTrue(asyncio.run(task.maintain_inventory(client)))
+        self.assertEqual(client.applied, [belt.tag])
+        policy = InventoryPolicy()
+        report = equipment_report(client, policy, carried_gear_score(client, policy))
+        family = next(f for f in report["families"] if f["type"] == c.TYPE_GIRDLE)
+        self.assertEqual(family["new_choice"]["name"], "forged meteoric steel belt")
+        # AC +1 (20) and 4 x 4.8% protections at condition 95 (154), over
+        # the girdle's 4 x 1.6% at condition 80 (51).
+        self.assertEqual(family["new_choice"]["new_score"], 174)
+        self.assertEqual(family["worn"][0]["new_score"], 51)
+
+    def test_style_profiles_value_the_same_gear_differently(self):
+        from .equipment import GearScorer, gear_style
+        from .tasks import CasterProfile, InventoryPolicy, carried_gear_score
+        self.assertEqual(gear_style("wizardry spells", True), "caster")
+        self.assertEqual(gear_style("bow archery", False), "bow")
+        self.assertEqual(gear_style("slash weapons", False), "melee")
+        skill = Item(90, item_type=c.TYPE_SKILL, name="slash weapons", extra={"level": 36})
+        sword = self.examined(10, c.TYPE_WEAPON, "sword", "sword (wc+4) (dam+8) (3.00 sec)",
+                              worn=True)
+        sword.required_skill_tag = skill.tag
+        might = self.examined(11, c.TYPE_RING, "ring (dam+2)", "ring (dam+2)")
+        mind = self.examined(12, c.TYPE_RING, "ring (Pow+2) (mana+10)",
+                             "ring (Pow+2) (mana+10)")
+        quick = self.examined(13, c.TYPE_WEAPON, "rapier", "rapier (wc+4) (dam+6) (2.00 sec)")
+        quick.required_skill_tag = skill.tag
+        bow = self.examined(14, c.TYPE_BOW, "long bow", "long bow (wc+4) (dam+6)")
+        client = self.client(skill, sword, might, mind, quick, bow,
+                             stats={"pow": 15, "int": 15},
+                             equipment={c.EQUIP_WEAPON: sword.tag})
+
+        def scorer(style):
+            policy = InventoryPolicy(caster_stats=style == "caster", gear_style=style)
+            if style == "caster":
+                policy.caster_profile = CasterProfile.from_client(client)
+            return GearScorer(client, policy, carried_gear_score(client, policy))
+
+        melee, caster, archer = scorer("melee"), scorer("caster"), scorer("bow")
+        # Melee: damage per second at Slash 36 (LEVEL_DAMAGE 9.75) beats mana.
+        self.assertGreater(melee.value(might), melee.value(mind))
+        # Caster: Pow 15 -> 17 (spell damage) and mana beat melee damage.
+        self.assertGreater(caster.value(mind), caster.value(might))
+        # Melee: 6 damage every 2 s beats 8 every 3 s.
+        self.assertGreater(melee.value(quick), melee.value(sword))
+        # The launcher's arrows count in full only for an archer.
+        self.assertGreater(archer.value(bow), melee.value(bow))
+
+    def test_shop_upgrades_use_the_equip_loops_score(self):
+        from .tasks import InventoryPolicy, gear_scorer
+        client, girdle, belt = self.belt_client()
+        stock = Item(5, flags=c.ITEM_UNPAID, item_type=c.TYPE_GIRDLE,
+                     name="forged meteoric steel belt", weight=2.0)
+        client.state.place_item(stock, 0)
+        task = BuyShopUpgradeTask()
+        self.assertTrue(task._apply_examine_metadata(
+            client, stock,
+            "That is forged meteoric steel belt (ac+1) (Protections: impact +5%, "
+            "slash +5%, cleave +5%, pierce +5%). Qua: 95 Con: 95."))
+        self.assertEqual(stock.extra["gear_examine"]["name"], stock.name)
+        # Owned copies count as the baseline: the carried belt ties it.
+        self.assertLess(task._upgrade_score(client, stock), 0)
+        client.state.remove_item(belt.tag)
+        scorer = gear_scorer(client, InventoryPolicy())
+        self.assertEqual(task._upgrade_score(client, stock),
+                         scorer.value(stock) - scorer.value(girdle))
+        self.assertEqual(task._upgrade_score(client, stock), 174 - 51)
+
+    def test_gear_without_examine_data_falls_back_to_the_name_score(self):
+        from .tasks import InventoryPolicy, carried_gear_score, gear_scorer
+        worn = self.examined(1, c.TYPE_BOOTS, "boots", "boots (ac+1)", worn=True,
+                             quality=10, condition=50)
+        unknown = self.examined(2, c.TYPE_BOOTS, "sturdy boots", None,
+                                quality=80, condition=100)
+        client = self.client(worn, unknown, equipment={c.EQUIP_BOOTS: 1})
+        policy = InventoryPolicy()
+        scorer = gear_scorer(client, policy)
+        name = carried_gear_score(client, policy)
+        self.assertIsNone(scorer.value(unknown))
+        self.assertEqual(scorer.score(unknown), name(unknown))
+        # One scale for both: the examined boots fall back too.
+        self.assertEqual(scorer.compare(unknown, [worn]),
+                         (name(unknown), [name(worn)], False))
+        self.assertTrue(asyncio.run(FarmTask().maintain_inventory(client)))
+        self.assertEqual(client.applied, [2])
 
 
 class BuildInfoTests(unittest.TestCase):

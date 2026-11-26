@@ -373,9 +373,30 @@ after the last refusal (or at once, when the content revision changes).
 
 She works out what each piece of gear really adds when worn
 (`equipment.py`; the design is
-[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md) 4.8, phase
-F3). This changes no choice yet: the name-based `gear_score` still decides
-what she wears and buys.
+[docs/LEARNING_AND_FEEDBACK.md](docs/LEARNING_AND_FEEDBACK.md) 4.8, phases
+F3 and F4). One scorer, `GearScorer`, decides what she wears (the farm's
+equip loop), what she buys (shop upgrades) and which spare gear is surplus
+to sell:
+
+- **By style.** Her build picks the profile: caster while Wizardry trains,
+  bow while she trains an archery skill, melee otherwise. Melee values
+  damage per second (damage × `LEVEL_DAMAGE` of her weapon skill × the Str
+  bonus, over the weapon's delay) and WC; a caster values Int, Pow, mana and
+  regeneration by what they add at her stats (COMBAT.md, "Caster gear
+  scoring") and melee damage at a quarter; an archer values a launcher's
+  arrow WC and damage in full. All value AC, protections, hit points and
+  Str, Dex and Con at the server's table values.
+- **Speed.** A `(speed+N)` item and the armour speed cap count by how much
+  faster or slower she really is, from the server's formula (`living.c`):
+  0.85, plus the Dex bonus and N/30 per item, clamped to the lowest worn
+  armour speed cap, plus (1 + N/3)/10 per item after the cap. Speed is
+  weighted up by half while she has no working recall. Once she carries
+  more than half her weight limit, an item's weight costs the speed it
+  would take off her (encumbrance starts at 65%).
+- **Girdles and belts** are worn like any other slot (the belt slot).
+- **Fallback.** Two items are compared on the effective scale only when
+  both have examine data; otherwise both use the old name-based score
+  (`gear_score` plus the archetype's base score).
 
 - **The "+N" rules follow the Classic server.** "+N" adds N to each of AC,
   block and absorb the item has a base value for and, unless it is a
@@ -397,10 +418,9 @@ what she wears and buys.
   without the "+N"; until an item is examined its archetype's base stats
   are used.
 - **Shadow logging.** At most every 30 seconds she compares, per gear
-  family, what the current score and the effective-stats score would put
-  on. Each change in where they disagree is a `gear-shadow` decision with
-  both items and both scores, for the owner's review before phase F4
-  switches the scoring.
+  family, what the old name score and `GearScorer` would put on. Each
+  change in where they disagree is a `gear-shadow` decision with both
+  items and both scores.
 
 The dashboard's read-only **Equipment** tab lists each gear family she
 carries: what she wears and the best candidate, with both scores, the
