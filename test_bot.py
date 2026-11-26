@@ -30792,15 +30792,14 @@ class FoodObsoleteTests(unittest.TestCase):
             self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
             self.assertEqual(client.dropped, [(0, 1, 26), (0, 2, 3)])
             self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
-            # The legs stayed (the drop failed) and loot merged into a new
-            # tag: matched by name, retried after the backoff.
-            client.state.remove_item(1)
-            client.state.place_item(Item(11, item_type=c.TYPE_FOOD, quality=100,
-                                         name="chicken leg", quantity=27), 7)
+            # The apples went (their tag is gone). The legs stayed: that
+            # drop failed, and loot merged into the stack. Retried after the
+            # backoff, with what merged.
             client.state.remove_item(2)
+            client.state.items[1].quantity = 27
             now[0] += farm.FOOD_DROP_RETRY_SECONDS
             self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
-            self.assertEqual(client.dropped[-1], (0, 11, 27))
+            self.assertEqual(client.dropped[-1], (0, 1, 27))
             now[0] += farm.FOOD_DROP_RETRY_SECONDS * 2
             self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
             # After FOOD_DROP_TRIES drops it is kept, recorded once.
@@ -30812,11 +30811,28 @@ class FoodObsoleteTests(unittest.TestCase):
             kept = [d for a, d in client.decisions if a == "obsolete-food-kept"]
             self.assertEqual(kept, ["chicken leg: still carried after 3 drops"])
             # Gone, and later loot of the name starts afresh.
-            client.state.remove_item(11)
-            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            client.state.remove_item(1)
             client.state.place_item(Item(12, item_type=c.TYPE_FOOD, quality=100,
                                          name="chicken leg"), 7)
             self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(client.dropped[-1], (0, 12, 1))
+
+        # A drop that worked, then fresh loot of that name while she was busy
+        # (no call in between): dropped at once, never counted as kept.
+        farm = FarmTask(zone="/test", target="kobold")
+        client = self.junk_client()
+        client.state.remove_item(2)
+        with patch("atrinik_bot.tasks.time.monotonic", lambda: now[0]):
+            for tag in (21, 22, 23, 24):
+                self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+                dropped_tag = client.dropped[-1][1]
+                client.state.remove_item(dropped_tag)
+                client.state.place_item(Item(tag, item_type=c.TYPE_FOOD,
+                                             quality=100, name="chicken leg"), 7)
+            self.assertEqual([entry[1] for entry in client.dropped],
+                             [1, 21, 22, 23])
+        self.assertNotIn("obsolete-food-kept",
+                         [action for action, _ in client.decisions])
         # Where food matters she keeps it all.
         client = self.junk_client("off")
         self.assertFalse(asyncio.run(FarmTask(
@@ -30929,6 +30945,32 @@ class FoodObsoleteTests(unittest.TestCase):
         self.assertFalse(watch.obsolete(state, now=now))
         with patch("atrinik_bot.hunger.time.time", lambda: now):
             self.assertFalse(food_obsolete(state))
+        # Carried food that does not feed her (so the hungry test passes):
+        # the starvation damage alone, health lost with no hit, restarts
+        # the window each time and keeps the old rules.
+        state = self.auto_state(food=0)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            watch.observe(state, now=now)
+        self.assertFalse(watch.obsolete(state, now=now))
+        self.assertEqual(watch.since, now)
+        # The same window with each loss an attack's is not restarted.
+        state = self.auto_state(food=0)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            state.messages = [(now - 1.0, c.CHAT_TYPE_GAME, "ff0000",
+                               "The kobold hit you for 1 (1) damage.")]
+            watch.observe(state, now=now)
+        self.assertEqual(watch.since, 0.0)
+        self.assertTrue(watch.obsolete(state, now=now))
         # Health lost to attacks at food 0 is no starvation, but hungry with
         # nothing to eat she keeps the old rules even so.
         state = self.auto_state(food=0)
