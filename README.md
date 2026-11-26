@@ -477,8 +477,10 @@ consumables. The rest goes to her apartment chest, and some is sold:
   slows her), at most once per 30 minutes. An item the chest refuses
   for god-given gear ("You can't store god-given items ...") is not
   offered again; a full chest or any other refusal only backs off. What
-  she deposited is never taken back out by the same or a later visit that
-  session. A junk sale waits for 8 items, a cure shortfall or 85% of her
+  she deposited is not taken back out that session until why it went
+  home changes (identified under a new name, or a level requirement she
+  now meets). God-given refusals include "First remove all god-given
+  items from this container!". A junk sale waits for 8 items, a cure shortfall or 85% of her
   limit. The dashboard, CLI and mana-crystal chest visits update the
   index too, without set labels (the circuit's next visit adds them).
 - **Containers.** The key ring stays. A bag of holding is known by its "of
@@ -487,16 +489,22 @@ consumables. The rest goes to her apartment chest, and some is sold:
   weightless 0.30). She carries her best bag only while what she carries
   would weigh more than half her limit without it (it goes home again
   below 40%), and puts gems and the ammunition her build does not shoot
-  in it, never coins, heals or unknown items (gems are never sold or
-  stored as valuables, so hiding them in the bag changes no decision).
-  The server's rules (`types/container.c`, `types/player.c`): applying an
-  unready container readies it, applying a readied closed one opens it,
-  and applying the open one closes and unreadies it; only a readied
-  container takes a move into it, and a readied or open one takes every
-  pickup. So she readies the bag, fills it, then opens and closes it to
-  unready it; a bag seen open is closed with one apply. The bag is fetched
-  from home once she needs it (above 50%), before the 65% storage trigger,
-  since the bag is what keeps her below it. Other containers go home; a duplicate plain
+  in it, never coins, heals, unknown items or a valuable-looking gem
+  (magical, or quality 90 or more), which stays where storage and cure
+  funding see it. The server's rules (`types/container.c`,
+  `types/player.c`): applying an unready container readies it, applying
+  a readied closed one opens it, and applying the open one closes and
+  unreadies it; only a readied container takes a move into it, and a
+  readied or open one takes every pickup. So she readies the bag on a
+  quiet farm tick, fills it, then opens and closes it to unready it. The
+  unready step runs on every tick, so a fight or a trip that starts while
+  it is readied unreadies it before any loot is picked up; a bag seen open
+  is closed with one apply. Each apply waits up to 3 seconds for the
+  server's flag change. If the bag will not unready after a few applies,
+  she gives it up and the dashboard warns `bag-readied` ("Bag left
+  readied: pickups go into it"). The bag is fetched from home once she
+  needs it (above 50%), before the 65% storage trigger, since the bag is
+  what keeps her below it. Other containers go home; a duplicate plain
   container (same name, empty weight) is sold.
 - **Sold.** The worst duplicates (gear the equip loop would never wear
   that is no build's best), cursed or damned potions, spare recall wands
@@ -510,8 +518,10 @@ consumables. The rest goes to her apartment chest, and some is sold:
 - **Identify-all.** Unknown gear, carried or stored, sends her to the
   cheapest smith she can reach once her wallet pays him plus a 1,000
   copper reserve. The fee is flat, so she goes for three or more unknown
-  pieces, any unknown ring, amulet or wand, within an hour of her carried
-  wallet rising by a gold coin or more (the owner dropping gold), or once
+  pieces, any unknown ring, amulet or wand, within an hour of any rise of
+  at least one gold coin in her carried wallet (loot, a sale, a
+  withdrawal, or the owner dropping gold, which she picks up like loot:
+  they cannot be told apart), or once
   the first unknown piece has waited 6 hours. The smiths: Kulgar (world_8_79, 1,450), John Markor (world_5_58,
   2,200) or Conbran Strongfist (world_0_69, 3,200); a smith she cannot
   reach is passed over for 6 hours. Stored unknown gear is taken out of

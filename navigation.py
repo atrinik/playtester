@@ -7104,6 +7104,20 @@ def identify_alerts(client: AtrinikClient) -> list[dict[str, str]]:
                      "unknown item(s); drop gold to help"}]
 
 
+def bag_alerts(client: AtrinikClient) -> list[dict[str, str]]:
+    """The dashboard's warning once she gave up unreadying her bag of
+    holding (FarmCircuitTask._unready_bag): while it stays readied, every
+    pickup goes into it."""
+    tag = getattr(client, "bag_left_readied", 0) or 0
+    bag = client.state.items.get(tag) if tag else None
+    if (bag is None or bag.location != client.state.player_tag or
+            not bag.flags & (c.ITEM_APPLIED | c.ITEM_CONTAINER_OPEN)):
+        return []
+    return [{"id": "bag-readied", "level": "warn",
+             "text": f"Bag left readied: pickups go into it ({bag.name}); "
+                     "apply it to close it"}]
+
+
 # Where the heal restock keeps the cheapest healing price it was last
 # given (client.state.vendor_quotes), for heal_restock_quote.
 HEAL_QUOTE_KEY = "heal-restock"
@@ -9371,7 +9385,10 @@ class FarmCircuitTask(BotTask):
         # Items deposited this session: never taken back out by the
         # active-build retrieval (_chest_wants), which ranks on another
         # scale once the item is no longer examined in her pack.
-        self._deposited_tags: set[int] = set()
+        # Each maps to her level and the item's name when deposited: a
+        # level she has since reached, or a new name (identified), lets it
+        # come back.
+        self._deposited_tags: dict[int, tuple[int, str]] = {}
         # The identify fetch's backoff after it failed (on ``clock``).
         self._identify_fetch_retry_at = 0.0
         # The running storage trip's deposit (its sent items are
@@ -9380,6 +9397,10 @@ class FarmCircuitTask(BotTask):
         # _fill_bag's unready sequence: applies sent, and bags it gave up.
         self._bag_unready_applies = 0
         self._bag_given_up: set[int] = set()
+        # Her last bag apply, until its flag change shows: (tag, flags
+        # before, sent at), and applies that never showed one.
+        self._bag_pending: tuple[int, int, float] | None = None
+        self._bag_unconfirmed = 0
         # The storage and sale choices for one inventory state (_cached).
         self._inventory_cache: tuple[tuple | None, dict] = (None, {})
         self._identification: NavigateThenTask | None = None
@@ -10740,8 +10761,10 @@ class FarmCircuitTask(BotTask):
     IDENTIFY_BATCH = 3
     # ... unless one is likely valuable ...
     IDENTIFY_VALUABLE_TYPES = (c.TYPE_RING, c.TYPE_AMULET, c.TYPE_WAND)
-    # ... or her carried wallet just rose by at least a gold coin (the
-    # owner drops one at her feet), within the last hour ...
+    # ... or her carried wallet rose by at least a gold coin at once within
+    # the last hour: any such rise (loot, a sale, a withdrawal, the owner
+    # dropping gold at her feet, which she picks up like loot; they cannot
+    # be told apart) ...
     GIFT_COPPER = 10_000
     GIFT_SECONDS = 3600.0
     # ... or the first unknown piece has waited this long (wall clock).
@@ -11050,10 +11073,19 @@ class FarmCircuitTask(BotTask):
         bag of holding while she needs one and carries none."""
         state = client.state
         build = self._build(client)
-        deposited = set(self._deposited_tags)
-        if self._storage_deposit is not None:
-            deposited.update(self._storage_deposit.sent_tags)
-        chest = {item.tag for item in contents if item.tag not in deposited}
+        level = int(state.stats.get("level", 0) or 0)
+
+        def stays(item: Item) -> bool:
+            if self._storage_deposit is not None and item.tag in self._storage_deposit.sent_tags:
+                return True
+            reason = self._deposited_tags.get(item.tag)
+            if reason is None:
+                return False
+            at_level, name = reason
+            changed = (name != item.name or
+                       at_level < item.required_level <= level)
+            return not changed
+        chest = {item.tag for item in contents if not stays(item)}
         sets = self._owned_sets(client, contents, builds=(build,))
         scorer = self._scorer_for(client)(build)
         policy = InventoryPolicy()
@@ -11078,60 +11110,118 @@ class FarmCircuitTask(BotTask):
                 wants.add(bag.tag)
         return wants
 
-    # Applies the unready sequence (open, then close) may take in all;
-    # then she gives the bag up for the session (bag-unready-failed).
+    # Applies the unready sequence (open, then close) may take in all,
+    # and applies whose flag change the server did not show within
+    # BAG_CONFIRM_SECONDS; then she gives the bag up for the session
+    # (bag_alerts).
     BAG_UNREADY_APPLIES = 4
+    BAG_CONFIRM_SECONDS = 3.0
+    _BAG_FLAGS = c.ITEM_APPLIED | c.ITEM_CONTAINER_OPEN
 
-    async def _fill_bag(self, client: AtrinikClient) -> bool:
-        """While she carries her bag of holding because she needs it, put
-        identified gems and the ammo her build does not shoot into it, one
-        a tick; each item is offered once (a pouch takes only gems, say).
+    def _bag_waiting(self, client: AtrinikClient) -> bool:
+        """Whether her last bag apply still waits for the server's flag
+        change; one that never shows counts towards giving up."""
+        pending = self._bag_pending
+        if pending is None:
+            return False
+        tag, flags, sent_at = pending
+        bag = client.state.items.get(tag)
+        if bag is None or bag.flags & self._BAG_FLAGS != flags:
+            self._bag_pending = None
+            return False
+        if self.clock() - sent_at < self.BAG_CONFIRM_SECONDS:
+            return True
+        self._bag_pending = None
+        self._bag_unconfirmed += 1
+        if self._bag_unconfirmed >= self.BAG_UNREADY_APPLIES:
+            self._give_up_bag(client, bag)
+        return False
+
+    def _give_up_bag(self, client: AtrinikClient, bag: Item) -> None:
+        self._bag_given_up.add(bag.tag)
+        _set_attr(client, "bag_left_readied", bag.tag)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("bag-unready-failed", bag.name)
+
+    async def _bag_apply(self, client: AtrinikClient, bag: Item) -> None:
+        self._bag_pending = (bag.tag, bag.flags & self._BAG_FLAGS, self.clock())
+        await client.apply(bag.tag)
+
+    def _bag_fill_item(self, client: AtrinikClient, bag: Item) -> Item | None:
+        """The next item for her bag of holding while she needs it: an
+        identified gem (not a valuable-looking one: magical or quality 90
+        or more, which stays where storage and cure funding see it) or
+        ammo her build does not shoot; never coins or heals."""
+        state = client.state
+        if not storage.bag_wanted(state, carried=True):
+            return None
+        policy = InventoryPolicy()
+        build = self._build(client)
+        return next((item for item in state.inventory
+                     if item.tag != bag.tag and item.tag not in self._bag_fill_tried and
+                     storage.bag_fill(item) and policy.identified(item) and
+                     not item.flags & c.ITEM_MAGICAL and
+                     not (item.quality != 255 and item.quality >= 90) and
+                     not policy.apartment_valuable(item) and
+                     storage.holds(bag, item) and
+                     not (item.item_type == c.TYPE_ARROW and build == "bow")), None)
+
+    async def _unready_bag(self, client: AtrinikClient, *, filling: bool) -> bool:
+        """Unready her bag of holding unless she is filling it now
+        (``filling``: a quiet farm tick, no trip under way, something to
+        put in). Run on every tick, fight or not: readied or open, the bag
+        takes every pickup (types/player.c pick_up).
 
         The server's container rules (types/container.c apply_func,
-        types/player.c sack_can_hold and pick_up): only a readied
-        (applied) container takes a move into it; applying an unready one
-        readies it, applying a readied closed one opens it, and applying
-        the open one closes it, which also unreadies it (container_close).
-        Readied or open, it takes every pickup, coins and heals too. So
-        she readies the bag, fills it, and at once opens and closes it to
-        unready it. A bag seen open is closed with one apply."""
-        state = client.state
-        now = self.clock()
-        if now - self._bag_fill_at < 0.6:
+        container_close): applying an unready container readies it,
+        applying a readied closed one opens it, and applying the open one
+        closes and unreadies it. Each apply waits for the server's flag
+        change (BAG_CONFIRM_SECONDS). True when it sent or awaits one."""
+        bag = storage.best_bag(client.state.inventory)
+        if bag is None or bag.tag in self._bag_given_up:
             return False
+        if self._bag_waiting(client):
+            return True
+        applied = bool(bag.flags & c.ITEM_APPLIED)
+        is_open = bool(bag.flags & c.ITEM_CONTAINER_OPEN)
+        if not applied and not is_open:
+            self._bag_unready_applies = 0
+            return False
+        if (filling and not is_open and
+                self._bag_fill_item(client, bag) is not None):
+            return False
+        self._bag_unready_applies += 1
+        if self._bag_unready_applies > self.BAG_UNREADY_APPLIES:
+            self._give_up_bag(client, bag)
+            return False
+        await self._bag_apply(client, bag)
+        return True
+
+    async def _fill_bag(self, client: AtrinikClient) -> bool:
+        """On a quiet farm tick, ready her bag of holding and put one item
+        a tick into it (_bag_fill_item); each item is offered once (a
+        pouch takes only gems, say). Only a readied container takes a move
+        into it (types/player.c sack_can_hold); _unready_bag unreadies it
+        once nothing is left to put in, or a fight or trip starts."""
+        state = client.state
         bag = storage.best_bag(state.inventory)
         if bag is None or bag.tag in self._bag_given_up:
             return False
-        applied = bool(bag.flags & c.ITEM_APPLIED)
-        is_open = bool(bag.flags & c.ITEM_CONTAINER_OPEN)
-        item = None
-        if storage.bag_wanted(state, carried=True):
-            policy = InventoryPolicy()
-            build = self._build(client)
-            item = next((item for item in state.inventory
-                         if item.tag != bag.tag and item.tag not in self._bag_fill_tried and
-                         storage.bag_fill(item) and policy.identified(item) and
-                         storage.holds(bag, item) and
-                         not (item.item_type == c.TYPE_ARROW and build == "bow")), None)
-        if is_open or (applied and item is None):
-            # Unready it: a readied bag is opened, then the open one closed.
-            self._bag_unready_applies += 1
-            if self._bag_unready_applies > self.BAG_UNREADY_APPLIES:
-                self._bag_given_up.add(bag.tag)
-                recorder = getattr(client, "record_action", None)
-                if recorder is not None:
-                    recorder("bag-unready-failed", bag.name)
-                return False
-            self._bag_fill_at = now
-            await client.apply(bag.tag)
+        if self._bag_waiting(client):
             return True
-        self._bag_unready_applies = 0
+        if bag.flags & c.ITEM_CONTAINER_OPEN:
+            return False
+        item = self._bag_fill_item(client, bag)
         if item is None:
             return False
-        self._bag_fill_at = now
-        if not applied:
-            await client.apply(bag.tag)
+        now = self.clock()
+        if not bag.flags & c.ITEM_APPLIED:
+            await self._bag_apply(client, bag)
             return True
+        if now - self._bag_fill_at < 0.6:
+            return True
+        self._bag_fill_at = now
         self._bag_fill_tried.add(item.tag)
         await client.move_item(bag.tag, item.tag, item.quantity)
         recorder = getattr(client, "record_action", None)
@@ -12945,8 +13035,10 @@ class FarmCircuitTask(BotTask):
             if (self._storage.status in (TaskStatus.FAILED, TaskStatus.COMPLETE) and
                     isinstance(self._storage.task, DepositItemsTask)):
                 carried = {item.tag for item in client.state.inventory}
-                self._deposited_tags.update(
-                    tag for tag in self._storage.task.sent_tags if tag not in carried)
+                level = int(client.state.stats.get("level", 0) or 0)
+                for tag in self._storage.task.sent_tags - carried:
+                    item = client.state.items.get(tag)
+                    self._deposited_tags[tag] = (level, item.name if item else "")
                 self._storage_deposit = None
             if self._storage.status == TaskStatus.FAILED:
                 log.warning("unidentified storage failed: %s",
@@ -13014,6 +13106,13 @@ class FarmCircuitTask(BotTask):
         # maintenance trip which remains queued after the real bag arrives.
         if not self._inventory_ready(client):
             return
+        # Never a readied bag across a fight or a trip: it takes every
+        # pickup. Filling waits for a quiet farm tick (_fill_bag).
+        farm_now = self.child.task if self.child is not None else None
+        await self._unready_bag(client, filling=bool(
+            isinstance(farm_now, FarmTask) and
+            not any(getattr(self, name) is not None for name in self.SERVICE_ATTRIBUTES) and
+            not self._busy_finishing_fight_or_loot(client, farm_now)))
         level = self._combat_progression_level(client)
         self._progression_level = level
         await self._clear_combat_after_death(client)

@@ -15717,6 +15717,8 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
         self.assertIsInstance(autoplay.child, NavigateThenTask)
         self.assertIsInstance(autoplay.child.task, RetrieveItemsTask)
         self.assertTrue(autoplay.child.task.require_match)
+        # The chest visit keeps her apartment index current.
+        self.assertIsNotNone(autoplay.child.task.indexer)
         self.assertTrue(autoplay._mana_recovery_attempted)
 
     def test_autoplay_backs_off_persisted_mana_recovery_failure(self):
@@ -41404,10 +41406,16 @@ class InventoryStorageTests(unittest.TestCase):
                                      weight=55.0, name="anvil cake"), 7)
         self.assertEqual({item.tag for item in circuit._storable_items(client)}, {bag.tag})
         server = ContainerServer(client)
+
+        def tick(quiet=True):
+            """The circuit's two bag steps: unready (every tick), fill (quiet)."""
+            circuit._bag_fill_at = float("-inf")
+            sent = asyncio.run(circuit._unready_bag(client, filling=quiet))
+            return asyncio.run(circuit._fill_bag(client)) if quiet and not sent else sent
+
         # She readies the bag (the server fills only a readied one) ...
         for _ in range(10):
-            circuit._bag_fill_at = float("-inf")
-            if not asyncio.run(circuit._fill_bag(client)):
+            if not tick():
                 break
         self.assertEqual(server.log, [("ready", fine.tag), ("move", gem.tag),
                                       ("open", fine.tag), ("close", fine.tag)])
@@ -41420,17 +41428,34 @@ class InventoryStorageTests(unittest.TestCase):
         self.assertEqual(coin.location, 7)
         # A bag seen open (she or the owner opened it) is closed once.
         fine.flags |= c.ITEM_APPLIED | c.ITEM_CONTAINER_OPEN
-        circuit._bag_fill_at = float("-inf")
-        self.assertTrue(asyncio.run(circuit._fill_bag(client)))
+        self.assertTrue(tick())
         self.assertEqual(server.log[-1], ("close", fine.tag))
-        circuit._bag_fill_at = float("-inf")
-        self.assertFalse(asyncio.run(circuit._fill_bag(client)))
+        self.assertFalse(tick())
+        # A fight starts while it is readied for filling: it is unreadied
+        # before any corpse is looted.
+        ruby = Item(16, item_type=c.TYPE_JEWEL, quality=80, condition=80, weight=0.5,
+                    name="ruby jewel")
+        client.state.place_item(ruby, 7)
+        self.assertTrue(tick())
+        self.assertEqual(server.log[-1], ("ready", fine.tag))
+        while tick(quiet=False):
+            pass
+        self.assertFalse(fine.flags & c.ITEM_APPLIED)
+        loot = Item(17, item_type=c.TYPE_POTION, quality=80, name="potion of healing")
+        server.pick_up(loot)
+        self.assertEqual(loot.location, 7)
+        self.assertEqual(ruby.location, 7)
+        # A valuable-looking gem stays out of the bag, where storage sees it.
+        star = Item(18, item_type=c.TYPE_GEM, flags=c.ITEM_MAGICAL, quality=95,
+                    condition=95, name="star sapphire")
+        client.state.place_item(star, 7)
+        self.assertIsNot(circuit._bag_fill_item(client, fine), star)
+        client.state.remove_item(18)
         # Light again: a readied bag is unreadied before it can go home.
         client.state.remove_item(14)
         fine.flags |= c.ITEM_APPLIED
         for _ in range(4):
-            circuit._bag_fill_at = float("-inf")
-            asyncio.run(circuit._fill_bag(client))
+            tick()
         self.assertFalse(fine.flags & c.ITEM_APPLIED)
         self.assertIn(fine.tag, {item.tag for item in circuit._storable_items(client)})
         client.state.place_item(Item(14, item_type=c.TYPE_FOOD, quality=80,
@@ -41647,7 +41672,7 @@ class InventoryStorageTests(unittest.TestCase):
                              (TaskStatus.FAILED, {starter.tag}, set()))
             godgiven = DepositItemsTask("chest", predicate=lambda item: True)
             asyncio.run(godgiven.tick(client))
-            client.state.add_message(0, "ffffff", DepositItemsTask.GODGIVEN)
+            client.state.add_message(0, "ffffff", DepositItemsTask.GODGIVEN[1])
             now[0] += 10
             asyncio.run(godgiven.tick(client))
             self.assertEqual(godgiven.godgiven_tags, {starter.tag})
@@ -41670,8 +41695,74 @@ class InventoryStorageTests(unittest.TestCase):
         circuit._storage_deposit = deposit
         self.assertEqual(circuit._chest_wants(client, [stored]), set())
         circuit._storage_deposit = None
-        circuit._deposited_tags.add(stored.tag)
+        circuit._deposited_tags[stored.tag] = (38, stored.name)
         self.assertEqual(circuit._chest_wants(client, [stored]), set())
+        # Once why it went home changes (identified under a new name, or
+        # a level requirement she now meets), it may come back.
+        stored.name = "soft leather girdle +4 of strength"
+        self.assertEqual(circuit._chest_wants(client, [stored]), {stored.tag})
+        stored.name = "soft leather girdle +4"
+        stored.required_level = 40
+        self.assertEqual(circuit._chest_wants(client, [stored]), set())
+        client.state.stats["level"] = 40
+        self.assertEqual(circuit._chest_wants(client, [stored]), {stored.tag})
+
+    def test_a_bag_the_server_never_unreadies_is_given_up_with_a_warning(self):
+        from .navigation import bag_alerts
+        client = self._client()
+        bag = Item(10, item_type=c.TYPE_CONTAINER, quality=80, condition=80, weight=0.2,
+                   flags=c.ITEM_MAGICAL | c.ITEM_APPLIED, name="wool bag of holding")
+        client.state.place_item(bag, 7)
+        now = [100.0]
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], clock=lambda: now[0])
+        client.apply = AsyncMock()
+        # Each apply waits for the server's flag change ...
+        self.assertTrue(asyncio.run(circuit._unready_bag(client, filling=False)))
+        self.assertTrue(asyncio.run(circuit._unready_bag(client, filling=False)))
+        self.assertEqual(client.apply.await_count, 1)
+        # ... and none ever comes: after a few she gives up and warns.
+        for _ in range(10):
+            now[0] += circuit.BAG_CONFIRM_SECONDS + 1
+            asyncio.run(circuit._unready_bag(client, filling=False))
+        self.assertIn(bag.tag, circuit._bag_given_up)
+        self.assertLessEqual(client.apply.await_count, circuit.BAG_UNREADY_APPLIES)
+        [alert] = bag_alerts(client)
+        self.assertEqual((alert["id"], alert["level"]), ("bag-readied", "warn"))
+        self.assertIn("pickups go into it", alert["text"])
+        bag.flags &= ~c.ITEM_APPLIED
+        self.assertEqual(bag_alerts(client), [])
+
+    def test_only_the_apartment_chest_is_indexed(self):
+        from . import storage
+        client = self._client()
+        chest = Item(90, name="chest")
+        client.state.place_item(chest, 0)
+        client.state.place_item(Item(91, item_type=c.TYPE_BOOTS, quality=80, name="boots"),
+                                chest.tag)
+        client.state.map.path = "/shattered_islands/world_0_69"
+        storage.plain_indexer().observe(client, chest)
+        self.assertEqual(storage.stored(client.state), [])
+        client.state.map.path = FarmCircuitTask.APARTMENT
+        storage.plain_indexer().observe(client, chest)
+        self.assertEqual([(row["name"], row["sets"]) for row in storage.stored(client.state)],
+                         [("boots", [])])
+
+    def test_dashboard_chest_tasks_keep_the_index(self):
+        from .web_server import WebControlServer
+        client = AtrinikClient(ClientConfig(character="Sera"))
+        server = WebControlServer(client, TaskEngine(client), WorldGraph())
+        started = []
+
+        async def replace(task):
+            started.append(task)
+            return {}
+        server._replace_task = replace
+        asyncio.run(server._set_task({"type": "deposit", "container": "chest",
+                                      "patterns": ["boots"]}))
+        asyncio.run(server._set_task({"type": "retrieve", "container": "chest",
+                                      "patterns": ["boots"]}))
+        self.assertEqual([type(task.indexer).__name__ for task in started],
+                         ["ChestIndexer", "ChestIndexer"])
 
     def test_index_rows_from_memory_are_finite(self):
         from . import storage

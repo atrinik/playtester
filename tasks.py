@@ -9340,7 +9340,10 @@ class DepositItemsTask(BotTask):
     STORAGE_FULL = "storage container is full"
     STORAGE_REFUSED = "storage container refused"
     WONT_FIT = re.compile(r"\bthat won't fit in the (.+?)!", re.I)
-    GODGIVEN = "You can't store god-given items outside your inventory!"
+    # The server's god-given refusals (socket/item.c esrv_move_object): an
+    # item itself, or a container holding one.
+    GODGIVEN = ("You can't store god-given items outside your inventory!",
+                "First remove all god-given items from this container!")
 
     def __init__(self, container_name: str, patterns: tuple[str, ...] = (),
                  *, unidentified_only: bool = False,
@@ -9399,7 +9402,7 @@ class DepositItemsTask(BotTask):
             match = self.WONT_FIT.search(entry[3]) if len(entry) > 3 else None
             if match and self.container_name in match.group(1).casefold():
                 self.full = True
-            if len(entry) > 3 and self.GODGIVEN in entry[3]:
+            if len(entry) > 3 and any(text in entry[3] for text in self.GODGIVEN):
                 self._godgiven_seen = True
         self._feedback_start = client.state.message_count
         policy = InventoryPolicy()

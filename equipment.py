@@ -1140,8 +1140,12 @@ class GearExaminer:
                 # line and end with "It contains ..." (types/player.c);
                 # until that line is in, wait for it, up to ANSWER_TIMEOUT.
                 from .storage import read_bag_examine
-                lines = [str(line[3]) for line in entries[index + 1:index + 6]
-                         if len(line) >= 4 and line[1] == c.CHAT_TYPE_GAME]
+                lines = []
+                for line in entries[index + 1:]:
+                    if len(line) >= 4 and line[1] == c.CHAT_TYPE_GAME:
+                        lines.append(str(line[3]))
+                        if lines[-1].startswith("It contains "):
+                            break
                 ended = any(line.startswith("It contains ") for line in lines)
                 if not ended and self.clock() - sent_at <= self.ANSWER_TIMEOUT:
                     return False
