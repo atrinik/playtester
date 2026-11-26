@@ -43298,43 +43298,109 @@ class SafeRetreatTests(unittest.TestCase):
                          [a for a, _ in client.recorded])
         self.assertNotIn(False, client.combat)
 
-    def test_three_followers_are_never_taken_onto_the_spot(self):
+    def _clocked_train(self, members=3, hold_x=14):
+        """She at (20, 12) on the last leg, no lead-aways left; ``members``
+        treants start at x 10 and close 1 tile a second to ``hold_x``,
+        then hold there. Returns (client, walk, run): run(seconds) ticks
+        her defence every 0.25 s of a fake clock and returns each tick's
+        (time, answer, direct moves sent)."""
+        from . import navigation as navigation_module
+
         client, walk = self._approach()
         m = client.state.map
         m.world_x, m.world_y = 20, 12
-        monsters = [(100, 14, 12), (101, 14, 13), (102, 14, 11)]
-        self._place(client, monsters)
-        self._followed(walk, client, monsters)
-        # No lead-aways left, and the stand far past its limit: with three
-        # she still stands.
         walk._leads = walk.LEAD_AWAY_LIMIT
-        walk._stand_since = time.monotonic() - walk.APPROACH_STAND_SECONDS - 1
-        self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
+        rows = [12, 13, 11, 14, 10][:members]
+        place = {100 + i: [10, y] for i, y in enumerate(rows)}
+        clock = [1000.0]
+        log = []
+
+        def run(seconds, drop=()):
+            for target_id in drop:
+                place.pop(target_id, None)
+            end = clock[0] + seconds
+            with patch.object(navigation_module.time, "monotonic",
+                              side_effect=lambda: clock[0]):
+                while clock[0] < end:
+                    elapsed = clock[0] - 1000.0
+                    for spot in place.values():
+                        spot[0] = min(hold_x, 10 + int(elapsed))
+                    self._place(client, [(k, x, y)
+                                         for k, (x, y) in place.items()])
+                    client.direct_moves.clear()
+                    walk._last_defense_action = 0.0
+                    answer = asyncio.run(
+                        walk._defend_while_navigating(client))
+                    log.append((elapsed, answer, list(client.direct_moves)))
+                    clock[0] += 0.25
+            return log
+
+        return client, walk, run
+
+    def test_a_train_holding_at_range_is_held_until_the_trip_fails(self):
+        # Three treants close in, then stand 6 tiles off. The server keeps
+        # her as their enemy within 9 tiles, so they stay a train: she
+        # stands, never walking on, and at 180 s the trip fails.
+        client, walk, run = self._clocked_train()
+        log = run(170.0)
+        self.assertIn("approach-stand", [a for a, _ in client.recorded])
+        standing = [entry for entry in log if entry[0] >= 4.0]
+        self.assertTrue(all(answer for _, answer, _ in standing))
+        self.assertTrue(all(not moves for _, _, moves in standing))
+        self.assertNotIn("approach-train-held",
+                         [a for a, _ in client.recorded])
+        self.assertNotEqual(walk.status, TaskStatus.FAILED)
+        run(20.0)
+        self.assertIn("approach-train-held", [a for a, _ in client.recorded])
+        self.assertEqual(walk.status, TaskStatus.FAILED)
+        self.assertTrue(walk.train_held)
+
+    def test_three_followers_are_never_taken_onto_the_spot(self):
+        # A train of three past the two-follower limit still holds her,
+        # with no cooldown; once one leaves, two past it let her walk on.
+        client, walk, run = self._clocked_train()
+        log = run(60.0)
+        self.assertTrue(log[-1][1])
         self.assertEqual(walk._stand_cooldown_until, 0.0)
         self.assertNotEqual(walk.status, TaskStatus.FAILED)
-        # None of them reaching her for APPROACH_TRAIN_STAND_SECONDS: the
-        # trip fails rather than take them in.
-        walk._stand_since = (time.monotonic() -
-                             walk.APPROACH_TRAIN_STAND_SECONDS - 1)
-        walk._last_defense_action = 0.0
-        asyncio.run(walk._defend_while_navigating(client))
-        self.assertEqual(walk.status, TaskStatus.FAILED)
-        self.assertIn("approach-train-held", [a for a, _ in client.recorded])
-        walk.status = TaskStatus.RUNNING
-        walk.train_held = False
-        walk._stand_since = time.monotonic() - walk.APPROACH_STAND_SECONDS - 1
-        # Two past the limit: the walk goes on.
-        monsters = monsters[:2]
-        self._place(client, monsters)
-        walk._pursuit_samples.clear()
-        self._followed(walk, client, monsters)
-        self.assertEqual(walk._approach_mode(
-            client, walk._track_pursuers(client, [
-                (max(abs(x - 20), abs(y - 12)), 8 + x - 20, 8 + y - 12,
-                 next(iter(m.tiles[(8 + x - 20, 8 + y - 12)]
-                           .objects.values())))
-                for _, x, y in monsters]), []), "")
+        run(1.0, drop=(102,))
         self.assertGreater(walk._stand_cooldown_until, 0.0)
+        self.assertNotIn("approach-train-held",
+                         [a for a, _ in client.recorded])
+
+    def test_train_holds_round_trip_through_memory_and_reject_bad_times(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            now = time.time()
+            client.note_farm_train_hold("/farm", now - 60.0)
+            # Not finite, or in the future: never kept.
+            client.note_farm_train_hold("/farm", float("nan"))
+            client.note_farm_train_hold("/farm", float("inf"))
+            client.note_farm_train_hold("/farm", now + 3600.0)
+            self.assertEqual(client.state.farm_train_holds["/farm"],
+                             [now - 60.0])
+            restored = AtrinikClient(ClientConfig(
+                character="Sera", runtime_state_path=path))
+            restored.state.player_name = "Sera"
+            restored.load_character_memory("Sera")
+            self.assertEqual(restored.state.farm_train_holds,
+                             {"/farm": [now - 60.0]})
+            # Load drops stale, future, non-finite and malformed entries.
+            restored._runtime_memory["Sera"]["farm_train_holds"] = {
+                "/farm": [now - 60.0, now - 90000.0, now + 3600.0,
+                          float("nan"), "x", True],
+                "/old": [now - 90000.0], 7: [now], "/bad": "x"}
+            restored.load_character_memory("Sera")
+            self.assertEqual(restored.state.farm_train_holds,
+                             {"/farm": [now - 60.0]})
+            # Another character starts with none.
+            restored.state.player_name = "Ana"
+            restored.load_character_memory("Ana")
+            self.assertEqual(restored.state.farm_train_holds, {})
 
     def test_a_gap_in_a_thin_wall_is_no_doorway_to_hold(self):
         # Open on its diagonals, three attackers a side reach it.
@@ -43599,6 +43665,28 @@ class SafeRetreatTests(unittest.TestCase):
         self.assertEqual(hard, [(14, 9, 3)])
         self.assertEqual(sorted(soft), [(6, 12, 4, walk.LEAD_SPAWN_COST),
                                         (14, 9, 4, walk.LEAD_SPAWN_COST)])
+
+    def test_first_sightings_of_pursuers_are_never_evicted(self):
+        client, walk = self._approach()
+        walk.PURSUIT_ORIGINS = 3
+        m = client.state.map
+        m.world_x, m.world_y = 20, 12
+        walk._pursuer_ids = {1: time.monotonic()}
+        walk._lead = {"ids": {2}}
+        walk._pursuit_map = "/road"
+        walk._pursuit_origins = {1: ("/road", 0, 0), 2: ("/road", 1, 1),
+                                 3: ("/road", 2, 2)}
+        monsters = [(100, 14, 12)]
+        self._place(client, monsters)
+        walk._track_pursuers(client, self._threats_of(client, monsters))
+        self.assertEqual(set(walk._pursuit_origins), {1, 2, 100})
+        # With only pursuers' and the lead's left, nothing is evicted and
+        # a newcomer's is not kept.
+        walk._pursuer_ids[100] = time.monotonic()
+        monsters = [(101, 14, 13)]
+        self._place(client, monsters)
+        walk._track_pursuers(client, self._threats_of(client, monsters))
+        self.assertEqual(set(walk._pursuit_origins), {1, 2, 100})
 
     def test_a_lead_away_is_stuck_only_after_repeated_misses(self):
         # Walled in on one square: each miss waits LEAD_RETRY_SECONDS, and

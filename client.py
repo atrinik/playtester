@@ -653,7 +653,9 @@ class AtrinikClient:
             self.state.farm_train_holds = {
                 str(path): [float(at) for at in times
                             if isinstance(at, (int, float)) and
-                            now - float(at) < 86400.0]
+                            not isinstance(at, bool) and
+                            math.isfinite(float(at)) and
+                            0.0 <= now - float(at) < 86400.0]
                 for path, times in (holds.items()
                                     if isinstance(holds, dict) else ())
                 if isinstance(path, str) and isinstance(times, list)}
@@ -1345,10 +1347,12 @@ class AtrinikClient:
     def note_farm_train_hold(self, path: str, at: float) -> None:
         """Persist a train-held approach to farm map ``path`` at ``at``,
         keeping the last day's (FarmCircuitTask._leave_train_held_spot)."""
-        if not path:
+        at = float(at)
+        if not path or not math.isfinite(at) or at > time.time() + 1.0:
+            # A non-finite or future time would hold the count up for ever.
             return
         holds = [held for held in self.state.farm_train_holds.get(path, [])
-                 if at - held < 86400.0]
+                 if math.isfinite(held) and 0.0 <= at - held < 86400.0]
         holds.append(float(at))
         self.state.farm_train_holds[path] = holds
         character = self.state.player_name or self.config.character

@@ -2436,7 +2436,15 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
   2 s old took it 2 or more tiles nearer where she stands now, so her own
   walk towards a creature that stands or wanders makes none. It stays a
   pursuer while in view within 9 tiles, for 12 s after it last
-  qualified. Outclassed creatures do not count.
+  qualified; a member of a stand against three or more stays one
+  without that lapse while in view within 9 tiles, as the server keeps
+  her as its enemy within `MAX_AGGRO_RANGE`, so a train holding off at
+  range keeps her stand (and its 180 s limit) going. Outclassed creatures
+  do not count. Because a map change starts the samples afresh, a
+  creature that follows her over a seam qualifies again only after about
+  2 s of closing (or on contact); approach discipline does not run on
+  the farm map itself, so this gap only delays a stand on the map before
+  it.
 - **Before arrival** (`_approach_mode`), only on a farm trip and off the
   farm map, on the last leg or within about 25 tiles of the farm map
   along her route (`_near_spot`), and never under the seam contact after
@@ -2460,7 +2468,8 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
     its farm branch, then quarantines that leg's map, its area and the
     map she stood on (`farm-zone-quarantine`, never shortening a longer
     one) for 30 minutes, 2 hours on the second such hold there within a
-    day and 6 hours from the third (`farm_train_holds`, in her memory).
+    day and 6 hours from the third (`farm_train_holds`, in her memory;
+    non-finite and future times are never kept).
     The analyzer, which skips a spot with any leg quarantined, then
     chooses again; with every ranked spot quarantined it records
     `farm-spots-exhausted` and the circuit completes, and autoplay holds
