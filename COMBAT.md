@@ -2111,11 +2111,13 @@ gap says so.
   child cast its spell with spells only (`FarmCircuitTask._build_spell`,
   `FarmTask.fielded_caster`); the circuit's training plan and its until
   levels stay as they were, and leaving the build ends it. A fielded
-  caster who cannot afford a cast above her healing reserve fights with
-  her wielded weapon by the ordinary melee rules (pack split, heals,
-  retreat, flee and recall) and casts again as soon as she can, one
-  `caster-out-of-mana` decision each time she runs dry. Without a weapon
-  she keeps the spell-only routine.
+  caster who cannot afford a cast above her healing reserve, with no
+  charged mana crystal to draw from, fights with her wielded weapon by the
+  ordinary melee rules (pack split, heals, retreat, flee and recall) and
+  casts again as soon as she can; out of a fight she rests for mana as
+  the spell routine does, rather than pulling with her weapon. A
+  `caster-out-of-mana` decision is recorded at most once a minute.
+  Without a weapon she keeps the spell-only routine.
 - **Spell damage.** A caster build's damage per hit is the median of her
   sampled hits with its spell, kept per spell (a fielded spell never
   resets her training spell's) and saved in her character memory (at

@@ -2444,8 +2444,10 @@ class FarmTask(BotTask):
         # disengages), and a build's gear style replaces her training's.
         self.fielded_caster = False
         self.gear_style_override = ""
-        # Whether a fielded caster is out of SP for a cast (spell_only_training).
+        # Whether a fielded caster is out of SP for a cast
+        # (spell_only_training), and when that was last recorded.
         self._caster_dry = False
+        self._caster_dry_at = float("-inf")
         self.allow_launchers = (
             not bool(self.combat_spell)
             if allow_launchers is None else bool(allow_launchers))
@@ -3483,6 +3485,10 @@ class FarmTask(BotTask):
             self.training_active(client) and
             not self.casts_firestorm(client))
 
+    # A fielded caster's caster-out-of-mana record repeats at most this
+    # often: each regenerated cast would otherwise start a new one.
+    DRY_RECORD_SECONDS = 60.0
+
     def spell_only_training(self, client: AtrinikClient) -> bool:
         """Whether every hit on a training target must be the trained spell.
 
@@ -3493,6 +3499,7 @@ class FarmTask(BotTask):
         """
         if not ("wizardry" in self.combat_skill and
                 self.training_active(client)):
+            self._caster_dry = False
             return False
         # A bar too small for one cast beyond the healing reserve can never
         # cast: then the weapon trains (the profile ranks it that way too).
@@ -3501,17 +3508,24 @@ class FarmTask(BotTask):
         cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
         if spell is not None and self.fielded_caster and self._wields_weapon(client):
             # A fielded caster who cannot afford a cast above her healing
-            # reserve fights with her weapon, by the ordinary melee rules,
-            # until she can again (one caster-out-of-mana record each time).
+            # reserve, with no charged mana crystal to draw from, fights
+            # with her weapon by the ordinary melee rules until she can
+            # cast again (a caster-out-of-mana record at most every
+            # DRY_RECORD_SECONDS, not one per regenerated cast).
             sp = int(client.state.stats.get("sp", 0) or 0)
-            dry = cost > sp - self.healing_mana_reserve(client)
-            if dry and not self._caster_dry:
+            dry = (cost > sp - self.healing_mana_reserve(client) and
+                   not ManaCrystal.has_charge(client))
+            now = time.monotonic()
+            if dry and not self._caster_dry and now - self._caster_dry_at >= self.DRY_RECORD_SECONDS:
+                self._caster_dry_at = now
                 recorder = getattr(client, "record_action", None)
                 if recorder is not None:
                     recorder("caster-out-of-mana", f"{spell.name}: fighting with her weapon")
             self._caster_dry = dry
             if dry:
                 return False
+        else:
+            self._caster_dry = False
         return spell is not None and (
             maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
 
@@ -7382,7 +7396,8 @@ class FarmTask(BotTask):
             await client.set_combat(False)
             self.complete()
             return
-        if (engaged is None and self.spell_only_training(client) and
+        if (engaged is None and
+                (self.spell_only_training(client) or self._caster_dry) and
                 (nearest_threat is None or nearest_threat[0] > 2) and
                 not any(active_threat(entry) for entry in threats
                         if entry[3].target_id not in pulled_aside_ids) and

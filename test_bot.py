@@ -42121,7 +42121,7 @@ class BuildPerSpotTests(unittest.TestCase):
             client = QuestTests._wizard_training_client(100, x=9, y=8)
             if weapon:
                 sword = Item(50, flags=c.ITEM_APPLIED, item_type=c.TYPE_WEAPON,
-                             name="long sword")
+                             quality=80, condition=80, name="long sword")
                 client.state.inventory.append(sword)
                 client.state.items[50] = sword
                 client.state.equipment[c.EQUIP_WEAPON] = 50
@@ -42158,10 +42158,22 @@ class BuildPerSpotTests(unittest.TestCase):
             tick(client, task)
         self.assertEqual(client.fired, [(3, 42)])
         self.assertNotIn(True, client.combat)
-        # Dry again, a second episode is recorded.
+        # Dry again after a cast: no new record within a minute (each
+        # regenerated cast would start one), then another.
+        client.state.stats["sp"] = 0
+        self.assertFalse(task.spell_only_training(client))
+        self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 1)
+        client.state.stats["sp"] = 20
+        self.assertTrue(task.spell_only_training(client))
+        task._caster_dry_at -= task.DRY_RECORD_SECONDS
         client.state.stats["sp"] = 0
         self.assertFalse(task.spell_only_training(client))
         self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 2)
+        # A charged mana crystal to draw from: not dry, the spell routine
+        # (which draws) stays.
+        from .tasks import ManaCrystal
+        with patch.object(ManaCrystal, "has_charge", classmethod(lambda cls, client: True)):
+            self.assertTrue(task.spell_only_training(client))
         # Without a weapon she keeps the spell-only routine: no melee.
         client, task = farm(weapon=False)
         tick(client, task)
