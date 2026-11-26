@@ -2613,8 +2613,6 @@ class FarmTask(BotTask):
         # The last safe-square route a retreat took: (goal kind, goal,
         # steps), for its retreat-choice record.
         self._safe_route_note: tuple[str, tuple[int, int], int] | None = None
-        # The inputs of the last safe-square search that found no route.
-        self._safe_route_miss: tuple | None = None
         self._priority_target_ids: dict[int, int] = {}
         # Set by the farm circuit while autoplay's switch to its recovery
         # phase waits for this fight: finish the engaged target and fight
@@ -6117,23 +6115,15 @@ class FarmTask(BotTask):
             # next such square.
             return None
         # One search a call: the remembered squares outrank the exits,
-        # the nearer of each first. A miss is kept until her square, the
-        # threats or the goals change, so a cornered retreat does not
-        # search again every tick.
+        # the nearer of each first.
         remembered_set = set(remembered)
         if not remembered_set and not exits:
-            return None
-        key = (m.path, start, tuple(sorted(threat_world)),
-               tuple(sorted(hazard_world)), frozenset(remembered_set),
-               frozenset(exits), frozenset(blocked))
-        if key == self._safe_route_miss:
             return None
         route = safe_square_route(
             node, start, remembered_set | exits, threats=threat_world,
             hazards=hazard_world, blocked=blocked,
             best=lambda point: int(point in remembered_set), stop_at=1)
         if route is None or len(route) < 2:
-            self._safe_route_miss = key
             return None
         kind = "safe" if route[-1] in remembered_set else "exit"
         world_x, world_y = route[1]

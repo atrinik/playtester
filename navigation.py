@@ -5177,8 +5177,9 @@ class NavigateThenTask(BotTask):
         # (_near_spot's last answer, by map); and the terrain features
         # looked up.
         self._pursuit_samples: dict[int, deque] = {}
+        self._pursuit_map = ""
         self._pursuit_origins: dict[int, tuple[str, int, int]] = {}
-        self._pursuer_ids: set[int] = set()
+        self._pursuer_ids: dict[int, float] = {}
         self._lead: dict[str, Any] | None = None
         self._leads = 0
         self._stand_since = 0.0
@@ -5940,20 +5941,28 @@ class NavigateThenTask(BotTask):
         self._seam_contact = True
         return True
 
+    # A trip remembers where at most this many creatures were first seen.
+    PURSUIT_ORIGINS = 256
+
     def _track_pursuers(self, client: AtrinikClient, threats) -> list:
-        """The threats following her: each one sampled now, a pursuer when
-        within MAX_AGGRO_RANGE and, against its oldest sample at least
-        APPROACH_PURSUIT_MIN_SECONDS old (within the window), its own
-        movement took it 2 or more tiles nearer where she stands now (or
-        she changed maps and it is no farther off); or it is beside her
-        and hitting her. A creature that sits on its spawn or wanders,
-        however she walks, is none. Once a pursuer, a creature stays one
-        while it is in view within MAX_AGGRO_RANGE (_pursuer_ids), so a
-        train that holds off at range still counts. Where each creature
-        was first seen is kept while it is sampled (_pursuit_origins)."""
+        """The threats following her. Each creature in view is sampled
+        (world square and time, this map only: a map change starts the
+        samples afresh). It qualifies when it is beside her and hitting
+        her, or when its own movement since its oldest sample at least
+        APPROACH_PURSUIT_MIN_SECONDS old took it 2 or more tiles nearer
+        where she stands now, so her own walk towards a creature that
+        stands or wanders never makes one. A pursuer is one that
+        qualified within the last APPROACH_PURSUIT_WINDOW_SECONDS and is
+        in view within MAX_AGGRO_RANGE (_pursuer_ids holds when each last
+        qualified). Where each creature was first seen this trip is kept
+        (_pursuit_origins, at most PURSUIT_ORIGINS)."""
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
         now = time.monotonic()
+        if self._pursuit_map != m.path:
+            self._pursuit_map = m.path
+            self._pursuit_samples.clear()
+            self._pursuer_ids.clear()
         horizon = now - self.APPROACH_PURSUIT_WINDOW_SECONDS
         for target_id in list(self._pursuit_samples):
             samples = self._pursuit_samples[target_id]
@@ -5961,10 +5970,9 @@ class NavigateThenTask(BotTask):
                 samples.popleft()
             if not samples:
                 del self._pursuit_samples[target_id]
-                self._pursuit_origins.pop(target_id, None)
-        self._pursuer_ids &= {
-            threat[3].target_id for threat in threats
-            if threat[0] <= MAX_AGGRO_RANGE}
+        self._pursuer_ids = {
+            target_id: at for target_id, at in self._pursuer_ids.items()
+            if at >= horizon}
         pursuers = []
         for threat in threats:
             distance, x, y, obj = threat
@@ -5974,31 +5982,21 @@ class NavigateThenTask(BotTask):
             samples = self._pursuit_samples.setdefault(
                 obj.target_id, deque(maxlen=self.APPROACH_PURSUIT_SAMPLES))
             oldest = samples[0] if samples else None
-            samples.append((now, m.path, world[0], world[1], distance))
-            self._pursuit_origins.setdefault(
-                obj.target_id, (m.path, world[0], world[1]))
+            samples.append((now, world[0], world[1]))
+            if obj.target_id not in self._pursuit_origins:
+                if len(self._pursuit_origins) >= self.PURSUIT_ORIGINS:
+                    self._pursuit_origins.pop(next(iter(self._pursuit_origins)))
+                self._pursuit_origins[obj.target_id] = (m.path, *world)
             if distance > MAX_AGGRO_RANGE:
                 continue
+            closed = (oldest is not None and
+                      now - oldest[0] >= self.APPROACH_PURSUIT_MIN_SECONDS and
+                      max(abs(oldest[1] - m.world_x),
+                          abs(oldest[2] - m.world_y)) - distance >= 2)
+            if closed or (distance <= 1 and self._hit_by(client, obj)):
+                self._pursuer_ids[obj.target_id] = now
             if obj.target_id in self._pursuer_ids:
                 pursuers.append(threat)
-                continue
-            if distance <= 1 and self._hit_by(client, obj):
-                pursuers.append(threat)
-                continue
-            if (oldest is None or
-                    now - oldest[0] < self.APPROACH_PURSUIT_MIN_SECONDS):
-                continue
-            if oldest[1] != m.path:
-                # She changed maps and it is still near: it came along.
-                if distance <= oldest[4]:
-                    pursuers.append(threat)
-                continue
-            # Its own movement closed on where she is now by 2 or more:
-            # her walk towards a creature that stands or wanders does not.
-            if max(abs(oldest[2] - m.world_x),
-                   abs(oldest[3] - m.world_y)) - distance >= 2:
-                pursuers.append(threat)
-        self._pursuer_ids.update(threat[3].target_id for threat in pursuers)
         return pursuers
 
     def _edge_arrival(self, edge: MapEdge) -> tuple[int, int]:
@@ -6196,11 +6194,10 @@ class NavigateThenTask(BotTask):
         the nearest of those beyond MAX_AGGRO_RANGE, a square of her
         cleared trail or her walk first among those. It keeps out of the
         detection radius of every spawn none of the train came from, and
-        pays to cross any spawn's margin (_lead_spawns). Already beyond
-        MAX_AGGRO_RANGE of them she waits there. False when no square gains
-        on where she stands: she stands this tick, and tries again after
-        LEAD_RETRY_SECONDS; LEAD_STUCK_FAILS misses in a row mark the lead
-        stuck. A miss is kept until her square or the threats change."""
+        pays to cross any spawn's margin (_lead_spawns). False when no
+        square gains on where she stands: she stands this tick, and tries
+        again after LEAD_RETRY_SECONDS; LEAD_STUCK_FAILS misses in a row
+        mark the lead stuck."""
         lead = self._lead
         m = client.state.map
         now = time.monotonic()
@@ -6227,9 +6224,6 @@ class NavigateThenTask(BotTask):
                         for x, y in threat_world), default=99)
 
         here_gap = train_gap(here)
-        if here_gap > MAX_AGGRO_RANGE:
-            # Already clear of them all: wait for the chase to drop.
-            return True
         trail = set()
         if isinstance(self.task, FarmTask):
             trail = {(x, y) for path, x, y in self.task._cleared_trail
@@ -6238,22 +6232,17 @@ class NavigateThenTask(BotTask):
         blocked = {(x, y) for path, x, y in self._retreat_blocked
                    if path == m.path}
         hard, soft = self._lead_spawns(node, m)
-        key = (m.path, here, tuple(sorted(threat_world)), frozenset(blocked),
-               tuple(hard), frozenset(trail))
-        route = None
-        if key != lead.get("miss"):
-            clear = MAX_AGGRO_RANGE + 1
-            route = safe_square_route(
-                node, here, (), threats=threat_world, hazards=hard,
-                soft=soft, blocked=blocked,
-                allow_locked=self.navigation._allow_locked(client),
-                best=lambda point: (min(train_gap(point), clear),
-                                    int(point in trail)),
-                stop_at=(clear, 1))
-            if (route is None or len(route) < 2 or
-                    train_gap(route[-1]) <= here_gap):
-                lead["miss"] = key
-                route = None
+        clear = MAX_AGGRO_RANGE + 1
+        route = safe_square_route(
+            node, here, (), threats=threat_world, hazards=hard,
+            soft=soft, blocked=blocked,
+            allow_locked=self.navigation._allow_locked(client),
+            best=lambda point: (min(train_gap(point), clear),
+                                int(point in trail)),
+            stop_at=(clear, 1))
+        if (route is None or len(route) < 2 or
+                train_gap(route[-1]) <= here_gap):
+            route = None
         dx = dy = 0
         if route is not None:
             dx, dy = route[1][0] - here[0], route[1][1] - here[1]
@@ -10645,7 +10634,9 @@ class FarmCircuitTask(BotTask):
     def _quarantine_farm_path(self, client: AtrinikClient, path: str,
                               reason: str, *, seconds: float | None = None) -> None:
         seconds = self.FARM_DEATH_QUARANTINE_SECONDS if seconds is None else seconds
-        until = time.time() + seconds
+        # A longer quarantine already in place is never shortened.
+        until = max(time.time() + seconds, float(
+            client.state.farm_zone_quarantine.get(path, 0.0) or 0.0))
         setter = getattr(client, "quarantine_farm_zone", None)
         if setter is not None:
             setter(path, until)
@@ -11166,24 +11157,51 @@ class FarmCircuitTask(BotTask):
         return self._upgrade_progression(client, farm)
 
     # A spot whose approach a train of followers held (approach-train-held)
-    # is left for this long, so the analyzer picks another.
-    APPROACH_TRAIN_QUARANTINE_SECONDS = 30 * 60
+    # is left this long, longer each time within a day (farm_train_holds):
+    # 30 minutes, then 2 hours, then 6.
+    APPROACH_TRAIN_QUARANTINE_SECONDS = (30 * 60, 2 * 60 * 60, 6 * 60 * 60)
+    TRAIN_HOLD_MEMORY_SECONDS = 24 * 60 * 60
 
     async def _leave_train_held_spot(self, client: AtrinikClient,
                                      farm: FarmTask) -> None:
         """Three or more followers held her approach to this leg's map and
-        none of them came to be fought (NavigateThenTask.train_held): back
-        that map off for APPROACH_TRAIN_QUARANTINE_SECONDS (the analyzer
-        skips a spot with any leg quarantined) and choose again. With no
-        other spot chosen the circuit fails with the walk's reason, and
-        autoplay chooses again from the ranking, the quarantine applying."""
+        none of them came to be fought (NavigateThenTask.train_held).
+
+        That map's area (_quarantine_farm_area, and the map itself) and the
+        map she stands on, where the train was, are quarantined for
+        APPROACH_TRAIN_QUARANTINE_SECONDS by how often this happened there
+        in the last day (farm_train_holds, kept in her memory); a longer
+        quarantine is kept. The analyzer, which skips a spot with any leg
+        quarantined, then chooses again (_upgrade_progression): another
+        spot, or, with every ranked spot quarantined, farm-spots-exhausted
+        and the circuit completes (autoplay holds until one is usable).
+        With no ranking to follow the circuit fails with the walk's reason
+        and autoplay chooses from the ranking."""
         assert self.child is not None
         await client.clear_actions()
         await client.set_combat(False)
-        self._quarantine_farm_path(
-            client, self.child.navigation.destination,
-            f"approach held: {self.child.error}",
-            seconds=self.APPROACH_TRAIN_QUARANTINE_SECONDS)
+        destination = self.child.navigation.destination
+        now = time.time()
+        holds = [at for at in (getattr(client.state, "farm_train_holds", {})
+                               or {}).get(destination, ())
+                 if now - at < self.TRAIN_HOLD_MEMORY_SECONDS]
+        seconds = self.APPROACH_TRAIN_QUARANTINE_SECONDS[
+            min(len(holds), len(self.APPROACH_TRAIN_QUARANTINE_SECONDS) - 1)]
+        note = getattr(client, "note_farm_train_hold", None)
+        if note is not None:
+            note(destination, now)
+        else:
+            client.state.farm_train_holds = {
+                **(getattr(client.state, "farm_train_holds", {}) or {}),
+                destination: [*holds, now]}
+        reason = f"approach held: {self.child.error}"
+        self._quarantine_farm_path(client, destination, reason,
+                                   seconds=seconds)
+        self._quarantine_farm_area(client, destination, reason,
+                                   seconds=seconds)
+        here = client.state.map.path
+        if here and here != destination:
+            self._quarantine_farm_path(client, here, reason, seconds=seconds)
         if self._upgrade_progression(client, farm):
             return
         self.fail(self.child.error)
@@ -14738,6 +14756,9 @@ class FarmCircuitTask(BotTask):
             self.child.navigation.complete()
         await self.child.tick(client)
         if self.child.status == TaskStatus.FAILED:
+            if self.child.train_held and isinstance(farm, FarmTask):
+                await self._leave_train_held_spot(client, farm)
+                return
             self.fail(self.child.error)
             return
         if self.child.navigation.status != TaskStatus.COMPLETE:

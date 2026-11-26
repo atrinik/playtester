@@ -2424,22 +2424,19 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
 - **Cost on the event loop.** Every safe-square search settles at most
   1,200 squares within 24 tiles; a retreat or a lead-away step runs one
   search, and no tick runs both (the retreat's runs only on the farm map,
-  the lead-away only off it). A search that found nothing is not repeated
-  while her square, the threats, the hazards and the goals stay the same.
-  Measured worst cases on an open 100x100 map with 15 spawns and 5
+  the lead-away only off it). Measured worst cases on an open 100x100 map with 15 spawns and 5
   threats: about 5 ms for the retreat, 6 to 8 ms for a lead-away step.
 - **Spawn-radius cost on the way in** (docs/ROUTING.md 1.6): on an
   optional trip her walk skirts aggressive spawns on the farm map and the
   maps tiled to it when a route about as short goes round.
 - **Pursuers** (`NavigateThenTask._track_pursuers`). Each creature in
-  view is sampled every defence tick for 12 s. It is a pursuer when it is
-  within 9 tiles and its own movement since its oldest sample at least
-  2 s old took it 2 or more tiles nearer where she stands now (so her own
-  walk towards a creature that stands or wanders makes none), or she
-  changed maps and it is no farther off, or it is beside her and hitting
-  her. Once a pursuer, it stays one while in view within 9 tiles, so a
-  train holding off at range still counts. Outclassed creatures do not
-  count.
+  view is sampled every defence tick for 12 s, on the map she is on (a
+  map change starts afresh). It qualifies when it is beside her and
+  hitting her, or when its own movement since its oldest sample at least
+  2 s old took it 2 or more tiles nearer where she stands now, so her own
+  walk towards a creature that stands or wanders makes none. It stays a
+  pursuer while in view within 9 tiles, for 12 s after it last
+  qualified. Outclassed creatures do not count.
 - **Before arrival** (`_approach_mode`), only on a farm trip and off the
   farm map, on the last leg or within about 25 tiles of the farm map
   along her route (`_near_spot`), and never under the seam contact after
@@ -2459,18 +2456,25 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
     pursuer reaching her restarts it), then the walk goes on for at least
     30 s, so wanderers cannot hold her. Against three or more it has no
     such limit; one that none of them reaches for 180 s fails the trip
-    (`approach-train-held`, latched). The farm circuit then quarantines
-    that leg's map for 30 minutes (`farm-zone-quarantine`; the analyzer
-    skips a spot with any leg quarantined) and chooses again, or fails
+    (`approach-train-held`, latched). The farm circuit, on its transit or
+    its farm branch, then quarantines that leg's map, its area and the
+    map she stood on (`farm-zone-quarantine`, never shortening a longer
+    one) for 30 minutes, 2 hours on the second such hold there within a
+    day and 6 hours from the third (`farm_train_holds`, in her memory).
+    The analyzer, which skips a spot with any leg quarantined, then
+    chooses again; with every ranked spot quarantined it records
+    `farm-spots-exhausted` and the circuit completes, and autoplay holds
+    until a spot is usable. With no ranking to follow the circuit fails
     and autoplay chooses from the ranking;
   - with more than 2 (the pack cap), or heals outpaced, she **leads them
     away** (`approach-lead-away`), combat off, on this map: to the square
     in reach farthest from them, the nearest of those beyond 9 tiles, a
     cleared-trail square first among those. The walk keeps out of the
     detection radius of every spawn none of the train came from (a train
-    member first seen, this trip, within a spawn's radius makes it theirs) and pays 6
+    member first seen, this trip, within a spawn's radius makes it
+    theirs; up to 256 first sightings are kept a trip) and pays 6
     a square to cross any spawn's radius plus margin, so a dense map does
-    not wall it in. Beyond 9 tiles of them all she waits. It ends
+    not wall it in. It ends
     (`approach-lead-done`) once none of the train is in view within 9
     tiles, or after 90 s; then the walk plans its route again and
     re-approaches. A step that finds nothing to gain tries again after

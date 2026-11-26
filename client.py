@@ -648,6 +648,18 @@ class AtrinikClient:
                 }
             else:
                 self.state.farm_zone_quarantine = {}
+            holds = record.get("farm_train_holds", {})
+            now = time.time()
+            self.state.farm_train_holds = {
+                str(path): [float(at) for at in times
+                            if isinstance(at, (int, float)) and
+                            now - float(at) < 86400.0]
+                for path, times in (holds.items()
+                                    if isinstance(holds, dict) else ())
+                if isinstance(path, str) and isinstance(times, list)}
+            self.state.farm_train_holds = {
+                path: times for path, times in
+                self.state.farm_train_holds.items() if times}
             checks = record.get("farm_zone_last_checked", {})
             if isinstance(checks, dict):
                 self.state.farm_zone_last_checked = {
@@ -759,6 +771,7 @@ class AtrinikClient:
             self.state.route_hazards = {}
             self.state.vendor_quotes = {}
             self.state.farm_zone_quarantine = {}
+            self.state.farm_train_holds = {}
             self.state.farm_zone_last_checked = {}
             self.state.lore_attempt_counts = {}
             self.state.apartment_bed_bound = False
@@ -1317,13 +1330,34 @@ class AtrinikClient:
             for zone, expiry in self.state.farm_zone_quarantine.items()
             if expiry > now
         }
-        self.state.farm_zone_quarantine[path] = max(now, float(until))
+        # A quarantine is never shortened.
+        self.state.farm_zone_quarantine[path] = max(
+            now, float(until),
+            float(self.state.farm_zone_quarantine.get(path, 0.0) or 0.0))
         character = self.state.player_name or self.config.character
         if not character:
             return
         self._runtime_memory.setdefault(character, {})[
             "farm_zone_quarantine"] = dict(
                 self.state.farm_zone_quarantine)
+        self._persist_character_memory()
+
+    def note_farm_train_hold(self, path: str, at: float) -> None:
+        """Persist a train-held approach to farm map ``path`` at ``at``,
+        keeping the last day's (FarmCircuitTask._leave_train_held_spot)."""
+        if not path:
+            return
+        holds = [held for held in self.state.farm_train_holds.get(path, [])
+                 if at - held < 86400.0]
+        holds.append(float(at))
+        self.state.farm_train_holds[path] = holds
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})[
+            "farm_train_holds"] = {
+                key: list(value)
+                for key, value in self.state.farm_train_holds.items()}
         self._persist_character_memory()
 
     def set_farm_zone_last_checked(self, path: str,

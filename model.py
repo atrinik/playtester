@@ -342,6 +342,10 @@ class GameState:
     vendor_quotes: dict[str, dict[str, int | float | str]] = field(
         default_factory=dict)
     farm_zone_quarantine: dict[str, float] = field(default_factory=dict)
+    # Farm leg map -> when a train of followers held her approach to it
+    # (approach-train-held), the last day's: each repeat backs it off
+    # longer (FarmCircuitTask._leave_train_held_spot).
+    farm_train_holds: dict[str, list[float]] = field(default_factory=dict)
     # Which farming-analyzer ranking autoplay follows (see farm_analyzer.OBJECTIVES).
     farm_objective: str = "xp"
     # The operator's combat build per farm spot (its path) or for every
