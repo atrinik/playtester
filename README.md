@@ -405,8 +405,9 @@ to sell:
 - **Speed.** A `(speed+N)` item and the armour speed cap count by how much
   faster or slower she really is, from the server's formula (`living.c`):
   0.85, plus the Dex bonus and N/30 per item, clamped to the lowest worn
-  armour speed cap, plus (1 + N/3)/10 per item after the cap. Speed is
-  weighted up by half while she has no working recall (a change in that
+  armour speed cap, plus (1 + N/3)/10 per item after the cap. +0.1 speed
+  is worth +3 AC (owner decision, 2026-11-26), and speed is weighted up by
+  half while she has no working recall (a change in that
   counts only once it has held for 2 minutes). Once she carries more than
   half her weight limit, an item's weight costs the speed it would take off
   her (encumbrance starts at 65%), but only where the decision changes

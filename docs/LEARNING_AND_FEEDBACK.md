@@ -1914,15 +1914,15 @@ surplus sale (`_surplus_equipment`). Differences from the F4 text:
   `wc_bonus` and `speed_bonus`, `hp_bonus` on her base hit points), plus 5
   a point toward the next step; speed recomputed with the server formula
   (`living.c:1051-1096`), so a `(speed+N)` item (now parsed) and the armour
-  speed cap count by her real gain, 1500 points per 1.0 speed and half as
-  much again with no working recall (`working_recall` follows a change
+  speed cap count by her real gain, 600 points per 1.0 speed (owner
+  decision, 2026-11-26: +0.1 speed is worth +3 AC, 3 × 20 / 0.1) and half
+  as much again with no working recall (`working_recall` follows a change
   only once it has held for 2 minutes); and, above half her weight limit,
   the speed an item's weight would cost her (ramping in to the real
   encumbrance at 65%). That weight is charged only where the decision
   changes what she carries (`weight_for`): the shop charges the stock (a
   purchase adds it), the surplus sale an unworn spare (selling sheds it),
-  and the equip loop nothing (a swap keeps both carried). The speed weights
-  are provisional, pending the owner.
+  and the equip loop nothing (a swap keeps both carried).
 - **A ring** is valued against her worn set without the ring it would
   replace: itself when worn, the weakest worn ring when both slots are
   full (ties to the lower tag, as the equip loop takes off), none when one
