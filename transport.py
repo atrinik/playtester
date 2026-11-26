@@ -63,6 +63,18 @@ async def _handshake(protocol: Any, timeout: float) -> None:
     raise TimeoutError(f"QUIC handshake gave no answer in {timeout:g} s")
 
 
+async def _exit(context: Any, protocol: Any) -> None:
+    """Leave the connection context, at most CLOSE_TIMEOUT seconds: a close
+    that never completes never holds her reconnect back. Its UDP transport
+    is then closed here, as the context would have."""
+    try:
+        await asyncio.wait_for(context.__aexit__(None, None, None), CLOSE_TIMEOUT)
+    except TimeoutError:
+        transport = getattr(protocol, "_transport", None)
+        if transport is not None:
+            transport.close()
+
+
 @dataclass(slots=True)
 class QuicStream:
     """Own an aioquic connection context and its game stream."""
@@ -70,6 +82,7 @@ class QuicStream:
     context: Any
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
+    protocol: Any = None
 
     @classmethod
     async def connect(cls, host: str, port: int, certificate_sha256: str,
@@ -118,18 +131,14 @@ class QuicStream:
             reader, writer = await protocol.create_stream()
             writer.write(GAME_STREAM_PREFACE)
             await asyncio.wait_for(writer.drain(), timeout)
-            return cls(context, reader, writer)
+            return cls(context, reader, writer, protocol)
         except BaseException:
             if protocol is not None:
                 # Bounded: a close that never completes never holds the
                 # caller's error (and her reconnect) back.
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        context.__aexit__(None, None, None), CLOSE_TIMEOUT)
+                await _exit(context, protocol)
             raise
 
     async def close(self) -> None:
         self.writer.close()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(
-                self.context.__aexit__(None, None, None), CLOSE_TIMEOUT)
+        await _exit(self.context, self.protocol)

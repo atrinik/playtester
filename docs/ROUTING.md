@@ -603,9 +603,10 @@ starvations.
   the fallback. `NavigateTask.start` and `_replan` now plan through
   `_plan_off_loop`: a `BackgroundPlans` plan of the trip's own, on a copy
   of the trip (`_planning_copy`: its own containers and care crossing)
-  with her `PlanningClient`, keyed by the map she stood on (planned again
-  from another map; a step on the same map in a fight does not restart
-  it, and the route still leaves that map).
+  with her `PlanningClient`, keyed by the map and the static component
+  she stood in (`_plan_key`: planned again from another map or another
+  part of the same one, such as across a shop mat; a step within the
+  same part in a fight does not restart it).
   - Until it is done the route stays empty, `NavigateTask.planning` is
     true and the trip's tick returns before any step: she does not move,
     and a path the server still walks for her is stopped. Her trip's
@@ -627,8 +628,10 @@ starvations.
     next tier (`_check_cancelled` in `_route_points`).
   - Essential and critical trips (`critical`: an aborted expedition's
     retreat) plan at `PRIORITY_HEAL`, and while the worker runs or queues
-    another job (`planner.busy`; a ranking can take 45 s) they plan on
-    the loop, as before. An optional trip waits behind such a job, and
+    another job (`planner.busy`: a job counts from its submission until it
+    ends, a dropped one still queued never; a ranking can take 45 s) they
+    plan on the loop, as before; a trip not started plans there as itself
+    too (a live plan, `_plan_here`). An optional trip waits behind such a job, and
     she stands still that long.
 - **Plans made before a trip serve its start.** `NavigateTask.prepare`
   plans a trip that has not started, off the loop, as the trip itself (a
