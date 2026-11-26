@@ -41933,8 +41933,11 @@ class BuildPerSpotTests(unittest.TestCase):
         ratings["ranged-kite"] = self._rating("ranged-kite", 0.7, 700.0, worst=9.0)
         self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
                                        warn=encounter_warning).build, "single")
-        # Unrated, she keeps her default plan.
+        # Unrated, she keeps her default plan, or the build she fields
+        # while a new ranking is rated (no swap back and forth).
         self.assertEqual(builds.choose(client.state, "/spot", {}, {}, self.LEVELS).build, "melee")
+        self.assertEqual(builds.choose(client.state, "/spot", {}, {}, self.LEVELS,
+                                       current="single").build, "single")
         # The analyzer rates every style she can field.
         self.assertEqual(builds.fieldable_styles(client.state, self.LEVELS),
                          ("melee", "ranged-kite"))
@@ -42006,6 +42009,21 @@ class BuildPerSpotTests(unittest.TestCase):
         circuit.child = circuit._new_child()
         circuit._storage_retry_at = float("inf")
         self.assertFalse(circuit._needs_apartment_storage(client))
+        # A failed trip's backoff stands even for a build change.
+        circuit._storage_backoff_until = circuit.clock() + 600.0
+        client.state.build_choices = {"/farm": "single"}
+        self.assertTrue(circuit._review_combat_build(client, circuit.child.task))
+        self.assertEqual(circuit._swap_build, "single")
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        # Back to melee, then the backoff ends.
+        client.state.build_choices = {"*": "melee"}
+        circuit._swap_build = ""
+        self.assertTrue(circuit._review_combat_build(client, circuit.child.task))
+        self.assertEqual(circuit._build_name, "melee")
+        circuit._storage_backoff_until = 0.0
+        circuit._storage_retry_at = float("inf")
+        circuit._swap_build = ""
+        client.actions.clear()
         # The operator picks the single-target caster here: the build
         # changes, and her chest holds that build's girdle.
         client.state.build_choices = {"/farm": "single"}
@@ -42072,6 +42090,16 @@ class BuildPerSpotTests(unittest.TestCase):
         circuit._storage_retry_at = 0.0
         self.assertFalse(circuit._swap_build)
         self.assertFalse(circuit._review_combat_build(client, circuit.child.task))
+        # A new circuit takes over the build she fields: no needless swap.
+        successor = self._circuit(client)
+        successor.child = successor._new_child()
+        self.assertTrue(successor._review_combat_build(client, successor.child.task))
+        self.assertEqual((successor._build_name, successor._swap_build), ("single", ""))
+        # An explicit circuit fields no build.
+        explicit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        client.build_styles = ("melee", "ranged-kite")
+        self.assertFalse(explicit._review_combat_build(client, successor.child.task))
+        self.assertEqual((client.active_build_style, client.build_styles), ("", ()))
 
     def test_the_suggestion_lists_owned_items_first(self):
         from . import storage

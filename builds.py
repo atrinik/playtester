@@ -227,7 +227,7 @@ def _rank(build: str, rating: Mapping[str, Any] | None,
 
 def choose(state: Any, spot: str, ratings: Mapping[str, Mapping[str, Any] | None],
            choices: Mapping[str, str], spell_levels: Mapping[str, int], *,
-           warn: Any = lambda rating: False) -> Choice | None:
+           warn: Any = lambda rating: False, current: str = "melee") -> Choice | None:
     """The build she fields on ``spot`` (its key, FarmAnalyzer.spot_key's
     path), or None when she can field none.
 
@@ -235,7 +235,8 @@ def choose(state: Any, spot: str, ratings: Mapping[str, Mapping[str, Any] | None
     style (the encounter fields, xp_hour), or None when unrated; ``warn``
     is farm_analyzer.encounter_warning. On auto, of the builds she can
     field and the analyzer rated, the safest (no warning) with the most
-    XP; with no rating yet, melee (her default plan, plan()).
+    XP; unrated, the build she fields (``current``) while she can, else
+    melee (her default plan, plan()).
     """
     missing = {name: gaps(name, state, spell_levels) for name in BUILD_NAMES}
     missing = {name: reasons for name, reasons in missing.items() if reasons}
@@ -258,9 +259,14 @@ def choose(state: Any, spot: str, ratings: Mapping[str, Mapping[str, Any] | None
         reason = (f"safest she can field: {BUILDS[best].encounter_style} "
                   f"encounter safety {float(rating.get('encounter_safety') or 0):.2f}, "
                   f"XP {float(rating.get('xp_hour') or 0):.0f}/h")
+    elif current in ready and current != "melee":
+        # Unrated (a new spot), she keeps what she fields: no swap back and
+        # forth while a rating comes.
+        best = current
+        reason = "no encounter ratings yet: the build she fields"
     else:
-        # Unrated, she keeps her default plan (melee: her weapon, with the
-        # automatic Wizardry training).
+        # Unrated, her default plan (melee: her weapon, with the automatic
+        # Wizardry training).
         best = "melee"
         reason = "no encounter ratings yet: her default plan"
     if chosen != AUTO:

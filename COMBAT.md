@@ -2115,8 +2115,12 @@ gap says so.
   ranking, kept apart from the ranking), and she fields the safest: a build
   without an encounter warning before one with, then the most XP; among
   warned builds the highest encounter safety. Until a style is rated, she
-  keeps her default plan (melee). The rating uses her current damage
-  profile with only the style changed.
+  keeps the build she fields (a new circuit takes it over), else her
+  default plan (melee); a new ranking keeps each style's earlier ratings
+  until that style is re-run, so the build does not flip while they come.
+  The rating uses her current damage profile with only the style changed.
+  An explicit (non-analyzer) circuit fields no build and clears the build
+  style from her profile.
 - **Unmet requirement.** An operator's build she cannot field falls back to
   the auto choice among those she can, with a `build-gap` decision and a
   "Build gap" warning alert. The "get this build" errand works towards the
@@ -2133,13 +2137,16 @@ gap says so.
   does not go: the dashboard shows "Get this build: need 5g for Firestorm
   from Dunowen" (and a `build-errand-funds` decision) until the owner drops
   gold on her. "You don't have enough money..." is handled the same way.
+  A failed errand waits on its own backoff (30 minutes, longer for a
+  refused strict route), apart from the magic bullet purchase.
 - **Swapping sets.** A build change whose set or consumables her chest
   holds (her index's set labels, ammunition for the bow, area-spell wands
   for the AoE caster) makes one apartment trip (`SwapSetTask`): take out the
   new build's pieces that beat what she wears and its consumables, wear
   them (the server takes off what each slot held), then deposit what is no
   longer her active set. Items deposited earlier in the session may come
-  back on that trip.
+  back on that trip. The trip skips the routine 30-minute wait between
+  storage visits, never a failed trip's backoff.
 - **Suggestion.** The Farming tab lists the best set for the spot's build
   from what she owns: per slot what she wears or carries first (the gear
   scorer's best), then what her chest holds for that build, and the stored

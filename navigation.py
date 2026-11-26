@@ -9663,6 +9663,14 @@ class FarmCircuitTask(BotTask):
         self._build_noted: tuple = ()
         self._swap_build = ""
         self._spell_shortfall = ""
+        # What the shortfall is for (spell, price), for the decision record.
+        self._spell_shortfall_key: tuple = ()
+        # Until when a failed storage trip waits (a build change's swap
+        # never cuts it short), and the errand's own retry time.
+        self._storage_backoff_until = 0.0
+        self._learn_retry_at = 0.0
+        # Whether this circuit took over the build she was fielding.
+        self._build_seeded = False
         self._cure: NavigateThenTask | None = None
         self._cure_retry_at = 0.0
         self._cure_apply_at = 0.0
@@ -10208,7 +10216,7 @@ class FarmCircuitTask(BotTask):
         spot = str((self.spot or {}).get("path", ""))
         choice = builds.choose(
             state, spot, ratings, getattr(state, "build_choices", {}) or {}, levels,
-            warn=farm_analyzer_plan.encounter_warning)
+            warn=farm_analyzer_plan.encounter_warning, current=self._build_name)
         _set_attr(client, "build_styles", builds.fieldable_styles(state, levels))
         self._build_choice = choice
         self._publish_build(client, choice)
@@ -10232,7 +10240,7 @@ class FarmCircuitTask(BotTask):
         }
         _set_attr(client, "build_status", status)
         noted = (status["spot"], status["build"], status["chosen"], status["fallback"],
-                 status["shortfall"])
+                 self._spell_shortfall_key if self._spell_shortfall else ())
         if noted == self._build_noted:
             return
         self._build_noted = noted
@@ -10247,27 +10255,48 @@ class FarmCircuitTask(BotTask):
         if self._spell_shortfall:
             recorder("build-errand-funds", self._spell_shortfall)
 
+    def _field_build(self, client: AtrinikClient, name: str) -> None:
+        """Note the build she fields, on the client too (her profile's
+        encounter style, and the next circuit's starting build); a change
+        plans one swap trip (_plan_swap)."""
+        previous = self._build_name
+        self._build_name = name
+        _set_attr(client, "active_build", name)
+        _set_attr(client, "active_build_style",
+                  "" if name == "melee" else builds.BUILDS[name].encounter_style)
+        if name != previous:
+            self._plan_swap(client)
+
     def _review_combat_build(self, client: AtrinikClient,
                              farm: FarmTask) -> bool:
         """Reconfigure secondary training only between fights and loot."""
         if not self._auto_combat_build:
+            # An explicit circuit fields no build: no build style rates her
+            # spot, and no other style is run for it.
+            if getattr(client, "active_build_style", ""):
+                _set_attr(client, "active_build_style", "")
+            if getattr(client, "build_styles", ()):
+                _set_attr(client, "build_styles", ())
             return False
+        if not self._build_seeded:
+            # A new circuit starts with the build she already fields (and
+            # wears the set of).
+            self._build_seeded = True
+            seeded = getattr(client, "active_build", "melee")
+            self._build_name = seeded if seeded in builds.BUILDS else "melee"
         desired = self._automatic_combat_plan(client)
         current = (self.combat_skill, self.combat_spell,
                    self.combat_skill_until_level)
-        if desired == current or self._busy_finishing_fight_or_loot(
-                client, farm):
+        choice = self._build_choice
+        if desired == current:
+            if choice is not None and choice.build != self._build_name:
+                self._field_build(client, choice.build)
+            return False
+        if self._busy_finishing_fight_or_loot(client, farm):
             return False
         self.combat_skill, self.combat_spell, target = desired
         self.combat_skill_until_level = target
-        previous = self._build_name
-        choice = self._build_choice
-        self._build_name = choice.build if choice is not None else "melee"
-        _set_attr(client, "active_build_style",
-                  "" if self._build_name == "melee"
-                  else builds.BUILDS[self._build_name].encounter_style)
-        if self._build_name != previous:
-            self._plan_swap(client)
+        self._field_build(client, choice.build if choice is not None else "melee")
         self.child = self._new_child()
         self._farm_started_at = 0.0
         self._empty_spawn_since = 0.0
@@ -11177,13 +11206,16 @@ class FarmCircuitTask(BotTask):
 
     # --- Swapping gear sets on a build change (builds.py) ------------------
 
-    def _consumable(self, item: Item, build: str | None = None) -> bool:
+    def _consumable(self, client: AtrinikClient, item: Item,
+                    build: str | None = None) -> bool:
         """Whether an item is a consumable of a build's kit: ammunition for
         her launcher (bow), an area-spell wand or rod (AoE caster)."""
         build = build or self._build_name
         name = item.name.casefold()
         if build == "bow" and item.item_type == c.TYPE_ARROW:
-            return True
+            found = builds.launcher(client.state)
+            words = builds.AMMO_WORDS[found[1]] if found else ("arrow", "bolt", "stone")
+            return any(word in name for word in words)
         return (build == "aoe" and item.item_type in (c.TYPE_WAND, c.TYPE_ROD) and
                 any(spell in name for spell in builds.AREA_SPELLS))
 
@@ -11194,15 +11226,16 @@ class FarmCircuitTask(BotTask):
         style = self._build(client)
         rows = storage.stored(client.state)
         consumable = lambda row: self._consumable(
-            Item(0, item_type=row["type"], name=row["name"]))
+            client, Item(0, item_type=row["type"], name=row["name"]))
         wanted = [row for row in rows if any(
             label.startswith(style + ":") for label in row.get("sets", ())) or
             consumable(row)]
         if not wanted:
             return
         self._swap_build = self._build_name
-        # A build change is worth a visit now, not after the routine wait.
-        self._storage_retry_at = 0.0
+        # A build change is worth a visit now, not after the routine wait,
+        # but a failed trip's backoff stands.
+        self._storage_retry_at = self._storage_backoff_until
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
             recorder("build-swap", f"{builds.BUILDS[self._build_name].label}: fetching "
@@ -11288,8 +11321,8 @@ class FarmCircuitTask(BotTask):
                 if name == style:
                     slots.setdefault(slot, []).append({"name": row["name"], "where": "stored"})
         consumables = [row["name"] for row in storage.stored(client.state)
-                       if self._consumable(Item(0, item_type=row["type"], name=row["name"]),
-                                           build)]
+                       if self._consumable(
+                           client, Item(0, item_type=row["type"], name=row["name"]), build)]
         return {"build": build, "label": builds.BUILDS[build].label, "style": style,
                 "slots": slots, "consumables": consumables, "shop": []}
 
@@ -11454,7 +11487,7 @@ class FarmCircuitTask(BotTask):
                     item.item_type == c.TYPE_CONTAINER):
                 stored.append(item)
             elif item.item_type in (c.TYPE_WAND, c.TYPE_ROD):
-                if not unknown and self._consumable(item):
+                if not unknown and self._consumable(client, item):
                     continue
                 if not unknown and any(word in name for word in (
                         "heal", "cure", "identify", "restoration", "recall")) and not (
@@ -11501,7 +11534,7 @@ class FarmCircuitTask(BotTask):
         wants = self._set_upgrades(client, build, sets, chest)
         # Her build's consumables (ammunition, area-spell wands) come too.
         wants.update(item.tag for item in contents
-                     if item.tag in chest and self._consumable(item) and
+                     if item.tag in chest and self._consumable(client, item) and
                      InventoryPolicy().identified(item))
         if storage.best_bag(state.inventory) is None and storage.bag_wanted(state):
             bag = storage.best_bag(contents)
@@ -12841,8 +12874,8 @@ class FarmCircuitTask(BotTask):
         shortfall is shown on the dashboard ("need N for <spell> from
         <seller>"); the owner can drop gold on her."""
         offer = self._learn_offer(client)
-        if offer is None or self.clock() < self._spell_retry_at:
-            self._spell_shortfall = "" if offer is None else self._spell_shortfall
+        if offer is None:
+            self._spell_shortfall = ""
             return False
         reserve = self._depletion_service_cost(client)
         spare = BuyShopUpgradeTask.wallet_value(client) - reserve
@@ -12851,9 +12884,10 @@ class FarmCircuitTask(BotTask):
                 f"need {format_money(offer.price)} for {offer.spell.title()} from "
                 f"{offer.seller} ({format_money(max(0, spare))} spare above her "
                 f"{format_money(reserve)} cure reserve)")
+            self._spell_shortfall_key = (offer.spell, offer.price)
             return False
         self._spell_shortfall = ""
-        return True
+        return self.clock() >= self._learn_retry_at
 
     def _new_learn_spell(self, client: AtrinikClient) -> NavigateThenTask:
         offer = self._learn_offer(client)
@@ -13205,12 +13239,19 @@ class FarmCircuitTask(BotTask):
             if self._spell_purchase.status in (
                     TaskStatus.COMPLETE, TaskStatus.FAILED):
                 learn = self._spell_purchase.task
-                if self._spell_purchase.status == TaskStatus.FAILED:
+                if (self._spell_purchase.status == TaskStatus.FAILED and
+                        isinstance(learn, LearnSpellTask)):
+                    log.warning("learning %s failed: %s", learn.spell,
+                                self._spell_purchase.error)
+                    self._learn_retry_at = self.clock() + self.failure_backoff(
+                        self._spell_purchase.error, 1800.0)
+                    if learn.shortfall:
+                        self._spell_shortfall = self._spell_purchase.error
+                        self._spell_shortfall_key = (learn.spell, learn.shortfall)
+                elif self._spell_purchase.status == TaskStatus.FAILED:
                     log.warning("spell purchase failed: %s",
                                 self._spell_purchase.error)
                     self._spell_retry_at = self.clock() + 1800.0
-                    if isinstance(learn, LearnSpellTask) and learn.shortfall:
-                        self._spell_shortfall = self._spell_purchase.error
                 elif isinstance(learn, LearnSpellTask):
                     log.info("%s learned from %s; returning to farm",
                              learn.spell, learn.npc)
@@ -13218,7 +13259,7 @@ class FarmCircuitTask(BotTask):
                     if recorder is not None:
                         recorder("build-spell-learned", f"{learn.spell} from {learn.npc}")
                     # The next build review can field it at once.
-                    self._spell_retry_at = 0.0
+                    self._learn_retry_at = 0.0
                 else:
                     log.info("magic bullet learned; returning to farm")
                     self._spell_retry_at = self.clock() + 86400.0
@@ -13500,6 +13541,7 @@ class FarmCircuitTask(BotTask):
                     self._storage_refused.update(deposit.godgiven_tags)
                 self._storage_retry_at = self.clock() + self.failure_backoff(
                     self._storage.error, 1800.0)
+                self._storage_backoff_until = self._storage_retry_at
                 self._strict_trip_refused(
                     client, "apartment storage", self._storage.error)
                 self._swap_build = ""

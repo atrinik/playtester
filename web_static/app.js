@@ -318,7 +318,7 @@ function renderCombatBuild() {
   if (sig === lastBuildSig) return;
   lastBuildSig = sig;
   const st = b.status;
-  $("#build-spot").innerHTML = st ? buildButtons(b, b.spot_choice || "auto", st.spot) : '<span class="muted small">Not farming an analyzer spot.</span>';
+  $("#build-spot").innerHTML = st && st.spot ? buildButtons(b, b.spot_choice || "auto", st.spot) : '<span class="muted small">Not farming an analyzer spot.</span>';
   $("#build-every").innerHTML = buildButtons(b, b.every_spot || "auto", "*");
   if (!st) { $("#build-status").innerHTML = ""; return; }
   const label = k => (b.labels || {})[k] || k;

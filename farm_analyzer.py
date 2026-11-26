@@ -1159,12 +1159,13 @@ class FarmAnalyzer:
                 if fields}
 
     def spot_ratings(self, spot: dict | None) -> dict[str, dict | None]:
-        """A spot's rating in each style rated for the current ranking."""
+        """A spot's latest rating in each style. A new ranking keeps the
+        earlier ratings until each style's run for it replaces them, so
+        the build she fields does not change while they are re-run."""
         if not spot:
             return {}
         key = self.spot_key(spot)
-        return {style: ratings.get(key) for style, ratings in self.style_ratings.items()
-                if self.style_generation.get(style) == self.report_generation}
+        return {style: ratings.get(key) for style, ratings in self.style_ratings.items()}
 
     @staticmethod
     def _spots(report: dict) -> list[dict]:
