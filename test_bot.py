@@ -44298,12 +44298,13 @@ class RouteVarietyTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(self.maps(task.route), ["/b", "/d"])
             self.assertTrue(task._variety_done)
-            # A replan never varies again.
+            # A replan never varies again: the best route.
             task.route = []
             task._replan(client)
             while task.planning and time.monotonic() < deadline:
                 task._replan(client)
                 time.sleep(0.01)
+            self.assertEqual(self.maps(task.route), ["/a", "/d"])
         self.assertEqual(len(threads), 1)
         self.assertIsNot(threads[0], threading.main_thread())
         self.assertIn("route-variety", [record["action"] for record in client.action_history])
@@ -44372,21 +44373,32 @@ class RouteVarietyTests(unittest.TestCase):
                              hidden=True)
             door = MapEdge("/greyton", "/inn", 6, 5, 1, 1, "exit", "door")
             seam = MapEdge("/greyton", "/fields", 23, 5, kind="tile")
+            gate = MapEdge("/hills", "/cave", 3, 3, 1, 1, "exit", "invis_exit", hidden=True)
             navigation_module = __import__("atrinik_bot.navigation", fromlist=["x"])
-            for edge in (secret, door, seam, secret):
+            # Into Greyton, then out by a hidden exit: a new way out of a
+            # town she knows is a secret exit. A hidden cave mouth on a map
+            # new to her (invis_exit authors those too) is only a new exit.
+            road = MapEdge("/road", "/greyton", 1, 1, 2, 2, kind="tile")
+            for edge in (road, secret, door, seam, secret, gate):
                 navigation_module.route_variety.note_crossing(client, edge)
             actions = [(record["action"], record["detail"]) for record in client.action_history]
             self.assertEqual([action for action, _ in actions], [
-                "route-new-map", "route-secret-exit", "route-new-map", "route-new-exit",
-                "route-new-map"])
+                "route-new-map", "route-new-map", "route-secret-exit", "route-new-map",
+                "route-new-exit", "route-new-map", "route-new-map", "route-new-exit"])
             self.assertAlmostEqual(client.state.route_map_visits["/sewers"][0], 2.0, places=3)
             self.assertAlmostEqual(client.state.route_edge_uses["seam:/greyton>/fields"][0], 1.0,
                                    places=3)
             # Written at once the first time, then at most every 5 minutes;
-            # a reload keeps them.
-            later = AtrinikClient(ClientConfig(
-                character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
-            later.load_character_memory("Sera")
+            # a reload keeps what was written.
+            def reloaded():
+                later = AtrinikClient(ClientConfig(
+                    character="Sera", runtime_state_path=str(Path(directory) / "state.json")))
+                later.load_character_memory("Sera")
+                return later
+
+            self.assertEqual(set(reloaded().state.route_map_visits), {"/greyton"})
+            client.remember_route_visits(force=True)
+            later = reloaded()
             self.assertIn("/sewers", later.state.route_map_visits)
             self.assertIn("exit:/greyton:4,5>/sewers", later.state.route_edge_uses)
 
@@ -44397,6 +44409,16 @@ class RouteVarietyTests(unittest.TestCase):
         self.assertTrue(circuit._new_bank_sync().navigation.vary_route)
         self.assertTrue(circuit._new_child().navigation.vary_route)
         self.assertFalse(circuit._new_disease_cure().navigation.vary_route)
+        # An optional errand marked essential (cure funding) never varies.
+        from .navigation import mark_essential
+        funding = mark_essential(circuit._new_junk_sale(self.client()), "funding")
+        client = self.client()
+        self.used(client, *self.A_EDGES)
+        funding.navigation._graph = self.graph()
+        funding.navigation.destination, funding.navigation.destination_xy = "/d", (10, 10)
+        route, actions, _ = self.plan(funding.navigation, client)
+        self.assertEqual(self.maps(route), ["/a", "/d"])
+        self.assertEqual(actions, [])
         self.assertFalse(NavigateTask(graph, "/d").vary_route)
 
 

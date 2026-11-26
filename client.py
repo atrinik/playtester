@@ -1199,7 +1199,10 @@ class AtrinikClient:
             return
         self._route_visits_saved_at = monotonic
         try:
-            self._persist_character_memory()
+            # From a tick: never SQLite's usual 10 s wait.
+            self._memory_store().save(
+                character, "state", self._runtime_memory.get(character, {}),
+                timeout=route_events.WRITE_TIMEOUT)
         except Exception as error:  # A count never fails a tick.
             log.warning("route visits not saved: %s", error)
 

@@ -3556,6 +3556,9 @@ class NavigateTask(BotTask):
                       if edge.kind == dialogue_edges.DIALOGUE} <= voyages]
         memo: dict[tuple, float] = {}
         best = route_variety.candidate(route, self._walk_cost(client, route, deadline, memo))
+        if not math.isfinite(best.cost):
+            # Its walk cannot be priced: nothing is "within" it.
+            return None
         candidates = [route_variety.candidate(
             candidate, self._walk_cost(client, candidate, deadline, memo))
             for candidate in routes]
@@ -3572,6 +3575,11 @@ class NavigateTask(BotTask):
             rng=self.variety_rng)
 
     @staticmethod
+    def _save_timeout(client: AtrinikClient) -> float | None:
+        """A tick's bound on a decision-ledger save (her real client)."""
+        return route_events.WRITE_TIMEOUT if isinstance(client, AtrinikClient) else None
+
+    @staticmethod
     def _variety_check(client: AtrinikClient, deadline: float) -> None:
         _check_cancelled(client)
         if time.monotonic() > deadline:
@@ -3581,7 +3589,8 @@ class NavigateTask(BotTask):
                    deadline: float, memo: dict[tuple, float]) -> float:
         """Her walk along ``edges`` to the goal, in steps: each map's
         authored path (local_path) with the walk's spawn-radius costs
-        (_spawn_costs), plus route_variety.TRANSITION_STEPS a transition.
+        (_spawn_costs), plus route_variety.TRANSITION_STEPS an exit or
+        voyage and one step a tile seam; a leg with no path costs inf.
         ``memo`` keeps each leg for the other candidates."""
         access = self._allow_locked(client)
         current = client.state.map.path
@@ -3595,9 +3604,10 @@ class NavigateTask(BotTask):
                 path = self.graph.local_path(map_path, start, goal,
                                              allow_locked=access,
                                              extra_costs=extra or None)
-                memo[key] = (sum(1 + extra.get(point, 0) for point in path[1:])
-                             if path else
-                             max(abs(goal[0] - start[0]), abs(goal[1] - start[1])))
+                # A leg with no authored path is no estimate: the route is
+                # priced out (the best route's own legs always walk).
+                memo[key] = (sum(1 + min(254, extra.get(point, 0)) for point in path[1:])
+                             if path or start == goal else math.inf)
             return memo[key]
 
         cost = 0.0
@@ -3609,7 +3619,7 @@ class NavigateTask(BotTask):
                           max(0, min(node.height - 1, edge.y)))
             if edge.kind != dialogue_edges.DIALOGUE:
                 cost += leg(current, here, target)
-            cost += route_variety.TRANSITION_STEPS + (edge.kind == "tile")
+            cost += 1 if edge.kind == "tile" else route_variety.TRANSITION_STEPS
             here, current = _edge_arrival(self.graph, edge), edge.destination
         goals = self._goal_points()
         if goals:
@@ -5279,7 +5289,7 @@ class NavigateTask(BotTask):
                 self._voyage = None
                 self._record(client, "navigation-voyage-arrived",
                              route_blocks.edge_subject(arrived))
-            route_variety.note_crossing(client, arrived)
+            route_variety.note_crossing(client, arrived, save_timeout=self._save_timeout(client))
         if not self.route or self.route[0].source != client.state.map.path:
             if self._voyage is not None:
                 self._voyage_landed_elsewhere(client)
@@ -5339,7 +5349,8 @@ class NavigateTask(BotTask):
                      edge.destination,
                      (edge.destination_x, edge.destination_y),
                      allow_locked=self._allow_locked(client)))):
-            route_variety.note_crossing(client, self.route.pop(0))
+            route_variety.note_crossing(client, self.route.pop(0),
+                                        save_timeout=self._save_timeout(client))
 
 
 class NavigateThenTask(BotTask):

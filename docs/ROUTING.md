@@ -1597,7 +1597,9 @@ alternate between routes about as good as the best (`route_variety.py`).
   dropped.
 - **Cost.** Each route's walk in steps: each map's authored path
   (`local_path`) with the walk's spawn-radius cost (`_spawn_costs`, 1.6) on
-  a farm trip's maps, plus 4 steps a transition and the walk to the goal.
+  a farm trip's maps, plus 4 steps an exit or voyage (a load), one step a
+  tile seam, and the walk to the goal. A leg with no authored path prices
+  the route out.
   A route that skirts the farm map's spawns is priced as the walk will
   walk it, so variety never trades the approach discipline (COMBAT.md) for
   a fresh road; the approach rules themselves are unchanged.
@@ -1610,8 +1612,10 @@ alternate between routes about as good as the best (`route_variety.py`).
   `KNOWN_LETHAL_TRANSIT`, learned route hazards), her counting route
   deaths and her quarantined spots: the same hazard tier or a safer one.
   Among the best route and the eligible ones she takes the one with the
-  most unvisited edges (a count under 0.5), then the least mean use, a
-  random draw breaking ties. Once a road is the more used, the other wins
+  largest share of unvisited edges (a count under 0.5; a share, so a
+  route never wins only for having more edges), then the least mean use,
+  a random draw breaking ties. The shadow report (route_shadow.py) still
+  compares the planner's best route. Once a road is the more used, the other wins
   the next trip.
 - **Bounds.** The search runs once a trip, in the trip's own plan on the
   planner worker (1.12, `_plan_on_copy`); a plan made on the loop
@@ -1626,7 +1630,12 @@ alternate between routes about as good as the best (`route_variety.py`).
   alternatives were left out as longer or more dangerous. A map she
   enters for the first time in her memory records `route-new-map`; an exit
   taken for the first time `route-new-exit`, or `route-secret-exit` when
-  it is authored invisible (`sys_object` or `invisible`, `MapEdge.hidden`).
+  it is authored invisible (`sys_object` or `invisible`, `MapEdge.hidden`)
+  and leaves a map she already knew: a new way out of a familiar place.
+  `invis_exit` also authors ordinary cave mouths and house doors, so a
+  hidden exit from a map new to her counts only as new. Their ledger saves
+  wait at most 0.25 s, as the tick's other records do; counts made since
+  the last write are lost on a crash (at most 5 minutes).
   These are decision records (the decision list and `actions_total`), not
   the observation ledger, which keeps only her authored readings.
 

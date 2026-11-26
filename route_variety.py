@@ -49,8 +49,9 @@ UNVISITED_BELOW = 0.5
 DEFAULT_TOLERANCE = 0.15
 # A tolerance above this is a configuration mistake: capped.
 MAX_TOLERANCE = 0.5
-# A map transition costs this many steps of walking (route_costs'
-# TRANSITION_SECONDS at its DEFAULT_SECONDS_PER_TILE).
+# An exit or voyage costs this many steps of walking (route_costs'
+# TRANSITION_SECONDS at its DEFAULT_SECONDS_PER_TILE); a tile seam is one
+# step, with no map load.
 TRANSITION_STEPS = 4
 # Alternatives searched per trip: one route avoiding each of this many
 # edges of the best route, and one priced by her counts.
@@ -130,10 +131,18 @@ def dump(maps: dict[str, tuple[float, float]],
             "edges": {key: [round(count, 3), at] for key, (count, at) in edges.items()}}
 
 
-def note_crossing(client: Any, edge: Any, *, now: float | None = None) -> None:
+def note_crossing(client: Any, edge: Any, *, now: float | None = None,
+                  save_timeout: float | None = None) -> None:
     """She crossed ``edge`` on a trip (on the loop): count the edge and the
     map it entered, record a first visit for the dashboard, and keep the
-    counts in her memory."""
+    counts in her memory. ``save_timeout`` bounds the decision ledger's
+    save (a tick never waits SQLite's usual 10 s for it).
+
+    A first exit is a secret one (SECRET_EXIT) when it is authored
+    invisible and leaves a map she already knew: a new way out of a
+    familiar place. ``invis_exit`` also authors ordinary cave mouths and
+    house doors, so a hidden exit from a map new to her is only a new
+    exit."""
     state = getattr(client, "state", None)
     edges = getattr(state, "route_edge_uses", None)
     maps = getattr(state, "route_map_visits", None)
@@ -141,17 +150,19 @@ def note_crossing(client: Any, edge: Any, *, now: float | None = None) -> None:
         return
     now = time.time() if now is None else now
     subject = edge_subject(edge)
+    known_source = decayed(maps.get(edge.source), now) > 0.0
     new_edge = bump(edges, subject, now, MAX_EDGES)
     new_map = (edge.destination != edge.source and
                bump(maps, edge.destination, now, MAX_MAPS))
     recorder = getattr(client, "record_action", None)
     if recorder is not None:
+        timeout = {} if save_timeout is None else {"save_timeout": save_timeout}
         if new_map:
-            recorder(NEW_MAP, f"{edge.destination} (from {edge.source})")
+            recorder(NEW_MAP, f"{edge.destination} (from {edge.source})", **timeout)
         if new_edge and getattr(edge, "kind", "exit") == "exit":
-            secret = bool(getattr(edge, "hidden", False))
+            secret = bool(getattr(edge, "hidden", False)) and known_source
             recorder(SECRET_EXIT if secret else NEW_EXIT,
-                     f"{subject} ({edge.label or 'exit'})")
+                     f"{subject} ({edge.label or 'exit'})", **timeout)
     remember = getattr(client, "remember_route_visits", None)
     if remember is not None:
         remember(now=now)
@@ -193,13 +204,14 @@ class Choice:
 
 
 def usage(edge_uses: dict[str, tuple[float, float]], subjects: Iterable[str],
-          now: float) -> tuple[int, float]:
-    """(unvisited edges, mean decayed use) of a route's subjects."""
+          now: float) -> tuple[int, float, float]:
+    """(unvisited edges, their share, mean decayed use) of a route's
+    subjects."""
     values = [decayed(edge_uses.get(subject), now) for subject in subjects]
     if not values:
-        return 0, 0.0
-    return (sum(value < UNVISITED_BELOW for value in values),
-            sum(values) / len(values))
+        return 0, 0.0, 0.0
+    unvisited = sum(value < UNVISITED_BELOW for value in values)
+    return unvisited, unvisited / len(values), sum(values) / len(values)
 
 
 def choose(best: Candidate, candidates: Sequence[Candidate], *,
@@ -212,8 +224,9 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
     A candidate is eligible when its cost is at most ``tolerance`` above
     the best route's and it enters no ``danger`` map (a hazard of any tier,
     a route death, a quarantined spot) that the best route does not.
-    Among the best route and the eligible ones, the most unvisited edges
-    win, then the least mean use, then a random draw."""
+    Among the best route and the eligible ones, the largest share of
+    unvisited edges wins (a share, so a route is never preferred only for
+    having more edges), then the least mean use, then a random draw."""
     rng = rng or random.Random()
     danger = frozenset(danger)
     allowed = best.maps & danger
@@ -234,11 +247,11 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
         eligible.append(candidate)
 
     def key(candidate: Candidate) -> tuple:
-        unvisited, mean = usage(edge_uses, candidate.subjects, now)
-        return (unvisited, -round(mean, 2), rng.random())
+        _, share, mean = usage(edge_uses, candidate.subjects, now)
+        return (round(share, 3), -round(mean, 2), rng.random())
 
     chosen = max(eligible, key=key)
-    unvisited, mean = usage(edge_uses, chosen.subjects, now)
+    unvisited, _, mean = usage(edge_uses, chosen.subjects, now)
     reason = (f"{len(eligible) - 1} alternative(s) within {tolerance:.0%}"
               f" ({longer} longer, {dangerous} more dangerous left out);"
               f" {unvisited} unvisited edge(s), mean use {mean:.1f}")
