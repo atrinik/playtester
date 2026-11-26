@@ -36,7 +36,7 @@ from .navigation import (analyzer_farm_choice, analyzer_spot_legs, effective_far
                          ShopUpgradeSweepTask, WorldGraph)
 from . import route_blocks
 from . import terrain
-from . import route_events, route_shadow
+from . import route_events, route_shadow, storage
 from .navigation_spots import navigation_spot_catalog
 from .dialogue_edges import dialogue_summary
 from .unlocks import gate_counts, unlock_state
@@ -1649,7 +1649,7 @@ class WebControlServer:
             if not patterns:
                 raise ValueError("supply at least one deposit pattern")
             return await self._replace_task(DepositItemsTask(
-                container, patterns))
+                container, patterns, indexer=storage.plain_indexer()))
         if kind == "retrieve":
             container = str(data.get("container", "")).strip()
             if not container:
@@ -1661,7 +1661,7 @@ class WebControlServer:
             for pattern in patterns:
                 re.compile(pattern)
             return await self._replace_task(RetrieveItemsTask(
-                container, patterns))
+                container, patterns, indexer=storage.plain_indexer()))
         raise ValueError("unknown task type")
 
     def _inventory_item(self, tag: Any):

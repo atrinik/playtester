@@ -16,6 +16,7 @@ Each stored piece of gear carries the build sets it belongs to
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections.abc import Callable, Iterable
@@ -239,6 +240,14 @@ def entry(item: Item, labels: Iterable[str] = (), *, identified: bool = True) ->
     return row
 
 
+def _number(value: Any, default: float) -> float:
+    """A finite number from memory, else ``default``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    value = float(value)
+    return value if math.isfinite(value) else default
+
+
 def valid_entry(value: Any) -> dict | None:
     """A stored row as loaded from memory, or None when malformed."""
     if (not isinstance(value, dict) or not isinstance(value.get("name"), str) or
@@ -247,20 +256,17 @@ def valid_entry(value: Any) -> dict | None:
     sets = value.get("sets", [])
     row = {
         "name": value["name"][:200], "type": value["type"],
-        "quantity": max(1, int(value.get("quantity", 1) or 1))
-        if isinstance(value.get("quantity", 1), (int, float)) else 1,
-        "weight": float(value.get("weight", 0) or 0)
-        if isinstance(value.get("weight", 0), (int, float)) else 0.0,
+        "quantity": max(1, min(1_000_000, int(_number(value.get("quantity", 1), 1.0)))),
+        "weight": max(0.0, _number(value.get("weight", 0), 0.0)),
         "identified": bool(value.get("identified", True)),
         "magical": bool(value.get("magical", False)),
         "cursed": bool(value.get("cursed", False)),
         "sets": [str(label)[:40] for label in sets][:8] if isinstance(sets, list) else [],
-        "at": float(value.get("at", 0) or 0)
-        if isinstance(value.get("at", 0), (int, float)) else 0.0,
+        "at": _number(value.get("at", 0), 0.0),
     }
-    factor = value.get("bag_factor")
-    if isinstance(factor, (int, float)) and 0 < factor < 1:
-        row["bag_factor"] = float(factor)
+    factor = _number(value.get("bag_factor"), 0.0)
+    if 0 < factor < 1:
+        row["bag_factor"] = factor
     face = value.get("face")
     if isinstance(face, int) and not isinstance(face, bool):
         row["face"] = face
@@ -322,6 +328,18 @@ def stored_unidentified(state: Any, types: Iterable[int]) -> list[dict]:
             if not row["identified"] and row["type"] in wanted]
 
 
+def no_labels(client: Any, items: list[Item]) -> dict[int, list[str]]:
+    """For chest visits outside the farm circuit (the dashboard, the CLI,
+    the mana crystal's recovery): rows without set labels, which the
+    circuit's next visit adds back."""
+    return {}
+
+
+def plain_indexer() -> "ChestIndexer":
+    from .tasks import InventoryPolicy
+    return ChestIndexer(no_labels, InventoryPolicy().identified)
+
+
 class ChestIndexer:
     """Keeps the index current through one chest visit.
 
@@ -347,6 +365,10 @@ class ChestIndexer:
 
     def observe(self, client: Any, container: Item) -> None:
         state = client.state
+        if "/apartments/" not in str(getattr(getattr(state, "map", None), "path", "") or ""):
+            # Only her apartment's chest is indexed (a dashboard deposit
+            # may name any container).
+            return
         carried = {item.tag for item in state.inventory}
         contents = state.inventories.get(container.tag)
         if contents is not None:

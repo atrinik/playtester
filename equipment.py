@@ -1136,11 +1136,17 @@ class GearExaminer:
             if not _answers(text, name):
                 continue
             if item is not None and item.item_type == c.TYPE_CONTAINER:
-                # A container's weight lines follow its name line.
+                # An identified container's weight lines follow its name
+                # line and end with "It contains ..." (types/player.c);
+                # until that line is in, wait for it, up to ANSWER_TIMEOUT.
                 from .storage import read_bag_examine
-                for line in entries[index + 1:index + 6]:
-                    if len(line) >= 4 and line[1] == c.CHAT_TYPE_GAME:
-                        read_bag_examine(item, str(line[3]))
+                lines = [str(line[3]) for line in entries[index + 1:index + 6]
+                         if len(line) >= 4 and line[1] == c.CHAT_TYPE_GAME]
+                ended = any(line.startswith("It contains ") for line in lines)
+                if not ended and self.clock() - sent_at <= self.ANSWER_TIMEOUT:
+                    return False
+                for line in lines:
+                    read_bag_examine(item, line)
             text = re.sub(r"^That is an? ", "That is ", text)
             rest = text[len(prefix):]
             if item is not None:

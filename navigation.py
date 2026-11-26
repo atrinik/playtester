@@ -74,7 +74,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     retreat_mobility, unresolved_hostile_contact,
                     combat_allowed, heal_waiting, out_of_heals_and_recall,
                     UnpreparedHold, empty_recall_wand,
-                    usable_recharge_scroll, wand_charges, wand_known_empty,
+                    usable_recharge_scroll, wand_charges, wand_known_empty, recall_wands,
                     area_caster_identities, tiled_neighbours)
 from .tasks import (RECALL_REQUIRED_LEVEL, CasterProfile, gear_scorer, heal_consumables,
                     reads_scrolls)
@@ -7034,6 +7034,13 @@ IDENTIFY_RESERVE = 1_000
 SMITH_UNREACHABLE_SECONDS = 6 * 3600.0
 
 
+def _set_attr(client: AtrinikClient, name: str, value) -> None:
+    try:
+        setattr(client, name, value)
+    except AttributeError:
+        pass
+
+
 def smith_unreachable(client: AtrinikClient) -> dict[str, float]:
     """Until when (wall clock) each smith she could not reach is passed
     over; in memory, for the connection."""
@@ -7077,6 +7084,10 @@ def identify_alerts(client: AtrinikClient) -> list[dict[str, str]]:
     her apartment, while her wallet cannot pay the cheapest smith she can
     reach plus IDENTIFY_RESERVE. Info only: the owner may drop gold on
     her feet, and she goes once she can pay."""
+    if depleted_for_temple(client.state):
+        # The cure comes first (its own alert): no identify-all is bought
+        # meanwhile but the cure's batch.
+        return []
     carried = len(unidentified_gear(client))
     stored = len(storage.stored_unidentified(client.state, identify_gear_types()))
     if not carried and not stored:
@@ -9357,8 +9368,18 @@ class FarmCircuitTask(BotTask):
         self._bag_fill_tried: set[int] = set()
         # Items the chest refused (god-given gear): never offered again.
         self._storage_refused: set[int] = set()
-        # The bag of holding _fill_bag opened, to close it again.
-        self._bag_opened = 0
+        # Items deposited this session: never taken back out by the
+        # active-build retrieval (_chest_wants), which ranks on another
+        # scale once the item is no longer examined in her pack.
+        self._deposited_tags: set[int] = set()
+        # The identify fetch's backoff after it failed (on ``clock``).
+        self._identify_fetch_retry_at = 0.0
+        # The running storage trip's deposit (its sent items are
+        # deposited ones too).
+        self._storage_deposit: DepositItemsTask | None = None
+        # _fill_bag's unready sequence: applies sent, and bags it gave up.
+        self._bag_unready_applies = 0
+        self._bag_given_up: set[int] = set()
         # The storage and sale choices for one inventory state (_cached).
         self._inventory_cache: tuple[tuple | None, dict] = (None, {})
         self._identification: NavigateThenTask | None = None
@@ -10675,7 +10696,9 @@ class FarmCircuitTask(BotTask):
     def _needs_apartment_storage(self, client: AtrinikClient) -> bool:
         """Whether to take what is not her active set home: at once for a
         valuable, else once STORE_BATCH items wait or she carries more than
-        STORE_WEIGHT of her limit; or to fetch her bag of holding."""
+        STORE_WEIGHT of her limit; or to fetch her bag of holding, which
+        she needs from storage.BAG_NEEDED (50%) of her limit, earlier than
+        STORE_WEIGHT on purpose: the bag is what keeps her below it."""
         if self.clock() < self._storage_retry_at:
             return False
         if self._bag_fetch_due(client):
@@ -10708,10 +10731,49 @@ class FarmCircuitTask(BotTask):
         if self._cure_shortfall(client):
             due = urgent_recall_candidate or self._cure_identify_due(client)
         else:
-            due = bool(urgent_recall_candidate or unidentified_gear(client) or
-                       storage.stored_unidentified(client.state, identify_gear_types()))
+            due = urgent_recall_candidate or self._identify_batch_due(client)
         cost = identify_smith(client)[3]
         return due and BuyShopUpgradeTask.wallet_value(client) >= cost + IDENTIFY_RESERVE
+
+    # Identify-all waits for this many unknown pieces of gear (carried and
+    # stored) ...
+    IDENTIFY_BATCH = 3
+    # ... unless one is likely valuable ...
+    IDENTIFY_VALUABLE_TYPES = (c.TYPE_RING, c.TYPE_AMULET, c.TYPE_WAND)
+    # ... or her carried wallet just rose by at least a gold coin (the
+    # owner drops one at her feet), within the last hour ...
+    GIFT_COPPER = 10_000
+    GIFT_SECONDS = 3600.0
+    # ... or the first unknown piece has waited this long (wall clock).
+    IDENTIFY_WAIT_SECONDS = 6 * 3600.0
+
+    def _identify_batch_due(self, client: AtrinikClient) -> bool:
+        """Whether unknown gear is worth an identify-all now: the fee is
+        flat (1,450c or more), so one stray piece waits (owner decision,
+        2026-11-26: any unknown gear, without paying the full fee for one
+        common item)."""
+        now = time.time()
+        wallet = BuyShopUpgradeTask.carried_wallet_value(client)
+        seen = getattr(client, "identify_wallet_seen", None)
+        if seen is not None and wallet - seen >= self.GIFT_COPPER:
+            _set_attr(client, "identify_gift_at", now)
+        _set_attr(client, "identify_wallet_seen", wallet)
+        carried = unidentified_gear(client)
+        stored = (storage.stored_unidentified(client.state, identify_gear_types())
+                  if self.clock() >= self._identify_fetch_retry_at else [])
+        if not carried and not stored:
+            _set_attr(client, "unknown_gear_since", None)
+            return False
+        since = getattr(client, "unknown_gear_since", None)
+        if since is None:
+            since = now
+            _set_attr(client, "unknown_gear_since", now)
+        gift = float(getattr(client, "identify_gift_at", 0.0) or 0.0)
+        return (len(carried) + len(stored) >= self.IDENTIFY_BATCH or
+                any(item.item_type in self.IDENTIFY_VALUABLE_TYPES for item in carried) or
+                any(row["type"] in self.IDENTIFY_VALUABLE_TYPES for row in stored) or
+                now - gift <= self.GIFT_SECONDS or
+                now - since >= self.IDENTIFY_WAIT_SECONDS)
 
     def _needs_inventory_capability(
             self, client: AtrinikClient, purpose: str) -> bool:
@@ -10752,6 +10814,7 @@ class FarmCircuitTask(BotTask):
         and the next storage trip puts it back."""
         smith = identify_smith(client) if client is not None else IDENTIFY_SMITHS[0]
         if (fetch and client is not None and
+                self.clock() >= self._identify_fetch_retry_at and
                 storage.stored_unidentified(client.state, identify_gear_types())):
             policy, types = InventoryPolicy(), identify_gear_types()
             task = NavigateThenTask(
@@ -10787,16 +10850,17 @@ class FarmCircuitTask(BotTask):
         (_chest_wants)."""
         tags = {item.tag for item in self._storable_items(client, keep_unknown=keep_unknown)}
         indexer = self._chest_indexer()
+        # Only what _storable_items chose: never her active set, even a
+        # valuable (a best ring not yet worn), nor what is for sale.
+        deposit = DepositItemsTask(
+            "chest", predicate=lambda item: item.tag in tags, indexer=indexer,
+            then_retrieve=RetrieveItemsTask(
+                "chest", predicate=InventoryPolicy().sellable_junk,
+                select=self._chest_wants, indexer=indexer,
+                max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT))
+        self._storage_deposit = deposit
         task = NavigateThenTask(
-            self.graph, self.APARTMENT,
-            # Only what _storable_items chose: never her active set, even
-            # a valuable (a best ring not yet worn), nor what is for sale.
-            DepositItemsTask(
-                "chest", predicate=lambda item: item.tag in tags, indexer=indexer,
-                then_retrieve=RetrieveItemsTask(
-                    "chest", predicate=InventoryPolicy().sellable_junk,
-                    select=self._chest_wants, indexer=indexer,
-                    max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT)),
+            self.graph, self.APARTMENT, deposit,
             destination_xy=self.APARTMENT_CHEST_XY, combat_approach=True)
         task.navigation.strict_safety = True
         return task
@@ -10804,7 +10868,7 @@ class FarmCircuitTask(BotTask):
     # --- What she carries and what goes home (storage.py) ------------------
 
     # Storage waits for this many items to take home, unless one is a
-    # valuable or she carries more than storage.BAG_NEEDED of her limit.
+    # valuable or she carries STORE_WEIGHT of her limit.
     STORE_BATCH = 8
     # ... or once she carries this share of her limit, where encumbrance
     # starts to slow her.
@@ -10885,22 +10949,11 @@ class FarmCircuitTask(BotTask):
         labels = storage.set_labels(self._owned_sets(client, items))
         return {item.tag: labels.get(item.tag, []) for item in items}
 
-    def _recall_wands(self, client: AtrinikClient) -> list[Item]:
-        """Her identified, uncursed recall wands, the one she keeps first:
-        one not known empty, the most charges, the highest level."""
-        policy = InventoryPolicy()
-        charges = wand_charges(client)
-
-        def level(item: Item) -> int:
-            match = re.search(r"\(lvl (\d+)\)", item.name)
-            return int(match.group(1)) if match else 0
-        wands = [item for item in client.state.inventory
-                 if item.item_type == c.TYPE_WAND and
-                 "word of recall" in item.name.casefold() and policy.identified(item) and
-                 not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED)]
-        return sorted(wands, key=lambda item: (
-            wand_known_empty(client, item), -int(charges.get(item.tag, 0) or 0),
-            -level(item), item.tag))
+    @staticmethod
+    def _recall_wands(client: AtrinikClient) -> list[Item]:
+        """Her recall wands, the one she keeps first (tasks.recall_wands):
+        recharge (empty_recall_wand) goes only to that one."""
+        return recall_wands(client)
 
     def _sell_tags(self, client: AtrinikClient) -> set[int]:
         """Sold although otherwise preserved: cursed or damned potions,
@@ -10997,7 +11050,10 @@ class FarmCircuitTask(BotTask):
         bag of holding while she needs one and carries none."""
         state = client.state
         build = self._build(client)
-        chest = {item.tag for item in contents}
+        deposited = set(self._deposited_tags)
+        if self._storage_deposit is not None:
+            deposited.update(self._storage_deposit.sent_tags)
+        chest = {item.tag for item in contents if item.tag not in deposited}
         sets = self._owned_sets(client, contents, builds=(build,))
         scorer = self._scorer_for(client)(build)
         policy = InventoryPolicy()
@@ -11022,40 +11078,58 @@ class FarmCircuitTask(BotTask):
                 wants.add(bag.tag)
         return wants
 
+    # Applies the unready sequence (open, then close) may take in all;
+    # then she gives the bag up for the session (bag-unready-failed).
+    BAG_UNREADY_APPLIES = 4
+
     async def _fill_bag(self, client: AtrinikClient) -> bool:
         """While she carries her bag of holding because she needs it, put
-        gems and the ammo her build does not shoot into it, one a tick;
-        each item is offered once (a pouch takes only gems, say).
+        identified gems and the ammo her build does not shoot into it, one
+        a tick; each item is offered once (a pouch takes only gems, say).
 
-        The server puts things only into an applied container
-        (sack_can_hold: "The bag is not active."), and an applied one takes
-        every pickup (pick_up), coins and heals too. So she applies the bag,
-        fills it, and applies it again to close it at once."""
+        The server's container rules (types/container.c apply_func,
+        types/player.c sack_can_hold and pick_up): only a readied
+        (applied) container takes a move into it; applying an unready one
+        readies it, applying a readied closed one opens it, and applying
+        the open one closes it, which also unreadies it (container_close).
+        Readied or open, it takes every pickup, coins and heals too. So
+        she readies the bag, fills it, and at once opens and closes it to
+        unready it. A bag seen open is closed with one apply."""
         state = client.state
         now = self.clock()
         if now - self._bag_fill_at < 0.6:
             return False
         bag = storage.best_bag(state.inventory)
-        opened = state.items.get(self._bag_opened) if self._bag_opened else None
-        wanted = bag is not None and storage.bag_wanted(state, carried=True)
-        build = self._build(client)
-        item = next((item for item in state.inventory
-                     if wanted and item.tag != bag.tag and
-                     item.tag not in self._bag_fill_tried and
-                     storage.bag_fill(item) and storage.holds(bag, item) and
-                     not (item.item_type == c.TYPE_ARROW and build == "bow")), None)
-        if opened is not None and (item is None or opened.tag != bag.tag):
-            self._bag_fill_at = now
-            if opened.flags & c.ITEM_APPLIED and opened.location == state.player_tag:
-                await client.apply(opened.tag)
-                return True
-            self._bag_opened = 0
+        if bag is None or bag.tag in self._bag_given_up:
             return False
+        applied = bool(bag.flags & c.ITEM_APPLIED)
+        is_open = bool(bag.flags & c.ITEM_CONTAINER_OPEN)
+        item = None
+        if storage.bag_wanted(state, carried=True):
+            policy = InventoryPolicy()
+            build = self._build(client)
+            item = next((item for item in state.inventory
+                         if item.tag != bag.tag and item.tag not in self._bag_fill_tried and
+                         storage.bag_fill(item) and policy.identified(item) and
+                         storage.holds(bag, item) and
+                         not (item.item_type == c.TYPE_ARROW and build == "bow")), None)
+        if is_open or (applied and item is None):
+            # Unready it: a readied bag is opened, then the open one closed.
+            self._bag_unready_applies += 1
+            if self._bag_unready_applies > self.BAG_UNREADY_APPLIES:
+                self._bag_given_up.add(bag.tag)
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("bag-unready-failed", bag.name)
+                return False
+            self._bag_fill_at = now
+            await client.apply(bag.tag)
+            return True
+        self._bag_unready_applies = 0
         if item is None:
             return False
         self._bag_fill_at = now
-        if not bag.flags & c.ITEM_APPLIED:
-            self._bag_opened = bag.tag
+        if not applied:
             await client.apply(bag.tag)
             return True
         self._bag_fill_tried.add(item.tag)
@@ -12807,7 +12881,21 @@ class FarmCircuitTask(BotTask):
         if self._identification is not None:
             await self._identification.tick(client)
             trip = self._identification
-            if trip.status == TaskStatus.FAILED:
+            if (trip.status == TaskStatus.FAILED and
+                    getattr(trip, "identify_fetch", False)):
+                # The chest could not be reached or opened: what she
+                # carries is identified anyway; the fetch waits.
+                log.warning("identify fetch failed: %s", trip.error)
+                self._identify_fetch_retry_at = (
+                    self.clock() + self.failure_backoff(trip.error, 1800.0))
+                self._strict_trip_refused(client, "identify fetch", trip.error)
+                if unidentified_gear(client):
+                    smith = self._new_mass_identification(client, fetch=False)
+                    smith.navigation.essential = trip.navigation.essential
+                    self._identification = smith
+                else:
+                    self._identification = None
+            elif trip.status == TaskStatus.FAILED:
                 log.warning("mass identification failed: %s", trip.error)
                 smith = getattr(trip, "identify_smith", "")
                 if smith and trip.task.status == TaskStatus.READY:
@@ -12854,13 +12942,20 @@ class FarmCircuitTask(BotTask):
             return True
         if self._storage is not None:
             await self._storage.tick(client)
+            if (self._storage.status in (TaskStatus.FAILED, TaskStatus.COMPLETE) and
+                    isinstance(self._storage.task, DepositItemsTask)):
+                carried = {item.tag for item in client.state.inventory}
+                self._deposited_tags.update(
+                    tag for tag in self._storage.task.sent_tags if tag not in carried)
+                self._storage_deposit = None
             if self._storage.status == TaskStatus.FAILED:
                 log.warning("unidentified storage failed: %s",
                             self._storage.error)
                 deposit = self._storage.task
                 if isinstance(deposit, DepositItemsTask):
-                    # God-given gear, say: the chest refuses it for good.
-                    self._storage_refused.update(deposit.refused_tags)
+                    # God-given gear is refused for good; a full chest or
+                    # any other refusal only backs off.
+                    self._storage_refused.update(deposit.godgiven_tags)
                 self._storage_retry_at = self.clock() + self.failure_backoff(
                     self._storage.error, 1800.0)
                 self._strict_trip_refused(

@@ -662,6 +662,7 @@ async def main_async(args: argparse.Namespace) -> None:
     from .farm_analyzer import FarmAnalyzer, run_periodically
     from .navigation import NavigateTask, NavigateThenTask, WorldGraph
     from .quest_tasks import EscapingDesertedIslandTask
+    from . import storage
     from .tasks import (BankTask, DepositItemsTask, FarmTask, JunkPolicy,
                         SellJunkTask, TaskEngine)
     from .web_server import WebControlServer
@@ -730,7 +731,8 @@ async def main_async(args: argparse.Namespace) -> None:
     elif args.task == "sell":
         engine.set_task(SellJunkTask(args.merchant, JunkPolicy(tuple(args.junk))))
     elif args.task == "deposit":
-        engine.set_task(DepositItemsTask(args.container, tuple(args.item)))
+        engine.set_task(DepositItemsTask(args.container, tuple(args.item),
+                                         indexer=storage.plain_indexer()))
     elif args.task in ("web", "autoplay"):
         graph = WorldGraph().build()
         # The authored-text index her observation ledger attributes and

@@ -17580,10 +17580,11 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             "/shattered_islands/world_8_79", width=24, height=24)
         circuit = FarmCircuitTask(graph, [("/farm", "rat")])
         self.assertFalse(circuit._needs_mass_identification(client))
-        # One unknown piece of gear is enough (owner decision, 2026-11-26).
+        # Any unknown gear is identified (owner decision, 2026-11-26): a
+        # likely valuable piece at once.
         client.state.place_item(Item(
-            999, item_type=c.TYPE_WEAPON, quality=255,
-            name="unknown final weapon", weight=3.5), 7)
+            999, item_type=c.TYPE_RING, quality=255,
+            name="unknown ring", weight=0.1), 7)
         self.assertTrue(circuit._needs_mass_identification(client))
         service = circuit._new_mass_identification(client)
         self.assertEqual(service.navigation.destination,
@@ -41214,6 +41215,48 @@ class PlanningOffLoopTests(unittest.TestCase):
                          "autoplay:level-115 > temple-food (safety)")
 
 
+class ContainerServer:
+    """A carried container as the Classic server treats it
+    (types/container.c apply_func and container_close, types/player.c
+    sack_can_hold and pick_up): applying an unready container readies it,
+    a readied closed one opens, an open one closes and is unreadied; only
+    a readied one takes a move into it, and a readied or open one takes
+    every pickup."""
+
+    def __init__(self, client):
+        self.client, self.log = client, []
+        client.apply = self.apply
+        client.move_item = self.move_item
+
+    async def apply(self, tag, apply_action=0):
+        item = self.client.state.items[tag]
+        if item.flags & c.ITEM_CONTAINER_OPEN:
+            item.flags &= ~(c.ITEM_CONTAINER_OPEN | c.ITEM_APPLIED)
+            self.log.append(("close", tag))
+        elif item.flags & c.ITEM_APPLIED:
+            item.flags |= c.ITEM_CONTAINER_OPEN
+            self.log.append(("open", tag))
+        else:
+            item.flags |= c.ITEM_APPLIED
+            self.log.append(("ready", tag))
+
+    async def move_item(self, to, tag, quantity):
+        state = self.client.state
+        sack = state.items.get(to)
+        if sack is not None and sack.item_type == c.TYPE_CONTAINER:
+            if not sack.flags & c.ITEM_APPLIED:
+                self.log.append(("refused", tag))
+                return
+            state.place_item(state.items[tag], to)
+        self.log.append(("move", tag))
+
+    def pick_up(self, item):
+        state = self.client.state
+        sack = next((bag for bag in state.inventory
+                     if bag.item_type == c.TYPE_CONTAINER and bag.flags & c.ITEM_APPLIED), None)
+        state.place_item(item, sack.tag if sack is not None else state.player_tag)
+
+
 class InventoryStorageTests(unittest.TestCase):
     """She carries her active set; the rest goes home, sorted into a set
     per build (storage.py, FarmCircuitTask._storable_items)."""
@@ -41239,6 +41282,7 @@ class InventoryStorageTests(unittest.TestCase):
             client.state.player_name = "Sera"
             client.state.player_tag = 7
             client.load_character_memory("Sera")
+            client.state.map.path = FarmCircuitTask.APARTMENT
             belt = Item(31, item_type=c.TYPE_GIRDLE, quality=80, condition=80, weight=2.0,
                         name="forged meteoric steel belt")
             client.state.place_item(belt, 7)
@@ -41359,25 +41403,38 @@ class InventoryStorageTests(unittest.TestCase):
         client.state.place_item(Item(14, item_type=c.TYPE_FOOD, quality=80,
                                      weight=55.0, name="anvil cake"), 7)
         self.assertEqual({item.tag for item in circuit._storable_items(client)}, {bag.tag})
-        client.move_item = AsyncMock()
-        client.apply = AsyncMock()
-        # The server fills only an applied bag: she opens it, fills it ...
-        self.assertTrue(asyncio.run(circuit._fill_bag(client)))
-        client.apply.assert_awaited_once_with(fine.tag)
-        client.move_item.assert_not_awaited()
-        fine.flags |= c.ITEM_APPLIED
+        server = ContainerServer(client)
+        # She readies the bag (the server fills only a readied one) ...
+        for _ in range(10):
+            circuit._bag_fill_at = float("-inf")
+            if not asyncio.run(circuit._fill_bag(client)):
+                break
+        self.assertEqual(server.log, [("ready", fine.tag), ("move", gem.tag),
+                                      ("open", fine.tag), ("close", fine.tag)])
+        # ... fills it, and opens and closes it, which unreadies it: a pickup
+        # stays in her pack, and nothing more is sent.
+        self.assertEqual(gem.location, fine.tag)
+        self.assertFalse(fine.flags & (c.ITEM_APPLIED | c.ITEM_CONTAINER_OPEN))
+        coin = Item(15, item_type=c.TYPE_MONEY, quality=100, name="copper coins")
+        server.pick_up(coin)
+        self.assertEqual(coin.location, 7)
+        # A bag seen open (she or the owner opened it) is closed once.
+        fine.flags |= c.ITEM_APPLIED | c.ITEM_CONTAINER_OPEN
         circuit._bag_fill_at = float("-inf")
         self.assertTrue(asyncio.run(circuit._fill_bag(client)))
-        client.move_item.assert_awaited_once_with(fine.tag, gem.tag, 10)
-        # ... and closes it again, so no pickup lands in it.
-        client.state.place_item(gem, fine.tag)
-        circuit._bag_fill_at = float("-inf")
-        self.assertTrue(asyncio.run(circuit._fill_bag(client)))
-        self.assertEqual(client.apply.await_args_list[-1].args, (fine.tag,))
-        fine.flags &= ~c.ITEM_APPLIED
+        self.assertEqual(server.log[-1], ("close", fine.tag))
         circuit._bag_fill_at = float("-inf")
         self.assertFalse(asyncio.run(circuit._fill_bag(client)))
-        self.assertEqual(circuit._bag_opened, 0)
+        # Light again: a readied bag is unreadied before it can go home.
+        client.state.remove_item(14)
+        fine.flags |= c.ITEM_APPLIED
+        for _ in range(4):
+            circuit._bag_fill_at = float("-inf")
+            asyncio.run(circuit._fill_bag(client))
+        self.assertFalse(fine.flags & c.ITEM_APPLIED)
+        self.assertIn(fine.tag, {item.tag for item in circuit._storable_items(client)})
+        client.state.place_item(Item(14, item_type=c.TYPE_FOOD, quality=80,
+                                     weight=55.0, name="anvil cake"), 7)
         # A pouch takes only gems: food is never offered to it.
         self.assertFalse(storage.holds(fine, client.state.items[14]))
         # Heavy with no bag carried but one stored: a trip fetches it.
@@ -41399,13 +41456,36 @@ class InventoryStorageTests(unittest.TestCase):
         client.state.place_item(Item(20, item_type=c.TYPE_WEAPON, quality=255,
                                      name="small axe"), 7)
         circuit = self._circuit()
-        # One unknown piece is enough, once the wallet covers it.
         self.assertFalse(circuit._needs_mass_identification(client))
         [alert] = identify_alerts(client)
         self.assertEqual(alert["id"], "identify-unfunded")
         self.assertIn("Identify needs 2450 copper", alert["text"])
         self.assertIn("drop gold to help", alert["text"])
         client.state.bank_balance = 2_450
+        # One common unknown piece waits: the fee is flat ...
+        self.assertFalse(circuit._needs_mass_identification(client))
+        self.assertEqual(identify_alerts(client), [])
+        # ... for at most IDENTIFY_WAIT_SECONDS.
+        client.unknown_gear_since -= circuit.IDENTIFY_WAIT_SECONDS
+        self.assertTrue(circuit._needs_mass_identification(client))
+        client.unknown_gear_since = time.time()
+        # A gold coin dropped at her feet sends her at once.
+        client.state.place_item(Item(25, item_type=c.TYPE_MONEY, quality=100,
+                                     name="gold coin"), 7)
+        self.assertTrue(circuit._needs_mass_identification(client))
+        client.identify_gift_at = 0.0
+        self.assertFalse(circuit._needs_mass_identification(client))
+        # So does an unknown ring, amulet or wand, or a batch of three.
+        client.state.place_item(Item(26, item_type=c.TYPE_RING, quality=255, name="ring"), 7)
+        self.assertTrue(circuit._needs_mass_identification(client))
+        client.state.remove_item(26)
+        for tag in (27, 28):
+            client.state.place_item(Item(tag, item_type=c.TYPE_BOOTS, quality=255,
+                                         name="boots"), 7)
+        self.assertTrue(circuit._needs_mass_identification(client))
+        for tag in (25, 27, 28):
+            client.state.remove_item(tag)
+        client.unknown_gear_since -= circuit.IDENTIFY_WAIT_SECONDS
         self.assertTrue(circuit._needs_mass_identification(client))
         self.assertEqual(identify_alerts(client), [])
         trip = circuit._new_mass_identification(client)
@@ -41423,12 +41503,21 @@ class InventoryStorageTests(unittest.TestCase):
         client.state.remove_item(20)
         self.assertFalse(circuit._needs_mass_identification(client))
         client.state.apartment_storage = [storage.entry(
-            Item(21, item_type=c.TYPE_BOOTS, quality=255, name="boots"), identified=False)]
+            Item(21, item_type=c.TYPE_WAND, quality=255, name="wand"), identified=False)]
         self.assertTrue(circuit._needs_mass_identification(client))
         fetch = circuit._new_mass_identification(client)
         self.assertTrue(fetch.identify_fetch)
         self.assertEqual(fetch.navigation.destination, circuit.APARTMENT)
         self.assertTrue(fetch.task.predicate(Item(22, item_type=c.TYPE_BOOTS, quality=255)))
+        # A failed fetch leaves carried unknowns to the smith, and waits.
+        client.state.place_item(Item(29, item_type=c.TYPE_RING, quality=255, name="ring"), 7)
+        fetch.status, fetch.error = TaskStatus.FAILED, "storage container is not visible"
+        circuit._identification = fetch
+        asyncio.run(circuit._tick_running_service(client))
+        self.assertIsInstance(circuit._identification.task, MassIdentifyTask)
+        self.assertFalse(getattr(circuit._new_mass_identification(client),
+                                 "identify_fetch", False))
+        client.state.remove_item(29)
         self.assertFalse(fetch.task.predicate(Item(23, item_type=c.TYPE_BOOTS, quality=80)))
         # Unknown gear is no longer stored while she can pay to identify it.
         client.state.place_item(Item(24, item_type=c.TYPE_BOOTS, quality=255, name="boots"), 7)
@@ -41470,7 +41559,8 @@ class InventoryStorageTests(unittest.TestCase):
         circuit = self._circuit()
         # The best one is kept (and recharged on the #139 path) ...
         self.assertEqual(circuit._recall_wands(client)[0], wands[1])
-        self.assertEqual(empty_recall_wand(client), wands[0])
+        # Recharge (#139) goes to the kept wand, never a spare for sale.
+        self.assertEqual(empty_recall_wand(client), wands[1])
         junk = {item.tag for item in circuit._identified_junk(client)}
         # ... the empty spares are sold, never stored.
         self.assertEqual(junk, {wands[0].tag, wands[2].tag})
@@ -41480,6 +41570,9 @@ class InventoryStorageTests(unittest.TestCase):
         wand_charges(client)[wands[1].tag] = 3
         wand_charges(client).pop(wands[2].tag)
         self.assertEqual(circuit._recall_wands(client)[0], wands[1])
+        # While it works, no scroll of recharge is read or bought.
+        self.assertIsNone(empty_recall_wand(client))
+        self.assertFalse(circuit._empty_recall_wand(client))
         self.assertEqual({item.tag for item in circuit._identified_junk(client)},
                          {wands[0].tag})
         self.assertEqual([item.tag for item in circuit._storable_items(client)],
@@ -41520,7 +41613,13 @@ class InventoryStorageTests(unittest.TestCase):
         circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], clock=lambda: 100.0)
         self.assertEqual(circuit._storable_items(client), [spare])
         deposit = DepositItemsTask("chest")
+        # A full chest (or any other refusal) only backs off ...
         deposit.refused_tags = {spare.tag}
+        circuit._storage = Trip(TaskStatus.FAILED, deposit)
+        asyncio.run(circuit._tick_running_service(client))
+        self.assertEqual(circuit._storable_items(client), [spare])
+        # ... only a god-given refusal is for good.
+        deposit.godgiven_tags = {spare.tag}
         circuit._storage = Trip(TaskStatus.FAILED, deposit)
         asyncio.run(circuit._tick_running_service(client))
         self.assertEqual(circuit._storable_items(client), [])
@@ -41528,6 +41627,92 @@ class InventoryStorageTests(unittest.TestCase):
         circuit._storage = Trip(TaskStatus.COMPLETE, deposit)
         asyncio.run(circuit._tick_running_service(client))
         self.assertEqual(circuit._storage_retry_at, 100.0 + circuit.STORAGE_VISIT_SECONDS)
+
+    def test_a_deposit_names_god_given_refusals_only(self):
+        client = self._client()
+        client.state.map.path = FarmCircuitTask.APARTMENT
+        chest = Item(90, name="chest", flags=c.ITEM_CONTAINER_OPEN)
+        client.state.place_item(chest, 0)
+        starter = Item(61, item_type=c.TYPE_WEAPON, quality=80, name="dagger")
+        client.state.place_item(starter, 7)
+        client.move_item = AsyncMock()
+        now = [100.0]
+        with patch("atrinik_bot.tasks.time.monotonic", side_effect=lambda: now[0]):
+            full = DepositItemsTask("chest", predicate=lambda item: True)
+            asyncio.run(full.tick(client))
+            client.state.add_message(0, "ffffff", "That won't fit in the chest!")
+            now[0] += 10
+            asyncio.run(full.tick(client))
+            self.assertEqual((full.status, full.refused_tags, full.godgiven_tags),
+                             (TaskStatus.FAILED, {starter.tag}, set()))
+            godgiven = DepositItemsTask("chest", predicate=lambda item: True)
+            asyncio.run(godgiven.tick(client))
+            client.state.add_message(0, "ffffff", DepositItemsTask.GODGIVEN)
+            now[0] += 10
+            asyncio.run(godgiven.tick(client))
+            self.assertEqual(godgiven.godgiven_tags, {starter.tag})
+
+    def test_what_she_deposited_is_not_fetched_back(self):
+        client = self._client()
+        worn = Item(1, flags=c.ITEM_APPLIED, item_type=c.TYPE_GIRDLE, quality=50,
+                    condition=50, name="soft leather girdle")
+        stored = Item(2, item_type=c.TYPE_GIRDLE, quality=90, condition=90,
+                      name="soft leather girdle +4")
+        client.state.place_item(worn, 7)
+        client.state.equipment[c.EQUIP_BELT] = worn.tag
+        circuit = self._circuit()
+        self.assertEqual(circuit._chest_wants(client, [stored]), {stored.tag})
+        # Deposited this visit (or earlier this session), it stays home:
+        # deposit and retrieval rank on different scales, so taking it
+        # back would ping-pong.
+        deposit = DepositItemsTask("chest")
+        deposit._sent[stored.tag] = 0.0
+        circuit._storage_deposit = deposit
+        self.assertEqual(circuit._chest_wants(client, [stored]), set())
+        circuit._storage_deposit = None
+        circuit._deposited_tags.add(stored.tag)
+        self.assertEqual(circuit._chest_wants(client, [stored]), set())
+
+    def test_index_rows_from_memory_are_finite(self):
+        from . import storage
+        rows = storage.load_index([
+            {"name": "belt", "type": c.TYPE_GIRDLE, "quantity": float("inf"),
+             "weight": float("nan"), "at": float("inf"), "bag_factor": float("nan")},
+            {"name": "bad", "type": True}])
+        self.assertEqual([(row["name"], row["quantity"], row["weight"], row["at"])
+                          for row in rows], [("belt", 1, 0.0, 0.0)])
+        self.assertNotIn("bag_factor", rows[0])
+
+    def test_identify_note_waits_for_the_cure(self):
+        from .navigation import identify_alerts
+        client = self._client()
+        client.state.place_item(Item(20, item_type=c.TYPE_RING, quality=255, name="ring"), 7)
+        self.assertEqual(len(identify_alerts(client)), 1)
+        client.state.depletion_points = 67
+        client.state.depletion_points_known = True
+        client.state.place_item(Item(22, item_type=c.TYPE_FORCE, quality=0, name="depletion"), 7)
+        self.assertEqual(identify_alerts(client), [])
+
+    def test_a_container_examine_waits_for_its_weight_lines(self):
+        from .equipment import GearExaminer
+        from . import storage
+        client = self._client()
+        bag = Item(10, item_type=c.TYPE_CONTAINER, quality=80, condition=80, name="Sera's sack")
+        client.state.place_item(bag, 7)
+        now = [100.0]
+        examiner = GearExaminer(clock=lambda: now[0])
+        examiner.pending = (bag.tag, bag.name, client.state.message_count, now[0])
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff", "That is Sera's sack")
+        # The name line alone does not settle it: the weight lines follow.
+        self.assertFalse(examiner.read_answer(client))
+        self.assertNotIn("gear_examine", bag.extra)
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                 "It decreases the weight of items inside by 55.0%.")
+        client.state.add_message(c.CHAT_TYPE_GAME, "ffffff",
+                                 "It contains 1.000 kg, decreased to 0.450 kg.")
+        self.assertTrue(examiner.read_answer(client))
+        self.assertAlmostEqual(storage.bag_factor(bag), 0.45)
+        self.assertIn("gear_examine", bag.extra)
 
     def test_cursed_potions_and_spare_plain_containers_are_sold(self):
         client = self._client()

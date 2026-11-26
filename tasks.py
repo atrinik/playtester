@@ -664,15 +664,32 @@ def usable_recharge_scroll(client: AtrinikClient) -> Item | None:
         failures.get(item.tag, 0) < RECHARGE_SCROLL_ATTEMPTS), None)
 
 
-def empty_recall_wand(client: AtrinikClient) -> Item | None:
-    """An identified, paid, uncursed recall wand known to be empty."""
+def recall_wands(client: AtrinikClient) -> list[Item]:
+    """Her identified, paid, uncursed recall wands, the one she keeps
+    first: one not known empty, the most charges, the highest level. The
+    rest are spares the circuit stores or sells
+    (FarmCircuitTask._storable_items, _sell_tags)."""
     policy = InventoryPolicy()
-    return next((
-        item for item in client.state.inventory
-        if item.item_type == c.TYPE_WAND and
-        re.search(r"\bword of recall\b", item.name, re.I) and
-        policy.identified(item) and not item.flags & _BAD_ITEM_FLAGS and
-        wand_known_empty(client, item)), None)
+    charges = wand_charges(client)
+
+    def level(item: Item) -> int:
+        match = re.search(r"\(lvl (\d+)\)", item.name)
+        return int(match.group(1)) if match else 0
+    wands = [item for item in client.state.inventory
+             if item.item_type == c.TYPE_WAND and
+             re.search(r"\bword of recall\b", item.name, re.I) and
+             policy.identified(item) and not item.flags & _BAD_ITEM_FLAGS]
+    return sorted(wands, key=lambda item: (
+        wand_known_empty(client, item), -int(charges.get(item.tag, 0) or 0),
+        -level(item), item.tag))
+
+
+def empty_recall_wand(client: AtrinikClient) -> Item | None:
+    """The recall wand she keeps (recall_wands), when it is known to be
+    empty: the one a scroll of recharge goes to. None while it works, so
+    no recharge is read or bought for a spare."""
+    wands = recall_wands(client)
+    return wands[0] if wands and wand_known_empty(client, wands[0]) else None
 
 
 def recall_waiting(client: AtrinikClient) -> bool:
@@ -9323,6 +9340,7 @@ class DepositItemsTask(BotTask):
     STORAGE_FULL = "storage container is full"
     STORAGE_REFUSED = "storage container refused"
     WONT_FIT = re.compile(r"\bthat won't fit in the (.+?)!", re.I)
+    GODGIVEN = "You can't store god-given items outside your inventory!"
 
     def __init__(self, container_name: str, patterns: tuple[str, ...] = (),
                  *, unidentified_only: bool = False,
@@ -9348,9 +9366,18 @@ class DepositItemsTask(BotTask):
         self.refused = 0
         # Whether the server said this container has no room.
         self.full = False
-        # The items it refused.
+        # The items it refused, and those refused as god-given (the
+        # server's own reason, socket/item.c esrv_move_object): only those
+        # are never offered again.
         self.refused_tags: set[int] = set()
+        self.godgiven_tags: set[int] = set()
+        self._godgiven_seen = False
         self._feedback_start = 0
+
+    @property
+    def sent_tags(self) -> set[int]:
+        """The items it offered to the container."""
+        return set(self._sent)
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
@@ -9372,6 +9399,8 @@ class DepositItemsTask(BotTask):
             match = self.WONT_FIT.search(entry[3]) if len(entry) > 3 else None
             if match and self.container_name in match.group(1).casefold():
                 self.full = True
+            if len(entry) > 3 and self.GODGIVEN in entry[3]:
+                self._godgiven_seen = True
         self._feedback_start = client.state.message_count
         policy = InventoryPolicy()
         items = [
@@ -9413,6 +9442,10 @@ class DepositItemsTask(BotTask):
         # longer active, say), is an ordinary failure.
         self.refused = len(items)
         self.refused_tags = {item.tag for item in items}
+        if self._godgiven_seen and not self.full:
+            # Only "won't fit" says the chest is full; with the god-given
+            # answer and no other, what is still carried is god-given.
+            self.godgiven_tags = set(self.refused_tags)
         follow = self.then_retrieve
         if follow is not None and follow.status not in (
                 TaskStatus.COMPLETE, TaskStatus.FAILED):

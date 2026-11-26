@@ -8,7 +8,7 @@ import re
 import sqlite3
 import time
 
-from . import route_events, self_improvement, unlocks
+from . import route_events, self_improvement, storage, unlocks
 from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
@@ -528,7 +528,7 @@ class AutoplayTask(BotTask):
                     self.graph, self.MANA_CRYSTAL_APARTMENT,
                     RetrieveItemsTask(
                         "chest", (r"Gandyld's Mana Crystal",),
-                        require_match=True),
+                        require_match=True, indexer=storage.plain_indexer()),
                     destination_xy=(1, 3), combat_approach=True))
         except ConnectionError:
             # Setup was interrupted before the recovery ran to an outcome.
