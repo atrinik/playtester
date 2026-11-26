@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ssl
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ QUIC_ALPN = "atrinik/2"
 GAME_STREAM_PREFACE = b"ATRN\x01\x00\x00\x01"
 # Public alias retained for callers predating the typed-stream naming.
 QUIC_GAME_STREAM_PREFACE = GAME_STREAM_PREFACE
+# The longest a connection's close is waited for (aioquic's wait_closed).
+CLOSE_TIMEOUT = 5.0
 
 
 def normalize_certificate_sha256(value: str) -> str:
@@ -30,6 +33,48 @@ def normalize_certificate_sha256(value: str) -> str:
     return fingerprint
 
 
+def _retrieve(future: asyncio.Future) -> None:
+    """Mark a future's outcome as seen, so an exception no one awaits is
+    never reported as never retrieved."""
+    if not future.cancelled():
+        future.exception()
+
+
+async def _handshake(protocol: Any, timeout: float) -> None:
+    """Send the first flight and wait at most ``timeout`` seconds for the
+    QUIC handshake (``wait_connected=False`` sends nothing by itself).
+
+    aioquic waits on a shielded waiter future that a closing connection
+    later fails with ConnectionError. On a timeout that waiter outlives
+    the wait: a done-callback retrieves its outcome, and the caller's
+    context exit closes the connection."""
+    protocol.transmit()
+    wait = asyncio.ensure_future(protocol.wait_connected())
+    done, _ = await asyncio.wait({wait}, timeout=timeout)
+    if wait in done:
+        wait.result()
+        return
+    waiter = getattr(protocol, "_connected_waiter", None)
+    if waiter is not None:
+        waiter.add_done_callback(_retrieve)
+    wait.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await wait
+    raise TimeoutError(f"QUIC handshake gave no answer in {timeout:g} s")
+
+
+async def _exit(context: Any, protocol: Any) -> None:
+    """Leave the connection context, at most CLOSE_TIMEOUT seconds: a close
+    that never completes never holds her reconnect back. Its UDP transport
+    is then closed here, as the context would have."""
+    try:
+        await asyncio.wait_for(context.__aexit__(None, None, None), CLOSE_TIMEOUT)
+    except TimeoutError:
+        transport = getattr(protocol, "_transport", None)
+        if transport is not None:
+            transport.close()
+
+
 @dataclass(slots=True)
 class QuicStream:
     """Own an aioquic connection context and its game stream."""
@@ -37,6 +82,7 @@ class QuicStream:
     context: Any
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
+    protocol: Any = None
 
     @classmethod
     async def connect(cls, host: str, port: int, certificate_sha256: str,
@@ -62,10 +108,17 @@ class QuicStream:
             is_client=True,
             verify_mode=ssl.CERT_NONE,
         )
-        context = connect(host, port, configuration=configuration)
+        # The handshake is awaited here, under our own timeout, not inside
+        # the context: a timeout that cancelled aioquic's shielded
+        # handshake waiter left its later ConnectionError unretrieved
+        # ("Future exception was never retrieved") on every timed-out
+        # reconnect.
+        context = connect(host, port, configuration=configuration,
+                          wait_connected=False)
         protocol = None
         try:
             protocol = await asyncio.wait_for(context.__aenter__(), timeout)
+            await _handshake(protocol, timeout)
             certificate = protocol._quic.tls._peer_certificate
             if certificate is None:
                 raise ProtocolError("QUIC peer did not provide a certificate")
@@ -78,12 +131,14 @@ class QuicStream:
             reader, writer = await protocol.create_stream()
             writer.write(GAME_STREAM_PREFACE)
             await asyncio.wait_for(writer.drain(), timeout)
-            return cls(context, reader, writer)
+            return cls(context, reader, writer, protocol)
         except BaseException:
             if protocol is not None:
-                await context.__aexit__(None, None, None)
+                # Bounded: a close that never completes never holds the
+                # caller's error (and her reconnect) back.
+                await _exit(context, protocol)
             raise
 
     async def close(self) -> None:
         self.writer.close()
-        await self.context.__aexit__(None, None, None)
+        await _exit(self.context, self.protocol)

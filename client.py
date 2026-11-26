@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import sqlite3
 import time
@@ -286,7 +287,13 @@ class AtrinikClient:
         self._access_accepted = False
         self._account_sent = False
         self._character_sent = False
+        # Her keepalives (_keepalive_loop): the last id sent, the ones not
+        # yet echoed and when each was sent (time.monotonic()), when the last
+        # echo came back, and its round trip in seconds (None before one).
+        self._keepalive_id = 0
+        self._keepalive_sent: dict[int, float] = {}
         self._last_keepalive = 0.0
+        self.keepalive_latency: float | None = None
         self._death_depletion_until = 0.0
         self._pending_death_losses: list[tuple[float, str]] = []
         self._party_setup_name = ""
@@ -1618,7 +1625,18 @@ class AtrinikClient:
         while not self._closed:
             try:
                 await self.connect()
-                await self._read_loop()
+                keepalive = asyncio.create_task(self._keepalive_loop())
+                try:
+                    await self._read_loop()
+                finally:
+                    keepalive.cancel()
+                    # Its outcome never replaces the read loop's: a failure
+                    # of its own is only logged.
+                    outcome, = await asyncio.gather(
+                        keepalive, return_exceptions=True)
+                    if (isinstance(outcome, BaseException) and
+                            not isinstance(outcome, asyncio.CancelledError)):
+                        log.warning("keepalive task failed: %r", outcome)
             except asyncio.CancelledError:
                 raise
             except (ConnectionError, asyncio.IncompleteReadError, OSError, ProtocolError) as exc:
@@ -1639,6 +1657,41 @@ class AtrinikClient:
                 break
             self._reconnect_requested = False
             await asyncio.sleep(self.config.reconnect_delay)
+
+    # While she plays, a keepalive every this many seconds (a random point
+    # in the range): the server drops a playing connection that sends
+    # nothing for SOCKET_LOGIN_IDLE_TIMEOUT (10 minutes; server
+    # socket/server.c), and every keepalive resets that idle counter
+    # (socket_command_keepalive, socket/request.c). Live, before
+    # 2026-11-26, she never sent one and was dropped 83 times a day.
+    KEEPALIVE_SECONDS = (30.0, 60.0)
+    # Unanswered keepalives remembered for their round trip, at most.
+    KEEPALIVE_PENDING = 8
+
+    async def _keepalive_loop(self) -> None:
+        """Send a keepalive every KEEPALIVE_SECONDS while she plays, for one
+        connection: run() starts it after connecting and cancels it when
+        the read loop ends."""
+        self._keepalive_sent.clear()
+        while not self._closed:
+            await asyncio.sleep(random.uniform(*self.KEEPALIVE_SECONDS))
+            if self.state.phase != "playing" or self.writer is None:
+                continue
+            try:
+                await self.send_keepalive()
+            except ConnectionError:
+                # The read loop sees the same failure and reconnects.
+                return
+
+    async def send_keepalive(self) -> None:
+        """One keepalive with a fresh id; its echo (_handle_keepalive)
+        gives the round trip."""
+        self._keepalive_id = (self._keepalive_id + 1) & 0xFFFFFFFF
+        ident = self._keepalive_id
+        self._keepalive_sent[ident] = time.monotonic()
+        while len(self._keepalive_sent) > self.KEEPALIVE_PENDING:
+            self._keepalive_sent.pop(next(iter(self._keepalive_sent)))
+        await self.send(Packet(c.S_KEEPALIVE).u32(ident))
 
     async def _read_loop(self) -> None:
         while not self._closed:
@@ -3248,10 +3301,17 @@ class AtrinikClient:
         await self.emit("book", raw)
 
     async def _handle_keepalive(self, cur: Cursor, raw: bytes) -> None:
-        packet = Packet(c.S_KEEPALIVE)
-        if cur.remaining >= 4:
-            packet.u32(cur.u32())
-        await self.send(packet)
+        """The server's echo of her keepalive (socket_command_keepalive):
+        record when it came and its round trip. Never answered: the server
+        echoes every keepalive with an id, so an answer would ping-pong."""
+        if cur.remaining < 4:
+            return
+        ident = cur.u32()
+        now = time.monotonic()
+        self._last_keepalive = now
+        sent = self._keepalive_sent.pop(ident, None)
+        if sent is not None:
+            self.keepalive_latency = now - sent
 
     async def select_character(self, name: str) -> None:
         await self.send(Packet(c.S_ACCOUNT).u8(c.ACCOUNT_LOGIN_CHAR).string(name))

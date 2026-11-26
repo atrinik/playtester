@@ -13,7 +13,9 @@ import os
 import posixpath
 import threading
 import dataclasses
+import functools
 import re
+import weakref
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
@@ -43,6 +45,7 @@ from . import planner
 from . import route_shadow
 from . import unlocks
 from .equipment import abandon_gear_examine
+from .observations import WHITE as WHITE_NAME, is_player, plain
 from .route_blocks import NO_WALLS, OwnerWalls
 from .route_costs import drain
 from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
@@ -2626,6 +2629,18 @@ class NavigateTask(BotTask):
     # instead of ping-ponging every 75 s.
     EDGE_EXCLUSION_SECONDS = 75.0
     EDGE_EXCLUSION_MAX_SECONDS = 300.0
+    # A square a living occupant newly blocks this many times within
+    # OCCUPANT_BLOCK_WINDOW_SECONDS is a blocker that comes and goes: she
+    # holds still for OCCUPANT_HOLD_SECONDS (navigation-occupant-hold)
+    # instead of stepping round it and back (_movement_blockers).
+    OCCUPANT_BLOCK_REPEATS = 3
+    OCCUPANT_BLOCK_WINDOW_SECONDS = 10.0
+    OCCUPANT_HOLD_SECONDS = 3.0
+    # Only squares this close to her count towards a hold.
+    OCCUPANT_HOLD_RADIUS = 2
+    # A player's name in this colour marks a PvP area, where players block
+    # one another (server request.c get_playername_color, map.c blocked()).
+    PVP_PLAYER_COLOR = "ff3030"
 
     @property
     def _excluded_edges(self) -> set[tuple]:
@@ -2640,7 +2655,10 @@ class NavigateTask(BotTask):
     def _exclude_edge(self, edge: MapEdge) -> None:
         """Exclude one exit (other stairs between the maps stay open) or a
         whole tile seam: EDGE_EXCLUSION_SECONDS, doubled on each repeat of
-        the same key, up to EDGE_EXCLUSION_MAX_SECONDS."""
+        the same key, up to EDGE_EXCLUSION_MAX_SECONDS. A route plan under
+        way is planned again with it."""
+        if self._route_plans is not None:
+            self._route_plans.forget("route")
         key = ((edge.source, edge.destination, edge.x, edge.y)
                if edge.kind != "tile" else (edge.source, edge.destination))
         strikes = self._edge_exclusion_strikes.get(key, 0)
@@ -2779,6 +2797,11 @@ class NavigateTask(BotTask):
         # the pack moves or is cleared.
         self._threat_blocked: set[tuple[int, int]] = set()
         self._temporary_blocked: set[tuple[int, int]] = set()
+        # When each square was newly blocked by an occupant lately, and
+        # until when she holds still for one that comes and goes
+        # (OCCUPANT_BLOCK_REPEATS).
+        self._occupant_blocks: dict[tuple[str, int, int], list[float]] = {}
+        self._occupant_hold_until = 0.0
         self._route_threat_maps: set[str] = set()
         self._threat_fallback = False
         self.allow_ranged_hazard_fallback = False
@@ -2834,6 +2857,36 @@ class NavigateTask(BotTask):
         self._care_staging_retry_at = 0.0
         # A ranking's probes share one component refresh.
         self.refresh: ComponentRefresh | None = None
+        # The trip's own route plan on the planner worker (_plan_off_loop):
+        # "start" or "replan" while one is under way, else "".
+        self._planning = ""
+        self._route_plans: BackgroundPlans | None = None
+        # A plan made before the trip started (prepare): (where she stood,
+        # when, its route or its ValueError).
+        self._prepared: tuple | None = None
+        # The inputs whose every hazard tier failed in the last plan
+        # (_plan_avoiding): a retry with the fallback starts at it.
+        self._tiers_failed_at: tuple | None = None
+        # What a plan on the worker leaves for the loop to do with her
+        # real client once it is collected: its shadow report, the live
+        # learned plan's metrics, a care-wait record (_defer).
+        self._deferred: list[Callable[[Any], None]] = []
+        # A plan went to the worker while a path may still be walking.
+        self._planning_stop = False
+        # A trip that must never wait behind a ranking on the worker (an
+        # aborted expedition's retreat): with the worker busy it plans on
+        # the loop, as essential trips do.
+        self.critical = False
+
+    # What a plan sets on the task that plans (_plan), copied back from the
+    # planning copy a plan on the worker ran on (_plan_off_loop).
+    PLAN_STATE = ("_walls", "_offer", "_crossed", "_bounded", "care",
+                  "learned_plan", "_route_threat_maps", "_threat_fallback",
+                  "hazard_fallback_taken", "_tiers_failed_at",
+                  "_deferred")
+    # A prepared plan (prepare) serves the trip's start this long, while
+    # she still stands where it was made.
+    PREPARED_SECONDS = 60.0
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
@@ -2842,12 +2895,187 @@ class NavigateTask(BotTask):
             client.state.map.world_y)
         if self.tolerance and not self._approach:
             self._approach = self._approach_candidates()
-        self.route = self._plan(client)
+        route = self._plan_off_loop(client)
+        if route is PLANNING:
+            # She stands still, defended by her trip, until it is done; a
+            # path the server still walks for her is stopped next tick.
+            self._planning, self.route = "start", []
+            self._planning_stop = True
+        else:
+            self.route = route
         self._last_progress = time.monotonic()
 
     def complete(self) -> None:
         self._temporary_blocked.clear()
+        self._drop_plan()
         super().complete()
+
+    def fail(self, reason: str) -> None:
+        self._drop_plan()
+        super().fail(reason)
+
+    @property
+    def planning(self) -> bool:
+        """Whether the trip's route is being planned on the worker."""
+        return bool(self._planning)
+
+    def _drop_plan(self) -> None:
+        """Drop the route plan under way (it never runs, or stops early)."""
+        self._planning, self._planning_stop = "", False
+        if self._route_plans is not None:
+            self._route_plans.forget("route")
+
+    @staticmethod
+    def _origin(client: AtrinikClient) -> tuple[str, int, int]:
+        m = client.state.map
+        return m.path, m.world_x, m.world_y
+
+    def _planning_copy(self, *, live: bool = False) -> "NavigateTask":
+        """A copy of the trip for the worker to plan on: its own containers
+        (the loop may change the trip's meanwhile) and care crossing; the
+        rest is shared and only read. ``live`` plans a trip not started yet
+        as the trip itself (prepare): a live plan, not a probe."""
+        # Expired exclusions are pruned here, on the trip itself: the copy
+        # prunes only its own.
+        self._excluded_edges
+        twin = copy.copy(self)
+        if live:
+            twin.status = TaskStatus.RUNNING
+        for name, value in vars(self).items():
+            if isinstance(value, (list, dict, set)):
+                setattr(twin, name, copy.copy(value))
+        if self.care is not None:
+            twin.care = copy.copy(self.care)
+        twin._route_plans = None
+        twin._deferred = []
+        return twin
+
+    def _defer(self, client: AtrinikClient, effect: Callable[[Any], None]) -> None:
+        """Apply ``effect`` to her client now, or, planning on the worker,
+        once the plan is collected on the loop (_plan_off_loop): the
+        worker writes nothing the loop reads."""
+        if isinstance(client, planner.PlanningClient):
+            self._deferred.append(effect)
+        else:
+            effect(client)
+
+    def _urgent(self) -> bool:
+        """An essential or critical trip: planned first on the worker,
+        and on the loop while the worker runs another job."""
+        return bool(self.essential) or self.critical
+
+    def _plan_off_loop(self, client: AtrinikClient, *,
+                       live: bool = False) -> "list[MapEdge] | _Planning":
+        """The trip's route from where she stands, planned on the planner
+        worker (ROUTING 1.12): PLANNING until it is done, then the route,
+        or its ValueError raised here, as _plan would have raised it.
+
+        The worker plans on a copy of the trip (_planning_copy) with her
+        PlanningClient; what the plan sets on the trip (PLAN_STATE) is
+        copied back, and its recorded actions replayed, when it is
+        collected. A plan made before the trip started (prepare) is used
+        instead while she still stands where it was made. Already on the
+        worker (a ranking's probe), it plans at once."""
+        if (planner.worker_generation() is not None or
+                isinstance(client, planner.PlanningClient) or
+                not hasattr(self._graph, "planner_view")):
+            return self._plan_here(client, live=live)
+        prepared, self._prepared = self._prepared, None
+        if (prepared is not None and prepared[0] == self._origin(client) and
+                time.monotonic() - prepared[1] <= self.PREPARED_SECONDS):
+            if isinstance(prepared[2], ValueError):
+                raise prepared[2]
+            return prepared[2]
+        if self._route_plans is None:
+            plans = self._route_plans = BackgroundPlans()
+            # A trip dropped with its plan under way (its owner moved on)
+            # cancels it: queued it never runs, running it stops at its
+            # next tier (_check_cancelled).
+            weakref.finalize(self, plans.forget, "route")
+        plans = self._route_plans
+        if (self._urgent() and not plans.planning("route") and
+                planner.busy()):
+            # The worker runs another job (a ranking can take 45 s): an
+            # essential or critical trip never waits behind it.
+            return self._plan_here(client, live=live)
+        # The care-wait record lives on her client: made here, the
+        # worker's copy of her client reads it through. A copy is made on
+        # every poll (cheap): a plan under way never uses it, and a result
+        # that went stale meanwhile is planned again with it.
+        _care_waits(client)
+        build = functools.partial(_plan_on_copy, self._planning_copy(live=live))
+        result = plans.get(
+            "route", self._graph, client, build,
+            # From another map or another part of this one the result is
+            # planned again; a step within the same part in a fight does
+            # not restart it, and the route still leaves from there.
+            key=self._plan_key(client),
+            priority=(planner.PRIORITY_HEAL if self._urgent()
+                      else planner.PRIORITY_OTHER))
+        if result is PLANNING:
+            return PLANNING
+        if result is None:
+            raise ValueError(
+                f"no route to {self.destination}: the planner gave no answer "
+                f"in {BackgroundPlans.MAX_PENDING_SECONDS:.0f} s")
+        route, error, state = result
+        self._adopt(client, state)
+        if error is not None:
+            raise error
+        return route
+
+    def _plan_key(self, client: AtrinikClient) -> tuple:
+        """Where a plan is from, for BackgroundPlans: her map and the part
+        of it she stands in (its static component, by its least square)."""
+        path, x, y = self._origin(client)
+        try:
+            component = self._graph._component(
+                path, (x, y), allow_locked=self._allow_locked(client))
+        except (AttributeError, KeyError):
+            component = frozenset()
+        return path, (min(component) if component else (x, y))
+
+    def _plan_here(self, client: AtrinikClient, *,
+                   live: bool = False) -> "list[MapEdge]":
+        """Plan now, here. A trip not started planned ``live`` (prepare)
+        plans as the trip itself, on its planning copy, as on the worker:
+        a live plan, never a probe."""
+        if not live or self.status == TaskStatus.RUNNING:
+            return self._plan(client)
+        route, error, state = _plan_on_copy(self._planning_copy(live=True), client)
+        self._adopt(client, state)
+        if error is not None:
+            raise error
+        return route
+
+    def _adopt(self, client: AtrinikClient, state: dict) -> None:
+        """Copy back what a plan on a planning copy set (PLAN_STATE), and
+        apply what it left for her client (_defer)."""
+        care = state.get("care")
+        if (care is not None and self.care is not None and self.care.finished and
+                care.key == self.care.key):
+            # Finished on the loop while the plan ran: it stays finished.
+            care.finished = True
+        for name, value in state.items():
+            setattr(self, name, value)
+        deferred, self._deferred = self._deferred, []
+        for effect in deferred:
+            effect(client)
+
+    def prepare(self, client: AtrinikClient) -> "list[MapEdge] | _Planning":
+        """Plan a trip that has not started yet, off the loop: PLANNING
+        until done, then its route, or its ValueError raised. Its start
+        then uses this plan (_plan_off_loop) rather than planning again."""
+        origin = self._origin(client)
+        try:
+            route = self._plan_off_loop(client, live=True)
+        except ValueError as exc:
+            self._prepared = (origin, time.monotonic(), exc)
+            raise
+        if route is not PLANNING:
+            self._prepared = (origin, time.monotonic(), route)
+        return route
+
 
     def _allow_locked(self, client: AtrinikClient):
         """Her access set: the unlock state's, unless the task overrides it."""
@@ -2955,6 +3183,8 @@ class NavigateTask(BotTask):
         does its ValueError reach the tier, which then relaxes as it always
         did.
         """
+        # A dropped plan stops between tiers.
+        _check_cancelled(self._plan_client)
         try:
             route = self.graph.route_points(
                 *args, walls=self._walls, offer=self._offer, **kwargs)
@@ -3079,7 +3309,9 @@ class NavigateTask(BotTask):
                 previous = waits.get(key)
                 if previous is not None and since - previous[1] <= CARE_WAIT_RESUME_SECONDS:
                     since, alerted = previous[0], previous[2]
-                waits[key] = (since, clock(), alerted)
+                record = (since, clock(), alerted)
+                self._defer(client, lambda real: _care_waits(real).__setitem__(
+                    key, record))
             care = self.care = CareCrossing(mode, tuple(subjects), since, clock=clock,
                                             key=key, alerted=alerted)
         else:
@@ -3512,7 +3744,7 @@ class NavigateTask(BotTask):
         # over its budget; the trip it ranks for decides when it runs.
         live = self.status == TaskStatus.RUNNING
         if live:
-            route_shadow.note_live_plan(client, plan)
+            self._defer(client, lambda real: route_shadow.note_live_plan(real, plan))
         if plan.outcome == route_costs.BLOCKED:
             raise OwnerBlockRefusal(plan.reason)
         # The threat fields describe the route returned, a probe's
@@ -3551,7 +3783,10 @@ class NavigateTask(BotTask):
         for care. Never raises."""
         if self.status != TaskStatus.RUNNING or self._care_staging is not None:
             return
-        route_shadow.request_trip(client, self, origin, route, error)
+        # A trip's plan on the worker is reported on the loop when it is
+        # collected (_plan_off_loop).
+        self._defer(client, lambda real: route_shadow.request_trip(
+            real, self, origin, route, error))
 
     def _plan_strict(self, client: AtrinikClient, learned: set[str],
                      origin: tuple[str, tuple[int, int]] | None = None,
@@ -3634,6 +3869,31 @@ class NavigateTask(BotTask):
             return {**kwargs, "avoided_maps": avoided,
                     "penalized_maps": kwargs["penalized_maps"] | (kwargs["avoided_maps"] - avoided)}
 
+        # Every tier short of the fallback failed for exactly these inputs
+        # in the last plan (a farm return retried with the fallback,
+        # _retry_unavoidable_return_route): this plan starts at the
+        # fallback rather than search them all again.
+        inputs = (source, tuple(source_xy), self.destination,
+                  tuple(args[3]), frozenset(kwargs["excluded"]),
+                  frozenset(kwargs["avoided_maps"]),
+                  frozenset(kwargs["penalized_maps"]), kwargs["allow_locked"],
+                  self._walls, self._offer)
+        failed_before, self._tiers_failed_at = self._tiers_failed_at, None
+        if (failed_before == inputs and self.allow_ranged_hazard_fallback and
+                (overlevel_hazards or ranged_hazards or pack_hazards)):
+            route = self._route_points(
+                *args, **relaxed(set(self.KNOWN_LETHAL_TRANSIT)))
+            self._threat_fallback = self.hazard_fallback_taken = True
+            if not previous_fallback:
+                self._record(client, "navigation-threat-fallback",
+                             "careful-clear expedition requires hostile "
+                             f"transit to {self.destination}")
+            self._route_threat_maps = {
+                edge.destination for edge in route
+                if edge.destination in (overlevel_hazards | ranged_hazards |
+                                        pack_hazards)}
+            return route
+
         try:
             route = self._route_points(*args, unwalled_retry=False, **kwargs)
         except ValueError as first:
@@ -3675,6 +3935,7 @@ class NavigateTask(BotTask):
                             *args, **fallback_kwargs)
                     except ValueError:
                         if not self.allow_ranged_hazard_fallback:
+                            self._tiers_failed_at = inputs
                             excluded = sorted(self._excluded_edges)
                             raise ValueError(
                                 f"{preferred_exc}; excluded edges: "
@@ -3703,6 +3964,8 @@ class NavigateTask(BotTask):
                                 "careful-clear expedition requires hostile "
                                 f"transit to {self.destination}")
                 elif route is None:
+                    if not self.allow_ranged_hazard_fallback:
+                        self._tiers_failed_at = inputs
                     excluded = sorted(self._excluded_edges)
                     raise ValueError(
                         f"{preferred_exc}; excluded edges: {excluded}") \
@@ -3825,20 +4088,59 @@ class NavigateTask(BotTask):
         return min(self.STALL_RETRY_MAX_SECONDS,
                    max(self.STALL_RETRY_SECONDS, movement_ack_timeout(client)))
 
+    def _passable(self, client: AtrinikClient, obj) -> bool:
+        """_passable_player, knowing her own graph's PvP maps."""
+        node = self.graph.nodes.get(client.state.map.path)
+        if (node is not None and node.pvp and
+                str(obj.name_color).casefold() != WHITE_NAME):
+            # On a PvP map party members (green) block her too.
+            return False
+        return self._passable_player(client, obj)
+
+    @classmethod
+    def _passable_player(cls, client: AtrinikClient, obj) -> bool:
+        """Another player she may walk onto: outside PvP areas players share
+        squares, while a monster or NPC (FLAG_MONSTER) blocks every living
+        thing (server map.c blocked()). Her party members are players too
+        (on a PvP map they block: _passable). A green name is also the
+        server's colour for a weaker creature: only one no authored object
+        carries counts as a player.
+        Live, on 2026-11-26 on world_0_67, the owner's character beside her
+        route kept her stepping off it and back four times a second."""
+        state = client.state
+        content = getattr(client, "authored_content", None)
+        color = str(obj.name_color).casefold()
+        if color == cls.PVP_PLAYER_COLOR:
+            return False
+        # The server names weaker creatures green too: without her
+        # authored names to tell them apart, only white is a player.
+        if content is None and color != WHITE_NAME:
+            return False
+        return is_player(obj, plain(getattr(state, "player_name", "") or ""),
+                         content)
+
     def _movement_blockers(self, client: AtrinikClient) -> set[tuple[int, int]]:
-        """Combine learned fixtures with currently visible living occupants."""
+        """Combine learned fixtures with currently visible living occupants.
+
+        Other players never count (_passable_player). A square an occupant
+        newly blocks OCCUPANT_BLOCK_REPEATS times within
+        OCCUPANT_BLOCK_WINDOW_SECONDS starts a hold (_occupant_hold_until):
+        she waits instead of stepping round it and back."""
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
         targets = getattr(m, "targets", None)
         temporary = set()
+        friendly = set()
         if callable(targets):
             for view_x, view_y, obj in targets():
-                if not obj.target_id:
+                if not obj.target_id or self._passable(client, obj):
                     continue
                 point = (m.world_x + view_x - cx,
                          m.world_y + view_y - cy)
                 if point != (m.world_x, m.world_y):
                     temporary.add(point)
+                    if obj.is_friend:
+                        friendly.add(point)
         newly_blocked = temporary - self._temporary_blocked
         self._temporary_blocked = temporary
         if newly_blocked:
@@ -3847,9 +4149,38 @@ class NavigateTask(BotTask):
                 recorder(
                     "navigation-occupant-blocked",
                     ", ".join(f"{x},{y}" for x, y in sorted(newly_blocked)))
+            # Only a friendly occupant (a townsperson, a guard) beside her
+            # makes her hold, and never under attack or on an essential or
+            # critical trip: a hostile one is fled or fought.
+            if not self._urgent() and not recent_hostile_contact(client, 5.0):
+                self._note_occupant_blocks(client, m.path, {
+                    (x, y) for x, y in newly_blocked & friendly
+                    if max(abs(x - m.world_x), abs(y - m.world_y)) <=
+                    self.OCCUPANT_HOLD_RADIUS})
         return (self._runtime_blocked | self._threat_blocked |
                 self._temporary_blocked |
                 self._rejected_departures_on(m.path, (m.world_x, m.world_y)))
+
+    def _note_occupant_blocks(self, client: AtrinikClient, map_path: str,
+                              squares: set[tuple[int, int]]) -> None:
+        """Count newly blocked squares beside her (OCCUPANT_HOLD_RADIUS);
+        one blocked again and again starts a hold (OCCUPANT_BLOCK_REPEATS)."""
+        now = time.monotonic()
+        horizon = now - self.OCCUPANT_BLOCK_WINDOW_SECONDS
+        self._occupant_blocks = {
+            key: kept for key, times in self._occupant_blocks.items()
+            if (kept := [at for at in times if at > horizon])}
+        for x, y in squares:
+            times = self._occupant_blocks.setdefault((map_path, x, y), [])
+            times.append(now)
+            if (len(times) < self.OCCUPANT_BLOCK_REPEATS or
+                    now < self._occupant_hold_until):
+                continue
+            self._occupant_hold_until = now + self.OCCUPANT_HOLD_SECONDS
+            times.clear()
+            self._record(client, "navigation-occupant-hold",
+                         f"{x},{y} blocked {self.OCCUPANT_BLOCK_REPEATS} times "
+                         f"in {self.OCCUPANT_BLOCK_WINDOW_SECONDS:.0f}s")
 
     def _reject_departure(self, key: tuple[str, int, int]) -> None:
         """Close one seam departure square that rejected her step.
@@ -3892,6 +4223,16 @@ class NavigateTask(BotTask):
                     client.state.map.world_y)
         now = time.monotonic()
         blocked = self._movement_blockers(client)
+        if now < self._occupant_hold_until:
+            # A blocker that comes and goes: she stands still rather than
+            # step round it and back. The hold is no stall.
+            if self._issued_goal is not None or self._issued_click is not None:
+                await client.clear_actions()
+                self._issued_goal = None
+                self._issued_click = None
+            self._last_action = now
+            self._last_progress = now
+            return True
         if (self._issued_click is not None and
                 self._issued_click[0] == client.state.map.path and
                 self._issued_click[1:] in self._temporary_blocked):
@@ -4364,11 +4705,28 @@ class NavigateTask(BotTask):
     VOYAGE_APPROACH_STALL_SECONDS = 20.0
 
     def _replan(self, client: AtrinikClient) -> None:
+        """Plan the route again, on the planner worker (_plan_off_loop):
+        while it runs the route stays empty and she does not move."""
+        pending = self._planning
         try:
-            self.route = self._plan(client)
+            route = self._plan_off_loop(client)
         except ValueError as exc:
-            if not self._wait_for_exclusions(client, exc):
+            self._planning = ""
+            if pending == "start" or not self._wait_for_exclusions(client, exc):
                 self.fail(str(exc))
+            return
+        if route is PLANNING:
+            if not pending:
+                # The server may still walk her last path: stopped on the
+                # next tick (_planning_stop).
+                self._planning_stop = True
+            self._planning, self.route = pending or "replan", []
+            return
+        self._planning = ""
+        self.route = route
+        if pending:
+            # Waiting for the plan was no stall.
+            self._last_progress = time.monotonic()
 
     async def _take_voyage(self, client: AtrinikClient, edge: MapEdge) -> None:
         """Take one dialogue voyage (dialogue_edges.py): walk beside the
@@ -4465,6 +4823,17 @@ class NavigateTask(BotTask):
         if self.status != TaskStatus.RUNNING or client.state.phase != "playing":
             return
         self._record_progress(client)
+        if self._planning:
+            # Her route is being planned on the worker: she stands still
+            # (her trip's defence goes on) until it is done.
+            if self._planning_stop:
+                self._planning_stop = False
+                await client.clear_actions()
+                self._issued_goal = self._issued_click = None
+            self._replan(client)
+            # Collected or not, she takes no step on this tick: her trip
+            # (a route-death hold) sees the new route before she walks it.
+            return
         # Her route events: a crossing since the last tick, the edge ahead.
         route_events.note_tick(client, self)
         if self.care is not None:
@@ -6160,6 +6529,11 @@ class ShopUpgradeSweepTask(BotTask):
         self.settlement: NavigateTask | None = None
         self._settlement_inherited = False
         self._settlement_complete_at = 0.0
+        # The checkout mat ranking on the planner worker (_new_settlement),
+        # and whether the settlement it is for was inherited (None when
+        # none is under way).
+        self._checkout_plans = BackgroundPlans()
+        self._checkout_inherited: bool | None = None
         self.purchased = False
         self.allow_launchers = bool(allow_launchers)
         self.allow_hostile_transit = bool(allow_hostile_transit)
@@ -6188,45 +6562,114 @@ class ShopUpgradeSweepTask(BotTask):
         return [item for item in client.state.inventory
                 if item.flags & c.ITEM_UNPAID]
 
-    def _new_settlement(self, client: AtrinikClient) -> NavigateTask | None:
-        """Route across a shop mat so acquired stock becomes paid."""
+    def _checkout_goals(self, client: AtrinikClient
+                        ) -> list[tuple[str, tuple[int, int]]]:
+        """Where crossing a shop mat leads, from where she stands: (map,
+        goal) for each mat she can reach inside the shop, whose far side
+        is another component. A mat on her own map, or on a tiled
+        neighbour where the shop continues across the seam: Greyton's
+        shop is on world_9_67, its mats on world_10_67 beside it. Cheap:
+        no route search."""
         path = client.state.map.path
         start = client.state.map.world_x, client.state.map.world_y
         node = self.graph.nodes.get(path)
         if node is None:
-            return None
-        source_component = self.graph._component(path, start)
-        choices: list[tuple[int, tuple[int, int], NavigateTask]] = []
+            return []
+        goals: list[tuple[str, tuple[int, int]]] = []
+
+        def mats(map_path: str, origin: tuple[int, int]) -> None:
+            mat_node = self.graph.nodes.get(map_path)
+            if mat_node is None:
+                return
+            source_component = self.graph._component(map_path, origin)
+            for edge in mat_node.edges:
+                if (edge.source != map_path or edge.destination != map_path or
+                        edge.kind != "exit"):
+                    continue
+                transition = self.graph._transition(edge, origin)
+                if transition is None:
+                    continue
+                _, arrival = transition
+                arrival_component = self.graph._component(map_path, arrival)
+                if not arrival_component or arrival_component == source_component:
+                    continue
+                ordinary = [
+                    point for point in arrival_component
+                    if point not in mat_node.automatic_exits and
+                    mat_node.walkable(*point)
+                ]
+                goal = min(
+                    ordinary or [arrival],
+                    key=lambda point: (
+                        max(abs(point[0] - arrival[0]),
+                            abs(point[1] - arrival[1])), point))
+                if (map_path, goal) not in goals:
+                    goals.append((map_path, goal))
+
+        mats(path, start)
         for edge in node.edges:
-            if (edge.source != path or edge.destination != path or
-                    edge.kind != "exit"):
+            if edge.source != path or edge.kind != "tile":
                 continue
-            transition = self.graph._transition(edge, start)
-            if transition is None:
-                continue
-            _, arrival = transition
-            arrival_component = self.graph._component(path, arrival)
-            if not arrival_component or arrival_component == source_component:
-                continue
-            ordinary = [
-                point for point in arrival_component
-                if point not in node.automatic_exits and node.walkable(*point)
-            ]
-            goal = min(
-                ordinary or [arrival],
-                key=lambda point: (
-                    max(abs(point[0] - arrival[0]),
-                        abs(point[1] - arrival[1])), point))
-            navigation = NavigateTask(self.graph, path, goal)
-            navigation.allow_ranged_hazard_fallback = (
-                self.allow_hostile_transit)
-            try:
-                route = navigation._plan(client)
-            except ValueError:
-                continue
-            choices.append((len(route), goal, navigation))
-        return min(choices, key=lambda value: (value[0], value[1]))[2] \
-            if choices else None
+            # Each part of the neighbour her side of the seam leads into.
+            for _, arrival in self.graph._tile_transitions(edge, start):
+                mats(edge.destination, arrival)
+        return goals
+
+    def _new_settlement(self, client: AtrinikClient
+                        ) -> NavigateTask | None | _Planning:
+        """Route across a shop mat so acquired stock becomes paid: the mat
+        with the shortest route (_checkout_goals), ranked on the planner
+        worker (ROUTING 1.12). PLANNING while that runs; None when no mat
+        is reachable. The chosen walk plans its own route as it starts."""
+        goals = self._checkout_goals(client)
+        if not goals:
+            return None
+        here = (client.state.map.path, client.state.map.world_x,
+                client.state.map.world_y)
+        graph, fallback = self.graph, self.allow_hostile_transit
+
+        def rank(proxy):
+            best = None
+            for path, goal in goals:
+                navigation = NavigateTask(graph, path, goal)
+                navigation.allow_ranged_hazard_fallback = fallback
+                try:
+                    route = navigation._plan(proxy)
+                except ValueError:
+                    continue
+                key = (len(route), goal, path)
+                if best is None or key < best[0]:
+                    best = (key, navigation, route)
+            return best
+
+        best = self._checkout_plans.get(
+            "checkout", graph, client, rank, key=(here, tuple(goals), fallback))
+        if best is PLANNING:
+            return PLANNING
+        if best is None:
+            return None
+        # The walk plans its own, live route when it starts: a ranking's
+        # probe is no live plan (no care, metrics or learned decisions).
+        _, navigation, _ = best
+        return navigation
+
+    def _begin_settlement(self, client: AtrinikClient, inherited: bool) -> bool:
+        """Start the walk across a shop mat; False while its ranking runs
+        (she waits where she is) or once the sweep failed for want of a
+        reachable mat."""
+        settlement = self._new_settlement(client)
+        if settlement is PLANNING:
+            self._checkout_inherited = inherited
+            return False
+        self._checkout_inherited = None
+        self.settlement = settlement
+        self._settlement_inherited = inherited
+        self._settlement_complete_at = 0.0
+        if settlement is None:
+            self.fail("unpaid shop stock has no reachable checkout mat" if inherited
+                      else "purchased shop stock has no reachable checkout mat")
+            return False
+        return True
 
     async def tick(self, client: AtrinikClient) -> None:
         if self.status == TaskStatus.READY:
@@ -6237,11 +6680,9 @@ class ShopUpgradeSweepTask(BotTask):
         # otherwise unpaid stock is excluded from the owned-item baseline and
         # the sweep can buy duplicates of the same slot.
         if self.settlement is None and self.child is None and unpaid:
-            self.settlement = self._new_settlement(client)
-            self._settlement_inherited = True
-            self._settlement_complete_at = 0.0
-            if self.settlement is None:
-                self.fail("unpaid shop stock has no reachable checkout mat")
+            inherited = (True if self._checkout_inherited is None
+                         else self._checkout_inherited)
+            if not self._begin_settlement(client, inherited):
                 return
         if self.settlement is not None:
             await self.settlement.tick(client)
@@ -6285,12 +6726,8 @@ class ShopUpgradeSweepTask(BotTask):
                     self.purchased = True
                     self.complete()
                     return
-                self.settlement = self._new_settlement(client)
-                self._settlement_inherited = False
-                self._settlement_complete_at = 0.0
                 self.child = None
-                if self.settlement is None:
-                    self.fail("purchased shop stock has no reachable checkout mat")
+                self._begin_settlement(client, False)
                 return
             self.index += 1
             self.child = None
@@ -7568,6 +8005,38 @@ def analyzer_farm_choice(
     return choice
 
 
+def out_of_league_marks(client: AtrinikClient) -> set[str]:
+    """The creature kinds marked out of her league and not yet expired
+    (FarmTask.out_healed, out_of_league_kinds), normalized
+    (FarmTask._kind_key)."""
+    store = getattr(client, "out_of_league_kinds", None) or {}
+    now = time.monotonic()
+    return {FarmTask._kind_key(kind) for kind, until in store.items()
+            if float(until) > now}
+
+
+def residents_out_of_league(graph: "WorldGraph", paths: Iterable[str],
+                            marked: set[str]) -> tuple[str, ...]:
+    """The resident kinds of ``paths`` (their authored, not peaceful,
+    spawns, by name or archetype) when every one is in ``marked`` (a spawn
+    that can roll several kinds counts once all are), else ()."""
+    if not marked:
+        return ()
+    residents = [spawn for path in dict.fromkeys(paths)
+                 for spawn in graph.named_spawns.get(path, ())
+                 if not spawn.peaceful]
+    if not residents:
+        return ()
+    kinds = set()
+    for spawn in residents:
+        names = {FarmTask._kind_key(name)
+                 for name in (spawn.named, *spawn.candidates) if name}
+        if not names or not names <= marked:
+            return ()
+        kinds.add(spawn.named)
+    return tuple(sorted(kinds))
+
+
 def _analyzer_farm_choice(
         client: AtrinikClient, graph: "WorldGraph", *, search: bool = True,
         search_verdict: bool | None = None,
@@ -7581,6 +8050,8 @@ def _analyzer_farm_choice(
     a spot whose route enters a map where she recently died on the way to a
     farm (route_death_blocked_maps) is skipped while that death counts, for
     every circuit behind the map, not only the one she was heading to; and
+    a spot whose every resident kind is marked out of her league
+    (residents_out_of_league) is skipped while the marks last; and
     a spot rated hazardous for her current kit (kit_hazardous_spot) is
     skipped until her survivability improves, unless every usable spot is
     hazardous; then the least dangerous of them is farmed (the safer
@@ -7636,12 +8107,17 @@ def _analyzer_farm_choice(
     objectives = (("safety",) if funding else
                   tuple(dict.fromkeys(
                       (effective_farm_objective(client.state), chosen))))
+    # A spot whose every resident kind is marked out of her league would
+    # be quarantined as soon as she arrived (_observe_out_of_league).
+    marked = out_of_league_marks(client)
     for position, objective in enumerate(objectives):
         for rank, spot in enumerate(seam_ranking(client, graph, objective)):
             legs = analyzer_spot_legs(spot, graph)
             if (legs and all(float(quarantine.get(path, 0.0) or 0.0) <= now
                              for path, _ in legs) and
-                    not any(path in blocked for path, _ in legs)):
+                    not any(path in blocked for path, _ in legs) and
+                    not residents_out_of_league(
+                        graph, (path for path, _ in legs), marked)):
                 entry = (objective, legs, spot)
                 order[id(entry)] = (position, rank)
                 (hazardous if kit_hazardous_spot(client, spot, legs, graph)
@@ -8102,6 +8578,18 @@ def planning_client(client: AtrinikClient, graph: "WorldGraph") -> planner.Plann
         proxy._route_cost_model = model
         proxy._route_cost_model_state = (state[0], math.inf, state[2])
     return proxy
+
+
+def _plan_on_copy(twin: "NavigateTask", proxy: Any) -> tuple:
+    """A trip's plan on the worker (NavigateTask._plan_off_loop): its
+    route or None, its ValueError or None, and what the plan set on the
+    trip (PLAN_STATE)."""
+    try:
+        route, error = twin._plan(proxy), None
+    except ValueError as exc:
+        route, error = None, exc
+    return route, error, {name: getattr(twin, name)
+                          for name in NavigateTask.PLAN_STATE}
 
 
 class _BackgroundPlan:
@@ -9248,28 +9736,16 @@ class FarmCircuitTask(BotTask):
         if (self.child.navigation.status != TaskStatus.COMPLETE or
                 client.state.map.path not in legs):
             return False
-        store = getattr(client, "out_of_league_kinds", None) or {}
-        now = time.monotonic()
-        marked = {FarmTask._kind_key(kind) for kind, until in store.items()
-                  if float(until) > now}
+        marked = out_of_league_marks(client)
         if not marked:
             return False
         quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
         if all(float(quarantine.get(path, 0.0) or 0.0) > time.time()
                for path in legs):
             return False
-        residents = [spawn for path in legs
-                     for spawn in self.graph.named_spawns.get(path, ())
-                     if not spawn.peaceful]
-        if not residents:
+        kinds = residents_out_of_league(self.graph, legs, marked)
+        if not kinds:
             return False
-        kinds = set()
-        for spawn in residents:
-            names = {FarmTask._kind_key(name)
-                     for name in (spawn.named, *spawn.candidates) if name}
-            if not names or not names <= marked:
-                return False
-            kinds.add(spawn.named)
         detail = (f"{(self.spot or {}).get('name', self._spot_key())}: every "
                   f"resident kind is out of her league "
                   f"({', '.join(sorted(kinds))})")
@@ -9534,10 +10010,24 @@ class FarmCircuitTask(BotTask):
         navigation = self.child.navigation
         if client.state.map.path == navigation.destination:
             return False
+        if navigation.planning:
+            # Its plan runs on the worker and she stands still; the tick
+            # that collects it takes no step, so the route it brings is
+            # checked here before she walks it.
+            return False
         if not navigation.route or navigation.route[0].source != client.state.map.path:
-            try:
-                navigation.route = navigation._plan(client)
-            except ValueError:
+            # Never planned on the loop: the leg's own plan, on the worker.
+            if navigation.status == TaskStatus.READY:
+                try:
+                    route = navigation.prepare(client)
+                except ValueError:
+                    return False
+                if route is PLANNING:
+                    # Not started, it walks nowhere: hold until it is known.
+                    return True
+                return any(edge.destination in maps for edge in route)
+            navigation._replan(client)
+            if navigation.planning or navigation.status != TaskStatus.RUNNING:
                 return False
         return any(edge.destination in maps for edge in navigation.route)
 
@@ -9641,7 +10131,9 @@ class FarmCircuitTask(BotTask):
         return False
 
     def _retry_unavoidable_return_route(self, client: AtrinikClient) -> bool:
-        """Broaden a failed level-18+ return only after safe routing fails."""
+        """Broaden a failed level-18+ return only after safe routing fails.
+        The retry's plan starts at the fallback tier: the others just
+        failed for the same inputs (_tiers_failed_at)."""
         if self.child is None:
             return False
         navigation = self.child.navigation
@@ -11472,6 +11964,7 @@ class FarmCircuitTask(BotTask):
             self._expedition_abort_reason = reason
             self._expedition_return = NavigateTask(
                 self.graph, path, (x, y), tolerance=1)
+            self._expedition_return.critical = True
             await client.clear_actions()
             await client.set_combat(False)
             recorder = getattr(client, "record_action", None)
@@ -12459,6 +12952,9 @@ class RecoveryTask(BotTask):
         self._home_retry_at = 0.0
         # The rest before a hazard crossing home ends by this clock time.
         self._hazard_rest_until: float | None = None
+        # The ordinary walk home's plan is still to be judged for the
+        # hazard fallback before it departs (_start_ordinary_home_walk).
+        self._home_probe = False
         # Walks home failed in a row, and the latest failure.
         self._home_failures = 0
         self._home_error = ""
@@ -12731,24 +13227,35 @@ class RecoveryTask(BotTask):
     def _start_ordinary_home_walk(self, client: AtrinikClient,
                                   home: tuple[str, tuple[int, int]]
                                   ) -> NavigateThenTask:
-        """The ordinary walk home, and once, before it departs, whether its
-        route takes the hazard fallback. If so it heals and steps away
-        early, and where she stands has no hostile spawns she rests first
-        (_hazard_rest_until): depleted, she crosses rested. On a map with
-        hostile spawns she goes at once, since staying is worse. Replans
-        within the walk never rest again."""
+        """The ordinary walk home. Once, before it departs, its route is
+        judged for the hazard fallback (_judge_home_walk)."""
         walk = self._new_home_walk(client, home, strict=False)
         self._hazard_rest_until = None
+        self._home_probe = walk.navigation.allow_ranged_hazard_fallback
+        return walk
+
+    def _judge_home_walk(self, client: AtrinikClient,
+                         walk: NavigateThenTask) -> bool:
+        """Whether the ordinary walk home takes the hazard fallback: its own
+        plan, made before it departs on the planner worker (prepare), which
+        its start then uses (one plan, not two). False while that plan
+        runs: she stands and defends meanwhile. If it takes the fallback,
+        the walk heals and steps away early, and where she stands has no
+        hostile spawns she rests first (_hazard_rest_until): depleted, she
+        crosses rested. On a map with hostile spawns she goes at once,
+        since staying is worse. Replans within the walk never rest again."""
+        if not self._home_probe:
+            return True
         navigation = walk.navigation
-        if not navigation.allow_ranged_hazard_fallback:
-            return walk
         try:
-            # A planning probe: the walk has not started.
-            navigation._plan(client)
+            route = navigation.prepare(client)
         except ValueError:
-            return walk
-        if not navigation.hazard_fallback_taken:
-            return walk
+            route = None
+        if route is PLANNING:
+            return False
+        self._home_probe = False
+        if route is None or not navigation.hazard_fallback_taken:
+            return True
         self._careful(walk)
         here = client.state.map.path
         if not navigation._hostile_map(here):
@@ -12756,7 +13263,14 @@ class RecoveryTask(BotTask):
             self._record(client, "recovery-home-hazard-rest",
                          f"resting on {here} before crossing "
                          f"{', '.join(sorted(navigation._route_threat_maps))}")
-        return walk
+        return True
+
+    async def _hold_still(self, client: AtrinikClient) -> None:
+        """Stay where she is: defend under contact, else keep safe."""
+        if _contact_this_life(client):
+            await self._defend(client)
+        else:
+            await self.safety.enforce(client)
 
     @staticmethod
     def _rested(client: AtrinikClient) -> bool:
@@ -12776,10 +13290,7 @@ class RecoveryTask(BotTask):
                 self.at_home(client)):
             self._hazard_rest_until = None
             return False
-        if _contact_this_life(client):
-            await self._defend(client)
-        else:
-            await self.safety.enforce(client)
+        await self._hold_still(client)
         return True
 
     async def _tick_home_walk(self, client: AtrinikClient) -> None:
@@ -12793,6 +13304,9 @@ class RecoveryTask(BotTask):
         """
         walk = self._home_walk
         assert walk is not None
+        if not self._judge_home_walk(client, walk):
+            await self._hold_still(client)
+            return
         if await self._hazard_rest(client):
             return
         await walk.tick(client)
@@ -12809,6 +13323,9 @@ class RecoveryTask(BotTask):
                 recorder("recovery-home-unsafe-route", walk.error)
             walk = self._home_walk = self._start_ordinary_home_walk(
                 client, home)
+            if not self._judge_home_walk(client, walk):
+                await self._hold_still(client)
+                return
             if await self._hazard_rest(client):
                 return
             await walk.tick(client)
@@ -12884,6 +13401,7 @@ class RecoveryTask(BotTask):
             await client.set_combat(False)
             self._home_walk = self._new_home_walk(client, home, strict=True)
             self._hazard_rest_until = None
+            self._home_probe = False
             await self._tick_home_walk(client)
             return
         # Every errand starts from her savebed; off it, she waits for the

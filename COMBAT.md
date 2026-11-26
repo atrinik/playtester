@@ -729,7 +729,9 @@ recovery phase:
   hazard maps when no hazard-free route exists
   (`navigation-threat-fallback`): pack-hazard maps, and with them learned
   ranged and over-level maps; only `KNOWN_LETHAL_TRANSIT` stays closed.
-  Once, when such a walk is created, its plan is checked: if it takes
+  Once, when such a walk is created, its plan (made on the planner
+  worker, and the one the walk then follows; she holds still, defending,
+  while it runs) is checked: if it takes
   that fallback, the walk heals below 85% and, below 70%, stops and steps
   away from what hits her, as the recall shopping and cure trips do. If
   she stands on a map without hostile spawns she first rests there, with
@@ -738,6 +740,13 @@ recovery phase:
   `recovery-home-hazard-rest`. On a map with hostile spawns she goes at
   once, since staying is worse. A replan during the walk never rests
   again; the next walk, after `HOME_RETRY_SECONDS`, is checked afresh.
+  Quest trips take the same fallback from the same level (the Fort
+  Sether Illness quest had no route out of the Burnt Forest), only as a
+  defended leg. From level 18 every dialogue trip's walk is a defended
+  `combat_approach` leg (`NavigateThenTask`, never a bare navigation),
+  and from level 18 dialogue walks and quest farm and kill legs carry a
+  leg policy that heals below 85% and steps away below 70% for the whole
+  leg, not only where it crosses a hazard map. Both are intended.
   Already home (a death during the rest respawns her there), she does
   not rest. The rest, its record and the home-unreachable streak are the
   recovery task's own memory: a rebuilt task (autoplay's handover, Stop
@@ -1796,7 +1805,10 @@ and learned too little from them. Three changes:
   and a spawn that can roll several kinds counts only once all of them
   are marked. The analyzer choice then picks another spot, and her
   ordinary walk takes her off the map along its route. With no spot left,
-  the circuit ends, as for any quarantined spot. Live, she stayed on
+  the circuit ends, as for any quarantined spot. While the marks last the
+  analyzer choice never picks such a spot to begin with
+  (`residents_out_of_league`): picked, it was quarantined as soon as she
+  arrived. Live, she stayed on
   world_16_74 with every kind there marked, ran along its edges away from
   slow treants and was cornered at (19,23).
 

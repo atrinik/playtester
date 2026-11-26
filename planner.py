@@ -40,6 +40,7 @@ import inspect
 import itertools
 import logging
 import queue
+import signal
 import threading
 import time
 from collections.abc import Callable
@@ -58,6 +59,35 @@ PRIORITY_OTHER = 2
 # Jobs for whichever worker is current, in priority, then submission, order.
 _jobs: queue.PriorityQueue = queue.PriorityQueue()
 _order = itertools.count()
+# The futures of the jobs submitted and not yet finished, queued or
+# running (busy): added on submit, removed when a job ends or is skipped as
+# cancelled, or when its worker is abandoned (unstick).
+_outstanding: set[concurrent.futures.Future] = set()
+_outstanding_lock = threading.Lock()
+
+
+def _settle(future: concurrent.futures.Future) -> None:
+    with _outstanding_lock:
+        _outstanding.discard(future)
+
+
+# Signals the process receives from outside: a worker thread never takes
+# one. A process-directed signal goes to any thread that does not block it,
+# so with a worker alive, a SIGTERM the main thread holds blocked (the
+# feedback filer's cleanup, pthread_sigmask) was taken by the worker
+# instead and handled early. Faults raised by the thread itself stay
+# unblocked.
+_FAULTS = {"SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGABRT", "SIGTRAP", "SIGSYS"}
+
+
+def _block_signals() -> None:
+    """Block every signal but the faults on the calling (worker) thread:
+    they are the main thread's to take."""
+    if not hasattr(signal, "pthread_sigmask"):
+        return
+    signal.pthread_sigmask(signal.SIG_BLOCK, {
+        number for number in signal.valid_signals()
+        if getattr(number, "name", "") not in _FAULTS})
 
 
 class _Worker:
@@ -90,10 +120,13 @@ class _Worker:
                priority: int = PRIORITY_OTHER,
                **kwargs: Any) -> concurrent.futures.Future:
         future: concurrent.futures.Future = concurrent.futures.Future()
+        with _outstanding_lock:
+            _outstanding.add(future)
         _jobs.put((priority, next(_order), (future, fn, args, kwargs)))
         return future
 
     def _run(self) -> None:
+        _block_signals()
         _local.generation = self.generation
         while _worker is self:
             item = _jobs.get()
@@ -103,6 +136,7 @@ class _Worker:
                 return
             future, fn, args, kwargs = item[2]
             if not future.set_running_or_notify_cancel():
+                _settle(future)
                 continue
             self.future, self.started_at = future, time.monotonic()
             try:
@@ -113,6 +147,7 @@ class _Worker:
                 future.set_result(result)
             finally:
                 self.future = None
+                _settle(future)
 
 
 _worker: _Worker | None = None
@@ -150,6 +185,10 @@ def unstick(limit: float) -> str:
         _generation += 1
         _worker = _Worker(_generation)
         _worker.start()
+        # Its job's result is never read: it no longer makes the planner
+        # busy.
+        if current.future is not None:
+            _settle(current.future)
     note = (f"planner worker {current.generation} ran one job for more than "
             f"{limit:.0f} s; worker {_generation} started")
     log.warning("%s", note)
@@ -170,6 +209,15 @@ def worker_generation() -> int | None:
 def on_worker() -> bool:
     """Whether this code runs on a planner worker."""
     return worker_generation() is not None
+
+
+def busy() -> bool:
+    """Whether a job is running or queued that a plan submitted now would
+    wait for: a dropped (cancelled) job still queued does not count. A job
+    counts from its submission until it ends, with no gap while the
+    worker takes it from the queue."""
+    with _outstanding_lock:
+        return any(not future.cancelled() for future in _outstanding)
 
 
 def submit(fn: Callable[..., Any], /, *args: Any,
