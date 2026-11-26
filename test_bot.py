@@ -43315,7 +43315,8 @@ class SafeRetreatTests(unittest.TestCase):
         clock = [1000.0]
         log = []
 
-        def run(seconds, drop=()):
+        def run(seconds, drop=(), hide=()):
+            # ``drop`` leave for good; ``hide`` are out of view this run.
             for target_id in drop:
                 place.pop(target_id, None)
             end = clock[0] + seconds
@@ -43326,7 +43327,8 @@ class SafeRetreatTests(unittest.TestCase):
                     for spot in place.values():
                         spot[0] = min(hold_x, 10 + int(elapsed))
                     self._place(client, [(k, x, y)
-                                         for k, (x, y) in place.items()])
+                                         for k, (x, y) in place.items()
+                                         if k not in hide])
                     client.direct_moves.clear()
                     walk._last_defense_action = 0.0
                     answer = asyncio.run(
@@ -43363,10 +43365,32 @@ class SafeRetreatTests(unittest.TestCase):
         self.assertTrue(log[-1][1])
         self.assertEqual(walk._stand_cooldown_until, 0.0)
         self.assertNotEqual(walk.status, TaskStatus.FAILED)
-        run(1.0, drop=(102,))
+        # One leaves for longer than the grace: two are left, and their
+        # stand gets its own 45 s from then, not none.
+        log = run(4.0, drop=(102,))
+        self.assertTrue(all(answer for _, answer, _ in log[-16:]))
+        self.assertEqual(walk._stand_cooldown_until, 0.0)
+        run(46.0)
         self.assertGreater(walk._stand_cooldown_until, 0.0)
         self.assertNotIn("approach-train-held",
                          [a for a, _ in client.recorded])
+
+    def test_a_train_member_missing_a_moment_keeps_the_train(self):
+        # One of the three is out of view for 0.3 s at 60 s: still a
+        # train, the stand holds, and the trip fails at about 180 s.
+        client, walk, run = self._clocked_train()
+        run(60.0)
+        log = run(0.5, hide=(102,))
+        self.assertTrue(all(answer for _, answer, _ in log[-2:]))
+        log = run(110.0)
+        self.assertTrue(all(answer and not moves
+                            for _, answer, moves in log[-440:]))
+        self.assertEqual(walk._stand_cooldown_until, 0.0)
+        self.assertNotIn("approach-train-held",
+                         [a for a, _ in client.recorded])
+        run(15.0)
+        self.assertIn("approach-train-held", [a for a, _ in client.recorded])
+        self.assertEqual(walk.status, TaskStatus.FAILED)
 
     def test_train_holds_round_trip_through_memory_and_reject_bad_times(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -43496,12 +43520,16 @@ class SafeRetreatTests(unittest.TestCase):
         walk._track_pursuers(client, self._threats_of(client, monsters))
         for samples in walk._pursuit_samples.values():
             samples[0] = (samples[0][0] - 3.0, *samples[0][1:])
+        # A stand under way there ends with the map.
+        walk._stand_since = time.monotonic()
+        walk._train_ids = {100: time.monotonic()}
         # Across the seam, the same three now 4 tiles off, on the road.
         m.path, m.world_x, m.world_y = "/road", 0, 12
         monsters = [(100, 4, 12), (101, 4, 13), (102, 4, 11)]
         self._place(client, monsters)
         self.assertEqual(walk._track_pursuers(
             client, self._threats_of(client, monsters)), [])
+        self.assertEqual((walk._stand_since, walk._train_ids), (0.0, {}))
         self.assertEqual(walk._approach_mode(client, [], []), "")
 
     # world_16_74's aggressive residents (spawns.txt): eight treants, a

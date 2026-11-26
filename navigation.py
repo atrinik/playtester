@@ -5180,9 +5180,13 @@ class NavigateThenTask(BotTask):
         self._pursuit_map = ""
         self._pursuit_origins: dict[int, tuple[str, int, int]] = {}
         self._pursuer_ids: dict[int, float] = {}
-        # The members of a train stand under way (_approach_mode): they
-        # stay pursuers while in view within MAX_AGGRO_RANGE.
-        self._train_ids: set[int] = set()
+        # The members of a train stand under way (_approach_mode), each
+        # with when it was last seen in view within MAX_AGGRO_RANGE: they
+        # stay pursuers while so, and TRAIN_MISSING_GRACE_SECONDS after.
+        # How many of them are out of view within that grace now.
+        self._train_ids: dict[int, float] = {}
+        self._train_missing = 0
+        self._was_train = False
         self._lead: dict[str, Any] | None = None
         self._leads = 0
         self._stand_since = 0.0
@@ -5257,7 +5261,9 @@ class NavigateThenTask(BotTask):
         self._escaping = False
         self._lead = None
         self._stand_since = 0.0
-        self._train_ids = set()
+        self._train_ids = {}
+        self._train_missing = 0
+        self._was_train = False
         self._cornered_target = 0
         self._cornered_logged.clear()
         self._cornered_hold_since = 0.0
@@ -5947,6 +5953,8 @@ class NavigateThenTask(BotTask):
 
     # A trip remembers where at most this many creatures were first seen.
     PURSUIT_ORIGINS = 256
+    # A train member out of view stays one for this long.
+    TRAIN_MISSING_GRACE_SECONDS = 3.0
 
     def _track_pursuers(self, client: AtrinikClient, threats) -> list:
         """The threats following her. Each creature in view is sampled
@@ -5958,9 +5966,14 @@ class NavigateThenTask(BotTask):
         stands or wanders never makes one. A pursuer is one that
         qualified within the last APPROACH_PURSUIT_WINDOW_SECONDS and is
         in view within MAX_AGGRO_RANGE (_pursuer_ids holds when each last
-        qualified); a member of a train stand under way (_train_ids) stays
-        one, without that lapse, while in view within MAX_AGGRO_RANGE,
-        as the server keeps her as its enemy. Where each creature was first seen this trip is kept
+        qualified). A member of a train stand under way (_train_ids) stays
+        one without that lapse while in view within MAX_AGGRO_RANGE, as
+        the server keeps her as its enemy, and is still counted for
+        TRAIN_MISSING_GRACE_SECONDS while out of view (_train_missing);
+        seen beyond MAX_AGGRO_RANGE, or out of view longer, it leaves.
+        When the train shrinks to two, those two stay latched until the
+        stand resets. A map change ends the samples, the latches and the
+        stand. Where each creature was first seen this trip is kept
         (_pursuit_origins, at most PURSUIT_ORIGINS)."""
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2
@@ -5969,7 +5982,10 @@ class NavigateThenTask(BotTask):
             self._pursuit_map = m.path
             self._pursuit_samples.clear()
             self._pursuer_ids.clear()
+            # A new map (a seam, an exit, a recall) ends a stand.
             self._train_ids.clear()
+            self._stand_since = 0.0
+            self._was_train = False
         horizon = now - self.APPROACH_PURSUIT_WINDOW_SECONDS
         for target_id in list(self._pursuit_samples):
             samples = self._pursuit_samples[target_id]
@@ -5980,8 +5996,22 @@ class NavigateThenTask(BotTask):
         self._pursuer_ids = {
             target_id: at for target_id, at in self._pursuer_ids.items()
             if at >= horizon}
-        self._train_ids &= {threat[3].target_id for threat in threats
-                            if threat[0] <= MAX_AGGRO_RANGE}
+        # A train member seen within MAX_AGGRO_RANGE is refreshed; one seen
+        # beyond it leaves; one out of view stays for
+        # TRAIN_MISSING_GRACE_SECONDS (a one-tick gap in the view must not
+        # break the train).
+        in_view = {threat[3].target_id: threat[0] for threat in threats}
+        for target_id in list(self._train_ids):
+            if target_id in in_view:
+                if in_view[target_id] <= MAX_AGGRO_RANGE:
+                    self._train_ids[target_id] = now
+                else:
+                    del self._train_ids[target_id]
+            elif now - self._train_ids[target_id] > (
+                    self.TRAIN_MISSING_GRACE_SECONDS):
+                del self._train_ids[target_id]
+        self._train_missing = sum(target_id not in in_view
+                                  for target_id in self._train_ids)
         pursuers = []
         for threat in threats:
             distance, x, y, obj = threat
@@ -5995,7 +6025,7 @@ class NavigateThenTask(BotTask):
             if obj.target_id not in self._pursuit_origins:
                 if len(self._pursuit_origins) >= self.PURSUIT_ORIGINS:
                     # The oldest that is no pursuer, train or lead member.
-                    keep = (set(self._pursuer_ids) | self._train_ids |
+                    keep = (set(self._pursuer_ids) | set(self._train_ids) |
                             (self._lead["ids"] if self._lead else set()))
                     evict = next((target_id
                                   for target_id in self._pursuit_origins
@@ -6084,6 +6114,7 @@ class NavigateThenTask(BotTask):
             self._lead = None
             self._stand_since = 0.0
             self._train_ids.clear()
+            self._was_train = False
             return ""
         if self._lead is not None:
             if not self._lead_done(client, pursuers, threats, now):
@@ -6099,20 +6130,28 @@ class NavigateThenTask(BotTask):
             self.navigation._issued_click = None
             self.navigation._last_progress = now
         # Three or more she never takes onto the farm map: their stand has
-        # no time limit and no cooldown.
-        train = len(pursuers) > self.APPROACH_PACK_CAP
-        if (len(pursuers) < self.APPROACH_STAND_PURSUERS or
+        # no time limit and no cooldown. A train member briefly out of view
+        # still counts (_train_missing).
+        count = len(pursuers) + self._train_missing
+        train = count > self.APPROACH_PACK_CAP
+        if self._was_train and not train and self._stand_since:
+            # The train shrank to two: their stand starts its own limit
+            # now, not in the tick the train shrank.
+            self._stand_since = now
+        self._was_train = train and bool(self._stand_since)
+        if (count < self.APPROACH_STAND_PURSUERS or
                 (now < self._stand_cooldown_until and not train) or
                 not self._near_spot(client)):
             self._stand_since = 0.0
             self._train_ids.clear()
+            self._was_train = False
             return ""
-        if ((len(pursuers) > self.APPROACH_PACK_CAP or
-                healing_outpaced(client)) and
+        if ((train or healing_outpaced(client)) and
                 self._leads < self.LEAD_AWAY_LIMIT):
             self._leads += 1
             self._stand_since = 0.0
             self._train_ids.clear()
+            self._was_train = False
             self._lead = {"since": now, "steps": 0, "stuck": False,
                           "ids": {threat[3].target_id for threat in pursuers},
                           "at": (m.path, m.world_x, m.world_y)}
@@ -6130,11 +6169,11 @@ class NavigateThenTask(BotTask):
                         self.APPROACH_TRAIN_STAND_SECONDS):
             self._stand_since = 0.0
             self._train_ids.clear()
+            self._was_train = False
             self.train_held = True
             if recorder is not None:
-                recorder("approach-train-held",
-                         f"pursuers={len(pursuers)}")
-            self.fail(f"{len(pursuers)} followers held the approach to "
+                recorder("approach-train-held", f"pursuers={count}")
+            self.fail(f"{count} followers held the approach to "
                       f"{self.navigation.destination} for "
                       f"{self.APPROACH_TRAIN_STAND_SECONDS:.0f}s")
             return ""
@@ -6142,6 +6181,7 @@ class NavigateThenTask(BotTask):
               not train):
             self._stand_since = 0.0
             self._train_ids.clear()
+            self._was_train = False
             self._stand_cooldown_until = (
                 now + self.APPROACH_STAND_COOLDOWN_SECONDS)
             return ""
@@ -6149,7 +6189,9 @@ class NavigateThenTask(BotTask):
             # The train's members stay pursuers while in view within
             # MAX_AGGRO_RANGE, as the server keeps her as their enemy
             # (_track_pursuers): holding off at range lapses nothing.
-            self._train_ids.update(threat[3].target_id for threat in pursuers)
+            self._train_ids.update(
+                (threat[3].target_id, now) for threat in pursuers)
+            self._was_train = True
         return "stand"
 
     def _lead_done(self, client: AtrinikClient, pursuers, threats,

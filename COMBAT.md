@@ -2436,11 +2436,17 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
   2 s old took it 2 or more tiles nearer where she stands now, so her own
   walk towards a creature that stands or wanders makes none. It stays a
   pursuer while in view within 9 tiles, for 12 s after it last
-  qualified; a member of a stand against three or more stays one
+  qualified. A member of a stand against three or more stays one
   without that lapse while in view within 9 tiles, as the server keeps
   her as its enemy within `MAX_AGGRO_RANGE`, so a train holding off at
-  range keeps her stand (and its 180 s limit) going. Outclassed creatures
-  do not count. Because a map change starts the samples afresh, a
+  range keeps her stand (and its 180 s limit) going; out of view it still
+  counts for 3 s, so a one-tick gap in the view does not break the
+  train, and seen beyond 9 tiles or out of view longer it leaves. When
+  the train shrinks to two, those two stay latched until the stand
+  resets, and their stand's 45 s limit starts when it shrank. A map
+  change (a seam, an exit, a recall) ends the stand and every latch.
+  Outclassed creatures do not count. Because a map change starts the
+  samples afresh, a
   creature that follows her over a seam qualifies again only after about
   2 s of closing (or on contact); approach discipline does not run on
   the farm map itself, so this gap only delays a stand on the map before
