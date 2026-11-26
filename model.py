@@ -339,6 +339,12 @@ class GameState:
     # Maps where a route death took combat damage, by wall-clock time until
     # which navigation avoids them.
     route_hazards: dict[str, float] = field(default_factory=dict)
+    # Route variety (route_variety.py): per map and per edge subject, her
+    # decayed use count and when she last used it (wall clock), kept in her
+    # memory as route_visits. Values are tuples, so a planning copy's one
+    # level copy never shares a mutable entry with the loop.
+    route_map_visits: dict[str, tuple[float, float]] = field(default_factory=dict)
+    route_edge_uses: dict[str, tuple[float, float]] = field(default_factory=dict)
     vendor_quotes: dict[str, dict[str, int | float | str]] = field(
         default_factory=dict)
     farm_zone_quarantine: dict[str, float] = field(default_factory=dict)

@@ -36,7 +36,7 @@ from . import post_mortem
 from .owner_watch import OwnerWatchRecorder, name_digest
 from .owner_watch import capture as owner_watch_capture
 from .terrain import FightRecorder
-from . import route_events, route_shadow
+from . import route_events, route_shadow, route_variety
 from . import storage
 from .self_improvement import PLAYER_CHANNELS, from_server
 from .trends import Trends
@@ -211,6 +211,10 @@ class ClientConfig:
     # and farm choices are as before and the learned ones run in the shadow
     # (route_shadow.py); the owner turns it on after the shadow soak.
     learned_route_costs: bool = False
+    # docs/ROUTING.md 4.11: an optional trip may take a less-used route
+    # costing at most this share more than the best one (route_variety.py);
+    # 0 turns route variety off.
+    route_variety_tolerance: float = 0.15
     # Another character on the same account (ATRINIK_BOT_OPERATOR_CHARACTER):
     # the only player whose party vitals she keeps and, behind
     # ``watch_owner``, whom she watches play.
@@ -368,6 +372,8 @@ class AtrinikClient:
         # Whether a mana-crystal backoff without a character to persist it
         # for is already logged (set_mana_crystal_retry).
         self._mana_crystal_unpersisted_warned = False
+        # When her route-variety counts were last written (remember_route_visits).
+        self._route_visits_saved_at = -math.inf
         # (time, path) of each arrival on a new map, newest last.
         self.map_arrivals: list[tuple[float, str]] = []
         # Per-minute XP, deaths, heals, depletion and food for the dashboard.
@@ -631,6 +637,8 @@ class AtrinikClient:
                 str(path): float(until)
                 for path, until in (hazards.items() if isinstance(hazards, dict) else ())
                 if isinstance(until, (int, float))}
+            self.state.route_map_visits, self.state.route_edge_uses = \
+                route_variety.load(record.get("route_visits"))
             quotes = record.get("vendor_quotes", {})
             self.state.vendor_quotes = {
                 str(key): dict(value)
@@ -771,6 +779,7 @@ class AtrinikClient:
             self.state.cure_funding_farm_retry_until = 0.0
             self.state.mana_crystal_retry_until = {}
             self.state.route_hazards = {}
+            self.state.route_map_visits, self.state.route_edge_uses = {}, {}
             self.state.vendor_quotes = {}
             self.state.farm_zone_quarantine = {}
             self.state.farm_train_holds = {}
@@ -1173,6 +1182,26 @@ class AtrinikClient:
         self._runtime_memory.setdefault(character, {})[
             "route_hazards"] = dict(self.state.route_hazards)
         self._persist_character_memory()
+
+    def remember_route_visits(self, *, now: float | None = None,
+                              force: bool = False) -> None:
+        """Keep her route-variety counts (route_variety.py) in her character
+        memory next to her route hazards: in the record at once, written at
+        most every route_variety.PERSIST_SECONDS (any other save of her
+        character memory writes them too), or now with ``force``."""
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})["route_visits"] = \
+            route_variety.dump(self.state.route_map_visits, self.state.route_edge_uses)
+        monotonic = time.monotonic()
+        if not force and monotonic - self._route_visits_saved_at < route_variety.PERSIST_SECONDS:
+            return
+        self._route_visits_saved_at = monotonic
+        try:
+            self._persist_character_memory()
+        except Exception as error:  # A count never fails a tick.
+            log.warning("route visits not saved: %s", error)
 
     def record_vendor_quote(
             self, key: str, item: str, unit_cost: int) -> None:
