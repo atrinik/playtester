@@ -2414,10 +2414,14 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
   takes the first step of the walk to the nearest remembered safe square
   of this map; only with none in reach, to the way in or a safe seam
   square. The walk (`safe_square_route`, a bounded Dijkstra over walkable
-  squares: at most 1,200 squares settled, 24 tiles out, about 5 ms) never
+  squares: at most 1,200 squares settled, 24 tiles out; measured about
+  5 ms at that cap on an open 100x100 map with 15 hazards, and a retreat
+  runs at most two) never
   enters a hazard radius from `retreat_hazards` unless she stands in it,
   never steps onto a threat, pays 4 extra for each square beside one, and
-  never ends within 2 tiles of one. `retreat-choice` adds `safe=x,y
+  never ends within 2 tiles of one. Its step never brings her nearer the
+  nearest threat, and none is taken while she already stands on a safe
+  or exit square. `retreat-choice` adds `safe=x,y
   steps=N` or `exit=x,y steps=N`. With a gaining step the #138 ranking
   decides, unchanged; so do the pursued stand and the cornered breakout.
 - **Spawn-radius cost on the way in** (docs/ROUTING.md 1.6): on an
@@ -2436,9 +2440,12 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
     a doorway or corridor (the fight records' `terrain.features`) or a
     safe square, stepping to the nearest one within 6 tiles that keeps 2
     tiles from every threat. She closes no gap: each pursuer is fought as
-    it reaches her, with the walk's defence (heals first; the pack split
-    and cornered rules still apply). A stand lasts at most 45 s, then the
-    walk goes on for at least 30 s, so wanderers cannot hold her;
+    it reaches her, with the walk's defence (heals first). Off a
+    defensible square the pack split and cornered rules still apply; on
+    one the split's retreat step is skipped, so two closing in do not
+    move her off it. A stand against two lasts at most 45 s, then the
+    walk goes on for at least 30 s, so wanderers cannot hold her; against
+    three or more it has no limit;
   - with more than 2 (the pack cap), or heals outpaced, she **leads them
     away** (`approach-lead-away`), combat off, on this map: to the nearest
     cleared-trail square more than 9 tiles from all of them, else to the
@@ -2449,9 +2456,10 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
     (one beside her) she fights as in a stand, and with nowhere to gain
     distance she stands.
 
-  So she does not walk onto the farm map with two or more in tow. Other
-  trips keep the transit hold-fire, fighting back only when hit and not
-  moving, as before.
+  So she never walks onto the farm map with three or more in tow, and
+  with two only after a 45 s stand. Nothing here runs under the seam
+  contact after the farm's own seam retreat. Other trips keep the transit
+  hold-fire, fighting back only when hit and not moving, as before.
 
 Accepted limits: a lead-away stays on the map she is on, so a small map
 can leave her standing; a safe square is per trip and per map; the walk's

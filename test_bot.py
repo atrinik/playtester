@@ -43101,6 +43101,9 @@ class SafeRetreatTests(unittest.TestCase):
         (_, dy), choice = self._retreat(client, task)
         self.assertIn("safe=22,3", choice)
         self.assertEqual(dy, -1)
+        # Standing on the way in already, no shuffle to another one.
+        client, task = self._edge(way_in=("/test", 23, 12))
+        self.assertNotIn("exit=", self._retreat(client, task)[1])
 
     def test_a_gaining_step_keeps_the_ordinary_retreat(self):
         # In the open, a step that gains distance exists: the ranking from
@@ -43275,6 +43278,49 @@ class SafeRetreatTests(unittest.TestCase):
         walk._stand_since = 0.0
         asyncio.run(walk._defend_while_navigating(client))
         self.assertNotIn("approach-stand", [a for a, _ in client.recorded])
+
+    def test_a_doorway_stand_is_not_given_up_to_the_pack_split(self):
+        # Both followers within 4 tiles of her in the doorway: the pack
+        # split's retreat step would give the doorway up. She holds it,
+        # combat state untouched by a retreat, and the walk waits.
+        terrain = {(x, y): 0 if x == 21 and y != 12 else 1
+                   for x in range(24) for y in range(24)}
+        client, walk = self._approach(terrain=terrain)
+        m = client.state.map
+        m.world_x, m.world_y = 21, 12
+        monsters = [(100, 19, 12), (101, 18, 12)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+        self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
+        self.assertEqual(client.direct_moves, [])
+        self.assertNotIn("navigation-retreat-choice",
+                         [a for a, _ in client.recorded])
+
+    def test_three_followers_are_never_taken_onto_the_spot(self):
+        client, walk = self._approach()
+        m = client.state.map
+        m.world_x, m.world_y = 20, 12
+        monsters = [(100, 14, 12), (101, 14, 13), (102, 14, 11)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+        # No lead-aways left, and the stand far past its limit: with three
+        # she still stands.
+        walk._leads = walk.LEAD_AWAY_LIMIT
+        walk._stand_since = time.monotonic() - walk.APPROACH_STAND_SECONDS - 1
+        self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
+        self.assertEqual(walk._stand_cooldown_until, 0.0)
+        # Two past the limit: the walk goes on.
+        monsters = monsters[:2]
+        self._place(client, monsters)
+        walk._pursuit_samples.clear()
+        self._followed(walk, client, monsters)
+        self.assertEqual(walk._approach_mode(
+            client, walk._track_pursuers(client, [
+                (max(abs(x - 20), abs(y - 12)), 8 + x - 20, 8 + y - 12,
+                 next(iter(m.tiles[(8 + x - 20, 8 + y - 12)]
+                           .objects.values())))
+                for _, x, y in monsters]), []), "")
+        self.assertGreater(walk._stand_cooldown_until, 0.0)
 
     def test_five_followers_are_led_away_beyond_aggro_range(self):
         client, walk = self._approach()

@@ -6096,6 +6096,11 @@ class FarmTask(BotTask):
         exits = set(self.safe_seam_squares(client))
         if self.way_in is not None and self.way_in[0] == m.path:
             exits.add(self.way_in[1:])
+        if start in exits or start in remembered:
+            # Already there: the ordinary ranking (a seam step onto a safe
+            # side included) or the breakout decides, not a shuffle to the
+            # next such square.
+            return None
         route = None
         kind = ""
         for kind, goals in (("safe", remembered), ("exit", exits)):
@@ -6119,7 +6124,8 @@ class FarmTask(BotTask):
         separation = min(max(abs(cx + dx - x), abs(cy + dy - y))
                          for x, y in threats)
         nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
-        if gain_only and separation <= nearest:
+        if separation < nearest or (gain_only and separation <= nearest):
+            # Never closer to the nearest threat than she is.
             return None
         escape_depth, escape_area = retreat_mobility(
             node, (world_x, world_y),

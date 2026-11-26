@@ -6008,7 +6008,7 @@ class NavigateThenTask(BotTask):
         return near
 
     def _approach_mode(self, client: AtrinikClient, pursuers,
-                       threats) -> str:
+                       threats, seam_contact: bool = False) -> str:
         """The approach discipline for this tick: "lead" (lead the train
         away, _lead_away_step), "stand" (stop at a defensible square and
         fight them there one at a time) or "" (walk on).
@@ -6018,16 +6018,19 @@ class NavigateThenTask(BotTask):
         Otherwise near the farm map (_near_spot) with
         APPROACH_STAND_PURSUERS or more pursuers she stands; with more
         than APPROACH_PACK_CAP, or heals outpaced, she leads them away
-        while she has leads left (LEAD_AWAY_LIMIT a trip). So she does not
-        walk onto the farm map with two or more in tow. A stand lasts at
-        most APPROACH_STAND_SECONDS, then the walk goes on for
-        APPROACH_STAND_COOLDOWN_SECONDS.
+        while she has leads left (LEAD_AWAY_LIMIT a trip). A stand against
+        two lasts at most APPROACH_STAND_SECONDS, then the walk goes on
+        for APPROACH_STAND_COOLDOWN_SECONDS; against three or more it has
+        no limit, so she never walks onto the farm map with them.
+        Nothing runs under seam contact (_seam_retreat_contact).
         """
         m = client.state.map
         now = time.monotonic()
         recorder = getattr(client, "record_action", None)
-        if (not isinstance(self.task, FarmTask) or
+        if (not isinstance(self.task, FarmTask) or seam_contact or
                 m.path == self.navigation.destination):
+            # Under contact after the farm's own seam retreat the fight
+            # there decides (_seam_retreat_contact), not the approach.
             self._lead = None
             self._stand_since = 0.0
             return ""
@@ -6044,8 +6047,11 @@ class NavigateThenTask(BotTask):
             self.navigation._issued_goal = None
             self.navigation._issued_click = None
             self.navigation._last_progress = now
+        # Three or more she never takes onto the farm map: their stand has
+        # no time limit and no cooldown.
+        train = len(pursuers) > self.APPROACH_PACK_CAP
         if (len(pursuers) < self.APPROACH_STAND_PURSUERS or
-                now < self._stand_cooldown_until or
+                (now < self._stand_cooldown_until and not train) or
                 not self._near_spot(client)):
             self._stand_since = 0.0
             return ""
@@ -6065,7 +6071,8 @@ class NavigateThenTask(BotTask):
             self._stand_since = now
             if recorder is not None:
                 recorder("approach-stand", f"pursuers={len(pursuers)}")
-        elif now - self._stand_since >= self.APPROACH_STAND_SECONDS:
+        elif (now - self._stand_since >= self.APPROACH_STAND_SECONDS and
+              not train):
             self._stand_since = 0.0
             self._stand_cooldown_until = (
                 now + self.APPROACH_STAND_COOLDOWN_SECONDS)
@@ -6396,7 +6403,8 @@ class NavigateThenTask(BotTask):
         pursuers = self._track_pursuers(client, [
             threat for threat in threats
             if threat[3].target_id not in outclassed])
-        approach = self._approach_mode(client, pursuers, threats)
+        approach = self._approach_mode(client, pursuers, threats,
+                                       seam_contact)
         if approach == "lead" and any(threat[0] <= 1 for threat in nearby):
             approach = "stand"
         approach_stand = (approach == "stand" and
@@ -6691,8 +6699,13 @@ class NavigateThenTask(BotTask):
                 nearest = min(beside, key=lambda threat: (
                     int(getattr(threat[3], "target_hp", 0) or 100),
                     threat[3].target_id))
+        # A stand holding a doorway, corridor or safe square fights there:
+        # the split's retreat step would give the square up.
+        holding = bool(approach_stand and node is not None and node.terrain
+                       and self._defensible(
+                           client, node, (m.world_x, m.world_y)))
         split = (overwhelmed and not hold_fire and not safety_hold and
-                 not seam_beside)
+                 not seam_beside and not holding)
         cornered = None
         if split and not escape_due:
             cornered = await self._cornered_split(client, nearby)
