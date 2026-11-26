@@ -520,15 +520,17 @@ ENCUMBRANCE_START = 0.65
 ENCUMBRANCE_SCORED = 0.50
 
 GEAR_STYLES = ("melee", "caster", "bow")
-# Scorer weights, on the shop examine score's scale (AC +1 = 20, a protection
-# percent = PROTECTION_WEIGHT). Damage per second counts DPS_WEIGHT a point
-# after LEVEL_DAMAGE and the Str bonus; a speed of 1.0 counts SPEED_WEIGHT
-# (+0.1, a tenth faster walking and commands, is worth an AC+7).
+# Scorer weights, on the shop examine score's scale (AC +1 = AC_WEIGHT, a
+# protection percent = PROTECTION_WEIGHT). Damage per second counts
+# DPS_WEIGHT a point after LEVEL_DAMAGE and the Str bonus.
+AC_WEIGHT = 20
 DPS_WEIGHT = 10
 WC_WEIGHT = 10
-SPEED_WEIGHT = 1500
-# Speed is her only escape without a working recall. SPEED_WEIGHT and this
-# factor are provisional until the owner settles them (2026-11-26).
+# Speed (owner decision, 2026-11-26, "moderate"): +0.1 speed is worth +3
+# AC. So 0.1 x SPEED_WEIGHT = 3 x AC_WEIGHT = 60, and a speed of 1.0 counts
+# 3 x 20 / 0.1 = 600.
+SPEED_WEIGHT = 3 * AC_WEIGHT * 10
+# Speed is her only escape without a working recall: half as much again.
 NO_RECALL_SPEED_FACTOR = 1.5
 # Which items an item's weight is charged to (GearScorer weight_for): none
 # when she swaps between items she carries anyway (the equip loop); an
@@ -871,9 +873,11 @@ class GearScorer:
                    ) * (melee_share if item.item_type == c.TYPE_WEAPON else 1.0)
         speed_term = ((self.speed_delta(item, stats) - self.weight_cost(item)) *
                       self._speed_weight() if speed else 0.0)
-        shield = (self._shield_worth(rest) if shield_rule and self._two_handed(item)
-                  else 0)
-        total = (damage + missile + wc + stats.ac * 20 + stats.block * 2 + stats.absorb * 2 +
+        # Only a shield the server still counts: under a worn two-handed
+        # item it is off already, as speed_delta sees it.
+        shield = (self._shield_worth(rest) if shield_rule and self._two_handed(item) and
+                  not self._shield_off(rest) else 0)
+        total = (damage + missile + wc + stats.ac * AC_WEIGHT + stats.block * 2 + stats.absorb * 2 +
                  sum(value for _, value in stats.protections) * PROTECTION_WEIGHT +
                  attacks + hp + floor + maxsp + regen + stats.regen_hp +
                  len(stats.specials) * SPECIAL_WEIGHT + caster + speed_term - shield)
