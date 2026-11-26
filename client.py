@@ -1197,14 +1197,16 @@ class AtrinikClient:
         monotonic = time.monotonic()
         if not force and monotonic - self._route_visits_saved_at < route_variety.PERSIST_SECONDS:
             return
-        self._route_visits_saved_at = monotonic
         try:
-            # From a tick: never SQLite's usual 10 s wait.
+            # From a tick: never SQLite's usual 10 s wait. A failed save is
+            # tried again at the next crossing.
             self._memory_store().save(
                 character, "state", self._runtime_memory.get(character, {}),
                 timeout=route_events.WRITE_TIMEOUT)
         except Exception as error:  # A count never fails a tick.
             log.warning("route visits not saved: %s", error)
+            return
+        self._route_visits_saved_at = monotonic
 
     def record_vendor_quote(
             self, key: str, item: str, unit_cost: int) -> None:

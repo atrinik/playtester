@@ -3557,7 +3557,11 @@ class NavigateTask(BotTask):
         memo: dict[tuple, float] = {}
         best = route_variety.candidate(route, self._walk_cost(client, route, deadline, memo))
         if not math.isfinite(best.cost):
-            # Its walk cannot be priced: nothing is "within" it.
+            # Its walk cannot be priced (a live position cut off by a
+            # runtime change): nothing is "within" it.
+            self._record(client, route_variety.ROUTE_VARIETY,
+                         f"{self.destination}: best route kept; its walk "
+                         "could not be priced")
             return None
         candidates = [route_variety.candidate(
             candidate, self._walk_cost(client, candidate, deadline, memo))
@@ -3605,7 +3609,7 @@ class NavigateTask(BotTask):
                                              allow_locked=access,
                                              extra_costs=extra or None)
                 # A leg with no authored path is no estimate: the route is
-                # priced out (the best route's own legs always walk).
+                # priced out (the best route's too, which keeps it).
                 memo[key] = (sum(1 + min(254, extra.get(point, 0)) for point in path[1:])
                              if path or start == goal else math.inf)
             return memo[key]

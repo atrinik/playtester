@@ -44344,6 +44344,36 @@ class RouteVarietyTests(unittest.TestCase):
         self.assertEqual(len(table), 3)
         self.assertNotIn("seam:/a>/b", table)
 
+    def test_a_route_never_wins_only_for_having_more_edges(self):
+        from . import route_variety as rv
+
+        now = 1_000_000.0
+        best = rv.Candidate(("a",), 10.0, ("exit:a", "exit:b"), frozenset())
+        # Three unvisited edges of six against one of two: the same share.
+        longer = rv.Candidate(("b",), 10.0, tuple(f"exit:{i}" for i in range(6)),
+                              frozenset())
+        uses = {"exit:a": (5.0, now), **{f"exit:{i}": (5.0, now) for i in range(3)}}
+        picks = {rv.choose(best, [longer], edge_uses=uses, danger=(), tolerance=0.15,
+                           now=now, rng=__import__("random").Random(seed)).varied
+                 for seed in range(20)}
+        # A tie on share and use: the draw decides, both ways.
+        self.assertEqual(picks, {True, False})
+        uses["exit:3"] = (5.0, now)
+        self.assertFalse(rv.choose(best, [longer], edge_uses=uses, danger=(),
+                                   tolerance=0.15, now=now).varied)
+
+    def test_a_seam_costs_one_step_and_an_exit_four(self):
+        graph = self.graph()
+        graph.nodes["/s"].edges.append(MapEdge("/s", "/d", 19, 10, kind="tile"))
+        task = self.trip(graph)
+        client = self.client()
+        seam = MapEdge("/s", "/d", 20, 10, kind="tile")
+        door = MapEdge("/s", "/a", 2, 10, 10, 10, "exit", "door a")
+        deadline = time.monotonic() + 5
+        task.destination_xy = None
+        self.assertEqual(task._walk_cost(client, [seam], deadline, {}), 16 + 1)
+        self.assertEqual(task._walk_cost(client, [door], deadline, {}), 1 + 4)
+
     def test_stored_counts_are_validated(self):
         from . import route_variety as rv
 
