@@ -38579,6 +38579,23 @@ class LearnedRoutePlanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((task.care.mode, task.care.subjects), ("bounded", ("map:/blocked",)))
         self.assertIn("route-budget-override", self.client.actions())
 
+    def test_with_the_flag_on_a_prepared_plan_on_the_loop_is_live_too(self):
+        # With the worker busy an essential trip plans on the loop: a
+        # prepared plan there is the live plan as well.
+        from . import planner as planner_module
+
+        self.client.config.learned_route_costs = True
+        self.graph = blocks_graph(detour=False)
+        self.deaths_on_blocked()
+        self.client.state.stats.update(hp=10)
+        task = self.trip("cure")
+        with patch.object(planner_module, "busy", lambda: True):
+            self.assertEqual(self.maps(task.prepare(self.client)),
+                             ["/blocked", "/goal"])
+        self.assertEqual(task.status, TaskStatus.READY)
+        self.assertEqual(task.care.mode, "bounded")
+        self.assertIn("route-budget-override", self.client.actions())
+
     def test_with_the_flag_on_a_strict_essential_trip_overrides_with_care(self):
         self.client.config.learned_route_costs = True
         self.graph = blocks_graph(detour=False)
@@ -40061,6 +40078,61 @@ class PlanningOffLoopTests(unittest.TestCase):
             asyncio.run(task.tick(client))
         self.assertFalse(task.planning)
         self.assertTrue(task.care.finished)
+
+    def test_a_dropped_ranking_never_makes_the_planner_busy(self):
+        import threading
+        from . import planner as planner_module
+
+        import queue
+
+        release = threading.Event()
+        self.wait_for(lambda: not planner_module.busy())
+        # A dropped ranking still queued (a queue the idle worker is not
+        # taking from yet) is no reason to plan on the loop.
+        with patch.object(planner_module, "_jobs", queue.PriorityQueue()):
+            queued = planner_module.submit(lambda: None)
+            self.assertTrue(planner_module.busy())
+            queued.cancel()
+            self.assertFalse(planner_module.busy())
+        planner_module._settle(queued)
+        # Submitted, a job counts at once, until it ends.
+        release.clear()
+        job = planner_module.submit(lambda: release.wait(5))
+        self.assertTrue(planner_module.busy())
+        release.set()
+        self.wait_for(job.done)
+        self.wait_for(lambda: not planner_module.busy())
+
+    def test_a_plan_from_another_part_of_the_map_is_planned_again(self):
+        import threading
+        from . import navigation as navigation_module
+
+        release = threading.Event()
+        real = navigation_module.NavigateTask._plan
+
+        def plan(task, client, *, origin=None):
+            release.wait(2)
+            return real(task, client, origin=origin)
+
+        client = self.client()
+        client.state.map.path = "/shattered_islands/world_10_67"
+        client.state.map.world_x, client.state.map.world_y = 0, 8
+        task = NavigateTask(built_graph(), "/shattered_islands/world_8_78",
+                            (4, 9), tolerance=1)
+        with patch.object(navigation_module.NavigateTask, "_plan", plan):
+            try:
+                asyncio.run(task.tick(client))
+                first = task._route_plans._plans["route"].future
+                # A step within the same part keeps it.
+                client.state.map.world_y = 7
+                asyncio.run(task.tick(client))
+                self.assertIs(task._route_plans._plans["route"].future, first)
+                # Across the shop mat, another part: planned again.
+                client.state.map.world_x, client.state.map.world_y = 1, 11
+                asyncio.run(task.tick(client))
+                self.assertIsNot(task._route_plans._plans["route"].future, first)
+            finally:
+                release.set()
 
     def test_a_dropped_trip_forgets_its_plan(self):
         import gc

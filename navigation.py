@@ -2987,7 +2987,7 @@ class NavigateTask(BotTask):
         if (planner.worker_generation() is not None or
                 isinstance(client, planner.PlanningClient) or
                 not hasattr(self._graph, "planner_view")):
-            return self._plan(client)
+            return self._plan_here(client, live=live)
         prepared, self._prepared = self._prepared, None
         if (prepared is not None and prepared[0] == self._origin(client) and
                 time.monotonic() - prepared[1] <= self.PREPARED_SECONDS):
@@ -3005,7 +3005,7 @@ class NavigateTask(BotTask):
                 planner.busy()):
             # The worker runs another job (a ranking can take 45 s): an
             # essential or critical trip never waits behind it.
-            return self._plan(client)
+            return self._plan_here(client, live=live)
         # The care-wait record lives on her client: made here, the
         # worker's copy of her client reads it through. A copy is made on
         # every poll (cheap): a plan under way never uses it, and a result
@@ -3014,11 +3014,10 @@ class NavigateTask(BotTask):
         build = functools.partial(_plan_on_copy, self._planning_copy(live=live))
         result = plans.get(
             "route", self._graph, client, build,
-            # From another map the result is planned again (her origin
-            # when it was asked for is the key; a step on the same map in
-            # a fight does not restart it, and the route still leaves the
-            # map she stands on).
-            key=client.state.map.path,
+            # From another map or another part of this one the result is
+            # planned again; a step within the same part in a fight does
+            # not restart it, and the route still leaves from there.
+            key=self._plan_key(client),
             priority=(planner.PRIORITY_HEAL if self._urgent()
                       else planner.PRIORITY_OTHER))
         if result is PLANNING:
@@ -3028,6 +3027,38 @@ class NavigateTask(BotTask):
                 f"no route to {self.destination}: the planner gave no answer "
                 f"in {BackgroundPlans.MAX_PENDING_SECONDS:.0f} s")
         route, error, state = result
+        self._adopt(client, state)
+        if error is not None:
+            raise error
+        return route
+
+    def _plan_key(self, client: AtrinikClient) -> tuple:
+        """Where a plan is from, for BackgroundPlans: her map and the part
+        of it she stands in (its static component, by its least square)."""
+        path, x, y = self._origin(client)
+        try:
+            component = self._graph._component(
+                path, (x, y), allow_locked=self._allow_locked(client))
+        except (AttributeError, KeyError):
+            component = frozenset()
+        return path, (min(component) if component else (x, y))
+
+    def _plan_here(self, client: AtrinikClient, *,
+                   live: bool = False) -> "list[MapEdge]":
+        """Plan now, here. A trip not started planned ``live`` (prepare)
+        plans as the trip itself, on its planning copy, as on the worker:
+        a live plan, never a probe."""
+        if not live or self.status == TaskStatus.RUNNING:
+            return self._plan(client)
+        route, error, state = _plan_on_copy(self._planning_copy(live=True), client)
+        self._adopt(client, state)
+        if error is not None:
+            raise error
+        return route
+
+    def _adopt(self, client: AtrinikClient, state: dict) -> None:
+        """Copy back what a plan on a planning copy set (PLAN_STATE), and
+        apply what it left for her client (_defer)."""
         care = state.get("care")
         if (care is not None and self.care is not None and self.care.finished and
                 care.key == self.care.key):
@@ -3038,9 +3069,6 @@ class NavigateTask(BotTask):
         deferred, self._deferred = self._deferred, []
         for effect in deferred:
             effect(client)
-        if error is not None:
-            raise error
-        return route
 
     def prepare(self, client: AtrinikClient) -> "list[MapEdge] | _Planning":
         """Plan a trip that has not started yet, off the loop: PLANNING
