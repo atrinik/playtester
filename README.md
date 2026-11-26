@@ -731,7 +731,8 @@ analyzer drops a map whose likely simultaneous aggro is larger.
 Since analyzer v3.11.0 each run also turns on the analyzer's encounter
 model (COMBAT.md, "Encounter-aware spot choice"). It passes her combat
 style (`--combat-style melee` with a weapon, `ranged-kite` while she trains
-Wizardry with spells only, which she casts from range; never `aoe-kite`, as
+Wizardry with spells only, which she casts from range once the spell fits
+beyond her healing reserve; never `aoe-kite`, as
 she has no area spell), her measured healing (`--healing-per-second`: the
 median of her landed heal-spell casts over a swing plus a one-second cast,
 within what her SP regeneration sustains; 0 until one has landed) and her
@@ -742,8 +743,8 @@ encounter-aware `spot_safety_score` and a spot counts as risky below 0.8
 rather than 1, since that score is never saturated; the pack cap above
 reads the bad pull (`worst_pack`), at most 6 (three times the single-target
 pack of 2, also while Wizardry trains), instead of the direct pack
-(`max_aggro_pack`). A report
-without a schema version is read by its older fields as before. The
+(`max_aggro_pack`). A report without a schema version is read by its
+older fields as before. The
 decision record of a chosen spot (`farm-spot-selected`) and the Farming
 tab's spot line show the encounter safety, the expected and bad pull's
 packs and the analyzer's `encounter_reasons`.

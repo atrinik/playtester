@@ -633,6 +633,7 @@ def combat_profile(client, spell_damage: float = 0.0,
     # SINGLE_TARGET_MAX_AGGRO_PACK.
     max_aggro_pack = SINGLE_TARGET_MAX_AGGRO_PACK
     caster: dict[str, Any] = {}
+    spells_only = False
     training, spell_name, _ = automatic_training_plan(state)
     trained_level = owned_skill_level(state, training) if training else 0
     if trained_level >= 1:
@@ -651,6 +652,10 @@ def combat_profile(client, spell_damage: float = 0.0,
             if item.item_type == c.TYPE_SPELL and "heal" in item.name.casefold() and
             int(item.extra.get("cost", 0) or 0) > 0]
         offence = maxsp - min(heal_costs, default=0) * 3
+        # As FarmTask.spell_only_training: she casts from range (caster_kite)
+        # once the spell fits beyond the healing reserve, even before a hit
+        # of it has been sampled; otherwise her weapon trains.
+        spells_only = spell is not None and (maxsp <= 0 or cost <= offence)
         if (spell_damage > 0 and spell_attack in SPELL_ATTACKS and
                 0 < cost <= offence and regen > 0):
             caster = dict(
@@ -662,9 +667,6 @@ def combat_profile(client, spell_damage: float = 0.0,
                     item.item_type == c.TYPE_SKILL and
                     item.name.casefold() == "meditation"
                     for item in state.inventory))
-    # Training with spells, she casts from range even before a hit of the
-    # spell has been sampled (caster_kite).
-    spells_only = trained_level >= 1
     swing = SPELL_CAST_DELAY if spells_only else weapon_speed
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
@@ -863,7 +865,8 @@ class FarmAnalyzer:
                   record.get("action") in ("fire", "apply") and
                   float(record.get("time", 0) or 0) >= oldest - HEAL_ATTRIBUTION_SECONDS]
         for timestamp, _, _, text in entries:
-            healed = HEALED_TEXT.match(str(text).strip())
+            text = str(text).strip()
+            healed = HEALED_TEXT.match(text)
             if healed and heal_spells:
                 order = next((entry for entry in reversed(orders)
                               if 0.0 <= timestamp - entry[0] <= HEAL_ATTRIBUTION_SECONDS),

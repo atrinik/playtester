@@ -1985,8 +1985,8 @@ health and healing.
     for her action timer ([heals in melee](#heals-in-melee-2026-11-23)), so
     one lands about every swing (her weapon speed, or one second while she
     trains with spells, when the same SP also pays for her damage casts,
-    so that estimate is optimistic) plus a one-second cast, and no faster than her SP
-    regeneration pays for. Until one heal lands it is 0. Her live heals had a
+    so that estimate is optimistic) plus a one-second cast, and no faster
+    than her SP regeneration pays for. Until one heal lands it is 0. Her live heals had a
     median of 12 HP (8 to 26), so with a 3 s weapon she passes 3 HP/s.
   - `--character-speed`: her displayed speed, as before.
 
@@ -2006,8 +2006,9 @@ health and healing.
     `BAD_PULL_PACK_FACTOR` (3) times `SINGLE_TARGET_MAX_AGGRO_PACK`: 6
     whenever the profile caps its pack. While Wizardry trains (direct cap 1)
     it stays 6, since `ranged-kite`'s wider bad-pull footprint would leave
-    almost no spot under 3. Her deaths were on maps with bad pulls of 7 and 8. `--max-aggro-pack` is still passed; the analyzer applies it
-    to the direct pack.
+    almost no spot under 3. Her deaths were on maps with bad pulls of 7
+    and 8. `--max-aggro-pack` is still passed; the analyzer applies it to
+    the direct pack.
   - The model already counts spawns on tiled neighbour maps within reach of
     a pull, casters included. So [seam exposure](#safer-spot-choice-2026-11-23)
     only raises the pack the cap reads and adds its flags and fields; it no

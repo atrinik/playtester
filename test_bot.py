@@ -21423,6 +21423,8 @@ class FarmAnalyzerTests(unittest.TestCase):
         # A spell the reserve leaves no room for, or no regen: the weapon.
         state.stats["maxsp"] = 19
         self.assertIn("--melee-damage", combat_profile(client, 14.5, "magic").arguments())
+        # Then her weapon trains, in melee (FarmTask.spell_only_training).
+        self.assertEqual(combat_profile(client, 14.5, "magic").combat_style, "melee")
         state.stats.update({"maxsp": 62, "regen_sp": 0})
         self.assertIn("--melee-damage", combat_profile(client, 14.5, "magic").arguments())
 
