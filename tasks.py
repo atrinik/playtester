@@ -9293,6 +9293,8 @@ class DepositItemsTask(BotTask):
         self.refused = 0
         # Whether the server said this container has no room.
         self.full = False
+        # The items it refused.
+        self.refused_tags: set[int] = set()
         self._feedback_start = 0
 
     async def tick(self, client: AtrinikClient) -> None:
@@ -9355,6 +9357,7 @@ class DepositItemsTask(BotTask):
         # too heavy for the room left, or any other refusal (a chest no
         # longer active, say), is an ordinary failure.
         self.refused = len(items)
+        self.refused_tags = {item.tag for item in items}
         follow = self.then_retrieve
         if follow is not None and follow.status not in (
                 TaskStatus.COMPLETE, TaskStatus.FAILED):

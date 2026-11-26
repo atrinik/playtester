@@ -7031,7 +7031,9 @@ def identify_smith(client: AtrinikClient) -> tuple[str, str, tuple[int, int], in
 def identify_gear_types() -> tuple[int, ...]:
     """Gear whose being unknown sends her to a smith: what she could wear,
     containers (a bag of holding) and devices."""
-    return (*InventoryPolicy().equipment_types, c.TYPE_CONTAINER, c.TYPE_WAND, c.TYPE_ROD)
+    return (*(kind for kind in InventoryPolicy().equipment_types
+              if kind != c.TYPE_LIGHT_APPLY),
+            c.TYPE_CONTAINER, c.TYPE_WAND, c.TYPE_ROD)
 
 
 def unidentified_gear(client: AtrinikClient) -> list[Item]:
@@ -9325,6 +9327,10 @@ class FarmCircuitTask(BotTask):
         # items offered (each once).
         self._bag_fill_at = float("-inf")
         self._bag_fill_tried: set[int] = set()
+        # Items the chest refused (god-given gear): never offered again.
+        self._storage_refused: set[int] = set()
+        # The bag of holding _fill_bag opened, to close it again.
+        self._bag_opened = 0
         # The storage and sale choices for one inventory state (_cached).
         self._inventory_cache: tuple[tuple | None, dict] = (None, {})
         self._identification: NavigateThenTask | None = None
@@ -10641,7 +10647,7 @@ class FarmCircuitTask(BotTask):
     def _needs_apartment_storage(self, client: AtrinikClient) -> bool:
         """Whether to take what is not her active set home: at once for a
         valuable, else once STORE_BATCH items wait or she carries more than
-        storage.BAG_NEEDED of her limit; or to fetch her bag of holding."""
+        STORE_WEIGHT of her limit; or to fetch her bag of holding."""
         if self.clock() < self._storage_retry_at:
             return False
         if self._bag_fetch_due(client):
@@ -10651,7 +10657,7 @@ class FarmCircuitTask(BotTask):
         return bool(items) and (
             any(policy.apartment_valuable(item) for item in items) or
             len(items) >= self.STORE_BATCH or
-            policy.weight_ratio(client) >= storage.BAG_NEEDED)
+            policy.weight_ratio(client) >= self.STORE_WEIGHT)
 
     def _needs_mass_identification(self, client: AtrinikClient) -> bool:
         """Identify-all at the cheapest smith she can reach, once her wallet
@@ -10772,6 +10778,11 @@ class FarmCircuitTask(BotTask):
     # Storage waits for this many items to take home, unless one is a
     # valuable or she carries more than storage.BAG_NEEDED of her limit.
     STORE_BATCH = 8
+    # ... or once she carries this share of her limit, where encumbrance
+    # starts to slow her.
+    STORE_WEIGHT = 0.65
+    # After a completed storage visit, the next waits this long.
+    STORAGE_VISIT_SECONDS = 1800.0
 
     def _build(self, client: AtrinikClient) -> str:
         """Her active build's gear style, as the equip loop scores it."""
@@ -10815,8 +10826,7 @@ class FarmCircuitTask(BotTask):
                 "weight_limit", "regen_sp")),
             tuple(sorted(wand_charges(client).items())),
             len(storage.stored(state)), id(getattr(state, "apartment_storage", None)),
-            self.combat_skill, self.combat_spell,
-            int(BuyShopUpgradeTask.wallet_value(client)))
+            self.combat_skill, self.combat_spell, len(self._storage_refused))
 
     def _cached(self, client: AtrinikClient, key: tuple, compute: Callable[[], Any]) -> Any:
         """One computation per inventory state: the storage and sale
@@ -10875,8 +10885,6 @@ class FarmCircuitTask(BotTask):
                 item.flags & (c.ITEM_CURSED | c.ITEM_DAMNED)}
         tags.update(item.tag for item in self._recall_wands(client)[1:]
                     if wand_known_empty(client, item))
-        stored_plain = {row["name"] for row in storage.stored(client.state)
-                        if row["type"] == c.TYPE_CONTAINER and not row.get("bag_factor")}
         groups: dict[str, list[Item]] = {}
         for item in client.state.inventory:
             if (item.item_type == c.TYPE_CONTAINER and policy.identified(item) and
@@ -10888,7 +10896,9 @@ class FarmCircuitTask(BotTask):
         for name, members in groups.items():
             members.sort(key=lambda item: (-float(item.weight or 0), item.tag))
             lightest = min(float(item.weight or 0) for item in members)
-            spare = members if name in stored_plain else members[1:]
+            # One of each name is kept (stored), even with one at home: a
+            # lone container may still hold something.
+            spare = members[1:]
             tags.update(item.tag for item in spare
                         if float(item.weight or 0) <= lightest + 1e-6)
         return tags
@@ -10922,6 +10932,7 @@ class FarmCircuitTask(BotTask):
             unknown = not policy.identified(item)
             if (item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID) or
                     item.tag in junk or item.tag in active or
+                    item.tag in self._storage_refused or
                     item.tag in (kept_wand, kept_bag) or
                     item.item_type in (c.TYPE_SPELL, c.TYPE_SKILL, c.TYPE_MONEY,
                                        c.TYPE_POWER_CRYSTAL, c.TYPE_KEY, c.TYPE_FORCE,
@@ -10968,7 +10979,14 @@ class FarmCircuitTask(BotTask):
             slots = len(policy.equipment_slots.get(item_type, ())) or 1
             current = [item for item in worn.values() if item.item_type == item_type]
             for item in members:
-                if item.tag in chest and scorer.beats(item, current, slots)[0]:
+                # The equip loop never switches her trained weapon school.
+                other_school = bool(
+                    item.item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and item.required_skill_tag and
+                    any(worn_item.required_skill_tag and
+                        worn_item.required_skill_tag != item.required_skill_tag
+                        for worn_item in current))
+                if (item.tag in chest and not other_school and
+                        scorer.beats(item, current, slots)[0]):
                     wants.add(item.tag)
         if storage.best_bag(state.inventory) is None and storage.bag_wanted(state):
             bag = storage.best_bag(contents)
@@ -10979,23 +10997,40 @@ class FarmCircuitTask(BotTask):
     async def _fill_bag(self, client: AtrinikClient) -> bool:
         """While she carries her bag of holding because she needs it, put
         gems and the ammo her build does not shoot into it, one a tick;
-        each item is offered once (a pouch takes only gems, say)."""
+        each item is offered once (a pouch takes only gems, say).
+
+        The server puts things only into an applied container
+        (sack_can_hold: "The bag is not active."), and an applied one takes
+        every pickup (pick_up), coins and heals too. So she applies the bag,
+        fills it, and applies it again to close it at once."""
         state = client.state
-        bag = storage.best_bag(state.inventory)
-        if bag is None or not storage.bag_wanted(state, carried=True):
-            return False
         now = self.clock()
         if now - self._bag_fill_at < 0.6:
             return False
+        bag = storage.best_bag(state.inventory)
+        opened = state.items.get(self._bag_opened) if self._bag_opened else None
+        wanted = bag is not None and storage.bag_wanted(state, carried=True)
         build = self._build(client)
         item = next((item for item in state.inventory
-                     if item.tag != bag.tag and item.tag not in self._bag_fill_tried and
+                     if wanted and item.tag != bag.tag and
+                     item.tag not in self._bag_fill_tried and
                      storage.bag_fill(item) and storage.holds(bag, item) and
                      not (item.item_type == c.TYPE_ARROW and build == "bow")), None)
+        if opened is not None and (item is None or opened.tag != bag.tag):
+            self._bag_fill_at = now
+            if opened.flags & c.ITEM_APPLIED and opened.location == state.player_tag:
+                await client.apply(opened.tag)
+                return True
+            self._bag_opened = 0
+            return False
         if item is None:
             return False
-        self._bag_fill_tried.add(item.tag)
         self._bag_fill_at = now
+        if not bag.flags & c.ITEM_APPLIED:
+            self._bag_opened = bag.tag
+            await client.apply(bag.tag)
+            return True
+        self._bag_fill_tried.add(item.tag)
         await client.move_item(bag.tag, item.tag, item.quantity)
         recorder = getattr(client, "record_action", None)
         if recorder is not None:
@@ -11255,6 +11290,7 @@ class FarmCircuitTask(BotTask):
             "/shattered_islands/strakewood_island/apartments/apartment_cheap",
             RetrieveItemsTask(
                 "chest", predicate=self._cure_funding_wants(client),
+                indexer=self._chest_indexer(),
                 max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT),
             destination_xy=(1, 3), combat_approach=True)
         task.navigation.strict_safety = True
@@ -12769,6 +12805,10 @@ class FarmCircuitTask(BotTask):
             if self._storage.status == TaskStatus.FAILED:
                 log.warning("unidentified storage failed: %s",
                             self._storage.error)
+                deposit = self._storage.task
+                if isinstance(deposit, DepositItemsTask):
+                    # God-given gear, say: the chest refuses it for good.
+                    self._storage_refused.update(deposit.refused_tags)
                 self._storage_retry_at = self.clock() + self.failure_backoff(
                     self._storage.error, 1800.0)
                 self._strict_trip_refused(
@@ -12777,6 +12817,9 @@ class FarmCircuitTask(BotTask):
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
                 note_cure_funding_errand(client)
+                # One visit per STORAGE_VISIT_SECONDS at most: what it could
+                # not settle (a bag over the weight cap) waits.
+                self._storage_retry_at = self.clock() + self.STORAGE_VISIT_SECONDS
                 self._storage = None
             return True
         if self._bed_binding is not None:

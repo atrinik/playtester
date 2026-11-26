@@ -311,7 +311,8 @@ def note_retrieved(client: Any, items: Iterable[Item]) -> None:
 
 
 def stored_bags(state: Any) -> list[dict]:
-    return sorted((row for row in stored(state) if row.get("bag_factor")),
+    return sorted((row for row in stored(state)
+                   if row.get("bag_factor") and not row.get("cursed")),
                   key=lambda row: row["bag_factor"])
 
 

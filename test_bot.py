@@ -17934,6 +17934,8 @@ class QuestTests(RouteDeathReachIsolation, unittest.TestCase):
             client.state.remove_item(tag)
         self.assertFalse(circuit._needs_apartment_storage(client))
         client.state.items[799].weight = 51.0
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        client.state.items[799].weight = 66.0
         self.assertTrue(circuit._needs_apartment_storage(client))
 
         rare_client = type("Client", (), {})()
@@ -40992,16 +40994,35 @@ class InventoryStorageTests(unittest.TestCase):
         self.assertFalse(asyncio.run(circuit._fill_bag(client)))
         # Above half her limit she keeps the best one, and fills it with gems.
         client.state.place_item(Item(14, item_type=c.TYPE_FOOD, quality=80,
-                                     weight=50.0, name="anvil cake"), 7)
+                                     weight=55.0, name="anvil cake"), 7)
         self.assertEqual({item.tag for item in circuit._storable_items(client)}, {bag.tag})
         client.move_item = AsyncMock()
+        client.apply = AsyncMock()
+        # The server fills only an applied bag: she opens it, fills it ...
+        self.assertTrue(asyncio.run(circuit._fill_bag(client)))
+        client.apply.assert_awaited_once_with(fine.tag)
+        client.move_item.assert_not_awaited()
+        fine.flags |= c.ITEM_APPLIED
+        circuit._bag_fill_at = float("-inf")
         self.assertTrue(asyncio.run(circuit._fill_bag(client)))
         client.move_item.assert_awaited_once_with(fine.tag, gem.tag, 10)
+        # ... and closes it again, so no pickup lands in it.
+        client.state.place_item(gem, fine.tag)
+        circuit._bag_fill_at = float("-inf")
+        self.assertTrue(asyncio.run(circuit._fill_bag(client)))
+        self.assertEqual(client.apply.await_args_list[-1].args, (fine.tag,))
+        fine.flags &= ~c.ITEM_APPLIED
+        circuit._bag_fill_at = float("-inf")
+        self.assertFalse(asyncio.run(circuit._fill_bag(client)))
+        self.assertEqual(circuit._bag_opened, 0)
         # A pouch takes only gems: food is never offered to it.
         self.assertFalse(storage.holds(fine, client.state.items[14]))
         # Heavy with no bag carried but one stored: a trip fetches it.
         for tag in (10, 11):
             client.state.remove_item(tag)
+        self.assertFalse(circuit._bag_fetch_due(client))
+        # A cursed bag at home is never fetched (it would not be taken).
+        client.state.apartment_storage = [dict(storage.entry(bag), cursed=True)]
         self.assertFalse(circuit._bag_fetch_due(client))
         client.state.apartment_storage = [storage.entry(bag)]
         self.assertTrue(circuit._bag_fetch_due(client))
@@ -41120,6 +41141,30 @@ class InventoryStorageTests(unittest.TestCase):
         task._last_action = 0.0
         asyncio.run(task.tick(client))
         client.move_item.assert_awaited_once_with(0, spare.tag, 1)
+
+    def test_storage_visits_are_spaced_and_refused_items_stay(self):
+        class Trip:
+            def __init__(self, status, task):
+                self.status, self.task, self.error = status, task, "storage container refused: 1"
+
+            async def tick(self, client):
+                return None
+
+        client = self._client()
+        spare = Item(60, item_type=c.TYPE_WAND, quality=80, condition=80,
+                     name="pine wand of firestorm (lvl 2)")
+        client.state.place_item(spare, 7)
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], clock=lambda: 100.0)
+        self.assertEqual(circuit._storable_items(client), [spare])
+        deposit = DepositItemsTask("chest")
+        deposit.refused_tags = {spare.tag}
+        circuit._storage = Trip(TaskStatus.FAILED, deposit)
+        asyncio.run(circuit._tick_running_service(client))
+        self.assertEqual(circuit._storable_items(client), [])
+        circuit._storage_retry_at = 0.0
+        circuit._storage = Trip(TaskStatus.COMPLETE, deposit)
+        asyncio.run(circuit._tick_running_service(client))
+        self.assertEqual(circuit._storage_retry_at, 100.0 + circuit.STORAGE_VISIT_SECONDS)
 
     def test_cursed_potions_and_spare_plain_containers_are_sold(self):
         client = self._client()

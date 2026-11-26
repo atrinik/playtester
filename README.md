@@ -461,15 +461,19 @@ consumables. The rest goes to her apartment chest, and some is sold:
   Each stored gear row names the sets it belongs to (`melee:weapon`,
   `caster:ring`), for a later build change.
 - **Trips.** A storage trip leaves at once for a valuable, else once 8
-  items wait or she carries more than half her weight limit. A junk sale
-  likewise waits for 8 items, a cure shortfall or 85% of her limit.
+  items wait or she carries 65% of her weight limit (where encumbrance
+  slows her), at most once per 30 minutes. An item the chest refuses
+  (god-given gear) is not offered again. A junk sale waits for 8 items, a
+  cure shortfall or 85% of her limit.
 - **Containers.** The key ring stays. A bag of holding is known by its "of
   ... holding" title or its examine ("It decreases the weight of items
   inside by N%"); bags rank by the server's multiplier (minor 0.85 down to
   weightless 0.30). She carries her best bag only while what she carries
   would weigh more than half her limit without it (it goes home again
   below 40%), and puts gems and the ammunition her build does not shoot
-  in it, never coins or heals. Other containers go home; a duplicate plain
+  in it, never coins or heals. The server fills only an applied bag, and
+  an applied bag takes every pickup, so she applies it, fills it and
+  closes it again at once. Other containers go home; a duplicate plain
   container (same name, empty weight) is sold.
 - **Sold.** The worst duplicates (gear the equip loop would never wear
   that is no build's best), cursed or damned potions, spare recall wands
