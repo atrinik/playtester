@@ -391,12 +391,14 @@ Dungeon maps are never pack hazards, however dense: Underground City
   are no occupants (`_passable_player`): outside PvP areas players share
   squares, while monsters and NPCs (`FLAG_MONSTER`) block every living
   thing (server `map.c` `blocked()`), and in a PvP area, where players
-  block, the server names them red. Live, on 2026-11-26 on world_0_67,
+  block, the server names them red. The server names weaker creatures
+  green as well, so a green name counts as a player only when it is no
+  authored name (without her authored names, only white does). Live, on 2026-11-26 on world_0_67,
   the owner's character on the next square kept her stepping off her
   route and back four times a second. A square an occupant newly blocks
   `OCCUPANT_BLOCK_REPEATS` (3) times within 10 s starts a 3 s hold
   (`navigation-occupant-hold`): she stands still instead of stepping
-  round it and back.
+  round it and back. Only squares within two of her count.
 
 None of this persists, or reaches another trip or task.
 
@@ -597,7 +599,7 @@ starvations.
   of the trip (`_planning_copy`: its own containers and care crossing)
   with her `PlanningClient`. Until it is done the route stays empty,
   `NavigateTask.planning` is true and the trip's tick returns before any
-  step: she does not move, while her trip's defence (fights, heals,
+  step: she does not move (a path she was walking is stopped), while her trip's defence (fights, heals,
   retreats) carries on as for any other `PLANNING` answer. When it is
   collected, what the plan sets on the trip (`PLAN_STATE`: owner walls,
   the dialogue offer, care crossings, the learned plan, threat maps, the

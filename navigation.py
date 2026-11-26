@@ -44,7 +44,7 @@ from . import planner
 from . import route_shadow
 from . import unlocks
 from .equipment import abandon_gear_examine
-from .observations import is_player, plain
+from .observations import WHITE as WHITE_NAME, is_player, plain
 from .route_blocks import NO_WALLS, OwnerWalls
 from .route_costs import drain
 from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
@@ -2635,6 +2635,8 @@ class NavigateTask(BotTask):
     OCCUPANT_BLOCK_REPEATS = 3
     OCCUPANT_BLOCK_WINDOW_SECONDS = 10.0
     OCCUPANT_HOLD_SECONDS = 3.0
+    # Only squares this close to her count towards a hold.
+    OCCUPANT_HOLD_RADIUS = 2
     # A player's name in this colour marks a PvP area, where players block
     # one another (server request.c get_playername_color, map.c blocked()).
     PVP_PLAYER_COLOR = "ff3030"
@@ -2867,6 +2869,8 @@ class NavigateTask(BotTask):
         # A plan on the worker's shadow report, made on the loop once the
         # plan is collected (_shadow).
         self._deferred_shadow: tuple | None = None
+        # A replan went to the worker while a path may still be walking.
+        self._planning_stop = False
 
     # What a plan sets on the task that plans (_plan), copied back from the
     # planning copy a plan on the worker ran on (_plan_off_loop).
@@ -2955,12 +2959,12 @@ class NavigateTask(BotTask):
         if self._route_plans is None:
             self._route_plans = BackgroundPlans()
         plans = self._route_plans
-        build = _unused_build
-        if not plans.planning("route"):
-            # The care-wait record lives on her client: made here, the
-            # worker's copy of her client reads it through.
-            _care_waits(client)
-            build = functools.partial(_plan_on_copy, self._planning_copy())
+        # The care-wait record lives on her client: made here, the
+        # worker's copy of her client reads it through. A copy is made on
+        # every poll (cheap): a plan under way never uses it, and a result
+        # that went stale meanwhile is planned again with it.
+        _care_waits(client)
+        build = functools.partial(_plan_on_copy, self._planning_copy())
         result = plans.get(
             "route", self._graph, client, build,
             priority=(planner.PRIORITY_HEAL if self.essential
@@ -4017,10 +4021,16 @@ class NavigateTask(BotTask):
         Live, on 2026-11-26 on world_0_67, the owner's character beside her
         route kept her stepping off it and back four times a second."""
         state = client.state
-        if not is_player(obj, plain(getattr(state, "player_name", "") or ""),
-                         getattr(client, "authored_content", None)):
+        content = getattr(client, "authored_content", None)
+        color = str(obj.name_color).casefold()
+        if color == cls.PVP_PLAYER_COLOR:
             return False
-        return str(obj.name_color).casefold() != cls.PVP_PLAYER_COLOR
+        # The server names weaker creatures green too: without her
+        # authored names to tell them apart, only white is a player.
+        if content is None and color != WHITE_NAME:
+            return False
+        return is_player(obj, plain(getattr(state, "player_name", "") or ""),
+                         content)
 
     def _movement_blockers(self, client: AtrinikClient) -> set[tuple[int, int]]:
         """Combine learned fixtures with currently visible living occupants.
@@ -4049,15 +4059,18 @@ class NavigateTask(BotTask):
                 recorder(
                     "navigation-occupant-blocked",
                     ", ".join(f"{x},{y}" for x, y in sorted(newly_blocked)))
-            self._note_occupant_blocks(client, m.path, newly_blocked)
+            self._note_occupant_blocks(client, m.path, {
+                (x, y) for x, y in newly_blocked
+                if max(abs(x - m.world_x), abs(y - m.world_y)) <=
+                self.OCCUPANT_HOLD_RADIUS})
         return (self._runtime_blocked | self._threat_blocked |
                 self._temporary_blocked |
                 self._rejected_departures_on(m.path, (m.world_x, m.world_y)))
 
     def _note_occupant_blocks(self, client: AtrinikClient, map_path: str,
                               squares: set[tuple[int, int]]) -> None:
-        """Count newly blocked squares; one blocked again and again starts
-        a hold (OCCUPANT_BLOCK_REPEATS)."""
+        """Count newly blocked squares beside her (OCCUPANT_HOLD_RADIUS);
+        one blocked again and again starts a hold (OCCUPANT_BLOCK_REPEATS)."""
         now = time.monotonic()
         horizon = now - self.OCCUPANT_BLOCK_WINDOW_SECONDS
         self._occupant_blocks = {
@@ -4609,6 +4622,10 @@ class NavigateTask(BotTask):
                 self.fail(str(exc))
             return
         if route is PLANNING:
+            if not pending:
+                # The server may still walk her last path: stopped on the
+                # next tick (_planning_stop).
+                self._planning_stop = True
             self._planning, self.route = pending or "replan", []
             return
         self._planning = ""
@@ -4715,6 +4732,10 @@ class NavigateTask(BotTask):
         if self._planning:
             # Her route is being planned on the worker: she stands still
             # (her trip's defence goes on) until it is done.
+            if self._planning_stop:
+                self._planning_stop = False
+                await client.clear_actions()
+                self._issued_goal = self._issued_click = None
             self._replan(client)
             if self._planning or self.status != TaskStatus.RUNNING:
                 return
@@ -8475,11 +8496,6 @@ def _plan_on_copy(twin: "NavigateTask", proxy: Any) -> tuple:
                           for name in NavigateTask.PLAN_STATE}
 
 
-def _unused_build(proxy: Any) -> Any:
-    """BackgroundPlans.get's build for a plan already under way: never run."""
-    raise AssertionError("a plan under way is never built again")
-
-
 class _BackgroundPlan:
     """One build(PlanningClient) call on the planner worker."""
 
@@ -9897,6 +9913,10 @@ class FarmCircuitTask(BotTask):
             return False
         navigation = self.child.navigation
         if client.state.map.path == navigation.destination:
+            return False
+        if navigation.planning:
+            # Its plan runs on the worker and she stands still: the route
+            # it brings is checked on a later tick.
             return False
         if not navigation.route or navigation.route[0].source != client.state.map.path:
             try:

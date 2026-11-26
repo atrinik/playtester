@@ -19774,6 +19774,7 @@ class NavigationTests(unittest.TestCase):
             player = MapObject(5, 0, 0, 0, name="Zoey", name_color=color,
                                target_id=99)
             graph, node, client = self._corridor_with_occupant(player)
+            client.authored_content = types.SimpleNamespace(names={"rat"})
             task = NavigateTask(graph, node.path, (1, 2))
             asyncio.run(task.tick(client))
             self.assertEqual(client.steps, [5])
@@ -19796,6 +19797,14 @@ class NavigationTests(unittest.TestCase):
             self.assertEqual(client.steps, [], obj.name)
             self.assertEqual(task._temporary_blocked, {(1, 2)})
             self.assertIn(("navigation-occupant-blocked", "1,2"), client.actions)
+        # Without her authored names a green name may be a weaker
+        # creature (the server's level colour): it blocks.
+        graph, node, client = self._corridor_with_occupant(
+            MapObject(5, 0, 0, 0, name="Zoey", name_color="00ff00",
+                      target_id=99))
+        task = NavigateTask(graph, node.path, (1, 2))
+        asyncio.run(task.tick(client))
+        self.assertEqual(client.steps, [])
 
     def test_an_occupant_that_comes_and_goes_makes_her_hold_still(self):
         # Blocked again and again on one square, she waits rather than
@@ -19823,6 +19832,17 @@ class NavigationTests(unittest.TestCase):
             task._last_action = 0.0
             asyncio.run(task.tick(client))
         self.assertEqual(len(client.steps), moves)
+        # Only squares beside her count: one far off coming and going
+        # never makes her hold.
+        far = NavigateTask(graph, node.path, (1, 2))
+        client.state.player_name = "Sera"
+        far._movement_blockers(client)
+        for _ in range(far.OCCUPANT_BLOCK_REPEATS + 1):
+            client.state.map.tile(8, 13).objects[6] = monster
+            far._movement_blockers(client)
+            client.state.map.tile(8, 13).objects.clear()
+            far._movement_blockers(client)
+        self.assertEqual(far._occupant_hold_until, 0.0)
         # The hold ends, and she walks on.
         task._occupant_hold_until = 0.0
         task._last_action = 0.0
@@ -39372,11 +39392,17 @@ class PlanningOffLoopTests(unittest.TestCase):
             self.assertEqual(task.route[-1].destination,
                              "/shattered_islands/world_8_78")
             self.assertTrue(moves())
-            # A replan runs there too.
+            # A replan runs there too, and stops the path she was walking.
             release.clear()
             task.route = []
             asyncio.run(task.tick(client))
             self.assertTrue(task.planning)
+            cleared = len([packet for packet in client.sent
+                           if packet.packet_type == c.S_CLEAR])
+            asyncio.run(task.tick(client))
+            self.assertEqual(len([packet for packet in client.sent
+                                  if packet.packet_type == c.S_CLEAR]),
+                             cleared + 1)
             release.set()
             self.wait_for(lambda: task._route_plans._plans["route"].future.done())
             asyncio.run(task.tick(client))
