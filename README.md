@@ -86,7 +86,7 @@ from already downloaded files without network access:
 atrinik-playtester dependencies \
   --source-archive /media/atrinik-content-1.14.0.tar.gz \
   --runtime-archive /media/atrinik-content-1.14.0-classic-runtime.tar.gz \
-  --analyzer-archive /media/atrinik-tools-farming-analyzer-3.10.0.tar.gz \
+  --analyzer-archive /media/atrinik-tools-farming-analyzer-3.11.0.tar.gz \
   --server-archive /media/atrinik-classic-server-5.99.0.tar.gz \
   --offline
 ```
@@ -728,8 +728,38 @@ simulated so far. She fights one target at a time and casts no area spell,
 so the profile passes `--max-aggro-pack 2` (1 while Wizardry trains): the
 analyzer drops a map whose likely simultaneous aggro is larger.
 
-The analyzer scores a spot from its own maps alone. Until it models tiled
-neighbours, the bot folds them in itself (`seam_ranking`, COMBAT.md "Safer
+Since analyzer v3.11.0 the bot also runs the analyzer's encounter model, to
+warn only (owner decision, 2026-11-25; COMBAT.md, "Encounter warnings").
+The ranking run above is the one she chooses by and passes no
+`--combat-style`: with a style the analyzer lowers `spot_safety_score`,
+`safety_score`, `score` and the views' order to its encounter safety. Once
+a ranking is in, a separate encounter run passes her combat style
+(`--combat-style melee` with a weapon, `ranged-kite` while she trains
+Wizardry with spells only, which she casts from range once the spell fits
+beyond her healing reserve; never `aoe-kite`, as she has no area spell),
+her measured healing (`--healing-per-second`, below) and her displayed
+speed (`--character-speed`), and its encounter fields (`encounter_safety`,
+`expected_pack`, `worst_pack`, `encounter_reasons` and the rest) are copied
+onto the ranked spots with the same path and map paths. Her ranking never
+waits for it, and a ranking that falls due stops it first. It does not run until one heal has landed: with no healing
+every pull would rate as unhealed. A new ranking, another style or a 15%
+change in her healing re-runs only the encounter run; a failed one keeps the
+ranking, shows on the Farming tab and is retried after 15 minutes. Each run
+takes about 15 to 30 seconds. Her healing is the median of her landed
+heal-spell casts over a weapon swing plus a one-second cast (an upper bound:
+casts also wait out other actions), within what her SP regeneration pays at
+her cheapest heal spell's cost.
+
+The farm circuit records a `farm-spot-encounter` decision with the style,
+encounter safety, expected and bad pull's packs and reasons whenever her
+spot's rating changes, the spot she starts on included, and the Farming tab
+shows the same. When her spot's encounter safety is under 0.8 or its bad
+pull over 6, a `farm-spot-encounter-warning` decision names it and its first
+reasons, and the dashboard raises a `farm-encounter` warning alert while
+autoplay farms that circuit and the spot still warns.
+
+The analyzer scores a spot's pack from its own maps alone, so the bot folds
+tiled neighbours in itself (`seam_ranking`, COMBAT.md "Safer
 spot choice"): from its world graph, a neighbour map's aggressive spawns
 within their detection radius, and its casters within 10 tiles, of where
 she pulls raise the spot's pack, as do the circuit's own maps' spawns

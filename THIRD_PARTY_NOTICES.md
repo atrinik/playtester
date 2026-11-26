@@ -34,14 +34,14 @@ they are cached external inputs and are not covered by this repository's MIT
 License.
 
 Farm spots are ranked by the separately distributed `farming_analyzer` from the
-`atrinik/tools` `v3.10.0` release at commit
-`dcb1ef9e415e5c507fba409eb0440ebfc304004f`. Its MIT release asset
-`atrinik-tools-farming-analyzer-3.10.0.tar.gz`
-(`sha256:441db410150acc205e41f929d4c824d39ce47ef323e46015f97a92db3f7d0de9`)
+`atrinik/tools` `v3.11.0` release at commit
+`594c7591646ab4177824637fbe0c3219ed11c750`. Its MIT release asset
+`atrinik-tools-farming-analyzer-3.11.0.tar.gz`
+(`sha256:650ad63727aee97cd3b4376e624241211f292c631f10591762ea6d25138e1afd`)
 is cached and run as a separate process; it is not vendored or imported into
-the playtester process. The analyzer reads the Classic server's experience and
-skill tables as text from the GPL-2.0-or-later `atrinik/classic` `v5.99.0`
-server source archive `atrinik-classic-server-5.99.0.tar.gz`
+the playtester process. The analyzer reads the Classic server's experience,
+skill, ally-call and spell tables and its server constants as text from the
+GPL-2.0-or-later `atrinik/classic` `v5.99.0` server source archive `atrinik-classic-server-5.99.0.tar.gz`
 (`sha256:ea3fd518bacbad7b7f2ccc2ac1425cc32470abd1422ec91832dc07e7c63534e5`,
 commit `adcab31088a7ce02555d7a6f4f862034a982abbb`). That source is cached data:
 the analyzer reads it, and at runtime the dashboard also reads its `new_levels`

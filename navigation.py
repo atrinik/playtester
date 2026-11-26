@@ -8706,6 +8706,8 @@ class FarmCircuitTask(BotTask):
         # preferred objective; explicit circuits keep their given legs.
         self.analyzer_driven = bool(analyzer_driven)
         self.spot = spot
+        # The encounter rating last recorded for her spot (_note_encounter).
+        self._encounter_noted: tuple[str, str, str] | None = None
         # Analyzer-derived safety applies to every analyzer spot, including one
         # an operator starts by hand (which does not follow later rankings).
         self._analyzer_safety = self.analyzer_driven or spot is not None
@@ -9407,6 +9409,7 @@ class FarmCircuitTask(BotTask):
         objective, desired, spot = choice
         if desired == self.legs:
             self.spot = spot
+            self._note_encounter(client, spot)
             return False
         if busy:
             return False
@@ -9428,7 +9431,40 @@ class FarmCircuitTask(BotTask):
             recorder("farm-spot-selected",
                      f"{spot.get('name', '?')} ({objective}): "
                      + ", ".join(path for path, _ in self.legs))
+        self._note_encounter(client, spot)
         return True
+
+    def _note_encounter(self, client: AtrinikClient, spot: dict) -> None:
+        """Keep her spot's encounter warning current: on the spot she starts
+        on, after a switch, and when a new analysis re-rates the same spot.
+        Warn only (owner decision, 2026-11-25). The warning
+        (farm_analyzer.encounter_warning) is kept on the client as
+        ``farm_encounter_warning`` with this circuit, for the dashboard's
+        farm-encounter alert while autoplay farms this circuit; a spot left
+        unrated (no encounter run yet, or a failed one) keeps what was noted
+        for it. Each change is recorded too: farm-spot-encounter (the
+        rating), farm-spot-encounter-warning, or farm-spot-encounter-clear
+        once a warned spot no longer warns."""
+        summary = farm_analyzer_plan.encounter_summary(spot)
+        warning = farm_analyzer_plan.encounter_warning(spot)
+        noted = (str(spot.get("path", "")), summary, warning)
+        previous = self._encounter_noted
+        if noted == previous or (
+                not summary and previous is not None and previous[0] == noted[0]):
+            return
+        self._encounter_noted = noted
+        client.farm_encounter_warning = (
+            {"text": warning, "circuit": self} if warning else None)
+        recorder = getattr(client, "record_action", None)
+        if recorder is None:
+            return
+        if summary:
+            recorder("farm-spot-encounter", f"{spot.get('name', '?')}: {summary}")
+        if warning:
+            log.warning("farm spot encounter warning: %s", warning)
+            recorder("farm-spot-encounter-warning", warning)
+        elif previous is not None and previous[2]:
+            recorder("farm-spot-encounter-clear", f"{spot.get('name', '?')}")
 
     async def _recover_failed_navigation(
             self, client: AtrinikClient, farm: FarmTask) -> bool:

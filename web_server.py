@@ -19,8 +19,8 @@ from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                   POLICIES, RECOMMENDED_QUEST_ORDER)
 from .autoplay import AutoplayTask
 from .build_info import build_info
-from .farm_analyzer import (DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_approach,
-                            risky_spot)
+from .farm_analyzer import (DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS,
+                            encounter_warning, risky_approach, risky_spot)
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .equipment import equipment_report
@@ -668,6 +668,16 @@ class DashboardState:
                 "count": count,
                 "since": float(getattr(self.engine, "step_error_since", 0.0))}
 
+    def farm_encounter_warning(self, autoplay) -> str:
+        """The encounter warning of the circuit autoplay farms now
+        (FarmCircuitTask._note_encounter), or "": none once autoplay farms
+        another circuit, does something else or stops."""
+        warning = getattr(self.client, "farm_encounter_warning", None)
+        if (not isinstance(warning, dict) or autoplay is None or
+                getattr(autoplay, "child", None) is not warning.get("circuit")):
+            return ""
+        return str(warning.get("text", ""))
+
     def alerts(self) -> list[dict[str, str]]:
         """Alerts for the operator: deaths, starvation, stuck, disconnected,
         and while farming is unsafe its suspension and what blocks it."""
@@ -684,7 +694,8 @@ class DashboardState:
             autoplay_started_at=(float(getattr(task, "started_at", 0.0) or 0.0)
                                  if autoplay else None),
             task_running=task is not None, waiting_explained=waiting,
-            engine_error=self.engine_error())
+            engine_error=self.engine_error(),
+            farm_encounter=self.farm_encounter_warning(task if autoplay else None))
         care = self.care_alerts()
         if any(alert["id"] == "essential-care-wait" for alert in care):
             # The care alert explains the wait; no stuck alert besides it.
@@ -968,6 +979,8 @@ class DashboardState:
                 **{key: spot.get(key) for key in SUMMARY_FIELDS},
                 "approach_risky": risky_approach(spot),
                 "spot_risky": risky_spot(spot),
+                # Warn only (farm_analyzer.encounter_warning).
+                "encounter_warning": encounter_warning(spot),
                 "rank": (ranked.index(spot.get("path")) + 1
                          if spot.get("path") in ranked else None)}
         snapshot["objective_override"] = (

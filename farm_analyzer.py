@@ -11,11 +11,23 @@ changes materially, her savebed moves, or the result ages out. A spot is
 judged from her savebed: the analyzer charges the maps crossed from there to
 the spot (approach danger) against her maximum health. One ``--ranking all`` run yields every objective, so switching the
 preferred objective never needs a new run.
+
+Since analyzer v3.11.0 (report ``schema_version`` 2) each analysis is two
+processes. The ranking run passes no ``--combat-style``, so every field she
+chooses by (``safety_score``, ``spot_safety_score``, ``score`` and the views'
+order) is the analyzer's pre-encounter estimate: with a style the analyzer
+lowers those to its encounter safety. The encounter run then passes her
+combat style, measured healing and speed, and its encounter fields
+(``encounter_safety``, ``expected_pack``, ``worst_pack``,
+``encounter_reasons``, ...) are copied onto the ranked spots by path, to
+warn only (owner decision, 2026-11-25). A report without a schema version
+(an older analyzer) carries no encounter fields.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 from dataclasses import dataclass
 import json
@@ -73,6 +85,14 @@ SPELL_HIT_WINDOW_SECONDS = 3.0
 # of whatever she did last (a sword swing included), and mana, not the cast
 # rate, bounds a spell-only kill rate, so a fixed second is used.
 SPELL_CAST_DELAY = 1.0
+# The server's answer to every heal that lands (tasks.HEALED_MESSAGE).
+HEALED_TEXT = re.compile(r"^The spell heals you for (\d{1,9}) hp", re.I)
+# A heal answer this soon after her FIRE of a healing spell is that spell's.
+HEAL_ATTRIBUTION_SECONDS = 2.0
+HEAL_SAMPLES = 30
+# The analyzer's combat styles (--combat-style) for her two kits.
+MELEE_STYLE = "melee"
+RANGED_KITE_STYLE = "ranged-kite"
 
 
 def owned_skill_level(state, name: str) -> int:
@@ -121,6 +141,25 @@ SINGLE_TARGET_MAX_AGGRO_PACK = 2
 SEAM_REACH_TILES = 10
 # Danger added per seam caster, the analyzer's own caster bonus.
 SEAM_CASTER_DANGER = 20.0
+# The analyzer report schema that carries the encounter model's fields.
+ENCOUNTER_SCHEMA = 2
+# Warn only (owner decision, 2026-11-25: keep the XP choice): the chosen
+# spot's encounter warning (encounter_warning) fires below this encounter
+# safety or above this bad pull (worst_pack). With analyzer v3.11.0 and her
+# live kit (2026-11-25: level 37, 333 health, melee, 3 HP/s) every Burnt
+# Forest map she died on rated 0.40 to 0.77 with bad pulls of 7 and 8; the
+# maps whose bad pull stays under four health bars rated 0.80 and up.
+ENCOUNTER_WARN_SAFETY = 0.8
+ENCOUNTER_WARN_WORST_PACK = 6
+# Encounter-model fields copied from the styled run onto the ranked spots
+# (FarmAnalyzer._merge_encounters). The ranking's own fields are untouched.
+ENCOUNTER_FIELDS = (
+    "encounter_style", "encounter_applied", "expected_pack",
+    "mean_expected_pack", "worst_pack", "encounter_need", "encounter_worst_need",
+    "encounter_safety", "encounter_expected_safety", "encounter_worst_safety",
+    "encounter_pull", "encounter_reasons", "wanderer_spawns", "caster_spawns",
+    "ranged_spawns", "linking_spawns", "spawn_density", "doorways", "seam_spawns",
+)
 
 # Fields copied from each ranked result into the dashboard snapshot.
 SUMMARY_FIELDS = (
@@ -134,6 +173,9 @@ SUMMARY_FIELDS = (
     "approach_danger_flags", "approach_unknown",
     # The bot's seam exposure (seam_adjusted).
     "seam_aggressive_spawns", "seam_casters", "seam_maps",
+    # The encounter model (analyzer v3.11.0, schema_version 2).
+    "analyzer_schema_version", "encounter_applied", "encounter_style",
+    "encounter_safety", "expected_pack", "worst_pack", "encounter_reasons",
 )
 # The approach safety an unreachable spot is capped at. The analyzer's walk
 # follows exits and tiled seams only (no ships, scripts or keys), so
@@ -179,6 +221,16 @@ def _number(value) -> float | None:
     return None
 
 
+def encounter_rated(spot: dict) -> bool:
+    """Whether a ranked spot carries the analyzer's encounter model: its
+    report has schema_version ENCOUNTER_SCHEMA or later (stamped on each
+    spot as analyzer_schema_version, FarmAnalyzer._bounded) and the model
+    ran for a combat style. Otherwise only the older fields are read."""
+    version = spot.get("analyzer_schema_version")
+    return (isinstance(version, int) and not isinstance(version, bool) and
+            version >= ENCOUNTER_SCHEMA and spot.get("encounter_applied") is True)
+
+
 def spot_safety(spot: dict) -> float:
     """A ranked spot's own safety, without its approach: the analyzer's
     spot_safety_score (v3.10.0), else its safety_score, else 1."""
@@ -198,6 +250,45 @@ def risky_spot(spot: dict) -> bool:
     circuit of spot safety 0.95, and died there to three attackers at once.
     """
     return spot_safety(spot) < APPROACH_SAFETY_FLOOR
+
+
+def encounter_summary(spot: dict, reasons: int = 3) -> str:
+    """A short account of the encounter model's rating for the decision
+    record, or "" for a spot it did not rate."""
+    if not encounter_rated(spot):
+        return ""
+    safety = _number(spot.get("encounter_safety"))
+    expected = _number(spot.get("expected_pack"))
+    worst = _number(spot.get("worst_pack"))
+    text = (f"{spot.get('encounter_style', '?')} encounter safety "
+            f"{safety if safety is not None else 0:.2f}, pack "
+            f"{expected if expected is not None else 0:.1f}/"
+            f"{worst if worst is not None else 0:g}")
+    listed = [str(reason) for reason in (spot.get("encounter_reasons") or ())
+              if isinstance(reason, str)][:reasons]
+    return text + (": " + "; ".join(listed) if listed else "")
+
+
+def encounter_warning(spot: dict, reasons: int = 2) -> str:
+    """Why the encounter model warns about a ranked spot, or "" when it
+    does not (or did not rate it): its encounter safety under
+    ENCOUNTER_WARN_SAFETY or its bad pull over ENCOUNTER_WARN_WORST_PACK.
+    Warn only: nothing reads it to choose a spot."""
+    if not encounter_rated(spot):
+        return ""
+    safety = _number(spot.get("encounter_safety"))
+    worst = _number(spot.get("worst_pack"))
+    causes = []
+    if safety is not None and safety < ENCOUNTER_WARN_SAFETY:
+        causes.append(f"encounter safety {safety:.2f} < {ENCOUNTER_WARN_SAFETY:g}")
+    if worst is not None and worst > ENCOUNTER_WARN_WORST_PACK:
+        causes.append(f"bad pull {worst:g} > {ENCOUNTER_WARN_WORST_PACK}")
+    if not causes:
+        return ""
+    listed = [str(reason) for reason in (spot.get("encounter_reasons") or ())
+              if isinstance(reason, str)][:reasons]
+    return (f"{spot.get('name', '?')}: " + ", ".join(causes) +
+            (": " + "; ".join(listed) if listed else ""))
 
 
 @dataclass(frozen=True)
@@ -325,8 +416,16 @@ class CombatProfile:
     # She has Meditation: resting out of combat ramps regeneration up to
     # tenfold (types/player.c, player_do_some_living).
     meditation: bool = False
+    # The analyzer's encounter model (v3.11.0): how she fights (combat_style)
+    # and the HP per second her heal spell sustains in a fight
+    # (healing_rate); "" runs without the model.
+    combat_style: str = ""
+    healing_per_second: float = 0.0
 
-    def arguments(self) -> list[str]:
+    def arguments(self, styled: bool = False) -> list[str]:
+        """The analyzer's profile arguments; without ``styled`` (the
+        ranking run) no --combat-style, which would change the fields she
+        ranks by."""
         if self.spell_damage > 0:
             args = [
                 str(self.skill_level),
@@ -357,10 +456,16 @@ class CombatProfile:
             args += ["--player-protection", f"{name}={value}"]
         if self.max_aggro_pack:
             args += ["--max-aggro-pack", str(self.max_aggro_pack)]
+        if self.combat_style:
+            if styled:
+                args += ["--combat-style", self.combat_style]
+            args += ["--healing-per-second", f"{self.healing_per_second:g}"]
         return args
 
     def materially_differs(self, other: "CombatProfile | None") -> bool:
-        """Whether a new analysis could rank spots differently."""
+        """Whether a new analysis could rank spots differently. Her combat
+        style and healing feed only the encounter run (encounters_differ),
+        never the ranking."""
         if other is None:
             return True
         if (self.skill, self.skill_level, self.attack, self.character_level,
@@ -390,6 +495,15 @@ class CombatProfile:
         new = dict(self.protections)
         return any(abs(new.get(name, 0) - old.get(name, 0)) >= 5
                    for name in set(old) | set(new))
+
+    def encounters_differ(self, other: "CombatProfile | None") -> bool:
+        """Whether the encounter run could rate spots differently: another
+        style, or healing more than 15% off."""
+        if other is None:
+            return True
+        return (self.combat_style != other.combat_style or
+                abs(self.healing_per_second - other.healing_per_second) >
+                0.15 * max(abs(other.healing_per_second), 1.0))
 
     def no_survivability_gain(self, earlier: "CombatProfile") -> bool:
         """Whether a failure she had with ``earlier`` still applies to her now.
@@ -441,15 +555,53 @@ class CombatProfile:
             "mana_cost": self.mana_cost, "mana_regen": self.mana_regen,
             "max_mana": self.max_mana, "spell_attack": self.spell_attack,
             "meditation": self.meditation,
+            "combat_style": self.combat_style,
+            "healing_per_second": self.healing_per_second,
         }
 
 
+def healing_rate(state, heal: float, swing: float) -> float:
+    """The HP per second her healing spell sustains in a fight, for the
+    analyzer's --healing-per-second; 0 until a heal of it has landed.
+
+    ``heal`` is the median of her landed heal-spell casts
+    (FarmAnalyzer.observe_spells; potions and scrolls do not count: they
+    run out). In a fight a cast waits for her action timer (COMBAT.md,
+    heals in melee), so one lands about every ``swing`` (her weapon's
+    speed, or a cast while she trains with spells) plus SPELL_CAST_DELAY.
+    Her mana bounds it too: regen_sp over the spell's cost, casts a
+    second. Live, on 2026-11-25, minor healing landed 8 to 26 (median 12)
+    with a 3 s weapon: 3 HP/s, against at most 5.5 seen.
+    """
+    if heal <= 0 or swing <= 0:
+        return 0.0
+    rate = heal / (swing + SPELL_CAST_DELAY)
+    costs = [int(item.extra.get("cost", 0) or 0) for item in state.inventory
+             if item.item_type == c.TYPE_SPELL and "heal" in item.name.casefold()]
+    try:
+        regen = float(state.stats.get("regen_sp", 0) or 0)
+    except (TypeError, ValueError):
+        regen = 0.0
+    cost = min((value for value in costs if value > 0), default=0)
+    if cost and regen > 0:
+        rate = min(rate, heal * regen / cost)
+    return round(rate, 2)
+
+
 def combat_profile(client, spell_damage: float = 0.0,
-                   spell_attack: str = "") -> CombatProfile | None:
+                   spell_attack: str = "", heal: float = 0.0) -> CombatProfile | None:
     """Read the killing skill and player doll, or None if unsupported.
 
     ``spell_damage``/``spell_attack`` are the observed raw damage per hit of
-    her damage spell and its attack type (see FarmAnalyzer.observe_spells).
+    her damage spell and its attack type, ``heal`` the median of her landed
+    heal-spell casts (see FarmAnalyzer.observe_spells).
+
+    Her combat style for the analyzer's encounter model: ``ranged-kite``
+    while she trains with spells only (caster_kite holds one target at
+    range and steps away), else ``melee``: her weapon fights one target in
+    place, and melee_kite steps away only from a lone pursuer, standing
+    when another hostile is close (KITE_CROWD_RADIUS). She casts no area
+    spell, so never ``aoe-kite``.
     """
     state = client.state
     weapon = state.items.get(state.equipment.get(c.EQUIP_WEAPON, 0))
@@ -488,6 +640,7 @@ def combat_profile(client, spell_damage: float = 0.0,
     # SINGLE_TARGET_MAX_AGGRO_PACK.
     max_aggro_pack = SINGLE_TARGET_MAX_AGGRO_PACK
     caster: dict[str, Any] = {}
+    spells_only = False
     training, spell_name, _ = automatic_training_plan(state)
     trained_level = owned_skill_level(state, training) if training else 0
     if trained_level >= 1:
@@ -506,6 +659,10 @@ def combat_profile(client, spell_damage: float = 0.0,
             if item.item_type == c.TYPE_SPELL and "heal" in item.name.casefold() and
             int(item.extra.get("cost", 0) or 0) > 0]
         offence = maxsp - min(heal_costs, default=0) * 3
+        # As FarmTask.spell_only_training: she casts from range (caster_kite)
+        # once the spell fits beyond the healing reserve, even before a hit
+        # of it has been sampled; otherwise her weapon trains.
+        spells_only = spell is not None and (maxsp <= 0 or cost <= offence)
         if (spell_damage > 0 and spell_attack in SPELL_ATTACKS and
                 0 < cost <= offence and regen > 0):
             caster = dict(
@@ -517,12 +674,15 @@ def combat_profile(client, spell_damage: float = 0.0,
                     item.item_type == c.TYPE_SKILL and
                     item.name.casefold() == "meditation"
                     for item in state.inventory))
+    swing = SPELL_CAST_DELAY if spells_only else weapon_speed
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
         character_level=character_level, max_health=max_health,
         speed=round(speed, 3), armour_class=armour_class, protections=protections,
-        max_aggro_pack=max_aggro_pack, **caster)
+        max_aggro_pack=max_aggro_pack,
+        combat_style=RANGED_KITE_STYLE if spells_only else MELEE_STYLE,
+        healing_per_second=healing_rate(state, heal, swing), **caster)
 
 
 class _OriginRejected(RuntimeError):
@@ -574,6 +734,10 @@ class FarmAnalyzer:
     # does not ensure that a kept circuit avoids a map that failed (live,
     # every Burnt Forest circuit shared one).
     AREA_CIRCUITS = 3
+    # The encounter run lists every scored candidate in ``results`` (each
+    # view and the results are cut at --top), so every ranked spot finds
+    # its rating: about 200 candidates at her level.
+    ENCOUNTER_TOP = 5000
 
     def __init__(self, analyzer_root: Path, content_root: Path, server_root: Path, *,
                  python: str = sys.executable,
@@ -606,6 +770,19 @@ class FarmAnalyzer:
         self.spell_samples: list[int] = []
         self.spell_attack = ""
         self.spell_name = ""
+        # The encounter run (warn only): its task and process, why it last
+        # failed ("" when it did not), when it last started, the profile it
+        # rated and the ranking (report_generation) it was merged into.
+        self._encounter_task: asyncio.Task | None = None
+        self._encounter_process: asyncio.subprocess.Process | None = None
+        self.encounter_error = ""
+        self._encounter_attempt_at = 0.0
+        self.encounter_profile: CombatProfile | None = None
+        self.encounter_generation = -1
+        # Bumped each time a ranking run replaces the report.
+        self.report_generation = 0
+        # HP of her recent landed heal-spell casts (healing_rate).
+        self.heal_samples: list[int] = []
         self._message_position = 0
 
     @classmethod
@@ -642,11 +819,13 @@ class FarmAnalyzer:
             return ""
         return path
 
-    def command(self, profile: CombatProfile, origin: str = "") -> list[str]:
+    def command(self, profile: CombatProfile, origin: str = "", *,
+                styled: bool = False) -> list[str]:
         """The isolated analyzer invocation for one profile.
 
         With an ``origin`` (her savebed map) the approach to every spot is
-        judged from there alone, as she actually travels.
+        judged from there alone, as she actually travels. ``styled`` is the
+        encounter run (CombatProfile.arguments).
         """
         bootstrap = (
             "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
@@ -654,10 +833,11 @@ class FarmAnalyzer:
             "runpy.run_module('farming_analyzer', run_name='__main__', alter_sys=True)")
         command = [
             self.python, "-E", "-s", "-c", bootstrap, str(self.analyzer_root),
-            *profile.arguments(),
+            *profile.arguments(styled),
             "--content-root", str(self.content_root),
             "--server-root", str(self.server_root),
-            "--ranking", "all", "--top", str(max(self.TOP, self.SAFETY_TOP)),
+            "--ranking", "all",
+            "--top", str(self.ENCOUNTER_TOP if styled else max(self.TOP, self.SAFETY_TOP)),
             "--json",
             "--unreachable-approach-safety", f"{UNREACHABLE_APPROACH_SAFETY:g}",
         ]
@@ -683,16 +863,45 @@ class FarmAnalyzer:
                 now - self.reported_at >= self.REFRESH_SECONDS)
 
     def observe_spells(self, client) -> None:
-        """Record the raw damage of her damage spell from her own hit text.
+        """Record the raw damage of her damage spell from her own hit text,
+        and the HP of each heal-spell cast that lands (healing_rate).
 
         Only hit text within a few seconds of her own offensive cast counts,
         so elemental melee (rings of fire and the like) is never sampled.
+        A heal counts only when her latest FIRE or APPLY, at most
+        HEAL_ATTRIBUTION_SECONDS before the server's answer, fired a
+        healing spell she knows.
         """
         state = client.state
         entries = state.messages_since(self._message_position)
         self._message_position = state.message_count
         casts = list(getattr(client, "offensive_casts", ()))
+        heal_spells = {item.name.casefold() for item in state.inventory
+                       if item.item_type == c.TYPE_SPELL and
+                       "heal" in item.name.casefold()}
+        # Her FIREs and APPLYs, newest last: a heal answer belongs to the
+        # latest one before it, and counts only if that FIRE cast a
+        # healing spell (an applied potion or scroll does not).
+        oldest = min((float(entry[0]) for entry in entries), default=0.0)
+        orders = [(float(record.get("time", 0) or 0), record.get("action"),
+                   str(record.get("detail", "")).casefold())
+                  for record in list(getattr(client, "action_history", ()) or ())
+                  if isinstance(record, dict) and
+                  record.get("action") in ("fire", "apply") and
+                  float(record.get("time", 0) or 0) >= oldest - HEAL_ATTRIBUTION_SECONDS]
         for timestamp, _, _, text in entries:
+            text = str(text).strip()
+            healed = HEALED_TEXT.match(text)
+            if healed and heal_spells:
+                order = next((entry for entry in reversed(orders)
+                              if 0.0 <= timestamp - entry[0] <= HEAL_ATTRIBUTION_SECONDS),
+                             None)
+                if (order is not None and order[1] == "fire" and
+                        any(order[2].startswith(name + " ") or order[2] == name
+                            for name in heal_spells) and int(healed.group(1)) > 0):
+                    self.heal_samples = (
+                        self.heal_samples + [int(healed.group(1))])[-HEAL_SAMPLES:]
+                continue
             spell = next((
                 name for cast_at, name in reversed(casts)
                 if 0.0 <= timestamp - cast_at <= SPELL_HIT_WINDOW_SECONDS), "")
@@ -723,7 +932,8 @@ class FarmAnalyzer:
         profile = combat_profile(
             client,
             statistics.median(self.spell_samples) if observed else 0.0,
-            self.spell_attack)
+            self.spell_attack,
+            statistics.median(self.heal_samples) if self.heal_samples else 0.0)
         if profile is None:
             if self.report is None and not self.running:
                 self.status = "unsupported"
@@ -731,7 +941,10 @@ class FarmAnalyzer:
             return False
         origin = self.approach_origin(client.state)
         if not self.due(profile, origin):
-            return False
+            return self._poll_encounters(profile)
+        # A new ranking would drop an encounter run's result anyway: stop it
+        # so the two never share her host's cores.
+        self._cancel_encounters()
         self._last_attempt_at = self.clock()
         # Report the run as soon as it is scheduled, not when it first runs.
         self.status = "running"
@@ -741,31 +954,152 @@ class FarmAnalyzer:
         self._task = asyncio.get_running_loop().create_task(self._run(profile, origin))
         return True
 
-    async def _analyze(self, command: list[str]) -> dict:
-        """One analyzer process's validated report, or RuntimeError."""
-        self._process = await asyncio.create_subprocess_exec(
+    @property
+    def encounter_running(self) -> bool:
+        return self._encounter_task is not None and not self._encounter_task.done()
+
+    def encounter_due(self, profile: CombatProfile | None) -> bool:
+        """Whether the warn-only encounter run should rate the current
+        ranking: never while either run is running, for a profile without a
+        style, or before one heal has landed (healing_per_second 0 would
+        rate every pull as unhealed and warn about nearly every spot). Then
+        a new ranking, another style or healing 15% off (at most every
+        MIN_INTERVAL_SECONDS) calls for one; a failed one is retried after
+        RETRY_SECONDS."""
+        if (profile is None or self.report is None or self.running or
+                self.encounter_running or not profile.combat_style or
+                profile.healing_per_second <= 0):
+            return False
+        elapsed = self.clock() - self._encounter_attempt_at
+        if self.encounter_error:
+            return elapsed >= self.RETRY_SECONDS
+        if self.encounter_generation != self.report_generation:
+            return True
+        return (elapsed >= self.MIN_INTERVAL_SECONDS and
+                profile.encounters_differ(self.encounter_profile))
+
+    def _cancel_encounters(self) -> None:
+        """Kill a running encounter run's process and cancel its task. A
+        process that has exited but is not reaped yet (returncode still
+        None) raises ProcessLookupError on kill; it needs none."""
+        process = self._encounter_process
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        if self.encounter_running:
+            self._encounter_task.cancel()
+
+    def _poll_encounters(self, profile: CombatProfile) -> bool:
+        if not self.encounter_due(profile):
+            return False
+        self._encounter_attempt_at = self.clock()
+        self._encounter_task = asyncio.get_running_loop().create_task(
+            self._run_encounters(profile, self.report_generation))
+        return True
+
+    async def _run_encounters(self, profile: CombatProfile, generation: int) -> None:
+        """One encounter run, merged into the ranking it was started for.
+        Her ranking never waits for it; a ranking replaced meanwhile drops
+        the result, and the next poll rates the new one."""
+        try:
+            styled = await self._analyze(
+                self.command(profile, self.origin, styled=True), encounter=True)
+        except asyncio.CancelledError:
+            if (self._encounter_process is not None and
+                    self._encounter_process.returncode is None):
+                with contextlib.suppress(ProcessLookupError):
+                    self._encounter_process.kill()
+            raise
+        except Exception as error:  # Warn only: the ranking stands.
+            self.encounter_error = str(error)
+            log.warning("farming analyzer encounter run failed: %s", error)
+        else:
+            self.encounter_error = ""
+            if generation == self.report_generation and self.report is not None:
+                self._merge_encounters(self.report, styled)
+                self.encounter_profile = profile
+                self.encounter_generation = generation
+        finally:
+            self._encounter_process = None
+
+    async def _analyze(self, command: list[str], *, encounter: bool = False) -> dict:
+        """One analyzer process's validated report, or RuntimeError. The
+        encounter run keeps its process apart (_encounter_process)."""
+        process = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        if encounter:
+            self._encounter_process = process
+        else:
+            self._process = process
         try:
             stdout, stderr = await asyncio.wait_for(
-                self._process.communicate(), self.TIMEOUT_SECONDS)
+                process.communicate(), self.TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            self._process.kill()
-            await self._process.wait()
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
             raise RuntimeError(f"timed out after {self.TIMEOUT_SECONDS:.0f}s")
-        if self._process.returncode != 0:
+        if process.returncode != 0:
             text = stderr.decode(errors="replace")
             detail = text.strip().splitlines()[-1:] or [""]
             error = (_OriginRejected if ORIGIN_REJECTED_TEXT in text
                      else RuntimeError)
             raise error(
-                f"exited with status {self._process.returncode}: {detail[0][:300]}")
+                f"exited with status {process.returncode}: {detail[0][:300]}")
         report = await asyncio.to_thread(json.loads, stdout)
         rankings = report.get("rankings") if isinstance(report, dict) else None
         if not isinstance(rankings, dict) or not all(
                 isinstance(rankings.get(name), list) for name in OBJECTIVES):
             raise RuntimeError("report has no ranking for every objective")
-        return self._bounded(report)
+        return report
+
+    @staticmethod
+    def spot_key(spot: dict) -> tuple[str, tuple[str, ...]]:
+        """A spot's identity across runs: its path (a circuit's names only
+        its maps' basenames) and its content-relative map paths."""
+        return (str(spot.get("path", "")),
+                tuple(str(path) for path in spot.get("map_paths") or ()))
+
+    @staticmethod
+    def _merge_encounters(report: dict, styled: dict) -> dict:
+        """Copy the encounter run's ENCOUNTER_FIELDS onto the ranking's
+        spots of the same identity (spot_key), stamping each with the
+        encounter run's schema_version. Nothing the ranking chooses by
+        changes. An identity the encounter run gives two different ratings
+        is skipped rather than attached to the wrong spot; a spot it did not
+        rate keeps the ranking run's unapplied (encounter_applied false)
+        fields, which encounter_rated ignores."""
+        version = styled.get("schema_version")
+        if not (isinstance(version, int) and not isinstance(version, bool)):
+            return report
+        found: dict[tuple, dict | None] = {}
+        for spot in [*(styled.get("results") or ()),
+                     *(spot for ranked in styled["rankings"].values()
+                       if isinstance(ranked, list) for spot in ranked)]:
+            if not isinstance(spot, dict):
+                continue
+            key = FarmAnalyzer.spot_key(spot)
+            fields = {name: spot[name] for name in ENCOUNTER_FIELDS if name in spot}
+            if key in found and found[key] != fields:
+                found[key] = None
+            else:
+                found.setdefault(key, fields)
+        for spot in FarmAnalyzer._spots(report):
+            fields = found.get(FarmAnalyzer.spot_key(spot))
+            if fields:
+                spot.update(fields, analyzer_schema_version=version)
+        return report
+
+    @staticmethod
+    def _spots(report: dict) -> list[dict]:
+        """Every spot dict of a report: rankings, results, representatives."""
+        return [spot for spot in [
+            *(spot for ranked in report["rankings"].values()
+              if isinstance(ranked, list) for spot in ranked),
+            *(report.get("results") or ()),
+            *(group.get("representative") for group in report.get("groups") or ()
+              if isinstance(group, dict))] if isinstance(spot, dict)]
 
     @staticmethod
     def circuit_area(spot) -> tuple[str, str] | None:
@@ -796,7 +1130,14 @@ class FarmAnalyzer:
         """The report with its safety view cut back to SAFETY_TOP, every
         other view to TOP spots with at most AREA_CIRCUITS circuits of one
         area (_distinct; the analyzer's --top, SAFETY_TOP, applies to all
-        of them), and its unranked results to TOP."""
+        of them), and its unranked results to TOP. Each spot is stamped
+        with the report's schema_version (analyzer_schema_version, absent
+        before v3.11.0), which encounter_rated checks before any encounter
+        field is read."""
+        version = report.get("schema_version")
+        if isinstance(version, int) and not isinstance(version, bool):
+            for spot in self._spots(report):
+                spot["analyzer_schema_version"] = version
         rankings = report["rankings"]
         for name, ranked in list(rankings.items()):
             if isinstance(ranked, list):
@@ -823,6 +1164,7 @@ class FarmAnalyzer:
                 self.rejected_origins.add(origin)
                 origin = ""
                 report = await self._analyze(self.command(profile))
+            report = self._bounded(report)
         except asyncio.CancelledError:
             if self._process is not None and self._process.returncode is None:
                 self._process.kill()
@@ -833,6 +1175,7 @@ class FarmAnalyzer:
             log.warning("farming analyzer failed: %s", error)
         else:
             self.report = report
+            self.report_generation += 1
             self.profile = profile
             self.origin = origin
             self.status = "ready"
@@ -874,21 +1217,25 @@ class FarmAnalyzer:
             "profile": self.profile.describe() if self.profile else None,
             "approach_origin": self.origin or None,
             "rejected_origins": sorted(self.rejected_origins),
+            "encounter_error": self.encounter_error,
+            "encounter_running": self.encounter_running,
             "ranking": [
                 {**{key: item.get(key) for key in SUMMARY_FIELDS},
                  "approach_risky": risky_approach(item),
-                 "spot_risky": risky_spot(item)}
+                 "spot_risky": risky_spot(item),
+                 "encounter_warning": encounter_warning(item)}
                 for item in ranked[:5]
             ],
         }
 
     async def close(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._task, self._encounter_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
 
 async def run_periodically(analyzer: FarmAnalyzer, client, *, interval: float = 30.0) -> None:

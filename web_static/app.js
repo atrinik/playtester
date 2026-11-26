@@ -167,6 +167,16 @@ function spotLine(r) {
   if (!r.spot_risky && !seam) return "";
   return `<small class="${r.spot_risky ? "warn-text" : "muted"}" title="${r.spot_risky ? "One encounter is expected to cost more than her health bar: farmed only when no safe spot is usable" : "Neighbouring maps across a seam"}">Spot ${pct(r.spot_safety_score)} safe · pack ${Math.round(+r.max_aggro_pack || 0)}${seam}</small>`;
 }
+// Warn only: the analyzer's encounter model (schema 2) for her combat style,
+// flagged when farm_analyzer.encounter_warning (below 0.8 encounter safety
+// or above a bad pull of 6) names the spot.
+function encounterLine(r) {
+  if (!(+r.analyzer_schema_version >= 2 && r.encounter_applied === true)) return "";
+  const warn = !!r.encounter_warning;
+  const reasons = (Array.isArray(r.encounter_reasons) ? r.encounter_reasons : []).map(String).join("\n");
+  const title = (warn ? "Warning only: the choice is unchanged\n" : "") + reasons;
+  return `<small class="${warn ? "warn-text" : "muted"}" title="${esc(title)}">Encounters (${esc(r.encounter_style || "")}): ${pct(r.encounter_safety)} safe · pack ${(+r.expected_pack || 0).toFixed(1)}, bad pull ${Math.round(+r.worst_pack || 0)}${r.encounter_warning ? ` · ${esc(r.encounter_warning)}` : ""}</small>`;
+}
 function renderFarming() {
   const fa = slow.farming_analysis;
   if (!fa) return;
@@ -174,7 +184,7 @@ function renderFarming() {
   const status = $("#fa-status");
   status.classList.toggle("warn-text", fa.status === "failed" || fa.status === "unsupported");
   status.textContent = fa.running ? "Analyzing…"
-    : fa.status === "ready" ? `Updated ${since(fa.finished_at)} ago · ${fa.duration}s run`
+    : fa.status === "ready" ? `Updated ${since(fa.finished_at)} ago · ${fa.duration}s run${fa.encounter_error ? ` · encounter run failed: ${fa.encounter_error}` : ""}`
     : fa.status === "failed" ? `Last run failed: ${fa.error}`
     : fa.status === "unsupported" ? `Not analyzed: ${fa.error}`
     : fa.status === "unavailable" ? "Analyzer unavailable" : "Waiting for the first run";
@@ -188,7 +198,7 @@ function renderFarming() {
     ? `Farming for ${(fa.objectives || {})[fa.objective] || fa.objective} while depleted (${fa.objective_override.points} points); back to ${(fa.objectives || {})[chosen] || chosen} once cured. `
     : "";
   $("#fa-profile").textContent = override + (p
-    ? `Simulating ${p.skill} ${p.skill_level}${p.max_aggro_pack ? ` (≤${p.max_aggro_pack} aggro)` : ''} · ${p.spell_damage > 0 ? `spells only: ${p.spell_damage} ${p.spell_attack}/cast · ${p.cast_delay}s/cast · ${p.mana_cost} of ${p.max_mana} SP · ${p.mana_regen} SP/s` : `DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing`} · HP ${p.max_health} · AC ${p.armour_class}`
+    ? `Simulating ${p.skill} ${p.skill_level}${p.max_aggro_pack ? ` (≤${p.max_aggro_pack} aggro)` : ''} · ${p.spell_damage > 0 ? `spells only: ${p.spell_damage} ${p.spell_attack}/cast · ${p.cast_delay}s/cast · ${p.mana_cost} of ${p.max_mana} SP · ${p.mana_regen} SP/s` : `DAM ${p.damage} · WC ${p.weapon_class} · ${p.weapon_speed}s/swing`} · HP ${p.max_health} · AC ${p.armour_class}${p.combat_style ? ` · ${p.combat_style}, heals ${p.healing_per_second} HP/s, speed ${p.speed}` : ""}`
     : "") + (fa.approach_origin ? ` · approach from ${String(fa.approach_origin).replace(/^.*\//, "")}` : "");
   // Mark the spot autoplay farms; list it first when it ranks below the top five.
   const farmed = fa.farmed_spot;
@@ -201,6 +211,7 @@ function renderFarming() {
       <div class="spot-metrics"><span title="Estimated XP per hour">XP ${rate(r.xp_hour)}/h</span><span title="Estimated money per hour">${coins(r.money_hour, 2)}/h</span><span title="Estimated loot drops per hour">Loot ${rate(r.loot_hour)}/h</span><span title="Estimated incoming damage per clear">Danger ${Math.round(+r.danger || 0)}</span></div>
       ${approachLine(r, !!fa.approach_origin)}
       ${spotLine(r)}
+      ${encounterLine(r)}
       <small class="muted">${esc((r.monsters || []).slice(0, 5).join(", "))}${(r.monsters || []).length > 5 ? " …" : ""}</small>
     </div>`).join("") || '<span class="muted">No ranking yet.</span>';
   const learning = fa.self_improvement || {};
