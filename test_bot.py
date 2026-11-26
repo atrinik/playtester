@@ -22132,6 +22132,25 @@ class FarmAnalyzerTests(unittest.TestCase):
                                  for spot in analyzer._spots(analyzer.report)))
             self.assertTrue(analyzer.encounter_due(analyzer.profile))
             grind = analyzer.ranking("xp")[0]
+            # A process that exited but is not reaped yet refuses the kill
+            # (ProcessLookupError): the ranking still starts.
+
+            class Unreaped:
+                returncode = None
+
+                def kill(self):
+                    raise ProcessLookupError
+
+            analyzer._encounter_process = Unreaped()
+            analyzer._encounter_task = asyncio.get_running_loop().create_task(asyncio.sleep(30))
+            analyzer._last_attempt_at -= analyzer.REFRESH_SECONDS
+            analyzer.reported_at -= analyzer.REFRESH_SECONDS
+            self.assertTrue(analyzer.poll(client))
+            self.assertTrue(analyzer.running)
+            await analyzer._task
+            self.assertEqual(analyzer.status, "ready", analyzer.error)
+            analyzer._encounter_process = None
+            grind = analyzer.ranking("xp")[0]
             (package / "HANG").unlink()
             # An encounter run that outlives its ranking attaches nothing.
             await analyzer._run_encounters(analyzer.profile, generation)

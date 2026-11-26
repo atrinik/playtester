@@ -27,6 +27,7 @@ warn only (owner decision, 2026-11-25). A report without a schema version
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 from dataclasses import dataclass
 import json
@@ -978,10 +979,13 @@ class FarmAnalyzer:
                 profile.encounters_differ(self.encounter_profile))
 
     def _cancel_encounters(self) -> None:
-        """Kill a running encounter run's process and cancel its task."""
+        """Kill a running encounter run's process and cancel its task. A
+        process that has exited but is not reaped yet (returncode still
+        None) raises ProcessLookupError on kill; it needs none."""
         process = self._encounter_process
         if process is not None and process.returncode is None:
-            process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
         if self.encounter_running:
             self._encounter_task.cancel()
 
@@ -1003,7 +1007,8 @@ class FarmAnalyzer:
         except asyncio.CancelledError:
             if (self._encounter_process is not None and
                     self._encounter_process.returncode is None):
-                self._encounter_process.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    self._encounter_process.kill()
             raise
         except Exception as error:  # Warn only: the ranking stands.
             self.encounter_error = str(error)
@@ -1031,7 +1036,8 @@ class FarmAnalyzer:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(), self.TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
             await process.wait()
             raise RuntimeError(f"timed out after {self.TIMEOUT_SECONDS:.0f}s")
         if process.returncode != 0:
