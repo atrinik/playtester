@@ -105,3 +105,19 @@ class QuicHandshakeTimeoutTests(unittest.IsolatedAsyncioTestCase):
             silent.close()
         self.assertEqual(
             [context.get("message") for context in reported], [])
+
+    async def test_a_close_that_never_completes_is_bounded(self):
+        from unittest.mock import patch
+        from . import transport
+
+        class Writer:
+            def close(self):
+                pass
+
+        class Context:
+            async def __aexit__(self, *args):
+                await asyncio.sleep(3600)
+
+        stream = QuicStream(Context(), None, Writer())
+        with patch.object(transport, "CLOSE_TIMEOUT", 0.05):
+            await asyncio.wait_for(stream.close(), 2)

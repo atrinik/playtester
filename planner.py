@@ -172,6 +172,14 @@ def on_worker() -> bool:
     return worker_generation() is not None
 
 
+def busy() -> bool:
+    """Whether the worker is running a job or has jobs queued: a plan
+    submitted now would wait for them."""
+    current = _worker
+    return ((current is not None and current.future is not None) or
+            not _jobs.empty())
+
+
 def submit(fn: Callable[..., Any], /, *args: Any,
            priority: int = PRIORITY_OTHER,
            **kwargs: Any) -> concurrent.futures.Future:
