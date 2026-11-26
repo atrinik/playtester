@@ -1791,6 +1791,8 @@ class WebControlServer:
             # The operator retries a "get this build" errand that gave up.
             self.client.learn_errand_failed = ""
             self.client.learn_errand_failures = 0
+            # The circuit's own backoff ends too (_needs_learn_spell).
+            self.client.learn_errand_retry = True
             return {"ok": True}
         if kind == "chat":
             text = str(data.get("text", "")).strip()

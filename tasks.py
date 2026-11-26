@@ -2444,6 +2444,7 @@ class FarmTask(BotTask):
         # disengages), and a build's gear style replaces her training's.
         self.fielded_caster = False
         self.gear_style_override = ""
+        self._caster_dry_noted = False
         self.allow_launchers = (
             not bool(self.combat_spell)
             if allow_launchers is None else bool(allow_launchers))
@@ -7310,17 +7311,20 @@ class FarmTask(BotTask):
         engaged = next((entry for entry in threats
                         if entry[3].target_id == engaged_id), None)
         if (self.fielded_caster and nearest_threat is not None and
-                nearest_threat[0] <= 1 and self.spell_only_training(client) and
+                nearest_threat[0] <= 1 and active_threat(nearest_threat) and
+                recent_hostile_contact(client) and self.spell_only_training(client) and
                 (spell := self.combat_spell_item(client)) is not None and
                 not self.offensive_spell_affordable(client, spell)):
             # A fielded caster out of SP with a hostile in contact has
             # nothing to fight with: disengage, rather than kite slowly
             # until her mana regenerates.
             recorder = getattr(client, "record_action", None)
-            if recorder is not None:
+            if recorder is not None and not self._caster_dry_noted:
                 recorder("caster-out-of-mana", f"{spell.name}: disengaging")
+            self._caster_dry_noted = True
             await self.low_health_retreat(client)
             return
+        self._caster_dry_noted = False
         nearby_pack = [
             entry for entry in threats
             if entry[0] <= 4 and active_threat(entry)]

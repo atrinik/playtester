@@ -42013,6 +42013,30 @@ class BuildPerSpotTests(unittest.TestCase):
             restored.set_build_choice("/shattered_islands/world_17_72", "auto")
             self.assertEqual(restored.state.build_choices, {"*": "melee"})
 
+    def test_build_choices_keep_at_most_200_spots_and_every_spot(self):
+        from . import builds
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.set_build_choice(builds.EVERY_SPOT, "melee")
+            for index in range(builds.MAX_BUILD_CHOICES + 5):
+                client.set_build_choice(f"/spot_{index}", "bow")
+            self.assertEqual(len(client.state.build_choices), builds.MAX_BUILD_CHOICES)
+            self.assertEqual(client.state.build_choices["*"], "melee")
+            self.assertNotIn("/spot_0", client.state.build_choices)
+            # Memory written before the cap: the every-spot choice stays.
+            client._runtime_memory["Sera"]["build_choices"] = {
+                "*": "aoe", **{f"/old_{index}": "bow" for index in range(300)}}
+            client._persist_character_memory()
+            restored = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            restored.state.player_name = "Sera"
+            restored.load_character_memory("Sera")
+            self.assertEqual(len(restored.state.build_choices), builds.MAX_BUILD_CHOICES)
+            self.assertEqual(restored.state.build_choices["*"], "aoe")
+            self.assertIn("/old_299", restored.state.build_choices)
+
     def test_the_dashboard_sets_the_build_choice(self):
         client = AtrinikClient(ClientConfig())
         engine = TaskEngine(client)
@@ -42311,6 +42335,10 @@ class BuildPerSpotTests(unittest.TestCase):
         server = WebControlServer(real, TaskEngine(real), WorldGraph())
         self.assertEqual(asyncio.run(server._action({"type": "retry_learn"})), {"ok": True})
         self.assertEqual((real.learn_errand_failed, real.learn_errand_failures), ("", 0))
+        # The retry ends the circuit's own backoff too.
+        client.learn_errand_failed, client.learn_errand_retry = "", True
+        circuit._learn_retry_at = circuit.clock() + 3600.0
+        self.assertTrue(circuit._needs_learn_spell(client))
 
     def test_her_live_state_keeps_melee_on_a_melee_rated_spot(self):
         from . import builds
@@ -42457,9 +42485,15 @@ class BuildPerSpotTests(unittest.TestCase):
             await analyzer._encounter_task
             grind = analyzer.ranking("xp")[0]
             self.assertEqual(grind["encounter_style"], "melee")
-            # No magic bullet hit sampled yet: the caster is not rated.
+            # No magic bullet hit sampled yet: the caster is not rated, even
+            # while she fields it (its warnings come from her ordinary
+            # profile, kept as melee's).
             self.assertFalse(analyzer.poll(client))
             self.assertNotIn("single", analyzer.spot_ratings(grind))
+            client.active_build = "single"
+            self.assertFalse(analyzer.poll(client))
+            self.assertNotIn("single", analyzer.spot_ratings(grind))
+            client.active_build = "melee"
             # Sampled, at the next ranking it is, with its own profile.
             analyzer.samples_by_spell["magic bullet"] = [10, 12, 14]
             analyzer.attack_by_spell["magic bullet"] = "magic"

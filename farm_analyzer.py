@@ -896,6 +896,9 @@ class FarmAnalyzer:
         # profile her real numbers cannot describe is not rated. Per build:
         # the ranking it rated, when it last started and why it last failed.
         self.style_ratings: dict[str, dict[tuple, dict]] = {}
+        # The build the merged (warn-only) encounter run last rated for:
+        # another build she fields re-runs it.
+        self.encounter_key = "melee"
         self.style_generation: dict[str, int] = {}
         self._style_attempt_at: dict[str, float] = {}
         self.style_errors: dict[str, str] = {}
@@ -1132,9 +1135,19 @@ class FarmAnalyzer:
         per other build she can field."""
         builds = dict(getattr(client, "fieldable_builds", None) or {})
         current = str(getattr(client, "active_build", "") or "melee")
-        own = self._build_profile(client, current, builds.get(current, ""), profile) or profile
-        if self.encounter_due(own):
+        own = self._build_profile(client, current, builds.get(current, ""), profile)
+        if own is None:
+            # Her numbers cannot describe the build she fields yet: its
+            # warnings come from her ordinary profile, kept as melee's, and
+            # the build itself stays unrated.
+            self.style_ratings.pop(current, None)
+            own, current = profile, "melee"
+        if self.encounter_due(own) or (
+                self.encounter_key != current and self.report is not None and
+                not self.running and not self.encounter_running and
+                own.healing_per_second > 0):
             self._encounter_attempt_at = self.clock()
+            self.encounter_key = current
             self._encounter_task = asyncio.get_running_loop().create_task(
                 self._run_encounters(own, self.report_generation, key=current))
             return True

@@ -699,10 +699,16 @@ class AtrinikClient:
             self.state.farm_objective = (
                 objective if objective in OBJECTIVES else DEFAULT_OBJECTIVE)
             choices = record.get("build_choices", {})
-            self.state.build_choices = dict(list({
+            loaded = {
                 str(spot)[:300]: value for spot, value in choices.items()
                 if isinstance(spot, str) and value in builds.CHOICES
-            }.items())[-builds.MAX_BUILD_CHOICES:]) if isinstance(choices, dict) else {}
+            } if isinstance(choices, dict) else {}
+            # The most recent spots, never the every-spot choice dropped.
+            spots = [key for key in loaded if key != builds.EVERY_SPOT]
+            kept = spots[-(builds.MAX_BUILD_CHOICES - (builds.EVERY_SPOT in loaded)):]
+            self.state.build_choices = {
+                key: loaded[key] for key in loaded
+                if key == builds.EVERY_SPOT or key in set(kept)}
             try:
                 self.state.last_bank_deposit_at = max(
                     0.0, float(record.get("last_bank_deposit_at", 0.0)))

@@ -2111,7 +2111,8 @@ gap says so.
   child cast its spell with spells only (`FarmCircuitTask._build_spell`,
   `FarmTask.fielded_caster`); the circuit's training plan and its until
   levels stay as they were, and leaving the build ends it. Out of SP with
-  a hostile in contact, a fielded caster disengages (a `caster-out-of-mana`
+  an attacking hostile in contact (adjacent, and recent hostile contact),
+  a fielded caster disengages (a `caster-out-of-mana`
   decision and a retreat step) rather than kiting until her mana returns.
 - **Choosing.** The operator picks a build for the farmed spot (or a ranked
   one) or for every spot on the Farming tab ("Combat build"), kept in her
@@ -2123,8 +2124,10 @@ gap says so.
   other build, once per ranking, kept apart from the ranking). A build
   whose profile her real numbers cannot give (a spell never sampled, a
   launcher not examined, a bar that cannot pay the spell beyond the
-  healing reserve) is not rated, and only a rating `encounter_rated`
-  accepts counts. She fields the safest: a build without an encounter
+  healing reserve) is not rated, even while she fields it (its warn-only
+  run then uses her ordinary profile, kept as melee's), and only a rating
+  `encounter_rated` accepts counts. Fielding another build re-runs the
+  warn-only run for it. She fields the safest: a build without an encounter
   warning before one with, then the most XP; among warned builds the
   highest encounter safety. She keeps the build she fields unless another
   is safer (hers warns, the other does not, at once) or earns 20% more XP
@@ -2154,8 +2157,8 @@ gap says so.
   the strict route policy of the other optional errands. A failed trip
   waits on its own backoff (30 minutes, longer for a refused strict route);
   after three failed trips the errand gives up with a "Learn errand
-  failed" alert until the operator retries it (the alert's Retry button)
-  or the process restarts.
+  failed" alert until the operator retries it (the Farming tab's Retry,
+  which also ends the trip's backoff) or the process restarts.
 - **Swapping sets.** A build change that changes the gear style makes one
   apartment trip (`SwapSetTask`) when her chest holds, as her index knows
   it, a piece of the new style's set that beats what she wears, or the new

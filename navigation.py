@@ -10260,7 +10260,7 @@ class FarmCircuitTask(BotTask):
         if self._spell_shortfall:
             recorder("build-errand-funds", self._spell_shortfall)
 
-    def _field_build(self, client: AtrinikClient, name: str) -> None:
+    def _field_build(self, client: AtrinikClient, name: str, before: str = "") -> None:
         """Note the build she fields and its spell, on the client too (the
         analyzer rates her spot for it, and the next circuit starts with
         it); a change plans one swap trip (_plan_swap)."""
@@ -10271,7 +10271,7 @@ class FarmCircuitTask(BotTask):
         _set_attr(client, "active_build", name)
         if name != previous:
             _set_attr(client, "active_build_since", time.time())
-            self._plan_swap(client, previous)
+            self._plan_swap(client, previous, before)
             # A successor circuit takes over a swap not yet made.
             _set_attr(client, "pending_swap_build", self._swap_build)
 
@@ -10308,9 +10308,10 @@ class FarmCircuitTask(BotTask):
         if ((desired, build, spell) == (current, *made_for) or
                 self._busy_finishing_fight_or_loot(client, farm)):
             return False
+        before = self._build(client)
         self.combat_skill, self.combat_spell, target = desired
         self.combat_skill_until_level = target
-        self._field_build(client, build)
+        self._field_build(client, build, before)
         self.child = self._new_child()
         self._farm_started_at = 0.0
         self._empty_spawn_since = 0.0
@@ -11257,16 +11258,19 @@ class FarmCircuitTask(BotTask):
             _set_attr(client, "pending_swap_build", "")
         self._storage_swap = ""
 
-    def _plan_swap(self, client: AtrinikClient, previous: str = "melee") -> None:
+    def _plan_swap(self, client: AtrinikClient, previous: str = "melee",
+                   before: str = "") -> None:
         """After a build change, one apartment visit swaps her set
         (SwapSetTask), when the gear style changes and her chest holds,
         as her index knows it, a piece of the new style's set that beats
         what she wears, or the new build's consumables. Caster builds share
         one set, so AoE to single-target needs no trip."""
         style = self._build(client)
-        before = (builds.BUILDS[previous].gear_style if previous in builds.BUILDS and
-                  previous != "melee" else
-                  gear_style(self.combat_skill, self._trains_wizardry(client)))
+        # The gear style before the change (_review_combat_build passes it).
+        before = before or (
+            builds.BUILDS[previous].gear_style if previous in builds.BUILDS and
+            previous != "melee" else
+            gear_style(self.combat_skill, self._trains_wizardry(client)))
         rows = storage.stored(client.state)
         wanted: list[dict] = []
         if style != before:
@@ -12943,6 +12947,10 @@ class FarmCircuitTask(BotTask):
         (_spending_reserve). Until then the shortfall is shown on the
         dashboard ("need N for <spell> from <seller>"); the owner can drop
         gold on her. Given up after LEARN_ATTEMPTS failed trips."""
+        if getattr(client, "learn_errand_retry", False):
+            # The operator retried it from the dashboard.
+            _set_attr(client, "learn_errand_retry", False)
+            self._learn_retry_at = 0.0
         offer = self._learn_offer(client)
         if offer is None or getattr(client, "learn_errand_failed", ""):
             self._spell_shortfall = ""
