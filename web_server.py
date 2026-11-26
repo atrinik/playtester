@@ -19,8 +19,8 @@ from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                   POLICIES, RECOMMENDED_QUEST_ORDER)
 from .autoplay import AutoplayTask
 from .build_info import build_info
-from .farm_analyzer import (DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS, risky_approach,
-                            risky_spot)
+from .farm_analyzer import (DEFAULT_OBJECTIVE, OBJECTIVES, SUMMARY_FIELDS,
+                            encounter_warning, risky_approach, risky_spot)
 from . import self_improvement
 from .client import AtrinikClient, map_object_visual_name
 from .equipment import equipment_report
@@ -968,6 +968,8 @@ class DashboardState:
                 **{key: spot.get(key) for key in SUMMARY_FIELDS},
                 "approach_risky": risky_approach(spot),
                 "spot_risky": risky_spot(spot),
+                # Warn only (farm_analyzer.encounter_warning).
+                "encounter_warning": encounter_warning(spot),
                 "rank": (ranked.index(spot.get("path")) + 1
                          if spot.get("path") in ranked else None)}
         snapshot["objective_override"] = (

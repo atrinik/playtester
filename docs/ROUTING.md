@@ -1364,10 +1364,10 @@ category as the quarantines and `kit_hazard` filters that
   approach danger to it, and the lock carries it since v3.10.0. So `D(spot)`
   uses no content priors (4.5).
 - Since v3.11.0 (https://github.com/atrinik/tools/pull/35) the lock also
-  carries the analyzer's encounter model. Each run passes her combat style,
-  measured healing and speed, and the spot's own safety and pack cap read
-  the encounter fields (COMBAT.md, "Encounter-aware spot choice"). The
-  score's inputs (4.5) are unchanged.
+  carries the analyzer's encounter model. A separate encounter run passes
+  her combat style, measured healing and speed, and its fields only warn
+  (COMBAT.md, "Encounter warnings"); the ranking run passes no style, so
+  the analyzer's ranking and the score's inputs (4.5) are unchanged.
 - Savebed selection ranks beds by route cost, not tiles. The ship then counts
   for a Brynknot bed serving Asteria spots.
 - `_observe_farm_death` already blames the destination for a transit death

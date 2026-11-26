@@ -1957,28 +1957,38 @@ judge a map's and a circuit's pack, and its casters, in one coordinate
 frame with its tiled neighbours, the neighbours' spawns counted as
 uncleared, so its danger, pack filter and safety score agree with this.
 Then this post-adjustment goes.
-Analyzer v3.11.0 does this for every spot its encounter model rates
-([below](#encounter-aware-spot-choice-2026-11-25)), and for those the
-post-adjustment only annotates.
+Analyzer v3.11.0's encounter model counts those neighbours, but she reads
+it only to warn ([below](#encounter-warnings-2026-11-25)), so this
+post-adjustment stays.
 
-## Encounter-aware spot choice (2026-11-25)
+## Encounter warnings (2026-11-25)
 
 On 2026-11-25 she died four times in the Burnt Forest (level 37, 333
 health, a slash weapon, minor healing). Every Burnt Forest spot rated
 safety 1.0 and direct pack 1: authored spawns there stand more than three
-tiles apart, so the #130 pack cap of 2 never applied, while packs of three
-to eight formed from wanderers, engaged radii, chases and her own
-retreats. The locked analyzer is now atrinik/tools v3.11.0
-(https://github.com/atrinik/tools/pull/35), whose encounter model rates a
-map by the packs a pull really brings, for a combat style, against her
-health and healing.
+tiles apart, while packs of three to eight formed from wanderers, engaged
+radii, chases and her own retreats. The locked analyzer is now
+atrinik/tools v3.11.0 (https://github.com/atrinik/tools/pull/35), whose
+encounter model rates a map by the packs a pull really brings, for a
+combat style, against her health and healing.
 
-- **What she passes** (`CombatProfile.arguments`):
+Owner decision (2026-11-25), shown that ranking by it would cut her
+estimated XP from 6.1 to 0.76 million an hour: **keep the XP choice, warn
+only.** Her spot choice, risky floor, #130 pack cap and seam exposure are
+unchanged.
+
+- **Two runs** (`FarmAnalyzer._run`). With `--combat-style` the analyzer
+  lowers `spot_safety_score` to the lower of its older estimate and the
+  encounter safety, and with it `safety_score`, the balanced and safety
+  scores and those views' order; the older estimate is not reported
+  separately. So the ranking run, which she chooses by, passes no style.
+  A second, encounter run passes:
   - `--combat-style`: `melee` with a weapon, since she fights one target in
     place and `melee_kite` steps away only from a lone pursuer, standing when
     another hostile is close; `ranged-kite` while Wizardry trains with
-    spells only (`caster_kite` holds one target at range). She casts no
-    area spell, so never `aoe-kite`.
+    spells only (`caster_kite` holds one target at range; as
+    `FarmTask.spell_only_training`, once the spell fits beyond her healing
+    reserve). She casts no area spell, so never `aoe-kite`.
   - `--healing-per-second` (`healing_rate`): the median HP of her landed
     heal-spell casts (`FarmAnalyzer.heal_samples`, from "The spell heals
     you for N hp!" within 2 s of her FIRE of a healing spell she knows; an
@@ -1987,63 +1997,50 @@ health and healing.
     one lands about every swing (her weapon speed, or one second while she
     trains with spells, when the same SP also pays for her damage casts,
     so that estimate is optimistic) plus a one-second cast, and no faster
-    than her SP regeneration pays for. Until one heal lands it is 0. Her live heals had a
-    median of 12 HP (8 to 26), so with a 3 s weapon she passes 3 HP/s.
-  - `--character-speed`: her displayed speed, as before.
+    than her SP regeneration pays for. Until one heal lands it is 0. Her
+    live heals had a median of 12 HP (8 to 26), so with a 3 s weapon she
+    passes 3 HP/s. The ranking run passes it too; without a style it
+    changes no field she ranks by.
+  - `--character-speed`: her displayed speed, as both runs always did.
 
-  A 15% change in her healing, or another style, calls for a new run.
-- **What she reads**, only from a report with `"schema_version": 2`
-  (`FarmAnalyzer._bounded` stamps it on each spot as
-  `analyzer_schema_version`; `encounter_rated` also wants
-  `encounter_applied`). A report without it is read by its older fields.
-  - `spot_safety_score` is now the lower of the older estimate and the
-    encounter safety. That blend of the expected and the bad pull's cost is
-    never saturated at 1, so `risky_spot` uses `ENCOUNTER_SAFETY_FLOOR`
-    (0.8) for these spots. Below it, a spot comes after every safe one and
-    the cure-funding farm never takes it. Replayed below, every map she died
-    on rated 0.40 to 0.77.
-  - The #130 pack cap (`seam_adjusted`, `spot_pack`, `pack_cap`) reads the
-    bad pull (`worst_pack`) instead of `max_aggro_pack`, allowing
-    `BAD_PULL_PACK_FACTOR` (3) times `SINGLE_TARGET_MAX_AGGRO_PACK`: 6
-    whenever the profile caps its pack. While Wizardry trains (direct cap 1)
-    it stays 6, since `ranged-kite`'s wider bad-pull footprint would leave
-    almost no spot under 3. Her deaths were on maps with bad pulls of 7
-    and 8. `--max-aggro-pack` is still passed; the analyzer applies it to
-    the direct pack.
-  - The model already counts spawns on tiled neighbour maps within reach of
-    a pull, casters included. So [seam exposure](#safer-spot-choice-2026-11-23)
-    only raises the pack the cap reads and adds its flags and fields; it no
-    longer lowers the analyzer's safety again.
-  - The `farm-spot-selected` decision appends the style, encounter safety,
-    expected and bad pull's packs and the first three `encounter_reasons`.
-    The Farming tab's spot line shows the same, with every reason in its
-    tooltip.
+  A 15% change in her healing, or another style, calls for a new analysis.
+  Its encounter fields (`ENCOUNTER_FIELDS`) are copied onto the ranking
+  run's spots with the same path (`_merge_encounters`), and the report's
+  `schema_version` is stamped on each spot (`analyzer_schema_version`);
+  `encounter_rated` reads them only from schema 2 with `encounter_applied`.
+  A failed encounter run is logged and keeps the ranking.
+- **Warn only.** `farm-spot-selected` appends the style, encounter safety,
+  expected and bad pull's packs and the first three `encounter_reasons`.
+  When the chosen spot's encounter safety is under `ENCOUNTER_WARN_SAFETY`
+  (0.8) or its bad pull (`worst_pack`) over `ENCOUNTER_WARN_WORST_PACK` (6),
+  `encounter_warning` names it, the causes and its first two reasons in a
+  `farm-spot-encounter-warning` decision, and the dashboard raises a
+  `farm-encounter` warning alert until another spot is selected. The
+  Farming tab adds an "Encounters" line to each spot, flagged on the same
+  thresholds, with the reasons in its tooltip. Every map she died on rated
+  0.40 to 0.77 with bad pulls of 7 and 8; the maps whose bad pull stays
+  under four health bars rated 0.80 and up.
 
-A replay of her live state (2026-11-25, savebed `world_7_79`) through the
-bot's code path, with the locked analyzer v3.11.0, content v1.14.0, her
-kit, 3 HP/s healing and the world graph's seam exposure:
+A replay of her live state (savebed `world_7_79`, content v1.14.0, her kit
+at 3 HP/s) with the encounter model:
 
-- Every Burnt Forest circuit still leads the raw XP view, now at spot safety
-  0.40 to 0.46.
-- `world_17_72` (0.40, bad pull 8) and every spot containing it are left out
-  by the cap, as is `world_16_74` alone (0.77, bad pull 8). The three circuits
-  through `world_16_74` that stay under the cap are all risky.
-- Of the XP view's 29 kept spots, 16 stay under the cap. The first safe ones
-  are `world_19_76` (Eld Woods Island, L34, spot 0.80, pack 1.1, bad pull 3)
-  and `world_15_73` (Burnt Forest, 0.81, bad pull 5). She farms
-  `world_19_76`, at an estimated 0.76 million XP an hour against the
-  6.1 million of the Burnt Forest circuit she farmed.
-- At 4.25 HP/s (minor healing's mean 17 HP), `world_19_75` (0.82) joins them.
+- The Burnt Forest circuits she farms rate 0.40 to 0.46 with bad pulls of
+  3 to 8.
+- `world_17_72` rates 0.40 with a bad pull of 8, and `world_16_74` 0.77
+  with a bad pull of 8.
+- The best-rated XP spots, `world_19_76` (0.80, bad pull 3) and
+  `world_15_73` (0.81, bad pull 5), earn a fraction of the circuits' XP.
+
+She keeps farming the circuits, now with the warning.
 
 Accepted limits:
 
-- The floor and the factor are calibrated on one character and one zone, as
-  is the analyzer's model.
-- With her measured 3 HP/s, `world_19_76` sits right at the floor.
-- A heal near full health reports what it healed, not what it could, so the
-  median understates her healing.
-- The southern Burnt Forest maps (L27-30) are outside the analyzer's XP
-  filter at her level and are not ranked at all.
+- An analysis costs two analyzer processes (about 30 s each, `nice`d, at
+  most every ten minutes).
+- The thresholds are calibrated on one character and one zone, as is the
+  analyzer's model.
+- A heal near full health reports what it healed, not what it could, so
+  the median understates her healing.
 
 ## Packs on a walk: cornered and outclassed (2026-11-24)
 

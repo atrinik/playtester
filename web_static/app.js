@@ -161,21 +161,21 @@ function approachLine(r, fromBed) {
   return `<small class="${r.approach_risky ? "warn-text" : "muted"}" title="Spot safety ${pct(r.spot_safety_score)} · overall ${pct(r.safety_score)}${r.approach_risky ? " · farmed only when no spot with a safe approach is usable" : ""}">${text}</small>`;
 }
 // The spot's own safety, seam exposure included (farm_analyzer.seam_adjusted).
-// Rated by the analyzer's encounter model (schema 2), the expected and bad
-// pull's packs, with its reasons in the tooltip.
 function spotLine(r) {
   const seam = +r.seam_casters || +r.seam_aggressive_spawns
     ? ` · seam ${+r.seam_aggressive_spawns || 0} aggressive, ${+r.seam_casters || 0} casters` : "";
-  const encounter = +r.analyzer_schema_version >= 2 && r.encounter_applied === true;
-  if (!r.spot_risky && !seam && !encounter) return "";
-  const pack = encounter
-    ? `${esc(r.encounter_style || "")} pack ${(+r.expected_pack || 0).toFixed(1)}, bad pull ${Math.round(+r.worst_pack || 0)}`
-    : `pack ${Math.round(+r.max_aggro_pack || 0)}`;
-  const reasons = encounter ? (Array.isArray(r.encounter_reasons) ? r.encounter_reasons : []).map(String).join("\n") : "";
-  const title = r.spot_risky
-    ? `${encounter ? "Its encounters rate below her safety floor" : "One encounter is expected to cost more than her health bar"}: farmed only when no safe spot is usable`
-    : encounter ? "The analyzer's encounter model" : "Neighbouring maps across a seam";
-  return `<small class="${r.spot_risky ? "warn-text" : "muted"}" title="${esc(title + (reasons ? "\n" + reasons : ""))}">Spot ${pct(r.spot_safety_score)} safe · ${pack}${seam}</small>`;
+  if (!r.spot_risky && !seam) return "";
+  return `<small class="${r.spot_risky ? "warn-text" : "muted"}" title="${r.spot_risky ? "One encounter is expected to cost more than her health bar: farmed only when no safe spot is usable" : "Neighbouring maps across a seam"}">Spot ${pct(r.spot_safety_score)} safe · pack ${Math.round(+r.max_aggro_pack || 0)}${seam}</small>`;
+}
+// Warn only (farm_analyzer.encounter_warning): the analyzer's encounter model
+// (schema 2) for her combat style, flagged below 0.8 encounter safety or
+// above a bad pull of 6 (ENCOUNTER_WARN_SAFETY, ENCOUNTER_WARN_WORST_PACK).
+function encounterLine(r) {
+  if (!(+r.analyzer_schema_version >= 2 && r.encounter_applied === true)) return "";
+  const warn = (+r.encounter_safety || 0) < 0.8 || (+r.worst_pack || 0) > 6;
+  const reasons = (Array.isArray(r.encounter_reasons) ? r.encounter_reasons : []).map(String).join("\n");
+  const title = (warn ? "Warning only: the choice is unchanged\n" : "") + reasons;
+  return `<small class="${warn ? "warn-text" : "muted"}" title="${esc(title)}">Encounters (${esc(r.encounter_style || "")}): ${pct(r.encounter_safety)} safe · pack ${(+r.expected_pack || 0).toFixed(1)}, bad pull ${Math.round(+r.worst_pack || 0)}${r.encounter_warning ? ` · ${esc(r.encounter_warning)}` : ""}</small>`;
 }
 function renderFarming() {
   const fa = slow.farming_analysis;
@@ -211,6 +211,7 @@ function renderFarming() {
       <div class="spot-metrics"><span title="Estimated XP per hour">XP ${rate(r.xp_hour)}/h</span><span title="Estimated money per hour">${coins(r.money_hour, 2)}/h</span><span title="Estimated loot drops per hour">Loot ${rate(r.loot_hour)}/h</span><span title="Estimated incoming damage per clear">Danger ${Math.round(+r.danger || 0)}</span></div>
       ${approachLine(r, !!fa.approach_origin)}
       ${spotLine(r)}
+      ${encounterLine(r)}
       <small class="muted">${esc((r.monsters || []).slice(0, 5).join(", "))}${(r.monsters || []).length > 5 ? " …" : ""}</small>
     </div>`).join("") || '<span class="muted">No ranking yet.</span>';
   const learning = fa.self_improvement || {};

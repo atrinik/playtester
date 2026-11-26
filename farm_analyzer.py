@@ -12,11 +12,16 @@ judged from her savebed: the analyzer charges the maps crossed from there to
 the spot (approach danger) against her maximum health. One ``--ranking all`` run yields every objective, so switching the
 preferred objective never needs a new run.
 
-Since analyzer v3.11.0 (report ``schema_version`` 2) the run also names her
-combat style, measured healing and speed, so the analyzer's encounter model
-rates each spot by the packs a pull really brings (``spot_safety_score``,
-``expected_pack``, ``worst_pack``, ``encounter_reasons``). A report without a
-schema version (an older analyzer) is read by its older fields.
+Since analyzer v3.11.0 (report ``schema_version`` 2) each analysis is two
+processes. The ranking run passes no ``--combat-style``, so every field she
+chooses by (``safety_score``, ``spot_safety_score``, ``score`` and the views'
+order) is the analyzer's pre-encounter estimate: with a style the analyzer
+lowers those to its encounter safety. The encounter run then passes her
+combat style, measured healing and speed, and its encounter fields
+(``encounter_safety``, ``expected_pack``, ``worst_pack``,
+``encounter_reasons``, ...) are copied onto the ranked spots by path, to
+warn only (owner decision, 2026-11-25). A report without a schema version
+(an older analyzer) carries no encounter fields.
 """
 
 from __future__ import annotations
@@ -137,22 +142,23 @@ SEAM_REACH_TILES = 10
 SEAM_CASTER_DANGER = 20.0
 # The analyzer report schema that carries the encounter model's fields.
 ENCOUNTER_SCHEMA = 2
-# Below this encounter-aware spot safety (the analyzer's blend of the
-# expected pull's and the bad pull's cost against her health, which is
-# never saturated at 1) a spot counts as risky. With analyzer v3.11.0 and
-# her live kit (2026-11-25: level 37, 333 health, melee, 4.25 HP/s), every
-# Burnt Forest map she died on rated 0.40 to 0.77, and the maps whose bad
-# pull stays under four health bars rated 0.82 and up.
-ENCOUNTER_SAFETY_FLOOR = 0.8
-# A spot's bad pull (the analyzer's worst_pack: the engaged radius plus
-# every wanderer and ally call more likely than not to join) may hold at
-# most this many times SINGLE_TARGET_MAX_AGGRO_PACK whenever the profile
-# caps its pack. While Wizardry trains (cap 1) the same bad-pull cap
-# applies: ranged-kite's wider bad-pull footprint would leave almost no
-# spot under three. Live, on 2026-11-25,
-# she died on Burnt Forest maps of bad pull 7 and 8 (one treant is about
-# break-even for her heals, three are lethal without a recall).
-BAD_PULL_PACK_FACTOR = 3
+# Warn only (owner decision, 2026-11-25: keep the XP choice): the chosen
+# spot's encounter warning (encounter_warning) fires below this encounter
+# safety or above this bad pull (worst_pack). With analyzer v3.11.0 and her
+# live kit (2026-11-25: level 37, 333 health, melee, 3 HP/s) every Burnt
+# Forest map she died on rated 0.40 to 0.77 with bad pulls of 7 and 8; the
+# maps whose bad pull stays under four health bars rated 0.80 and up.
+ENCOUNTER_WARN_SAFETY = 0.8
+ENCOUNTER_WARN_WORST_PACK = 6
+# Encounter-model fields copied from the styled run onto the ranked spots
+# (FarmAnalyzer._merge_encounters). The ranking's own fields are untouched.
+ENCOUNTER_FIELDS = (
+    "encounter_style", "encounter_applied", "expected_pack",
+    "mean_expected_pack", "worst_pack", "encounter_need", "encounter_worst_need",
+    "encounter_safety", "encounter_expected_safety", "encounter_worst_safety",
+    "encounter_pull", "encounter_reasons", "wanderer_spawns", "caster_spawns",
+    "ranged_spawns", "linking_spawns", "spawn_density", "doorways", "seam_spawns",
+)
 
 # Fields copied from each ranked result into the dashboard snapshot.
 SUMMARY_FIELDS = (
@@ -226,8 +232,7 @@ def encounter_rated(spot: dict) -> bool:
 
 def spot_safety(spot: dict) -> float:
     """A ranked spot's own safety, without its approach: the analyzer's
-    spot_safety_score (v3.10.0; encounter-aware under a combat style since
-    v3.11.0), else its safety_score, else 1."""
+    spot_safety_score (v3.10.0), else its safety_score, else 1."""
     for key in ("spot_safety_score", "safety_score"):
         value = _number(spot.get(key))
         if value is not None:
@@ -235,40 +240,15 @@ def spot_safety(spot: dict) -> float:
     return 1.0
 
 
-def spot_pack(spot: dict) -> float:
-    """The pack a ranked spot's pull may bring, as the #130 pack cap reads
-    it: the analyzer's bad pull (worst_pack) when the encounter model rated
-    the spot, else its largest direct aggro pack (max_aggro_pack)."""
-    if encounter_rated(spot):
-        worst = _number(spot.get("worst_pack"))
-        if worst is not None:
-            return worst
-    return _number(spot.get("max_aggro_pack")) or 0.0
-
-
-def pack_cap(spot: dict, profile: "CombatProfile | None") -> int:
-    """The largest spot_pack the profile accepts; 0 allows any. A bad pull
-    (worst_pack, when spot_pack reads it) may hold BAD_PULL_PACK_FACTOR
-    times SINGLE_TARGET_MAX_AGGRO_PACK; a direct pack, the profile's
-    max_aggro_pack."""
-    cap = int(getattr(profile, "max_aggro_pack", 0) or 0)
-    if cap and encounter_rated(spot) and _number(spot.get("worst_pack")) is not None:
-        return BAD_PULL_PACK_FACTOR * SINGLE_TARGET_MAX_AGGRO_PACK
-    return cap
-
-
 def risky_spot(spot: dict) -> bool:
     """Whether one encounter at a ranked spot is expected to cost more than
-    her whole health bar (its own safety below APPROACH_SAFETY_FLOOR), or,
-    rated by the encounter model, its safety is below
-    ENCOUNTER_SAFETY_FLOOR.
+    her whole health bar (its own safety below APPROACH_SAFETY_FLOOR).
 
     Autoplay prefers spots that are neither this nor risky_approach. Live,
     on 2026-11-23, she farmed the XP view's first spot, an Underground City
     circuit of spot safety 0.95, and died there to three attackers at once.
     """
-    floor = ENCOUNTER_SAFETY_FLOOR if encounter_rated(spot) else APPROACH_SAFETY_FLOOR
-    return spot_safety(spot) < floor
+    return spot_safety(spot) < APPROACH_SAFETY_FLOOR
 
 
 def encounter_summary(spot: dict, reasons: int = 3) -> str:
@@ -286,6 +266,28 @@ def encounter_summary(spot: dict, reasons: int = 3) -> str:
     listed = [str(reason) for reason in (spot.get("encounter_reasons") or ())
               if isinstance(reason, str)][:reasons]
     return text + (": " + "; ".join(listed) if listed else "")
+
+
+def encounter_warning(spot: dict, reasons: int = 2) -> str:
+    """Why the encounter model warns about a ranked spot, or "" when it
+    does not (or did not rate it): its encounter safety under
+    ENCOUNTER_WARN_SAFETY or its bad pull over ENCOUNTER_WARN_WORST_PACK.
+    Warn only: nothing reads it to choose a spot."""
+    if not encounter_rated(spot):
+        return ""
+    safety = _number(spot.get("encounter_safety"))
+    worst = _number(spot.get("worst_pack"))
+    causes = []
+    if safety is not None and safety < ENCOUNTER_WARN_SAFETY:
+        causes.append(f"encounter safety {safety:.2f} < {ENCOUNTER_WARN_SAFETY:g}")
+    if worst is not None and worst > ENCOUNTER_WARN_WORST_PACK:
+        causes.append(f"bad pull {worst:g} > {ENCOUNTER_WARN_WORST_PACK}")
+    if not causes:
+        return ""
+    listed = [str(reason) for reason in (spot.get("encounter_reasons") or ())
+              if isinstance(reason, str)][:reasons]
+    return (f"{spot.get('name', '?')}: " + ", ".join(causes) +
+            (": " + "; ".join(listed) if listed else ""))
 
 
 @dataclass(frozen=True)
@@ -310,8 +312,7 @@ class SeamExposure:
 def seam_adjusted(spot: dict, exposure: SeamExposure,
                   profile: "CombatProfile | None") -> dict | None:
     """A ranked spot with its seam exposure folded in, or None when its
-    pack (spot_pack), the exposed one included, exceeds the profile's
-    pack_cap.
+    pack, the exposed one included, exceeds the profile's max_aggro_pack.
 
     The analyzer scores a circuit from its own maps alone, and judges its
     pack per map. Live, on 2026-11-23, it rated the Underground City circuit
@@ -325,31 +326,22 @@ def seam_adjusted(spot: dict, exposure: SeamExposure,
     monster times the pack, plus SEAM_CASTER_DANGER per seam caster);
     ``safety_score`` is at most that. A spot nothing reaches is returned
     as it is.
-
-    A spot the encounter model rated (encounter_rated) is capped by its
-    bad pull (worst_pack) instead, and keeps the analyzer's safety: that
-    model already counts the spawns on tiled neighbour maps within reach
-    of a pull, casters included, so the exposure only annotates it.
     """
-    encounter = encounter_rated(spot)
-    ranked_pack = spot_pack(spot)
+    ranked_pack = _number(spot.get("max_aggro_pack")) or 0.0
     pack = max(ranked_pack, float(exposure.pack))
-    cap = pack_cap(spot, profile)
+    cap = int(getattr(profile, "max_aggro_pack", 0) or 0)
     if cap and pack > cap:
         return None
     if exposure.aggressive <= 0 and exposure.pack <= 0:
         return spot
     adjusted = dict(spot)
     adjusted.update(
+        max_aggro_pack=pack, analyzer_max_aggro_pack=ranked_pack,
         seam_aggressive_spawns=exposure.aggressive,
         seam_casters=exposure.casters, seam_maps=list(exposure.maps))
-    if not encounter:
-        adjusted.update(max_aggro_pack=pack, analyzer_max_aggro_pack=ranked_pack)
     if exposure.casters:
         adjusted["danger_flags"] = [
             *(spot.get("danger_flags") or ()), f"seam caster×{exposure.casters}"]
-    if encounter:
-        return adjusted
     danger = _number(spot.get("danger"))
     health = float(getattr(profile, "max_health", 0) or 0)
     if danger is not None and health > 0 and (
@@ -429,7 +421,10 @@ class CombatProfile:
     combat_style: str = ""
     healing_per_second: float = 0.0
 
-    def arguments(self) -> list[str]:
+    def arguments(self, styled: bool = True) -> list[str]:
+        """The analyzer's profile arguments; without ``styled`` (the
+        ranking run) no --combat-style, which would change the fields she
+        ranks by."""
         if self.spell_damage > 0:
             args = [
                 str(self.skill_level),
@@ -461,8 +456,9 @@ class CombatProfile:
         if self.max_aggro_pack:
             args += ["--max-aggro-pack", str(self.max_aggro_pack)]
         if self.combat_style:
-            args += ["--combat-style", self.combat_style,
-                     "--healing-per-second", f"{self.healing_per_second:g}"]
+            if styled:
+                args += ["--combat-style", self.combat_style]
+            args += ["--healing-per-second", f"{self.healing_per_second:g}"]
         return args
 
     def materially_differs(self, other: "CombatProfile | None") -> bool:
@@ -759,6 +755,8 @@ class FarmAnalyzer:
         self.spell_samples: list[int] = []
         self.spell_attack = ""
         self.spell_name = ""
+        # Why the last encounter run failed ("" when it did not).
+        self.encounter_error = ""
         # HP of her recent landed heal-spell casts (healing_rate).
         self.heal_samples: list[int] = []
         self._message_position = 0
@@ -797,11 +795,13 @@ class FarmAnalyzer:
             return ""
         return path
 
-    def command(self, profile: CombatProfile, origin: str = "") -> list[str]:
+    def command(self, profile: CombatProfile, origin: str = "", *,
+                styled: bool = False) -> list[str]:
         """The isolated analyzer invocation for one profile.
 
         With an ``origin`` (her savebed map) the approach to every spot is
-        judged from there alone, as she actually travels.
+        judged from there alone, as she actually travels. ``styled`` is the
+        encounter run (CombatProfile.arguments).
         """
         bootstrap = (
             "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); "
@@ -809,7 +809,7 @@ class FarmAnalyzer:
             "runpy.run_module('farming_analyzer', run_name='__main__', alter_sys=True)")
         command = [
             self.python, "-E", "-s", "-c", bootstrap, str(self.analyzer_root),
-            *profile.arguments(),
+            *profile.arguments(styled),
             "--content-root", str(self.content_root),
             "--server-root", str(self.server_root),
             "--ranking", "all", "--top", str(max(self.TOP, self.SAFETY_TOP)),
@@ -950,7 +950,41 @@ class FarmAnalyzer:
         if not isinstance(rankings, dict) or not all(
                 isinstance(rankings.get(name), list) for name in OBJECTIVES):
             raise RuntimeError("report has no ranking for every objective")
-        return self._bounded(report)
+        return report
+
+    @staticmethod
+    def _merge_encounters(report: dict, styled: dict) -> dict:
+        """Copy the encounter run's ENCOUNTER_FIELDS onto the ranking run's
+        spots with the same path, and its schema_version onto the report.
+        Nothing else of the ranking changes. A spot the encounter run did not
+        list keeps the ranking run's unapplied (encounter_applied false)
+        fields."""
+        version = styled.get("schema_version")
+        if not (isinstance(version, int) and not isinstance(version, bool)):
+            return report
+        found: dict[str, dict] = {}
+        for spot in [*(spot for ranked in styled["rankings"].values()
+                       if isinstance(ranked, list) for spot in ranked),
+                     *(styled.get("results") or ())]:
+            if isinstance(spot, dict) and isinstance(spot.get("path"), str):
+                found.setdefault(spot["path"], spot)
+        for spot in FarmAnalyzer._spots(report):
+            source = found.get(spot.get("path"))
+            if source is not None:
+                spot.update({key: source[key] for key in ENCOUNTER_FIELDS
+                             if key in source})
+        report["schema_version"] = version
+        return report
+
+    @staticmethod
+    def _spots(report: dict) -> list[dict]:
+        """Every spot dict of a report: rankings, results, representatives."""
+        return [spot for spot in [
+            *(spot for ranked in report["rankings"].values()
+              if isinstance(ranked, list) for spot in ranked),
+            *(report.get("results") or ()),
+            *(group.get("representative") for group in report.get("groups") or ()
+              if isinstance(group, dict))] if isinstance(spot, dict)]
 
     @staticmethod
     def circuit_area(spot) -> tuple[str, str] | None:
@@ -987,13 +1021,8 @@ class FarmAnalyzer:
         field is read."""
         version = report.get("schema_version")
         if isinstance(version, int) and not isinstance(version, bool):
-            for spot in [*(spot for ranked in report["rankings"].values()
-                           if isinstance(ranked, list) for spot in ranked),
-                         *(report.get("results") or ()),
-                         *(group.get("representative") for group in report.get("groups") or ()
-                           if isinstance(group, dict))]:
-                if isinstance(spot, dict):
-                    spot["analyzer_schema_version"] = version
+            for spot in self._spots(report):
+                spot["analyzer_schema_version"] = version
         rankings = report["rankings"]
         for name, ranked in list(rankings.items()):
             if isinstance(ranked, list):
@@ -1020,6 +1049,20 @@ class FarmAnalyzer:
                 self.rejected_origins.add(origin)
                 origin = ""
                 report = await self._analyze(self.command(profile))
+            if profile.combat_style:
+                # Warn only: a failed encounter run keeps the ranking.
+                try:
+                    styled = await self._analyze(
+                        self.command(profile, origin, styled=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self.encounter_error = str(error)
+                    log.warning("farming analyzer encounter run failed: %s", error)
+                else:
+                    self.encounter_error = ""
+                    report = self._merge_encounters(report, styled)
+            report = self._bounded(report)
         except asyncio.CancelledError:
             if self._process is not None and self._process.returncode is None:
                 self._process.kill()
@@ -1071,6 +1114,7 @@ class FarmAnalyzer:
             "profile": self.profile.describe() if self.profile else None,
             "approach_origin": self.origin or None,
             "rejected_origins": sorted(self.rejected_origins),
+            "encounter_error": self.encounter_error,
             "ranking": [
                 {**{key: item.get(key) for key in SUMMARY_FIELDS},
                  "approach_risky": risky_approach(item),
