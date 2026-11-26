@@ -3527,8 +3527,9 @@ class FarmTask(BotTask):
             dry = (castable and cost > sp - reserve and
                    not ManaCrystal.has_charge(client))
             engaged_id = self._engaged_target[0] if self._engaged_target else None
-            if engaged_id is not None or recent_hostile_contact(client):
-                # A fight: the dry rest's stall clock counts quiet rest only.
+            if recent_hostile_contact(client):
+                # A fight: the dry rest's stall clock counts quiet rest only
+                # (the rest gate resets it for a visible engagement too).
                 self._dry_rest_sp = None
             if (self._caster_dry and castable and sp < maxsp and
                     ((engaged_id is not None and engaged_id == self._dry_target) or
