@@ -28923,10 +28923,10 @@ class EquipmentTests(unittest.TestCase):
         # Body armour: the name-based score values the chain mail's quality
         # and the ring mail's "+2" alike and keeps what she wears; effective
         # stats count the ring mail's better impact protection, and the
-        # chain mail's speed cap 0.80 slows her from 0.85 (-0.05, 75 points)
+        # chain mail's speed cap 0.80 slows her from 0.85 (-0.05, 30 points)
         # where the ring mail's 0.90 does not.
         self.assertEqual(client.recorded, [("gear-shadow", (
-            "body armour: name scoring keeps silksteel chain mail +1 (old 463, new 665); "
+            "body armour: name scoring keeps silksteel chain mail +1 (old 463, new 710); "
             "gear scorer puts on black iron ring mail +2 (old 456, new 780)"))])
         # Logged once per change, not on every call.
         count = len(client.recorded)
@@ -29437,14 +29437,14 @@ class GearScorerTests(unittest.TestCase):
         self.assertEqual(task._upgrade_score(client, stock), 174 - 51)
 
     def test_capped_armours_still_rank_below_zero(self):
-        # A 0.60 cap costs more than either armour gives: values are signed,
+        # A 0.30 cap costs more than either armour gives: values are signed,
         # so the better plate still beats the scale mail.
         from .tasks import InventoryPolicy, gear_scorer
         worn = self.examined(3, c.TYPE_ARMOUR, "scale mail",
-                             "scale mail (speed cap 0.60) (ac+6) (Protections: slash +20%)",
+                             "scale mail (speed cap 0.30) (ac+6) (Protections: slash +20%)",
                              worn=True)
         plate = self.examined(4, c.TYPE_ARMOUR, "plate mail",
-                              "plate mail (speed cap 0.60) (ac+8) (Protections: slash +30%)")
+                              "plate mail (speed cap 0.30) (ac+8) (Protections: slash +30%)")
         client = self.client(worn, plate, equipment={c.EQUIP_ARMOUR: 3})
         scorer = gear_scorer(client, InventoryPolicy())
         self.assertLess(scorer.value(worn), 0)
@@ -29526,7 +29526,9 @@ class GearScorerTests(unittest.TestCase):
     def test_an_empty_body_slot_takes_armour_whatever_its_cap(self):
         from .equipment import NO_RECALL_SPEED_FACTOR, SPEED_WEIGHT
         from .tasks import InventoryPolicy, gear_scorer
-        self.assertEqual((SPEED_WEIGHT, NO_RECALL_SPEED_FACTOR), (1500, 1.5))
+        # Owner decision: +0.1 speed is worth +3 AC (3 x 20 = 60 points).
+        self.assertEqual((SPEED_WEIGHT, NO_RECALL_SPEED_FACTOR), (600, 1.5))
+        self.assertEqual(0.1 * SPEED_WEIGHT, 3 * 20)
         mail = self.examined(2, c.TYPE_ARMOUR, "heavy mail",
                              "heavy mail (speed cap 0.40) (ac+2) (Protections: slash +5%)")
         client = self.client(mail)
@@ -29614,7 +29616,7 @@ class GearScorerTests(unittest.TestCase):
         # Counted again: AC +4 against its 0.50 cap (no recall here: the
         # speed weight is 1.5 times SPEED_WEIGHT).
         weight = one_handed._speed_weight()
-        self.assertEqual(weight, 2250)
+        self.assertEqual(weight, 900)
         self.assertEqual(one_handed.value(shield), round(80 - (0.875 - 0.5) * weight))
         # A two-handed candidate is charged the shield it switches off
         # (AC +4, 80) and credited the cap it lifts.
@@ -29625,6 +29627,60 @@ class GearScorerTests(unittest.TestCase):
         lifted = (0.875 - 0.5) * weight
         self.assertAlmostEqual(scorer.value(two) - scorer.value(halberd), lifted - 80,
                                delta=1)
+
+    def test_a_bow_under_a_two_handed_weapon_pays_for_no_shield(self):
+        # The shield is off already under the worn two-handed weapon: a
+        # two-handed launcher switches nothing more off.
+        from .tasks import InventoryPolicy, gear_scorer
+        halberd = self.examined(1, c.TYPE_WEAPON, "halberd", "halberd (dam+9) (3.00 sec)",
+                                worn=True)
+        halberd.flags |= c.ITEM_WEAPON_2H | c.ITEM_LOCKED
+        shield = self.examined(2, c.TYPE_SHIELD, "tower shield", "tower shield (ac+4)",
+                               worn=True)
+        shield.flags |= c.ITEM_LOCKED
+        bow = self.examined(3, c.TYPE_BOW, "long bow", "long bow (dam+2) (delay+1.0s)")
+        bow.flags |= c.ITEM_WEAPON_2H
+        client = self.client(halberd, shield, bow,
+                             equipment={c.EQUIP_WEAPON: 1, c.EQUIP_SHIELD: 2})
+        policy = InventoryPolicy()
+        scorer = gear_scorer(client, policy)
+        self.assertEqual(scorer._value(bow), scorer._value(bow, shield_rule=False))
+        self.assertTrue(scorer.beats(bow, [])[0])
+        task = FarmTask()
+        task.allow_launchers = True
+        self.assertTrue(asyncio.run(task.maintain_inventory(client)))
+        self.assertEqual(client.applied, [3])
+        # The shop: the same stock bow is an upgrade over nothing.
+        client.state.remove_item(bow.tag)
+        stock = self.examined(5, c.TYPE_BOW, "long bow", "long bow (dam+2) (delay+1.0s)")
+        stock.flags |= c.ITEM_UNPAID | c.ITEM_WEAPON_2H
+        client.state.place_item(stock, 0)
+        expected = gear_scorer(client, policy).value(stock)
+        self.assertGreater(BuyShopUpgradeTask()._upgrade_score(client, stock), 0)
+        self.assertEqual(BuyShopUpgradeTask()._upgrade_score(client, stock), expected)
+
+    def test_the_shops_free_ring_baseline_is_a_wearable_spare(self):
+        from .tasks import CasterProfile
+        worn = self.examined(1, c.TYPE_RING, "ring (Protections: fire +20%)",
+                             "ring (Protections: fire +20%)", worn=True)
+        cursed = self.examined(2, c.TYPE_RING, "ring (Protections: acid +30%)",
+                               "ring (Protections: acid +30%)")
+        cursed.flags |= c.ITEM_CURSED
+        high = self.examined(3, c.TYPE_RING, "ring (Protections: cold +30%)",
+                             "ring (Protections: cold +30%)", required_level=90)
+        client = self.client(worn, cursed, high, equipment={c.EQUIP_RING_RIGHT: 1})
+        stock = Item(5, flags=c.ITEM_UNPAID, item_type=c.TYPE_RING, quality=80,
+                     condition=100, name="ring (Protections: acid +9%)")
+        client.state.place_item(stock, 0)
+        self.assertEqual(BuyShopUpgradeTask()._upgrade_score(client, stock), 9 * 8)
+        # A caster: a usable spare with protection is the baseline, and a
+        # free slot adds no displacement margin on top.
+        spare = self.examined(4, c.TYPE_RING, "ring (Protections: slow +3%)",
+                              "ring (Protections: slow +3%)")
+        client.state.place_item(spare, 1)
+        caster = BuyShopUpgradeTask(caster_stats=True)
+        caster.policy.caster_profile = CasterProfile.from_client(client)
+        self.assertEqual(caster._upgrade_score(client, stock), 9 * 8 - 3 * 8)
 
     def test_a_family_is_ordered_on_one_scale(self):
         from .tasks import InventoryPolicy, carried_gear_score, gear_scorer

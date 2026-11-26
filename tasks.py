@@ -8028,9 +8028,13 @@ class BuyShopUpgradeTask(BotTask):
             # A free slot (the second ring): nothing worn is displaced; a
             # spare she already carries is the baseline, so she never buys
             # what the equip loop declined to wear.
+            # Only a spare the equip loop could wear (its filters).
+            level = int(client.state.stats.get("level", 0) or 0)
             current = [item for item in client.state.inventory
                        if item.item_type == candidate.item_type and
-                       not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID) and
+                       not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID |
+                                         c.ITEM_CURSED | c.ITEM_DAMNED) and
+                       item.required_level <= level and
                        self.policy.identified(item)]
         mine, theirs, effective = scorer.compare(candidate, current)
         scored = list(zip(theirs, current))
@@ -8039,8 +8043,9 @@ class BuyShopUpgradeTask(BotTask):
         improvement = mine - (baseline[0] if baseline is not None else 0)
         # Once she is loaded, GearScorer charges the stock's weight
         # (weight_cost): a purchase adds it; what she owns stays carried.
+        # A free slot displaces nothing, so no caster displacement margin.
         margin = (scorer.displacement_margin(baseline[1], effective)
-                  if baseline is not None else 0)
+                  if baseline is not None and not free else 0)
         return (improvement if improvement >= self.min_improvement + margin
                 else -1)
 
