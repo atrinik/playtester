@@ -88,12 +88,15 @@ def safe_square_route(node, start: tuple[int, int], goals, *,
                       max_nodes: int = SAFE_ROUTE_NODES,
                       radius: int = SAFE_ROUTE_RADIUS,
                       best: Callable[[tuple[int, int]], Any] | None = None,
+                      soft=(), stop_at: Any = None,
                       ) -> list[tuple[int, int]] | None:
     """The cheapest walk from ``start`` to the nearest of ``goals`` on
     ``node`` (world squares), or None. With ``best`` instead, the walk to
     the square it scores highest of all the search settles (``goals``
     then only limits which squares may end it; empty for any), the
-    cheaper of equal ones.
+    cheaper of equal ones; the search ends at the first square scoring
+    ``stop_at`` or more, when given. ``soft`` (world x, y, radius, cost) adds
+    ``cost`` to each square within the radius instead of walling it.
 
     Steps are 8-way over authored walkable squares, static occupants,
     ``blocked`` squares and the threats' own squares excluded. A square
@@ -130,6 +133,13 @@ def safe_square_route(node, start: tuple[int, int], goals, *,
                          for hy in range(y - r, y + r + 1))
     beside = {(x + dx, y + dy) for x, y in threats
               for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+    extra: dict[tuple[int, int], int] = {}
+    for x, y, r, weight in soft:
+        if max(abs(start[0] - x), abs(start[1] - y)) > radius + r:
+            continue
+        for hx in range(x - r, x + r + 1):
+            for hy in range(y - r, y + r + 1):
+                extra[(hx, hy)] = max(extra.get((hx, hy), 0), int(weight))
 
     def walk(end):
         path = [end]
@@ -152,6 +162,8 @@ def safe_square_route(node, start: tuple[int, int], goals, *,
                 score = best(current)
                 if chosen is None or score > chosen[0]:
                     chosen = (score, current)
+                if stop_at is not None and score >= stop_at:
+                    return walk(current)
         elif current in goal_set:
             return walk(current)
         for dx, dy in c.DIRECTION_DELTAS.values():
@@ -162,7 +174,8 @@ def safe_square_route(node, start: tuple[int, int], goals, *,
                     or nxt in excluded or nxt in hazardous or
                     not node.walkable(*nxt, allow_locked=allow_locked)):
                 continue
-            step = cost + 1 + (SAFE_ROUTE_BESIDE_COST if nxt in beside else 0)
+            step = (cost + 1 + extra.get(nxt, 0) +
+                    (SAFE_ROUTE_BESIDE_COST if nxt in beside else 0))
             if step < costs.get(nxt, step + 1):
                 costs[nxt] = step
                 parents[nxt] = current
@@ -2600,6 +2613,8 @@ class FarmTask(BotTask):
         # The last safe-square route a retreat took: (goal kind, goal,
         # steps), for its retreat-choice record.
         self._safe_route_note: tuple[str, tuple[int, int], int] | None = None
+        # The inputs of the last safe-square search that found no route.
+        self._safe_route_miss: tuple | None = None
         self._priority_target_ids: dict[int, int] = {}
         # Set by the farm circuit while autoplay's switch to its recovery
         # phase waits for this fight: finish the engaged target and fight
@@ -6101,17 +6116,26 @@ class FarmTask(BotTask):
             # side included) or the breakout decides, not a shuffle to the
             # next such square.
             return None
-        route = None
-        kind = ""
-        for kind, goals in (("safe", remembered), ("exit", exits)):
-            route = safe_square_route(
-                node, start, goals, threats=threat_world,
-                hazards=hazard_world, blocked=blocked)
-            if route is not None and len(route) >= 2:
-                break
-            route = None
-        if route is None:
+        # One search a call: the remembered squares outrank the exits,
+        # the nearer of each first. A miss is kept until her square, the
+        # threats or the goals change, so a cornered retreat does not
+        # search again every tick.
+        remembered_set = set(remembered)
+        if not remembered_set and not exits:
             return None
+        key = (m.path, start, tuple(sorted(threat_world)),
+               tuple(sorted(hazard_world)), frozenset(remembered_set),
+               frozenset(exits), frozenset(blocked))
+        if key == self._safe_route_miss:
+            return None
+        route = safe_square_route(
+            node, start, remembered_set | exits, threats=threat_world,
+            hazards=hazard_world, blocked=blocked,
+            best=lambda point: int(point in remembered_set), stop_at=1)
+        if route is None or len(route) < 2:
+            self._safe_route_miss = key
+            return None
+        kind = "safe" if route[-1] in remembered_set else "exit"
         world_x, world_y = route[1]
         dx, dy = world_x - start[0], world_y - start[1]
         direction = next((value for value, delta in

@@ -43234,12 +43234,15 @@ class SafeRetreatTests(unittest.TestCase):
             walk._pursuit_samples[target_id] = collections.deque(
                 [(then, m.path, x - back, y, distance)], maxlen=64)
 
+    PASSAGE = {(x, y): 0 if 20 <= x <= 22 and y != 12 else 1
+               for x in range(24) for y in range(24)}
+
     def test_two_followers_near_the_spot_are_fought_at_a_doorway(self):
-        # A wall at x 21 with a one-wide gap at (21, 12): a doorway on the
-        # last leg. Two treants follow her from the west.
-        terrain = {(x, y): 0 if x == 21 and y != 12 else 1
-                   for x in range(24) for y in range(24)}
-        client, walk = self._approach(terrain=terrain)
+        # A wall three thick (x 20 to 22) with a one-wide passage at y 12:
+        # its middle square (21, 12) is a corridor only one attacker per
+        # side reaches, on the last leg. Two treants follow her from the
+        # west; she is at the passage's mouth.
+        client, walk = self._approach(terrain=self.PASSAGE)
         m = client.state.map
         m.world_x, m.world_y = 20, 12
         monsters = [(100, 15, 12), (101, 13, 12)]
@@ -43247,7 +43250,7 @@ class SafeRetreatTests(unittest.TestCase):
         self._followed(walk, client, monsters)
         self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
         self.assertIn("approach-stand", [a for a, _ in client.recorded])
-        # Not onward to the farm: into the doorway, and no fight yet.
+        # Not onward to the farm: into the passage, and no fight yet.
         self.assertEqual(len(client.direct_moves), 1)
         self.assertEqual(c.DIRECTION_DELTAS[client.direct_moves[0][0]],
                          (1, 0))
@@ -43283,9 +43286,7 @@ class SafeRetreatTests(unittest.TestCase):
         # Both followers within 4 tiles of her in the doorway: the pack
         # split's retreat step would give the doorway up. She holds it,
         # combat state untouched by a retreat, and the walk waits.
-        terrain = {(x, y): 0 if x == 21 and y != 12 else 1
-                   for x in range(24) for y in range(24)}
-        client, walk = self._approach(terrain=terrain)
+        client, walk = self._approach(terrain=self.PASSAGE)
         m = client.state.map
         m.world_x, m.world_y = 21, 12
         monsters = [(100, 19, 12), (101, 18, 12)]
@@ -43320,6 +43321,7 @@ class SafeRetreatTests(unittest.TestCase):
         self.assertEqual(walk.status, TaskStatus.FAILED)
         self.assertIn("approach-train-held", [a for a, _ in client.recorded])
         walk.status = TaskStatus.RUNNING
+        walk.train_held = False
         walk._stand_since = time.monotonic() - walk.APPROACH_STAND_SECONDS - 1
         # Two past the limit: the walk goes on.
         monsters = monsters[:2]
@@ -43333,6 +43335,159 @@ class SafeRetreatTests(unittest.TestCase):
                            .objects.values())))
                 for _, x, y in monsters]), []), "")
         self.assertGreater(walk._stand_cooldown_until, 0.0)
+
+    def test_a_gap_in_a_thin_wall_is_no_doorway_to_hold(self):
+        # Open on its diagonals, three attackers a side reach it.
+        terrain = {(x, y): 0 if x == 21 and y != 12 else 1
+                   for x in range(24) for y in range(24)}
+        client, walk = self._approach(terrain=terrain)
+        node = walk.navigation.graph.nodes["/road"]
+        self.assertFalse(walk._defensible(client, node, (21, 12)))
+        node.terrain = dict(self.PASSAGE)
+        walk._feature_cache.clear()
+        self.assertTrue(walk._defensible(client, node, (21, 12)))
+
+    def test_three_beside_her_on_a_held_square_split_as_anywhere(self):
+        # A remembered safe square in the open: two beside her are held,
+        # three are the pack split's again.
+        client, walk = self._approach()
+        m = client.state.map
+        m.world_x, m.world_y = 12, 12
+        walk.task._safe_squares[("/road", 12, 12)] = time.monotonic()
+        monsters = [(100, 11, 12), (101, 11, 11), (102, 11, 13)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+        walk._leads = walk.LEAD_AWAY_LIMIT
+        client.state.messages = [(time.time(), 2, "ff0000", self.TREANT_HIT)]
+        self.assertTrue(asyncio.run(walk._defend_while_navigating(client)))
+        self.assertEqual(len(client.direct_moves), 1)
+        dx, _ = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+        self.assertEqual(dx, 1)
+        self.assertIn("navigation-retreat-choice",
+                      [a for a, _ in client.recorded])
+
+    def test_her_own_walk_makes_no_pursuer(self):
+        # She walks east towards a wanderer that moves 2 tiles north: its
+        # distance shrinks by her steps, not its own.
+        client, walk = self._approach()
+        m = client.state.map
+        m.world_x, m.world_y = 10, 12
+        then = time.monotonic() - 3.0
+        walk._pursuit_samples[100] = collections.deque(
+            [(then, "/road", 16, 14, 6)], maxlen=64)
+        m.world_x = 13
+        self._place(client, [(100, 16, 12)])
+        threats = [(3, 11, 8, next(iter(m.tiles[(11, 8)].objects.values())))]
+        self.assertEqual(walk._track_pursuers(client, threats), [])
+        # One that walked 3 tiles at her is one.
+        walk._pursuit_samples[100] = collections.deque(
+            [(then, "/road", 19, 12, 6)], maxlen=64)
+        self.assertEqual(len(walk._track_pursuers(client, threats)), 1)
+
+    # world_16_74's aggressive residents (spawns.txt): eight treants, a
+    # bear and a deer on 24x24, each acquiring her within 3.
+    WORLD_16_74_SPAWNS = [
+        (0, 9), (4, 3), (6, 12), (8, 19), (13, 3),
+        (14, 9), (14, 16), (19, 4), (20, 13), (22, 19)]
+
+    def test_a_lead_away_works_on_a_burnt_forest_density_map(self):
+        client, walk = self._approach()
+        graph = walk.navigation.graph
+        graph.named_spawns["/road"] = [
+            NamedSpawn("/road", x, y, "charred treant", (), aggro_radius=3)
+            for x, y in self.WORLD_16_74_SPAWNS]
+        m = client.state.map
+        # Between spawns, a train of three from the (6, 12) and (4, 3)
+        # spawns closing from the west, at a third of her pace.
+        m.world_x, m.world_y = 10, 8
+        monsters = [(100, 7, 8), (101, 6, 9), (102, 7, 7)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+        moved = 0
+        for tick in range(40):
+            walk._last_defense_action = 0.0
+            client.direct_moves.clear()
+            asyncio.run(walk._defend_while_navigating(client))
+            if "approach-lead-done" in [a for a, _ in client.recorded]:
+                break
+            if client.direct_moves:
+                moved += 1
+                dx, dy = c.DIRECTION_DELTAS[client.direct_moves[0][0]]
+                m.world_x += dx
+                m.world_y += dy
+            if tick % 3 == 0:
+                monsters = [
+                    (target_id, x + (m.world_x > x) - (m.world_x < x),
+                     y + (m.world_y > y) - (m.world_y < y))
+                    for target_id, x, y in monsters]
+            self._place(client, monsters)
+        self.assertGreater(moved, 3, client.recorded)
+        self.assertIn("approach-lead-done", [a for a, _ in client.recorded])
+        # Not stuck: the lead-aways are not used up.
+        self.assertLess(walk._leads, walk.LEAD_AWAY_LIMIT)
+
+    def test_a_train_held_approach_backs_the_spot_off_in_the_circuit(self):
+        # The circuit's transit branch: three followers no one of which
+        # comes to be fought for APPROACH_TRAIN_STAND_SECONDS end the trip,
+        # the spot is quarantined and the analyzer chooses again; the walk
+        # does not restart its stand.
+        client, walk = self._approach()
+        client.state.farm_zone_quarantine = {}
+        client.state.phase = "playing"
+        m = client.state.map
+        m.world_x, m.world_y = 20, 12
+        monsters = [(100, 14, 12), (101, 14, 13), (102, 14, 11)]
+        self._place(client, monsters)
+        self._followed(walk, client, monsters)
+        walk._leads = walk.LEAD_AWAY_LIMIT
+        walk._stand_since = (time.monotonic() -
+                             walk.APPROACH_TRAIN_STAND_SECONDS - 1)
+        circuit = FarmCircuitTask(walk.navigation.graph,
+                                  [("/farm", "charred treant")])
+        circuit.child = walk
+        circuit.status = TaskStatus.RUNNING
+        chosen = []
+
+        def choose(client_, farm):
+            chosen.append(farm)
+            return False
+
+        circuit._upgrade_progression = choose
+        for name in dir(circuit):
+            if not name.startswith(("_needs_", "_queue_")):
+                continue
+            setattr(circuit, name, lambda *args, **kwargs: False)
+        for name, value in (
+                ("_inventory_ready", True), ("_observe_farm_death", False),
+                ("_observe_out_of_league", None), ("_observe_disease", None),
+                ("_review_combat_build", False), ("_leg_ready", True),
+                ("_busy_finishing_fight_or_loot", False),
+                ("_heal_restock_waiting", False), ("_food_urgent", False),
+                ("_keep_unknown", False)):
+            setattr(circuit, name, Mock(return_value=value))
+        for name in ("_tick_expedition_return", "_unready_bag",
+                     "_clear_combat_after_death", "_tick_running_service",
+                     "_maintain_safe_inventory", "_apply_disease_cure",
+                     "_fill_bag", "_transit_emergency_recall",
+                     "_hold_for_route_death_verdict",
+                     "_await_recall_wand_charges"):
+            setattr(circuit, name, AsyncMock(return_value=False))
+        circuit.server_clock.sync = AsyncMock(return_value=False)
+        walk.task.recall_pending_step = AsyncMock(return_value=False)
+        asyncio.run(circuit.tick(client))
+        self.assertTrue(walk.train_held)
+        self.assertIn("approach-train-held", [a for a, _ in client.recorded])
+        self.assertIn("farm-zone-quarantine", [a for a, _ in client.recorded])
+        self.assertGreater(client.state.farm_zone_quarantine["/farm"],
+                           time.time() + 29 * 60)
+        self.assertEqual(len(chosen), 2)  # the tick's own, then the backoff
+        self.assertEqual(circuit.status, TaskStatus.FAILED)
+        # Latched: the walk starts no stand again.
+        walk._stand_since = 0.0
+        self.assertEqual(walk._approach_mode(client, [
+            (6, 2, 8, MapObject(3, 1, 0, 0, name="charred treant",
+                                target_id=target_id))
+            for target_id in (100, 101, 102)], []), "")
 
     def test_five_followers_are_led_away_beyond_aggro_range(self):
         client, walk = self._approach()
@@ -43391,11 +43546,14 @@ class SafeRetreatTests(unittest.TestCase):
                MapEdge("/a", "/b", 24, 12, kind="tile"),
                MapEdge("/b", "/farm", 24, 12, kind="tile")]
         client, walk = self._approach(route=far)
+        for path in ("/a", "/b"):
+            walk.navigation.graph.nodes[path] = MapNode(
+                path=path, width=24, height=24)
         m = client.state.map
         m.world_x, m.world_y = 2, 12
         monsters = [(100, 0, 12), (101, 0, 13)]
         self._place(client, monsters)
-        self._followed(walk, client, monsters, back=0)
+        self._followed(walk, client, monsters)
         asyncio.run(walk._defend_while_navigating(client))
         self.assertNotIn("approach-stand", [a for a, _ in client.recorded])
         # Already in contact on the other trip, cornered by them for a
