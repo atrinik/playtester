@@ -44,7 +44,7 @@ from . import route_events
 from . import planner
 from . import route_shadow
 from . import unlocks
-from .equipment import abandon_gear_examine, gear_style
+from .equipment import WEIGHT_UNWORN, abandon_gear_examine, gear_style
 from .observations import WHITE as WHITE_NAME, is_player, plain
 from .route_blocks import NO_WALLS, OwnerWalls
 from .route_costs import drain
@@ -10950,22 +10950,39 @@ class FarmCircuitTask(BotTask):
             r"^(?:iron|bronze|steel|wooden|spruce|soft leather) .*(?:sword|axe|mace|club|spear|bow|shield|armour|skirt|sandals|boots|gloves|helmet)$",
         ), tags=frozenset(tags), sell_identified_junk=True)
 
+    @staticmethod
+    def _fieldable_styles(client: AtrinikClient) -> list[str]:
+        """The gear styles she can field (equipment.GEAR_STYLES): melee
+        always, caster once she knows a spell, bow once an archery skill is
+        above level 1."""
+        inventory = getattr(client.state, "inventory", ())
+        styles = ["melee"]
+        if any(item.item_type == c.TYPE_SPELL for item in inventory):
+            styles.append("caster")
+        if any(item.item_type == c.TYPE_SKILL and "archery" in item.name.casefold() and
+               int(item.extra.get("level", 0) or 0) > 1 for item in inventory):
+            styles.append("bow")
+        return styles
+
     def _surplus_equipment(self, client: AtrinikClient) -> list[Item]:
-        """Return identified gear proven inferior to every occupied slot,
-        scored for her build as the equip loop scores it."""
-        caster = self._trains_wizardry(client)
-        policy = InventoryPolicy(
-            caster_stats=caster, gear_style=gear_style(self.combat_skill, caster),
-            caster_profile=CasterProfile.from_client(client) if caster else None)
+        """Return identified gear proven inferior to every occupied slot
+        under every style she can field (_fieldable_styles), so a spare
+        caster or bow piece is kept while she fights melee."""
+        policy = InventoryPolicy()
+        scorers = []
+        for style in self._fieldable_styles(client):
+            styled = InventoryPolicy(
+                caster_stats=style == "caster", gear_style=style,
+                caster_profile=(CasterProfile.from_client(client)
+                                if style == "caster" else None))
+            # Selling sheds the spare's weight; what she wears stays.
+            scorers.append(gear_scorer(client, styled, weight_for=WEIGHT_UNWORN))
         level = int(client.state.stats.get("level", 0) or 0)
         equipped = {
             tag: client.state.items[tag]
             for tag in client.state.equipment.values()
             if tag in client.state.items
         }
-
-        # The equip loop's decider: what it would never put on is surplus.
-        scorer = gear_scorer(client, policy)
 
         surplus = []
         for item in client.state.inventory:
@@ -10990,8 +11007,11 @@ class FarmCircuitTask(BotTask):
                 any(equipped_item.required_skill_tag and
                     equipped_item.required_skill_tag != item.required_skill_tag
                     for equipped_item in current))
+            # The equip loop's decider: what it would put on under no
+            # style she can field is surplus.
             if (different_weapon_school or
-                    not scorer.beats(item, current, len(slots))[0]):
+                    not any(scorer.beats(item, current, len(slots))[0]
+                            for scorer in scorers)):
                 surplus.append(item)
         return surplus
 

@@ -264,6 +264,20 @@ def archetypes_by_face() -> dict[tuple[str, int], tuple[tuple[str, BaseStats], .
     return {key: tuple(values) for key, values in index.items()}
 
 
+@lru_cache(maxsize=1)
+def two_handed_faces() -> frozenset[tuple[str, int]]:
+    """(face, type) of weapons and launchers whose archetypes sharing that
+    face are all two-handed (``two_handed 1``)."""
+    seen: dict[tuple[str, int], set[bool]] = {}
+    for record in load_archetypes().values():
+        attrs = record.get("attrs", {})
+        item_type = _number(attrs, "type")
+        face = str(attrs.get("face", "") or "").casefold()
+        if item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and face:
+            seen.setdefault((face, item_type), set()).add(bool(_number(attrs, "two_handed")))
+    return frozenset(key for key, flags in seen.items() if flags == {True})
+
+
 def archetype_for(face: str, item_type: int) -> tuple[str, BaseStats] | None:
     """The archetype a carried item's face and type name, if unambiguous.
 
@@ -527,8 +541,14 @@ GEAR_STYLES = ("melee", "caster", "bow")
 DPS_WEIGHT = 10
 WC_WEIGHT = 10
 SPEED_WEIGHT = 1500
-# Speed is her only escape without a working recall.
+# Speed is her only escape without a working recall. SPEED_WEIGHT and this
+# factor are provisional until the owner settles them (2026-11-26).
 NO_RECALL_SPEED_FACTOR = 1.5
+# Which items an item's weight is charged to (GearScorer weight_for): none
+# when she swaps between items she carries anyway (the equip loop); an
+# item not yet hers (a shop purchase adds it); an unworn carried item (the
+# surplus sale sheds it).
+WEIGHT_NONE, WEIGHT_UNOWNED, WEIGHT_UNWORN = "none", "unowned", "unworn"
 # A stat point is worth at least this, for the next table step.
 STAT_FLOOR = 5
 # What melee damage and WC are worth to a caster, and arrow WC and damage
@@ -608,8 +628,10 @@ class GearScorer:
     """
 
     def __init__(self, client: Any, policy: Any, fallback: Callable[[Item], int],
-                 *, style: str | None = None, recall: bool = True):
+                 *, style: str | None = None, recall: bool = True,
+                 weight_for: str = WEIGHT_NONE):
         self.client, self.policy, self.fallback = client, policy, fallback
+        self.weight_for = weight_for
         style = style or getattr(policy, "gear_style", "") or (
             "caster" if getattr(policy, "caster_stats", False) else "melee")
         self.style = style if style in GEAR_STYLES else "melee"
@@ -636,6 +658,8 @@ class GearScorer:
                      item.item_type != c.TYPE_LIGHT_APPLY}
         self._context: dict[int, EffectiveStats | None] = {}
         self._values: dict[int, int | None] = {}
+        self._owned = {item.tag for item in inventory}
+        self._families: dict[int, bool] = {}
         self.carried = sum(float(item.weight or 0) * item.quantity for item in inventory)
         try:
             self.limit = float(stats.get("weight_limit", 0) or 0)
@@ -686,10 +710,45 @@ class GearScorer:
         return stats if stats is not None and stats.source == "examine" else None
 
     def _rest(self, item: Item) -> list[Item]:
-        """Her worn set without what this item would replace."""
-        if item.item_type == c.TYPE_RING:
+        """Her worn set without what this item would replace: its slot; for
+        a ring, itself when worn, else the weakest worn ring when both ring
+        slots are full (the one the equip loop takes off), else nothing."""
+        if item.item_type != c.TYPE_RING:
+            return [worn for worn in self.worn.values() if worn.item_type != item.item_type]
+        if item.tag in self.worn:
             return [worn for tag, worn in self.worn.items() if tag != item.tag]
-        return [worn for worn in self.worn.values() if worn.item_type != item.item_type]
+        rings = [worn for worn in self.worn.values() if worn.item_type == c.TYPE_RING]
+        slots = len(getattr(self.policy, "equipment_slots", {}).get(c.TYPE_RING, ())) or 2
+        if len(rings) < slots:
+            return list(self.worn.values())
+        # A worn ring's value depends only on itself, so this never recurses.
+        replaced = min(rings, key=lambda ring: (self.value(ring) is None,
+                                                self.value(ring) or 0))
+        return [worn for worn in self.worn.values() if worn.tag != replaced.tag]
+
+    def _two_handed(self, item: Item) -> bool:
+        faces = getattr(self.client, "faces", {}) or {}
+        face = str(faces.get(item.face, "") or "").casefold()
+        return (face, item.item_type) in two_handed_faces()
+
+    def _speed_stats(self, items: list[Item], extra: Item | None = None,
+                     extra_stats: EffectiveStats | None = None
+                     ) -> list[EffectiveStats | None]:
+        """The effective stats that count for her speed with ``items`` (and
+        ``extra``, with ``extra_stats``) worn: a shield counts for nothing
+        while a two-handed weapon or launcher is wielded
+        (living_update_player)."""
+        everything = [*items, *([extra] if extra is not None else [])]
+        two_handed = any(item.item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and
+                         self._two_handed(item) for item in everything)
+
+        def counts(item: Item) -> bool:
+            return not (two_handed and item.item_type == c.TYPE_SHIELD)
+
+        stats = [self.context_stats(item) for item in items if counts(item)]
+        if extra is not None and counts(extra):
+            stats.append(extra_stats)
+        return stats
 
     def _rest_stats(self, rest: list[Item]) -> dict[str, int]:
         """Her stats without the worn items left out of ``rest``."""
@@ -709,24 +768,29 @@ class GearScorer:
             return 0.0
         rest = self._rest(item)
         own = self._rest_stats(rest)
-        others = [self.context_stats(worn) for worn in rest]
-        return (player_speed(own["Dex"] + _stat_total(stats, "Dex"), [*others, stats],
+        others = self._speed_stats(rest)
+        with_item = self._speed_stats(rest, item, stats)
+        return (player_speed(own["Dex"] + _stat_total(stats, "Dex"), with_item,
                              self.carried, self.limit) -
                 player_speed(own["Dex"], others, self.carried, self.limit))
 
     def weight_cost(self, item: Item) -> float:
         """The speed her carrying this item's weight costs, once she carries
         more than ENCUMBRANCE_SCORED of her limit; ramps in up to the real
-        slowdown at ENCUMBRANCE_START."""
-        if self.limit <= 0:
+        slowdown at ENCUMBRANCE_START. Charged only where the decision
+        changes what she carries (``weight_for``): never in the equip
+        loop, which swaps between items she carries either way."""
+        charged = (self.weight_for == WEIGHT_UNOWNED and item.tag not in self._owned or
+                   self.weight_for == WEIGHT_UNWORN and item.tag in self._owned and
+                   item.tag not in self.worn)
+        if self.limit <= 0 or not charged:
             return 0.0
         ratio = self.carried / self.limit
         if ratio <= ENCUMBRANCE_SCORED:
             return 0.0
         ramp = min(1.0, (ratio - ENCUMBRANCE_SCORED) /
                    (ENCUMBRANCE_START - ENCUMBRANCE_SCORED))
-        unloaded = player_speed(self.stats["Dex"],
-                                [self.context_stats(worn) for worn in self.worn.values()])
+        unloaded = player_speed(self.stats["Dex"], self._speed_stats(list(self.worn.values())))
         per_kg = unloaded / (self.limit * (1.0 - ENCUMBRANCE_START))
         return float(item.weight or 0) * per_kg * ramp
 
@@ -769,7 +833,8 @@ class GearScorer:
         dps_without = rest_dam * level_factor * strength(own["Str"]) / self.weapon_delay
         damage = (dps_with - dps_without) * DPS_WEIGHT * melee_share
         # Arrows: the launcher's (or arrow's) WC and damage per shot.
-        shot = (stats.delay if stats.item_type == c.TYPE_BOW else None) or BOW_REFERENCE_DELAY
+        shot = (stats.delay if stats.item_type == c.TYPE_BOW and stats.delay is not None
+                else BOW_REFERENCE_DELAY)
         missile = (stats.missile_wc * WC_WEIGHT + stats.missile_dam * DPS_WEIGHT *
                    level_factor * strength(new["Str"]) / max(0.125, shot)) * missile_share
         wc_share = max(melee_share, missile_share)
@@ -809,6 +874,26 @@ class GearScorer:
         value = self.value(item)
         return value if value is not None else self.fallback(item)
 
+    def family_effective(self, item_type: int) -> bool:
+        """Whether every gear item of this type she carries has examine
+        data, so the family can be ordered on the effective scale."""
+        if item_type not in self._families:
+            self._families[item_type] = all(
+                self.value(item) is not None
+                for item in getattr(self.client.state, "inventory", ())
+                if item.item_type == item_type and
+                not item.flags & c.ITEM_UNPAID and self.policy.identified(item))
+        return self._families[item_type]
+
+    def order(self, item: Item) -> int:
+        """For ordering candidates as ``compare`` would: the effective
+        value only when the whole family has examine data, else the
+        fallback for the whole family."""
+        value = self.value(item)
+        if value is not None and self.family_effective(item.item_type):
+            return value
+        return self.fallback(item)
+
     def compare(self, candidate: Item, current: list[Item]
                 ) -> tuple[int, list[int], bool]:
         """The candidate's and the current items' scores on one scale, and
@@ -831,6 +916,17 @@ class GearScorer:
         return round(sum(max(0.0, value) for _, value in stats.protections) *
                      PROTECTION_WEIGHT)
 
+    def fills(self, candidate: Item) -> bool:
+        """Whether a free slot takes this item: anything that is not a net
+        loss, and always one that adds AC or protection, whatever its
+        speed cap costs (a body slot is never left empty for its cap)."""
+        value = self.value(candidate)
+        if value is None or value >= 0:
+            return True
+        stats = self.effective(candidate)
+        return stats is not None and (
+            stats.ac > 0 or sum(value for _, value in stats.protections) > 0)
+
     def beats(self, candidate: Item, current: list[Item], slots: int = 1
               ) -> tuple[bool, Item | None]:
         """Whether the candidate should replace the weakest of what she
@@ -839,8 +935,7 @@ class GearScorer:
         of ``slots``, such as the second ring) takes any item that is not a
         net loss on the effective scale."""
         if len(current) < slots:
-            value = self.value(candidate)
-            return value is None or value >= 0, None
+            return self.fills(candidate), None
         mine, theirs, effective = self.compare(candidate, current)
         index = min(range(len(current)), key=theirs.__getitem__)
         worst = current[index]
@@ -919,7 +1014,7 @@ def equipment_report(client: Any, policy: Any,
         def decided() -> Item | None:
             """The candidate GearScorer puts on, as the equip loop does."""
             slots = len(policy.equipment_slots.get(item_type, ())) or 1
-            return next((item for item in sorted(candidates, key=scorer.score, reverse=True)
+            return next((item for item in sorted(candidates, key=scorer.order, reverse=True)
                          if scorer.beats(item, worn, slots)[0]), None)
 
         # Only what the equip loop chooses is compared: a light is chosen

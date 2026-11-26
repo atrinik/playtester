@@ -406,9 +406,18 @@ to sell:
   faster or slower she really is, from the server's formula (`living.c`):
   0.85, plus the Dex bonus and N/30 per item, clamped to the lowest worn
   armour speed cap, plus (1 + N/3)/10 per item after the cap. Speed is
-  weighted up by half while she has no working recall. Once she carries
-  more than half her weight limit, an item's weight costs the speed it
-  would take off her (encumbrance starts at 65%).
+  weighted up by half while she has no working recall (a change in that
+  counts only once it has held for 2 minutes). Once she carries more than
+  half her weight limit, an item's weight costs the speed it would take off
+  her (encumbrance starts at 65%), but only where the decision changes
+  what she carries: a purchase adds the stock's weight and a sale sheds a
+  spare's; swapping between carried items costs nothing. An empty slot
+  always takes an item that adds AC or protection, whatever its speed cap.
+  A shield's cap does not count under a two-handed weapon or launcher, as
+  the server ignores the shield then.
+- **Surplus** is spare gear that no style she can field would put on:
+  melee always, caster once she knows a spell, bow once an archery skill
+  is above level 1.
 - **Girdles and belts** are worn like any other slot (the belt slot).
 - **Fallback.** Two items are compared on the effective scale only when
   both have examine data; otherwise both use the old name-based score
