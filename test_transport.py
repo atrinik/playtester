@@ -78,3 +78,30 @@ class QuicTransportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ProtocolError, "fingerprint mismatch"):
             await QuicStream.connect("127.0.0.1", self.port, "0" * 64, 2.0)
         self.assertEqual(self.streams, 0)
+
+
+class QuicHandshakeTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_timed_out_handshake_leaves_no_unretrieved_exception(self):
+        # A peer that never answers: the handshake times out. Live, every
+        # timed-out reconnect logged "Future exception was never retrieved"
+        # for aioquic's handshake waiter.
+        import gc
+
+        loop = asyncio.get_running_loop()
+        silent, _ = await loop.create_datagram_endpoint(
+            asyncio.DatagramProtocol, local_addr=("127.0.0.1", 0))
+        port = silent.get_extra_info("sockname")[1]
+        reported = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _, context: reported.append(context))
+        try:
+            with self.assertRaises(TimeoutError):
+                await QuicStream.connect("127.0.0.1", port, "0" * 64, 0.2)
+            for _ in range(3):
+                await asyncio.sleep(0.05)
+                gc.collect()
+        finally:
+            loop.set_exception_handler(previous)
+            silent.close()
+        self.assertEqual(
+            [context.get("message") for context in reported], [])

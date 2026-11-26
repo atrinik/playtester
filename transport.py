@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ssl
 from dataclasses import dataclass
@@ -28,6 +29,36 @@ def normalize_certificate_sha256(value: str) -> str:
             "characters"
         )
     return fingerprint
+
+
+def _retrieve(future: asyncio.Future) -> None:
+    """Mark a future's outcome as seen, so an exception no one awaits is
+    never reported as never retrieved."""
+    if not future.cancelled():
+        future.exception()
+
+
+async def _handshake(protocol: Any, timeout: float) -> None:
+    """Send the first flight and wait at most ``timeout`` seconds for the
+    QUIC handshake (``wait_connected=False`` sends nothing by itself).
+
+    aioquic waits on a shielded waiter future that a closing connection
+    later fails with ConnectionError. On a timeout that waiter outlives
+    the wait: a done-callback retrieves its outcome, and the caller's
+    context exit closes the connection."""
+    protocol.transmit()
+    wait = asyncio.ensure_future(protocol.wait_connected())
+    done, _ = await asyncio.wait({wait}, timeout=timeout)
+    if wait in done:
+        wait.result()
+        return
+    waiter = getattr(protocol, "_connected_waiter", None)
+    if waiter is not None:
+        waiter.add_done_callback(_retrieve)
+    wait.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await wait
+    raise TimeoutError(f"QUIC handshake gave no answer in {timeout:g} s")
 
 
 @dataclass(slots=True)
@@ -62,10 +93,17 @@ class QuicStream:
             is_client=True,
             verify_mode=ssl.CERT_NONE,
         )
-        context = connect(host, port, configuration=configuration)
+        # The handshake is awaited here, under our own timeout, not inside
+        # the context: a timeout that cancelled aioquic's shielded
+        # handshake waiter left its later ConnectionError unretrieved
+        # ("Future exception was never retrieved") on every timed-out
+        # reconnect.
+        context = connect(host, port, configuration=configuration,
+                          wait_connected=False)
         protocol = None
         try:
             protocol = await asyncio.wait_for(context.__aenter__(), timeout)
+            await _handshake(protocol, timeout)
             certificate = protocol._quic.tls._peer_certificate
             if certificate is None:
                 raise ProtocolError("QUIC peer did not provide a certificate")
