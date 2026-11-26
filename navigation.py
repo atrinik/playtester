@@ -10970,7 +10970,10 @@ class FarmCircuitTask(BotTask):
         caster or bow piece is kept while she fights melee."""
         policy = InventoryPolicy()
         scorers = []
-        for style in self._fieldable_styles(client):
+        # Her current build's style always counts (a fresh archer's bow).
+        styles = dict.fromkeys([*self._fieldable_styles(client),
+                                gear_style(self.combat_skill, self._trains_wizardry(client))])
+        for style in styles:
             styled = InventoryPolicy(
                 caster_stats=style == "caster", gear_style=style,
                 caster_profile=(CasterProfile.from_client(client)
