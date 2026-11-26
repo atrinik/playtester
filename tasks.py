@@ -4199,10 +4199,15 @@ class FarmTask(BotTask):
             self._caster_dry = False
             return False
         if nearest is None:
+            if recent_hostile_contact(client):
+                # Hit by an attacker out of view (a heal retargeted her, the
+                # view scrolled): keep retreating.
+                await self.low_health_retreat(client)
+                return True
             # Nothing active, but a monster in view (passive or not yet
             # roused): hold, so no target is chosen or pulled. With none in
-            # view the farm's own paths (an unseen attacker's retreat, loot,
-            # the training rest) run, the episode kept.
+            # view the farm's own paths (loot, the training rest) run, the
+            # episode kept.
             return bool(in_view)
         if nearest <= self.DRY_RETREAT_RADIUS:
             await self.low_health_retreat(client)
