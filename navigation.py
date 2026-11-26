@@ -51,6 +51,7 @@ from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
 
 from .alerts import HUNGRY_FOOD
+from .hunger import food_obsolete
 from .client import AtrinikClient, format_money, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import farm_analyzer as farm_analyzer_plan
@@ -62,6 +63,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     BuyHealingStockTask, BuyShopUpgradeTask,
                     DepositItemsTask, FarmTask, InventoryPolicy, JunkPolicy,
                     InventoryCapabilityTask, MassIdentifyTask, SafetyPolicy, safe_food,
+                    obsolete_food,
                     RANGED_RESIDENT_MARKERS, RANGED_RESIDENT_RADIUS,
                     RetrieveItemsTask, SellJunkTask, TaskStatus,
                     TempleFoodTask, TempleServiceTask,
@@ -8357,6 +8359,9 @@ def unidentified_food(client: AtrinikClient) -> list:
     """Carried food she would eat once identified (it may be cursed until
     then): server-typed food she owns, the kind safety eats. Unpaid items are
     left out, as the identify capability leaves them out."""
+    if food_obsolete(client):
+        # Food is junk (tasks.obsolete_food): nothing to identify it for.
+        return []
     policy = InventoryPolicy()
     return [item for item in client.state.inventory
             if item.item_type == c.TYPE_FOOD and not policy.identified(item) and
@@ -8365,14 +8370,17 @@ def unidentified_food(client: AtrinikClient) -> list:
 
 def starving_without_food(client: AtrinikClient) -> bool:
     """Food 0 and no safe food carried (food_reserve: edible items only):
-    no rest can help, only food."""
-    return (int(client.state.stats.get("food", 1) or 0) <= 0 and
+    no rest can help, only food. Never where food is obsolete
+    (hunger.food_obsolete): food 0 has no effect there."""
+    return (not food_obsolete(client) and
+            int(client.state.stats.get("food", 1) or 0) <= 0 and
             food_reserve(client) == 0)
 
 
 def hungry(client: AtrinikClient) -> bool:
-    """Low on food with nothing left to eat: she must go and get some."""
-    return (food_reserve(client) <= 1 and
+    """Low on food with nothing left to eat: she must go and get some.
+    Never where food is obsolete (hunger.food_obsolete)."""
+    return (not food_obsolete(client) and food_reserve(client) <= 1 and
             int(client.state.stats.get("food", 1000) or 0) < HUNGRY_FOOD)
 
 
@@ -10293,6 +10301,9 @@ class FarmCircuitTask(BotTask):
                     InventoryCapabilityTask.candidates(client, purpose))
 
     def _needs_food_resupply(self, client: AtrinikClient) -> bool:
+        if food_obsolete(client):
+            # Food never drains (hunger.food_obsolete): no restock either.
+            return False
         # While shop resupply backs off, a temple can still feed her; a low
         # reserve alone waits for the shop, she is not hungry yet. Carried
         # food she can identify on the spot comes first: it may already be
@@ -10803,11 +10814,12 @@ class FarmCircuitTask(BotTask):
                  len(task.task.retrieved))
 
     @staticmethod
-    def _junk_policy(tags=()) -> JunkPolicy:
+    def _junk_policy(tags=(), food=()) -> JunkPolicy:
         return JunkPolicy((
             r"^paper ",
             r"^(?:iron|bronze|steel|wooden|spruce|soft leather) .*(?:sword|axe|mace|club|spear|bow|shield|armour|skirt|sandals|boots|gloves|helmet)$",
-        ), tags=frozenset(tags), sell_identified_junk=True)
+        ), tags=frozenset(tags), sell_identified_junk=True,
+            food_tags=frozenset(food))
 
     @staticmethod
     def _surplus_equipment(client: AtrinikClient) -> list[Item]:
@@ -10855,7 +10867,9 @@ class FarmCircuitTask(BotTask):
 
     def _identified_junk(self, client: AtrinikClient) -> list[Item]:
         surplus = self._surplus_equipment(client)
-        policy = self._junk_policy(item.tag for item in surplus)
+        policy = self._junk_policy(
+            (item.tag for item in surplus),
+            (item.tag for item in obsolete_food(client)))
         return [item for item in client.state.inventory if policy.junk(item)]
 
     def _needs_junk_sale(self, client: AtrinikClient) -> bool:
@@ -10872,7 +10886,9 @@ class FarmCircuitTask(BotTask):
             self.graph, "/shattered_islands/world_0_69",
             SellJunkTask(
                 "Brynknot shop floor",
-                self._junk_policy(item.tag for item in surplus)),
+                self._junk_policy(
+                    (item.tag for item in surplus),
+                    (item.tag for item in obsolete_food(client)))),
             destination_xy=(15, 7), combat_approach=True)
         task.navigation.strict_safety = True
         return task

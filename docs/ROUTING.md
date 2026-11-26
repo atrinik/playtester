@@ -1181,7 +1181,9 @@ can stop a trip (owner decision). Farm trips use selection instead (below).
   1800 s up to 6 h, then 900 s at once, halving every 6 h from there.
   Route choice, the strict avoid set and the farm score and caps keep the
   decaying cost, so 4.5's death-rate bounds hold.
-- **Essential trips** are food when hungry or starving, a cure or the
+- **Essential trips** are food when hungry or starving (never on a server
+  where food is obsolete, `hunger.food_obsolete`: there `hungry` and
+  `starving_without_food` are false, so no trip yields to hunger), a cure or the
   depletion service, the savebed move, and a bank trip that pays for one of
   these. They are never declined into stranding. When their budget, their
   strict plan or an owner block would decline them, they take the cheapest

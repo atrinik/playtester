@@ -15,6 +15,8 @@ from __future__ import annotations
 import time
 from typing import Any, Iterable
 
+from .hunger import food_obsolete
+
 DEATH_WINDOW_SECONDS = 3600.0
 REPEATED_DEATHS = 2
 STUCK_SECONDS = 20 * 60.0
@@ -156,14 +158,17 @@ def active(state: Any, decisions: Iterable[dict], watch: ProgressWatch, *,
         alerts.append({"id": "deaths", "level": "critical",
                        "text": f"{deaths} deaths in the last hour"})
     stats = getattr(state, "stats", {}) or {}
-    if (getattr(state, "phase", "") == "playing" and "food" in stats and
+    # Where food is obsolete (hunger.food_obsolete) food 0 does nothing.
+    hunger_matters = not food_obsolete(state)
+    if (hunger_matters and
+            getattr(state, "phase", "") == "playing" and "food" in stats and
             int(stats.get("food") or 0) <= 0):
         alerts.append({"id": "starving", "level": "critical",
                        "text": "Starving: food is 0"})
     # Only while she is still idle and still needs food: fed by hand, or by
     # a task the operator started, the failure no longer matters.
     failure = (idle_food_failure(decisions, now)
-               if not task_running and
+               if hunger_matters and not task_running and
                getattr(state, "phase", "") == "playing" and "food" in stats and
                int(stats.get("food") or 0) < HUNGRY_FOOD else None)
     if failure is not None:

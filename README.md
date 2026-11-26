@@ -174,6 +174,24 @@ after one of them a restart still starts idle. Without `--character`
 nothing is stored: the bot logs a warning once, and the dashboard's last
 task says the Stop is not kept across a restart.
 
+Classic 5.119.0 (https://github.com/atrinik/classic/pull/655) removed
+starvation: food never drains and food 0 does nothing. The wire protocol did
+not change, so `--food-obsolete` (`ATRINIK_BOT_FOOD_OBSOLETE`) tells her
+which rules apply (`hunger.py`):
+
+- `on`, the default, for the live server: every hunger behaviour is off.
+  She makes no food or temple trips and no food restock, never eats, and
+  rests and banks mana at food 0. The starving and idle-food alerts stay
+  silent, and a low food stat neither makes a trip give way nor stops an
+  operator assist. Carried food is junk: identified food goes with the
+  next junk sale, and unidentified food, which no shop buys, is dropped on
+  a quiet square outside her apartment (`obsolete-food-drop`). Quest food,
+  named food (Gimli's lembas), locked food, flesh and drink are kept.
+- `off`: the hunger rules of an older server, unchanged.
+- `auto`: `off` until her food has stayed unchanged for 30 minutes in which
+  she moved and gained experience, then `on`; one fall of it keeps `off` for
+  the run.
+
 `atrinik-playtester --version`, the startup log line, and the dashboard header
 name the build: its release tag (with `+N` when the commit is N commits past
 it) and short commit, linked to GitHub. CMake records them from Git on every
@@ -664,7 +682,8 @@ when the coin reached her. The running bot then:
    plays, the amount is 1 gold coin (the cap), the last run that reached
    `/create` was more than 24 hours ago, and she is idle at a safe square:
    logged in, no task or idle food trip, no target or combat, nothing hit her
-   in the last 10 seconds, health at least 90% and food at least 300; and
+   in the last 10 seconds, health at least 90% and food at least 300 (not
+   checked where food is obsolete, see Run); and
    she can carry the coin (the server refuses a pickup unless what she
    carries plus the coin stays under her weight limit, which depletion
    lowers with Str: on 2026-11-18 Sera carried 40.6 kg against 25 kg, so
@@ -890,7 +909,8 @@ blocked map stays usable as a destination. Blocks are stored per character
 in the runtime state database (`route_blocks`) and are written only through
 `POST /api/route-blocks`: loopback only, a loopback `Host`, no foreign
 `Origin`, and `application/json` only, which an HTML form cannot send
-cross-site. Only an essential trip (food while she is hungry or starving, a
+cross-site. Only an essential trip (food while she is hungry or starving,
+never where food is obsolete, a
 cure, the depletion service, a savebed move, a trip that funds one of them,
 and the recovery phase's walk home) crosses a block, and
 only when every route does; a block never sends a trip through a hazard

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import re
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -131,6 +132,19 @@ def load_catalog(root: Path | None = None) -> dict[str, QuestDefinition]:
         )
         catalog[definition.name] = definition
     return catalog
+
+
+@functools.lru_cache(maxsize=1)
+def quest_item_names() -> frozenset[str]:
+    """Every item a formal quest asks for (its ``<item>`` objectives), by
+    casefolded name: such an item is never junk, whatever its type (the
+    tutorial's wild white mushrooms are food). Read once and cached."""
+    return frozenset(
+        objective.name.casefold()
+        for definition in load_catalog().values()
+        for part in flatten_parts(definition.parts)
+        for objective in part.objectives
+        if objective.kind == "item" and objective.name)
 
 
 _MARKUP = re.compile(r"\[[^]]+\]")

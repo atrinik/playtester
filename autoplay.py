@@ -24,6 +24,7 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          farming_unsafe_reason, food_reserve, hungry,
                          PLANNING, TempleFoodPlanner)
 from .alerts import HUNGRY_FOOD
+from .hunger import food_obsolete
 from .quest_tasks import EscapingDesertedIslandTask
 from .route_blocks import map_subject
 from .tasks import (BotTask, FarmTask, RetrieveItemsTask, SafetyPolicy,
@@ -936,7 +937,13 @@ class IdleSurvival:
         """Run one survival step; True while a food trip has her busy.
 
         ``safety`` is the engine's idle policy, which eats carried food.
+        Where food is obsolete (hunger.food_obsolete) there is nothing to
+        survive: no trip starts and one under way ends.
         """
+        if food_obsolete(client):
+            if self.child is not None:
+                self.drop(task_took_over=True)
+            return False
         if self.child is not None:
             return await self._tick_trip(client)
         state = client.state
