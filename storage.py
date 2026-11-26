@@ -231,6 +231,9 @@ def entry(item: Item, labels: Iterable[str] = (), *, identified: bool = True) ->
         "cursed": bool(item.flags & (c.ITEM_CURSED | c.ITEM_DAMNED)),
         "sets": sorted(set(labels)),
         "at": round(time.time(), 1),
+        # Kept so a build change can score the stored piece (its name
+        # scores with them where no examine is kept).
+        "quality": int(item.quality or 0), "condition": int(item.condition or 0),
     }
     factor = bag_factor(item)
     if factor is not None:
@@ -264,6 +267,10 @@ def valid_entry(value: Any) -> dict | None:
         "sets": [str(label)[:40] for label in sets][:8] if isinstance(sets, list) else [],
         "at": _number(value.get("at", 0), 0.0),
     }
+    for name in ("quality", "condition"):
+        number = value.get(name)
+        if isinstance(number, int) and not isinstance(number, bool):
+            row[name] = max(0, min(255, number))
     factor = _number(value.get("bag_factor"), 0.0)
     if 0 < factor < 1:
         row["bag_factor"] = factor

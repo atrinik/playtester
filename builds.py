@@ -11,10 +11,13 @@ storage.BUILDS) and the analyzer's encounter style that rates a spot for it
 
 The build for a spot is the operator's choice for that spot or for every
 spot (the dashboard, kept in her character memory), or on "auto" the
-safest build she can field there by the encounter model's per-style
-ratings (farm_analyzer.FarmAnalyzer.style_ratings), ranked by XP. A build
-she cannot field leaves a gap: the next build she can field is used, the
-gap is shown, and the farm circuit runs a "get this build" errand where a
+safest build she can field there by the encounter model's rating of each
+build's own profile (farm_analyzer.build_profile,
+FarmAnalyzer.style_ratings), ranked by XP, with a hold against near ties.
+Fielding a caster build is not training: the farm casts its spell while
+it is fielded, and the circuit's training plan is unchanged. A build she
+cannot field leaves a gap: the next build she can field is used, the gap
+is shown, and the farm circuit runs a "get this build" errand where a
 known spell seller can fix it (navigation.LearnSpellTask).
 
 Pure functions of her state, so the circuit, the analyzer and the dashboard
@@ -58,6 +61,8 @@ BUILDS: dict[str, Build] = {
 }
 BUILD_NAMES = tuple(BUILDS)
 CHOICES = (AUTO, *BUILD_NAMES)
+# The most spots with their own choice kept in her memory.
+MAX_BUILD_CHOICES = 200
 
 # Spells that strike several monsters at once (cones and swarms), first
 # the ones to learn first: the owner's first target is Firestorm from
@@ -171,21 +176,22 @@ def fieldable(state: Any, spell_levels: Mapping[str, int]) -> tuple[str, ...]:
     return tuple(name for name in BUILD_NAMES if not gaps(name, state, spell_levels))
 
 
-def plan(name: str, state: Any, spell_levels: Mapping[str, int],
-         default: tuple[str, str, int]) -> tuple[str, str, int]:
-    """The circuit's (combat_skill, combat_spell, until level) for a
-    build: melee keeps ``default`` (the automatic training plan,
-    farm_analyzer.automatic_training_plan); the casters cast their spell
-    with Wizardry for good; the bow trains its archery skill with the
-    launcher pull."""
+def build_spell(name: str, state: Any, spell_levels: Mapping[str, int]) -> str:
+    """The spell a caster build fights with ("" for the others). Fielding
+    it is not training: the circuit's training plan (until levels) stays
+    as it was, and the farm casts this spell while the build is fielded."""
     if name == "aoe":
-        return "wizardry spells", castable(state, AREA_SPELLS, spell_levels), 0
+        return castable(state, AREA_SPELLS, spell_levels)
     if name == "single":
-        return "wizardry spells", castable(state, SINGLE_SPELLS, spell_levels), 0
-    if name == "bow":
-        found = launcher(state)
-        return (found[1] if found else "bow archery"), "", 0
-    return default
+        return castable(state, SINGLE_SPELLS, spell_levels)
+    return ""
+
+
+def fieldable_spells(state: Any, spell_levels: Mapping[str, int]) -> dict[str, str]:
+    """The builds she can field and each one's spell ("" for none), for
+    the analyzer's per-build encounter runs."""
+    return {name: build_spell(name, state, spell_levels)
+            for name in fieldable(state, spell_levels)}
 
 
 @dataclass
@@ -214,51 +220,80 @@ def operator_choice(choices: Mapping[str, str], spot: str) -> str:
     return AUTO
 
 
-def _rank(build: str, rating: Mapping[str, Any] | None,
-          warn: Any) -> tuple:
-    """Safest first (no encounter warning), then most XP; unwarned
-    builds by XP, warned ones by encounter safety."""
-    rating = rating or {}
-    safety = float(rating.get("encounter_safety") or 0.0)
-    xp = float(rating.get("xp_hour") or 0.0)
-    warned = bool(warn(rating))
-    return (warned, -safety if warned else -xp, -xp, BUILD_NAMES.index(build))
+# On auto she leaves the build she fields only for a safer one (hers warns,
+# the other does not) or one earning at least SWITCH_XP_GAIN more XP an
+# hour, and not within HOLD_SECONDS of taking it up: a swap trip and a farm
+# restart are not worth a near tie.
+SWITCH_XP_GAIN = 0.20
+HOLD_SECONDS = 3600.0
+
+
+def wanted_build(choices: Mapping[str, str], missing: Mapping[str, list[str]],
+                 chosen: str) -> str:
+    """The build a "get this build" errand works towards: the operator's
+    unmet choice here, else the AoE build while she cannot field it and
+    auto or the operator wants it somewhere. With every spot set to
+    another build, none."""
+    if chosen != AUTO and chosen in missing:
+        return chosen
+    if "aoe" not in missing:
+        return ""
+    every = choices.get(EVERY_SPOT, AUTO)
+    if every == AUTO or every == "aoe" or "aoe" in choices.values():
+        return "aoe"
+    return ""
 
 
 def choose(state: Any, spot: str, ratings: Mapping[str, Mapping[str, Any] | None],
            choices: Mapping[str, str], spell_levels: Mapping[str, int], *,
-           warn: Any = lambda rating: False, current: str = "melee") -> Choice | None:
+           warn: Any = lambda rating: False, rated: Any = bool,
+           current: str = "melee", held: bool = False) -> Choice | None:
     """The build she fields on ``spot`` (its key, FarmAnalyzer.spot_key's
     path), or None when she can field none.
 
-    ``ratings`` maps each encounter style to the spot's rating in that
-    style (the encounter fields, xp_hour), or None when unrated; ``warn``
-    is farm_analyzer.encounter_warning. On auto, of the builds she can
-    field and the analyzer rated, the safest (no warning) with the most
-    XP; unrated, the build she fields (``current``) while she can, else
-    melee (her default plan, plan()).
+    ``ratings`` maps each build to the spot's encounter rating with that
+    build's own profile (FarmAnalyzer.style_ratings), or None; only a
+    rating ``rated`` accepts (farm_analyzer.encounter_rated) counts, and
+    ``warn`` is farm_analyzer.encounter_warning. An operator's choice
+    applies at once. On auto, of the builds she can field and the analyzer
+    rated, the safest (no warning) with the most XP; she keeps ``current``
+    unless another is safer (hers warns, the other does not: at once) or
+    earns SWITCH_XP_GAIN more (not while ``held``, HOLD_SECONDS since she
+    took it up). Unrated, she keeps ``current``
+    while she can field it, else melee (her default plan).
     """
     missing = {name: gaps(name, state, spell_levels) for name in BUILD_NAMES}
     missing = {name: reasons for name, reasons in missing.items() if reasons}
     ready = [name for name in BUILD_NAMES if name not in missing]
     chosen = operator_choice(choices, spot)
-    # The owner's first target is the AoE build: an errand works towards
-    # it while she cannot field it, or towards the operator's choice.
-    wanted = (chosen if chosen != AUTO and chosen in missing
-              else "aoe" if "aoe" in missing else "")
+    wanted = wanted_build(choices, missing, chosen)
     if not ready:
         return None
     if chosen != AUTO and chosen not in missing:
         return Choice(chosen, chosen, "operator's choice", missing, False, wanted)
-    rated = [name for name in ready
-             if ratings.get(BUILDS[name].encounter_style)]
-    if rated:
-        best = min(rated, key=lambda name: _rank(
-            name, ratings.get(BUILDS[name].encounter_style), warn))
-        rating = ratings.get(BUILDS[best].encounter_style) or {}
-        reason = (f"safest she can field: {BUILDS[best].encounter_style} "
-                  f"encounter safety {float(rating.get('encounter_safety') or 0):.2f}, "
-                  f"XP {float(rating.get('xp_hour') or 0):.0f}/h")
+    scored = {name: ratings.get(name) for name in ready
+              if ratings.get(name) and rated(ratings.get(name))}
+
+    def xp(name: str) -> float:
+        return float((scored.get(name) or {}).get("xp_hour") or 0.0)
+
+    def safety(name: str) -> float:
+        return float((scored.get(name) or {}).get("encounter_safety") or 0.0)
+
+    if scored:
+        best = min(scored, key=lambda name: (
+            bool(warn(scored[name])), -safety(name) if warn(scored[name]) else -xp(name),
+            -xp(name), BUILD_NAMES.index(name)))
+        if current in scored and best != current:
+            safer = bool(warn(scored[current])) and not warn(scored[best])
+            richer = (not warn(scored[best]) and
+                      xp(best) >= xp(current) * (1.0 + SWITCH_XP_GAIN))
+            # Safety does not wait for the hold.
+            if not safer and (held or not richer):
+                best = current
+        reason = (f"{'kept' if best == current else 'safest she can field'}: "
+                  f"{BUILDS[best].encounter_style} encounter safety {safety(best):.2f}, "
+                  f"XP {xp(best):.0f}/h")
     elif current in ready and current != "melee":
         # Unrated (a new spot), she keeps what she fields: no swap back and
         # forth while a rating comes.
@@ -273,13 +308,6 @@ def choose(state: Any, spot: str, ratings: Mapping[str, Mapping[str, Any] | None
         reason = (f"{BUILDS[chosen].label} needs: " + "; ".join(missing[chosen]) +
                   f"; falling back to {BUILDS[best].label} ({reason})")
     return Choice(best, chosen, reason, missing, chosen != AUTO, wanted)
-
-
-def fieldable_styles(state: Any, spell_levels: Mapping[str, int]) -> tuple[str, ...]:
-    """The encounter styles of the builds she can field, for the
-    analyzer's per-style encounter runs."""
-    return tuple(dict.fromkeys(BUILDS[name].encounter_style
-                               for name in fieldable(state, spell_levels)))
 
 
 def learn_target(wanted: str, state: Any, offers: Iterable[Any]) -> Any | None:

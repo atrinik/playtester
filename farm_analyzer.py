@@ -126,8 +126,9 @@ def automatic_training_plan(state) -> tuple[str, str, int]:
 
 
 # The largest likely simultaneous aggro (the analyzer's --max-aggro-pack)
-# a spot may have for her ordinary kit. She fights one target at a time and
-# casts no area spell, so a pack larger than two outlasts her heals. Live,
+# a spot may have for her ordinary kit. She fights one target at a time
+# (an area spell is a fielded build's, whose own profile caps its pack:
+# build_profile), so a pack larger than two outlasts her heals. Live,
 # on 2026-11-23 (level 37, 330 health), the analyzer allowed any pack
 # (0), and she died at an Underground City circuit of pack 3. The analyzer
 # rejects such a map before it forms circuits.
@@ -600,8 +601,9 @@ def combat_profile(client, spell_damage: float = 0.0,
     while she trains with spells only (caster_kite holds one target at
     range and steps away), else ``melee``: her weapon fights one target in
     place, and melee_kite steps away only from a lone pursuer, standing
-    when another hostile is close (KITE_CROWD_RADIUS). She casts no area
-    spell, so never ``aoe-kite``.
+    when another hostile is close (KITE_CROWD_RADIUS). A fielded build's
+    own profile and style (``aoe-kite`` for an area spell) are
+    build_profile's, for the encounter runs only.
     """
     state = client.state
     weapon = state.items.get(state.equipment.get(c.EQUIP_WEAPON, 0))
@@ -636,8 +638,9 @@ def combat_profile(client, spell_damage: float = 0.0,
     # share), so it is ranked at that skill's level on spots that send one
     # monster at a time, killing with the spell's damage and mana. Until a
     # cast has been observed, the weapon stands in. Otherwise she fights one
-    # target at a time (she casts no area spell), so spots are capped at
-    # SINGLE_TARGET_MAX_AGGRO_PACK.
+    # target at a time, so spots are capped at SINGLE_TARGET_MAX_AGGRO_PACK.
+    # The ranking always uses this ordinary profile; a fielded build's own
+    # (build_profile) is for its encounter runs only.
     max_aggro_pack = SINGLE_TARGET_MAX_AGGRO_PACK
     caster: dict[str, Any] = {}
     spells_only = False
@@ -675,10 +678,7 @@ def combat_profile(client, spell_damage: float = 0.0,
                     item.name.casefold() == "meditation"
                     for item in state.inventory))
     swing = SPELL_CAST_DELAY if spells_only else weapon_speed
-    # The build the farm circuit fields (builds.py) rates her spot in its
-    # own style; without one, her kit's.
-    style = str(getattr(client, "active_build_style", "") or "") or (
-        RANGED_KITE_STYLE if spells_only else MELEE_STYLE)
+    style = RANGED_KITE_STYLE if spells_only else MELEE_STYLE
     return CombatProfile(
         skill=school, skill_level=skill_level, attack=attack, damage=damage,
         weapon_class=weapon_class, weapon_speed=round(weapon_speed, 3),
@@ -687,6 +687,100 @@ def combat_profile(client, spell_damage: float = 0.0,
         max_aggro_pack=max_aggro_pack,
         combat_style=style,
         healing_per_second=healing_rate(state, heal, swing), **caster)
+
+
+# The most monsters at once an AoE caster's profile allows (the analyzer's
+# --max-aggro-pack), however many casts her bar holds.
+AOE_MAX_PACK = 6
+
+
+def build_profile(client, build: str, spell: str, base: "CombatProfile",
+                  samples: dict[str, list[int]], attacks: dict[str, str]
+                  ) -> "CombatProfile | None":
+    """Her profile fighting with a build (builds.py), for its encounter
+    run; None when her real numbers cannot describe it, and then autoplay
+    never fields it on its rating.
+
+    - melee: her ordinary profile (combat_profile), whose style is her
+      kit's.
+    - single / aoe: the build's spell, from her observed damage per hit of
+      it (``samples``, FarmAnalyzer.observe_spells), its SP cost, her SP
+      regeneration and her bar beyond the healing reserve (three casts of
+      her cheapest heal), cast with spells only. A single-target caster
+      takes one monster at a time (pack 1, as Wizardry training does); an
+      AoE caster's pack is what one full bar pays a cast for each monster
+      of, at most AOE_MAX_PACK.
+    - bow: her launcher's and its ammunition's examined missile damage and
+      WC (equipment.item_effective_stats), its delay, at her archery
+      skill's level, one monster at a time.
+    """
+    state = client.state
+    stats = state.stats
+    if build == "melee":
+        return base
+    try:
+        regen = float(stats.get("regen_sp", 0) or 0)
+        maxsp = int(stats.get("maxsp", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if build in ("single", "aoe"):
+        item = next((item for item in state.inventory
+                     if item.item_type == c.TYPE_SPELL and item.name.casefold() == spell), None)
+        hits = samples.get(spell) or []
+        attack = attacks.get(spell, "")
+        if item is None or not hits or attack not in SPELL_ATTACKS or regen <= 0:
+            return None
+        cost = int(item.extra.get("cost", 0) or 0)
+        heal_costs = [int(other.extra.get("cost", 0) or 0) for other in state.inventory
+                      if other.item_type == c.TYPE_SPELL and
+                      "heal" in other.name.casefold() and
+                      int(other.extra.get("cost", 0) or 0) > 0]
+        offence = maxsp - min(heal_costs, default=0) * 3
+        if cost <= 0 or cost > offence:
+            return None
+        pack = 1 if build == "single" else max(1, min(AOE_MAX_PACK, offence // cost))
+        level = owned_skill_level(state, "wizardry spells")
+        if level < 1:
+            return None
+        return dataclasses.replace(
+            base, skill="wizardry spells", skill_level=level, max_aggro_pack=pack,
+            spell_damage=round(statistics.median(hits), 1),
+            cast_delay=SPELL_CAST_DELAY, mana_cost=cost, mana_regen=round(regen, 3),
+            max_mana=offence, spell_attack=attack,
+            meditation=any(other.item_type == c.TYPE_SKILL and
+                           other.name.casefold() == "meditation"
+                           for other in state.inventory),
+            combat_style="aoe-kite" if build == "aoe" else RANGED_KITE_STYLE)
+    if build == "bow":
+        from . import builds
+        from .equipment import item_effective_stats
+        found = builds.launcher(state)
+        if found is None:
+            return None
+        bow, skill, _ = found
+        ammo = next((item for item in state.inventory
+                     if item.item_type == c.TYPE_ARROW and
+                     any(word in item.name.casefold() for word in builds.AMMO_WORDS[skill])),
+                    None)
+        try:
+            launched = item_effective_stats(client, bow)
+            fired = item_effective_stats(client, ammo) if ammo is not None else None
+        except Exception:  # No examine or archetype data.
+            return None
+        level = owned_skill_level(state, skill)
+        if launched is None or fired is None or level < 1:
+            return None
+        damage = int(launched.missile_dam + fired.missile_dam)
+        delay = float(launched.delay or base.weapon_speed or 0)
+        if damage < 1 or delay <= 0:
+            return None
+        return dataclasses.replace(
+            base, skill=skill, skill_level=level, attack="pierce", damage=damage,
+            weapon_class=int(base.weapon_class + launched.missile_wc + fired.missile_wc),
+            weapon_speed=round(delay, 3), max_aggro_pack=1, spell_damage=0.0,
+            cast_delay=0.0, mana_cost=0, mana_regen=0.0, max_mana=0, spell_attack="",
+            combat_style=RANGED_KITE_STYLE)
+    return None
 
 
 class _OriginRejected(RuntimeError):
@@ -788,13 +882,19 @@ class FarmAnalyzer:
         # HP of her recent landed heal-spell casts (healing_rate).
         self.heal_samples: list[int] = []
         self._message_position = 0
-        # The encounter model's rating of every spot in each style a build
-        # she can field fights in (builds.fieldable_styles, kept on the
-        # client as ``build_styles`` by the farm circuit): style -> spot_key
-        # -> encounter fields and xp_hour. Only her current style's run is
-        # merged into the ranking (warn only); the others feed the build
-        # choice (builds.choose). Per style: the ranking it rated, when it
-        # last started and why it last failed.
+        # Raw damage per hit and attack type of every damage spell she
+        # cast, by spell (build_profile).
+        self.samples_by_spell: dict[str, list[int]] = {}
+        self.attack_by_spell: dict[str, str] = {}
+        # The encounter model's rating of every spot for each build she can
+        # field, with that build's own profile (build_profile; the farm
+        # circuit keeps the builds and their spells on the client as
+        # ``fieldable_builds``, and the one she fields as ``active_build``):
+        # build -> spot_key -> encounter fields and xp_hour. Only the run of
+        # the build she fields is merged into the ranking (warn only); the
+        # others feed the build choice (builds.choose). A build whose
+        # profile her real numbers cannot describe is not rated. Per build:
+        # the ranking it rated, when it last started and why it last failed.
         self.style_ratings: dict[str, dict[tuple, dict]] = {}
         self.style_generation: dict[str, int] = {}
         self._style_attempt_at: dict[str, float] = {}
@@ -936,6 +1036,9 @@ class FarmAnalyzer:
             raw = int(match.group(1)) - int(match.group(2))
             if raw > 0:
                 self.spell_samples = (self.spell_samples + [raw])[-SPELL_SAMPLES:]
+                self.samples_by_spell[spell] = (
+                    self.samples_by_spell.get(spell, []) + [raw])[-SPELL_SAMPLES:]
+                self.attack_by_spell[spell] = attack
                 self.spell_attack = attack
 
     def poll(self, client) -> bool:
@@ -956,8 +1059,7 @@ class FarmAnalyzer:
             return False
         origin = self.approach_origin(client.state)
         if not self.due(profile, origin):
-            return self._poll_encounters(
-                profile, tuple(getattr(client, "build_styles", ()) or ()))
+            return self._poll_encounters(client, profile)
         # A new ranking would drop an encounter run's result anyway: stop it
         # so the two never share her host's cores.
         self._cancel_encounters()
@@ -1005,43 +1107,62 @@ class FarmAnalyzer:
         if self.encounter_running:
             self._encounter_task.cancel()
 
-    def style_due(self, profile: CombatProfile | None, style: str) -> bool:
-        """Whether another build's style (not her current one) should rate
-        the current ranking: as encounter_due, once per ranking, after the
-        current style's run, a failed one after RETRY_SECONDS."""
+    def build_due(self, profile: CombatProfile | None, build: str) -> bool:
+        """Whether another build (not the one she fields) should rate the
+        current ranking: as encounter_due, once per ranking, after her own
+        build's run, a failed one after RETRY_SECONDS."""
         if (profile is None or self.report is None or self.running or
-                self.encounter_running or not profile.combat_style or
-                profile.healing_per_second <= 0 or style == profile.combat_style or
+                self.encounter_running or profile.healing_per_second <= 0 or
                 self.encounter_generation != self.report_generation):
             return False
-        if self.style_generation.get(style) == self.report_generation:
+        if self.style_generation.get(build) == self.report_generation:
             return False
-        elapsed = self.clock() - self._style_attempt_at.get(style, float("-inf"))
-        return elapsed >= (self.RETRY_SECONDS if self.style_errors.get(style)
+        elapsed = self.clock() - self._style_attempt_at.get(build, float("-inf"))
+        return elapsed >= (self.RETRY_SECONDS if self.style_errors.get(build)
                            else self.MIN_INTERVAL_SECONDS)
 
-    def _poll_encounters(self, profile: CombatProfile, styles: tuple[str, ...] = ()) -> bool:
-        if self.encounter_due(profile):
+    def _build_profile(self, client, build: str, spell: str,
+                       base: CombatProfile) -> CombatProfile | None:
+        return build_profile(client, build, spell, base,
+                             self.samples_by_spell, self.attack_by_spell)
+
+    def _poll_encounters(self, client, profile: CombatProfile) -> bool:
+        """The encounter run of the build she fields (merged, warn only;
+        her ordinary profile while that build's cannot be derived), then one
+        per other build she can field."""
+        builds = dict(getattr(client, "fieldable_builds", None) or {})
+        current = str(getattr(client, "active_build", "") or "melee")
+        own = self._build_profile(client, current, builds.get(current, ""), profile) or profile
+        if self.encounter_due(own):
             self._encounter_attempt_at = self.clock()
             self._encounter_task = asyncio.get_running_loop().create_task(
-                self._run_encounters(profile, self.report_generation))
+                self._run_encounters(own, self.report_generation, key=current))
             return True
-        style = next((style for style in styles if self.style_due(profile, style)), "")
-        if not style:
-            return False
-        self._style_attempt_at[style] = self.clock()
-        self._encounter_task = asyncio.get_running_loop().create_task(
-            self._run_encounters(dataclasses.replace(profile, combat_style=style),
-                                 self.report_generation, merge=False))
-        return True
+        for build, spell in builds.items():
+            if build == current or not self.build_due(own, build):
+                continue
+            styled = self._build_profile(client, build, spell, profile)
+            if styled is None:
+                # Not describable from her real numbers: never rated, so
+                # auto never fields it on a rating.
+                self.style_ratings.pop(build, None)
+                self.style_generation[build] = self.report_generation
+                continue
+            self._style_attempt_at[build] = self.clock()
+            self._encounter_task = asyncio.get_running_loop().create_task(
+                self._run_encounters(styled, self.report_generation, merge=False,
+                                     key=build))
+            return True
+        return False
 
     async def _run_encounters(self, profile: CombatProfile, generation: int, *,
-                              merge: bool = True) -> None:
+                              merge: bool = True, key: str = "") -> None:
         """One encounter run, merged into the ranking it was started for
-        (``merge``: her current style's), and kept as that style's ratings
-        (style_ratings). Her ranking never waits for it; a ranking replaced
-        meanwhile drops the result, and the next poll rates the new one."""
-        style = profile.combat_style
+        (``merge``: the build she fields), and kept as that build's ratings
+        (style_ratings[key]). Her ranking never waits for it; a ranking
+        replaced meanwhile drops the result, and the next poll rates the new
+        one."""
+        style = key or "melee"
         try:
             styled = await self._analyze(
                 self.command(profile, self.origin, styled=True), encounter=True)

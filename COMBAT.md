@@ -1914,8 +1914,9 @@ counted toward the spot's kit hazard. Three changes:
   included.
 - **A pack she can hold.** Outside Wizardry training (pack 1, unchanged),
   `combat_profile` now ranks for `max_aggro_pack`
-  `SINGLE_TARGET_MAX_AGGRO_PACK` (2): she fights one target at a time and
-  casts no area spell. The analyzer drops a map whose pack exceeds it
+  `SINGLE_TARGET_MAX_AGGRO_PACK` (2): her ordinary kit fights one target at
+  a time (a fielded AoE build's pack cap is its own encounter profile's,
+  see "Combat builds per spot"). The analyzer drops a map whose pack exceeds it
   before it builds circuits, so `2_3`, `3_2`, `1_4` and the other
   Underground City maps of pack 3 or more leave every circuit.
 - **Pack recalls on the way count** toward the spot's kit hazard
@@ -2008,8 +2009,8 @@ unchanged.
     another hostile is close; `ranged-kite` while Wizardry trains with
     spells only (`caster_kite` holds one target at range; as
     `FarmTask.spell_only_training`, once the spell fits beyond her healing
-    reserve); her fielded build's style when she fields another build
-    ([combat builds](#combat-builds-per-spot-2026-11-26)).
+    reserve). The runs for the builds she can field use each build's own
+    profile ([combat builds](#combat-builds-per-spot-2026-11-26)).
   - `--healing-per-second` (`healing_rate`): the median HP of her landed
     heal-spell casts (`FarmAnalyzer.heal_samples`, from "The spell heals
     you for N hp!" within 2 s of her FIRE of a healing spell she knows; an
@@ -2092,12 +2093,12 @@ the spot autoplay farms. The spot itself is still chosen as before
 ([encounter warnings](#encounter-warnings-2026-11-25) stay warn only): the
 build is chosen for the spot, never the spot for a build.
 
-| Build | Requirement | Routine (FarmTask) | Gear style | Encounter style |
+| Build | Requirement | Routine (FarmTask) | Gear style | Encounter profile |
 | --- | --- | --- | --- | --- |
-| Melee | a weapon and a weapon school | her weapon, with the automatic Wizardry training plan | melee | `melee` |
-| AoE caster | a known area spell (firestorm, icestorm, ...) her Wizardry can cast | the Wizardry spell kite, packs allowed (`casts_firestorm` covers every area spell) | caster | `aoe-kite` |
-| Single-target caster | a known damage spell (magic bullet, ...) her Wizardry can cast | the Wizardry spell kite, one target | caster | `ranged-kite` |
-| Bow | a launcher, its archery skill and 20 ammunition | the launcher pull, then her weapon | bow | `ranged-kite` |
+| Melee | a weapon and a weapon school | her weapon, with the automatic Wizardry training plan | melee | her ordinary profile, `melee` |
+| AoE caster | a known area spell (firestorm, icestorm, ...) her Wizardry can cast | its spell with spells only (the Wizardry kite; `casts_firestorm` covers every area spell) | caster | the spell's sampled damage, cost and her SP; pack what one bar pays a cast for each monster of (at most 6); `aoe-kite` |
+| Single-target caster | a known damage spell (magic bullet, ...) her Wizardry can cast | its spell with spells only, one target | caster | the spell's numbers, pack 1, `ranged-kite` |
+| Bow | a launcher, its archery skill and 20 ammunition | the launcher pull, then her weapon | bow | the examined launcher and ammunition damage, WC and delay, pack 1, `ranged-kite` |
 
 The server refuses a spell above her Wizardry level
 (`types/common/apply.c`), so a spell's level is its archetype's. A wand or
@@ -2106,25 +2107,37 @@ fields no build: the farm casts, it does not fire wands (her firestorm L2
 and icestorm L5 wands with Magic Devices 1 would be weak anyway), and the
 gap says so.
 
-- **Choosing.** The operator picks a build for the farmed spot or for every
-  spot on the Farming tab ("Combat build"), kept in her character memory
-  (`GameState.build_choices`; "auto" for a spot clears its own choice). On
-  auto, the analyzer rates her spot in the encounter style of every build
-  she can field (`FarmAnalyzer.style_ratings`: after the warn-only run of
-  her own style, one more `--combat-style` run per other style, once per
-  ranking, kept apart from the ranking), and she fields the safest: a build
-  without an encounter warning before one with, then the most XP; among
-  warned builds the highest encounter safety. Until a style is rated, she
-  keeps the build she fields (a new circuit takes it over), else her
-  default plan (melee); a new ranking keeps each style's earlier ratings
-  until that style is re-run, so the build does not flip while they come.
-  The rating uses her current damage profile with only the style changed.
-  An explicit (non-analyzer) circuit fields no build and clears the build
-  style from her profile.
+- **Fielding is not training.** A fielded caster build makes the farm
+  child cast its spell with spells only (`FarmCircuitTask._build_spell`,
+  `FarmTask.fielded_caster`); the circuit's training plan and its until
+  levels stay as they were, and leaving the build ends it. Out of SP with
+  a hostile in contact, a fielded caster disengages (a `caster-out-of-mana`
+  decision and a retreat step) rather than kiting until her mana returns.
+- **Choosing.** The operator picks a build for the farmed spot (or a ranked
+  one) or for every spot on the Farming tab ("Combat build"), kept in her
+  character memory (`GameState.build_choices`, at most 200 spots; "auto"
+  for a spot clears its own choice); it applies at once. On auto, the
+  analyzer rates her spot for every build she can field with that build's
+  own profile (`farm_analyzer.build_profile`, `FarmAnalyzer.style_ratings`
+  by build: after the warn-only run of the build she fields, one run per
+  other build, once per ranking, kept apart from the ranking). A build
+  whose profile her real numbers cannot give (a spell never sampled, a
+  launcher not examined, a bar that cannot pay the spell beyond the
+  healing reserve) is not rated, and only a rating `encounter_rated`
+  accepts counts. She fields the safest: a build without an encounter
+  warning before one with, then the most XP; among warned builds the
+  highest encounter safety. She keeps the build she fields unless another
+  is safer (hers warns, the other does not, at once) or earns 20% more XP
+  an hour (not within an hour of taking hers up). Unrated, she keeps the
+  build she fields (a new circuit takes it over), else her default plan
+  (melee); a new ranking keeps each build's earlier ratings until it is
+  re-run. An explicit (non-analyzer) circuit fields no build.
 - **Unmet requirement.** An operator's build she cannot field falls back to
   the auto choice among those she can, with a `build-gap` decision and a
   "Build gap" warning alert. The "get this build" errand works towards the
-  operator's unmet build, else the AoE build while she cannot field it.
+  operator's unmet build here, else the AoE build while she cannot field
+  it and auto (or an operator's AoE choice somewhere) wants it; with every
+  spot set to another build, none (the gap still shows).
 - **Learning a spell** (`LearnSpellTask`). Spell sellers and their spells
   are indexed from content at graph build (`WorldGraph.spell_offers`: each
   `generic/spell_seller.py` event's `slaying` list, with each spell's level
@@ -2133,20 +2146,26 @@ gap says so.
   follows the spell's link, reads "X requires level N to use. Your wizardry
   spells skill is level M." and "X will cost you P. Is that okay?"
   (`Merchant.py` `SpellSeller`), and confirms only when she can cast it and
-  pay it beyond her cure reserve (the depletion service's cost). Short, she
-  does not go: the dashboard shows "Get this build: need 5g for Firestorm
-  from Dunowen" (and a `build-errand-funds` decision) until the owner drops
-  gold on her. "You don't have enough money..." is handled the same way.
-  A failed errand waits on its own backoff (30 minutes, longer for a
-  refused strict route), apart from the magic bullet purchase.
-- **Swapping sets.** A build change whose set or consumables her chest
-  holds (her index's set labels, ammunition for the bow, area-spell wands
-  for the AoE caster) makes one apartment trip (`SwapSetTask`): take out the
-  new build's pieces that beat what she wears and its consumables, wear
-  them (the server takes off what each slot held), then deposit what is no
-  longer her active set. Items deposited earlier in the session may come
-  back on that trip. The trip skips the routine 30-minute wait between
-  storage visits, never a failed trip's backoff.
+  pay it from true surplus (`_spending_reserve`: her cure reserve plus the
+  heal restock, recall and identify-all reserves). Short, she does not go:
+  the dashboard shows "Get this build: need 5g for Firestorm from Dunowen"
+  (and a `build-errand-funds` decision) until the owner drops gold on her.
+  "You don't have enough money..." is handled the same way. The trip uses
+  the strict route policy of the other optional errands. A failed trip
+  waits on its own backoff (30 minutes, longer for a refused strict route);
+  after three failed trips the errand gives up with a "Learn errand
+  failed" alert until the operator retries it (the alert's Retry button)
+  or the process restarts.
+- **Swapping sets.** A build change that changes the gear style makes one
+  apartment trip (`SwapSetTask`) when her chest holds, as her index knows
+  it, a piece of the new style's set that beats what she wears, or the new
+  build's consumables (ammunition for her launcher, area-spell wands): take
+  them out, wear the pieces (the server takes off what each slot held),
+  then deposit what is no longer her active set. The AoE and single-target
+  casters share the caster set, so a change between them makes no trip.
+  Items deposited earlier in the session may come back on that trip. The
+  trip skips the routine 30-minute wait between storage visits, never a
+  failed trip's backoff.
 - **Suggestion.** The Farming tab lists the best set for the spot's build
   from what she owns: per slot what she wears or carries first (the gear
   scorer's best), then what her chest holds for that build, and the stored
@@ -2154,7 +2173,9 @@ gap says so.
 
 Not done: shop items that would improve the set (no examined shop stock is
 cached), choosing icestorm or another element per spot by monster
-protections, and fighting with wands.
+protections, and fighting with wands. A caster build is rated only once
+her damage with its spell has been sampled, so auto fields a newly learnt
+spell only after the operator (or her Wizardry training) has cast it.
 
 ## Packs on a walk: cornered and outclassed (2026-11-24)
 

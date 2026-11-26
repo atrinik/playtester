@@ -699,10 +699,10 @@ class AtrinikClient:
             self.state.farm_objective = (
                 objective if objective in OBJECTIVES else DEFAULT_OBJECTIVE)
             choices = record.get("build_choices", {})
-            self.state.build_choices = {
+            self.state.build_choices = dict(list({
                 str(spot)[:300]: value for spot, value in choices.items()
                 if isinstance(spot, str) and value in builds.CHOICES
-            } if isinstance(choices, dict) else {}
+            }.items())[-builds.MAX_BUILD_CHOICES:]) if isinstance(choices, dict) else {}
             try:
                 self.state.last_bank_deposit_at = max(
                     0.0, float(record.get("last_bank_deposit_at", 0.0)))
@@ -1189,10 +1189,13 @@ class AtrinikClient:
             raise ValueError(f"unknown build {choice!r}")
         spot = str(spot or builds.EVERY_SPOT)[:300]
         choices = dict(self.state.build_choices)
-        if choice == builds.AUTO and spot != builds.EVERY_SPOT:
-            choices.pop(spot, None)
-        else:
+        choices.pop(spot, None)
+        if choice != builds.AUTO or spot == builds.EVERY_SPOT:
             choices[spot] = choice
+        # At most MAX_BUILD_CHOICES spots, the oldest choice going first.
+        while len(choices) > builds.MAX_BUILD_CHOICES:
+            oldest = next(key for key in choices if key != builds.EVERY_SPOT)
+            choices.pop(oldest)
         self.state.build_choices = choices
         character = self.state.player_name or self.config.character
         if not character:

@@ -329,12 +329,19 @@ function renderCombatBuild() {
     <div class="spot-head"><b>${esc(label(st.build) || "none")}</b>${st.active && st.active !== st.build ? `<span class="flag">fielding ${esc(label(st.active))}</span>` : ""}</div>
     <small class="${st.fallback ? "warn-text" : "muted"}">${esc(st.reason || "")}</small>
     ${st.shortfall ? `<small class="warn-text">Get this build: ${esc(st.shortfall)}</small>` : ""}
+    ${st.errand_failed ? `<small class="warn-text">Learn errand failed: ${esc(st.errand_failed)} <button class="secondary small" data-retry-learn="1">Retry</button></small>` : ""}
     ${gaps}
     ${slots ? `<small class="muted">Suggested ${esc(sug.label || "")} set (owned):</small>${slots}` : ""}
     ${(sug.consumables || []).length ? `<small class="muted">Stored consumables: ${esc(sug.consumables.join(", "))}</small>` : ""}
   </div>`;
 }
 document.addEventListener("click", e => {
+  const retry = e.target.closest("button[data-retry-learn]");
+  if (retry) {
+    action(retry, "Retry the learn errand", { type: "retry_learn" })
+      .then(ok => { if (ok) { lastBuildSig = ""; pollSlow(); } });
+    return;
+  }
   const btn = e.target.closest("button[data-build]");
   if (!btn || btn.classList.contains("active")) return;
   action(btn, `Combat build: ${btn.textContent}`, { type: "build_choice", spot: btn.dataset.scope, build: btn.dataset.build })

@@ -2439,6 +2439,11 @@ class FarmTask(BotTask):
         self.inventory_policy = InventoryPolicy()
         self.combat_skill = combat_skill.casefold().strip()
         self.combat_spell = combat_spell.casefold().strip()
+        # The farm circuit's fielded build (builds.py): a caster build
+        # fights with its spell (out of SP with a hostile in contact she
+        # disengages), and a build's gear style replaces her training's.
+        self.fielded_caster = False
+        self.gear_style_override = ""
         self.allow_launchers = (
             not bool(self.combat_spell)
             if allow_launchers is None else bool(allow_launchers))
@@ -4754,7 +4759,7 @@ class FarmTask(BotTask):
         self.inventory_policy.caster_profile = (
             CasterProfile.from_client(client)
             if self.inventory_policy.caster_stats else None)
-        self.inventory_policy.gear_style = gear_style(
+        self.inventory_policy.gear_style = self.gear_style_override or gear_style(
             self.combat_skill, self.inventory_policy.caster_stats)
         for item in client.state.inventory:
             lore_attempted = getattr(client, "lore_book_attempted", None)
@@ -7304,6 +7309,18 @@ class FarmTask(BotTask):
         engaged_id = self._engaged_target[0] if self._engaged_target else 0
         engaged = next((entry for entry in threats
                         if entry[3].target_id == engaged_id), None)
+        if (self.fielded_caster and nearest_threat is not None and
+                nearest_threat[0] <= 1 and self.spell_only_training(client) and
+                (spell := self.combat_spell_item(client)) is not None and
+                not self.offensive_spell_affordable(client, spell)):
+            # A fielded caster out of SP with a hostile in contact has
+            # nothing to fight with: disengage, rather than kite slowly
+            # until her mana regenerates.
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("caster-out-of-mana", f"{spell.name}: disengaging")
+            await self.low_health_retreat(client)
+            return
         nearby_pack = [
             entry for entry in threats
             if entry[0] <= 4 and active_threat(entry)]

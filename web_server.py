@@ -701,6 +701,10 @@ class DashboardState:
         if status.get("shortfall"):
             alerts.append({"id": "build-funds", "level": "warn",
                            "text": "Get this build: " + str(status["shortfall"])})
+        failed = getattr(self.client, "learn_errand_failed", "")
+        if failed:
+            alerts.append({"id": "build-errand-failed", "level": "warn",
+                           "text": f"Learn errand failed: {failed}"})
         return alerts
 
     def alerts(self) -> list[dict[str, str]]:
@@ -998,6 +1002,8 @@ class DashboardState:
         if status is not None:
             snapshot["status"] = {key: value for key, value in status.items()
                                   if key != "circuit"}
+            snapshot["status"]["errand_failed"] = str(
+                getattr(self.client, "learn_errand_failed", "") or "")
             snapshot["spot_choice"] = choices.get(status.get("spot", ""), builds.AUTO)
             try:
                 snapshot["suggestion"] = status["circuit"].build_suggestion(self.client)
@@ -1714,6 +1720,20 @@ class WebControlServer:
                 container, patterns, indexer=storage.plain_indexer()))
         raise ValueError("unknown task type")
 
+    def _known_spots(self) -> set[str]:
+        """Spots a build choice may name: every spot, the farmed one, and
+        each spot of the analyzer's rankings."""
+        known = {builds.EVERY_SPOT}
+        status = getattr(self.client, "build_status", None)
+        if isinstance(status, dict) and status.get("spot"):
+            known.add(str(status["spot"]))
+        report = getattr(getattr(self.client, "farm_analyzer", None), "report", None)
+        for ranked in ((report or {}).get("rankings") or {}).values():
+            for spot in ranked if isinstance(ranked, list) else ():
+                if isinstance(spot, dict) and spot.get("path"):
+                    known.add(str(spot["path"]))
+        return known
+
     def _inventory_item(self, tag: Any):
         value = int(tag)
         item = self.client.state.items.get(value)
@@ -1745,7 +1765,8 @@ class WebControlServer:
     async def _action(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
         if (getattr(self.engine, "operator_hold", "") and
-                kind not in ("farm_objective", "build_choice", "refresh_quests")):
+                kind not in ("farm_objective", "build_choice", "retry_learn",
+                             "refresh_quests")):
             # A manual order would move her or her gold mid-run.
             raise ValueError("an operator assist is running; act after it ends")
         if kind in ("move", "dialog", "apply", "apply_ground"):
@@ -1762,8 +1783,15 @@ class WebControlServer:
             if choice not in builds.CHOICES:
                 raise ValueError(f"unknown build {choice!r}")
             spot = str(data.get("spot", "") or builds.EVERY_SPOT)
+            if spot not in self._known_spots():
+                raise ValueError("not a farm spot she knows")
             self.client.set_build_choice(spot, choice)
             return {"ok": True, "spot": spot, "build": choice}
+        if kind == "retry_learn":
+            # The operator retries a "get this build" errand that gave up.
+            self.client.learn_errand_failed = ""
+            self.client.learn_errand_failures = 0
+            return {"ok": True}
         if kind == "chat":
             text = str(data.get("text", "")).strip()
             if not text:
