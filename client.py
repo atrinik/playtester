@@ -703,6 +703,12 @@ class AtrinikClient:
                 str(spot)[:300]: value for spot, value in choices.items()
                 if isinstance(spot, str) and value in builds.CHOICES
             } if isinstance(choices, dict) else {}
+            self.state.spell_samples = builds.load_spell_samples(
+                record.get("spell_samples", {}))
+            self.state.build_state = builds.load_build_state(record.get("build_state", {}))
+            for name in ("active_build", "active_build_since", "pending_swap_build"):
+                if name in self.state.build_state:
+                    setattr(self, name, self.state.build_state[name])
             # The most recent spots, never the every-spot choice dropped.
             spots = [key for key in loaded if key != builds.EVERY_SPOT]
             kept = spots[-(builds.MAX_BUILD_CHOICES - (builds.EVERY_SPOT in loaded)):]
@@ -761,6 +767,8 @@ class AtrinikClient:
             self.state.apartment_returns = {}
             self.state.farm_objective = DEFAULT_OBJECTIVE
             self.state.build_choices = {}
+            self.state.spell_samples = {}
+            self.state.build_state = {}
             self.state.farm_adaptations = {}
             self.state.bank_balance = 0
             self.state.bank_balance_known = False
@@ -1207,6 +1215,31 @@ class AtrinikClient:
         if not character:
             return
         self._runtime_memory.setdefault(character, {})["build_choices"] = dict(choices)
+        self._persist_character_memory()
+
+    def set_spell_samples(self, samples: dict) -> None:
+        """Persist her observed hits per damage spell (bounded)."""
+        self.state.spell_samples = builds.load_spell_samples(samples)
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})["spell_samples"] = dict(
+            self.state.spell_samples)
+        self._persist_character_memory()
+
+    def set_build_state(self, **changes) -> None:
+        """Persist the build she fields, since when, and a pending swap,
+        so the hold and the swap survive a restart."""
+        state = dict(self.state.build_state)
+        state.update(changes)
+        self.state.build_state = builds.load_build_state(state)
+        for name, value in changes.items():
+            setattr(self, name, value)
+        character = self.state.player_name or self.config.character
+        if not character:
+            return
+        self._runtime_memory.setdefault(character, {})["build_state"] = dict(
+            self.state.build_state)
         self._persist_character_memory()
 
     def set_apartment_bed_bound(self, bound: bool = True) -> None:

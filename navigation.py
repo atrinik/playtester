@@ -7249,6 +7249,25 @@ def _set_attr(client: AtrinikClient, name: str, value) -> None:
         pass
 
 
+def _build_rated(rating: dict) -> bool:
+    """A build's rating counts when the encounter model applied it and her
+    bar kills the spot's monsters with it (farm_analyzer.spot_affordable;
+    unknown counts)."""
+    return (farm_analyzer_plan.encounter_rated(rating) and
+            rating.get("build_affordable") is not False)
+
+
+def _note_build_state(client: AtrinikClient, **changes) -> None:
+    """The build she fields, since when and a pending swap, on the client
+    and in her character memory (client.set_build_state)."""
+    setter = getattr(client, "set_build_state", None)
+    if setter is not None:
+        setter(**changes)
+        return
+    for name, value in changes.items():
+        _set_attr(client, name, value)
+
+
 def smith_unreachable(client: AtrinikClient) -> dict[str, float]:
     """Until when (wall clock) each smith she could not reach is passed
     over; in memory, for the connection."""
@@ -10220,7 +10239,7 @@ class FarmCircuitTask(BotTask):
         choice = builds.choose(
             state, spot, ratings, getattr(state, "build_choices", {}) or {}, levels,
             warn=farm_analyzer_plan.encounter_warning,
-            rated=farm_analyzer_plan.encounter_rated, current=self._build_name,
+            rated=_build_rated, current=self._build_name,
             held=time.time() - since < builds.HOLD_SECONDS)
         _set_attr(client, "fieldable_builds", builds.fieldable_spells(state, levels))
         self._build_choice = choice
@@ -10268,12 +10287,14 @@ class FarmCircuitTask(BotTask):
         self._build_name = name
         self._build_spell = builds.build_spell(
             name, client.state, self.graph.spell_levels())
-        _set_attr(client, "active_build", name)
         if name != previous:
-            _set_attr(client, "active_build_since", time.time())
             self._plan_swap(client, previous, before)
-            # A successor circuit takes over a swap not yet made.
-            _set_attr(client, "pending_swap_build", self._swap_build)
+            # A successor circuit (or a restart) takes over the hold and a
+            # swap not yet made.
+            _note_build_state(client, active_build=name, active_build_since=time.time(),
+                              pending_swap_build=self._swap_build)
+        elif getattr(client, "active_build", None) != name:
+            _note_build_state(client, active_build=name)
 
     def _review_combat_build(self, client: AtrinikClient,
                              farm: FarmTask) -> bool:
@@ -10281,10 +10302,10 @@ class FarmCircuitTask(BotTask):
         between fights and loot."""
         if not self._auto_combat_build:
             # An explicit circuit fields no build: none rates her spot.
-            for name, empty in (("fieldable_builds", {}), ("active_build", ""),
-                                ("pending_swap_build", "")):
-                if getattr(client, name, empty):
-                    _set_attr(client, name, empty)
+            if getattr(client, "fieldable_builds", {}):
+                _set_attr(client, "fieldable_builds", {})
+            if getattr(client, "active_build", "") or getattr(client, "pending_swap_build", ""):
+                _note_build_state(client, active_build="", pending_swap_build="")
             return False
         if not self._build_seeded:
             # A new circuit starts with the build she already fields (and
@@ -11255,7 +11276,7 @@ class FarmCircuitTask(BotTask):
         (one trip per build change); a later change keeps its own."""
         if self._swap_build == self._storage_swap:
             self._swap_build = ""
-            _set_attr(client, "pending_swap_build", "")
+            _note_build_state(client, pending_swap_build="")
         self._storage_swap = ""
 
     def _plan_swap(self, client: AtrinikClient, previous: str = "melee",
@@ -11264,7 +11285,9 @@ class FarmCircuitTask(BotTask):
         (SwapSetTask), when the gear style changes and her chest holds,
         as her index knows it, a piece of the new style's set that beats
         what she wears, or the new build's consumables. Caster builds share
-        one set, so AoE to single-target needs no trip."""
+        one set, so a change between them makes no trip, and single-target
+        to AoE never fetches stored area wands: the farm does not fire wands,
+        so they would only be carried."""
         style = self._build(client)
         # The gear style before the change (_review_combat_build passes it).
         before = before or (
@@ -12927,11 +12950,16 @@ class FarmCircuitTask(BotTask):
         choice = self._build_choice
         if not self._auto_combat_build or choice is None or not choice.wanted:
             return None
-        return builds.learn_target(choice.wanted, client.state, self.graph.spell_offers())
+        # A spell given up (LEARN_ATTEMPTS failed trips) is passed over;
+        # another that fields the build may still be learnt.
+        given_up = getattr(client, "learn_errand_failed", None) or {}
+        return builds.learn_target(choice.wanted, client.state, [
+            offer for offer in self.graph.spell_offers() if offer.spell not in given_up])
 
     # After this many failed trips (route or dialogue, not money) the
     # errand gives up until the operator retries it from the dashboard or
-    # the process restarts (client.learn_errand_failed).
+    # the process restarts (client.learn_errand_failed: spell -> reason;
+    # learn_errand_failures: spell -> count).
     LEARN_ATTEMPTS = 3
 
     def _spending_reserve(self, client: AtrinikClient) -> int:
@@ -12948,11 +12976,14 @@ class FarmCircuitTask(BotTask):
         dashboard ("need N for <spell> from <seller>"); the owner can drop
         gold on her. Given up after LEARN_ATTEMPTS failed trips."""
         if getattr(client, "learn_errand_retry", False):
-            # The operator retried it from the dashboard.
+            # The operator retried a given-up errand from the dashboard: its
+            # route or dialogue backoff ends; a seller's money refusal
+            # keeps its own.
             _set_attr(client, "learn_errand_retry", False)
-            self._learn_retry_at = 0.0
+            if not self._shortfall_from_seller:
+                self._learn_retry_at = 0.0
         offer = self._learn_offer(client)
-        if offer is None or getattr(client, "learn_errand_failed", ""):
+        if offer is None:
             self._spell_shortfall = ""
             return False
         reserve = self._spending_reserve(client)
@@ -13336,12 +13367,15 @@ class FarmCircuitTask(BotTask):
                         self._spell_shortfall = self._spell_purchase.error
                         self._spell_shortfall_key = (learn.spell, learn.shortfall)
                     else:
-                        failures = int(getattr(client, "learn_errand_failures", 0) or 0) + 1
+                        failures = dict(getattr(client, "learn_errand_failures", None) or {})
+                        failures[learn.spell] = failures.get(learn.spell, 0) + 1
                         _set_attr(client, "learn_errand_failures", failures)
-                        if failures >= self.LEARN_ATTEMPTS:
+                        if failures[learn.spell] >= self.LEARN_ATTEMPTS:
                             reason = (f"{learn.spell} from {learn.npc}: "
                                       f"{self._spell_purchase.error}")
-                            _set_attr(client, "learn_errand_failed", reason)
+                            failed = dict(getattr(client, "learn_errand_failed", None) or {})
+                            failed[learn.spell] = reason
+                            _set_attr(client, "learn_errand_failed", failed)
                             recorder = getattr(client, "record_action", None)
                             if recorder is not None:
                                 recorder("build-errand-failed", reason)
@@ -13357,7 +13391,9 @@ class FarmCircuitTask(BotTask):
                         recorder("build-spell-learned", f"{learn.spell} from {learn.npc}")
                     # The next build review can field it at once.
                     self._learn_retry_at = 0.0
-                    _set_attr(client, "learn_errand_failures", 0)
+                    failures = dict(getattr(client, "learn_errand_failures", None) or {})
+                    failures.pop(learn.spell, None)
+                    _set_attr(client, "learn_errand_failures", failures)
                 else:
                     log.info("magic bullet learned; returning to farm")
                     self._spell_retry_at = self.clock() + 86400.0

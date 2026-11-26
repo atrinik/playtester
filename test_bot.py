@@ -41981,6 +41981,16 @@ class BuildPerSpotTests(unittest.TestCase):
         ratings["single"] = self._rating("ranged-kite", 0.5, 2000.0, worst=9.0)
         ratings["melee"] = self._rating("melee", 0.9, 100.0)
         self.assertEqual(pick(held=True), "melee")
+        # Both warn: one at least 0.10 safer wins at once, even held.
+        ratings["single"] = self._rating("ranged-kite", 0.7, 100.0, worst=9.0)
+        ratings["melee"] = self._rating("melee", 0.3, 2000.0, worst=9.0)
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                       warn=encounter_warning, rated=encounter_rated,
+                                       current="melee", held=True).build, "single")
+        ratings["single"] = self._rating("ranged-kite", 0.35, 100.0, worst=9.0)
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                       warn=encounter_warning, rated=encounter_rated,
+                                       current="melee").build, "melee")
         # The operator's choice applies at once, held or not.
         self.assertEqual(builds.choose(client.state, "/spot", ratings, {"*": "single"},
                                        self.LEVELS, current="melee", held=True).build,
@@ -42012,6 +42022,140 @@ class BuildPerSpotTests(unittest.TestCase):
                                                self.LEVELS).build, build)
             restored.set_build_choice("/shattered_islands/world_17_72", "auto")
             self.assertEqual(restored.state.build_choices, {"*": "melee"})
+
+    def test_the_circuit_holds_the_build_an_hour(self):
+        client = self._client()
+        circuit = self._circuit(client)
+        ratings = {"melee": self._rating("melee", 0.9, 1300.0),
+                   "single": self._rating("ranged-kite", 0.9, 1000.0)}
+        client.farm_analyzer = types.SimpleNamespace(spot_ratings=lambda spot: ratings)
+        circuit._build_name = "single"
+        client.active_build_since = time.time() - 600.0
+        self.assertEqual(circuit._choose_build(client).build, "single")
+        client.active_build_since = time.time() - 4000.0
+        self.assertEqual(circuit._choose_build(client).build, "melee")
+        # A build her bar cannot kill a monster with is not rated.
+        ratings["melee"] = dict(ratings["melee"], build_affordable=False)
+        self.assertEqual(circuit._choose_build(client).build, "single")
+
+    def test_build_state_and_spell_samples_survive_a_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.set_build_state(active_build="single", active_build_since=1234.5,
+                                   pending_swap_build="single")
+            client.set_spell_samples({"magic bullet": {"hits": [10, 12, "x", -3, 14],
+                                                       "attack": "magic"},
+                                      "bad": "row"})
+            restored = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            restored.state.player_name = "Sera"
+            restored.load_character_memory("Sera")
+            self.assertEqual((restored.active_build, restored.active_build_since,
+                              restored.pending_swap_build), ("single", 1234.5, "single"))
+            self.assertEqual(restored.state.spell_samples,
+                             {"magic bullet": {"hits": [10, 12, 14], "attack": "magic"}})
+            # The analyzer starts from them, and saves what it samples.
+            helper = FarmAnalyzerTests()
+            helper._cleanups = []
+            analyzer = helper.analyzer()
+            analyzer._load_samples(restored)
+            self.assertEqual(analyzer.samples_by_spell["magic bullet"], [10, 12, 14])
+            analyzer.samples_by_spell["firestorm"] = [12]
+            analyzer.attack_by_spell["firestorm"] = "fire"
+            # Saved at most once a minute.
+            analyzer._load_samples(restored)
+            self.assertNotIn("firestorm", restored.state.spell_samples)
+            analyzer._samples_saved_at -= analyzer.SAMPLE_SAVE_SECONDS
+            analyzer._load_samples(restored)
+            self.assertEqual(restored.state.spell_samples["firestorm"],
+                             {"hits": [12], "attack": "fire"})
+            for cleanup, args, kwargs in reversed(helper._cleanups):
+                cleanup(*args, **kwargs)
+
+    def test_a_fielded_caster_out_of_sp_disengages_until_it_recovers(self):
+        from .tasks import FarmTask
+        client = self._client()
+        client.state.stats.update(sp=2, maxsp=100)
+        for item in client.state.inventory:
+            if item.name == "magic bullet":
+                item.extra["cost"] = 4
+        farm = FarmTask(zone="/farm", combat_skill="wizardry spells",
+                        combat_spell="magic bullet")
+        farm.fielded_caster = True
+        retreats = []
+
+        async def retreat(client, gain_only=False):
+            retreats.append(True)
+            return True
+        farm.low_health_retreat = retreat
+        hostile = (1, 0, 0, types.SimpleNamespace(target_id=5))
+        contact = [True]
+        with patch("atrinik_bot.tasks.recent_hostile_contact", lambda client: contact[0]):
+            # Out of SP with a hostile attacking in contact: the episode
+            # begins, recorded once.
+            self.assertTrue(asyncio.run(farm.dry_caster_step(client, [hostile])))
+            # It keeps retreating while one is within 3 tiles ...
+            self.assertTrue(asyncio.run(farm.dry_caster_step(
+                client, [(3, 0, 0, hostile[3])])))
+            # ... and holds (no kite, no pull) once none is.
+            contact[0] = False
+            self.assertTrue(asyncio.run(farm.dry_caster_step(client, [])))
+            self.assertEqual(len(retreats), 2)
+            # One cast's SP is not enough to come back; half her bar is.
+            client.state.stats["sp"] = 10
+            self.assertTrue(asyncio.run(farm.dry_caster_step(client, [])))
+            client.state.stats["sp"] = 50
+            self.assertFalse(asyncio.run(farm.dry_caster_step(client, [])))
+        self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 1)
+        # Not a fielded caster (ordinary melee or Wizardry training): never.
+        farm.fielded_caster = False
+        client.state.stats["sp"] = 0
+        with patch("atrinik_bot.tasks.recent_hostile_contact", lambda client: True):
+            self.assertFalse(asyncio.run(farm.dry_caster_step(client, [hostile])))
+
+    def test_a_fielded_spell_never_resets_the_training_spells_samples(self):
+        helper = FarmAnalyzerTests()
+        helper._cleanups = []
+        analyzer = helper.analyzer()
+        client = helper.client()
+        state = client.state
+        state.player_tag = 7
+        state.stats.update(level=28, regen_sp=1.2, maxsp=100)
+        state.place_item(state.items[10], 7)
+        state.place_item(Item(tag=12, name="wizardry spells", item_type=c.TYPE_SKILL,
+                              extra={"level": 10}), 7)
+        state.place_item(Item(tag=13, name="magic bullet", item_type=c.TYPE_SPELL,
+                              extra={"cost": 4}), 7)
+        # Her training casts magic bullet; a fielded caster last cast
+        # firestorm, which reset the single-spell samples.
+        analyzer.samples_by_spell["magic bullet"] = [20, 20, 20]
+        analyzer.attack_by_spell["magic bullet"] = "magic"
+        analyzer.spell_name, analyzer.spell_samples = "firestorm", [9]
+
+        async def scenario():
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.profile.spell_damage, 20.0)
+            await analyzer.close()
+        asyncio.run(scenario())
+        for cleanup, args, kwargs in reversed(helper._cleanups):
+            cleanup(*args, **kwargs)
+
+    def test_a_build_choice_names_only_a_spot_she_knows(self):
+        client = AtrinikClient(ClientConfig())
+        server = WebControlServer(client, TaskEngine(client), WorldGraph())
+        client.farm_analyzer = types.SimpleNamespace(report={"rankings": {
+            "xp": [{"path": "circuit[a+b]"}], "money": "broken"}})
+        self.assertEqual(server._known_spots(), {"*", "circuit[a+b]"})
+        asyncio.run(server._action({"type": "build_choice", "spot": "circuit[a+b]",
+                                    "build": "single"}))
+        self.assertEqual(client.state.build_choices, {"circuit[a+b]": "single"})
+        for spot in ("/unranked", "../etc"):
+            with self.assertRaises(ValueError):
+                asyncio.run(server._action({"type": "build_choice", "spot": spot,
+                                            "build": "single"}))
 
     def test_build_choices_keep_at_most_200_spots_and_every_spot(self):
         from . import builds
@@ -42322,23 +42466,42 @@ class BuildPerSpotTests(unittest.TestCase):
             self.assertTrue(asyncio.run(circuit._tick_running_service(client)))
         circuit._learn_retry_at = 0.0
         self.assertEqual(client.learn_errand_failed,
-                         "firestorm from Dunowen: Dunowen offered no firestorm")
+                         {"firestorm": "firestorm from Dunowen: Dunowen offered no firestorm"})
         self.assertFalse(circuit._needs_learn_spell(client))
-        self.assertIn(("build-errand-failed", client.learn_errand_failed), client.actions)
+        self.assertIn(("build-errand-failed", client.learn_errand_failed["firestorm"]),
+                      client.actions)
+        # Given up per spell: another that fields the build is still learnt.
+        from .navigation import SpellOffer
+        circuit.graph.spell_offers = lambda: [
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "firestorm", 15, 50_000),
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "icestorm", 15, 50_000)]
+        self.assertTrue(circuit._needs_learn_spell(client))
+        self.assertEqual(circuit._learn_offer(client).spell, "icestorm")
         dashboard = DashboardState(client, None, WorldGraph(), {})
         self.assertIn("build-errand-failed", [
             alert["id"] for alert in dashboard.build_alerts(
                 types.SimpleNamespace(child=circuit))])
-        # The operator retries it from the dashboard.
+        # The operator retries it from the dashboard; with nothing given
+        # up, Retry is refused.
         real = AtrinikClient(ClientConfig())
-        real.learn_errand_failed, real.learn_errand_failures = "gave up", 3
         server = WebControlServer(real, TaskEngine(real), WorldGraph())
-        self.assertEqual(asyncio.run(server._action({"type": "retry_learn"})), {"ok": True})
-        self.assertEqual((real.learn_errand_failed, real.learn_errand_failures), ("", 0))
-        # The retry ends the circuit's own backoff too.
-        client.learn_errand_failed, client.learn_errand_retry = "", True
+        with self.assertRaises(ValueError):
+            asyncio.run(server._action({"type": "retry_learn"}))
+        real.learn_errand_failed = {"firestorm": "gave up"}
+        real.learn_errand_failures = {"firestorm": 3}
+        self.assertEqual(asyncio.run(server._action({"type": "retry_learn"})),
+                         {"ok": True, "retried": ["firestorm"]})
+        self.assertEqual((real.learn_errand_failed, real.learn_errand_failures,
+                          real.learn_errand_retry), ({}, {}, True))
+        # The retry ends the circuit's route backoff, never a seller's
+        # money refusal.
+        client.learn_errand_failed, client.learn_errand_retry = {}, True
         circuit._learn_retry_at = circuit.clock() + 3600.0
         self.assertTrue(circuit._needs_learn_spell(client))
+        client.learn_errand_retry = True
+        circuit._shortfall_from_seller = True
+        circuit._learn_retry_at = circuit.clock() + 3600.0
+        self.assertFalse(circuit._needs_learn_spell(client))
 
     def test_her_live_state_keeps_melee_on_a_melee_rated_spot(self):
         from . import builds
@@ -42386,16 +42549,72 @@ class BuildPerSpotTests(unittest.TestCase):
                          ("wizardry spells", 15, 12.0, 4, 108, 1.2, "magic", 1,
                           "ranged-kite"))
         self.assertIn("--damage-per-attack", single.arguments(styled=True))
-        aoe = build_profile(client, "aoe", "firestorm", base, samples, attacks)
-        # 108 SP beyond her healing reserve pays 8 casts: capped at 6.
+        table = {"firestorm": (3, 5), "magic bullet": (7, 5)}
+        aoe = build_profile(client, "aoe", "firestorm", base, samples, attacks, table)
+        # The area spell's reach (a 5-deep cone: --aoe-radius 3), up to 6
+        # monsters; whether her bar kills them is the spot's (below).
         self.assertEqual((aoe.spell_damage, aoe.mana_cost, aoe.max_aggro_pack,
-                          aoe.combat_style), (12.0, 13, 6, "aoe-kite"))
-        client.state.stats.update(maxsp=60)
-        self.assertEqual(build_profile(client, "aoe", "firestorm", base, samples,
-                                       attacks).max_aggro_pack, 3)
+                          aoe.combat_style, aoe.aoe_radius, aoe.damage_estimated),
+                         (12.0, 13, 6, "aoe-kite", 3, False))
+        args = aoe.arguments(styled=True)
+        self.assertEqual(args[args.index("--aoe-radius") + 1], "3")
+        self.assertAlmostEqual(aoe.bar_casts, 108 / 13)
         # A bar that cannot pay the spell beyond the reserve: no profile.
         client.state.stats.update(maxsp=20)
         self.assertIsNone(build_profile(client, "aoe", "firestorm", base, samples, attacks))
+
+    def test_an_unsampled_spell_is_estimated_by_the_server_formula(self):
+        from .farm_analyzer import (CombatProfile, build_profile, estimated_spell_damage,
+                                    spell_table)
+        client = self._client()
+        client.state.stats.update(regen_sp=1.2, maxsp=120, pow=15)
+        client.state.place_item(Item(300, item_type=c.TYPE_SPELL, name="firestorm",
+                                     extra={"cost": 13}), 7)
+        for item in client.state.inventory:
+            if item.name == "minor healing":
+                item.extra["cost"] = 4
+        # The pinned server's table (include/spellist.h): Firestorm bdam 3,
+        # its cone 5 deep; magic bullet bdam 7.
+        table = spell_table(str(Path("/home/zoey/dev/atrinik/classic/server/src")))
+        fake = {"firestorm": (3, 5), "magic bullet": (7, 5)}
+        if table:
+            self.assertEqual((table["firestorm"], table["magic bullet"][0]), ((3, 5), 7))
+        # 3 x (0.75 + 15 / 4) = 13.5 at Pow 15 (no bonus), rolled 11.3 to
+        # 13.5: 12.4 on average (server/spell_util.c SP_level_dam_adjust).
+        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 12.4)
+        client.state.stats["pow"] = 25
+        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 28.2)
+        client.state.stats["pow"] = 15
+        base = CombatProfile(skill="slash weapons", skill_level=36, attack="slash",
+                             damage=60, weapon_class=40, weapon_speed=2.0,
+                             character_level=38, max_health=333, speed=1.0,
+                             armour_class=40, protections=(), max_aggro_pack=2,
+                             combat_style="melee", healing_per_second=3.0)
+        aoe = build_profile(client, "aoe", "firestorm", base, {}, {}, fake)
+        self.assertEqual((aoe.spell_damage, aoe.spell_attack, aoe.damage_estimated),
+                         (12.4, "fire", True))
+        # Without the table, nothing to estimate from: no profile.
+        self.assertIsNone(build_profile(client, "aoe", "firestorm", base, {}, {}, {}))
+
+    def test_a_caster_must_kill_a_monster_on_one_bar(self):
+        from .farm_analyzer import CombatProfile, spot_affordable
+        profile = CombatProfile(skill="wizardry spells", skill_level=15, attack="slash",
+                                damage=1, weapon_class=1, weapon_speed=1.0,
+                                character_level=38, max_health=333, speed=1.0,
+                                armour_class=40, protections=(), spell_damage=12.0,
+                                cast_delay=1.0, mana_cost=13, mana_regen=1.0,
+                                max_mana=104, bar_casts=8.0)
+        # A kill takes 6 casts: her 8-cast bar does.
+        self.assertTrue(spot_affordable(profile, {"avg_kill_seconds": 6.0,
+                                                  "avg_player_attacks_second": 1.0}))
+        # 12 casts: 8 plus 12 s x 1 SP/s / 13 is under 9: not here.
+        self.assertFalse(spot_affordable(profile, {"avg_kill_seconds": 12.0,
+                                                   "avg_player_attacks_second": 1.0}))
+        self.assertIsNone(spot_affordable(profile, {}))
+        from .navigation import _build_rated
+        rated = self._rating("aoe-kite", 0.9, 1000.0)
+        self.assertTrue(_build_rated(rated))
+        self.assertFalse(_build_rated(dict(rated, build_affordable=False)))
 
     def test_learn_spell_reads_the_seller_and_handles_too_little_money(self):
         from .navigation import LearnSpellTask

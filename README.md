@@ -463,8 +463,11 @@ encounter profile. The operator picks one for the farmed spot or for every
 spot on the Farming tab (kept in her character memory); on auto she fields
 the safest build she can by the analyzer's encounter rating of each
 build's own profile, ranked by XP, and keeps hers against a near tie (20%
-more XP, an hour's hold; a safer build wins at once). A build whose
-profile her real numbers cannot give is never rated. A build she cannot
+more XP, an hour's hold; a safer build wins at once). A caster's spell
+damage is her sampled hits, kept in her memory, or before any the server
+formula's estimate; a caster build is rated on a spot only when one bar
+kills a monster there. A build whose profile her real numbers cannot give
+is never rated. A build she cannot
 field falls back with a "Build gap" alert, and a "get this build" errand
 learns the spell it needs from a spell seller (first Firestorm from
 Dunowen) once she can pay it from true surplus; until then the dashboard

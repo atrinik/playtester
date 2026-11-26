@@ -347,6 +347,12 @@ class GameState:
     # The operator's combat build per farm spot (its path) or for every
     # spot ("*"): a build name or "auto" (builds.py).
     build_choices: dict[str, str] = field(default_factory=dict)
+    # Her observed hits per damage spell (farm_analyzer.build_profile):
+    # spell -> {"hits": [...], "attack": "..."}.
+    spell_samples: dict[str, dict] = field(default_factory=dict)
+    # The build the farm circuit fields, since when (wall clock) and a
+    # swap not yet made (navigation.FarmCircuitTask._field_build).
+    build_state: dict = field(default_factory=dict)
     # Per-spot lessons from deaths and emergency recalls (self_improvement.py).
     farm_adaptations: dict[str, dict] = field(default_factory=dict)
     farm_zone_last_checked: dict[str, float] = field(default_factory=dict)

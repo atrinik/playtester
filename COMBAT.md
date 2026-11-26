@@ -2096,8 +2096,8 @@ build is chosen for the spot, never the spot for a build.
 | Build | Requirement | Routine (FarmTask) | Gear style | Encounter profile |
 | --- | --- | --- | --- | --- |
 | Melee | a weapon and a weapon school | her weapon, with the automatic Wizardry training plan | melee | her ordinary profile, `melee` |
-| AoE caster | a known area spell (firestorm, icestorm, ...) her Wizardry can cast | its spell with spells only (the Wizardry kite; `casts_firestorm` covers every area spell) | caster | the spell's sampled damage, cost and her SP; pack what one bar pays a cast for each monster of (at most 6); `aoe-kite` |
-| Single-target caster | a known damage spell (magic bullet, ...) her Wizardry can cast | its spell with spells only, one target | caster | the spell's numbers, pack 1, `ranged-kite` |
+| AoE caster | a known area spell (firestorm, icestorm, ...) her Wizardry can cast | its spell with spells only (the Wizardry kite; `casts_firestorm` covers every area spell) | caster | the spell's damage (sampled, else estimated), cost and her SP; up to 6 monsters, `--aoe-radius` half the spell's base range; `aoe-kite` |
+| Single-target caster | a known damage spell (magic bullet, ...) her Wizardry can cast | its spell with spells only, one target | caster | the spell's damage (sampled, else estimated), cost and her SP, pack 1, `ranged-kite` |
 | Bow | a launcher, its archery skill and 20 ammunition | the launcher pull, then her weapon | bow | the examined launcher and ammunition damage, WC and delay, pack 1, `ranged-kite` |
 
 The server refuses a spell above her Wizardry level
@@ -2112,8 +2112,25 @@ gap says so.
   `FarmTask.fielded_caster`); the circuit's training plan and its until
   levels stay as they were, and leaving the build ends it. Out of SP with
   an attacking hostile in contact (adjacent, and recent hostile contact),
-  a fielded caster disengages (a `caster-out-of-mana`
-  decision and a retreat step) rather than kiting until her mana returns.
+  a fielded caster disengages (`FarmTask.dry_caster_step`, one
+  `caster-out-of-mana` decision per episode): she retreats while any
+  active hostile is within 3 tiles, otherwise waits, and neither kites nor
+  pulls until her SP is back to half her bar.
+- **Spell damage.** A caster build's damage per hit is the median of her
+  sampled hits with its spell, kept per spell (a fielded spell never
+  resets her training spell's) and saved in her character memory (at
+  most 20 spells of 30 hits, once a minute). Before a hit is sampled it is
+  the server's formula (`server/spell_util.c` `SP_level_dam_adjust`): the
+  spell's base damage from the pinned server's `include/spellist.h` x
+  (0.75 + Wizardry / 4) x (1 + the Pow bonus), rolled from 80% to all of
+  it (Firestorm at Wizardry 15 and Pow 15: 12.4 on average), the rating
+  marked `damage_estimated`; her spell path is taken as neutral.
+- **One bar must kill.** A caster build is rated on a spot only when one
+  kill there (the rating's average kill time x her casts a second, rounded
+  up; an area cast hits the whole pack, so the same for a pack) takes no
+  more casts than her bar beyond the healing reserve pays, plus what her
+  SP regenerates over them (`spot_affordable`). The analyzer reports the
+  average monster's kill, not the toughest's.
 - **Choosing.** The operator picks a build for the farmed spot (or a ranked
   one) or for every spot on the Farming tab ("Combat build"), kept in her
   character memory (`GameState.build_choices`, at most 200 spots; "auto"
@@ -2130,8 +2147,11 @@ gap says so.
   warn-only run for it. She fields the safest: a build without an encounter
   warning before one with, then the most XP; among warned builds the
   highest encounter safety. She keeps the build she fields unless another
-  is safer (hers warns, the other does not, at once) or earns 20% more XP
-  an hour (not within an hour of taking hers up). Unrated, she keeps the
+  is safer (hers warns and the other does not, or both warn and it is
+  0.10 safer: at once) or earns 20% more XP an hour (not within an hour
+  of taking hers up). The build she fields, since when and a pending swap
+  are kept in her character memory, so a restart keeps the hold and the
+  swap. Unrated, she keeps the
   build she fields (a new circuit takes it over), else her default plan
   (melee); a new ranking keeps each build's earlier ratings until it is
   re-run. An explicit (non-analyzer) circuit fields no build.
@@ -2156,16 +2176,20 @@ gap says so.
   "You don't have enough money..." is handled the same way. The trip uses
   the strict route policy of the other optional errands. A failed trip
   waits on its own backoff (30 minutes, longer for a refused strict route);
-  after three failed trips the errand gives up with a "Learn errand
-  failed" alert until the operator retries it (the Farming tab's Retry,
-  which also ends the trip's backoff) or the process restarts.
+  after three failed trips for one spell the errand gives that spell up
+  (another that fields the build may still be learnt), with a "Learn
+  errand failed" alert until the operator retries it (the Farming tab's
+  Retry, refused when nothing gave up; it ends a route or dialogue
+  backoff, never a seller's money refusal) or the process restarts.
 - **Swapping sets.** A build change that changes the gear style makes one
   apartment trip (`SwapSetTask`) when her chest holds, as her index knows
   it, a piece of the new style's set that beats what she wears, or the new
   build's consumables (ammunition for her launcher, area-spell wands): take
   them out, wear the pieces (the server takes off what each slot held),
   then deposit what is no longer her active set. The AoE and single-target
-  casters share the caster set, so a change between them makes no trip.
+  casters share the caster set, so a change between them makes no trip,
+  and stored area wands are not fetched for it (the farm does not fire
+  wands).
   Items deposited earlier in the session may come back on that trip. The
   trip skips the routine 30-minute wait between storage visits, never a
   failed trip's backoff.
@@ -2176,9 +2200,7 @@ gap says so.
 
 Not done: shop items that would improve the set (no examined shop stock is
 cached), choosing icestorm or another element per spot by monster
-protections, and fighting with wands. A caster build is rated only once
-her damage with its spell has been sampled, so auto fields a newly learnt
-spell only after the operator (or her Wizardry training) has cast it.
+protections, and fighting with wands.
 
 ## Packs on a walk: cornered and outclassed (2026-11-24)
 

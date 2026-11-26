@@ -701,10 +701,10 @@ class DashboardState:
         if status.get("shortfall"):
             alerts.append({"id": "build-funds", "level": "warn",
                            "text": "Get this build: " + str(status["shortfall"])})
-        failed = getattr(self.client, "learn_errand_failed", "")
-        if failed:
+        failed = getattr(self.client, "learn_errand_failed", None) or {}
+        for reason in failed.values():
             alerts.append({"id": "build-errand-failed", "level": "warn",
-                           "text": f"Learn errand failed: {failed}"})
+                           "text": f"Learn errand failed: {reason}"})
         return alerts
 
     def alerts(self) -> list[dict[str, str]]:
@@ -1002,8 +1002,8 @@ class DashboardState:
         if status is not None:
             snapshot["status"] = {key: value for key, value in status.items()
                                   if key != "circuit"}
-            snapshot["status"]["errand_failed"] = str(
-                getattr(self.client, "learn_errand_failed", "") or "")
+            snapshot["status"]["errand_failed"] = "; ".join(
+                (getattr(self.client, "learn_errand_failed", None) or {}).values())
             snapshot["spot_choice"] = choices.get(status.get("spot", ""), builds.AUTO)
             try:
                 snapshot["suggestion"] = status["circuit"].build_suggestion(self.client)
@@ -1789,11 +1789,23 @@ class WebControlServer:
             return {"ok": True, "spot": spot, "build": choice}
         if kind == "retry_learn":
             # The operator retries a "get this build" errand that gave up.
-            self.client.learn_errand_failed = ""
-            self.client.learn_errand_failures = 0
-            # The circuit's own backoff ends too (_needs_learn_spell).
+            failed = dict(getattr(self.client, "learn_errand_failed", None) or {})
+            if not failed:
+                raise ValueError("no learn errand has given up")
+            spell = str(data.get("spell", "") or "")
+            if spell and spell not in failed:
+                raise ValueError(f"the learn errand for {spell!r} has not given up")
+            retried = [spell] if spell else list(failed)
+            failures = dict(getattr(self.client, "learn_errand_failures", None) or {})
+            for name in retried:
+                failed.pop(name, None)
+                failures.pop(name, None)
+            self.client.learn_errand_failed = failed
+            self.client.learn_errand_failures = failures
+            # The circuit's route or dialogue backoff ends too
+            # (_needs_learn_spell), never a seller's money refusal.
             self.client.learn_errand_retry = True
-            return {"ok": True}
+            return {"ok": True, "retried": retried}
         if kind == "chat":
             text = str(data.get("text", "")).strip()
             if not text:

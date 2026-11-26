@@ -2444,7 +2444,8 @@ class FarmTask(BotTask):
         # disengages), and a build's gear style replaces her training's.
         self.fielded_caster = False
         self.gear_style_override = ""
-        self._caster_dry_noted = False
+        # Whether a fielded caster's dry episode runs (dry_caster_step).
+        self._caster_dry = False
         self.allow_launchers = (
             not bool(self.combat_spell)
             if allow_launchers is None else bool(allow_launchers))
@@ -4156,6 +4157,47 @@ class FarmTask(BotTask):
         return await self.melee_kite(
             client, x, y, obj, map_node=self.map_node,
             preserve_spell_line=spell)
+
+    # A fielded caster that ran dry (dry_caster_step) keeps away from any
+    # hostile within DRY_RETREAT_RADIUS and pulls nothing until her SP is
+    # back to DRY_RESUME_SP of her maximum.
+    DRY_RETREAT_RADIUS = 3
+    DRY_RESUME_SP = 0.5
+
+    async def dry_caster_step(self, client: AtrinikClient, active: list) -> bool:
+        """A fielded caster out of SP disengages for real: once her spell
+        is unaffordable with an attacking hostile in contact (adjacent,
+        recent hostile contact), the dry episode begins (one
+        ``caster-out-of-mana`` record). Until her SP is back to
+        DRY_RESUME_SP she retreats while any active hostile (``active``,
+        the tick's (distance, x, y, obj) entries) is within
+        DRY_RETREAT_RADIUS, and otherwise waits: no spell-only kite, no
+        pull. True while it took the tick."""
+        if not self.fielded_caster or not self.spell_only_training(client):
+            self._caster_dry = False
+            return False
+        spell = self.combat_spell_item(client)
+        if spell is None:
+            return False
+        stats = client.state.stats
+        sp = int(stats.get("sp", 0) or 0)
+        maxsp = max(1, int(stats.get("maxsp", 0) or 0))
+        nearest = min((entry[0] for entry in active), default=None)
+        if not self._caster_dry:
+            if (nearest is None or nearest > 1 or not recent_hostile_contact(client) or
+                    self.offensive_spell_affordable(client, spell)):
+                return False
+            self._caster_dry = True
+            recorder = getattr(client, "record_action", None)
+            if recorder is not None:
+                recorder("caster-out-of-mana", f"{spell.name}: disengaging until "
+                         f"{self.DRY_RESUME_SP:.0%} SP")
+        if sp >= maxsp * self.DRY_RESUME_SP and self.offensive_spell_affordable(client, spell):
+            self._caster_dry = False
+            return False
+        if nearest is not None and nearest <= self.DRY_RETREAT_RADIUS:
+            await self.low_health_retreat(client)
+        return True
 
     async def caster_kite(self, client: AtrinikClient, x: int, y: int,
                           obj, spell: Item) -> bool:
@@ -7310,21 +7352,9 @@ class FarmTask(BotTask):
         engaged_id = self._engaged_target[0] if self._engaged_target else 0
         engaged = next((entry for entry in threats
                         if entry[3].target_id == engaged_id), None)
-        if (self.fielded_caster and nearest_threat is not None and
-                nearest_threat[0] <= 1 and active_threat(nearest_threat) and
-                recent_hostile_contact(client) and self.spell_only_training(client) and
-                (spell := self.combat_spell_item(client)) is not None and
-                not self.offensive_spell_affordable(client, spell)):
-            # A fielded caster out of SP with a hostile in contact has
-            # nothing to fight with: disengage, rather than kite slowly
-            # until her mana regenerates.
-            recorder = getattr(client, "record_action", None)
-            if recorder is not None and not self._caster_dry_noted:
-                recorder("caster-out-of-mana", f"{spell.name}: disengaging")
-            self._caster_dry_noted = True
-            await self.low_health_retreat(client)
+        if await self.dry_caster_step(client, [
+                entry for entry in threats if active_threat(entry)]):
             return
-        self._caster_dry_noted = False
         nearby_pack = [
             entry for entry in threats
             if entry[0] <= 4 and active_threat(entry)]

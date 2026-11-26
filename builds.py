@@ -226,6 +226,8 @@ def operator_choice(choices: Mapping[str, str], spot: str) -> str:
 # restart are not worth a near tie.
 SWITCH_XP_GAIN = 0.20
 HOLD_SECONDS = 3600.0
+# When both warn, one this much safer (encounter safety) wins at once.
+SWITCH_SAFETY_GAIN = 0.10
 
 
 def wanted_build(choices: Mapping[str, str], missing: Mapping[str, list[str]],
@@ -257,7 +259,8 @@ def choose(state: Any, spot: str, ratings: Mapping[str, Mapping[str, Any] | None
     ``warn`` is farm_analyzer.encounter_warning. An operator's choice
     applies at once. On auto, of the builds she can field and the analyzer
     rated, the safest (no warning) with the most XP; she keeps ``current``
-    unless another is safer (hers warns, the other does not: at once) or
+    unless another is safer (hers warns and the other does not, or both
+    warn and it is SWITCH_SAFETY_GAIN safer: at once) or
     earns SWITCH_XP_GAIN more (not while ``held``, HOLD_SECONDS since she
     took it up). Unrated, she keeps ``current``
     while she can field it, else melee (her default plan).
@@ -285,7 +288,9 @@ def choose(state: Any, spot: str, ratings: Mapping[str, Mapping[str, Any] | None
             bool(warn(scored[name])), -safety(name) if warn(scored[name]) else -xp(name),
             -xp(name), BUILD_NAMES.index(name)))
         if current in scored and best != current:
-            safer = bool(warn(scored[current])) and not warn(scored[best])
+            safer = bool(warn(scored[current])) and (
+                not warn(scored[best]) or
+                safety(best) >= safety(current) + SWITCH_SAFETY_GAIN)
             richer = (not warn(scored[best]) and
                       xp(best) >= xp(current) * (1.0 + SWITCH_XP_GAIN))
             # Safety does not wait for the hold.
@@ -308,6 +313,43 @@ def choose(state: Any, spot: str, ratings: Mapping[str, Mapping[str, Any] | None
         reason = (f"{BUILDS[chosen].label} needs: " + "; ".join(missing[chosen]) +
                   f"; falling back to {BUILDS[best].label} ({reason})")
     return Choice(best, chosen, reason, missing, chosen != AUTO, wanted)
+
+
+# What her memory keeps of her spell samples (FarmAnalyzer.observe_spells).
+MAX_SAMPLED_SPELLS = 20
+MAX_SPELL_SAMPLES = 30
+
+
+def load_spell_samples(value: Any) -> dict[str, dict]:
+    """Her saved hits per spell, validated and bounded."""
+    if not isinstance(value, dict):
+        return {}
+    samples: dict[str, dict] = {}
+    for spell, entry in list(value.items())[:MAX_SAMPLED_SPELLS]:
+        if not isinstance(spell, str) or not isinstance(entry, dict):
+            continue
+        hits = [int(hit) for hit in entry.get("hits", ()) or ()
+                if isinstance(hit, int) and not isinstance(hit, bool) and 0 < hit <= 100_000]
+        attack = entry.get("attack", "")
+        if hits and isinstance(attack, str):
+            samples[spell.casefold()[:64]] = {"hits": hits[-MAX_SPELL_SAMPLES:],
+                                              "attack": attack[:32]}
+    return samples
+
+
+def load_build_state(value: Any) -> dict:
+    """The saved build state (active_build, active_build_since,
+    pending_swap_build), validated."""
+    if not isinstance(value, dict):
+        return {}
+    state: dict = {}
+    for name in ("active_build", "pending_swap_build"):
+        if value.get(name) in ("", *BUILD_NAMES):
+            state[name] = value[name]
+    since = value.get("active_build_since")
+    if isinstance(since, (int, float)) and not isinstance(since, bool) and since >= 0:
+        state["active_build_since"] = float(since)
+    return state
 
 
 def learn_target(wanted: str, state: Any, offers: Iterable[Any]) -> Any | None:
