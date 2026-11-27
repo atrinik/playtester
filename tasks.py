@@ -3710,6 +3710,9 @@ class FarmTask(BotTask):
 
     def primary_combat_spell(self, client: AtrinikClient) -> Item | None:
         """Use configured spell pressure until finisher logic takes control."""
+        if self.fielded_caster:
+            # Refresh the latch (off the farm map nothing else may have).
+            self.spell_only_training(client)
         if self._caster_dry:
             # Latched dry: this fight is her weapon's.
             return None
@@ -3750,6 +3753,9 @@ class FarmTask(BotTask):
     async def training_finisher(self, client: AtrinikClient, x: int, y: int,
                                 obj) -> bool:
         """Attempt the killing blow with the explicitly requested skill."""
+        if self.fielded_caster:
+            # Refresh the latch (off the farm map nothing else may have).
+            self.spell_only_training(client)
         if self._caster_dry:
             # A fielded caster latched dry fights this fight with her weapon:
             # no finisher cast, kite or neutral buffer turns combat off.
