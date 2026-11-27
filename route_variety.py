@@ -291,7 +291,9 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
         entered = (candidate.maps | {candidate.start}) & danger
         if not entered <= allowed:
             return False
-        if (candidate.maps - {destination, candidate.start}) & hard:
+        # The start is exempt only while she does not come back to it, the
+        # destination only as the last map.
+        if set(candidate.sequence[:-1]) & hard:
             return False
         walks = dict(candidate.walks)
         return all(walks.get(path, 0.0) <= best_walks.get(path, 0.0)

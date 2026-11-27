@@ -3620,13 +3620,14 @@ class NavigateTask(BotTask):
                    danger: frozenset[str] | set[str] = frozenset()
                    ) -> tuple[float, dict[str, float]]:
         """Her walk along ``edges`` to the goal, in steps, and its walk on
-        each map (the start map's first leg and the destination's leg to
-        the goal included): each map's authored path (local_path) with
-        the spawn-radius costs (_spawn_square_costs) on a farm trip's maps
-        (_spawn_costs) and on every ``danger`` map, plus
+        each map (the start map's first leg, each entry and the
+        destination's leg to the goal included). Each leg is the path she
+        will walk (local_path with the runtime walk's _spawn_costs), priced
+        with the spawn squares it crosses (_spawn_square_costs) on a farm
+        trip's maps and on every ``danger`` map; plus
         route_variety.TRANSITION_STEPS an exit or voyage and one step a
-        tile seam; a leg with no path costs inf. ``memo`` keeps each leg
-        for the other candidates."""
+        tile seam, counted on the map entered; a leg with no path costs
+        inf. ``memo`` keeps each leg for the other candidates."""
         access = self._allow_locked(client)
         current = client.state.map.path
         here = (client.state.map.world_x, client.state.map.world_y)
@@ -3635,14 +3636,19 @@ class NavigateTask(BotTask):
             key = (map_path, start, goal)
             if key not in memo:
                 self._variety_check(client, deadline)
-                extra = ((self._spawn_square_costs(map_path) if map_path in danger
-                          else None) or self._spawn_costs(map_path) or {})
+                # The path she will walk: the runtime walk's own costs
+                # (_click_path: _spawn_costs, only on a farm trip's maps).
+                walked = self._spawn_costs(map_path)
                 path = self.graph.local_path(map_path, start, goal,
                                              allow_locked=access,
-                                             extra_costs=extra or None)
+                                             extra_costs=walked or None)
+                # Priced with the spawn squares it crosses, on her farm
+                # maps and on every danger map.
+                penalty = (self._spawn_square_costs(map_path)
+                           if map_path in danger or walked else {})
                 # A leg with no authored path is no estimate: the route is
                 # priced out (the best route's too, which keeps it).
-                memo[key] = (sum(1 + min(254, extra.get(point, 0)) for point in path[1:])
+                memo[key] = (sum(1 + min(254, penalty.get(point, 0)) for point in path[1:])
                              if path or start == goal else math.inf)
             return memo[key]
 
@@ -3658,8 +3664,12 @@ class NavigateTask(BotTask):
                 step = leg(current, here, target)
                 cost += step
                 walks[current] += step
-            cost += 1 if edge.kind == "tile" else route_variety.TRANSITION_STEPS
+            entry = 1 if edge.kind == "tile" else route_variety.TRANSITION_STEPS
+            cost += entry
             here, current = _edge_arrival(self.graph, edge), edge.destination
+            # Each entry counts on the map entered: two short passes of a
+            # danger map never undercut one long one.
+            walks[current] += entry
         goals = self._goal_points()
         if goals:
             step = min(leg(current, here, goal) for goal in goals)

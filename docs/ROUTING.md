@@ -1611,9 +1611,17 @@ alternate between routes about as good as the best (`route_variety.py`).
   (`local_path`) with the spawn-radius cost (`_spawn_costs`, 1.6) on a
   farm trip's maps and on every danger map (below) whatever the trip,
   plus 4 steps an exit or voyage (a load), one step a tile seam, and the
-  walk to the goal; and its walk on each map (the start map's first leg
-  and the destination's leg to the goal included). A leg with no
-  authored path prices the route out.
+  walk to the goal; and its walk on each map (the start map's first leg,
+  each entry's 4 steps or 1 for a seam, and the destination's leg to the
+  goal included, so two short passes of a map never undercut one long
+  one). Each leg is the path she will walk (`local_path` with the runtime
+  walk's own `_spawn_costs`, which skirts spawns only on a farm trip's
+  maps), priced with the spawn squares that path crosses on her farm maps
+  and on every danger map: the pricing follows the walk actually taken,
+  never a skirting path she would not walk. A danger map with no named
+  aggressive spawn (ranged, caster or over-level only) is compared in
+  plain steps, and a ranged attacker's reach can exceed the cost box. A
+  leg with no authored path prices the route out.
   A route that skirts the farm map's spawns is priced as the walk will
   walk it, so variety never trades the approach discipline (COMBAT.md) for
   a fresh road; the approach rules themselves are unchanged.
@@ -1632,7 +1640,9 @@ alternate between routes about as good as the best (`route_variety.py`).
     route's: an archer destination entered by a seam far from the goal
     loses to the stairs beside it;
   - it crosses no learned hazard, route-death or quarantined map on the
-    way, even one the best route crosses;
+    way, even one the best route crosses; the start map is exempt only
+    while the candidate does not come back to it, the destination only
+    as the last map;
   - it adds no voyage and crosses other maps than the best route.
   Among the best route and the eligible ones she takes the one with the
   largest share of unvisited ways (each edge counted by its pair of maps,

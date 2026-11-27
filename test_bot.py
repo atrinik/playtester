@@ -44373,7 +44373,7 @@ class RouteVarietyTests(unittest.TestCase):
         task.destination_xy = None
         self.assertEqual(task._walk_cost(client, [seam], deadline, {})[0], 16 + 1)
         self.assertEqual(task._walk_cost(client, [door], deadline, {}),
-                         (1 + 4, {"/s": 1, "/a": 0.0}))
+                         (1 + 4, {"/s": 1, "/a": 4}))
 
     def hazard_graph(self, middle="/p", b_door=(10, 12)):
         """/s to ``middle``, then by /a or /b to /d: the walk across
@@ -44487,6 +44487,74 @@ class RouteVarietyTests(unittest.TestCase):
         client.record_action = lambda action, detail="", **_: recorded.append(action)
         rv.note_crossing(client, graph.nodes["/s"].edges[1])
         self.assertNotIn(rv.NEW_EXIT, recorded)
+
+    def test_a_danger_map_is_priced_by_the_path_she_will_walk(self):
+        # Not a farm trip: she walks the archer map's plain path. By door b
+        # it runs 14 squares straight through an orc's box; the skirting
+        # path would cost less than door a's 20 clear squares, but she
+        # never walks it.
+        graph = WorldGraph()
+        for path, (width, height) in {"/s": (20, 20), "/a": (20, 20), "/b": (20, 20),
+                                      "/d": (40, 30)}.items():
+            node = MapNode(path, width=width, height=height)
+            node.terrain.update({(x, y): 1 for x in range(width) for y in range(height)})
+            graph.nodes[path] = node
+        graph.nodes["/s"].edges += [MapEdge("/s", "/a", 2, 10, 10, 10, "exit", "door a"),
+                                    MapEdge("/s", "/b", 4, 10, 10, 10, "exit", "door b")]
+        graph.nodes["/a"].edges.append(MapEdge("/a", "/d", 10, 0, 0, 15, "exit", "door x"))
+        graph.nodes["/b"].edges.append(MapEdge("/b", "/d", 10, 0, 20, 1, "exit", "door y"))
+        graph.map_monster_levels["/d"] = {"skeleton archer": 1}
+        graph.named_spawns["/d"] = [NamedSpawn("/d", 20, 8, "orc", ())]
+        client = self.client()
+        self.used(client, "exit:/s:2,10>/a", "exit:/a:10,0>/d", count=20.0)
+        task = NavigateTask(graph, "/d", (20, 15))
+        task.vary_route = True
+        route, actions, _ = self.plan(task, client)
+        self.assertEqual(self.maps(route), ["/a", "/d"], actions)
+        # Priced as walked, door y's way is far dearer (left out as longer).
+        self.assertIn("0 alternative(s)", actions[-1][1])
+
+    def test_a_hard_map_on_the_best_route_is_never_crossed_by_an_alternative(self):
+        # A map that killed her is the only way on: the other way on from
+        # it is as short, but she takes no other route across it.
+        graph = self.hazard_graph(middle="/h")
+        client = self.client()
+        client.state.route_hazards["/h"] = time.time() + 3600
+        self.used(client, "exit:/h:10,8>/a", "exit:/a:10,0>/d", count=20.0)
+        route, actions, _ = self.plan(self.trip(graph), client)
+        self.assertEqual(self.maps(route), ["/h", "/a", "/d"])
+        self.assertIn("1 more dangerous", actions[-1][1])
+
+    def test_the_start_and_destination_are_exempt_only_where_every_route_has_them(self):
+        from . import route_variety as rv
+
+        def route(*maps):
+            return rv.Candidate(maps, 10.0, tuple(f"pair:{m}" for m in maps),
+                                frozenset(maps), maps, "/s")
+
+        best = route("/a", "/d")
+        for hard, candidate, eligible in (
+                ({"/s"}, route("/b", "/d"), True),
+                ({"/s"}, route("/b", "/s", "/c", "/d"), False),
+                ({"/d"}, route("/b", "/d"), True),
+                ({"/d"}, route("/d", "/b", "/d"), False)):
+            with self.subTest(hard=hard, maps=candidate.sequence):
+                choice = rv.choose(best, [candidate], edge_uses={}, danger=hard,
+                                   hard=hard, tolerance=0.15, now=0.0)
+                self.assertEqual(choice.eligible, int(eligible))
+
+    def test_each_entry_into_a_map_counts_on_that_map(self):
+        graph = WorldGraph()
+        for path in ("/s", "/p", "/q", "/d"):
+            graph.nodes[path] = self.open_node(path)
+        edges = [MapEdge("/s", "/p", 4, 10, 10, 10, "exit", "in"),
+                 MapEdge("/p", "/q", 11, 10, 10, 10, "exit", "out"),
+                 MapEdge("/q", "/p", 11, 10, 12, 10, "exit", "back"),
+                 MapEdge("/p", "/d", 13, 10, 10, 10, "exit", "on")]
+        task = NavigateTask(graph, "/d")
+        _, walks = task._walk_cost(self.client(), edges, time.monotonic() + 5, {})
+        # Two passes of one step each, two entries.
+        self.assertEqual(walks["/p"], 2 + 2 * 4)
 
     def test_a_twin_door_square_takes_no_candidate_slot(self):
         # One candidate slot: avoiding the door square she used must avoid
