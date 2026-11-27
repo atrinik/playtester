@@ -43339,10 +43339,11 @@ class SafeRetreatTests(unittest.TestCase):
 
         return client, walk, run
 
-    def _clocked_walk(self, positions):
+    def _clocked_walk(self, positions, hitting=lambda t: False):
         """She at (20, 12) on the last leg, no lead-aways left; each tick
         of a 0.25 s fake clock puts the treants where ``positions(t)``
-        says ({id: (x, y)}) and ticks her defence. Returns (client, walk,
+        says ({id: (x, y)}) and ticks her defence; while ``hitting(t)``
+        a treant's hit on her is in her messages. Returns (client, walk,
         run): run(seconds) returns the time train-held fired, or None."""
         from . import navigation as navigation_module
 
@@ -43351,6 +43352,14 @@ class SafeRetreatTests(unittest.TestCase):
         m.world_x, m.world_y = 20, 12
         walk._leads = walk.LEAD_AWAY_LIMIT
         clock = [1000.0]
+        asked = client.target
+
+        async def target(x, y, target_id=0, *rest):
+            # The server acknowledges each selection.
+            client.state.target_id = target_id
+            await asked(x, y, target_id)
+
+        client.target = target
 
         def run(seconds):
             end = clock[0] + seconds
@@ -43360,6 +43369,9 @@ class SafeRetreatTests(unittest.TestCase):
                     elapsed = clock[0] - 1000.0
                     self._place(client, [
                         (k, x, y) for k, (x, y) in positions(elapsed).items()])
+                    client.state.messages = [(
+                        time.time(), 2, "ff0000", self.TREANT_HIT)] if (
+                            hitting(elapsed)) else []
                     walk._last_defense_action = 0.0
                     asyncio.run(walk._defend_while_navigating(client))
                     if walk.train_held:
@@ -43387,18 +43399,52 @@ class SafeRetreatTests(unittest.TestCase):
         self.assertEqual(walk.status, TaskStatus.FAILED)
 
     def test_time_fighting_one_in_contact_does_not_count(self):
-        # From 60 s to 120 s a fourth treant stands beside her (she fights
-        # it, and it is gone after): those 60 s are not standing, so the
-        # trip ends about 60 s later than it would.
+        # From 60 s to 120 s a fourth treant stands beside her hitting
+        # her (she fights it, and it is gone after): those 60 s are not
+        # standing, so the trip ends about 60 s later than it would.
         def positions(t):
             x = min(14, 10 + int(t))
             beside = {103: (19, 12)} if 60 <= t < 120 else {}
             return {100: (x, 12), 101: (x, 13), 102: (x, 11), **beside}
 
-        client, walk, run = self._clocked_walk(positions)
+        client, walk, run = self._clocked_walk(
+            positions, hitting=lambda t: 60 <= t < 120)
         held = run(400.0)
         self.assertIsNotNone(held)
         self.assertTrue(238.0 <= held <= 250.0, held)
+
+    def test_contact_every_other_tick_does_not_freeze_the_count(self):
+        # A pursuer beside her and hitting every other tick: only those
+        # intervals are left out, so the trip still ends, near 360 s.
+        def beside(t):
+            return t > 10 and round(t * 4) % 2 == 0
+
+        def positions(t):
+            x = min(14, 10 + int(t))
+            return {100: (x, 12), 101: (x, 13), 102: (x, 11),
+                    **({103: (19, 12)} if beside(t) else {})}
+
+        client, walk, run = self._clocked_walk(positions, hitting=beside)
+        held = run(900.0)
+        self.assertIsNotNone(held)
+        self.assertLess(held, 600.0)
+        self.assertGreaterEqual(walk._stand_total, 180.0)
+
+    def test_an_unkillable_neighbour_trips_the_hard_cap(self):
+        # A pursuer she cannot hurt stays beside her, hitting: none of
+        # that is standing, but 600 s of stand in all end the trip.
+        def positions(t):
+            x = min(14, 10 + int(t))
+            return {100: (x, 12), 101: (x, 13), 102: (x, 11),
+                    **({103: (19, 12)} if t > 10 else {})}
+
+        client, walk, run = self._clocked_walk(
+            positions, hitting=lambda t: t > 10)
+        held = run(900.0)
+        self.assertIsNotNone(held)
+        self.assertTrue(595.0 <= held <= 615.0, held)
+        self.assertLess(walk._stand_total, 180.0)
+        self.assertIn("approach-train-held", [a for a, _ in client.recorded])
 
     def test_a_train_holding_at_range_is_held_until_the_trip_fails(self):
         # Three treants close in, then stand 6 tiles off. The server keeps

@@ -2472,12 +2472,17 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
     rules decide as anywhere. A stand against two lasts at most 45 s (a
     pursuer reaching her restarts it), then the walk goes on for at least
     30 s, so wanderers cannot hold her. Against three or more it has no
-    such limit. One bound covers every stand of the walk: the seconds she
-    has stood with nothing beside her (`_stand_total`, at most 1 s a tick;
-    seconds fighting one beside her do not count), whatever the train
-    and however often it shrank and regrew, reset only by a new walk or a
-    map change. At 180 s the trip fails (`approach-train-held`, latched;
-    `approach-stand` and it log the same pursuer count). The farm circuit, on its transit or
+    such limit. Two bounds cover every stand of the walk, against two or
+    more alike, whatever the train and however often it shrank and
+    regrew, reset only by a new walk or a map change: the seconds she has
+    stood with no pursuer beside her (`_stand_total`, at most 1 s a tick;
+    only the intervals with a pursuer beside her, fighting, are left out,
+    so contact that comes and goes does not stop the count) reaching
+    180 s, or all her stand seconds, fighting included (`_stand_all`),
+    reaching 600 s, so a fight against something she cannot hurt ends
+    too. Either fails the trip (`approach-train-held`, latched;
+    `approach-stand` and it log the same pursuer count). Two pursuers'
+    repeated stands can reach these bounds as well. The farm circuit, on its transit or
     its farm branch, then quarantines that leg's map, its area and the
     map she stood on (`farm-zone-quarantine`, never shortening a longer
     one) for 30 minutes, 2 hours on the second such hold there within a
