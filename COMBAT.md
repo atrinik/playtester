@@ -2117,9 +2117,10 @@ gap says so.
   retreat, flee and recall). Dry stays latched while there is recent
   hostile contact or the target she ran dry on is engaged, short of a full
   bar: that may span back-to-back pulls under continuous contact. While
-  latched she casts nothing (no spell pressure, no finisher, its kite or
-  neutral buffer), so one regenerated cast does not send her back to
-  kiting. Out of a fight she rests for mana as the spell routine does,
+  latched she casts no fight spell (no spell pressure, no finisher, its
+  kite or neutral buffer), so one regenerated cast does not send her back
+  to kiting. An opening ranged pull at a creature three or more tiles off
+  may still spend a regenerated cast before she melees it. Out of a fight she rests for mana as the spell routine does,
   rather than pulling with her weapon, while her SP rises: after 60 s of
   quiet rest without a point gained she stops resting and the ordinary
   farm goes on. Without regeneration (no food, say) that costs up to 60 s
