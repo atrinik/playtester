@@ -3660,10 +3660,19 @@ class NavigateTask(BotTask):
             if node is not None:
                 target = (max(0, min(node.width - 1, edge.x)),
                           max(0, min(node.height - 1, edge.y)))
-            if edge.kind != dialogue_edges.DIALOGUE:
+            if edge.kind == dialogue_edges.DIALOGUE:
+                # The walk beside the NPC, as _take_voyage walks it: none
+                # within a square of it, else to the nearest approach.
+                if max(abs(here[0] - edge.x), abs(here[1] - edge.y)) <= 1:
+                    step = 0.0
+                else:
+                    approaches = self.graph.dialogue_approaches(
+                        edge, here, allow_locked=access)
+                    step = leg(current, here, approaches[0]) if approaches else math.inf
+            else:
                 step = leg(current, here, target)
-                cost += step
-                walks[current] += step
+            cost += step
+            walks[current] += step
             entry = 1 if edge.kind == "tile" else route_variety.TRANSITION_STEPS
             cost += entry
             here, current = _edge_arrival(self.graph, edge), edge.destination

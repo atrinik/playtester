@@ -44543,6 +44543,46 @@ class RouteVarietyTests(unittest.TestCase):
                                    hard=hard, tolerance=0.15, now=0.0)
                 self.assertEqual(choice.eligible, int(eligible))
 
+    def test_a_farm_map_leg_is_the_skirting_path_with_the_squares_it_crosses(self):
+        # The farm map's exit is the corner (14, 1) of an orc's box (x 6-14,
+        # y 1-9). From (10, 15) her walk skirts the box up its east side:
+        # 14 steps, the last onto the one box square, the exit (3 more).
+        # The plain path would cross 9 box squares (14 + 27).
+        graph = WorldGraph()
+        for path in ("/b", "/d"):
+            graph.nodes[path] = self.open_node(path)
+        graph.named_spawns["/b"] = [NamedSpawn("/b", 10, 5, "orc", ())]
+        client = self.client()
+        client.state.map.path = "/b"
+        client.state.map.world_x, client.state.map.world_y = 10, 15
+        task = NavigateTask(graph, "/d")
+        task.spawn_cost_maps = frozenset({"/b"})
+        exit_ = MapEdge("/b", "/d", 14, 1, 10, 10, "exit", "hole")
+        cost, walks = task._walk_cost(client, [exit_], time.monotonic() + 5, {})
+        self.assertEqual(walks["/b"], 14 + 1 * 3)
+        self.assertEqual(cost, 14 + 1 * 3 + 4)
+
+    def test_a_voyage_is_priced_by_the_walk_beside_its_npc(self):
+        # A danger map (archers, an orc's box at x 1-9, y 6-14): arriving
+        # far from the ferryman she walks 7 squares through the box to
+        # stand beside him; arriving beside the box's edge, one.
+        graph = WorldGraph()
+        for path in ("/s", "/p", "/isle"):
+            graph.nodes[path] = self.open_node(path)
+        graph.map_monster_levels["/p"] = {"skeleton archer": 1}
+        graph.named_spawns["/p"] = [NamedSpawn("/p", 5, 10, "orc", ())]
+        voyage = MapEdge("/p", "/isle", 10, 10, 5, 5, "dialogue", "Ferryman")
+        task = NavigateTask(graph, "/isle")
+        client = self.client()
+        danger = {"/p"}
+        walks = {}
+        for arrival in ((2, 10), (9, 12)):
+            door = MapEdge("/s", "/p", 2, 10, *arrival, "exit", "door")
+            _, walk = task._walk_cost(client, [door, voyage], time.monotonic() + 5, {},
+                                      danger)
+            walks[arrival] = walk["/p"]
+        self.assertEqual(walks, {(2, 10): 4 + 7 * 4, (9, 12): 4 + 1 * 4})
+
     def test_each_entry_into_a_map_counts_on_that_map(self):
         graph = WorldGraph()
         for path in ("/s", "/p", "/q", "/d"):

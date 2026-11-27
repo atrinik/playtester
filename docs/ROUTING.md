@@ -1621,7 +1621,10 @@ alternate between routes about as good as the best (`route_variety.py`).
   never a skirting path she would not walk. A danger map with no named
   aggressive spawn (ranged, caster or over-level only) is compared in
   plain steps, and a ranged attacker's reach can exceed the cost box. A
-  leg with no authored path prices the route out.
+  leg with no authored path prices the route out. A voyage's leg is the
+  walk to the nearest square beside its NPC (`dialogue_approaches`, as
+  `_take_voyage` walks it; none within a square of the NPC), priced the
+  same way.
   A route that skirts the farm map's spawns is priced as the walk will
   walk it, so variety never trades the approach discipline (COMBAT.md) for
   a fresh road; the approach rules themselves are unchanged.
