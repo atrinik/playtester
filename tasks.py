@@ -3710,6 +3710,9 @@ class FarmTask(BotTask):
 
     def primary_combat_spell(self, client: AtrinikClient) -> Item | None:
         """Use configured spell pressure until finisher logic takes control."""
+        if self._caster_dry:
+            # Latched dry: this fight is her weapon's.
+            return None
         if self.neutral_targets:
             # Dense passive farms are safe only while exactly one creature has
             # been deliberately pulled. Directional pressure during the chase
@@ -3747,6 +3750,10 @@ class FarmTask(BotTask):
     async def training_finisher(self, client: AtrinikClient, x: int, y: int,
                                 obj) -> bool:
         """Attempt the killing blow with the explicitly requested skill."""
+        if self._caster_dry:
+            # A fielded caster latched dry fights this fight with her weapon:
+            # no finisher cast, kite or neutral buffer turns combat off.
+            return False
         hp = int(client.state.stats.get("hp", 0) or 0)
         maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
         pending_for_target = bool(

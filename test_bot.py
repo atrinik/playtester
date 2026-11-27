@@ -42238,6 +42238,49 @@ class BuildPerSpotTests(unittest.TestCase):
         task._dry_rest_since -= task.DRY_REST_STALL_SECONDS
         tick(client, task)
         self.assertFalse(task._training_resting)
+        # Latched with the kobold in the finisher window and SP for two
+        # casts: she keeps meleeing, no finisher cast, kite or combat off.
+        client, task = farm()
+        tick(client, task)
+        self.assertTrue(task._caster_dry)
+        client.state.stats.update(sp=10, target_hp=10)
+        client.state.map.tile(9, 8).objects[3].target_hp = 10
+        client.combat.clear()
+        for _ in range(3):
+            client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+            tick(client, task)
+        self.assertTrue(client.combat and all(client.combat))
+        self.assertEqual((client.fired, client.direct_moves), ([], []))
+        # Each half of the latch on its own: the same engaged target with
+        # no contact ...
+        client.state.messages = []
+        task.remember_engagement(client, 9, 8, 100)
+        task._dry_target = 100
+        self.assertFalse(task.spell_only_training(client))
+        # ... and contact with no engaged target.
+        task._engaged_target = None
+        self.assertTrue(task.spell_only_training(client))
+        task._caster_dry = True
+        client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+        self.assertFalse(task.spell_only_training(client))
+        # A visible engagement (no contact) resets the dry rest's clock
+        # in the rest gate.
+        client.state.messages = []
+        task._caster_dry, task._dry_rest_sp = True, 5
+        task.remember_engagement(client, 9, 8, 100)
+        tick(client, task)
+        self.assertIsNone(task._dry_rest_sp)
+        # An engagement lingering out of view does not hold the clock back.
+        client, task = farm()
+        client.lock_item = AsyncMock()
+        client.state.messages = []
+        client.state.map.tiles.clear()
+        tick(client, task)
+        self.assertTrue(task._training_resting)
+        task.remember_engagement(client, 9, 8, 100)
+        task._dry_rest_since -= task.DRY_REST_STALL_SECONDS
+        tick(client, task)
+        self.assertFalse(task._training_resting)
         # Without a weapon she keeps the spell-only routine: no melee.
         client, task = farm(weapon=False)
         tick(client, task)
