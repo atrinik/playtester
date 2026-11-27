@@ -3481,16 +3481,10 @@ class NavigateTask(BotTask):
                 self.care is not None or
                 [search.edges[index] for index in search.transitions] != route):
             return route
-        if (self.hazard_fallback_taken or self._threat_fallback or
-                self._route_threat_maps - {self.destination}):
-            # Only a route clean at every tier varies: a fallback or threat
-            # tier's alternative could spend longer among the hazards. The
-            # destination (a farm spot is often a pack map) is entered by
-            # every route alike.
-            self._record(client, route_variety.ROUTE_VARIETY,
-                         f"{self.destination}: best route kept; it takes a "
-                         "hazard tier")
-            return route
+        # A route that took a fallback or threat tier varies too (owner
+        # decision, 2026-11-26), only within that tier's search (the
+        # RouteSearch kept is the winning tier's) and only by a route that
+        # spends no longer on any danger map (route_variety.choose).
         deadline = time.monotonic() + route_variety.SEARCH_SECONDS
         try:
             choice = self._variety_choice(client, route, search, deadline)
@@ -3527,30 +3521,25 @@ class NavigateTask(BotTask):
         """Alternatives to ``route`` in its own search: one avoiding each
         of its most used edges (up to route_variety.MAX_CANDIDATES), one
         priced by her counts; each a native search over the kept graph.
-        Then their walking cost (spawn costs included) and the choice."""
+        Then their walking cost and walk per danger map (spawn costs
+        included) and the choice."""
         source = client.state.map.path
+        # Never crossed by an alternative, even where the best route
+        # crosses them: maps that killed her, counting route deaths and
+        # quarantined spots.
+        hard = self._learned_route_hazards(client) | set(self._variety_avoid or ())
         danger = (self._known_ranged_hazard_maps(client, any_level=True) |
                   self._known_overlevel_hazard_maps(client) |
                   self._known_pack_hazard_maps(source) |
-                  set(self.KNOWN_LETHAL_TRANSIT) |
-                  self._learned_route_hazards(client) |
-                  set(self._variety_avoid or ()))
-        if source in danger or any(edge.destination in danger and
-                                   edge.destination != self.destination
-                                   for edge in route):
-            # She starts on, or the best route crosses, a hazard, a route
-            # death or a quarantined spot: only clean routes vary. Every
-            # route enters the destination alike.
-            self._record(client, route_variety.ROUTE_VARIETY,
-                         f"{self.destination}: best route kept; it starts on "
-                         "or enters a hazard")
-            return None
+                  set(self.KNOWN_LETHAL_TRANSIT) | hard)
         now = time.time()
         uses = getattr(client.state, "route_edge_uses", {}) or {}
         subjects = [route_blocks.edge_subject(edge) for edge in search.edges]
-        by_subject: dict[str, list[int]] = defaultdict(list)
+        # Each way (a pair of maps) is avoided whole: the other square of a
+        # double door is no alternative and takes no candidate's place.
+        by_pair: dict[str, list[int]] = defaultdict(list)
         for index, subject in enumerate(subjects):
-            by_subject[subject].append(index)
+            by_pair[route_variety.pair(subject)].append(index)
         base = (list(search.costs) if search.costs is not None
                 else [1] * len(search.targets))
         # More than any route that avoids it: the edge is left out unless
@@ -3561,17 +3550,18 @@ class NavigateTask(BotTask):
         def use(subject: str) -> float:
             return ways.get(route_variety.pair(subject), 0.0)
 
-        best_subjects = [route_blocks.edge_subject(edge) for edge in route]
-        ordered = sorted(dict.fromkeys(best_subjects), key=lambda subject: -use(subject))
+        best_pairs = [route_variety.pair(route_blocks.edge_subject(edge)) for edge in route]
+        ordered = sorted(dict.fromkeys(best_pairs), key=lambda way: -ways.get(way, 0.0))
         routes: list[list[MapEdge]] = []
-        for subject in ordered[:route_variety.MAX_CANDIDATES]:
+        for way in ordered[:route_variety.MAX_CANDIDATES]:
             self._variety_check(client, deadline)
             costs = list(base)
-            for index in by_subject[subject]:
+            for index in by_pair[way]:
                 costs[index] += avoid
             alternative = search.search(costs)
-            if alternative and subject not in {
-                    route_blocks.edge_subject(edge) for edge in alternative}:
+            if alternative and way not in {
+                    route_variety.pair(route_blocks.edge_subject(edge))
+                    for edge in alternative}:
                 routes.append(alternative)
         self._variety_check(client, deadline)
         priced = [cost + math.ceil(min(3.0, use(subject)))
@@ -3586,7 +3576,8 @@ class NavigateTask(BotTask):
                   if {edge for edge in candidate
                       if edge.kind == dialogue_edges.DIALOGUE} <= voyages]
         memo: dict[tuple, float] = {}
-        best = route_variety.candidate(route, self._walk_cost(client, route, deadline, memo))
+        best = route_variety.candidate(
+            route, *self._walk_cost(client, route, deadline, memo, danger), start=source)
         if not math.isfinite(best.cost):
             # Its walk cannot be priced (a live position cut off by a
             # runtime change): nothing is "within" it.
@@ -3595,10 +3586,10 @@ class NavigateTask(BotTask):
                          "could not be priced")
             return None
         candidates = [route_variety.candidate(
-            candidate, self._walk_cost(client, candidate, deadline, memo))
-            for candidate in routes]
+            candidate, *self._walk_cost(client, candidate, deadline, memo, danger),
+            start=source) for candidate in routes]
         return route_variety.choose(
-            best, candidates, edge_uses=uses, danger=danger,
+            best, candidates, edge_uses=uses, danger=danger, hard=hard,
             tolerance=route_variety.tolerance(client), now=now,
             rng=self.variety_rng)
 
@@ -3625,12 +3616,17 @@ class NavigateTask(BotTask):
             raise _VarietySlow()
 
     def _walk_cost(self, client: AtrinikClient, edges: Sequence[MapEdge],
-                   deadline: float, memo: dict[tuple, float]) -> float:
-        """Her walk along ``edges`` to the goal, in steps: each map's
-        authored path (local_path) with the walk's spawn-radius costs
-        (_spawn_costs), plus route_variety.TRANSITION_STEPS an exit or
-        voyage and one step a tile seam; a leg with no path costs inf.
-        ``memo`` keeps each leg for the other candidates."""
+                   deadline: float, memo: dict[tuple, float],
+                   danger: frozenset[str] | set[str] = frozenset()
+                   ) -> tuple[float, dict[str, float]]:
+        """Her walk along ``edges`` to the goal, in steps, and its walk on
+        each map (the start map's first leg and the destination's leg to
+        the goal included): each map's authored path (local_path) with
+        the spawn-radius costs (_spawn_square_costs) on a farm trip's maps
+        (_spawn_costs) and on every ``danger`` map, plus
+        route_variety.TRANSITION_STEPS an exit or voyage and one step a
+        tile seam; a leg with no path costs inf. ``memo`` keeps each leg
+        for the other candidates."""
         access = self._allow_locked(client)
         current = client.state.map.path
         here = (client.state.map.world_x, client.state.map.world_y)
@@ -3639,7 +3635,8 @@ class NavigateTask(BotTask):
             key = (map_path, start, goal)
             if key not in memo:
                 self._variety_check(client, deadline)
-                extra = self._spawn_costs(map_path) or {}
+                extra = ((self._spawn_square_costs(map_path) if map_path in danger
+                          else None) or self._spawn_costs(map_path) or {})
                 path = self.graph.local_path(map_path, start, goal,
                                              allow_locked=access,
                                              extra_costs=extra or None)
@@ -3650,6 +3647,7 @@ class NavigateTask(BotTask):
             return memo[key]
 
         cost = 0.0
+        walks: dict[str, float] = defaultdict(float)
         for edge in edges:
             node = self.graph.nodes.get(current)
             target = (edge.x, edge.y)
@@ -3657,13 +3655,19 @@ class NavigateTask(BotTask):
                 target = (max(0, min(node.width - 1, edge.x)),
                           max(0, min(node.height - 1, edge.y)))
             if edge.kind != dialogue_edges.DIALOGUE:
-                cost += leg(current, here, target)
+                step = leg(current, here, target)
+                cost += step
+                walks[current] += step
             cost += 1 if edge.kind == "tile" else route_variety.TRANSITION_STEPS
             here, current = _edge_arrival(self.graph, edge), edge.destination
         goals = self._goal_points()
         if goals:
-            cost += min(leg(current, here, goal) for goal in goals)
-        return cost
+            step = min(leg(current, here, goal) for goal in goals)
+            cost += step
+            walks[current] += step
+        else:
+            walks[current] += 0.0
+        return cost, dict(walks)
 
     def require_care(self, mode: str, subjects: Sequence[str], *,
                      clock: Callable[[], float] = time.monotonic,
@@ -4774,6 +4778,11 @@ class NavigateTask(BotTask):
         if (map_path not in self.spawn_cost_maps or self._urgent() or
                 self._care_staging is not None):
             return None
+        return self._spawn_square_costs(map_path)
+
+    def _spawn_square_costs(self, map_path: str) -> dict[tuple[int, int], int]:
+        """_spawn_costs' squares of ``map_path``, whatever the trip (route
+        variety prices every danger map's walk with them), cached per map."""
         cached = self._spawn_cost_cache.get(map_path)
         if cached is not None:
             return cached

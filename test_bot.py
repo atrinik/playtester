@@ -44371,38 +44371,100 @@ class RouteVarietyTests(unittest.TestCase):
         door = MapEdge("/s", "/a", 2, 10, 10, 10, "exit", "door a")
         deadline = time.monotonic() + 5
         task.destination_xy = None
-        self.assertEqual(task._walk_cost(client, [seam], deadline, {}), 16 + 1)
-        self.assertEqual(task._walk_cost(client, [door], deadline, {}), 1 + 4)
+        self.assertEqual(task._walk_cost(client, [seam], deadline, {})[0], 16 + 1)
+        self.assertEqual(task._walk_cost(client, [door], deadline, {}),
+                         (1 + 4, {"/s": 1, "/a": 0.0}))
 
-    def test_a_route_that_takes_a_hazard_tier_or_crosses_a_hazard_keeps_the_best(self):
+    def hazard_graph(self, middle="/p", b_door=(10, 12)):
+        """/s to ``middle``, then by /a or /b to /d: the walk across
+        ``middle`` is 2 to /a's door and 2 to (10, 12)."""
+        graph = WorldGraph()
+        for path in ("/s", middle, "/a", "/b", "/d"):
+            graph.nodes[path] = self.open_node(path)
+        graph.nodes["/s"].edges.append(MapEdge("/s", middle, 2, 10, 10, 10, "exit", "gate"))
+        graph.nodes[middle].edges += [
+            MapEdge(middle, "/a", 10, 8, 10, 10, "exit", "door a"),
+            MapEdge(middle, "/b", *b_door, 10, 10, "exit", "door b")]
+        for path in ("/a", "/b"):
+            graph.nodes[path].edges.append(MapEdge(path, "/d", 10, 0, 10, 10, "exit", "stairs"))
+        return graph
+
+    MIDDLE_A = ("exit:/p:10,8>/a", "exit:/a:10,0>/d")
+
+    def test_on_a_hazard_route_an_alternative_no_longer_on_the_hazard_is_taken(self):
+        # A pack map crossed in the middle (its fallback tier): the other
+        # way on from it is as short across it, so she takes it; a way
+        # that walks longer across the pack map never.
         from . import navigation as navigation_module
 
-        cases = {
-            # Over-level spawns on both ways: only the fallback tier routes.
-            "fallback tier": lambda graph, client: graph.map_monster_levels.update(
-                {"/a": {"dragon": 99}, "/b": {"dragon": 99}}),
-            # A ranged map she may cross at her level is still a hazard.
-            "ranged map": lambda graph, client: graph.map_monster_levels.update(
-                {"/a": {"skeleton archer": 1}}),
-            "start map": lambda graph, client: client.state.farm_zone_quarantine.update(
-                {"/s": time.time() + 3600}),
-        }
-        for name, make in cases.items():
-            with self.subTest(name):
-                graph, client = self.graph(), self.client()
+        for b_door, varied in (((10, 12), True), ((10, 14), False)):
+            with self.subTest(b_door=b_door):
+                client = self.client()
+                self.used(client, *self.MIDDLE_A, count=20.0)
+                with patch.object(navigation_module.NavigateTask, "_known_pack_hazard_maps",
+                                  return_value={"/p"}):
+                    route, actions, state = self.plan(
+                        self.trip(self.hazard_graph(b_door=b_door),
+                                  allow_ranged_hazard_fallback=True), client)
+                self.assertTrue(state["hazard_fallback_taken"])
+                self.assertEqual(self.maps(route), ["/p", "/b" if varied else "/a", "/d"])
+                if not varied:
+                    self.assertIn("1 more dangerous", actions[-1][1])
+
+    def test_a_fallback_tier_varies_within_its_own_search(self):
+        # Over-level spawns on the only way on: the planner's fallback
+        # tier. Its own search still holds the two ways on from there.
+        graph = self.hazard_graph(middle="/h")
+        graph.map_monster_levels["/h"] = {"dragon": 99}
+        client = self.client()
+        self.used(client, "exit:/h:10,8>/a", "exit:/a:10,0>/d", count=20.0)
+        route, actions, state = self.plan(self.trip(graph), client)
+        self.assertTrue(state["hazard_fallback_taken"])
+        self.assertEqual(self.maps(route), ["/h", "/b", "/d"])
+        self.assertIn("took a less-used route", actions[-1][1])
+
+    def test_a_longer_walk_across_a_hazard_start_map_is_never_taken(self):
+        from . import navigation as navigation_module
+
+        # From (3, 10): /a's door 1 step, /b's 2 by (5, 10), 1 by (4, 10).
+        for b_door, varied in (((5, 10), False), ((4, 10), True)):
+            with self.subTest(b_door=b_door):
+                client = self.client()
                 self.used(client, *self.A_EDGES, count=20.0)
-                make(graph, client)
-                route, actions, _ = self.plan(self.trip(graph), client)
-                self.assertEqual(self.maps(route)[-1], "/d")
-                self.assertIn("best route kept", actions[-1][1])
-                self.assertNotIn("took", actions[-1][1])
-        # A pack map on the best route (only world_* maps rate as packs).
-        graph, client = self.graph(), self.client()
-        self.used(client, *self.A_EDGES, count=20.0)
-        with patch.object(navigation_module.NavigateTask, "_known_pack_hazard_maps",
-                          return_value={"/a"}):
-            route, actions, _ = self.plan(self.trip(graph), client)
-        self.assertIn("best route kept", actions[-1][1])
+                with patch.object(navigation_module.NavigateTask, "_known_pack_hazard_maps",
+                                  return_value={"/s"}):
+                    route, actions, _ = self.plan(self.trip(self.graph(b_door=b_door)), client)
+                self.assertEqual(self.maps(route), ["/b" if varied else "/a", "/d"])
+
+    def test_a_longer_walk_inside_a_hazard_destination_is_never_taken(self):
+        # The archer destination: the way by /a lands beside the goal; the
+        # way by /b enters by a seam 45 squares from it. Within 15 % in
+        # all, but far longer among the archers.
+        def trip(archers):
+            graph = WorldGraph()
+            sizes = {"/s": (20, 20), "/a": (50, 5), "/b": (20, 10), "/d": (60, 10)}
+            for path, (width, height) in sizes.items():
+                node = MapNode(path, width=width, height=height)
+                node.terrain.update({(x, y): 1 for x in range(width) for y in range(height)})
+                graph.nodes[path] = node
+            graph.nodes["/s"].edges += [MapEdge("/s", "/a", 2, 10, 0, 2, "exit", "door a"),
+                                        MapEdge("/s", "/b", 4, 10, 18, 5, "exit", "door b")]
+            graph.nodes["/a"].edges.append(MapEdge("/a", "/d", 40, 2, 44, 5, "exit", "stairs"))
+            graph.nodes["/b"].edges.append(MapEdge("/b", "/d", 20, 5, kind="tile"))
+            if archers:
+                graph.map_monster_levels["/d"] = {"skeleton archer": 1}
+            task = NavigateTask(graph, "/d", (45, 5))
+            task.vary_route = True
+            return task
+
+        client = self.client()
+        self.used(client, "exit:/s:2,10>/a", "exit:/a:40,2>/d", count=20.0)
+        route, actions, _ = self.plan(trip(True), client)
+        self.assertEqual(self.maps(route), ["/a", "/d"])
+        self.assertIn("1 more dangerous", actions[-1][1])
+        # Without the archers the seam's way is taken: it is the less used.
+        route, actions, _ = self.plan(trip(False), client)
+        self.assertEqual(self.maps(route), ["/b", "/d"], actions)
 
     def test_twin_door_squares_are_one_way(self):
         # An entrance of two adjacent exit squares to the same map: the
@@ -44425,6 +44487,31 @@ class RouteVarietyTests(unittest.TestCase):
         client.record_action = lambda action, detail="", **_: recorded.append(action)
         rv.note_crossing(client, graph.nodes["/s"].edges[1])
         self.assertNotIn(rv.NEW_EXIT, recorded)
+
+    def test_a_twin_door_square_takes_no_candidate_slot(self):
+        # One candidate slot: avoiding the door square she used must avoid
+        # its twin too, or the slot is spent on the same way.
+        from . import route_variety as rv
+
+        graph = self.graph()
+        graph.nodes["/s"].edges.insert(1, MapEdge("/s", "/a", 2, 11, 10, 11, "exit", "door a"))
+        client = self.client()
+        self.used(client, *self.A_EDGES, count=20.0)
+        from . import navigation as navigation_module
+        found = []
+        search = navigation_module.RouteSearch.search
+
+        def recorded(self, costs):
+            route = search(self, costs)
+            found.append([edge.destination for edge in route or ()])
+            return route
+
+        with patch.object(rv, "MAX_CANDIDATES", 1), \
+                patch.object(navigation_module.RouteSearch, "search", recorded):
+            route, actions, _ = self.plan(self.trip(graph), client)
+        # The one avoid search (the first) went by /b, not the twin square.
+        self.assertEqual(found[0], ["/b", "/d"])
+        self.assertEqual(self.maps(route), ["/b", "/d"], actions)
 
     def test_only_the_exit_she_took_is_counted_as_that_exit(self):
         from . import route_variety as rv
@@ -44469,6 +44556,28 @@ class RouteVarietyTests(unittest.TestCase):
             client.remember_route_visits()
             client.remember_route_visits()
             self.assertEqual(saves, [0.25])
+
+    def test_counts_are_written_on_close_and_on_a_dropped_connection(self):
+        from . import route_variety as rv
+
+        for how in ("close", "run"):
+            with self.subTest(how), tempfile.TemporaryDirectory() as directory:
+                path = str(Path(directory) / "state.json")
+                client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path,
+                                                    reconnect=False))
+                client.load_character_memory("Sera")
+                client.state.player_name = "Sera"
+                rv.note_crossing(client, MapEdge("/s", "/a", 2, 10, 10, 10, "exit", "door"))
+                rv.note_crossing(client, MapEdge("/a", "/d", 10, 0, 10, 10, "exit", "stairs"))
+                if how == "close":
+                    asyncio.run(client.close())
+                else:
+                    client.connect = AsyncMock(side_effect=ConnectionError("dropped"))
+                    with self.assertLogs("atrinik_bot.client", "WARNING"):
+                        asyncio.run(client.run())
+                later = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+                later.load_character_memory("Sera")
+                self.assertIn("/d", later.state.route_map_visits)
 
     def test_stored_counts_are_validated(self):
         from . import route_variety as rv

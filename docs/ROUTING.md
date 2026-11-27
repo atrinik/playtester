@@ -1578,7 +1578,9 @@ alternate between routes about as good as the best (`route_variety.py`).
   malformed, non-finite, overflowing, future or forgotten entry. An exit
   is counted as that exit only when she arrives on its authored arrival
   square (`_took_exit`); otherwise, as a seam always is, by its pair of
-  maps (`pair:SOURCE>DESTINATION`). The record is updated at each crossing
+  maps (`pair:SOURCE>DESTINATION`); an exit taken from a displaced
+  arrival is missed as that exit (one missing dashboard record), which
+  is accepted. The record is updated at each crossing
   and written at most every 5 minutes, and at once on a disconnect, a
   character switch or reload and a clean shutdown, each write waiting at
   most 0.25 s; a failed write waits for the next window. A crash loses the
@@ -1589,10 +1591,10 @@ alternate between routes about as good as the best (`route_variety.py`).
   identification, upgrade and utility shopping, and spell purchases. A
   trip marked essential or critical, a care crossing or its walk home,
   learned-cost plans, and a character below 70 % HP, hungry, starving or
-  depleted never vary; nor does a route that took a hazard fallback or
-  threat tier, crosses a threat map, or starts on or crosses a danger map
-  (below) other than the destination, which every route enters alike: only
-  routes clean at every tier vary. Critical escapes, recall walks, survival and cure
+  depleted never vary. A route on hazards may vary (owner decision,
+  2026-11-26, "allow on hazard routes"): one that took a fallback or threat
+  tier varies only within that tier's search, and only by a route that
+  spends no longer among the hazards (Choice, below). Critical escapes, recall walks, survival and cure
   trips and timed quest steps are never marked. Only the trip's first
   plan varies (`start`, `prepare`): never a replan, and a trip that failed
   (`fail`, so the farm return's fallback retry) never again.
@@ -1600,26 +1602,38 @@ alternate between routes about as good as the best (`route_variety.py`).
   (`RouteSearch`: the CSR graph of the winning tier's `route_points`, with
   its avoided and penalized maps, exclusions, owner walls and offer). On
   that graph, with no new expansion of the world, one native search
-  avoids each of the best route's most used edges (up to 8), and one
+  avoids each of the best route's most used ways (up to 8; every square
+  of a pair of maps at once, so a twin door takes no slot), and one
   prices every edge by her counts. A candidate that adds a voyage, or
   crosses the same maps as the best route (another square of the same
   doors), is dropped.
 - **Cost.** Each route's walk in steps: each map's authored path
-  (`local_path`) with the walk's spawn-radius cost (`_spawn_costs`, 1.6) on
-  a farm trip's maps, plus 4 steps an exit or voyage (a load), one step a
-  tile seam, and the walk to the goal. A leg with no authored path prices
-  the route out.
+  (`local_path`) with the spawn-radius cost (`_spawn_costs`, 1.6) on a
+  farm trip's maps and on every danger map (below) whatever the trip,
+  plus 4 steps an exit or voyage (a load), one step a tile seam, and the
+  walk to the goal; and its walk on each map (the start map's first leg
+  and the destination's leg to the goal included). A leg with no
+  authored path prices the route out.
   A route that skirts the farm map's spawns is priced as the walk will
   walk it, so variety never trades the approach discipline (COMBAT.md) for
   a fresh road; the approach rules themselves are unchanged.
-- **Choice** (`route_variety.choose`). A candidate is eligible when it
-  costs at most 15 % more than the best route
-  (`ClientConfig.route_variety_tolerance`, `--route-variety-tolerance`,
-  `ATRINIK_BOT_ROUTE_VARIETY_TOLERANCE`; 0 turns variety off, at most 0.5)
-  and enters no map the best route does not enter among the hazards of
+- **Choice** (`route_variety.choose`). The danger maps are the hazards of
   every tier (ranged and caster maps at any level, over-level, pack,
-  `KNOWN_LETHAL_TRANSIT`, learned route hazards), her counting route
-  deaths and her quarantined spots: the same hazard tier or a safer one.
+  `KNOWN_LETHAL_TRANSIT`), learned route hazards, her counting route
+  deaths and her quarantined spots. A candidate is eligible when:
+  - it costs at most 15 % more than the best route in all
+    (`ClientConfig.route_variety_tolerance`, `--route-variety-tolerance`,
+    `ATRINIK_BOT_ROUTE_VARIETY_TOLERANCE`; 0 turns variety off, at most
+    0.5);
+  - it enters no danger map the best route does not, the start map
+    counting as entered;
+  - on every danger map it shares with the best route, the start map and
+    the destination included, its walk there costs no more than the best
+    route's: an archer destination entered by a seam far from the goal
+    loses to the stairs beside it;
+  - it crosses no learned hazard, route-death or quarantined map on the
+    way, even one the best route crosses;
+  - it adds no voyage and crosses other maps than the best route.
   Among the best route and the eligible ones she takes the one with the
   largest share of unvisited ways (each edge counted by its pair of maps,
   so the twin squares of one entrance are one way; under 0.5 is
@@ -1635,9 +1649,11 @@ alternate between routes about as good as the best (`route_variety.py`).
   (`_plan_here`) never runs it. It gives up after 2 s and keeps the
   best route (`route_variety.SEARCH_SECONDS`), and stops with its plan
   when the plan is dropped. Measured offline on the built world: 10 to
-  35 ms on top of plans of 0.25 to 2 s (Brynknot's shop and bank from
+  41 ms on top of plans of 0.25 to 2.4 s (Brynknot's shop and bank from
   world_7_79, the Asteria sage from Greyton, the Burnt Forest from
-  Brynknot).
+  Brynknot). The two long trips take a hazard tier and still vary, each
+  by an alternative no longer on any hazard map; the short town trips
+  have none within 15 %.
 - **Dashboard.** Each search records `route-variety`: the route taken (or
   the best route kept), its cost against the best route's and how many
   alternatives were left out as longer or more dangerous. A map she

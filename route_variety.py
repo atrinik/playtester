@@ -16,8 +16,10 @@ candidates on the planner worker.
 - **Choice** (``choose``). Among routes no more than the tolerance (15 %,
   ``ClientConfig.route_variety_tolerance``) above the best route's walking
   cost, entering no hazard, route-death or quarantined map the best route
-  does not enter, she takes the one with the most unvisited edges, then the
-  least used, a small random draw breaking ties.
+  does not enter, walking no longer than it on any hazard map they share
+  (the start and destination included) and crossing no route-death,
+  quarantined or deadly map, she takes the one with the largest share of
+  unvisited ways, then the least used, a small random draw breaking ties.
 - **Discoveries.** A map she enters, or an exit she takes, for the first
   time in her memory is recorded for the dashboard (``route-new-map``,
   ``route-new-exit``; ``route-secret-exit`` for an exit authored invisible).
@@ -221,12 +223,16 @@ def tolerance(client: Any) -> float:
 @dataclass(frozen=True, slots=True)
 class Candidate:
     """A route (its edges), its walking cost in steps, the edge subjects
-    it crosses, the maps it enters, in order and as a set."""
+    it crosses, the maps it enters, in order and as a set, the map it
+    starts on, and its walk on each map it walks (start and destination
+    included)."""
     edges: tuple
     cost: float
     subjects: tuple[str, ...]
     maps: frozenset[str]
     sequence: tuple[str, ...] = ()
+    start: str = ""
+    walks: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,23 +258,44 @@ def usage(uses: dict[str, float], subjects: Iterable[str]) -> tuple[int, float, 
 
 def choose(best: Candidate, candidates: Sequence[Candidate], *,
            edge_uses: dict[str, tuple[float, float]], danger: Iterable[str],
-           tolerance: float, now: float,
+           tolerance: float, now: float, hard: Iterable[str] = (),
            rng: random.Random | None = None) -> Choice:
     """The route to take: ``best`` (the planner's) or one of
     ``candidates``.
 
-    A candidate is eligible when its cost is at most ``tolerance`` above
-    the best route's, it enters no ``danger`` map (a hazard of any tier,
-    a route death, a quarantined spot) that the best route does not, and
-    it crosses other maps than the best route (another square of the same
-    doors is no other way).
+    A candidate is eligible when all of these hold:
+
+    - its cost is at most ``tolerance`` above the best route's;
+    - it enters no ``danger`` map (a hazard of any tier, a route death, a
+      quarantined spot) that the best route does not, the start map
+      counting as entered;
+    - on every danger map it shares with the best route (the start and
+      the destination included) its walk costs no more than the best
+      route's walk there, so it never spends longer among hazards;
+    - it crosses no ``hard`` map (a map that killed her, a route death, a
+      quarantined spot) on the way, even one the best route crosses;
+    - it crosses other maps than the best route (another square of the
+      same doors is no other way).
     Among the best route and the eligible ones, the largest share of
     unvisited edges wins (a share, so a route is never preferred only for
     having more edges), then the least mean use, then a random draw."""
     rng = rng or random.Random()
     danger = frozenset(danger)
-    allowed = best.maps & danger
+    hard = frozenset(hard)
+    allowed = (best.maps | {best.start}) & danger
+    best_walks = dict(best.walks)
+    destination = best.sequence[-1] if best.sequence else ""
     limit = best.cost * (1.0 + tolerance)
+
+    def safer(candidate: Candidate) -> bool:
+        entered = (candidate.maps | {candidate.start}) & danger
+        if not entered <= allowed:
+            return False
+        if (candidate.maps - {destination, candidate.start}) & hard:
+            return False
+        walks = dict(candidate.walks)
+        return all(walks.get(path, 0.0) <= best_walks.get(path, 0.0)
+                   for path in entered)
     seen = {best.sequence}
     eligible = [best]
     longer = dangerous = 0
@@ -279,7 +306,7 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
         if candidate.cost > limit:
             longer += 1
             continue
-        if not (candidate.maps & danger) <= allowed:
+        if not safer(candidate):
             dangerous += 1
             continue
         eligible.append(candidate)
@@ -298,8 +325,10 @@ def choose(best: Candidate, candidates: Sequence[Candidate], *,
     return Choice(chosen, chosen is not best, reason, len(eligible) - 1, best.cost)
 
 
-def candidate(edges: Sequence[Any], cost: float) -> Candidate:
+def candidate(edges: Sequence[Any], cost: float,
+              walks: dict[str, float] | None = None, *, start: str = "") -> Candidate:
     return Candidate(tuple(edges), float(cost),
                      tuple(edge_subject(edge) for edge in edges),
                      frozenset(edge.destination for edge in edges),
-                     tuple(edge.destination for edge in edges))
+                     tuple(edge.destination for edge in edges), start,
+                     tuple(sorted((walks or {}).items())))
