@@ -5196,8 +5196,10 @@ class NavigateThenTask(BotTask):
         self._train_ids: dict[int, float] = {}
         self._train_missing = 0
         self._was_train = False
-        # Seconds this walk has stood (approach "stand") with no pursuer in
-        # contact, and when the last such tick was (0: not standing).
+        # Seconds this walk has stood (approach "stand") with no pursuer
+        # beside her; all its stand seconds, fighting included; and when
+        # the last stand tick was, contact or not (0: the last tick was no
+        # stand). A new walk or a map change resets them.
         self._stand_total = 0.0
         self._stand_all = 0.0
         self._stand_tick_at = 0.0
@@ -5205,8 +5207,9 @@ class NavigateThenTask(BotTask):
         self._leads = 0
         self._stand_since = 0.0
         self._stand_cooldown_until = 0.0
-        # Set once a train held the approach for APPROACH_TRAIN_STAND_SECONDS
-        # and failed the walk: latched, so no stand starts again.
+        # Set once the walk's stands reached APPROACH_TRAIN_STAND_SECONDS
+        # with no pursuer beside her, or APPROACH_STAND_HARD_SECONDS in
+        # all, and failed the walk: latched, so no stand starts again.
         self.train_held = False
         self._near_cache: tuple[str, bool] | None = None
         self._feature_cache: dict[tuple[str, int, int], bool] = {}
@@ -5991,8 +5994,8 @@ class NavigateThenTask(BotTask):
         that is how one leaves in practice; one seen beyond
         MAX_AGGRO_RANGE in a larger view leaves at once). When the train
         shrinks to two, those two stay latched until the stand resets. A
-        map change ends the samples, the latches, the stand and its count
-        (_stand_total). Where each creature was first seen this trip is kept
+        map change ends the samples, the latches, the stand and both its
+        counts (_stand_total, _stand_all). Where each creature was first seen this trip is kept
         (_pursuit_origins, at most PURSUIT_ORIGINS)."""
         m = client.state.map
         cx, cy = m.width // 2, m.height // 2

@@ -43430,6 +43430,20 @@ class SafeRetreatTests(unittest.TestCase):
         self.assertLess(held, 600.0)
         self.assertGreaterEqual(walk._stand_total, 180.0)
 
+    def test_a_non_hitting_neighbour_is_no_contact(self):
+        # Only a pursuer beside her is contact: a treant that stands
+        # beside her from 10 s without hitting her or closing in is not,
+        # so the train holding at range ends the trip at about 182 s.
+        def positions(t):
+            x = min(14, 10 + int(t))
+            return {100: (x, 12), 101: (x, 13), 102: (x, 11),
+                    **({103: (19, 12)} if t > 10 else {})}
+
+        client, walk, run = self._clocked_walk(positions)
+        held = run(400.0)
+        self.assertIsNotNone(held)
+        self.assertTrue(178.0 <= held <= 190.0, held)
+
     def test_an_unkillable_neighbour_trips_the_hard_cap(self):
         # A pursuer she cannot hurt stays beside her, hitting: none of
         # that is standing, but 600 s of stand in all end the trip.
