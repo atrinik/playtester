@@ -630,7 +630,11 @@ steps away and keeps her distance.
 The dashboard's Stop (`{"type": "stop"}`) ends the running task: no
 farming, questing, navigation or errands. It does not leave her unattended.
 A connected Atrinik character keeps getting hungry, so with no task the
-engine still runs a narrow survival guard (`TaskEngine._protect_idle`):
+engine still runs a narrow survival guard (`TaskEngine._protect_idle`).
+Where food is obsolete (Classic 5.119.0 and later, `--food-obsolete`, see
+the README's Run section) hunger is gone: the guard only heals her, never
+eats, and `IdleSurvival` starts no trip and ends one under way. On an older
+server:
 
 - the idle safety policy heals her and eats carried food below its food
   threshold (`idle-hunger`, "ate ..."). Only a rise in her food stat counts

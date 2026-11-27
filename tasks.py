@@ -31,6 +31,7 @@ from . import route_shadow, terrain
 from . import owner_watch
 from .observations import is_player, plain
 from .model import STARTER_APARTMENT, Item, MapObject
+from .hunger import food_obsolete
 from .pathfinding import grid_search
 
 log = logging.getLogger(__name__)
@@ -935,6 +936,49 @@ def safe_food(item: Item) -> bool:
             InventoryPolicy().identified(item))
 
 
+_quest_catalog_warned = False
+
+
+def obsolete_food(client: AtrinikClient) -> list[Item]:
+    """Carried food that is junk because food is obsolete
+    (hunger.food_obsolete); none while food still matters.
+
+    Only ordinary food: server-typed food (not flesh or drink, which quests
+    ask for: a sword spider's heart, a shipment of Charob Beer) that she
+    carries unapplied, paid and unlocked. A named item (a capital letter or
+    a possessive, such as Gimli's lembas), a name with a reserve word
+    (quest, key, unique...) and anything a formal quest asks for (the
+    tutorial's wild white mushrooms) is kept. Unreadable quest data keeps
+    it all.
+    """
+    if not food_obsolete(client):
+        return []
+    global _quest_catalog_warned
+    try:
+        from .quests import quest_item_names
+    except ImportError as exc:
+        if not _quest_catalog_warned:
+            _quest_catalog_warned = True
+            log.warning("quest catalog unavailable (%s); keeping carried food", exc)
+        return []
+    wanted = quest_item_names()
+    if wanted is None:
+        # Unreadable quest data (warned once, and cached): keep it all.
+        return []
+    reserve = InventoryPolicy().reserve_words + JunkPolicy().keep_patterns
+    junk = []
+    for item in client.state.inventory:
+        name = item.name.casefold()
+        if (item.item_type != c.TYPE_FOOD or
+                item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID | c.ITEM_LOCKED) or
+                item.name != name or "'" in name or
+                any(word in name for word in reserve) or
+                any(quest_name in name for quest_name in wanted)):
+            continue
+        junk.append(item)
+    return junk
+
+
 # What the server answers a heal that it ran but that healed nothing
 # (cast_heal, server/spell_effect.c): the cast still landed.
 HEAL_FAILED_MESSAGE = re.compile(r"^The healing spell fails!", re.I)
@@ -1360,6 +1404,9 @@ class SafetyPolicy:
                 log.warning("critical health %.0f%% and no usable heal", ratio * 100)
                 self._last_warning = now
         food_level = int(stats.get("food", 1000) or 0)
+        if food_obsolete(client):
+            # Food never drains and food 0 does nothing: never eat.
+            food_level = max(food_level, self.min_food)
         if food_level >= self.min_food:
             self._food_attempt_level = -1
             self._fruitless_meals = 0
@@ -2387,6 +2434,9 @@ class FarmTask(BotTask):
         # most once per live item tag instead of reopening the same book on
         # every rotation.
         self._lore_book_attempts: set[int] = set()
+        # Obsolete food drops by casefolded name (drop_obsolete_food):
+        # (drops sent, no drop before, given up and recorded, tag dropped).
+        self._food_drops: dict[str, tuple[int, float, bool, int]] = {}
         self._spellbook_attempts: set[int] = set()
         self._engaged_target: tuple[int, str, int, int, float] | None = None
         self._last_threat_origin: tuple[str, int, int, float] | None = None
@@ -3258,7 +3308,8 @@ class FarmTask(BotTask):
     async def bank_mana_crystal(self, client: AtrinikClient) -> bool:
         """Resting on a full bar, store mana in the crystal until it is
         full; the rest then refills the bar (see ManaCrystal)."""
-        if int(client.state.stats.get("food", 0) or 0) <= 0:
+        if (int(client.state.stats.get("food", 0) or 0) <= 0 and
+                not food_obsolete(client)):
             # Mana regenerates only with food: keep the bar she has.
             return False
         return await ManaCrystal.bank(client)
@@ -4554,6 +4605,69 @@ class FarmTask(BotTask):
                 "ammunition-unready")
             recorder(action,
                      f"{ranged_item.name}: restore configured combat loadout")
+        return True
+
+    # Seconds without hostile contact before she drops obsolete food.
+    FOOD_DROP_QUIET_SECONDS = 10.0
+    # A stack still carried after a drop is tried again after this, doubled
+    # each time, and given up after FOOD_DROP_TRIES drops.
+    FOOD_DROP_RETRY_SECONDS = 60.0
+    FOOD_DROP_TRIES = 3
+
+    async def drop_obsolete_food(self, client: AtrinikClient) -> bool:
+        """Drop one stack of obsolete food; True if the drop was sent.
+
+        Where food is obsolete (hunger.food_obsolete) carried food is junk
+        (obsolete_food). The caller picks the map (navigation.food_drop_map:
+        open country or a dungeon, never a town, shop or unique map); this
+        needs a quiet square too: no target and no hostile contact for
+        FOOD_DROP_QUIET_SECONDS.
+
+        Drops are kept per name, with the tag last dropped. A drop failed
+        only while that same tag is still carried (loot merged into it is
+        dropped with it): then the name is dropped again after
+        FOOD_DROP_RETRY_SECONDS, doubled each time, and after FOOD_DROP_TRIES
+        drops it is kept, recorded once (``obsolete-food-kept``). Once the
+        dropped tag is gone the drop worked, and a new stack of that name
+        (fresh loot) starts afresh.
+        """
+        junk = obsolete_food(client)
+        carried = {item.tag for item in junk}
+        self._food_drops = {name: entry for name, entry in self._food_drops.items()
+                            if entry[3] in carried}
+        now = time.monotonic()
+        due = []
+        for item in junk:
+            name = item.name.casefold()
+            tries, retry_at, kept, tag = self._food_drops.get(
+                name, (0, 0.0, False, 0))
+            if now < retry_at:
+                continue
+            if tries >= self.FOOD_DROP_TRIES:
+                if not kept:
+                    self._food_drops[name] = (tries, retry_at, True, tag)
+                    log.warning("%s stays in her pack after %d drops", item.name, tries)
+                    recorder = getattr(client, "record_action", None)
+                    if recorder is not None:
+                        recorder("obsolete-food-kept",
+                                 f"{item.name}: still carried after {tries} drops")
+                continue
+            due.append(item)
+        state = client.state
+        if (not due or getattr(state, "target_id", 0) or
+                recent_hostile_contact(client, self.FOOD_DROP_QUIET_SECONDS)):
+            return False
+        item = due[0]
+        name = item.name.casefold()
+        tries = self._food_drops.get(name, (0, 0.0, False, 0))[0] + 1
+        self._food_drops[name] = (
+            tries, now + self.FOOD_DROP_RETRY_SECONDS * 2 ** (tries - 1), False,
+            item.tag)
+        await client.move_item(0, item.tag, item.quantity)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("obsolete-food-drop", f"{item.quantity} {item.name}")
+        self._last_action = now
         return True
 
     async def maintain_inventory(self, client: AtrinikClient) -> bool:
@@ -7182,7 +7296,7 @@ class FarmTask(BotTask):
             sp = int(client.state.stats.get("sp", 0) or 0)
             maxsp = int(client.state.stats.get("maxsp", 0) or 0)
             food = int(client.state.stats.get("food", 0) or 0)
-            if 0 < maxsp and sp < maxsp and food > 0:
+            if 0 < maxsp and sp < maxsp and (food > 0 or food_obsolete(client)):
                 # A rest is new unless confirmed just now: one left behind by
                 # a detour starts over (clears, combat off, logged).
                 if not self.training_rest_active():
@@ -8954,7 +9068,9 @@ class TempleFoodTask(BotTask):
         if self.status == TaskStatus.READY:
             await self.start(client)
             self._feedback_start = client.state.message_count
-        if int(client.state.stats.get("food", 0) or 0) >= self.FED:
+        if (food_obsolete(client) or
+                int(client.state.stats.get("food", 0) or 0) >= self.FED):
+            # Fed, or food never drains (hunger.food_obsolete).
             self.complete()
             return
         if not self._sent_at:

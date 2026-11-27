@@ -62,6 +62,7 @@ from . import constants as c
 from .client import COIN_VALUES, AtrinikClient
 from .operator_key import (KEY_HEADER, OperatorKeyError, ensure_operator_key,
                            key_matches, operator_key_path, read_operator_key)
+from .hunger import food_obsolete
 from .tasks import unresolved_hostile_contact
 
 log = logging.getLogger(__name__)
@@ -356,7 +357,8 @@ class OperatorAssist:
         if maxhp <= 0 or hp < MIN_HEALTH_FRACTION * maxhp:
             return (f"not at a safe square: health below "
                     f"{MIN_HEALTH_FRACTION:.0%}")
-        if int(stats.get("food", 0) or 0) < MIN_FOOD:
+        if (int(stats.get("food", 0) or 0) < MIN_FOOD and
+                not food_obsolete(state)):
             return f"not at a safe square: food below {MIN_FOOD}"
         # In whole grams, as the server counts (the client divides by 1000).
         limit = round(float(stats.get("weight_limit", 0) or 0) * 1000)

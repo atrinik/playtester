@@ -24,6 +24,7 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          farming_unsafe_reason, food_reserve, hungry,
                          PLANNING, TempleFoodPlanner)
 from .alerts import HUNGRY_FOOD
+from .hunger import food_obsolete
 from .quest_tasks import EscapingDesertedIslandTask
 from .route_blocks import map_subject
 from .tasks import (BotTask, FarmTask, RetrieveItemsTask, SafetyPolicy,
@@ -691,8 +692,18 @@ class AutoplayTask(BotTask):
                     self.child.safe_for_progression_detour(client) and
                     await self._start_mana_crystal_detours(client)):
                 return
+            ended = (self.phase == "temple-food" and food_obsolete(client) and
+                     self.child.status not in (TaskStatus.COMPLETE,
+                                               TaskStatus.FAILED))
+            if ended:
+                # Food turned out obsolete (``auto``) during the trip: it
+                # ends as if she had eaten.
+                log.info("food is obsolete; ending %s", self.child.name)
+                await client.clear_actions()
+                self.child.complete()
             try:
-                await self.child.tick(client)
+                if not ended:
+                    await self.child.tick(client)
                 if isinstance(self.child, (FarmCircuitTask, RecoveryTask)):
                     self._circuit_backoffs = self.child.backoffs()
             except ConnectionError as exc:
@@ -936,7 +947,13 @@ class IdleSurvival:
         """Run one survival step; True while a food trip has her busy.
 
         ``safety`` is the engine's idle policy, which eats carried food.
+        Where food is obsolete (hunger.food_obsolete) there is nothing to
+        survive: no trip starts and one under way ends.
         """
+        if food_obsolete(client):
+            if self.child is not None:
+                self.drop(task_took_over=True)
+            return False
         if self.child is not None:
             return await self._tick_trip(client)
         state = client.state

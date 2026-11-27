@@ -174,6 +174,40 @@ after one of them a restart still starts idle. Without `--character`
 nothing is stored: the bot logs a warning once, and the dashboard's last
 task says the Stop is not kept across a restart.
 
+Classic 5.119.0 (https://github.com/atrinik/classic/pull/655) removed
+starvation: food never drains and food 0 does nothing. The wire protocol did
+not change, so `--food-obsolete` (`ATRINIK_BOT_FOOD_OBSOLETE`) tells her
+which rules apply (`hunger.py`):
+
+- `on`, the default, for the live server: every hunger behaviour is off.
+  She makes no food or temple trips and no food restock, never eats, and
+  rests and banks mana at food 0. The starving and idle-food alerts stay
+  silent, and a low food stat neither makes a trip give way nor stops an
+  operator assist. A food trip under way when food turns out obsolete
+  ends. Carried food is junk, dropped between pulls on her farm map when
+  that is open country or a dungeon (never a town, a `no_harm` or unique
+  map, a map with a shop floor or mat, a savebed, merchant or priest, or
+  her apartment), on a quiet square: no target and no hit for 10 seconds
+  (`obsolete-food-drop`). Food never triggers a junk sale or holds back cure
+  funding. A drop failed only while the same stack is still
+  carried; it is then dropped again after 1, then 2 minutes, and after
+  three drops kept, with `obsolete-food-kept` saying why. Fresh loot of a
+  name already dropped starts afresh. Junk food is only ordinary server-typed
+  food: quest food (any item a formal quest's objectives name), named food
+  (a capital letter or a possessive, such as Gimli's lembas), food whose
+  name has a reserve word (quest, key, talisman, artifact, unique,
+  exceptional, ring, amulet, spellbook, formula, recipe, mana crystal),
+  locked food, flesh and drink are kept. Unreadable quest data keeps all
+  food (one warning).
+- `off`: the hunger rules of an older server, unchanged.
+- `auto`: `off` until her food has stayed unchanged for 30 minutes in which
+  she moved and gained experience; the window starts again whenever food
+  changes and, at food 0, whenever she loses health to something other than
+  an attack (the old server's starvation). It never turns on while she is
+  hungry with no food on her, and one fall of food keeps `off` for the run.
+- An unknown `ATRINIK_BOT_FOOD_OBSOLETE` value is logged as an error and
+  means `auto`.
+
 `atrinik-playtester --version`, the startup log line, and the dashboard header
 name the build: its release tag (with `+N` when the commit is N commits past
 it) and short commit, linked to GitHub. CMake records them from Git on every
@@ -664,7 +698,8 @@ when the coin reached her. The running bot then:
    plays, the amount is 1 gold coin (the cap), the last run that reached
    `/create` was more than 24 hours ago, and she is idle at a safe square:
    logged in, no task or idle food trip, no target or combat, nothing hit her
-   in the last 10 seconds, health at least 90% and food at least 300; and
+   in the last 10 seconds, health at least 90% and food at least 300 (not
+   checked where food is obsolete, see Run); and
    she can carry the coin (the server refuses a pickup unless what she
    carries plus the coin stays under her weight limit, which depletion
    lowers with Str: on 2026-11-18 Sera carried 40.6 kg against 25 kg, so
@@ -890,7 +925,8 @@ blocked map stays usable as a destination. Blocks are stored per character
 in the runtime state database (`route_blocks`) and are written only through
 `POST /api/route-blocks`: loopback only, a loopback `Host`, no foreign
 `Origin`, and `application/json` only, which an HTML form cannot send
-cross-site. Only an essential trip (food while she is hungry or starving, a
+cross-site. Only an essential trip (food while she is hungry or starving,
+never where food is obsolete, a
 cure, the depletion service, a savebed move, a trip that funds one of them,
 and the recovery phase's walk home) crosses a block, and
 only when every route does; a block never sends a trip through a hazard

@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from .hunger import FoodWatch
+
 
 @dataclass(slots=True)
 class Character:
@@ -271,6 +273,11 @@ class GameState:
     inventory_replay_complete: bool = True
     stats: dict[str, int | float] = field(default_factory=dict)
     stat_observed_at: dict[str, float] = field(default_factory=dict)
+    # Whether food still matters (hunger.food_obsolete): "on", "off" or
+    # "auto". A constructed state keeps the hunger rules; the live client
+    # takes the command line's setting (on, for the live server).
+    food_obsolete: str = "off"
+    food_watch: FoodWatch = field(default_factory=FoodWatch)
     bank_balance: int = 0
     bank_balance_known: bool = False
     bank_balance_observed_at: float = 0.0

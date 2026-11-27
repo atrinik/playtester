@@ -30509,6 +30509,533 @@ class IdleSurvivalTests(unittest.TestCase):
 
 
 
+class FoodObsoleteTests(unittest.TestCase):
+    """Classic 5.119.0 never drains food (hunger.food_obsolete): every
+    hunger behaviour is a no-op there, and unchanged where food matters."""
+
+    SETTINGS = (("off", True), ("on", False))
+
+    @staticmethod
+    def circuit_client(setting, food=0):
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7,
+                                 food_obsolete=setting)
+        client.state.stats["food"] = food
+        client.state.bank_balance = 5_000
+        return client
+
+    def test_no_food_trip_temple_or_restock_where_food_is_obsolete(self):
+        from .navigation import hungry, starving_without_food, unidentified_food
+
+        graph = WorldGraph()
+        graph.temple_priests = ["priest"]
+        for setting, matters in self.SETTINGS:
+            with self.subTest(setting):
+                task = FarmCircuitTask(graph, [("/a", "treant")], clock=lambda: 10.0)
+                client = self.circuit_client(setting)
+                self.assertEqual(hungry(client), matters)
+                self.assertEqual(starving_without_food(client), matters)
+                self.assertEqual(task._food_urgent(client), matters)
+                self.assertEqual(task._needs_food_resupply(client), matters)
+                trip = NavigateTask(graph, "/a")
+                trip.essential = "food"
+                self.assertEqual(trip.is_essential(client), matters)
+                # Fed, a carried reserve below FOOD_RESERVE_LOW is restocked
+                # only where food matters.
+                client.state.stats["food"] = 300
+                self.assertEqual(task._needs_food_resupply(client), matters)
+                # Found food waits for identification only where it may be eaten.
+                client.state.place_item(Item(93, item_type=c.TYPE_FOOD,
+                                             name="apple"), 7)
+                self.assertEqual(bool(unidentified_food(client)), matters)
+
+    def test_temple_food_task_completes_at_once_where_food_is_obsolete(self):
+        client = QuestTests._talking_client(0)
+        client.state.food_obsolete = "on"
+        task = TempleFoodTask("Saruthar")
+        asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE)
+        self.assertEqual(client.talks, [])
+
+    def test_autoplay_never_pauses_for_temple_food_where_food_is_obsolete(self):
+        for setting, matters in self.SETTINGS:
+            with self.subTest(setting):
+                client = AtrinikClient(ClientConfig(food_obsolete=setting))
+                client.state.phase = "playing"
+                client.state.stats.update({"level": 23, "food": 0})
+                autoplay = AutoplayTask(WorldGraph(), target_level=115)
+                self.assertEqual(autoplay._needs_temple_food(client), matters)
+
+    def test_safety_never_eats_where_food_is_obsolete(self):
+        for setting, matters in self.SETTINGS:
+            with self.subTest(setting):
+                client = self.circuit_client(setting, food=50)
+                client.state.stats.update(hp=32, maxhp=32)
+                client.state.place_item(Item(43, item_type=c.TYPE_FOOD,
+                                             quality=100,
+                                             name="peeled rambutan"), 7)
+                applied = []
+
+                async def apply(tag):
+                    applied.append(tag)
+
+                client.apply = apply
+                asyncio.run(SafetyPolicy().enforce(client))
+                self.assertEqual(applied, [43] if matters else [])
+
+    def test_mana_and_training_rest_food_gates_lift_where_food_is_obsolete(self):
+        for setting, matters in self.SETTINGS:
+            with self.subTest(setting):
+                client, _ = QuestTests._crystal_farm_client(62, 62, x=14)
+                client.state.food_obsolete = setting
+                client.state.stats["food"] = 0
+                task = FarmTask(zone="/test", target="kobold",
+                                combat_skill="wizardry spells",
+                                combat_spell="cause light wounds")
+                asyncio.run(task.bank_mana_crystal(client))
+                self.assertEqual(client.applied, [] if matters else [70])
+                client = QuestTests._wizard_training_client(100, x=14, y=8)
+                client.state.food_obsolete = setting
+                client.state.stats.update({"sp": 30, "maxsp": 62, "food": 0})
+                task = FarmTask(zone="/test", target="kobold",
+                                combat_skill="wizardry spells",
+                                combat_spell="cause light wounds")
+                asyncio.run(task.tick(client))
+                self.assertEqual(task._training_resting, not matters)
+
+    def test_navigation_rests_at_food_0_where_food_is_obsolete(self):
+        client = QuestTests._combat_client()
+        client.state.map.tiles.clear()
+        client.state.stats.update(hp=80, maxhp=100, sp=5, maxsp=47, food=0)
+        client.state.combat = False
+        client.state.food_obsolete = "on"
+        node = MapNode(path="/test", width=25, height=25)
+        node.terrain = {(x, y): 1 for x in range(25) for y in range(25)}
+        graph = WorldGraph()
+        graph.nodes = {"/test": node}
+        farm = FarmTask(zone="/farm", target="ice golem")
+        task = NavigateThenTask(graph, "/farm", farm, combat_approach=True,
+                                safety=farm.safety)
+        task._defending = True
+        moves = len(client.direct_moves)
+        asyncio.run(task._defend_while_navigating(client))
+        # Food 0 does nothing: she rests to recover as with food on her.
+        self.assertTrue(task._defending)
+        self.assertEqual(len(client.direct_moves), moves)
+
+    def test_alerts_drop_starvation_where_food_is_obsolete(self):
+        from .alerts import ProgressWatch, active
+
+        now = 10_000.0
+        failed = [{"action": "idle-hunger-failed", "time": now - 60,
+                   "detail": "no temple priest is reachable"}]
+        for setting, matters in self.SETTINGS:
+            with self.subTest(setting):
+                state = GameState(phase="playing", player_tag=7,
+                                  food_obsolete=setting)
+                state.stats.update(exp=500, food=0)
+                state.map = MapState(path="/a", world_x=1, world_y=1)
+                ids = [alert["id"] for alert in active(
+                    state, failed, ProgressWatch(now), autoplay_started_at=None,
+                    now=now)]
+                self.assertEqual("starving" in ids, matters)
+                self.assertEqual("idle-food" in ids, matters)
+
+    def test_idle_survival_starts_no_food_trip_where_food_is_obsolete(self):
+        from .autoplay import IdleSurvival
+
+        for setting, matters in self.SETTINGS:
+            with self.subTest(setting):
+                client = AtrinikClient(ClientConfig(food_obsolete=setting))
+                client.state.phase = "playing"
+                client.state.map.path = IdleSurvivalTests.BED
+                client.state.stats.update({"level": 34, "hp": 100,
+                                           "maxhp": 100, "food": 0})
+                sent = []
+
+                async def send(packet):
+                    sent.append(packet)
+
+                client.send = send
+                engine = TaskEngine(client)
+                engine.idle_survival = IdleSurvival(WorldGraph())
+                trips = []
+
+                def trip(graph, client, exclude=()):
+                    trips.append(1)
+                    return TempleTrip("Friar Marcus")
+
+                with fake_temple_trips(trip):
+                    started = asyncio.run(engine._protect_idle())
+                self.assertEqual(bool(started), matters)
+                self.assertEqual(trips, [1] if matters else [])
+                # A trip under way when food turns out obsolete ends.
+                if not matters:
+                    engine.idle_survival.child = TempleTrip("Friar Marcus")
+                    self.assertFalse(asyncio.run(engine._protect_idle()))
+                    self.assertIsNone(engine.idle_survival.child)
+
+    def junk_client(self, setting="on"):
+        client = self.circuit_client(setting, food=0)
+        client.state.map.path = "/shattered_islands/world_0_69"
+        client.state.inventory_replay_complete = True
+        items = [
+            Item(1, item_type=c.TYPE_FOOD, quality=100, name="chicken leg",
+                 quantity=26),
+            Item(2, item_type=c.TYPE_FOOD, name="apple", quantity=3),
+            # Kept: a quest's food, a named food, locked and applied food,
+            # flesh and drink (quests ask for them).
+            Item(3, item_type=c.TYPE_FOOD, quality=100,
+                 name="wild white mushroom", quantity=70),
+            Item(4, item_type=c.TYPE_FOOD, quality=100, name="Gimli's lembas"),
+            Item(5, item_type=c.TYPE_FOOD, quality=100, name="waybread",
+                 flags=c.ITEM_LOCKED),
+            Item(6, item_type=c.TYPE_FLESH, quality=100,
+                 name="sword spider's heart"),
+            Item(7, item_type=c.TYPE_DRINK, quality=100, name="booze"),
+            Item(8, item_type=c.TYPE_FOOD, name="quest cake"),
+        ]
+        for item in items:
+            client.state.place_item(item, 7)
+        client.dropped = []
+
+        async def move_item(location, tag, quantity):
+            client.dropped.append((location, tag, quantity))
+
+        client.move_item = move_item
+        client.decisions = []
+        client.record_action = lambda action, detail="": (
+            client.decisions.append((action, detail)))
+        return client
+
+    def test_carried_food_is_junk_where_food_is_obsolete(self):
+        from .tasks import obsolete_food
+
+        client = self.junk_client()
+        self.assertEqual([item.tag for item in obsolete_food(client)], [1, 2])
+        self.assertEqual(obsolete_food(self.junk_client("off")), [])
+        # Unreadable quest data keeps every food.
+        with patch("atrinik_bot.quests.quest_item_names", return_value=None):
+            self.assertEqual(obsolete_food(client), [])
+
+    def test_food_never_starts_a_junk_sale_or_blocks_cure_funding(self):
+        # Short of the cure with only food carried: no Brynknot trip for
+        # it, and the cure-funding chest trip is not held back by it.
+        client = self.junk_client()
+        circuit = FarmCircuitTask(WorldGraph(), [("/a", "treant")],
+                                  clock=lambda: 10.0)
+        circuit._cure_shortfall = lambda client: True
+        self.assertEqual(circuit._identified_junk(client), [])
+        self.assertFalse(circuit._needs_junk_sale(client))
+        self.assertTrue(circuit._needs_cure_funding(client))
+
+    def drop_graph(self):
+        graph = WorldGraph()
+        for path, flags in (("/wild", {}), ("/unique", {"unique": True}),
+                            ("/town", {"no_harm": True}), ("/shop", {"shop": True}),
+                            ("/bed", {}), ("/vendor", {}),
+                            ("/a/apartments/cheap", {})):
+            graph.nodes[path] = MapNode(path=path, width=10, height=10)
+            for name, value in flags.items():
+                setattr(graph.nodes[path], name, value)
+        graph.savebeds["/bed"].append((1, 1))
+        graph.dialogue_vendors = [types.SimpleNamespace(map_path="/vendor")]
+        return graph
+
+    def test_food_is_dropped_only_on_open_country_or_dungeon_maps(self):
+        from .navigation import food_drop_map
+
+        graph = self.drop_graph()
+        self.assertTrue(food_drop_map(graph, "/wild"))
+        for path in ("/unique", "/town", "/shop", "/bed", "/vendor",
+                     "/a/apartments/cheap", "/unknown"):
+            with self.subTest(path):
+                self.assertFalse(food_drop_map(graph, path))
+        # The circuit drops between pulls only there.
+        farm = FarmTask(zone="/test", target="kobold")
+
+        async def maintain_inventory(client):
+            return False
+
+        farm.maintain_inventory = maintain_inventory
+        circuit = FarmCircuitTask(graph, [("/a", "treant")], clock=lambda: 10.0)
+        circuit._busy_finishing_fight_or_loot = lambda client, farm: False
+        for path, dropped in (("/town", []), ("/wild", [(0, 1, 26)])):
+            with self.subTest(path):
+                client = self.junk_client()
+                client.state.map.path = path
+                asyncio.run(circuit._maintain_safe_inventory(client, farm))
+                self.assertEqual(client.dropped[:1], dropped)
+
+    def test_built_graph_knows_towns_shops_and_unique_maps(self):
+        graph = built_graph()
+        brynknot = graph.nodes["/shattered_islands/world_0_69"]
+        self.assertTrue(brynknot.no_harm)
+        self.assertTrue(brynknot.shop)
+        from .navigation import food_drop_map
+
+        self.assertFalse(food_drop_map(graph, "/shattered_islands/world_0_69"))
+        # Thrakir's map, an early farm in open country.
+        self.assertTrue(food_drop_map(graph, "/shattered_islands/world_3_69"))
+
+    def test_food_drops_retry_by_name_then_give_up(self):
+        farm = FarmTask(zone="/test", target="kobold")
+        client = self.junk_client()
+        # Not while she has a target, nor right after a hit.
+        client.state.target_id = 9
+        self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+        client.state.target_id = 0
+        client.state.add_message(c.CHAT_TYPE_GAME, "ff0000",
+                                 "The kobold hit you for 3 (3) damage.")
+        self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+        client.state.messages = []
+        now = [1000.0]
+        with patch("atrinik_bot.tasks.time.monotonic", lambda: now[0]):
+            # Identified and unidentified food alike, a stack a tick.
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(client.dropped, [(0, 1, 26), (0, 2, 3)])
+            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            # The apples went (their tag is gone). The legs stayed: that
+            # drop failed, and loot merged into the stack. Retried after the
+            # backoff, with what merged.
+            client.state.remove_item(2)
+            client.state.items[1].quantity = 27
+            now[0] += farm.FOOD_DROP_RETRY_SECONDS
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(client.dropped[-1], (0, 1, 27))
+            now[0] += farm.FOOD_DROP_RETRY_SECONDS * 2
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            # After FOOD_DROP_TRIES drops it is kept, recorded once.
+            now[0] += farm.FOOD_DROP_RETRY_SECONDS * 4
+            dropped = len(client.dropped)
+            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertFalse(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(len(client.dropped), dropped)
+            kept = [d for a, d in client.decisions if a == "obsolete-food-kept"]
+            self.assertEqual(kept, ["chicken leg: still carried after 3 drops"])
+            # Gone, and later loot of the name starts afresh.
+            client.state.remove_item(1)
+            client.state.place_item(Item(12, item_type=c.TYPE_FOOD, quality=100,
+                                         name="chicken leg"), 7)
+            self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+            self.assertEqual(client.dropped[-1], (0, 12, 1))
+
+        # A drop that worked, then fresh loot of that name while she was busy
+        # (no call in between): dropped at once, never counted as kept.
+        farm = FarmTask(zone="/test", target="kobold")
+        client = self.junk_client()
+        client.state.remove_item(2)
+        with patch("atrinik_bot.tasks.time.monotonic", lambda: now[0]):
+            for tag in (21, 22, 23, 24):
+                self.assertTrue(asyncio.run(farm.drop_obsolete_food(client)))
+                dropped_tag = client.dropped[-1][1]
+                client.state.remove_item(dropped_tag)
+                client.state.place_item(Item(tag, item_type=c.TYPE_FOOD,
+                                             quality=100, name="chicken leg"), 7)
+            self.assertEqual([entry[1] for entry in client.dropped],
+                             [1, 21, 22, 23])
+        self.assertNotIn("obsolete-food-kept",
+                         [action for action, _ in client.decisions])
+        # Where food matters she keeps it all.
+        client = self.junk_client("off")
+        self.assertFalse(asyncio.run(FarmTask(
+            zone="/test", target="kobold").drop_obsolete_food(client)))
+        self.assertEqual(client.dropped, [])
+
+    def test_unreadable_quest_data_keeps_all_food_and_is_read_once(self):
+        from . import quests
+
+        quests.quest_item_names.cache_clear()
+        self.addCleanup(quests.quest_item_names.cache_clear)
+        with self.assertLogs("atrinik_bot.quests", "WARNING"):
+            self.assertIsNone(quests.quest_item_names(Path("/nonexistent/quests")))
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (directory / "broken").mkdir()
+        (directory / "broken" / "quest.xml").write_text("<quest")
+        with patch.object(quests, "load_catalog",
+                          wraps=quests.load_catalog) as load:
+            with self.assertLogs("atrinik_bot.quests", "WARNING"):
+                self.assertIsNone(quests.quest_item_names(directory))
+            self.assertIsNone(quests.quest_item_names(directory))
+            self.assertEqual(load.call_count, 1)
+        self.assertIn("wild white mushroom", quests.quest_item_names())
+
+    def test_settings_and_observed_obsolete_food(self):
+        from .hunger import food_obsolete, parse_setting
+
+        self.assertEqual(parse_setting(""), "on")
+        self.assertEqual(parse_setting("Off"), "off")
+        self.assertEqual(parse_setting("0"), "off")
+        self.assertEqual(parse_setting("auto"), "auto")
+        # An unknown value is an error, and decides from observation.
+        with self.assertLogs("atrinik_bot.hunger", "ERROR"):
+            self.assertEqual(parse_setting("bogus"), "auto")
+        self.assertFalse(food_obsolete(GameState()))
+        self.assertTrue(food_obsolete(GameState(food_obsolete="on")))
+        self.assertEqual(AtrinikClient(ClientConfig(
+            food_obsolete="on")).state.food_obsolete, "on")
+
+    @staticmethod
+    def auto_state(food=500):
+        state = GameState(phase="playing", player_tag=7, food_obsolete="auto")
+        state.map = MapState(path="/a", world_x=1, world_y=1)
+        state.stats.update(food=food, exp=100, hp=100)
+        state.place_item(Item(1, item_type=c.TYPE_FOOD, quality=100,
+                              name="chicken leg", quantity=5), 7)
+        return state
+
+    def test_auto_needs_a_whole_window_of_unchanged_food_moving_and_fighting(self):
+        from .hunger import OBSERVE_SECONDS
+
+        def played(food_after=500, *, move=True, fight=True,
+                   seconds=OBSERVE_SECONDS):
+            state = self.auto_state()
+            watch = state.food_watch
+            watch.observe(state, now=0.0)
+            self.assertFalse(watch.obsolete(state, now=0.0))
+            if move:
+                state.map.world_x = 2
+            if fight:
+                state.stats["exp"] = 150
+            state.stats["food"] = food_after
+            watch.observe(state, now=seconds / 2)
+            watch.observe(state, now=seconds)
+            return watch.obsolete(state, now=seconds)
+
+        self.assertTrue(played())
+        self.assertFalse(played(480))
+        self.assertFalse(played(seconds=OBSERVE_SECONDS - 60))
+        self.assertFalse(played(move=False))
+        self.assertFalse(played(fight=False))
+        # A meal restarts the window, and the moving and fighting before it
+        # no longer count.
+        state = self.auto_state()
+        watch = state.food_watch
+        watch.observe(state, now=0.0)
+        state.map.world_x, state.stats["exp"] = 2, 150
+        watch.observe(state, now=10.0)
+        state.stats["food"] = 600
+        watch.observe(state, now=20.0)
+        self.assertFalse(watch.obsolete(state, now=20.0 + OBSERVE_SECONDS))
+        state.map.world_x, state.stats["exp"] = 3, 200
+        watch.observe(state, now=30.0)
+        self.assertFalse(watch.obsolete(state, now=OBSERVE_SECONDS))
+        self.assertTrue(watch.obsolete(state, now=20.0 + OBSERVE_SECONDS))
+        # A fall seen once keeps the hunger rules for the run.
+        state = self.auto_state()
+        state.food_watch.observe(state, now=0.0)
+        state.stats["food"] = 499
+        state.food_watch.observe(state, now=1.0)
+        state.stats.update(food=600, exp=900)
+        state.map.world_x = 5
+        state.food_watch.observe(state, now=2.0)
+        self.assertFalse(state.food_watch.obsolete(state, now=10 * OBSERVE_SECONDS))
+
+    def test_auto_never_turns_on_while_an_old_server_starves_her(self):
+        from .hunger import OBSERVE_SECONDS, food_obsolete
+
+        # Old server, food 0 and nothing to eat: food stays 0 while
+        # starvation drains her health, as she walks and fights for an hour.
+        state = self.auto_state(food=0)
+        state.remove_item(1)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            watch.observe(state, now=now)
+        self.assertFalse(watch.obsolete(state, now=now))
+        with patch("atrinik_bot.hunger.time.time", lambda: now):
+            self.assertFalse(food_obsolete(state))
+        # Carried food that does not feed her (so the hungry test passes):
+        # the starvation damage alone, health lost with no hit, restarts
+        # the window each time and keeps the old rules.
+        state = self.auto_state(food=0)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            watch.observe(state, now=now)
+        self.assertFalse(watch.obsolete(state, now=now))
+        self.assertEqual(watch.since, now)
+        # The same window with each loss an attack's is not restarted.
+        state = self.auto_state(food=0)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            state.messages = [(now - 1.0, c.CHAT_TYPE_GAME, "ff0000",
+                               "The kobold hit you for 1 (1) damage.")]
+            watch.observe(state, now=now)
+        self.assertEqual(watch.since, 0.0)
+        self.assertTrue(watch.obsolete(state, now=now))
+        # Health lost to attacks at food 0 is no starvation, but hungry with
+        # nothing to eat she keeps the old rules even so.
+        state = self.auto_state(food=0)
+        state.remove_item(1)
+        watch = state.food_watch
+        for minute in range(61):
+            now = minute * 60.0
+            state.map.world_x = minute
+            state.stats["exp"] = 100 + minute
+            state.stats["hp"] = 100 - minute
+            state.messages = [(now, c.CHAT_TYPE_GAME, "ff0000",
+                               "The kobold hit you for 1 (1) damage.")]
+            watch.observe(state, now=now)
+        self.assertFalse(watch.obsolete(state, now=now))
+        # With food on her that window counts.
+        state.place_item(Item(2, item_type=c.TYPE_FOOD, quality=100,
+                              name="apple"), 7)
+        self.assertTrue(watch.obsolete(state, now=now))
+
+    def test_turning_obsolete_mid_trip_ends_the_food_trips(self):
+        # The farm circuit's food resupply.
+        circuit = FarmCircuitTask(WorldGraph(), [("/a", "treant")],
+                                  clock=lambda: 10.0)
+        circuit._resupply = TempleTrip("Friar Marcus")
+        circuit._resupply.status = TaskStatus.RUNNING
+        client = self.circuit_client("on", food=500)
+
+        async def clear_actions():
+            pass
+
+        client.clear_actions = clear_actions
+        self.assertFalse(asyncio.run(circuit._tick_running_service(client)))
+        self.assertIsNone(circuit._resupply)
+        # Autoplay's temple-food phase.
+        client = AtrinikClient(ClientConfig(food_obsolete="on"))
+        client.state.phase = "playing"
+        client.state.stats.update({"level": 23, "hp": 100, "maxhp": 100,
+                                   "food": 0})
+
+        async def send(packet):
+            pass
+
+        client.send = send
+        autoplay = AutoplayTask(WorldGraph(), target_level=115)
+        autoplay.status = TaskStatus.RUNNING
+        autoplay._intro_complete = True
+        trip = TempleTrip("Friar Marcus")
+        trip.status = TaskStatus.RUNNING
+        autoplay.phase, autoplay.child = "temple-food", trip
+        ticks = []
+
+        async def tick(client):
+            ticks.append(1)
+
+        trip.tick = tick
+        asyncio.run(autoplay.tick(client))
+        self.assertEqual(ticks, [])
+        self.assertEqual(trip.status, TaskStatus.COMPLETE)
+        self.assertIsNot(autoplay.child, trip)
+
+
 class FakeOperatorSession:
     """The operator character's connection, against a fake server that
     shares Sera's square: /tp, /create and a drop behave as the Classic
@@ -30751,6 +31278,13 @@ class OperatorAssistTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stored)
         self.assertTrue(all(r["outcome"] == "refused" and not r["counts"] for r in stored))
         self.assertFalse(self.assist.status()["assisted"])
+
+    async def test_low_food_refuses_only_where_food_still_matters(self):
+        state = self.client.state
+        state.stats.update(hp=300, food=100)
+        self.assertIn("food below", self.assist.refusal(1, "Sera"))
+        state.food_obsolete = "on"
+        self.assertEqual(self.assist.refusal(1, "Sera"), "")
 
     async def test_refuses_when_she_cannot_carry_the_coin(self):
         # Depletion lowers Str and so her weight limit (player_can_carry):
@@ -33114,6 +33648,18 @@ class OwnerBlockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.status, TaskStatus.FAILED)
         self.assertIn("yielded to hunger", task.error)
         self.assertEqual(self.client.actions(), ["essential-care-yield"])
+
+    async def test_where_food_is_obsolete_no_trip_yields_to_hunger(self):
+        # Classic 5.119.0: food never drains, so a low food stat is no
+        # reason to give up a care wait (hunger.food_obsolete).
+        self.graph = blocks_graph(detour=False)
+        self.block("/blocked")
+        self.client.state.food_obsolete = "on"
+        self.client.state.stats.update(hp=10, food=0)
+        task = self.trip("cure")
+        self.assertFalse(await self.walking(task))
+        self.assertNotEqual(task.status, TaskStatus.FAILED)
+        self.assertNotIn("essential-care-yield", self.client.actions())
 
     async def test_a_removed_block_ends_the_wait(self):
         self.graph = blocks_graph(detour=False)

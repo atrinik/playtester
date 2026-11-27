@@ -52,6 +52,7 @@ from .requirements import NAME_LOCK_PREFIX, Requirement, name_lock_id
 from .targeting import select_target, target_set_aside
 
 from .alerts import HUNGRY_FOOD
+from .hunger import food_obsolete
 from .client import AtrinikClient, format_money, map_object_visual_name
 from .farm_analyzer import DEFAULT_OBJECTIVE
 from . import farm_analyzer as farm_analyzer_plan
@@ -280,6 +281,12 @@ class MapNode:
     caster_identities: set[str] = field(default_factory=set)
     # The map header's ``pvp 1``: players may attack each other here.
     pvp: bool = False
+    # The map header's ``unique 1`` (per-player maps that keep what is
+    # dropped) and ``no_harm 1`` (towns), and whether a shop floor or shop
+    # mat lies on it: no map to drop junk food on (food_drop_map).
+    unique: bool = False
+    no_harm: bool = False
+    shop: bool = False
 
     def lock_allowed(self, point: tuple[int, int], access=False) -> bool:
         """Check one gated tile against an access set (requirements.py)."""
@@ -641,6 +648,8 @@ class WorldGraph:
                 int(one(attrs, "enter_y", 0) or 0),
             )
             self.nodes[key].pvp = str(one(attrs, "pvp", "0") or "0").strip() not in ("", "0")
+            self.nodes[key].unique = str(one(attrs, "unique", "0") or "0").strip() not in ("", "0")
+            self.nodes[key].no_harm = str(one(attrs, "no_harm", "0") or "0").strip() not in ("", "0")
             parsed_maps[key] = (path, parsed)
 
         auto_exits: dict[str, list[tuple[int, int, int, str, bool]]] = defaultdict(list)
@@ -691,6 +700,8 @@ class WorldGraph:
                     obj["arch"].startswith("shop_floor") and
                     one(attrs, "auto_apply", base.get("auto_apply")) == "1" and
                     one(attrs, "randomitems", base.get("randomitems")))
+                if obj["arch"].startswith(("shop_floor", "shop_mat")):
+                    node.shop = True
                 if authored_unpaid or dynamic_shop_stock:
                     point = (x, y)
                     if point not in self.shop_stocks[source]:
@@ -8452,22 +8463,43 @@ def unidentified_food(client: AtrinikClient) -> list:
     """Carried food she would eat once identified (it may be cursed until
     then): server-typed food she owns, the kind safety eats. Unpaid items are
     left out, as the identify capability leaves them out."""
+    if food_obsolete(client):
+        # Food is junk (tasks.obsolete_food): nothing to identify it for.
+        return []
     policy = InventoryPolicy()
     return [item for item in client.state.inventory
             if item.item_type == c.TYPE_FOOD and not policy.identified(item) and
             not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID)]
 
 
+def food_drop_map(graph: "WorldGraph", path: str) -> bool:
+    """Whether junk food may be dropped on ``path``
+    (FarmTask.drop_obsolete_food): a known map of open country or a
+    dungeon. Never a unique map or an apartment (their floors keep it), a
+    town (``no_harm``, a savebed, a merchant or a priest) or a map with a
+    shop floor or mat (dropping there sells or litters a shop)."""
+    node = graph.nodes.get(path)
+    return bool(
+        node is not None and not node.unique and not node.no_harm and
+        not node.shop and "/apartments/" not in path and
+        not graph.savebeds.get(path) and
+        not any(getattr(vendor, "map_path", None) == path for vendor in
+                (*graph.dialogue_vendors, *graph.temple_priests)))
+
+
 def starving_without_food(client: AtrinikClient) -> bool:
     """Food 0 and no safe food carried (food_reserve: edible items only):
-    no rest can help, only food."""
-    return (int(client.state.stats.get("food", 1) or 0) <= 0 and
+    no rest can help, only food. Never where food is obsolete
+    (hunger.food_obsolete): food 0 has no effect there."""
+    return (not food_obsolete(client) and
+            int(client.state.stats.get("food", 1) or 0) <= 0 and
             food_reserve(client) == 0)
 
 
 def hungry(client: AtrinikClient) -> bool:
-    """Low on food with nothing left to eat: she must go and get some."""
-    return (food_reserve(client) <= 1 and
+    """Low on food with nothing left to eat: she must go and get some.
+    Never where food is obsolete (hunger.food_obsolete)."""
+    return (not food_obsolete(client) and food_reserve(client) <= 1 and
             int(client.state.stats.get("food", 1000) or 0) < HUNGRY_FOOD)
 
 
@@ -10398,6 +10430,9 @@ class FarmCircuitTask(BotTask):
                     InventoryCapabilityTask.candidates(client, purpose))
 
     def _needs_food_resupply(self, client: AtrinikClient) -> bool:
+        if food_obsolete(client):
+            # Food never drains (hunger.food_obsolete): no restock either.
+            return False
         # While shop resupply backs off, a temple can still feed her; a low
         # reserve alone waits for the shop, she is not hungry yet. Carried
         # food she can identify on the spot comes first: it may already be
@@ -11206,6 +11241,9 @@ class FarmCircuitTask(BotTask):
         """Reconcile loot between pulls even on continuously respawning maps."""
         if self._busy_finishing_fight_or_loot(client, farm):
             return False
+        if (food_drop_map(self.graph, client.state.map.path) and
+                await farm.drop_obsolete_food(client)):
+            return True
         return await farm.maintain_inventory(client)
 
     async def _progress_checkpoint(self, client: AtrinikClient) -> bool:
@@ -12387,6 +12425,12 @@ class FarmCircuitTask(BotTask):
                          target[0], target[1], target[2])
                 self._bed_binding = None
             return True
+        if self._resupply is not None and food_obsolete(client):
+            # Food turned out obsolete (``auto``) during the trip: end it.
+            log.info("food is obsolete; ending %s", self._resupply.name)
+            await client.clear_actions()
+            self._resupply = None
+            self._food_planner.forget()
         if self._resupply is not None:
             await self._resupply.tick(client)
             self._settle_resupply(client)

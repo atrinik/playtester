@@ -10,6 +10,7 @@ import os
 import time
 from pathlib import Path
 
+from . import hunger
 from .build_info import build_info
 from .planner import LoopWatchdog
 from .compatibility import (CompatibilityError, configure_cached_bundle,
@@ -95,6 +96,14 @@ def parser() -> argparse.ArgumentParser:
         in ("1", "true", "yes", "on"),
         help="record how the operator character fights while it is in view "
              "and she is not fighting (default: off; recording only)",
+    )
+    p.add_argument(
+        "--food-obsolete", choices=hunger.SETTINGS,
+        default=hunger.parse_setting(os.getenv("ATRINIK_BOT_FOOD_OBSOLETE", "")),
+        help="whether food never drains on the server: on (the default, "
+             "Classic 5.119.0 and later), off (the hunger rules of an older "
+             "server) or auto (on once food stays unchanged for half an hour "
+             "of moving and fighting)",
     )
     p.add_argument("--register", action="store_true")
     p.add_argument("--create-character", action="store_true")
@@ -675,6 +684,7 @@ async def main_async(args: argparse.Namespace) -> None:
         learned_route_costs=args.learned_route_costs,
         operator_character=args.operator_character.strip(),
         watch_owner=args.watch_owner,
+        food_obsolete=args.food_obsolete,
         register=args.register, create_character=args.create_character,
         character_archetype=args.archetype,
     )

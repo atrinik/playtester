@@ -218,6 +218,10 @@ class ClientConfig:
     # Off (the default) nothing is recorded; the client still decodes tile
     # animations into a bounded ring and keeps the operator's vitals.
     watch_owner: bool = False
+    # Whether food still matters (hunger.food_obsolete): "on", "off" or
+    # "auto". Off (the default here) keeps the hunger rules; the command
+    # line defaults to on, for the live server (Classic 5.119.0 and later).
+    food_obsolete: str = "off"
 
 
 # kill_player (server types/player.c) sends exactly one of these, as the whole
@@ -273,7 +277,8 @@ class AtrinikClient:
 
     def __init__(self, config: ClientConfig):
         self.config = config
-        self.state = GameState(account=config.account)
+        self.state = GameState(account=config.account,
+                               food_obsolete=config.food_obsolete)
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self._quic_stream: QuicStream | None = None
@@ -2804,6 +2809,7 @@ class AtrinikClient:
         if self.trends.observe(self.state):
             self._persist_trends()
         self.progress_watch.observe(self.state)
+        self.state.food_watch.observe(self.state)
         await self.emit("stats", changed)
 
     def _decode_item_fields(self, cur: Cursor, flags: int, item: Item) -> None:
@@ -3238,6 +3244,7 @@ class AtrinikClient:
         self._observe(lambda recorder: recorder.note_position(self.state))
         # Movement arrives in map packets, between stats packets and polls.
         self.progress_watch.observe(self.state)
+        self.state.food_watch.observe(self.state)
         await self.emit("map", {"path": m.path, "name": m.name, "x": m.world_x, "y": m.world_y, "changed_map": old_path != m.path})
 
     async def _handle_interface(self, cur: Cursor, raw: bytes) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import logging
 import re
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -9,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .model import QuestPartProgress, QuestProgress
+
+log = logging.getLogger(__name__)
 
 try:
     from tools.world_content_audit import ROOT as CONTENT_ROOT
@@ -131,6 +135,37 @@ def load_catalog(root: Path | None = None) -> dict[str, QuestDefinition]:
         )
         catalog[definition.name] = definition
     return catalog
+
+
+@functools.lru_cache(maxsize=1)
+def quest_item_names(root: Path | None = None) -> frozenset[str] | None:
+    """Every item a formal quest asks for (its ``<item>`` objectives), by
+    casefolded name: such an item is never junk, whatever its type (the
+    tutorial's wild white mushrooms are food).
+
+    None when the quest data cannot be read: a missing quests directory,
+    no quest in it, or a file that does not parse. Callers then treat every
+    item as a quest's. Read once and cached, the failure too, with one
+    warning.
+    """
+    if root is None:
+        root = CONTENT_ROOT / "maps" / "interfaces" / "quests"
+    try:
+        catalog = load_catalog(root) if root.is_dir() else {}
+    except (OSError, ET.ParseError) as exc:
+        log.warning("quest catalog %s unreadable (%s); every item counts as "
+                    "a quest item", root, exc)
+        return None
+    if not catalog:
+        log.warning("no formal quest under %s; every item counts as a quest "
+                    "item", root)
+        return None
+    return frozenset(
+        objective.name.casefold()
+        for definition in catalog.values()
+        for part in flatten_parts(definition.parts)
+        for objective in part.objectives
+        if objective.kind == "item" and objective.name)
 
 
 _MARKUP = re.compile(r"\[[^]]+\]")
