@@ -28277,6 +28277,10 @@ class RouteFailureTests(unittest.TestCase):
         self.assertEqual(every.status, TaskStatus.RUNNING)
         self.assertEqual(every.route[0].destination, self.SURFACE)
         self.assertEqual(every.route[-1].destination, self.UNDERGROUND)
+        # Pruned on the trip itself by the plan, not only on the copy the
+        # plan ran on: read first without the property, which prunes by
+        # the clock (CI's clock is minutes after boot).
+        self.assertEqual(every._edge_exclusions, {})
         self.assertEqual(every._excluded_edges, set())
 
     def test_a_repeatedly_excluded_exit_stays_excluded_longer(self):
@@ -40120,6 +40124,18 @@ class PlanningOffLoopTests(unittest.TestCase):
             asyncio.run(task.tick(client))
         self.assertFalse(task.planning)
         self.assertTrue(task.care.finished)
+
+    def test_a_worker_never_takes_a_signal_meant_for_the_main_thread(self):
+        # CI: with a worker alive, a SIGTERM the feedback filer held blocked
+        # on the main thread went to the worker and was handled early.
+        import signal
+        from . import planner as planner_module
+
+        mask = planner_module.submit(
+            lambda: signal.pthread_sigmask(signal.SIG_BLOCK, set())).result(5)
+        self.assertIn(signal.SIGTERM, mask)
+        self.assertIn(signal.SIGINT, mask)
+        self.assertNotIn(signal.SIGSEGV, mask)
 
     def test_a_dropped_ranking_never_makes_the_planner_busy(self):
         import threading
