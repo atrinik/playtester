@@ -76,7 +76,9 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     combat_allowed, heal_waiting, out_of_heals_and_recall,
                     UnpreparedHold, empty_recall_wand,
                     usable_recharge_scroll, wand_charges, wand_known_empty, recall_wands,
-                    area_caster_identities, tiled_neighbours)
+                    area_caster_identities, tiled_neighbours,
+                    MAX_AGGRO_RANGE, safe_square_route)
+from .terrain import features as terrain_features, tile_directions
 from .tasks import (RECALL_REQUIRED_LEVEL, CasterProfile, gear_scorer, heal_consumables,
                     reads_scrolls)
 log = logging.getLogger(__name__)
@@ -1460,8 +1462,15 @@ class WorldGraph:
     def local_path(self, map_path: str, start: tuple[int, int],
                    goal: tuple[int, int], *,
                    allow_locked: bool = False,
-                   excluded: set[tuple[int, int]] | None = None) -> list[tuple[int, int]]:
-        """Find an authored-terrain path within one map for safe click legs."""
+                   excluded: set[tuple[int, int]] | None = None,
+                   extra_costs: dict[tuple[int, int], int] | None = None,
+                   ) -> list[tuple[int, int]]:
+        """Find an authored-terrain path within one map for safe click legs.
+
+        ``extra_costs`` adds to the cost of entering a square (each step
+        costs 1): the walk's spawn-radius cost (NavigateTask._spawn_costs).
+        Without it every step costs the same.
+        """
         node = self.nodes.get(map_path)
         if node is None:
             return []
@@ -1511,11 +1520,18 @@ class WorldGraph:
             y * node.width + x for x, y in (excluded or ())
             if 0 <= x < node.width and 0 <= y < node.height
         )
+        costs = None
+        if extra_costs:
+            cells = bytearray(b"\x01" * (node.width * node.height))
+            for (x, y), extra in extra_costs.items():
+                if 0 <= x < node.width and 0 <= y < node.height:
+                    cells[y * node.width + x] = max(1, min(255, 1 + int(extra)))
+            costs = bytes(cells)
         result = grid_search(
             node.width, node.height, walkability,
             start[1] * node.width + start[0],
             (point[1] * node.width + point[0] for point in candidates),
-            excluded=excluded_states,
+            excluded=excluded_states, costs=costs,
         )
         if result.status != "found":
             return []
@@ -2849,6 +2865,11 @@ class NavigateTask(BotTask):
         self._exclusion_wait_until = 0.0
         self._exclusion_waited = False
         self._runtime_blocked: set[tuple[int, int]] = set()
+        # Maps whose aggressive spawns the walk pays to skirt on an optional
+        # trip (_spawn_costs): a farm trip's destination and the maps tiled
+        # to it (NavigateThenTask). The squares and their costs, by map.
+        self.spawn_cost_maps: frozenset[str] = frozenset()
+        self._spawn_cost_cache: dict[str, dict[tuple[int, int], int]] = {}
         # When the current local route first disappeared (0.0 while one exists).
         # Separate from _last_progress, which approach-candidate rotation resets.
         self._no_route_since = 0.0
@@ -4355,7 +4376,7 @@ class NavigateTask(BotTask):
         path = self.graph.local_path(
             m.path, start, (world_x, world_y),
             allow_locked=self._allow_locked(client),
-            excluded=blocked)
+            excluded=blocked, extra_costs=self._spawn_costs(m.path))
         if path:
             self._no_route_since = 0.0
         elif not self._no_route_since:
@@ -4428,6 +4449,43 @@ class NavigateTask(BotTask):
         self._issued_click = (m.path, *next_point)
         self._last_action = now
         return True
+
+    # A square within an aggressive spawn's detection radius
+    # (its authored radius, at least SPAWN_COST_RADIUS) plus
+    # SPAWN_COST_MARGIN costs this many extra steps to enter.
+    SPAWN_COST = 3
+    SPAWN_COST_RADIUS = 3
+    SPAWN_COST_MARGIN = 1
+
+    def _spawn_costs(self, map_path: str) -> dict[tuple[int, int], int] | None:
+        """The extra cost of each square near an aggressive spawn of
+        ``map_path``, or None when the walk pays none there.
+
+        Only on an optional trip (not essential or critical, no care
+        staging) and only on spawn_cost_maps (a farm trip's destination
+        and its tiled neighbours), which bounds the work: one map's spawns,
+        computed once per map. The path then skirts a spawn when a route
+        about as short goes round it. Live (2026-11-26) she woke a train of
+        followers on her way to her farm spot and arrived with it.
+        """
+        if (map_path not in self.spawn_cost_maps or self._urgent() or
+                self._care_staging is not None):
+            return None
+        cached = self._spawn_cost_cache.get(map_path)
+        if cached is not None:
+            return cached
+        costs: dict[tuple[int, int], int] = {}
+        for spawn in (getattr(self.graph, "named_spawns", {}) or {}).get(
+                map_path, ()):
+            if spawn.peaceful:
+                continue
+            radius = (max(self.SPAWN_COST_RADIUS, int(spawn.aggro_radius)) +
+                      self.SPAWN_COST_MARGIN)
+            for x in range(spawn.x - radius, spawn.x + radius + 1):
+                for y in range(spawn.y - radius, spawn.y + radius + 1):
+                    costs[(x, y)] = self.SPAWN_COST
+        self._spawn_cost_cache[map_path] = costs
+        return costs
 
     async def _step_along_boundary(self, client: AtrinikClient, world_x: int,
                                    world_y: int, now: float) -> bool:
@@ -5054,6 +5112,46 @@ class NavigateThenTask(BotTask):
     SEAM_RETREAT_FIGHT_SECONDS = 20.0
     # ... and never longer than this after it: then the walk home wins.
     SEAM_RETREAT_FIGHT_CAP_SECONDS = 90.0
+    # Approach discipline (COMBAT.md, "Approach discipline"). A creature is
+    # a pursuer when, over at least APPROACH_PURSUIT_MIN_SECONDS of the
+    # last APPROACH_PURSUIT_WINDOW_SECONDS, it moved and kept up with her
+    # or closed in, and is within MAX_AGGRO_RANGE now.
+    APPROACH_PURSUIT_WINDOW_SECONDS = 12.0
+    APPROACH_PURSUIT_MIN_SECONDS = 2.0
+    APPROACH_PURSUIT_SAMPLES = 64
+    # Within this many tiles of the farm map (or on the last leg), this
+    # many pursuers make her stop and fight them at a defensible square;
+    # more than APPROACH_PACK_CAP, or heals outpaced, make her lead them
+    # away instead, more than MAX_AGGRO_RANGE tiles along her trail.
+    APPROACH_NEAR_TILES = 25
+    APPROACH_STAND_PURSUERS = 2
+    APPROACH_PACK_CAP = 2
+    LEAD_AWAY_CAP_SECONDS = 90.0
+    # Lead-aways per trip; then she stands.
+    LEAD_AWAY_LIMIT = 3
+    # A stand lasts at most this long, then the walk goes on for at least
+    # APPROACH_STAND_COOLDOWN_SECONDS: wanderers must not hold her for ever.
+    APPROACH_STAND_SECONDS = 45.0
+    # A stand against three or more has no such limit. Every walk counts
+    # the seconds she stands (against two or more) with no pursuer beside
+    # her, whatever the train and however it shrinks or regrows; at this
+    # many the trip ends rather than hold her for ever or take them in.
+    APPROACH_TRAIN_STAND_SECONDS = 180.0
+    # One tick adds at most this much to that count (a gap between ticks
+    # is not standing). Seconds with a pursuer beside her (fighting) are
+    # left out of it, but every stand second, those included, counts
+    # towards APPROACH_STAND_HARD_SECONDS, which ends the trip the same
+    # way: a fight against something she cannot hurt must end too. Two
+    # pursuers' stands count as well.
+    APPROACH_STAND_TICK_CAP_SECONDS = 1.0
+    APPROACH_STAND_HARD_SECONDS = 600.0
+    APPROACH_STAND_COOLDOWN_SECONDS = 30.0
+    # How far she looks for a doorway, corridor or safe square to stand at.
+    DEFENSIBLE_RADIUS = 6
+    # A corridor or doorway counts only with at most this many standable
+    # neighbours (terrain.features reach).
+    DEFENSIBLE_REACH = 3
+    DEFENSIBLE_ROUTE_NODES = 300
 
     def __init__(self, graph: WorldGraph, destination: str, task: BotTask,
                  destination_xy: tuple[int, int] | None = None,
@@ -5071,7 +5169,50 @@ class NavigateThenTask(BotTask):
                 task.map_bounds = (node.width, node.height)
                 task.map_node = node
         self.combat_approach = combat_approach
+        if isinstance(task, FarmTask):
+            # On an optional trip the walk skirts the aggressive spawns of
+            # the farm map and the maps tiled to it (_spawn_costs).
+            node = getattr(graph, "nodes", {}).get(destination)
+            self.navigation.spawn_cost_maps = frozenset(
+                {destination, *(tile_directions(node).values()
+                                if node is not None else ())})
         self.safety = safety or SafetyPolicy()
+        # Approach discipline: per creature id, its recent (time, map,
+        # world x, world y, distance) samples (_track_pursuers); the
+        # lead-away under way (_lead: when it began, the steps taken, the
+        # train's ids, where she last stood, and whether it is stuck);
+        # how many this trip; since when the stand under way holds and
+        # the end of its cooldown; whether the farm map is near
+        # (_near_spot's last answer, by map); and the terrain features
+        # looked up.
+        self._pursuit_samples: dict[int, deque] = {}
+        self._pursuit_map = ""
+        self._pursuit_origins: dict[int, tuple[str, int, int]] = {}
+        self._pursuer_ids: dict[int, float] = {}
+        # The members of a train stand under way (_approach_mode), each
+        # with when it was last seen in view within MAX_AGGRO_RANGE: they
+        # stay pursuers while so, and TRAIN_MISSING_GRACE_SECONDS after.
+        # How many of them are out of view within that grace now.
+        self._train_ids: dict[int, float] = {}
+        self._train_missing = 0
+        self._was_train = False
+        # Seconds this walk has stood (approach "stand") with no pursuer
+        # beside her; all its stand seconds, fighting included; and when
+        # the last stand tick was, contact or not (0: the last tick was no
+        # stand). A new walk or a map change resets them.
+        self._stand_total = 0.0
+        self._stand_all = 0.0
+        self._stand_tick_at = 0.0
+        self._lead: dict[str, Any] | None = None
+        self._leads = 0
+        self._stand_since = 0.0
+        self._stand_cooldown_until = 0.0
+        # Set once the walk's stands reached APPROACH_TRAIN_STAND_SECONDS
+        # with no pursuer beside her, or APPROACH_STAND_HARD_SECONDS in
+        # all, and failed the walk: latched, so no stand starts again.
+        self.train_held = False
+        self._near_cache: tuple[str, bool] | None = None
+        self._feature_cache: dict[tuple[str, int, int], bool] = {}
         self._defending = False
         self._last_defense_action = 0.0
         self._retreat_attempt: tuple[str, int, int, float] | None = None
@@ -5133,8 +5274,16 @@ class NavigateThenTask(BotTask):
 
     async def start(self, client: AtrinikClient) -> None:
         await super().start(client)
-        # A new walk starts no escape of an earlier one.
+        # A new walk starts no escape, lead-away or stand of an earlier one.
         self._escaping = False
+        self._lead = None
+        self._stand_since = 0.0
+        self._train_ids = {}
+        self._train_missing = 0
+        self._was_train = False
+        self._stand_total = 0.0
+        self._stand_all = 0.0
+        self._stand_tick_at = 0.0
         self._cornered_target = 0
         self._cornered_logged.clear()
         self._cornered_hold_since = 0.0
@@ -5822,6 +5971,486 @@ class NavigateThenTask(BotTask):
         self._seam_contact = True
         return True
 
+    # A trip remembers where at most this many creatures were first seen.
+    PURSUIT_ORIGINS = 256
+    # A train member out of view stays one for this long.
+    TRAIN_MISSING_GRACE_SECONDS = 3.0
+
+    def _track_pursuers(self, client: AtrinikClient, threats) -> list:
+        """The threats following her. Each creature in view is sampled
+        (world square and time, this map only: a map change starts the
+        samples afresh). It qualifies when it is beside her and hitting
+        her, or when its own movement since its oldest sample at least
+        APPROACH_PURSUIT_MIN_SECONDS old took it 2 or more tiles nearer
+        where she stands now, so her own walk towards a creature that
+        stands or wanders never makes one. A pursuer is one that
+        qualified within the last APPROACH_PURSUIT_WINDOW_SECONDS and is
+        in view within MAX_AGGRO_RANGE (_pursuer_ids holds when each last
+        qualified). A member of a train stand under way (_train_ids) stays
+        one without that lapse while in view within MAX_AGGRO_RANGE, as
+        the server keeps her as its enemy, and is still counted for
+        TRAIN_MISSING_GRACE_SECONDS while out of view (_train_missing);
+        out of view longer it leaves (her view reaches about 8 tiles, so
+        that is how one leaves in practice; one seen beyond
+        MAX_AGGRO_RANGE in a larger view leaves at once). When the train
+        shrinks to two, those two stay latched until the stand resets. A
+        map change ends the samples, the latches, the stand and both its
+        counts (_stand_total, _stand_all). Where each creature was first seen this trip is kept
+        (_pursuit_origins, at most PURSUIT_ORIGINS)."""
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        now = time.monotonic()
+        if self._pursuit_map != m.path:
+            self._pursuit_map = m.path
+            self._pursuit_samples.clear()
+            self._pursuer_ids.clear()
+            # A new map (a seam, an exit, a recall) ends a stand.
+            self._train_ids.clear()
+            self._stand_since = 0.0
+            self._was_train = False
+            self._stand_total = 0.0
+            self._stand_all = 0.0
+            self._stand_tick_at = 0.0
+        horizon = now - self.APPROACH_PURSUIT_WINDOW_SECONDS
+        for target_id in list(self._pursuit_samples):
+            samples = self._pursuit_samples[target_id]
+            while samples and samples[0][0] < horizon:
+                samples.popleft()
+            if not samples:
+                del self._pursuit_samples[target_id]
+        self._pursuer_ids = {
+            target_id: at for target_id, at in self._pursuer_ids.items()
+            if at >= horizon}
+        # A train member seen within MAX_AGGRO_RANGE is refreshed; one seen
+        # beyond it leaves; one out of view stays for
+        # TRAIN_MISSING_GRACE_SECONDS (a one-tick gap in the view must not
+        # break the train).
+        in_view = {threat[3].target_id: threat[0] for threat in threats}
+        for target_id in list(self._train_ids):
+            if target_id in in_view:
+                if in_view[target_id] <= MAX_AGGRO_RANGE:
+                    self._train_ids[target_id] = now
+                else:
+                    del self._train_ids[target_id]
+            elif now - self._train_ids[target_id] > (
+                    self.TRAIN_MISSING_GRACE_SECONDS):
+                del self._train_ids[target_id]
+        self._train_missing = sum(target_id not in in_view
+                                  for target_id in self._train_ids)
+        pursuers = []
+        for threat in threats:
+            distance, x, y, obj = threat
+            if not obj.target_id:
+                continue
+            world = (m.world_x + x - cx, m.world_y + y - cy)
+            samples = self._pursuit_samples.setdefault(
+                obj.target_id, deque(maxlen=self.APPROACH_PURSUIT_SAMPLES))
+            oldest = samples[0] if samples else None
+            samples.append((now, world[0], world[1]))
+            if obj.target_id not in self._pursuit_origins:
+                if len(self._pursuit_origins) >= self.PURSUIT_ORIGINS:
+                    # The oldest that is no pursuer, train or lead member.
+                    keep = (set(self._pursuer_ids) | set(self._train_ids) |
+                            (self._lead["ids"] if self._lead else set()))
+                    evict = next((target_id
+                                  for target_id in self._pursuit_origins
+                                  if target_id not in keep), None)
+                    if evict is not None:
+                        del self._pursuit_origins[evict]
+                if len(self._pursuit_origins) < self.PURSUIT_ORIGINS:
+                    self._pursuit_origins[obj.target_id] = (m.path, *world)
+            if distance > MAX_AGGRO_RANGE:
+                continue
+            closed = (oldest is not None and
+                      now - oldest[0] >= self.APPROACH_PURSUIT_MIN_SECONDS and
+                      max(abs(oldest[1] - m.world_x),
+                          abs(oldest[2] - m.world_y)) - distance >= 2)
+            if closed or (distance <= 1 and self._hit_by(client, obj)):
+                self._pursuer_ids[obj.target_id] = now
+            if (obj.target_id in self._pursuer_ids or
+                    obj.target_id in self._train_ids):
+                pursuers.append(threat)
+        return pursuers
+
+    def _edge_arrival(self, edge: MapEdge) -> tuple[int, int]:
+        """Where an edge of her route lands her on its destination map."""
+        if edge.kind != "tile":
+            return edge.destination_x, edge.destination_y
+        nodes = getattr(self.navigation.graph, "nodes", {})
+        source, target = nodes.get(edge.source), nodes.get(edge.destination)
+        x, y = edge.x, edge.y
+        if source is not None and target is not None:
+            x = (target.width - 1 if x < 0 else 0 if x >= source.width else x)
+            y = (target.height - 1 if y < 0 else 0 if y >= source.height
+                 else y)
+        return x, y
+
+    def _near_spot(self, client: AtrinikClient) -> bool:
+        """Whether she is on the last leg to the farm map (its next
+        transition enters it), or within about APPROACH_NEAR_TILES of it
+        along her route. A route cleared for a replan keeps the last
+        answer on this map."""
+        m = client.state.map
+        route = list(getattr(self.navigation, "route", None) or ())
+        if not route or route[0].source != m.path:
+            cached = self._near_cache
+            return bool(cached is not None and cached[0] == m.path and
+                        cached[1])
+        near = False
+        if route[-1].destination == self.navigation.destination:
+            near = len(route) == 1
+            tiles = max(abs(route[0].x - m.world_x),
+                        abs(route[0].y - m.world_y))
+            for previous, edge in zip(route, route[1:]):
+                arrival = self._edge_arrival(previous)
+                tiles += max(abs(edge.x - arrival[0]),
+                             abs(edge.y - arrival[1]))
+            near = near or tiles <= self.APPROACH_NEAR_TILES
+        self._near_cache = (m.path, near)
+        return near
+
+    def _approach_mode(self, client: AtrinikClient, pursuers,
+                       threats, seam_contact: bool = False) -> str:
+        """The approach discipline for this tick: "lead" (lead the train
+        away, _lead_away_step), "stand" (stop at a defensible square and
+        fight them there one at a time) or "" (walk on).
+
+        Only on a farm trip, off the farm map. A lead-away under way goes
+        on until done (_lead_done), then the walk plans its way back.
+        Otherwise near the farm map (_near_spot) with
+        APPROACH_STAND_PURSUERS or more pursuers she stands; with more
+        than APPROACH_PACK_CAP, or heals outpaced, she leads them away
+        while she has leads left (LEAD_AWAY_LIMIT a trip). A stand against
+        two lasts at most APPROACH_STAND_SECONDS (a pursuer reaching her
+        restarts it, and so does the train shrinking to two), then the
+        walk goes on for APPROACH_STAND_COOLDOWN_SECONDS; against three or
+        more it has no such limit, so she never walks onto the farm map
+        with them. Train members briefly out of view still count
+        (_track_pursuers' grace). One bound covers it all: the seconds
+        this walk has stood, against two or more, with no pursuer beside
+        her (_stand_total; at most APPROACH_STAND_TICK_CAP_SECONDS a tick)
+        reaching APPROACH_TRAIN_STAND_SECONDS, or all its stand seconds,
+        fighting included (_stand_all), reaching
+        APPROACH_STAND_HARD_SECONDS, fail the trip (approach-train-held),
+        whatever the train and however it shrank and regrew. Both are
+        reset only by a new walk or a map change.
+        Nothing runs under seam contact (_seam_retreat_contact).
+        """
+        m = client.state.map
+        now = time.monotonic()
+        recorder = getattr(client, "record_action", None)
+        # Only a stand tick counts the time since the last stand tick.
+        last_stand_tick, self._stand_tick_at = self._stand_tick_at, 0.0
+        if (not isinstance(self.task, FarmTask) or seam_contact or
+                self.train_held or m.path == self.navigation.destination):
+            # Under contact after the farm's own seam retreat the fight
+            # there decides (_seam_retreat_contact), not the approach.
+            self._lead = None
+            self._stand_since = 0.0
+            self._train_ids.clear()
+            self._was_train = False
+            return ""
+        if self._lead is not None:
+            if not self._lead_done(client, pursuers, threats, now):
+                return "lead"
+            if recorder is not None:
+                recorder("approach-lead-done",
+                         f"steps={self._lead['steps']} "
+                         f"pursuers={len(pursuers)}")
+            self._lead = None
+            # Re-approach: the walk plans its route again from here.
+            self.navigation.route = []
+            self.navigation._issued_goal = None
+            self.navigation._issued_click = None
+            self.navigation._last_progress = now
+        # Three or more she never takes onto the farm map: their stand has
+        # no time limit and no cooldown. A train member briefly out of view
+        # still counts (_train_missing).
+        count = len(pursuers) + self._train_missing
+        train = count > self.APPROACH_PACK_CAP
+        if self._was_train and not train and self._stand_since:
+            # The train shrank to two: their stand starts its own limit
+            # now, not in the tick the train shrank.
+            self._stand_since = now
+        self._was_train = train and bool(self._stand_since)
+        if (count < self.APPROACH_STAND_PURSUERS or
+                (now < self._stand_cooldown_until and not train) or
+                not self._near_spot(client)):
+            self._stand_since = 0.0
+            self._train_ids.clear()
+            self._was_train = False
+            return ""
+        if ((train or healing_outpaced(client)) and
+                self._leads < self.LEAD_AWAY_LIMIT):
+            self._leads += 1
+            self._stand_since = 0.0
+            self._train_ids.clear()
+            self._was_train = False
+            self._lead = {"since": now, "steps": 0, "stuck": False,
+                          "ids": {threat[3].target_id for threat in pursuers},
+                          "at": (m.path, m.world_x, m.world_y)}
+            if recorder is not None:
+                recorder("approach-lead-away",
+                         f"pursuers={len(pursuers)} lead={self._leads}")
+            return "lead"
+        if not self._stand_since or any(
+                threat[0] <= 1 for threat in pursuers):
+            # A pursuer reaching her keeps the stand fresh.
+            if not self._stand_since and recorder is not None:
+                recorder("approach-stand", f"pursuers={count}")
+            self._stand_since = now
+        elif (now - self._stand_since >= self.APPROACH_STAND_SECONDS and
+              not train):
+            self._stand_since = 0.0
+            self._train_ids.clear()
+            self._was_train = False
+            self._stand_cooldown_until = (
+                now + self.APPROACH_STAND_COOLDOWN_SECONDS)
+            return ""
+        if train:
+            # The train's members stay pursuers while in view within
+            # MAX_AGGRO_RANGE, as the server keeps her as their enemy
+            # (_track_pursuers): holding off at range lapses nothing.
+            self._train_ids.update(
+                (threat[3].target_id, now) for threat in pursuers)
+            self._was_train = True
+        step = (min(now - last_stand_tick,
+                    self.APPROACH_STAND_TICK_CAP_SECONDS)
+                if last_stand_tick else 0.0)
+        self._stand_all += step
+        if not any(threat[0] <= 1 for threat in pursuers):
+            # A pursuer beside her: she is fighting them as they come, and
+            # that interval alone is not counted.
+            self._stand_total += step
+        self._stand_tick_at = now
+        if (self._stand_total >= self.APPROACH_TRAIN_STAND_SECONDS or
+                self._stand_all >= self.APPROACH_STAND_HARD_SECONDS):
+            self._stand_since = 0.0
+            self._stand_tick_at = 0.0
+            self._train_ids.clear()
+            self._was_train = False
+            self.train_held = True
+            if recorder is not None:
+                recorder("approach-train-held", f"pursuers={count}")
+            self.fail(f"{count} followers held the approach to "
+                      f"{self.navigation.destination} for "
+                      f"{self._stand_all:.0f}s")
+            return ""
+        return "stand"
+
+    def _lead_done(self, client: AtrinikClient, pursuers, threats,
+                   now: float) -> bool:
+        """Whether the lead-away under way is over: none of the train (its
+        pursuers, then and since) in view within MAX_AGGRO_RANGE (the
+        server drops a chase beyond it; her view reaches about 8 tiles),
+        no way to gain on them after LEAD_STUCK_FAILS tries (no more
+        lead-aways this trip then), or LEAD_AWAY_CAP_SECONDS gone."""
+        lead = self._lead
+        lead["ids"].update(threat[3].target_id for threat in pursuers)
+        m = client.state.map
+        here = (m.path, m.world_x, m.world_y)
+        if here != lead["at"]:
+            lead["at"] = here
+            lead["steps"] += 1
+        if lead["stuck"]:
+            self._leads = self.LEAD_AWAY_LIMIT
+            return True
+        following = any(threat[0] <= MAX_AGGRO_RANGE and
+                        threat[3].target_id in lead["ids"]
+                        for threat in threats)
+        return (now - lead["since"] >= self.LEAD_AWAY_CAP_SECONDS or
+                not following)
+
+    def _spawn_hazards(self, node) -> list[tuple[int, int, int]]:
+        """Each aggressive spawn of ``node`` as (x, y, radius): its
+        detection radius, at least SPAWN_COST_RADIUS, plus the margin
+        (NavigateTask._spawn_costs' squares)."""
+        return [
+            (spawn.x, spawn.y,
+             max(NavigateTask.SPAWN_COST_RADIUS, int(spawn.aggro_radius)) +
+             NavigateTask.SPAWN_COST_MARGIN)
+            for spawn in (getattr(self.navigation.graph, "named_spawns", {})
+                          or {}).get(node.path, ())
+            if not spawn.peaceful]
+
+    # A lead-away step that finds no square gaining on the train tries
+    # again after LEAD_RETRY_SECONDS (she stands meanwhile); this many
+    # misses in a row end the lead as stuck. Each square of a spawn's
+    # margin ring (and of its radius, for the train's own spawns) costs
+    # LEAD_SPAWN_COST more instead of walling the walk.
+    LEAD_RETRY_SECONDS = 1.0
+    LEAD_STUCK_FAILS = 5
+    LEAD_SPAWN_COST = 6
+
+    def _lead_spawns(self, node, m) -> tuple[list, list]:
+        """The spawns a lead-away walk keeps out of (hard: within the
+        detection radius of a spawn none of the train came from) and pays
+        to cross (soft: every spawn's radius plus margin). A spawn is the
+        train's when one of its members was first seen within that
+        radius."""
+        lead = self._lead
+        origins = [
+            (x, y) for target_id, (path, x, y) in self._pursuit_origins.items()
+            if target_id in lead["ids"] and path == m.path]
+        hard, soft = [], []
+        for x, y, radius in self._spawn_hazards(node):
+            soft.append((x, y, radius, self.LEAD_SPAWN_COST))
+            if any(max(abs(x - ox), abs(y - oy)) <= radius
+                   for ox, oy in origins):
+                continue
+            hard.append((x, y, radius - NavigateTask.SPAWN_COST_MARGIN))
+        return hard, soft
+
+    async def _lead_away_step(self, client: AtrinikClient, threats) -> bool:
+        """One step of the lead-away, combat off, on this map
+        (safe_square_route, one search a call at most, paying for passing
+        beside a threat): to the square in reach farthest from the threats,
+        the nearest of those beyond MAX_AGGRO_RANGE, a square of her
+        cleared trail or her walk first among those. It keeps out of the
+        detection radius of every spawn none of the train came from, and
+        pays to cross any spawn's margin (_lead_spawns). False when no
+        square gains on where she stands: she stands this tick, and tries
+        again after LEAD_RETRY_SECONDS; LEAD_STUCK_FAILS misses in a row
+        mark the lead stuck."""
+        lead = self._lead
+        m = client.state.map
+        now = time.monotonic()
+        self._defending = True
+        self.navigation._issued_goal = None
+        self.navigation._issued_click = None
+        self.navigation._last_progress = now
+        if (now - self._last_defense_action < 0.30 or
+                self._retreat_step_pending(client, now)):
+            return True
+        if now < lead.get("retry_at", 0.0):
+            return False
+        node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
+        if node is None or not node.terrain:
+            lead["stuck"] = True
+            return False
+        cx, cy = m.width // 2, m.height // 2
+        here = (m.world_x, m.world_y)
+        threat_world = [(m.world_x + x - cx, m.world_y + y - cy)
+                        for _, x, y, _ in threats]
+
+        def train_gap(point) -> int:
+            return min((max(abs(point[0] - x), abs(point[1] - y))
+                        for x, y in threat_world), default=99)
+
+        here_gap = train_gap(here)
+        trail = set()
+        if isinstance(self.task, FarmTask):
+            trail = {(x, y) for path, x, y in self.task._cleared_trail
+                     if path == m.path}
+        trail.update((x, y) for path, x, y in self._trail if path == m.path)
+        blocked = {(x, y) for path, x, y in self._retreat_blocked
+                   if path == m.path}
+        hard, soft = self._lead_spawns(node, m)
+        clear = MAX_AGGRO_RANGE + 1
+        route = safe_square_route(
+            node, here, (), threats=threat_world, hazards=hard,
+            soft=soft, blocked=blocked,
+            allow_locked=self.navigation._allow_locked(client),
+            best=lambda point: (min(train_gap(point), clear),
+                                int(point in trail)),
+            stop_at=(clear, 1))
+        if (route is None or len(route) < 2 or
+                train_gap(route[-1]) <= here_gap):
+            route = None
+        dx = dy = 0
+        if route is not None:
+            dx, dy = route[1][0] - here[0], route[1][1] - here[1]
+        direction = next((value for value, delta in c.DIRECTION_DELTAS.items()
+                          if value and delta == (dx, dy)), 0)
+        if not direction:
+            lead["fails"] = lead.get("fails", 0) + 1
+            lead["retry_at"] = now + self.LEAD_RETRY_SECONDS
+            if lead["fails"] >= self.LEAD_STUCK_FAILS:
+                lead["stuck"] = True
+            return False
+        lead["fails"] = 0
+        await client.clear_actions()
+        if getattr(client.state, "combat", False):
+            await client.set_combat(False)
+        await client.move(direction)
+        self._send_retreat_step(client, *route[1], now)
+        self._last_defense_action = now
+        return True
+
+    def _defensible(self, client: AtrinikClient, node,
+                    point: tuple[int, int]) -> bool:
+        """Whether she can hold world square ``point``: a corridor or a
+        doorway (terrain.features, the fight records' terrain) that a
+        walking monster can reach from at most DEFENSIBLE_REACH of her 8
+        neighbours, so the approach really narrows to one or two (a gap
+        in a one-thick wall, open on its diagonals, does not), or a safe
+        square remembered this trip (FarmTask.note_safe_square)."""
+        path = client.state.map.path
+        if (isinstance(self.task, FarmTask) and
+                (path, *point) in self.task._safe_squares):
+            return True
+        key = (path, *point)
+        narrow = self._feature_cache.get(key)
+        if narrow is None:
+            found = terrain_features(node, *point)
+            narrow = bool(found.feature in ("corridor", "doorway") and
+                          found.reach is not None and
+                          found.reach <= self.DEFENSIBLE_REACH)
+            if len(self._feature_cache) > 4096:
+                self._feature_cache.clear()
+            self._feature_cache[key] = narrow
+        return narrow
+
+    async def _hold_defensible(self, client: AtrinikClient, threats) -> bool:
+        """Hold for the approach stand: where she is when she can hold it
+        (_defensible), else a step towards the nearest such square within
+        DEFENSIBLE_RADIUS that keeps 2 tiles from every threat, else where
+        she is. The walk waits meanwhile; the defence fights each pursuer
+        as it reaches her."""
+        m = client.state.map
+        now = time.monotonic()
+        self._defending = True
+        self.navigation._issued_goal = None
+        self.navigation._issued_click = None
+        self.navigation._last_progress = now
+        if (now - self._last_defense_action < 0.30 or
+                self._retreat_step_pending(client, now)):
+            return True
+        node = getattr(self.navigation.graph, "nodes", {}).get(m.path)
+        here = (m.world_x, m.world_y)
+        if node is None or not node.terrain or self._defensible(
+                client, node, here):
+            return True
+        cx, cy = m.width // 2, m.height // 2
+        threat_world = [(m.world_x + x - cx, m.world_y + y - cy)
+                        for _, x, y, _ in threats]
+        radius = self.DEFENSIBLE_RADIUS
+        goals = [
+            (x, y)
+            for x in range(here[0] - radius, here[0] + radius + 1)
+            for y in range(here[1] - radius, here[1] + radius + 1)
+            if node.walkable(x, y) and self._defensible(client, node, (x, y))]
+        route = safe_square_route(
+            node, here, goals, threats=threat_world,
+            blocked={(x, y) for path, x, y in self._retreat_blocked
+                     if path == m.path},
+            allow_locked=self.navigation._allow_locked(client),
+            max_nodes=self.DEFENSIBLE_ROUTE_NODES, radius=radius)
+        if route is None or len(route) < 2:
+            return True
+        dx, dy = route[1][0] - here[0], route[1][1] - here[1]
+        direction = next((value for value, delta in c.DIRECTION_DELTAS.items()
+                          if value and delta == (dx, dy)), 0)
+        if not direction:
+            return True
+        await client.clear_actions()
+        if getattr(client.state, "combat", False):
+            await client.set_combat(False)
+        await client.move(direction)
+        self._send_retreat_step(client, *route[1], now)
+        self._last_defense_action = now
+        return True
+
     async def _defend_while_navigating(self, client: AtrinikClient,
                                        *, own_walk: bool = False) -> bool:
         """Pause an encounter approach to heal or clear an aggroed pack.
@@ -5960,6 +6589,21 @@ class NavigateThenTask(BotTask):
         # before, so she never closes in on it.
         seam_beside = seam_contact and any(
             threat[0] <= 1 for threat in nearby)
+        # Approach discipline (COMBAT.md): near the farm map with a train
+        # behind her she stands at a defensible square and fights them as
+        # they come (no hold-fire), or leads a bigger one away first.
+        # Caught during a lead-away, the stand's rules fight it out.
+        pursuers = self._track_pursuers(client, [
+            threat for threat in threats
+            if threat[3].target_id not in outclassed])
+        approach = self._approach_mode(client, pursuers, threats,
+                                       seam_contact)
+        if approach == "lead" and any(threat[0] <= 1 for threat in nearby):
+            approach = "stand"
+        approach_stand = (approach == "stand" and
+                          not self.navigation.care_holds_fire(m.path))
+        if approach_stand:
+            hold_fire = False
         combat_released = False
         if hold_fire:
             engaged = (self.task._engaged_target
@@ -6040,6 +6684,16 @@ class NavigateThenTask(BotTask):
             if getattr(client.state, "combat", False):
                 await client.set_combat(False)
             return True
+        if approach == "lead":
+            if safety_action_issued:
+                # A heal just sent: a step now would cancel it.
+                return True
+            if await self._lead_away_step(client, threats):
+                return True
+            # Nowhere to lead them: she stands instead.
+            approach = "stand"
+            approach_stand = not self.navigation.care_holds_fire(m.path)
+            hold_fire = hold_fire and not approach_stand
         player_level = int(client.state.stats.get("level", 0) or 0)
         resolver = getattr(self.navigation.graph, "monster_level", None)
         dangerous = []
@@ -6124,7 +6778,8 @@ class NavigateThenTask(BotTask):
         if (safe and nearest is not None and nearest[0] > 2 and
                 len(pull_pack) >= 2 and
                 (pack_offensive is None or hold_fire) and
-                not self._cornered_target and not seam_beside):
+                not self._cornered_target and not seam_beside and
+                not approach_stand):
             # A cornered fight at range is not turned into a pack avoidance
             # (combat off, replan) between its own ticks.
             if await self._bypass_pack_blocked_exit(client):
@@ -6237,8 +6892,18 @@ class NavigateThenTask(BotTask):
                 nearest = min(beside, key=lambda threat: (
                     int(getattr(threat[3], "target_hp", 0) or 100),
                     threat[3].target_id))
+        # A stand holding a doorway, corridor or safe square fights there:
+        # the split's retreat step would give the square up. Not with more
+        # than APPROACH_PACK_CAP beside her, nor with heals losing: then
+        # the split and cornered rules decide as anywhere else.
+        holding = bool(
+            approach_stand and node is not None and node.terrain and
+            not healing_outpaced(client) and
+            sum(threat[0] <= 1 and threat[3].target_id not in outclassed
+                for threat in nearby) <= self.APPROACH_PACK_CAP and
+            self._defensible(client, node, (m.world_x, m.world_y)))
         split = (overwhelmed and not hold_fire and not safety_hold and
-                 not seam_beside)
+                 not seam_beside and not holding)
         cornered = None
         if split and not escape_due:
             cornered = await self._cornered_split(client, nearby)
@@ -6368,6 +7033,10 @@ class NavigateThenTask(BotTask):
             # Cornered in an escape: the closest attacker, not a committed
             # one farther off.
             nearest = min(nearby, key=lambda value: value[0])
+        if approach_stand and (nearest is None or nearest[0] > 1):
+            # The approach stand closes no gap: she holds her square (or
+            # takes it) and lets each pursuer come to her.
+            return await self._hold_defensible(client, threats)
         if (nearest is not None and nearest[0] <= 4 and
                 not (self._escaping and nearest[0] > 2)):
             self._defending = True
@@ -10079,7 +10748,9 @@ class FarmCircuitTask(BotTask):
     def _quarantine_farm_path(self, client: AtrinikClient, path: str,
                               reason: str, *, seconds: float | None = None) -> None:
         seconds = self.FARM_DEATH_QUARANTINE_SECONDS if seconds is None else seconds
-        until = time.time() + seconds
+        # A longer quarantine already in place is never shortened.
+        until = max(time.time() + seconds, float(
+            client.state.farm_zone_quarantine.get(path, 0.0) or 0.0))
         setter = getattr(client, "quarantine_farm_zone", None)
         if setter is not None:
             setter(path, until)
@@ -10598,6 +11269,59 @@ class FarmCircuitTask(BotTask):
         self._quarantine_farm_path(
             client, navigation.destination, f"unreachable: {navigation.error}")
         return self._upgrade_progression(client, farm)
+
+    # A spot whose approach a train of followers held (approach-train-held)
+    # is left this long, longer each time within a day (farm_train_holds):
+    # 30 minutes, then 2 hours, then 6.
+    APPROACH_TRAIN_QUARANTINE_SECONDS = (30 * 60, 2 * 60 * 60, 6 * 60 * 60)
+    TRAIN_HOLD_MEMORY_SECONDS = 24 * 60 * 60
+
+    async def _leave_train_held_spot(self, client: AtrinikClient,
+                                     farm: FarmTask) -> None:
+        """Followers held her approach to this leg's map: the walk stood
+        against two or more for APPROACH_TRAIN_STAND_SECONDS with none
+        beside her, or APPROACH_STAND_HARD_SECONDS in all, fighting
+        included (NavigateThenTask.train_held).
+
+        That map's area (_quarantine_farm_area, and the map itself) and the
+        map she stands on, where the train was, are quarantined for
+        APPROACH_TRAIN_QUARANTINE_SECONDS by how often this happened there
+        in the last day (farm_train_holds, kept in her memory); a longer
+        quarantine is kept. The analyzer, which skips a spot with any leg
+        quarantined, then chooses again (_upgrade_progression): another
+        spot, or, with every ranked spot quarantined, farm-spots-exhausted
+        and the circuit completes (autoplay holds until one is usable).
+        With no ranking to follow the circuit fails with the walk's reason
+        and autoplay chooses from the ranking."""
+        assert self.child is not None
+        await client.clear_actions()
+        await client.set_combat(False)
+        destination = self.child.navigation.destination
+        now = time.time()
+        holds = [at for at in (getattr(client.state, "farm_train_holds", {})
+                               or {}).get(destination, ())
+                 if isinstance(at, (int, float)) and math.isfinite(at) and
+                 0.0 <= now - at < self.TRAIN_HOLD_MEMORY_SECONDS]
+        seconds = self.APPROACH_TRAIN_QUARANTINE_SECONDS[
+            min(len(holds), len(self.APPROACH_TRAIN_QUARANTINE_SECONDS) - 1)]
+        note = getattr(client, "note_farm_train_hold", None)
+        if note is not None:
+            note(destination, now)
+        else:
+            client.state.farm_train_holds = {
+                **(getattr(client.state, "farm_train_holds", {}) or {}),
+                destination: [*holds, now]}
+        reason = f"approach held: {self.child.error}"
+        self._quarantine_farm_path(client, destination, reason,
+                                   seconds=seconds)
+        self._quarantine_farm_area(client, destination, reason,
+                                   seconds=seconds)
+        here = client.state.map.path
+        if here and here != destination:
+            self._quarantine_farm_path(client, here, reason, seconds=seconds)
+        if self._upgrade_progression(client, farm):
+            return
+        self.fail(self.child.error)
 
     def _reset_dwell_off_farm(self, map_path: str) -> bool:
         """Count dwell only while physically present on the farm map."""
@@ -14115,7 +14839,12 @@ class FarmCircuitTask(BotTask):
             # pack is still pursuing across a seam. Defend/retreat before route
             # planning so an exceptional disconnected start square cannot fail
             # the task and leave idle safety healing in place under attack.
-            if await self.child._defend_while_navigating(client):
+            defended = await self.child._defend_while_navigating(client)
+            if (self.child.train_held and isinstance(farm, FarmTask) and
+                    self.child.status == TaskStatus.FAILED):
+                await self._leave_train_held_spot(client, farm)
+                return
+            if defended:
                 return
             if self.child.navigation.status == TaskStatus.COMPLETE:
                 self.child.navigation.status = TaskStatus.RUNNING
@@ -14144,6 +14873,9 @@ class FarmCircuitTask(BotTask):
             self.child.navigation.complete()
         await self.child.tick(client)
         if self.child.status == TaskStatus.FAILED:
+            if self.child.train_held and isinstance(farm, FarmTask):
+                await self._leave_train_held_spot(client, farm)
+                return
             self.fail(self.child.error)
             return
         if self.child.navigation.status != TaskStatus.COMPLETE:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import heapq
 import logging
 import random
 import re
@@ -65,6 +66,121 @@ def retreat_mobility(node, point: tuple[int, int], *, blocked=(),
             seen.add(nxt)
             queue.append((nxt, distance + 1))
     return furthest, len(seen) - 1
+
+
+# A monster keeps chasing her until she is this many tiles away (server
+# MAX_AGGRO_RANGE, include/global.h) for more than MAX_AGGRO_TIME (12) of
+# its own moves (types/monster.c can_detect_enemy).
+MAX_AGGRO_RANGE = 9
+# The safe-square route (safe_square_route) settles at most this many
+# squares, within this many tiles of her: on a 24x24 world map that is the
+# whole map, and it bounds the work on the event loop elsewhere.
+SAFE_ROUTE_NODES = 1200
+SAFE_ROUTE_RADIUS = 24
+# What a route square beside an attacker costs on top of the step: she
+# takes its hits while she passes.
+SAFE_ROUTE_BESIDE_COST = 4
+
+
+def safe_square_route(node, start: tuple[int, int], goals, *,
+                      threats=(), hazards=(), blocked=(),
+                      allow_locked=False,
+                      max_nodes: int = SAFE_ROUTE_NODES,
+                      radius: int = SAFE_ROUTE_RADIUS,
+                      best: Callable[[tuple[int, int]], Any] | None = None,
+                      soft=(), stop_at: Any = None,
+                      ) -> list[tuple[int, int]] | None:
+    """The cheapest walk from ``start`` to the nearest of ``goals`` on
+    ``node`` (world squares), or None. With ``best`` instead, the walk to
+    the square it scores highest of all the search settles (``goals``
+    then only limits which squares may end it; empty for any), the
+    cheaper of equal ones; the search ends at the first square scoring
+    ``stop_at`` or more, when given. ``soft`` (world x, y, radius, cost) adds
+    ``cost`` to each square within the radius instead of walling it.
+
+    Steps are 8-way over authored walkable squares, static occupants,
+    ``blocked`` squares and the threats' own squares excluded. A square
+    within a hazard's radius (``hazards``: world x, y, radius) is never
+    entered (unless she stands in it already), and one beside a threat
+    costs SAFE_ROUTE_BESIDE_COST more.
+    A goal within 2 tiles of a threat is not safe now and is no goal. The
+    search settles at most ``max_nodes`` squares within ``radius`` tiles
+    of ``start``; the path starts with ``start``.
+    """
+    if node is None or not getattr(node, "terrain", None):
+        return None
+    start = tuple(start)
+    threats = [tuple(point) for point in threats]
+    requested = [tuple(goal) for goal in goals]
+    goal_set = {
+        goal for goal in requested
+        if goal != start and not any(
+            max(abs(goal[0] - x), abs(goal[1] - y)) <= 2
+            for x, y in threats)}
+    if not goal_set and (requested or best is None):
+        return None
+    excluded = set(blocked) | set(getattr(node, "occupied", ())) | set(threats)
+    excluded.discard(start)
+    # The squares within a hazard's radius, and those beside a threat,
+    # within reach of the search; a hazard she already stands in is hers
+    # to leave, not a wall.
+    hazardous = set()
+    for x, y, r in hazards:
+        if (max(abs(start[0] - x), abs(start[1] - y)) <= r or
+                max(abs(start[0] - x), abs(start[1] - y)) > radius + r):
+            continue
+        hazardous.update((hx, hy) for hx in range(x - r, x + r + 1)
+                         for hy in range(y - r, y + r + 1))
+    beside = {(x + dx, y + dy) for x, y in threats
+              for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+    extra: dict[tuple[int, int], int] = {}
+    for x, y, r, weight in soft:
+        if max(abs(start[0] - x), abs(start[1] - y)) > radius + r:
+            continue
+        for hx in range(x - r, x + r + 1):
+            for hy in range(y - r, y + r + 1):
+                extra[(hx, hy)] = max(extra.get((hx, hy), 0), int(weight))
+
+    def walk(end):
+        path = [end]
+        while path[-1] != start:
+            path.append(parents[path[-1]])
+        return path[::-1]
+
+    costs = {start: 0}
+    parents: dict[tuple[int, int], tuple[int, int]] = {}
+    frontier = [(0, start)]
+    settled = 0
+    chosen = None
+    while frontier and settled < max_nodes:
+        cost, current = heapq.heappop(frontier)
+        if cost > costs[current]:
+            continue
+        settled += 1
+        if best is not None:
+            if current != start and (not goal_set or current in goal_set):
+                score = best(current)
+                if chosen is None or score > chosen[0]:
+                    chosen = (score, current)
+                if stop_at is not None and score >= stop_at:
+                    return walk(current)
+        elif current in goal_set:
+            return walk(current)
+        for dx, dy in c.DIRECTION_DELTAS.values():
+            if not dx and not dy:
+                continue
+            nxt = current[0] + dx, current[1] + dy
+            if (max(abs(nxt[0] - start[0]), abs(nxt[1] - start[1])) > radius
+                    or nxt in excluded or nxt in hazardous or
+                    not node.walkable(*nxt, allow_locked=allow_locked)):
+                continue
+            step = (cost + 1 + extra.get(nxt, 0) +
+                    (SAFE_ROUTE_BESIDE_COST if nxt in beside else 0))
+            if step < costs.get(nxt, step + 1):
+                costs[nxt] = step
+                parents[nxt] = current
+                heapq.heappush(frontier, (step, nxt))
+    return walk(chosen[1]) if chosen is not None else None
 
 
 @dataclass(slots=True, frozen=True)
@@ -2484,6 +2600,19 @@ class FarmTask(BotTask):
         # Squares she stood on without hostile contact (path, x, y) ->
         # monotonic time: the cleared trail a retreat backs out along.
         self._cleared_trail: dict[tuple[str, int, int], float] = {}
+        # This trip's safe squares (path, x, y) -> when last confirmed:
+        # squares she held for SAFE_HOLD_SECONDS with no hostile within its
+        # detection radius (note_safe_square). The square being held and
+        # since when; the first farm-map square she stood on (the way in);
+        # and the farm map's edge squares onto maps with no aggressive
+        # spawn (safe_seam_squares, cached by map).
+        self._safe_squares: dict[tuple[str, int, int], float] = {}
+        self._safe_hold: tuple[tuple[str, int, int], float] | None = None
+        self.way_in: tuple[str, int, int] | None = None
+        self._safe_seam_cache: tuple[str, frozenset] | None = None
+        # The last safe-square route a retreat took: (goal kind, goal,
+        # steps), for its retreat-choice record.
+        self._safe_route_note: tuple[str, tuple[int, int], int] | None = None
         self._priority_target_ids: dict[int, int] = {}
         # Set by the farm circuit while autoplay's switch to its recovery
         # phase waits for this fight: finish the engaged target and fight
@@ -5859,10 +5988,16 @@ class FarmTask(BotTask):
         (low_health_retreat): those squares woke nothing when she crossed
         them.
         """
-        if self.under_hostile_contact(client):
-            return
         m = client.state.map
+        node = self.map_node
+        if (self.way_in is None and node is not None and
+                node.path == m.path):
+            self.way_in = (m.path, m.world_x, m.world_y)
+        if self.under_hostile_contact(client):
+            self._safe_hold = None
+            return
         now = time.monotonic()
+        self.note_safe_square(client, now)
         self._cleared_trail[(m.path, m.world_x, m.world_y)] = now
         if len(self._cleared_trail) > self.TRAIL_SQUARES:
             kept = sorted(self._cleared_trail.items(),
@@ -5873,6 +6008,147 @@ class FarmTask(BotTask):
             self._cleared_trail = {
                 key: seen for key, seen in self._cleared_trail.items()
                 if seen >= now - self.TRAIL_SECONDS}
+
+    # A square held this long with no hostile within its detection radius
+    # is a safe square (note_safe_square); a trip keeps at most this many,
+    # the most recently confirmed.
+    SAFE_HOLD_SECONDS = 10.0
+    SAFE_SQUARES = 64
+
+    def note_safe_square(self, client: AtrinikClient, now: float) -> None:
+        """Remember her square as safe once she has held it for
+        SAFE_HOLD_SECONDS with nothing on her (note_trail's caller checks
+        that) and no hostile in view within its detection radius: a rest
+        between pulls, a wait for the next spawn, a quiet stretch of her
+        walk in. The retreat routes back to one (safe_retreat_choice)."""
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        if any(max(abs(x - cx), abs(y - cy)) <=
+               self.detection_radius(client, obj)
+               for x, y, obj in m.targets(friendly=False)
+               if not self.authored_peaceful(client, obj) and
+               not self.ignore_unrequested_peaceful(client, obj)):
+            self._safe_hold = None
+            return
+        key = (m.path, m.world_x, m.world_y)
+        if self._safe_hold is None or self._safe_hold[0] != key:
+            self._safe_hold = (key, now)
+            return
+        if now - self._safe_hold[1] < self.SAFE_HOLD_SECONDS:
+            return
+        self._safe_squares[key] = now
+        if len(self._safe_squares) > self.SAFE_SQUARES:
+            kept = sorted(self._safe_squares.items(),
+                          key=lambda item: item[1])[-self.SAFE_SQUARES:]
+            self._safe_squares = dict(kept)
+
+    def safe_seam_squares(self, client: AtrinikClient) -> frozenset:
+        """The farm map's edge squares (walkable, unoccupied) on each side
+        tiled to a map with no aggressive spawn: a way off the farm that
+        leads nowhere hostile, unlike the seam onto world_17_74 at 16:15.
+        Corners count only through their sides."""
+        node = self.map_node
+        graph = getattr(client, "world_graph", None)
+        if node is None or graph is None or not node.terrain:
+            return frozenset()
+        if (self._safe_seam_cache is not None and
+                self._safe_seam_cache[0] == node.path):
+            return self._safe_seam_cache[1]
+        spawns = getattr(graph, "named_spawns", {}) or {}
+        squares = set()
+        for (side_x, side_y), other in self.seam_neighbours(client).items():
+            if side_x and side_y:
+                continue
+            if any(not spawn.peaceful
+                   for spawn in spawns.get(other.path, ())):
+                continue
+            if side_x:
+                x = 0 if side_x < 0 else node.width - 1
+                edge = ((x, y) for y in range(node.height))
+            else:
+                y = 0 if side_y < 0 else node.height - 1
+                edge = ((x, y) for x in range(node.width))
+            squares.update(point for point in edge
+                           if node.walkable(*point) and
+                           point not in node.occupied)
+        found = frozenset(squares)
+        self._safe_seam_cache = (node.path, found)
+        return found
+
+    def safe_retreat_choice(self, client: AtrinikClient, threats, hazards,
+                            *, gain_only: bool = False):
+        """The first step of the walk back to a safe square, as a
+        low_health_retreat choice, or None.
+
+        Used when no step gains distance (a corner, a map edge) or the
+        best one crosses a seam. The goal is the nearest remembered safe
+        square of this map (note_safe_square); only with none reachable
+        the way in or an edge square onto a map with no aggressive spawn
+        (safe_seam_squares), never a seam into the unknown. The walk
+        (safe_square_route) keeps out of every hazard radius she is not
+        already in (retreat_hazards) and pays for each square beside a
+        threat. ``gain_only`` takes it only when the step itself gains
+        distance from the nearest threat. Sets _safe_route_note for the
+        decision record.
+        """
+        self._safe_route_note = None
+        node = self._current_map_node(client)
+        if node is None or not threats:
+            return None
+        m = client.state.map
+        cx, cy = m.width // 2, m.height // 2
+        start = (m.world_x, m.world_y)
+        threat_world = [(m.world_x + x - cx, m.world_y + y - cy)
+                        for x, y in threats]
+        hazard_world = [(m.world_x + x - cx, m.world_y + y - cy, radius)
+                        for x, y, radius in hazards]
+        blocked = {(x, y) for path, x, y in self._retreat_blocked
+                   if path == m.path}
+        remembered = [(x, y) for path, x, y in self._safe_squares
+                      if path == m.path]
+        exits = set(self.safe_seam_squares(client))
+        if self.way_in is not None and self.way_in[0] == m.path:
+            exits.add(self.way_in[1:])
+        if start in exits or start in remembered:
+            # Already there: the ordinary ranking (a seam step onto a safe
+            # side included) or the breakout decides, not a shuffle to the
+            # next such square.
+            return None
+        # One search a call: the remembered squares outrank the exits,
+        # the nearer of each first.
+        remembered_set = set(remembered)
+        if not remembered_set and not exits:
+            return None
+        route = safe_square_route(
+            node, start, remembered_set | exits, threats=threat_world,
+            hazards=hazard_world, blocked=blocked,
+            best=lambda point: int(point in remembered_set), stop_at=1)
+        if route is None or len(route) < 2:
+            return None
+        kind = "safe" if route[-1] in remembered_set else "exit"
+        world_x, world_y = route[1]
+        dx, dy = world_x - start[0], world_y - start[1]
+        direction = next((value for value, delta in
+                          c.DIRECTION_DELTAS.items()
+                          if value and delta == (dx, dy)), 0)
+        tile = m.tiles.get((cx + dx, cy + dy))
+        if not direction or (tile is not None and any(
+                obj.target_id for obj in tile.objects.values())):
+            return None
+        separation = min(max(abs(cx + dx - x), abs(cy + dy - y))
+                         for x, y in threats)
+        nearest = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
+        if separation < nearest or (gain_only and separation <= nearest):
+            # Never closer to the nearest threat than she is.
+            return None
+        escape_depth, escape_area = retreat_mobility(
+            node, (world_x, world_y),
+            blocked=blocked | {start, *threat_world})
+        self._safe_route_note = (kind, route[-1], len(route) - 1)
+        on_trail = int((m.path, world_x, world_y) in self._cleared_trail)
+        return (1, int(separation >= 2), 0, min(separation, 2), on_trail,
+                separation, escape_depth, escape_area, 0, 0.0, direction,
+                world_x, world_y)
 
     def retreat_hazards(self, client: AtrinikClient,
                         fight_ids: set[int]) -> list[tuple[int, int, int]]:
@@ -6177,6 +6453,26 @@ class FarmTask(BotTask):
                 if choice[0] and choice[5] > nearest and crowd(
                     (cx + choice[11] - m.world_x,
                      cy + choice[12] - m.world_y)) <= here_crowd)
+        # No step gains distance (a corner, a map edge), or the best one
+        # crosses a seam into a map she may know nothing about: walk back
+        # to a safe square instead, the nearest remembered one first
+        # (safe_retreat_choice). Live on world_16_74 her one-step retreats
+        # ended cornered at a map edge, and at 16:15 one took the seam.
+        nearest_now = min(max(abs(x - cx), abs(y - cy)) for x, y in threats)
+        best = max(choices) if choices else None
+        if best is None or not any(
+                choice[0] and choice[5] > nearest_now and
+                self.within_farm_map(client, cx + choice[11] - m.world_x,
+                                     cy + choice[12] - m.world_y)
+                for choice in choices) or not self.within_farm_map(
+                    client, cx + best[11] - m.world_x,
+                    cy + best[12] - m.world_y):
+            safe = self.safe_retreat_choice(
+                client, threats, hazards, gain_only=gain_only)
+            if safe is not None:
+                choices = [safe]
+        else:
+            self._safe_route_note = None
         if gain_only:
             # Only a step that sheds the nearest threat; an equal-distance
             # one shuffles her beside it with her heals still losing.
@@ -6359,7 +6655,10 @@ class FarmTask(BotTask):
                 f"escape_depth={escape_depth} escape_area={escape_area} "
                 f"continuation={viable}" +
                 (f" hazards={-unhazard}" if unhazard else "") +
-                (" trail=1" if on_trail else "") + (
+                (" trail=1" if on_trail else "") +
+                (f" {note[0]}={note[1][0]},{note[1][1]} steps={note[2]}"
+                 if (note := self._safe_route_note) is not None
+                 else "") + (
                     "" if self.within_farm_map(
                         client, cx + world_x - m.world_x,
                         cy + world_y - m.world_y) else " seam=1"))

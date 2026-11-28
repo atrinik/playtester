@@ -53,6 +53,7 @@ FIGHTING_ACTIONS = frozenset({
     "pull-wait-approach", "pull-anchor-step", "lure-to-ground",
     "farm-pack-split", "cornered-breakout", "pursued-stand",
     "emergency-disengage", "invisible-finish-hold",
+    "approach-stand", "approach-lead-away",
 })
 RESTING_ACTIONS = frozenset({"training-rest", "navigation-recovery-hold"})
 TRAVELLING_ACTIONS = frozenset({

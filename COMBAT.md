@@ -2391,6 +2391,134 @@ now along safer steps; the trail is per farm task and starts again on a
 new leg; transit hold-fire after anything other than the farm's own seam
 step is unchanged.
 
+## Safe squares and approach discipline (2026-11-26)
+
+On the Burnt Forest (2026-11-25) her retreats ended cornered at map edges
+or took a seam into a map whose walk held fire; on 2026-11-26 the owner saw
+her reach her spot with about 15 slow followers and get overwhelmed.
+Server facts (`include/global.h`, `types/monster.c`): a monster acquires
+her within its `item_power` (3 here, 3 more once engaged) and keeps her
+until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
+`MAX_AGGRO_TIME` (12) of its moves.
+
+- **Safe squares, per trip** (`FarmTask.note_safe_square`). A square she
+  holds for `SAFE_HOLD_SECONDS` (10 s) with nothing on her and no hostile
+  in view within its detection radius is safe: a rest between pulls, a
+  wait for a spawn, a quiet stretch of her walk in. A trip keeps at most
+  `SAFE_SQUARES` (64). Also known: the first farm-map square she stood on
+  (`way_in`) and the farm map's edge squares on each side tiled to a map
+  with no aggressive spawn (`safe_seam_squares`).
+- **A longer retreat** (`safe_retreat_choice`). When the farm's retreat
+  (`low_health_retreat`, which the pack split also uses) finds no step
+  that gains distance and continues, or its best step crosses a seam, it
+  takes the first step of the walk to the nearest remembered safe square
+  of this map; only with none in reach, to the way in or a safe seam
+  square. The walk (`safe_square_route`, a bounded Dijkstra over walkable
+  squares) never enters a hazard radius from `retreat_hazards` unless she
+  stands in it, never steps onto a threat, pays 4 extra for each square
+  beside one, and never ends within 2 tiles of one. Its step never brings
+  her nearer the nearest threat, and none is taken while she already
+  stands on a safe or exit square. `retreat-choice` adds `safe=x,y
+  steps=N` or `exit=x,y steps=N`. With a gaining step the #138 ranking
+  decides, unchanged; so do the pursued stand and the cornered breakout.
+- **Cost on the event loop.** Every safe-square search settles at most
+  1,200 squares within 24 tiles; a retreat or a lead-away step runs one
+  search, and no tick runs both (the retreat's runs only on the farm map,
+  the lead-away only off it). Measured worst cases on an open 100x100 map with 15 spawns and 5
+  threats: about 5 ms for the retreat, 6 to 8 ms for a lead-away step.
+- **Spawn-radius cost on the way in** (docs/ROUTING.md 1.6): on an
+  optional trip her walk skirts aggressive spawns on the farm map and the
+  maps tiled to it when a route about as short goes round.
+- **Pursuers** (`NavigateThenTask._track_pursuers`). Each creature in
+  view is sampled every defence tick for 12 s, on the map she is on (a
+  map change starts afresh). It qualifies when it is beside her and
+  hitting her, or when its own movement since its oldest sample at least
+  2 s old took it 2 or more tiles nearer where she stands now, so her own
+  walk towards a creature that stands or wanders makes none. It stays a
+  pursuer while in view within 9 tiles, for 12 s after it last
+  qualified. A member of a stand against three or more stays one
+  without that lapse while in view within 9 tiles, as the server keeps
+  her as its enemy within `MAX_AGGRO_RANGE`, so a train holding off at
+  range keeps her stand going; out of view it still counts for 3 s, so
+  a one-tick gap in the view does not break the train, and out of view
+  longer it leaves (her view reaches about 8 tiles, so leaving view is
+  how one leaves; one seen beyond 9 tiles in a larger view leaves at
+  once). A member that comes back is counted again as soon as it
+  qualifies. When the train shrinks to two, those two stay latched until
+  the stand resets, and their stand's 45 s limit starts when it shrank.
+  A map change (a seam, an exit, a recall) ends the stand, every latch
+  and the stand count below.
+  Outclassed creatures do not count. Because a map change starts the
+  samples afresh, a
+  creature that follows her over a seam qualifies again only after about
+  2 s of closing (or on contact); approach discipline does not run on
+  the farm map itself, so this gap only delays a stand on the map before
+  it.
+- **Before arrival** (`_approach_mode`), only on a farm trip and off the
+  farm map, on the last leg or within about 25 tiles of the farm map
+  along her route (`_near_spot`), and never under the seam contact after
+  the farm's own seam retreat:
+  - with 2 or more pursuers she **stands** (`approach-stand`): no transit
+    hold-fire (a care crossing still holds), the walk waits, and she holds
+    a defensible square, stepping to the nearest one within 6 tiles that
+    keeps 2 tiles from every threat. Defensible is a corridor or doorway
+    (the fight records' `terrain.features`) that a walking monster reaches
+    from at most 3 of her 8 neighbours (so a gap in a one-thick wall, open
+    on its diagonals, is not one), or a safe square. She closes no gap:
+    each pursuer is fought as it reaches her, with the walk's defence
+    (heals first). On a defensible square, with at most 2 beside her and
+    heals keeping up, the pack split's retreat step is skipped so two
+    closing in do not move her off it; otherwise the split and cornered
+    rules decide as anywhere. A stand against two lasts at most 45 s (a
+    pursuer reaching her restarts it), then the walk goes on for at least
+    30 s, so wanderers cannot hold her. Against three or more it has no
+    such limit. Two bounds cover every stand of the walk, against two or
+    more alike, whatever the train and however often it shrank and
+    regrew, reset only by a new walk or a map change: the seconds she has
+    stood with no pursuer beside her (`_stand_total`, at most 1 s a tick;
+    only the intervals with a pursuer beside her, fighting, are left out,
+    so contact that comes and goes does not stop the count) reaching
+    180 s, or all her stand seconds, fighting included (`_stand_all`),
+    reaching 600 s, so a fight against something she cannot hurt ends
+    too. Either fails the trip (`approach-train-held`, latched;
+    `approach-stand` and it log the same pursuer count). Two pursuers'
+    repeated stands can reach these bounds as well. The farm circuit, on its transit or
+    its farm branch, then quarantines that leg's map, its area and the
+    map she stood on (`farm-zone-quarantine`, never shortening a longer
+    one) for 30 minutes, 2 hours on the second such hold there within a
+    day and 6 hours from the third (`farm_train_holds`, in her memory;
+    non-finite and future times are never kept).
+    The analyzer, which skips a spot with any leg quarantined, then
+    chooses again; with every ranked spot quarantined it records
+    `farm-spots-exhausted` and the circuit completes, and autoplay holds
+    until a spot is usable. With no ranking to follow the circuit fails
+    and autoplay chooses from the ranking;
+  - with more than 2 (the pack cap), or heals outpaced, she **leads them
+    away** (`approach-lead-away`), combat off, on this map: to the square
+    in reach farthest from them, the nearest of those beyond 9 tiles, a
+    cleared-trail square first among those. The walk keeps out of the
+    detection radius of every spawn none of the train came from (a train
+    member first seen, this trip, within a spawn's radius makes it
+    theirs; up to 256 first sightings are kept a trip) and pays 6
+    a square to cross any spawn's radius plus margin, so a dense map does
+    not wall it in. It ends
+    (`approach-lead-done`) once none of the train is in view within 9
+    tiles, or after 90 s; then the walk plans its route again and
+    re-approaches. A step that finds nothing to gain tries again after
+    1 s (she stands meanwhile); 5 misses in a row end it as stuck, and
+    she has no more lead-aways that trip. At most 3 a trip; caught (one
+    beside her) she fights as in a stand.
+
+  So she never walks onto the farm map with three or more in tow, and
+  with two only after a 45 s stand. Other trips keep the transit
+  hold-fire, fighting back only when hit and not moving, as before.
+
+Accepted limits: a lead-away stays on the map she is on, so a small map
+can leave her standing; a safe square is per trip and per map; the walk's
+own pack split (`_cornered_split`) still fights when cornered and does not
+route to safe squares; pursuit is judged from what she sees, so one that
+follows out of view does not count.
+
 ## Approach danger: known limitations
 
 Since analyzer v3.10.0, autoplay prefers spots whose approach from her
