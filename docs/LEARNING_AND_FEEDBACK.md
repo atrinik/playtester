@@ -1,10 +1,10 @@
 # Learning from the world and playtester feedback
 
 Status: design proposal. Phases F1 (the observation ledger), F2 (fact
-parsers and tile facts), F3 (effective item stats), F5 (the draft
-feedback queue), F6 (owner approval and GitHub filing), F10 (fights by
+parsers and tile facts), F3 (effective item stats), F4 (scoring gear by
+effective stats), F5 (the draft feedback queue), F6 (owner approval and GitHub filing), F10 (fights by
 terrain) and W1 (watching the owner, recording only, behind a flag) are
-implemented; "F1 as built", "F2 as built", "F3 as built", "F5 as built",
+implemented; "F1 as built", "F2 as built", "F3 as built", "F4 as built", "F5 as built",
 "F6 as built", "F10 as built" and "W1 as built" in section 6 record where
 they differ from this text. Nothing else here is
 implemented, and nothing here changes behaviour until the phased pull
@@ -1890,6 +1890,76 @@ What was built:
 reviews a day of shadow logs.
 *Accept:* the shadow divergence list is attached to the PR; with the flag
 off, choices are unchanged.
+
+*F4 as built* (`equipment.GearScorer`; owner decision, 2026-11-26: one
+style-aware scorer, no flag). It decides in the farm's equip loop
+(`maintain_inventory`), shop upgrades (`BuyShopUpgradeTask._upgrade_score`,
+which now stores the stock's examine base as carried gear's) and the
+surplus sale (`_surplus_equipment`). Differences from the F4 text:
+
+- **No flag and no damage-taken weighting.** Weights stay on the shop
+  examine score's scale (AC 20, a protection percent 8, a special 50);
+  protections are not weighted by recent damage taken.
+- **Style profiles** from her build (`gear_style`): caster while Wizardry
+  trains, bow while an archery skill trains, melee otherwise. Melee damage
+  is damage per second: damage × `LEVEL_DAMAGE` (her weapon skill's level)
+  × (1 + `dam_bonus[Str]`/10) over the weapon delay, 10 points a damage per
+  second. A caster values Int, Pow, mana and regeneration through
+  `caster_value` and melee damage and WC at a quarter; anyone but an
+  archer values arrow WC and damage at a quarter. Arrow damage is taken
+  per second over the launcher's examine "(delay+N.Ns)" (1 second when not
+  known) plus a plain arrow's delay.
+- **Context terms**, valued against her worn set without what the item
+  would replace: Str, Dex and Con at the `living.c` tables (`dam_bonus`,
+  `wc_bonus` and `speed_bonus`, `hp_bonus` on her base hit points), plus 5
+  a point toward the next step; speed recomputed with the server formula
+  (`living.c:1051-1096`), so a `(speed+N)` item (now parsed) and the armour
+  speed cap count by her real gain, 600 points per 1.0 speed (owner
+  decision, 2026-11-26: +0.1 speed is worth +3 AC, 3 × 20 / 0.1) and half
+  as much again with no working recall (`working_recall` follows a change
+  only once it has held for 2 minutes); and, above half her weight limit,
+  the speed an item's weight would cost her (ramping in to the real
+  encumbrance at 65%). That weight is charged only where the decision
+  changes what she carries (`weight_for`): the shop charges the stock (a
+  purchase adds it), the surplus sale an unworn spare (selling sheds it),
+  and the equip loop nothing (a swap keeps both carried).
+- **A ring** is valued against her worn set without the ring it would
+  replace: itself when worn, the weakest worn ring when both slots are
+  full (ties to the lower tag, as the equip loop takes off), none when one
+  is free. The shop's baseline for a free ring slot is her best carried
+  spare ring, else 0.
+- **The shield** gives nothing, speed cap included, while a two-handed
+  weapon or launcher (the server's `CS_FLAG_WEAPON_2H`, `ITEM_WEAPON_2H`)
+  is wielded, as the server skips it (`living.c` "No bonuses from the
+  shield"); a two-handed candidate is charged the worn shield's worth
+  apart from speed, and credited the speed cap it lifts.
+- **Ordering:** the equip loop and the panel order a gear family on the
+  effective scale only when every carried item of it has examine data,
+  else on the fallback for the whole family (`GearScorer.order`), as
+  `compare` compares.
+- **The surplus sale** sells a spare only when it loses under every style
+  she can field: her current build's, melee, caster once she knows a
+  spell, bow once an archery skill is above level 1.
+- **Examine data only.** The effective scale needs examine data (or a
+  ring's, amulet's or trinket's description in its name); archetype values
+  are context only. When either side of a comparison lacks it, both fall
+  back to the name score, with the caster displacement margin; on the
+  effective scale that margin is the item's condition-scaled protections.
+- **Signed values and free slots.** A value may be negative (a low speed
+  cap can cost more than the armour gives), so two capped armours still
+  rank. A free slot (an empty one, or the second ring slot) takes any item
+  that is not a net loss, and always armour that is a net gain apart from
+  speed, so a speed cap never leaves a body slot empty.
+- **The shop reads only its stock's answer line** ("That is " and its
+  name, on the game channel), as GearExaminer does, and stores it even with
+  no stats. Arrows are paced by the launcher's "(delay+N.Ns)" (a real 0
+  when it shows 0.0) plus a plain arrow's 7 ticks (bow.c).
+- **Girdles** are an equipment type with the belt slot. Before, the equip
+  loop gave every girdle -1, so the forged meteoric steel belt (AC +1,
+  +3.2% to the four physical protections over her soft leather girdle)
+  stayed in her pack.
+- The shadow log and the Equipment tab now compare the old name score with
+  `GearScorer`'s choice.
 
 **F5. `feat(feedback)`: the draft queue.** `feedback_items`, fingerprints,
 the evidence builder and template, excerpt quoting, redaction, the

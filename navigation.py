@@ -44,7 +44,7 @@ from . import route_events
 from . import planner
 from . import route_shadow
 from . import unlocks
-from .equipment import abandon_gear_examine
+from .equipment import WEIGHT_UNWORN, abandon_gear_examine, gear_style
 from .observations import WHITE as WHITE_NAME, is_player, plain
 from .route_blocks import NO_WALLS, OwnerWalls
 from .route_costs import drain
@@ -75,7 +75,8 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     UnpreparedHold, empty_recall_wand,
                     usable_recharge_scroll, wand_known_empty,
                     area_caster_identities, tiled_neighbours)
-from .tasks import RECALL_REQUIRED_LEVEL, heal_consumables, reads_scrolls
+from .tasks import (RECALL_REQUIRED_LEVEL, CasterProfile, gear_scorer, heal_consumables,
+                    reads_scrolls)
 log = logging.getLogger(__name__)
 
 
@@ -6527,7 +6528,8 @@ class ShopUpgradeSweepTask(BotTask):
                  allow_launchers: bool = True,
                  allow_hostile_transit: bool = False,
                  start_index: int = 0,
-                 caster_stats: bool = False):
+                 caster_stats: bool = False,
+                 style: str = ""):
         super().__init__("shop-upgrade-sweep")
         self.graph = graph
         self.waypoints = [
@@ -6550,13 +6552,15 @@ class ShopUpgradeSweepTask(BotTask):
         self.allow_hostile_transit = bool(allow_hostile_transit)
         # Value stock as a Wizardry caster would (see InventoryPolicy).
         self.caster_stats = bool(caster_stats)
+        # GearScorer's profile for the stock (equipment.gear_style).
+        self.style = style
 
     def _new_child(self) -> NavigateThenTask:
         path, point = self.waypoints[self.index]
         child = NavigateThenTask(
             self.graph, path, BuyShopUpgradeTask(
                 allow_launchers=self.allow_launchers,
-                caster_stats=self.caster_stats),
+                caster_stats=self.caster_stats, style=self.style),
             destination_xy=point, combat_approach=True,
             # Regional stock is reached through one authored level-14/15
             # crocodile/frog road. At level 18+, permit the live defensive
@@ -10950,20 +10954,41 @@ class FarmCircuitTask(BotTask):
         ), tags=frozenset(tags), sell_identified_junk=True)
 
     @staticmethod
-    def _surplus_equipment(client: AtrinikClient) -> list[Item]:
-        """Return identified gear proven inferior to every occupied slot."""
+    def _fieldable_styles(client: AtrinikClient) -> list[str]:
+        """The gear styles she can field (equipment.GEAR_STYLES): melee
+        always, caster once she knows a spell, bow once an archery skill is
+        above level 1."""
+        inventory = getattr(client.state, "inventory", ())
+        styles = ["melee"]
+        if any(item.item_type == c.TYPE_SPELL for item in inventory):
+            styles.append("caster")
+        if any(item.item_type == c.TYPE_SKILL and "archery" in item.name.casefold() and
+               int(item.extra.get("level", 0) or 0) > 1 for item in inventory):
+            styles.append("bow")
+        return styles
+
+    def _surplus_equipment(self, client: AtrinikClient) -> list[Item]:
+        """Return identified gear proven inferior to every occupied slot
+        under every style she can field (_fieldable_styles), so a spare
+        caster or bow piece is kept while she fights melee."""
         policy = InventoryPolicy()
+        scorers = []
+        # Her current build's style always counts (a fresh archer's bow).
+        styles = dict.fromkeys([*self._fieldable_styles(client),
+                                gear_style(self.combat_skill, self._trains_wizardry(client))])
+        for style in styles:
+            styled = InventoryPolicy(
+                caster_stats=style == "caster", gear_style=style,
+                caster_profile=(CasterProfile.from_client(client)
+                                if style == "caster" else None))
+            # Selling sheds the spare's weight; what she wears stays.
+            scorers.append(gear_scorer(client, styled, weight_for=WEIGHT_UNWORN))
         level = int(client.state.stats.get("level", 0) or 0)
         equipped = {
             tag: client.state.items[tag]
             for tag in client.state.equipment.values()
             if tag in client.state.items
         }
-
-        def score(item: Item) -> int:
-            prototype = BuyShopUpgradeTask._prototype(client, item)
-            return (policy.gear_score(item) +
-                    (prototype.base_score if prototype is not None else 0))
 
         surplus = []
         for item in client.state.inventory:
@@ -10988,8 +11013,11 @@ class FarmCircuitTask(BotTask):
                 any(equipped_item.required_skill_tag and
                     equipped_item.required_skill_tag != item.required_skill_tag
                     for equipped_item in current))
+            # The equip loop's decider: what it would put on under no
+            # style she can field is surplus.
             if (different_weapon_school or
-                    score(item) <= min(score(value) for value in current) + 15):
+                    not any(scorer.beats(item, current, len(slots))[0]
+                            for scorer in scorers)):
                 surplus.append(item)
         return surplus
 
@@ -11786,7 +11814,8 @@ class FarmCircuitTask(BotTask):
                 not self._auto_combat_build and not bool(self.combat_spell)),
             allow_hostile_transit=level >= 18,
             start_index=cursor,
-            caster_stats=self._trains_wizardry(client))
+            caster_stats=self._trains_wizardry(client),
+            style=gear_style(self.combat_skill, self._trains_wizardry(client)))
 
     def _trains_wizardry(self, client: AtrinikClient) -> bool:
         """Whether her current build trains Wizardry, as FarmTask decides

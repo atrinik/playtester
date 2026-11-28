@@ -9,7 +9,7 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
@@ -26,7 +26,10 @@ from .targeting import select_target, target_set_aside
 from .client import (COIN_VALUES, MAGIC_CAST_TYPES, AtrinikClient,
                      format_money, map_object_visual_name,
                      update_bank_balance)
-from .equipment import gear_examine_pending, gear_examiner
+from .equipment import (MAGIC_HIDDEN_TYPES, WEIGHT_NONE, WEIGHT_UNOWNED, BaseStats,
+                        GearScorer, base_to_json,
+                        examine_answers, gear_examine_pending, gear_examiner,
+                        gear_style, parse_description)
 from . import route_shadow, terrain
 from . import owner_watch
 from .observations import is_player, plain
@@ -78,7 +81,7 @@ def equipment_face_catalog() -> dict[str, tuple[EquipmentPrototype, ...]]:
         c.TYPE_WEAPON, c.TYPE_BOW, c.TYPE_ARMOUR, c.TYPE_SHIELD,
         c.TYPE_HELMET, c.TYPE_PANTS, c.TYPE_AMULET, c.TYPE_RING,
         c.TYPE_LIGHT_APPLY, c.TYPE_CLOAK, c.TYPE_BOOTS,
-        c.TYPE_GLOVES, c.TYPE_BRACERS,
+        c.TYPE_GLOVES, c.TYPE_BRACERS, c.TYPE_GIRDLE,
     }
     skill_names = {
         13: "bow archery", 14: "crossbow archery",
@@ -530,13 +533,57 @@ def heals_losing(client: AtrinikClient, ceiling: float,
 
 def carried_gear_score(client: AtrinikClient, policy: "InventoryPolicy"
                        ) -> Callable[[Item], int]:
-    """The score the equip loop (maintain_inventory) ranks carried gear by:
-    the name-based gear_score plus its archetype's base score."""
+    """The name-based score: gear_score plus its archetype's base score.
+    GearScorer falls back to it for gear with no examine data."""
     def score(item: Item) -> int:
         prototype = BuyShopUpgradeTask._prototype(client, item)
         return policy.gear_score(item) + (prototype.base_score
                                           if prototype is not None else 0)
     return score
+
+
+# How long a change in whether her recall works must hold before gear
+# scoring follows it, so a wand's charge read or a retry window does not
+# flip her speed weight back and forth.
+GEAR_RECALL_HOLD_SECONDS = 120.0
+
+
+def working_recall(client: AtrinikClient,
+                   clock: Callable[[], float] = time.monotonic) -> bool:
+    """Whether a recall source of hers works, as gear scoring sees it:
+    navigation's has_working_recall, changed only once the new answer has
+    held for GEAR_RECALL_HOLD_SECONDS (kept on the client as
+    ``gear_recall``); True when it cannot be read."""
+    try:
+        from .navigation import has_working_recall
+        now_working = bool(has_working_recall(client))
+    except Exception:            # a scoring input must never stop her
+        now_working = True
+    now = clock()
+    held = getattr(client, "gear_recall", None)
+    if not isinstance(held, dict):
+        held = {"value": now_working, "pending": None, "since": now}
+        with contextlib.suppress(AttributeError):
+            client.gear_recall = held
+        return now_working
+    if now_working == held["value"]:
+        held["pending"] = None
+    elif held["pending"] != now_working:
+        held["pending"], held["since"] = now_working, now
+    elif now - held["since"] >= GEAR_RECALL_HOLD_SECONDS:
+        held["value"], held["pending"] = now_working, None
+    return held["value"]
+
+
+def gear_scorer(client: AtrinikClient, policy: "InventoryPolicy",
+                fallback: Callable[[Item], int] | None = None, *,
+                weight_for: str = WEIGHT_NONE) -> GearScorer:
+    """The one gear decider (equipment.GearScorer) for the equip loop, shop
+    upgrades and the surplus sale, styled by ``policy.gear_style``.
+    ``weight_for`` says which items' weight the decision changes."""
+    return GearScorer(client, policy,
+                      fallback or carried_gear_score(client, policy),
+                      recall=working_recall(client), weight_for=weight_for)
 
 
 def wand_charges(client: AtrinikClient) -> dict[int, int]:
@@ -1625,6 +1672,8 @@ class InventoryPolicy:
     # rather than generically, against her stats in caster_profile.
     caster_stats: bool = False
     caster_profile: CasterProfile | None = None
+    # GearScorer's profile (equipment.GEAR_STYLES): melee, caster or bow.
+    gear_style: str = "melee"
 
     reserve_words: tuple[str, ...] = (
         "quest", "key", "talisman", "artifact", "unique", "exceptional",
@@ -1634,7 +1683,7 @@ class InventoryPolicy:
         c.TYPE_WEAPON, c.TYPE_BOW, c.TYPE_ARMOUR, c.TYPE_SHIELD,
         c.TYPE_HELMET, c.TYPE_PANTS, c.TYPE_AMULET, c.TYPE_RING,
         c.TYPE_LIGHT_APPLY, c.TYPE_CLOAK, c.TYPE_BOOTS,
-        c.TYPE_GLOVES, c.TYPE_BRACERS,
+        c.TYPE_GLOVES, c.TYPE_BRACERS, c.TYPE_GIRDLE,
     )
     equipment_slots: dict[int, tuple[int, ...]] = field(default_factory=lambda: {
         c.TYPE_WEAPON: (c.EQUIP_WEAPON,),
@@ -1650,6 +1699,7 @@ class InventoryPolicy:
         c.TYPE_BOOTS: (c.EQUIP_BOOTS,),
         c.TYPE_GLOVES: (c.EQUIP_GAUNTLETS,),
         c.TYPE_BRACERS: (c.EQUIP_BRACERS,),
+        c.TYPE_GIRDLE: (c.EQUIP_BELT,),
     })
 
     identification_types: tuple[int, ...] = (
@@ -4684,6 +4734,8 @@ class FarmTask(BotTask):
         self.inventory_policy.caster_profile = (
             CasterProfile.from_client(client)
             if self.inventory_policy.caster_stats else None)
+        self.inventory_policy.gear_style = gear_style(
+            self.combat_skill, self.inventory_policy.caster_stats)
         for item in client.state.inventory:
             lore_attempted = getattr(client, "lore_book_attempted", None)
             if (item.item_type == c.TYPE_BOOK and
@@ -4768,7 +4820,9 @@ class FarmTask(BotTask):
                     for tag in client.state.equipment.values()
                     if tag in client.state.items]
         equipped_by_tag = {item.tag: item for item in equipped}
-        score_item = carried_gear_score(client, self.inventory_policy)
+        scorer = gear_scorer(client, self.inventory_policy)
+        # One scale per family, as GearScorer.compare compares.
+        score_item = scorer.order
 
         for candidate in sorted(
                 client.state.inventory,
@@ -4788,8 +4842,7 @@ class FarmTask(BotTask):
                                        c.ITEM_CURSED | c.ITEM_DAMNED) or
                     candidate.required_level > level):
                 continue
-            score = score_item(candidate)
-            if score < 0:
+            if candidate.item_type not in self.inventory_policy.equipment_types:
                 continue
             slots = self.inventory_policy.equipment_slots.get(
                 candidate.item_type, ())
@@ -4806,10 +4859,10 @@ class FarmTask(BotTask):
                         item.required_skill_tag != candidate.required_skill_tag
                         for item in current)):
                 continue
-            worst = min(current, key=score_item) if current else None
-            if worst is not None and score <= (
-                    score_item(worst) + 15 +
-                    self.inventory_policy.displacement_margin(worst)):
+            # One scale for both: effective stats when all were examined,
+            # else the name score (GearScorer.beats).
+            upgrade, worst = scorer.beats(candidate, current, len(slots))
+            if not upgrade:
                 continue
             if worst is not None and len(current) >= len(slots) > 1:
                 # Both ring slots are full. The server would take off the
@@ -7008,7 +7061,8 @@ class FarmTask(BotTask):
                 # a time behind any wand examine (equipment.GearExaminer).
                 await gear_examiner(client).tick(
                     client, self.inventory_policy,
-                    carried_gear_score(client, self.inventory_policy))
+                    carried_gear_score(client, self.inventory_policy),
+                    recall=working_recall(client))
         # A hit never commits her to a set-aside pull or to a packmate within
         # its reach: combat text cannot say which one attacked, and fighting
         # the packmate drags the set-aside monster in too. Within two tiles
@@ -7767,7 +7821,8 @@ class BuyShopUpgradeTask(BotTask):
                  cash_reserve: int = 1_000,
                  spend_fraction: float = 0.25,
                  allow_launchers: bool = True,
-                 caster_stats: bool = False):
+                 caster_stats: bool = False,
+                 style: str = ""):
         super().__init__("buy-shop-upgrade")
         self.min_improvement = max(1, int(min_improvement))
         self.cash_reserve = max(0, int(cash_reserve))
@@ -7776,6 +7831,9 @@ class BuyShopUpgradeTask(BotTask):
         # The owning circuit sets this while she trains Wizardry, as the
         # farm's maintain_inventory does for carried gear.
         self.policy = InventoryPolicy(caster_stats=bool(caster_stats))
+        # GearScorer's profile; caster while she trains Wizardry.
+        self.policy.gear_style = style or (
+            "caster" if caster_stats else "melee")
         self._candidate = 0
         self._feedback_start = 0
         self._examined_at = 0.0
@@ -7934,6 +7992,9 @@ class BuyShopUpgradeTask(BotTask):
         return self.policy.gear_score(item) + base
 
     def _upgrade_score(self, client: AtrinikClient, candidate: Item) -> int:
+        """The candidate's gain over what she owns for its slot, on
+        GearScorer's scale (the equip loop's), or -1 when it is no upgrade
+        by min_improvement."""
         if (not self._structurally_eligible(client, candidate) or
                 not self.policy.identified(candidate)):
             return -1
@@ -7954,13 +8015,36 @@ class BuyShopUpgradeTask(BotTask):
                 self.policy.identified(item)
             })
             current = list(current_by_tag.values())
-        scored = [(self._gear_score(client, item), item) for item in current]
-        baseline = ((max if len(slots) == 1 else min)(
+        # The same scorer as the equip loop, on one scale: effective stats
+        # when the stock and what she owns were all examined, else the
+        # name score (with this examine's score for the stock).
+        # A purchase adds the stock's weight; what she owns stays carried.
+        scorer = gear_scorer(client, self.policy,
+                             lambda item: self._gear_score(client, item),
+                             weight_for=WEIGHT_UNOWNED)
+        free = len(current) < len(slots)
+        if free:
+            # A free slot (the second ring): nothing worn is displaced; a
+            # spare she already carries is the baseline, so she never buys
+            # what the equip loop declined to wear.
+            # Only a spare the equip loop could wear (its filters).
+            level = int(client.state.stats.get("level", 0) or 0)
+            current = [item for item in client.state.inventory
+                       if item.item_type == candidate.item_type and
+                       not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID |
+                                         c.ITEM_CURSED | c.ITEM_DAMNED) and
+                       item.required_level <= level and
+                       self.policy.identified(item)]
+        mine, theirs, effective = scorer.compare(candidate, current)
+        scored = list(zip(theirs, current))
+        baseline = ((max if len(slots) == 1 or free else min)(
             scored, key=lambda value: value[0]) if scored else None)
-        improvement = self._gear_score(client, candidate) - (
-            baseline[0] if baseline is not None else 0)
-        margin = (self.policy.displacement_margin(baseline[1])
-                  if baseline is not None else 0)
+        improvement = mine - (baseline[0] if baseline is not None else 0)
+        # Once she is loaded, GearScorer charges the stock's weight
+        # (weight_cost): a purchase adds it; what she owns stays carried.
+        # A free slot displaces nothing, so no caster displacement margin.
+        margin = (scorer.displacement_margin(baseline[1], effective)
+                  if baseline is not None and not free else 0)
         return (improvement if improvement >= self.min_improvement + margin
                 else -1)
 
@@ -7983,7 +8067,28 @@ class BuyShopUpgradeTask(BotTask):
             client, item).base_score, default=None)
 
     def _apply_examine_metadata(self, client: AtrinikClient, candidate: Item,
-                                feedback: str) -> bool:
+                                feedback: str,
+                                answer_lines: Sequence[str] | None = None) -> bool:
+        """Read the stock's examine. ``answer_lines``: the game-channel
+        lines its answer may be in (never chat); the feedback's lines when
+        not given."""
+        # The examine answer's base stats, read as GearExaminer reads
+        # carried gear's: only the line that answers for this item's name
+        # (never another item's answer or a chat line), its description in
+        # the name for a ring, amulet or trinket. A line with no stats is
+        # stored too, so the stock is on the same scale as her own gear.
+        lines = feedback.splitlines() if answer_lines is None else answer_lines
+        answer = next((line for line in lines
+                       if examine_answers(line.strip(), candidate.name)), None)
+        if answer is not None:
+            rest = re.sub(r"^That is an? ", "That is ", answer.strip())[
+                len(f"That is {candidate.name}"):]
+            shown = (candidate.name + rest
+                     if candidate.item_type in MAGIC_HIDDEN_TYPES else rest)
+            candidate.extra["gear_examine"] = {
+                "name": candidate.name,
+                "base": base_to_json(parse_description(shown) or BaseStats()),
+                "at": time.time()}
         quality = re.search(
             r"Qua:\s*(\d+)\s+Con:\s*(Indestructible|\d+)",
             feedback, re.I)
@@ -8157,7 +8262,10 @@ class BuyShopUpgradeTask(BotTask):
         if candidate is None:
             self.fail("shop upgrade disappeared after examination")
             return
-        identified = self._apply_examine_metadata(client, candidate, feedback)
+        identified = self._apply_examine_metadata(
+            client, candidate, feedback,
+            [str(entry[3]) for entry in client.state.messages_since(self._feedback_start)
+             if len(entry) > 3 and entry[1] == c.CHAT_TYPE_GAME])
         improvement = self._upgrade_score(client, candidate)
         if not identified or improvement < 0:
             recorder = getattr(client, "record_action", None)
