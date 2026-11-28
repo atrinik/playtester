@@ -658,6 +658,10 @@ starvations.
   a leg not started is planned) and never plans on the loop. The
   checkout-mat ranking (`ShopUpgradeSweepTask._new_settlement`) runs on
   the worker as a ranking; the walk it picks plans its own live route.
+- **Route variety searches here too.** An optional trip's first plan
+  on the worker may take a less-used route about as good as the best,
+  searched in the best route's own graph in at most 2 s (4.11); on the
+  loop it never runs.
 - **A retry with the fallback starts at it.** When every hazard tier
   short of the fallback fails, `_plan_avoiding` keeps the inputs it
   failed for (`_tiers_failed_at`: origin, goal, exclusions, hazard sets,
@@ -1556,6 +1560,127 @@ exactly one of them decides farm selection, so no death counts twice:
   posted on the PR: where she would have routed or farmed differently, and
   why. The owner approves each flag flip (P7, P8); nothing flips
   automatically. This gates the flips, not merging the shadow code.
+
+### 4.11 Route variety (2026-11-26)
+
+Every trip took the single cheapest route, so she walked the same roads
+for ever. The owner saw her find secret ways out of Greyton they had
+forgotten and wants her to see more of the world: optional trips now
+alternate between routes about as good as the best (`route_variety.py`).
+
+- **Counts.** Per character, how often she entered each map and crossed
+  each edge (its `route_blocks.edge_subject`), counted as she crosses on a
+  trip (`route_variety.note_crossing`, on the loop) and kept in
+  `GameState.route_map_visits` and `route_edge_uses`, and in her character
+  memory as `route_visits`, next to `route_hazards`. A count halves every
+  24 h, is forgotten after a week without use and is capped at 20; the
+  tables keep the 500 maps and 1,000 edges used last. A load drops a
+  malformed, non-finite, overflowing, future or forgotten entry. An exit
+  is counted as that exit only when she arrives on its authored arrival
+  square (`_took_exit`); otherwise, as a seam always is, by its pair of
+  maps (`pair:SOURCE>DESTINATION`); an exit taken from a displaced
+  arrival is missed as that exit (one missing dashboard record), which
+  is accepted. The record is updated at each crossing
+  and written at most every 5 minutes, and at once on a disconnect, a
+  character switch or reload and a clean shutdown, each write waiting at
+  most 0.25 s; a failed write waits for the next window. A crash loses the
+  counts since the last write (at most about 5 minutes).
+- **Optional trips** (`optional_trip`, `NavigateTask.vary_route`): the farm
+  circuit's walk to a spot, and the maintenance errands: the junk sale,
+  the bank balance and deposit, apartment storage and set swaps, mass
+  identification, upgrade and utility shopping, and spell purchases. A
+  trip marked essential or critical, a care crossing or its walk home,
+  learned-cost plans, and a character below 70 % HP, hungry, starving or
+  depleted never vary. A route on hazards may vary (owner decision,
+  2026-11-26, "allow on hazard routes"): one that took a fallback or threat
+  tier varies only within that tier's search, and only by a route that
+  spends no longer among the hazards (Choice, below). Critical escapes, recall walks, survival and cure
+  trips and timed quest steps are never marked. Only the trip's first
+  plan varies (`start`, `prepare`): never a replan, and a trip that failed
+  (`fail`, so the farm return's fallback retry) never again.
+- **Candidates.** The first plan keeps the search its route came from
+  (`RouteSearch`: the CSR graph of the winning tier's `route_points`, with
+  its avoided and penalized maps, exclusions, owner walls and offer). On
+  that graph, with no new expansion of the world, one native search
+  avoids each of the best route's most used ways (up to 8; every square
+  of a pair of maps at once, so a twin door takes no slot), and one
+  prices every edge by her counts. A candidate that adds a voyage, or
+  crosses the same maps as the best route (another square of the same
+  doors), is dropped.
+- **Cost.** Each route's walk in steps: each map's authored path
+  (`local_path`) with the spawn-radius cost (`_spawn_costs`, 1.6) on a
+  farm trip's maps and on every danger map (below) whatever the trip,
+  plus 4 steps an exit or voyage (a load), one step a tile seam, and the
+  walk to the goal; and its walk on each map (the start map's first leg,
+  each entry's 4 steps or 1 for a seam, and the destination's leg to the
+  goal included, so two short passes of a map never undercut one long
+  one). Each leg is the path she will walk (`local_path` with the runtime
+  walk's own `_spawn_costs`, which skirts spawns only on a farm trip's
+  maps), priced with the spawn squares that path crosses on her farm maps
+  and on every danger map: the pricing follows the walk actually taken,
+  never a skirting path she would not walk. A danger map with no named
+  aggressive spawn (ranged, caster or over-level only) is compared in
+  plain steps, and a ranged attacker's reach can exceed the cost box. A
+  leg with no authored path prices the route out. A voyage's leg is the
+  walk to the nearest square beside its NPC (`dialogue_approaches`, as
+  `_take_voyage` walks it; none within a square of the NPC), priced the
+  same way; a voyage with no square beside its NPC prices the route out
+  too. A best route that cannot be priced is kept.
+  A route that skirts the farm map's spawns is priced as the walk will
+  walk it, so variety never trades the approach discipline (COMBAT.md) for
+  a fresh road; the approach rules themselves are unchanged.
+- **Choice** (`route_variety.choose`). The danger maps are the hazards of
+  every tier (ranged and caster maps at any level, over-level, pack,
+  `KNOWN_LETHAL_TRANSIT`), learned route hazards, her counting route
+  deaths and her quarantined spots. A candidate is eligible when:
+  - it costs at most 15 % more than the best route in all
+    (`ClientConfig.route_variety_tolerance`, `--route-variety-tolerance`,
+    `ATRINIK_BOT_ROUTE_VARIETY_TOLERANCE`; 0 turns variety off, at most
+    0.5);
+  - it enters no danger map the best route does not, the start map
+    counting as entered;
+  - on every danger map it shares with the best route, the start map and
+    the destination included, its walk there costs no more than the best
+    route's: an archer destination entered by a seam far from the goal
+    loses to the stairs beside it;
+  - it crosses no learned hazard, route-death or quarantined map on the
+    way, even one the best route crosses; the start map is exempt only
+    while the candidate does not come back to it, the destination only
+    as the last map;
+  - it adds no voyage and crosses other maps than the best route.
+  Among the best route and the eligible ones she takes the one with the
+  largest share of unvisited ways (each edge counted by its pair of maps,
+  so the twin squares of one entrance are one way; under 0.5 is
+  unvisited; a share, so a route never wins only for having more edges),
+  then the least mean use,
+  a random draw breaking ties. Once a road is the more used, the other
+  wins the next trip. The shadow report (route_shadow.py) still compares
+  the planner's best route. The walk cost ignores live blockers (threat
+  halos, occupants): they change by the second, and the walk itself
+  steps round them as on any route.
+- **Bounds.** The search runs once a trip, in the trip's own plan on the
+  planner worker (1.12, `_plan_on_copy`); a plan made on the loop
+  (`_plan_here`) never runs it. It gives up after 2 s and keeps the
+  best route (`route_variety.SEARCH_SECONDS`), and stops with its plan
+  when the plan is dropped. Measured offline on the built world: 10 to
+  41 ms on top of plans of 0.25 to 2.4 s (Brynknot's shop and bank from
+  world_7_79, the Asteria sage from Greyton, the Burnt Forest from
+  Brynknot). The two long trips take a hazard tier and still vary, each
+  by an alternative no longer on any hazard map; the short town trips
+  have none within 15 %.
+- **Dashboard.** Each search records `route-variety`: the route taken (or
+  the best route kept), its cost against the best route's and how many
+  alternatives were left out as longer or more dangerous. A map she
+  enters for the first time in her memory records `route-new-map`; an exit
+  she took (`_took_exit`) between a pair of maps new to her records
+  `route-new-exit` (never the other square of a known door), or `route-secret-exit` when
+  it is authored invisible (`sys_object` or `invisible`, `MapEdge.hidden`)
+  and leaves a map she already knew: a new way out of a familiar place.
+  `invis_exit` also authors ordinary cave mouths and house doors, so a
+  hidden exit from a map new to her counts only as new. Their ledger saves
+  wait at most 0.25 s, as the tick's other records do.
+  These are decision records (the decision list and `actions_total`), not
+  the observation ledger, which keeps only her authored readings.
 
 ## 5. Phased plan
 

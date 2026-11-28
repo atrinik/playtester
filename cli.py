@@ -18,6 +18,16 @@ from .compatibility import (CompatibilityError, configure_cached_bundle,
                             load_lock, preflight_lock)
 
 
+def _route_variety_tolerance(text: str) -> float:
+    """ATRINIK_BOT_ROUTE_VARIETY_TOLERANCE as a share, or the default."""
+    from .route_variety import DEFAULT_TOLERANCE
+
+    try:
+        return float(text) if text.strip() else DEFAULT_TOLERANCE
+    except ValueError:
+        return DEFAULT_TOLERANCE
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="atrinik-playtester", allow_abbrev=False)
     p.add_argument("--version", action="version",
@@ -89,6 +99,12 @@ def parser() -> argparse.ArgumentParser:
         help="plan with learned route costs, errand budgets and the essential "
              "override (default: off; the learned plans run in the shadow until "
              "the owner approves the flip)",
+    )
+    p.add_argument(
+        "--route-variety-tolerance", type=float,
+        default=_route_variety_tolerance(os.getenv("ATRINIK_BOT_ROUTE_VARIETY_TOLERANCE", "")),
+        help="on optional trips, take a less-used route costing at most this "
+             "share more than the best one (default 0.15; 0 turns it off)",
     )
     p.add_argument(
         "--watch-owner", action="store_true",
@@ -683,6 +699,7 @@ async def main_async(args: argparse.Namespace) -> None:
         persist_tile_facts=args.persist_tile_facts,
         dialogue_edges=args.dialogue_edges,
         learned_route_costs=args.learned_route_costs,
+        route_variety_tolerance=args.route_variety_tolerance,
         operator_character=args.operator_character.strip(),
         watch_owner=args.watch_owner,
         food_obsolete=args.food_obsolete,

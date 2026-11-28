@@ -1132,6 +1132,19 @@ minus the learned danger on the spot's route and maps; one fresh death on
 the way moves her to any spot rated within half of the top one, and a spot
 pauses at 3000 s (4500 s behind a chokepoint).
 
+Optional trips (farm walks and maintenance errands: shops, the bank,
+storage, selling) alternate routes. She counts the maps and edges she uses
+(decaying over a week, in her memory) and, once a trip on the planner
+worker, takes a less-used route costing at most 15 % more than the best
+(`--route-variety-tolerance` or `ATRINIK_BOT_ROUTE_VARIETY_TOLERANCE`; 0
+turns it off) that adds no hazard map, crosses no route-death,
+quarantined or deadly map, and walks no longer than the best route on
+any hazard map it shares with it (the start and destination included).
+Twin squares of one door count as one way. Escapes, survival and cure trips, timed quest steps
+and replans always take the best route. The decision list shows each
+`route-variety` choice and first visits (`route-new-map`,
+`route-new-exit`, `route-secret-exit`); see docs/ROUTING.md 4.11.
+
 NPC voyages and quest-gated exits wait behind the owner's `dialogue_edges`
 flag (`--dialogue-edges` or `ATRINIK_BOT_DIALOGUE_EDGES=1`), off by default:
 the owner turns it on after one supervised voyage. With it off, plans are

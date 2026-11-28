@@ -11,6 +11,7 @@ import math
 import multiprocessing
 import os
 import posixpath
+import random
 import threading
 import dataclasses
 import functools
@@ -43,6 +44,7 @@ from . import route_costs
 from . import route_events
 from . import planner
 from . import route_shadow
+from . import route_variety
 from . import storage
 from . import unlocks
 from .equipment import WEIGHT_UNWORN, abandon_gear_examine, gear_style
@@ -274,6 +276,9 @@ class MapEdge:
     kind: str = "exit"
     label: str = ""
     automatic: bool = False
+    # An exit authored invisible to players (sys_object or invisible): a
+    # first use is a secret exit found (route_variety.SECRET_EXIT).
+    hidden: bool = False
 
 
 @dataclass(slots=True)
@@ -1021,11 +1026,14 @@ class WorldGraph:
                             apartment_returns[region].append(
                                 (source, x, y, name or obj["arch"], automatic))
                 if obj_type == "66" and destination:
+                    hidden = any(
+                        str(one(attrs, flag, base.get(flag)) or "0") == "1"
+                        for flag in ("sys_object", "invisible"))
                     node.edges.append(MapEdge(
                         source, _resolve(source, destination), x, y,
                         int(one(attrs, "hp", base.get("hp")) or 0),
                         int(one(attrs, "sp", base.get("sp")) or 0),
-                        "exit", name or obj["arch"], automatic,
+                        "exit", name or obj["arch"], automatic, hidden,
                     ))
                     # Some authored exit events conditionally redirect by
                     # appending a suffix to the ordinary exit path (notably
@@ -1061,7 +1069,7 @@ class WorldGraph:
                                     int(one(attrs, "hp", base.get("hp")) or 0),
                                     int(one(attrs, "sp", base.get("sp")) or 0),
                                     "exit", f"{name or obj['arch']} scripted",
-                                    automatic,
+                                    automatic, hidden,
                                 ))
                 elif obj_type == "66":
                     # Coordinate maps dynamically derive vertical tile paths.
@@ -1957,6 +1965,7 @@ class WorldGraph:
                      offer: dialogue_edges.DialogueOffer | None = None,
                      edge_cost: Callable[[MapEdge, tuple[int, int], tuple[int, int]], float]
                      | None = None,
+                     keep: list | None = None,
                      ) -> list[MapEdge]:
         """Route end-to-end between exact walkable components across maps.
 
@@ -1966,13 +1975,14 @@ class WorldGraph:
         ``offer`` adds dialogue voyages and closes quest-gated exits
         (dialogue_edges.py); None plans on the static graph. ``edge_cost``
         (route_costs.py) makes it the cheapest route by those costs instead,
-        penalized maps ignored (route_points_iter).
+        penalized maps ignored (route_points_iter). ``keep``, a list,
+        receives the search (RouteSearch) for alternatives (route variety).
         """
         return drain(self.route_points_iter(
             source, source_xy, destination, destination_points,
             allow_locked=allow_locked, excluded=excluded,
             avoided_maps=avoided_maps, penalized_maps=penalized_maps,
-            walls=walls, offer=offer, edge_cost=edge_cost))
+            walls=walls, offer=offer, edge_cost=edge_cost, keep=keep))
 
     def route_points_iter(self, source: str, source_xy: tuple[int, int],
                           destination: str,
@@ -1984,7 +1994,8 @@ class WorldGraph:
                           walls: OwnerWalls | None = None,
                           offer: dialogue_edges.DialogueOffer | None = None,
                           edge_cost: Callable[[MapEdge, tuple[int, int], tuple[int, int]],
-                                              float] | None = None):
+                                              float] | None = None,
+                          keep: list | None = None):
         """route_points as a generator that yields while it expands the
         world (_expand_component_states); its return value is the route.
         With ``edge_cost`` each transition costs that many seconds, in
@@ -2023,6 +2034,10 @@ class WorldGraph:
             raise ValueError(
                 f"no component route from {source} {source_xy} to "
                 f"{destination} {destination_points}")
+        if keep is not None:
+            keep.append(RouteSearch(offsets, targets, edge_metadata,
+                                    costs, route_edges, goals,
+                                    tuple(result.transitions)))
         return [route_edges[index] for index in result.transitions]
 
     def find_landmarks(self, query: str, *, archetype: str = "") -> list[Waypoint]:
@@ -2379,6 +2394,28 @@ CARE_PLATEAU_GAP_SECONDS = 5.0
 CARE_WAIT_RESUME_SECONDS = 300.0
 
 
+@dataclass(frozen=True, slots=True)
+class RouteSearch:
+    """One route_points search, kept for alternatives (route variety): its
+    CSR graph, the costs it searched with (None: breadth-first), its goal
+    states and the transitions of the route it found. Another search over
+    it is one native graph_search, no new expansion of the world."""
+    offsets: list[int]
+    targets: list[int]
+    metadata: list[int]
+    costs: list[int] | None
+    edges: list[MapEdge]
+    goals: list[int]
+    transitions: tuple[int, ...]
+
+    def search(self, costs: list[int]) -> list[MapEdge] | None:
+        result = graph_search(self.offsets, self.targets, 0, self.goals,
+                              metadata=self.metadata, costs=costs)
+        if result.status != "found":
+            return None
+        return [self.edges[index] for index in result.transitions]
+
+
 class OwnerBlockRefusal(Exception):
     """An optional trip's only route crosses an owner block. Not a
     ValueError, so no hazard tier catches it and relaxes (NavigateTask._plan
@@ -2607,6 +2644,15 @@ def care_recall_ready(client: AtrinikClient, *, starving: bool = False) -> bool:
     return not owned or bool(FarmTask.emergency_recall_candidates(client))
 
 
+def optional_trip(task: "NavigateThenTask") -> "NavigateThenTask":
+    """Mark a farm walk or maintenance errand as optional for route
+    variety (route_variety.py): its first plan may take a less-used route
+    about as good as the best. Never a critical escape, a recall walk, a
+    survival or cure trip or a timed quest step."""
+    task.navigation.vary_route = True
+    return task
+
+
 def mark_essential(task: BotTask | None, kind: str) -> BotTask | None:
     """Mark ``task``'s navigation essential (ESSENTIAL_TRIPS), and any
     navigation it starts later (MorgeeanShipKeyTask)."""
@@ -2649,6 +2695,10 @@ def _plan_inputs_of(client: Any) -> PlanInputs | None:
     her live client, whose plans read them themselves."""
     inputs = getattr(client, "plan_inputs", None)
     return inputs if isinstance(inputs, PlanInputs) else None
+
+
+class _VarietySlow(Exception):
+    """The route-variety search ran out of time: the best route is kept."""
 
 
 class PlanCancelled(Exception):
@@ -2958,13 +3008,26 @@ class NavigateTask(BotTask):
         # aborted expedition's retreat): with the worker busy it plans on
         # the loop, as essential trips do.
         self.critical = False
+        # Route variety (route_variety.py, ROUTING 4.11): an optional trip
+        # (a farm walk, a maintenance errand) whose first plan may take a
+        # less-used route about as good as the best; whether its one search
+        # was made; the maps it must not add (route deaths, quarantined
+        # spots, taken on the loop); and the draw that breaks ties.
+        self.vary_route = False
+        self._variety_done = False
+        self._variety_avoid: frozenset[str] | None = None
+        self.variety_rng: random.Random | None = None
+        # On the planning copy of a varied plan: keep each search
+        # (_route_points), and the one the route came from.
+        self._keep_search = False
+        self._route_search: RouteSearch | None = None
 
     # What a plan sets on the task that plans (_plan), copied back from the
     # planning copy a plan on the worker ran on (_plan_off_loop).
     PLAN_STATE = ("_walls", "_offer", "_crossed", "_bounded", "care",
                   "learned_plan", "_route_threat_maps", "_threat_fallback",
                   "hazard_fallback_taken", "_tiers_failed_at",
-                  "_deferred")
+                  "_deferred", "_variety_done")
     # A prepared plan (prepare) serves the trip's start this long, while
     # she still stands where it was made.
     PREPARED_SECONDS = 60.0
@@ -2976,7 +3039,7 @@ class NavigateTask(BotTask):
             client.state.map.world_y)
         if self.tolerance and not self._approach:
             self._approach = self._approach_candidates()
-        route = self._plan_off_loop(client)
+        route = self._plan_off_loop(client, vary=True)
         if route is PLANNING:
             # She stands still, defended by her trip, until it is done; a
             # path the server still walks for her is stopped next tick.
@@ -2993,6 +3056,9 @@ class NavigateTask(BotTask):
 
     def fail(self, reason: str) -> None:
         self._drop_plan()
+        # A trip started again after a failure (a farm return's fallback
+        # retry) replans after a failure: it never varies.
+        self.vary_route = False
         super().fail(reason)
 
     @property
@@ -3045,8 +3111,8 @@ class NavigateTask(BotTask):
         and on the loop while the worker runs another job."""
         return bool(self.essential) or self.critical
 
-    def _plan_off_loop(self, client: AtrinikClient, *,
-                       live: bool = False) -> "list[MapEdge] | _Planning":
+    def _plan_off_loop(self, client: AtrinikClient, *, live: bool = False,
+                       vary: bool = False) -> "list[MapEdge] | _Planning":
         """The trip's route from where she stands, planned on the planner
         worker (ROUTING 1.12): PLANNING until it is done, then the route,
         or its ValueError raised here, as _plan would have raised it.
@@ -3056,7 +3122,9 @@ class NavigateTask(BotTask):
         copied back, and its recorded actions replayed, when it is
         collected. A plan made before the trip started (prepare) is used
         instead while she still stands where it was made. Already on the
-        worker (a ranking's probe), it plans at once."""
+        worker (a ranking's probe), it plans at once. ``vary``: the trip's
+        first plan, which may take a less-used route (_vary_route), only
+        ever on the worker."""
         if (planner.worker_generation() is not None or
                 isinstance(client, planner.PlanningClient) or
                 not hasattr(self._graph, "planner_view")):
@@ -3084,7 +3152,13 @@ class NavigateTask(BotTask):
         # every poll (cheap): a plan under way never uses it, and a result
         # that went stale meanwhile is planned again with it.
         _care_waits(client)
-        build = functools.partial(_plan_on_copy, self._planning_copy(live=live))
+        vary = vary and self.vary_route and not self._variety_done
+        if vary and self._variety_avoid is None:
+            # Her route deaths and quarantined spots, read here on the loop
+            # once a trip: the worker never reads her farm memory.
+            self._variety_avoid = route_variety_avoid(client)
+        build = functools.partial(_plan_on_copy, self._planning_copy(live=live),
+                                  vary=vary)
         result = plans.get(
             "route", self._graph, client, build,
             # From another map or another part of this one the result is
@@ -3149,7 +3223,7 @@ class NavigateTask(BotTask):
         then uses this plan (_plan_off_loop) rather than planning again."""
         origin = self._origin(client)
         try:
-            route = self._plan_off_loop(client, live=True)
+            route = self._plan_off_loop(client, live=True, vary=True)
         except ValueError as exc:
             self._prepared = (origin, time.monotonic(), exc)
             raise
@@ -3266,14 +3340,21 @@ class NavigateTask(BotTask):
         """
         # A dropped plan stops between tiers.
         _check_cancelled(self._plan_client)
+        keep: list | None = [] if self._keep_search else None
+        self._route_search = None
         try:
             route = self.graph.route_points(
-                *args, walls=self._walls, offer=self._offer, **kwargs)
+                *args, walls=self._walls, offer=self._offer,
+                **({"keep": keep} if keep is not None else {}), **kwargs)
         except ValueError as blocked:
             if not self._walls or not unwalled_retry:
                 raise
             return self._unwalled_route(blocked, args, [kwargs])
         self._crossed = ()
+        if keep:
+            # The search this tier's route came from: alternatives search
+            # it again (_vary_route), with no new expansion of the world.
+            self._route_search = keep[-1]
         return route
 
     def _unwalled_route(self, blocked: ValueError, args: tuple,
@@ -3361,6 +3442,251 @@ class NavigateTask(BotTask):
                 # learned costs on, danger decayed under the budget).
                 self.care = None
         return route
+
+    def _may_vary(self, client: AtrinikClient) -> bool:
+        """Whether this plan may take a less-used route (route_variety.py):
+        on the planner worker only, the trip's first plan, an optional trip
+        (``vary_route``: farm walks, maintenance errands) that is not
+        essential, critical, staging for care or planned with learned
+        costs, while she is neither hungry, starving, low on HP nor
+        depleted. Never a critical escape, a recall walk, a cure, a timed
+        quest step or a replan after a failure: those never set
+        ``vary_route``, or clear it (fail)."""
+        if (not self.vary_route or self._variety_done or
+                planner.worker_generation() is None or
+                route_variety.tolerance(client) <= 0 or self._urgent() or
+                self.is_essential(client) or self._care_staging is not None or
+                self.care is not None or learned_route_costs(client)):
+            return False
+        state = client.state
+        stats = getattr(state, "stats", {}) or {}
+        hp, maxhp = int(stats.get("hp", 0) or 0), int(stats.get("maxhp", 0) or 0)
+        if maxhp > 0 and hp < maxhp * route_variety.LOW_HP_SHARE:
+            return False
+        if hungry(client) or starving_without_food(client):
+            return False
+        return not any(item.item_type == c.TYPE_FORCE and
+                       item.name.casefold() == "depletion"
+                       for item in getattr(state, "inventory", ()) or ())
+
+    def _vary_route(self, client: AtrinikClient,
+                    route: list[MapEdge]) -> list[MapEdge]:
+        """The trip's route: the planner's best one, or a less-used one
+        about as good (route_variety.choose), found in the best route's own
+        search (RouteSearch) in at most route_variety.SEARCH_SECONDS; on
+        the planner worker, once a trip. Records route-variety."""
+        self._variety_done = True
+        search = self._route_search
+        if (search is None or not route or self._crossed or self._bounded or
+                self.care is not None or
+                [search.edges[index] for index in search.transitions] != route):
+            return route
+        # A route that took a fallback or threat tier varies too (owner
+        # decision, 2026-11-26), only within that tier's search (the
+        # RouteSearch kept is the winning tier's) and only by a route that
+        # spends no longer on any danger map (route_variety.choose).
+        deadline = time.monotonic() + route_variety.SEARCH_SECONDS
+        try:
+            choice = self._variety_choice(client, route, search, deadline)
+        except PlanCancelled:
+            raise
+        except _VarietySlow:
+            self._record(client, route_variety.ROUTE_VARIETY,
+                         f"{self.destination}: the search took over "
+                         f"{route_variety.SEARCH_SECONDS:.0f} s; best route kept")
+            return route
+        except Exception:  # Variety never fails a trip.
+            log.exception("route variety failed for %s", self.destination)
+            return route
+        if choice is None:
+            return route
+        if not choice.varied:
+            self._record(client, route_variety.ROUTE_VARIETY,
+                         f"{self.destination}: best route kept; {choice.reason}")
+            return route
+        varied = list(choice.candidate.edges)
+        # Its hazards are a subset of the best route's (choose).
+        self._route_threat_maps = {edge.destination for edge in varied
+                                   if edge.destination in self._route_threat_maps}
+        self._record(client, route_variety.ROUTE_VARIETY,
+                     f"{self.destination}: took a less-used route "
+                     f"({len(varied)} edges, cost {choice.candidate.cost:.0f} "
+                     f"against the best route's {choice.best_cost:.0f}, "
+                     f"{len(route)} edges); {choice.reason}")
+        return varied
+
+    def _variety_choice(self, client: AtrinikClient, route: list[MapEdge],
+                        search: "RouteSearch", deadline: float
+                        ) -> "route_variety.Choice | None":
+        """Alternatives to ``route`` in its own search: one avoiding each
+        of its most used edges (up to route_variety.MAX_CANDIDATES), one
+        priced by her counts; each a native search over the kept graph.
+        Then their walking cost and walk per danger map (spawn costs
+        included) and the choice."""
+        source = client.state.map.path
+        # Never crossed by an alternative, even where the best route
+        # crosses them: maps that killed her, counting route deaths and
+        # quarantined spots.
+        hard = self._learned_route_hazards(client) | set(self._variety_avoid or ())
+        danger = (self._known_ranged_hazard_maps(client, any_level=True) |
+                  self._known_overlevel_hazard_maps(client) |
+                  self._known_pack_hazard_maps(source) |
+                  set(self.KNOWN_LETHAL_TRANSIT) | hard)
+        now = time.time()
+        uses = getattr(client.state, "route_edge_uses", {}) or {}
+        subjects = [route_blocks.edge_subject(edge) for edge in search.edges]
+        # Each way (a pair of maps) is avoided whole: the other square of a
+        # double door is no alternative and takes no candidate's place.
+        by_pair: dict[str, list[int]] = defaultdict(list)
+        for index, subject in enumerate(subjects):
+            by_pair[route_variety.pair(subject)].append(index)
+        base = (list(search.costs) if search.costs is not None
+                else [1] * len(search.targets))
+        # More than any route that avoids it: the edge is left out unless
+        # no route can avoid it.
+        avoid = sum(base) + 1
+        ways = route_variety.pair_uses(uses, now)
+
+        def use(subject: str) -> float:
+            return ways.get(route_variety.pair(subject), 0.0)
+
+        best_pairs = [route_variety.pair(route_blocks.edge_subject(edge)) for edge in route]
+        ordered = sorted(dict.fromkeys(best_pairs), key=lambda way: -ways.get(way, 0.0))
+        routes: list[list[MapEdge]] = []
+        for way in ordered[:route_variety.MAX_CANDIDATES]:
+            self._variety_check(client, deadline)
+            costs = list(base)
+            for index in by_pair[way]:
+                costs[index] += avoid
+            alternative = search.search(costs)
+            if alternative and way not in {
+                    route_variety.pair(route_blocks.edge_subject(edge))
+                    for edge in alternative}:
+                routes.append(alternative)
+        self._variety_check(client, deadline)
+        priced = [cost + math.ceil(min(3.0, use(subject)))
+                  for cost, subject in zip(base, subjects)]
+        alternative = search.search(priced)
+        if alternative:
+            routes.append(alternative)
+        voyages = {edge for edge in route if edge.kind == dialogue_edges.DIALOGUE}
+        # A voyage is slow and talks to an NPC: never one the best route
+        # does not take.
+        routes = [candidate for candidate in routes
+                  if {edge for edge in candidate
+                      if edge.kind == dialogue_edges.DIALOGUE} <= voyages]
+        memo: dict[tuple, float] = {}
+        best = route_variety.candidate(
+            route, *self._walk_cost(client, route, deadline, memo, danger), start=source)
+        if not math.isfinite(best.cost):
+            # Its walk cannot be priced (a live position cut off by a
+            # runtime change): nothing is "within" it.
+            self._record(client, route_variety.ROUTE_VARIETY,
+                         f"{self.destination}: best route kept; its walk "
+                         "could not be priced")
+            return None
+        candidates = [route_variety.candidate(
+            candidate, *self._walk_cost(client, candidate, deadline, memo, danger),
+            start=source) for candidate in routes]
+        return route_variety.choose(
+            best, candidates, edge_uses=uses, danger=danger, hard=hard,
+            tolerance=route_variety.tolerance(client), now=now,
+            rng=self.variety_rng)
+
+    def _took_exit(self, client: AtrinikClient, edge: MapEdge) -> bool:
+        """Whether where she arrived shows she took ``edge`` itself: an
+        exit's authored arrival square (another exit between the same maps,
+        or a displaced arrival, lands elsewhere). Seams and voyages are
+        counted by their maps anyway."""
+        if edge.kind != "exit":
+            return True
+        m = client.state.map
+        return (m.path == edge.destination and
+                (m.world_x, m.world_y) == _edge_arrival(self.graph, edge))
+
+    @staticmethod
+    def _save_timeout(client: AtrinikClient) -> float | None:
+        """A tick's bound on a decision-ledger save (her real client)."""
+        return route_events.WRITE_TIMEOUT if isinstance(client, AtrinikClient) else None
+
+    @staticmethod
+    def _variety_check(client: AtrinikClient, deadline: float) -> None:
+        _check_cancelled(client)
+        if time.monotonic() > deadline:
+            raise _VarietySlow()
+
+    def _walk_cost(self, client: AtrinikClient, edges: Sequence[MapEdge],
+                   deadline: float, memo: dict[tuple, float],
+                   danger: frozenset[str] | set[str] = frozenset()
+                   ) -> tuple[float, dict[str, float]]:
+        """Her walk along ``edges`` to the goal, in steps, and its walk on
+        each map (the start map's first leg, each entry and the
+        destination's leg to the goal included). Each leg is the path she
+        will walk (local_path with the runtime walk's _spawn_costs), priced
+        with the spawn squares it crosses (_spawn_square_costs) on a farm
+        trip's maps and on every ``danger`` map; plus
+        route_variety.TRANSITION_STEPS an exit or voyage and one step a
+        tile seam, counted on the map entered; a leg with no path costs
+        inf. ``memo`` keeps each leg for the other candidates."""
+        access = self._allow_locked(client)
+        current = client.state.map.path
+        here = (client.state.map.world_x, client.state.map.world_y)
+
+        def leg(map_path: str, start: tuple[int, int], goal: tuple[int, int]) -> float:
+            key = (map_path, start, goal)
+            if key not in memo:
+                self._variety_check(client, deadline)
+                # The path she will walk: the runtime walk's own costs
+                # (_click_path: _spawn_costs, only on a farm trip's maps).
+                walked = self._spawn_costs(map_path)
+                path = self.graph.local_path(map_path, start, goal,
+                                             allow_locked=access,
+                                             extra_costs=walked or None)
+                # Priced with the spawn squares it crosses, on her farm
+                # maps and on every danger map.
+                penalty = (self._spawn_square_costs(map_path)
+                           if map_path in danger or walked else {})
+                # A leg with no authored path is no estimate: the route is
+                # priced out (the best route's too, which keeps it).
+                memo[key] = (sum(1 + min(254, penalty.get(point, 0)) for point in path[1:])
+                             if path or start == goal else math.inf)
+            return memo[key]
+
+        cost = 0.0
+        walks: dict[str, float] = defaultdict(float)
+        for edge in edges:
+            node = self.graph.nodes.get(current)
+            target = (edge.x, edge.y)
+            if node is not None:
+                target = (max(0, min(node.width - 1, edge.x)),
+                          max(0, min(node.height - 1, edge.y)))
+            if edge.kind == dialogue_edges.DIALOGUE:
+                # The walk beside the NPC, as _take_voyage walks it: none
+                # within a square of it, else to the nearest approach.
+                if max(abs(here[0] - edge.x), abs(here[1] - edge.y)) <= 1:
+                    step = 0.0
+                else:
+                    approaches = self.graph.dialogue_approaches(
+                        edge, here, allow_locked=access)
+                    step = leg(current, here, approaches[0]) if approaches else math.inf
+            else:
+                step = leg(current, here, target)
+            cost += step
+            walks[current] += step
+            entry = 1 if edge.kind == "tile" else route_variety.TRANSITION_STEPS
+            cost += entry
+            here, current = _edge_arrival(self.graph, edge), edge.destination
+            # Each entry counts on the map entered: two short passes of a
+            # danger map never undercut one long one.
+            walks[current] += entry
+        goals = self._goal_points()
+        if goals:
+            step = min(leg(current, here, goal) for goal in goals)
+            cost += step
+            walks[current] += step
+        else:
+            walks[current] += 0.0
+        return cost, dict(walks)
 
     def require_care(self, mode: str, subjects: Sequence[str], *,
                      clock: Callable[[], float] = time.monotonic,
@@ -4471,6 +4797,11 @@ class NavigateTask(BotTask):
         if (map_path not in self.spawn_cost_maps or self._urgent() or
                 self._care_staging is not None):
             return None
+        return self._spawn_square_costs(map_path)
+
+    def _spawn_square_costs(self, map_path: str) -> dict[tuple[int, int], int]:
+        """_spawn_costs' squares of ``map_path``, whatever the trip (route
+        variety prices every danger map's walk with them), cached per map."""
         cached = self._spawn_cost_cache.get(map_path)
         if cached is not None:
             return cached
@@ -4827,7 +5158,8 @@ class NavigateTask(BotTask):
         while it runs the route stays empty and she does not move."""
         pending = self._planning
         try:
-            route = self._plan_off_loop(client)
+            # Only the trip's first plan may vary: never a replan.
+            route = self._plan_off_loop(client, vary=pending == "start")
         except ValueError as exc:
             self._planning = ""
             if pending == "start" or not self._wait_for_exclusions(client, exc):
@@ -5024,6 +5356,8 @@ class NavigateTask(BotTask):
                 self._voyage = None
                 self._record(client, "navigation-voyage-arrived",
                              route_blocks.edge_subject(arrived))
+            route_variety.note_crossing(client, arrived, exact=self._took_exit(client, arrived),
+                                        save_timeout=self._save_timeout(client))
         if not self.route or self.route[0].source != client.state.map.path:
             if self._voyage is not None:
                 self._voyage_landed_elsewhere(client)
@@ -5083,6 +5417,8 @@ class NavigateTask(BotTask):
                      edge.destination,
                      (edge.destination_x, edge.destination_y),
                      allow_locked=self._allow_locked(client)))):
+            route_variety.note_crossing(client, edge, exact=self._took_exit(client, edge),
+                                        save_timeout=self._save_timeout(client))
             self.route.pop(0)
 
 
@@ -7287,7 +7623,7 @@ class ShopUpgradeSweepTask(BotTask):
             safety=SafetyPolicy(heal_below=0.85, flee_below=0.70))
         child.navigation.allow_ranged_hazard_fallback = (
             self.allow_hostile_transit)
-        return child
+        return optional_trip(child)
 
     @staticmethod
     def _unpaid_inventory(client: AtrinikClient) -> list[Item]:
@@ -9618,16 +9954,37 @@ def planning_client(client: AtrinikClient, graph: "WorldGraph") -> planner.Plann
     return proxy
 
 
-def _plan_on_copy(twin: "NavigateTask", proxy: Any) -> tuple:
+def _plan_on_copy(twin: "NavigateTask", proxy: Any, *, vary: bool = False) -> tuple:
     """A trip's plan on the worker (NavigateTask._plan_off_loop): its
     route or None, its ValueError or None, and what the plan set on the
-    trip (PLAN_STATE)."""
+    trip (PLAN_STATE). With ``vary`` (the trip's first plan), on the
+    worker only, it may take a less-used route (NavigateTask._vary_route)."""
+    vary = vary and twin._may_vary(proxy)
+    twin._keep_search = vary
     try:
         route, error = twin._plan(proxy), None
+        if vary:
+            route = twin._vary_route(proxy, route)
     except ValueError as exc:
         route, error = None, exc
+    finally:
+        twin._keep_search, twin._route_search = False, None
     return route, error, {name: getattr(twin, name)
                           for name in NavigateTask.PLAN_STATE}
+
+
+def route_variety_avoid(client: AtrinikClient) -> frozenset[str]:
+    """The maps a varied route must not add (route_variety.choose): her
+    counting route deaths and her quarantined farm spots."""
+    now = time.time()
+    quarantine = getattr(client.state, "farm_zone_quarantine", {}) or {}
+    try:
+        deaths = route_death_maps(client)
+    except Exception:  # A variety input never fails a trip.
+        log.exception("route variety: route deaths not read")
+        deaths = set()
+    return frozenset({*deaths, *(path for path, until in quarantine.items()
+                                 if until > now)})
 
 
 class _BackgroundPlan:
@@ -11591,7 +11948,7 @@ class FarmCircuitTask(BotTask):
         # A farm trip has no route budget: farm selection weighs its
         # danger (ROUTING 4.5).
         task.navigation.trip = route_costs.FARM
-        return task
+        return optional_trip(task)
 
     @staticmethod
     def _food_reserve(client: AtrinikClient) -> int:
@@ -11946,7 +12303,7 @@ class FarmCircuitTask(BotTask):
                 destination_xy=self.APARTMENT_CHEST_XY, combat_approach=True)
             task.navigation.strict_safety = True
             task.identify_fetch = True
-            return task
+            return optional_trip(task)
         name, path, xy, cost = smith
         task = NavigateThenTask(
             self.graph, path, MassIdentifyTask(name, cost, cash_reserve=IDENTIFY_RESERVE),
@@ -11954,7 +12311,7 @@ class FarmCircuitTask(BotTask):
         task.navigation.tolerance = 1
         task.navigation.strict_safety = True
         task.identify_smith = name
-        return task
+        return optional_trip(task)
 
     def _chest_indexer(self) -> storage.ChestIndexer:
         """Keeps her apartment index current on a chest visit."""
@@ -11987,7 +12344,7 @@ class FarmCircuitTask(BotTask):
             self.graph, self.APARTMENT, deposit,
             destination_xy=self.APARTMENT_CHEST_XY, combat_approach=True)
         task.navigation.strict_safety = True
-        return task
+        return optional_trip(task)
 
     # --- Swapping gear sets on a build change (builds.py) ------------------
 
@@ -12112,7 +12469,7 @@ class FarmCircuitTask(BotTask):
             self.graph, self.APARTMENT, swap,
             destination_xy=self.APARTMENT_CHEST_XY, combat_approach=True)
         task.navigation.strict_safety = True
-        return task
+        return optional_trip(task)
 
     def build_suggestion(self, client: AtrinikClient) -> dict[str, Any]:
         """The best set for her spot's build from everything she owns, per
@@ -12867,7 +13224,7 @@ class FarmCircuitTask(BotTask):
                 self._sale_policy(client)),
             destination_xy=(15, 7), combat_approach=True)
         task.navigation.strict_safety = True
-        return task
+        return optional_trip(task)
 
     def _needs_bank_sync(self, client: AtrinikClient) -> bool:
         # Persistent balance knowledge is needed only before a budgeted
@@ -12924,7 +13281,7 @@ class FarmCircuitTask(BotTask):
             BankBalanceTask("Tolmir", refresh=refresh), destination_xy=(19, 15),
             combat_approach=True)
         task.navigation.strict_safety = True
-        return task
+        return optional_trip(task)
 
     def _needs_bank_deposit(self, client: AtrinikClient) -> bool:
         # Cross-world banking costs enough farm uptime that carrying one stray
@@ -13118,7 +13475,7 @@ class FarmCircuitTask(BotTask):
             BankTask("Tolmir", "all"), destination_xy=(19, 15),
             combat_approach=True)
         task.navigation.strict_safety = True
-        return task
+        return optional_trip(task)
 
     def _needs_upgrade_shopping(self, client: AtrinikClient) -> bool:
         level = int(client.state.stats.get("level", 0) or 0)
@@ -13375,7 +13732,7 @@ class FarmCircuitTask(BotTask):
             safety=SafetyPolicy(heal_below=0.85, flee_below=0.70))
         task.navigation.tolerance = 2
         task.navigation.allow_ranged_hazard_fallback = True
-        return task
+        return optional_trip(task)
 
     def _heal_restock_funds(self, client: AtrinikClient) -> int:
         """What the heal restock needs in her wallet before it starts: the
@@ -13753,7 +14110,7 @@ class FarmCircuitTask(BotTask):
         task.navigation.tolerance = 1
         # The route policy of the other optional errands (storage, shops).
         task.navigation.strict_safety = True
-        return task
+        return optional_trip(task)
 
     def _new_spell_purchase(self) -> NavigateThenTask:
         task = NavigateThenTask(
@@ -13765,7 +14122,7 @@ class FarmCircuitTask(BotTask):
             # of failing the entire purchase before leaving the farm circuit.
             destination_xy=(12, 3), combat_approach=True)
         task.navigation.tolerance = 1
-        return task
+        return optional_trip(task)
 
     def _leg_available(self, index: int) -> bool:
         minute = self.server_clock.game_minute()

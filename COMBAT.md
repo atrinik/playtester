@@ -2428,7 +2428,9 @@ until she is `MAX_AGGRO_RANGE` (9) tiles away for more than
   threats: about 5 ms for the retreat, 6 to 8 ms for a lead-away step.
 - **Spawn-radius cost on the way in** (docs/ROUTING.md 1.6): on an
   optional trip her walk skirts aggressive spawns on the farm map and the
-  maps tiled to it when a route about as short goes round.
+  maps tiled to it when a route about as short goes round. Route
+  variety (docs/ROUTING.md 4.11) prices its candidates with that cost, so
+  a less-used way in never trades it away.
 - **Pursuers** (`NavigateThenTask._track_pursuers`). Each creature in
   view is sampled every defence tick for 12 s, on the map she is on (a
   map change starts afresh). It qualifies when it is beside her and
