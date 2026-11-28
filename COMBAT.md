@@ -1914,8 +1914,9 @@ counted toward the spot's kit hazard. Three changes:
   included.
 - **A pack she can hold.** Outside Wizardry training (pack 1, unchanged),
   `combat_profile` now ranks for `max_aggro_pack`
-  `SINGLE_TARGET_MAX_AGGRO_PACK` (2): she fights one target at a time and
-  casts no area spell. The analyzer drops a map whose pack exceeds it
+  `SINGLE_TARGET_MAX_AGGRO_PACK` (2): her ordinary kit fights one target at
+  a time (a fielded AoE build's pack cap is its own encounter profile's,
+  see "Combat builds per spot"). The analyzer drops a map whose pack exceeds it
   before it builds circuits, so `2_3`, `3_2`, `1_4` and the other
   Underground City maps of pack 3 or more leave every circuit.
 - **Pack recalls on the way count** toward the spot's kit hazard
@@ -2008,7 +2009,8 @@ unchanged.
     another hostile is close; `ranged-kite` while Wizardry trains with
     spells only (`caster_kite` holds one target at range; as
     `FarmTask.spell_only_training`, once the spell fits beyond her healing
-    reserve). She casts no area spell, so never `aoe-kite`.
+    reserve). The runs for the builds she can field use each build's own
+    profile ([combat builds](#combat-builds-per-spot-2026-11-26)).
   - `--healing-per-second` (`healing_rate`): the median HP of her landed
     heal-spell casts (`FarmAnalyzer.heal_samples`, from "The spell heals
     you for N hp!" within 2 s of her FIRE of a healing spell she knows; an
@@ -2080,6 +2082,146 @@ Accepted limits:
   analyzer's model.
 - A heal near full health reports what it healed, not what it could, so
   the median understates her healing.
+
+## Combat builds per spot (2026-11-26)
+
+Live on 2026-11-26 she fought several monsters at once in melee on a spot
+better suited to an area spell. The owner asked for a build per location,
+chosen automatically or by the operator, with the matching gear set worn.
+`builds.py` holds the builds; `FarmCircuitTask._choose_build` picks one for
+the spot autoplay farms. The spot itself is still chosen as before
+([encounter warnings](#encounter-warnings-2026-11-25) stay warn only): the
+build is chosen for the spot, never the spot for a build.
+
+| Build | Requirement | Routine (FarmTask) | Gear style | Encounter profile |
+| --- | --- | --- | --- | --- |
+| Melee | a weapon and a weapon school | her weapon, with the automatic Wizardry training plan | melee | her ordinary profile, `melee` |
+| AoE caster | a known area spell (firestorm, icestorm, ...) her Wizardry can cast | its spell with spells only (the Wizardry kite; `casts_firestorm` covers every area spell) | caster | the spell's damage (sampled, else estimated), cost and her SP; up to 6 monsters, `--aoe-radius` half the spell's base range; `aoe-kite` |
+| Single-target caster | a known damage spell (magic bullet, ...) her Wizardry can cast | its spell with spells only, one target | caster | the spell's damage (sampled, else estimated), cost and her SP, pack 1, `ranged-kite` |
+| Bow | a launcher, its archery skill and 20 ammunition | the launcher pull, then her weapon | bow | the examined launcher and ammunition damage, WC and delay, pack 1, `ranged-kite` |
+
+The server refuses a spell above her Wizardry level
+(`types/common/apply.c`), so a spell's level is its archetype's. A wand or
+rod of an area spell is carried with the AoE set as a consumable but
+fields no build: the farm casts, it does not fire wands (her firestorm L2
+and icestorm L5 wands with Magic Devices 1 would be weak anyway), and the
+gap says so.
+
+- **Fielding is not training.** A fielded caster build makes the farm
+  child cast its spell with spells only (`FarmCircuitTask._build_spell`,
+  `FarmTask.fielded_caster`); the circuit's training plan and its until
+  levels stay as they were, and leaving the build ends it. A fielded
+  caster who cannot afford a cast above her healing reserve, with no
+  charged mana crystal to draw from, fights with her wielded weapon by the
+  ordinary melee rules (pack split with the melee pack cap, heals,
+  retreat, flee and recall). Dry stays latched while there is recent
+  hostile contact or the target she ran dry on is engaged, short of a full
+  bar: that may span back-to-back pulls under continuous contact. While
+  latched she casts no fight spell (no spell pressure, no finisher, its
+  kite or neutral buffer), so one regenerated cast does not send her back
+  to kiting. An opening ranged pull at a creature three or more tiles off
+  may still spend a regenerated cast before she melees it. Out of a fight she rests for mana as the spell routine does,
+  rather than pulling with her weapon, while her SP rises: after 60 s of
+  quiet rest without a point gained she stops resting and the ordinary
+  farm goes on. Without regeneration (no food, say) that costs up to 60 s
+  of rest between fights. Before her stats arrive she is not dry. A
+  `caster-out-of-mana` decision is recorded at most once a minute.
+  Without a weapon she keeps the spell-only routine. The spot was rated
+  for the caster build (owner decision, 2026-11-26): her melee fallback
+  there is judged by the melee rules alone, not by that rating.
+- **Spell damage.** A caster build's damage per hit is the median of her
+  sampled hits with its spell, kept per spell (a fielded spell never
+  resets her training spell's) and saved in her character memory (at
+  most 20 spells of 30 hits, once a minute). Before a hit is sampled it is
+  the server's formula (`server/spell_util.c` `SP_level_dam_adjust`): the
+  spell's base damage from the pinned server's `include/spellist.h` x
+  (0.75 + Wizardry / 4) x (1 + the Pow bonus), rolled between the whole
+  parts of 80% (plus a half) and all of it (Firestorm at Wizardry 15 and
+  Pow 15: 12 on average), the rating marked `damage_estimated`; her spell
+  path is taken as neutral. Swarms (bullet storm and swarm, meteor swarm,
+  frost nova) fire copies of a child spell and get no estimate: they are
+  rated only from sampled hits, with a reach of 3. No estimate is made
+  before her stats arrive, and without the server's table an area spell
+  is not rated at all.
+- **One bar must kill.** A caster build is rated on a spot only when one
+  kill there (the rating's average kill time over her cast delay, rounded
+  up; an area cast hits the whole pack, so the same for a pack) takes no
+  more casts than her bar beyond the healing reserve pays, plus what her
+  SP regenerates between them (`spot_affordable`). Only the caster builds
+  are gated: melee never is, even with her Wizardry training's spell
+  model. The analyzer reports the
+  average monster's kill, not the toughest's.
+- **Choosing.** The operator picks a build for the farmed spot (or a ranked
+  one) or for every spot on the Farming tab ("Combat build"), kept in her
+  character memory (`GameState.build_choices`, at most 200 spots; "auto"
+  for a spot clears its own choice); it applies at once. On auto, the
+  analyzer rates her spot for every build she can field with that build's
+  own profile (`farm_analyzer.build_profile`, `FarmAnalyzer.style_ratings`
+  by build: after the warn-only run of the build she fields, one run per
+  other build, once per ranking, kept apart from the ranking). A build
+  whose profile her real numbers cannot give (a spell never sampled, a
+  launcher not examined, a bar that cannot pay the spell beyond the
+  healing reserve) is not rated, even while she fields it (its warn-only
+  run then uses her ordinary profile, kept as melee's), and only a rating
+  `encounter_rated` accepts counts. Fielding another build re-runs the
+  warn-only run for it. She fields the safest: a build without an encounter
+  warning before one with, then the most XP; among warned builds the
+  highest encounter safety. She keeps the build she fields unless another
+  is safer (hers warns and the other does not, or both warn and it is
+  0.10 safer: at once) or earns 20% more XP an hour (not within an hour
+  of taking hers up). The build she fields, since when and a pending swap
+  are kept in her character memory, so a restart keeps the hold and the
+  swap. Unrated, she keeps the
+  build she fields (a new circuit takes it over), else her default plan
+  (melee); a new ranking keeps each build's earlier ratings until it is
+  re-run. An explicit (non-analyzer) circuit fields no build.
+- **Unmet requirement.** An operator's build she cannot field falls back to
+  the auto choice among those she can, with a `build-gap` decision and a
+  "Build gap" warning alert. The "get this build" errand works towards the
+  operator's unmet build here, else the AoE build while she cannot field
+  it and auto (or an operator's AoE choice somewhere) wants it; with every
+  spot set to another build, none (the gap still shows).
+- **Learning a spell** (`LearnSpellTask`). Spell sellers and their spells
+  are indexed from content at graph build (`WorldGraph.spell_offers`: each
+  `generic/spell_seller.py` event's `slaying` list, with each spell's level
+  and price from its archetype). The first target is Firestorm from
+  Dunowen (`world_17_2_2` (5,9), level 15, 5 gold). She greets the seller,
+  follows the spell's link, reads "X requires level N to use. Your wizardry
+  spells skill is level M." and "X will cost you P. Is that okay?"
+  (`Merchant.py` `SpellSeller`), and confirms only when she can cast it and
+  pay it from true surplus (`_spending_reserve`: her cure reserve plus the
+  heal restock, recall and identify-all reserves). Short, she does not go:
+  the dashboard shows "Get this build: need 5g for Firestorm from Dunowen"
+  (and a `build-errand-funds` decision) until the owner drops gold on her.
+  "You don't have enough money..." is handled the same way. The trip uses
+  the strict route policy of the other optional errands. A failed trip
+  waits on its spell's own backoff (30 minutes, longer for a refused strict
+  route);
+  after three failed trips for one spell the errand gives that spell up
+  (another that fields the build may still be learnt), with a "Learn
+  errand failed" alert until the operator retries it (the Farming tab's
+  Retry, refused when nothing gave up; it ends the retried spells' route
+  or dialogue backoff only, never a seller's money refusal) or the process restarts.
+- **Swapping sets.** A build change that changes the gear style makes one
+  apartment trip (`SwapSetTask`) when her chest holds, as her index knows
+  it, a piece of the new style's set that beats what she wears, or the new
+  build's consumables (ammunition for her launcher, area-spell wands): take
+  them out, wear the pieces (the server takes off what each slot held),
+  then deposit what is no longer her active set. The AoE and single-target
+  casters share the caster set, so a change between them makes no trip,
+  and stored area wands are not fetched for it (the farm does not fire
+  wands).
+  Items deposited earlier in the session may come back on that trip. The
+  trip skips the routine 30-minute wait between storage visits, never a
+  failed trip's backoff.
+- **Suggestion.** The Farming tab lists the best set for the spot's build
+  from what she owns: per slot what she wears or carries first (the gear
+  scorer's best), then what her chest holds for that build, and the stored
+  consumables.
+
+Not done: shop items that would improve the set (no examined shop stock is
+cached), choosing icestorm or another element per spot by monster
+protections, and fighting with wands.
 
 ## Packs on a walk: cornered and outclassed (2026-11-24)
 
@@ -2279,7 +2421,9 @@ savebed is known and fully safe (see the README's "Farming analyzer").
 At Wizardry 15 the single-target restriction should give way to area spells.
 
 - **Purchase.** Buy both firestorm and icestorm from Dunowen in the Wizards'
-  Tower (Daffodil, `world_17_2_2` at (5,9)), 5 gold each.
+  Tower (Daffodil, `world_17_2_2` at (5,9)), 5 gold each. Firestorm is now
+  learnt by the "get this build" errand
+  ([combat builds](#combat-builds-per-spot-2026-11-26)).
 - **Element choice.** Cast whichever spell the monsters are not immune to.
   Ice golems are cold-immune and fire-weak; lava golems are the reverse.
   Firestorm is the default.

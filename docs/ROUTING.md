@@ -1452,7 +1452,9 @@ category as the quarantines and `kit_hazard` filters that
   carries the analyzer's encounter model. A separate encounter run passes
   her combat style, measured healing and speed, and its fields only warn
   (COMBAT.md, "Encounter warnings"); the ranking run passes no style, so
-  the analyzer's ranking and the score's inputs (4.5) are unchanged.
+  the analyzer's ranking and the score's inputs (4.5) are unchanged. The
+  runs for the other builds' styles (COMBAT.md, "Combat builds per spot")
+  feed only the build she fields on the chosen spot, never the spot.
 - Savebed selection ranks beds by route cost, not tiles. The ship then counts
   for a Brynknot bed serving Asteria spots.
 - `_observe_farm_death` already blames the destination for a transit death

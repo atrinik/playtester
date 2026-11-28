@@ -33,6 +33,7 @@ from .equipment import (MAGIC_HIDDEN_TYPES, WEIGHT_NONE, WEIGHT_UNOWNED, BaseSta
 from . import route_shadow, terrain
 from . import owner_watch
 from . import storage
+from .builds import AREA_SPELLS
 from .observations import is_player, plain
 from .model import STARTER_APARTMENT, Item, MapObject
 from .hunger import food_obsolete
@@ -2438,6 +2439,21 @@ class FarmTask(BotTask):
         self.inventory_policy = InventoryPolicy()
         self.combat_skill = combat_skill.casefold().strip()
         self.combat_spell = combat_spell.casefold().strip()
+        # The farm circuit's fielded build (builds.py): a caster build
+        # fights with its spell (out of SP with a hostile in contact she
+        # disengages), and a build's gear style replaces her training's.
+        self.fielded_caster = False
+        self.gear_style_override = ""
+        # Whether a fielded caster is out of SP for a cast
+        # (spell_only_training), and when that was last recorded.
+        self._caster_dry = False
+        self._caster_dry_at = float("-inf")
+        # A dry caster's rest out of a fight (_dry_rest_rising): her SP when
+        # it last rose and since when.
+        self._dry_rest_sp: int | None = None
+        self._dry_rest_since = 0.0
+        # The target she was fighting when she ran dry (the latch's fight).
+        self._dry_target: int | None = None
         self.allow_launchers = (
             not bool(self.combat_spell)
             if allow_launchers is None else bool(allow_launchers))
@@ -3454,12 +3470,13 @@ class FarmTask(BotTask):
             self.combat_skill in item.name.casefold()), None)
 
     def casts_firestorm(self, client: AtrinikClient) -> bool:
-        """Whether this farm casts Firestorm, which strikes several at
-        once: configured and known. Merely knowing it is not enough."""
+        """Whether this farm casts an area spell (Firestorm and the
+        others of builds.AREA_SPELLS), which strikes several at once:
+        configured and known. Merely knowing one is not enough."""
         return (
-            self.combat_spell == "firestorm" and
+            self.combat_spell in AREA_SPELLS and
             any(item.item_type == c.TYPE_SPELL and
-                item.name.casefold() == "firestorm"
+                item.name.casefold() == self.combat_spell
                 for item in client.state.inventory))
 
     def single_target_wizardry(self, client: AtrinikClient) -> bool:
@@ -3474,6 +3491,10 @@ class FarmTask(BotTask):
             self.training_active(client) and
             not self.casts_firestorm(client))
 
+    # A fielded caster's caster-out-of-mana record repeats at most this
+    # often: each regenerated cast would otherwise start a new one.
+    DRY_RECORD_SECONDS = 60.0
+
     def spell_only_training(self, client: AtrinikClient) -> bool:
         """Whether every hit on a training target must be the trained spell.
 
@@ -3484,14 +3505,80 @@ class FarmTask(BotTask):
         """
         if not ("wizardry" in self.combat_skill and
                 self.training_active(client)):
+            self._caster_dry = False
             return False
         # A bar too small for one cast beyond the healing reserve can never
         # cast: then the weapon trains (the profile ranks it that way too).
         spell = self.combat_spell_item(client)
         maxsp = int(client.state.stats.get("maxsp", 0) or 0)
         cost = int(spell.extra.get("cost", 0) or 0) if spell else 0
+        if spell is not None and self.fielded_caster and self._wields_weapon(client):
+            # A fielded caster who cannot afford a cast above her healing
+            # reserve, with no charged mana crystal to draw from, fights
+            # with her weapon by the ordinary melee rules until she can
+            # cast again (a caster-out-of-mana record at most every
+            # DRY_RECORD_SECONDS, not one per regenerated cast).
+            sp = int(client.state.stats.get("sp", 0) or 0)
+            reserve = self.healing_mana_reserve(client)
+            # Only a bar that can ever pay a cast is "dry"; one that never
+            # can is the ordinary weapon path below, with no rests for SP.
+            # Before her stats arrive (no maximum yet) she is not dry.
+            castable = maxsp > 0 and cost <= maxsp - reserve
+            dry = (castable and cost > sp - reserve and
+                   not ManaCrystal.has_charge(client))
+            engaged_id = self._engaged_target[0] if self._engaged_target else None
+            if recent_hostile_contact(client):
+                # A fight: the dry rest's stall clock counts quiet rest only
+                # (the rest gate resets it for a visible engagement too).
+                self._dry_rest_sp = None
+            if (self._caster_dry and castable and sp < maxsp and
+                    ((engaged_id is not None and engaged_id == self._dry_target) or
+                     recent_hostile_contact(client))):
+                # Dry stays latched for the rest of the fight: one
+                # regenerated cast does not flip her back to the spell and
+                # away from melee; the rest between pulls refills her bar.
+                dry = True
+            now = time.monotonic()
+            if dry and not self._caster_dry and now - self._caster_dry_at >= self.DRY_RECORD_SECONDS:
+                self._caster_dry_at = now
+                recorder = getattr(client, "record_action", None)
+                if recorder is not None:
+                    recorder("caster-out-of-mana", f"{spell.name}: fighting with her weapon")
+            if dry and not self._caster_dry:
+                # The fight she ran dry in: a new pull is a new fight.
+                self._dry_target = engaged_id
+            self._caster_dry = dry
+            if not dry:
+                self._dry_rest_sp = None
+            if dry:
+                return False
+        else:
+            self._caster_dry = False
+            self._dry_rest_sp = None
         return spell is not None and (
             maxsp <= 0 or cost <= maxsp - self.healing_mana_reserve(client))
+
+    # A dry caster rests for SP out of a fight only while it rises: after
+    # this long without a point gained (no regeneration: no food, a
+    # depletion) she fights with her weapon as the ordinary farm does.
+    DRY_REST_STALL_SECONDS = 60.0
+
+    def _dry_rest_rising(self, client: AtrinikClient) -> bool:
+        sp = int(client.state.stats.get("sp", 0) or 0)
+        now = time.monotonic()
+        if self._dry_rest_sp is None or sp > self._dry_rest_sp:
+            self._dry_rest_sp, self._dry_rest_since = sp, now
+        elif sp < self._dry_rest_sp:
+            # Spent (a cast): the clock goes on, from the lower SP.
+            self._dry_rest_sp = sp
+        return now - self._dry_rest_since < self.DRY_REST_STALL_SECONDS
+
+    @staticmethod
+    def _wields_weapon(client: AtrinikClient) -> bool:
+        state = client.state
+        weapon = state.items.get(state.equipment.get(c.EQUIP_WEAPON, 0))
+        return (weapon is not None and weapon.item_type == c.TYPE_WEAPON and
+                bool(weapon.flags & c.ITEM_APPLIED))
 
     # Without a usable heal or a ready recall, she pulls only from this
     # share of her health up (owner decision, 2026-11-22: a recall is not
@@ -3623,6 +3710,12 @@ class FarmTask(BotTask):
 
     def primary_combat_spell(self, client: AtrinikClient) -> Item | None:
         """Use configured spell pressure until finisher logic takes control."""
+        if self.fielded_caster:
+            # Refresh the latch (off the farm map nothing else may have).
+            self.spell_only_training(client)
+        if self._caster_dry:
+            # Latched dry: this fight is her weapon's.
+            return None
         if self.neutral_targets:
             # Dense passive farms are safe only while exactly one creature has
             # been deliberately pulled. Directional pressure during the chase
@@ -3660,6 +3753,13 @@ class FarmTask(BotTask):
     async def training_finisher(self, client: AtrinikClient, x: int, y: int,
                                 obj) -> bool:
         """Attempt the killing blow with the explicitly requested skill."""
+        if self.fielded_caster:
+            # Refresh the latch (off the farm map nothing else may have).
+            self.spell_only_training(client)
+        if self._caster_dry:
+            # A fielded caster latched dry fights this fight with her weapon:
+            # no finisher cast, kite or neutral buffer turns combat off.
+            return False
         hp = int(client.state.stats.get("hp", 0) or 0)
         maxhp = max(1, int(client.state.stats.get("maxhp", 1) or 1))
         pending_for_target = bool(
@@ -4752,7 +4852,7 @@ class FarmTask(BotTask):
         self.inventory_policy.caster_profile = (
             CasterProfile.from_client(client)
             if self.inventory_policy.caster_stats else None)
-        self.inventory_policy.gear_style = gear_style(
+        self.inventory_policy.gear_style = self.gear_style_override or gear_style(
             self.combat_skill, self.inventory_policy.caster_stats)
         for item in client.state.inventory:
             lore_attempted = getattr(client, "lore_book_attempted", None)
@@ -7353,11 +7453,16 @@ class FarmTask(BotTask):
             await client.set_combat(False)
             self.complete()
             return
-        if (engaged is None and self.spell_only_training(client) and
-                (nearest_threat is None or nearest_threat[0] > 2) and
-                not any(active_threat(entry) for entry in threats
-                        if entry[3].target_id not in pulled_aside_ids) and
-                not recent_hostile_contact(client)):
+        quiet = (engaged is None and
+                 (nearest_threat is None or nearest_threat[0] > 2) and
+                 not any(active_threat(entry) for entry in threats
+                         if entry[3].target_id not in pulled_aside_ids) and
+                 not recent_hostile_contact(client))
+        if not quiet:
+            # A dry caster's rest-stall clock counts quiet rest time only.
+            self._dry_rest_sp = None
+        if quiet and (self.spell_only_training(client) or
+                      (self._caster_dry and self._dry_rest_rising(client))):
             # Spell-only training pulls on a full mana bar, so most of a
             # fight is cast without waiting for mana mid-fight. Resting out
             # of combat also ramps regeneration up (Meditation). Mana

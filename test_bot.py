@@ -61,6 +61,43 @@ from . import constants as c
 from .autoplay import AutoplayTask
 
 
+# Two rows of the server's spell table (include/spellist.h) as laid out:
+# id, name, sp, time, scrolls, charges, range, value_mul, bdam, bdur, ...
+SPELLIST_ROWS = """
+spell_struct spells[NROFREALSPELLS] = {
+    {"spell_firestorm",
+     "firestorm",
+     5,
+     8,
+     3,
+     6,
+     0,
+     1.0,
+     3,
+     5,
+     4,
+     4,
+     9,
+     "magic_fire.ogg",
+     SPELL_USE_CAST | SPELL_USE_WAND,
+     SPELL_DESC_DIRECTION,
+     PATH_FIRE,
+     "firebreath",
+     NULL},
+
+    {"spell_magic_bullet",
+     "magic bullet",
+     4, 8, 3, 6, 0, 1.0, 7, 5, 4, 4, 9,
+     "magic_bullet1.ogg",
+     SPELL_USE_CAST,
+     SPELL_DESC_DIRECTION,
+     PATH_MISSILE,
+     "bullet",
+     NULL},
+};
+"""
+
+
 @lru_cache(maxsize=1)
 def built_graph():
     return WorldGraph().build()
@@ -22079,8 +22116,9 @@ if ("--approach-origin" in args and
     raise SystemExit("unknown approach origin map: " +
                      args[args.index("--approach-origin") + 1])
 level = int(args[0])
-need = ("--melee-damage", "--weapon-class", "--weapon-speed", "--content-root",
-        "--server-root", "--ranking", "--json")
+need = (("--damage-per-attack", "--mana-cost") if "--damage-per-attack" in args else
+        ("--melee-damage", "--weapon-class", "--weapon-speed")) + (
+        "--content-root", "--server-root", "--ranking", "--json")
 missing = [flag for flag in need if flag not in args]
 if missing:
     print("missing " + " ".join(missing), file=sys.stderr)
@@ -22127,7 +22165,13 @@ if "--healing-per-second" in args:
                           encounter_style=(args[args.index("--combat-style") + 1]
                                            if styled else "melee"),
                           encounter_safety=0.4, expected_pack=1.5, worst_pack=8.0,
-                          encounter_reasons=["styled" if styled else "unstyled"])
+                          encounter_reasons=["styled" if styled else "unstyled"],
+                          avg_kill_seconds=30.0,
+                          # Echoes the profile a styled run rated with.
+                          encounter_need=" ".join(
+                              " ".join(args[args.index(flag):args.index(flag) + 2])
+                              for flag in ("--damage-per-attack", "--max-aggro-pack")
+                              if flag in args))
             if styled:
                 result["safety_score"] = min(result["safety_score"], 0.4)
                 result["spot_safety_score"] = 0.4
@@ -41839,6 +41883,1159 @@ class InventoryStorageTests(unittest.TestCase):
         # One pouch goes home; the key ring and the heal stay carried.
         self.assertEqual([item.tag for item in circuit._storable_items(client)],
                          [pouches[0].tag])
+
+
+class BuildPerSpotTests(unittest.TestCase):
+    """A combat build per farm spot (builds.py): chosen by the operator or
+    by the encounter model's per-style ratings, a gap and a "get this
+    build" errand when she cannot field it, and one apartment trip to
+    swap gear sets on a change."""
+
+    LEVELS = {"firestorm": 15, "icestorm": 15, "magic bullet": 1,
+              "minor healing": 1, "cause light wounds": 1}
+
+    @staticmethod
+    def _client(gold: int = 0):
+        """Sera live, on 2026-11-26: Slash 36, Wizardry 15, Magic Devices 1;
+        she knows magic bullet, minor healing and cause light wounds and
+        carries firestorm (L2) and icestorm (L5) wands."""
+        client = type("Client", (), {})()
+        client.state = GameState(phase="playing", player_tag=7)
+        client.state.stats.update(level=38, weight_limit=100, pow=15, int=15, maxsp=100)
+        client.state.bank_balance = 0
+        client.state.bank_balance_known = True
+        client.actions = []
+        client.record_action = lambda action, detail="": client.actions.append((action, detail))
+        tag = iter(range(100, 200))
+        for name, level in (("slash weapons", 36), ("wizardry spells", 15),
+                            ("magic devices", 1)):
+            client.state.place_item(Item(next(tag), item_type=c.TYPE_SKILL, name=name,
+                                         extra={"level": level}), 7)
+        for name in ("magic bullet", "minor healing", "cause light wounds"):
+            client.state.place_item(Item(next(tag), item_type=c.TYPE_SPELL, name=name), 7)
+        for name in ("wand of firestorm (lvl 2)", "wand of icestorm (lvl 5)"):
+            client.state.place_item(Item(next(tag), item_type=c.TYPE_WAND, quality=80,
+                                         name=name), 7)
+        client.state.place_item(Item(next(tag), item_type=c.TYPE_WEAPON, flags=c.ITEM_APPLIED,
+                                     quality=80, condition=80, name="long sword"), 7)
+        if gold:
+            client.state.place_item(Item(next(tag), item_type=c.TYPE_MONEY, quantity=gold,
+                                         name="gold coins"), 7)
+        return client
+
+    @staticmethod
+    def _rating(style, safety, xp, worst=2.0):
+        return {"analyzer_schema_version": 2, "encounter_applied": True,
+                "encounter_style": style, "encounter_safety": safety,
+                "worst_pack": worst, "xp_hour": xp, "name": "spot"}
+
+    def test_an_aoe_spot_without_an_area_spell_falls_back_with_a_gap(self):
+        from . import builds
+        from .farm_analyzer import encounter_warning
+        client = self._client()
+        self.assertEqual(builds.fieldable(client.state, self.LEVELS), ("melee", "single"))
+        gaps = builds.gaps("aoe", client.state, self.LEVELS)
+        self.assertIn("no area spell she can cast (Wizardry 15)", gaps[0])
+        # Her wands field no build: the farm casts, it does not fire wands.
+        self.assertIn("wand of firestorm (lvl 2)", gaps[0])
+        ratings = {"melee": self._rating("melee", 0.4, 900.0, worst=8.0),
+                   "single": self._rating("ranged-kite", 0.85, 700.0)}
+        choice = builds.choose(client.state, "/burnt", ratings, {"/burnt": "aoe"},
+                               self.LEVELS, warn=encounter_warning)
+        self.assertEqual((choice.build, choice.chosen, choice.fallback, choice.wanted),
+                         ("single", "aoe", True, "aoe"))
+        self.assertIn("AoE caster needs: no area spell", choice.reason)
+        self.assertIn("falling back to Single-target caster", choice.reason)
+        # Learnt, Firestorm fields it.
+        client.state.place_item(Item(300, item_type=c.TYPE_SPELL, name="firestorm"), 7)
+        choice = builds.choose(client.state, "/burnt", ratings, {"/burnt": "aoe"},
+                               self.LEVELS, warn=encounter_warning)
+        self.assertEqual((choice.build, choice.fallback), ("aoe", False))
+        self.assertEqual(builds.build_spell("aoe", client.state, self.LEVELS), "firestorm")
+
+    def test_auto_picks_the_safest_build_she_can_field(self):
+        from . import builds
+        from .farm_analyzer import encounter_warning
+        client = self._client()
+        # Melee would earn more, but its bad pulls warn; the safe single-
+        # target kite wins. The AoE build rates safest, but she cannot
+        # field it.
+        ratings = {"melee": self._rating("melee", 0.45, 1200.0, worst=8.0),
+                   "single": self._rating("ranged-kite", 0.85, 700.0),
+                   "aoe": self._rating("aoe-kite", 0.95, 1500.0)}
+        choice = builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                               warn=encounter_warning, current="")
+        self.assertEqual((choice.build, choice.chosen, choice.fallback), ("single", "auto", False))
+        self.assertIn("ranged-kite encounter safety 0.85", choice.reason)
+        # Both safe: the one with more XP.
+        ratings["melee"] = self._rating("melee", 0.9, 1200.0)
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                       warn=encounter_warning, current="").build, "melee")
+        # Neither safe: the safer one.
+        ratings["melee"] = self._rating("melee", 0.5, 1200.0, worst=9.0)
+        ratings["single"] = self._rating("ranged-kite", 0.7, 700.0, worst=9.0)
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                       warn=encounter_warning, current="").build, "single")
+        # Unrated, she keeps her default plan, or the build she fields
+        # while a new ranking is rated (no swap back and forth).
+        self.assertEqual(builds.choose(client.state, "/spot", {}, {}, self.LEVELS).build, "melee")
+        self.assertEqual(builds.choose(client.state, "/spot", {}, {}, self.LEVELS,
+                                       current="single").build, "single")
+        # The analyzer rates every build she can field, with its spell.
+        self.assertEqual(builds.fieldable_spells(client.state, self.LEVELS),
+                         {"melee": "", "single": "magic bullet"})
+
+    def test_an_unrated_build_never_beats_a_rated_one(self):
+        from . import builds
+        from .farm_analyzer import encounter_rated, encounter_warning
+        client = self._client()
+        unapplied = dict(self._rating("ranged-kite", 0.99, 5000.0), encounter_applied=False)
+        old = dict(self._rating("ranged-kite", 0.99, 5000.0), analyzer_schema_version=1)
+        warned = self._rating("melee", 0.3, 100.0, worst=9.0)
+        for rating in (unapplied, old, None):
+            choice = builds.choose(client.state, "/spot", {"melee": warned, "single": rating},
+                                   {}, self.LEVELS, warn=encounter_warning,
+                                   rated=encounter_rated, current="")
+            self.assertEqual(choice.build, "melee")
+
+    def test_the_build_holds_against_a_near_tie(self):
+        from . import builds
+        from .farm_analyzer import encounter_rated, encounter_warning
+        client = self._client()
+        ratings = {"single": self._rating("ranged-kite", 0.9, 1000.0),
+                   "melee": self._rating("melee", 0.9, 1150.0)}
+
+        def pick(held=False):
+            return builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                 warn=encounter_warning, rated=encounter_rated,
+                                 current="single", held=held).build
+        # 15% more XP is a near tie: she keeps what she fields.
+        self.assertEqual(pick(), "single")
+        # 25% more: worth a change, but not within the hour she took it up.
+        ratings["melee"] = self._rating("melee", 0.9, 1250.0)
+        self.assertEqual(pick(), "melee")
+        self.assertEqual(pick(held=True), "single")
+        # Hers warns and the other does not: safer wins at once.
+        ratings["single"] = self._rating("ranged-kite", 0.5, 2000.0, worst=9.0)
+        ratings["melee"] = self._rating("melee", 0.9, 100.0)
+        self.assertEqual(pick(held=True), "melee")
+        # Both warn: one at least 0.10 safer wins at once, even held.
+        ratings["single"] = self._rating("ranged-kite", 0.7, 100.0, worst=9.0)
+        ratings["melee"] = self._rating("melee", 0.3, 2000.0, worst=9.0)
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                       warn=encounter_warning, rated=encounter_rated,
+                                       current="melee", held=True).build, "single")
+        ratings["single"] = self._rating("ranged-kite", 0.35, 100.0, worst=9.0)
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                                       warn=encounter_warning, rated=encounter_rated,
+                                       current="melee").build, "melee")
+        # The operator's choice applies at once, held or not.
+        self.assertEqual(builds.choose(client.state, "/spot", ratings, {"*": "single"},
+                                       self.LEVELS, current="melee", held=True).build,
+                         "single")
+
+    def test_an_operator_build_choice_persists_and_sticks(self):
+        from . import builds
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.set_build_choice("/shattered_islands/world_17_72", "single")
+            client.set_build_choice(builds.EVERY_SPOT, "melee")
+            with self.assertRaises(ValueError):
+                client.set_build_choice("/x", "wizard")
+            restored = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            restored.state.player_name = "Sera"
+            restored.load_character_memory("Sera")
+            self.assertEqual(restored.state.build_choices,
+                             {"/shattered_islands/world_17_72": "single", "*": "melee"})
+            # The spot's choice sticks however the ratings go; elsewhere
+            # every spot's applies; "auto" for the spot clears its own.
+            sera = self._client()
+            ratings = {"melee": self._rating("melee", 0.99, 5000.0)}
+            for spot, build in (("/shattered_islands/world_17_72", "single"), ("/other", "melee")):
+                self.assertEqual(builds.choose(sera.state, spot, ratings,
+                                               restored.state.build_choices,
+                                               self.LEVELS).build, build)
+            restored.set_build_choice("/shattered_islands/world_17_72", "auto")
+            self.assertEqual(restored.state.build_choices, {"*": "melee"})
+
+    def test_the_circuit_holds_the_build_an_hour(self):
+        client = self._client()
+        circuit = self._circuit(client)
+        ratings = {"melee": self._rating("melee", 0.9, 1300.0),
+                   "single": self._rating("ranged-kite", 0.9, 1000.0)}
+        client.farm_analyzer = types.SimpleNamespace(spot_ratings=lambda spot: ratings)
+        circuit._build_name = "single"
+        client.active_build_since = time.time() - 600.0
+        self.assertEqual(circuit._choose_build(client).build, "single")
+        client.active_build_since = time.time() - 4000.0
+        self.assertEqual(circuit._choose_build(client).build, "melee")
+        # A build her bar cannot kill a monster with is not rated.
+        ratings["melee"] = dict(ratings["melee"], build_affordable=False)
+        self.assertEqual(circuit._choose_build(client).build, "single")
+
+    def test_build_state_and_spell_samples_survive_a_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.set_build_state(active_build="single", active_build_since=1234.5,
+                                   pending_swap_build="single")
+            client.set_spell_samples({"magic bullet": {"hits": [10, 12, "x", -3, 14],
+                                                       "attack": "magic"},
+                                      "bad": "row"})
+            restored = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            restored.state.player_name = "Sera"
+            restored.load_character_memory("Sera")
+            self.assertEqual((restored.active_build, restored.active_build_since,
+                              restored.pending_swap_build), ("single", 1234.5, "single"))
+            self.assertEqual(restored.state.spell_samples,
+                             {"magic bullet": {"hits": [10, 12, 14], "attack": "magic"}})
+            # The analyzer starts from them, and saves what it samples.
+            helper = FarmAnalyzerTests()
+            helper._cleanups = []
+            analyzer = helper.analyzer()
+            analyzer._load_samples(restored)
+            self.assertEqual(analyzer.samples_by_spell["magic bullet"], [10, 12, 14])
+            analyzer.samples_by_spell["firestorm"] = [12]
+            analyzer.attack_by_spell["firestorm"] = "fire"
+            analyzer._sample_count += 1
+            # Saved at most once a minute, whenever a hit was added (even
+            # one equal to the last).
+            analyzer._load_samples(restored)
+            self.assertNotIn("firestorm", restored.state.spell_samples)
+            analyzer._samples_saved_at -= analyzer.SAMPLE_SAVE_SECONDS
+            analyzer._load_samples(restored)
+            self.assertEqual(restored.state.spell_samples["firestorm"],
+                             {"hits": [12], "attack": "fire"})
+            for cleanup, args, kwargs in reversed(helper._cleanups):
+                cleanup(*args, **kwargs)
+
+    def test_a_dry_fielded_caster_fights_with_her_weapon(self):
+        from .tasks import FarmTask
+
+        def farm(weapon=True):
+            client = QuestTests._wizard_training_client(100, x=9, y=8)
+            if weapon:
+                sword = Item(50, flags=c.ITEM_APPLIED, item_type=c.TYPE_WEAPON,
+                             quality=80, condition=80, name="long sword")
+                client.state.inventory.append(sword)
+                client.state.items[50] = sword
+                client.state.equipment[c.EQUIP_WEAPON] = 50
+            client.state.stats.update(hp=100, maxhp=100, sp=0, maxsp=100, target_hp=100)
+            client.state.target_id = 100
+            client.state.messages = [(time.time(), 2, "cc66ff",
+                                      "kobold hit you for 4 damage.")]
+            client.actions = []
+            client.record_action = lambda action, detail="": client.actions.append(
+                (action, detail))
+            task = FarmTask(zone="/test", target="kobold", combat_skill="wizardry spells",
+                            combat_spell="cause light wounds")
+            task.fielded_caster = True
+            return client, task
+
+        def tick(client, task):
+            task._last_action = 0
+            asyncio.run(task.tick(client))
+
+        # Out of SP with the kobold attacking beside her: she melees it with
+        # her sword, by the ordinary rules, and walks after nothing.
+        client, task = farm()
+        tick(client, task)
+        tick(client, task)
+        self.assertTrue(client.combat and all(client.combat))
+        self.assertEqual((client.fired, client.moves, client.direct_moves), ([], [], []))
+        self.assertEqual([action for action, _ in client.actions], ["caster-out-of-mana"])
+        # The fight over and her SP back for a cast: she casts again (at
+        # the next kobold, four tiles off).
+        client.state.stats["sp"] = 20
+        client.state.messages = []
+        task.release_engagement(100)
+        client.combat.clear()
+        client.state.map.tile(9, 8).objects.pop(3)
+        client.state.map.tile(12, 8).objects[3] = MapObject(
+            3, 1, 0, 0, name="kobold", target_id=101, target_hp=100)
+        client.state.target_id = 101
+        for _ in range(3):
+            tick(client, task)
+        self.assertTrue(client.fired)
+        self.assertEqual(set(client.fired), {(3, 42)})
+        self.assertNotIn(True, client.combat)
+        # Dry again after a cast: no new record within a minute (each
+        # regenerated cast would start one), then another.
+        client.state.stats["sp"] = 0
+        self.assertFalse(task.spell_only_training(client))
+        self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 1)
+        task._engaged_target = None
+        client.state.stats["sp"] = 20
+        self.assertTrue(task.spell_only_training(client))
+        task._caster_dry_at -= task.DRY_RECORD_SECONDS
+        client.state.stats["sp"] = 0
+        self.assertFalse(task.spell_only_training(client))
+        self.assertEqual([action for action, _ in client.actions].count("caster-out-of-mana"), 2)
+        # A bar that can never pay a cast beyond her healing reserve is not
+        # "dry": the ordinary weapon path, with no rests for SP.
+        client.state.inventory.append(Item(60, item_type=c.TYPE_SPELL, name="minor healing",
+                                           extra={"cost": 40}))
+        self.assertFalse(task.spell_only_training(client))
+        self.assertFalse(task._caster_dry)
+        client.state.inventory.pop()
+        # A charged mana crystal to draw from: not dry, the spell routine
+        # (which draws) stays.
+        from .tasks import ManaCrystal
+        with patch.object(ManaCrystal, "has_charge", classmethod(lambda cls, client: True)):
+            self.assertTrue(task.spell_only_training(client))
+        # Dry in a fight stays dry for the rest of it: one regenerated cast
+        # does not flip her back to the spell; out of the fight the latch
+        # lifts.
+        client, task = farm()
+        tick(client, task)
+        self.assertTrue(task._caster_dry)
+        client.state.stats["sp"] = 4
+        client.combat.clear()
+        tick(client, task)
+        # Still in melee (combat on, no kite away), whatever the one cast's
+        # SP pays for alongside it.
+        self.assertFalse(task.spell_only_training(client))
+        self.assertTrue(client.combat and all(client.combat))
+        self.assertEqual(client.direct_moves, [])
+        # A full bar ends the latch even in the fight.
+        client.state.stats["sp"] = 100
+        self.assertTrue(task.spell_only_training(client))
+        client.state.stats["sp"] = 0
+        self.assertFalse(task.spell_only_training(client))
+        client.state.stats["sp"] = 4
+        client.state.messages = []
+        task.release_engagement(100)
+        client.state.map.tiles.clear()
+        self.assertTrue(task.spell_only_training(client))
+        # No stats yet (no maximum SP): not dry.
+        client.state.stats.update(sp=0, maxsp=0)
+        self.assertTrue(task.spell_only_training(client))
+        self.assertFalse(task._caster_dry)
+        # Dry with nothing near: she rests for SP rather than fighting
+        # with her weapon, while her SP rises; after a minute without a
+        # point gained she stops resting.
+        client, task = farm()
+        client.state.map.tiles.clear()
+        client.state.messages = []
+        client.lock_item = AsyncMock()
+        tick(client, task)
+        self.assertTrue(task._caster_dry)
+        self.assertIn("training-rest", [action for action, _ in client.actions])
+        self.assertTrue(task._training_resting)
+        # A fight between rests restarts the clock: only quiet rest counts.
+        task._dry_rest_since -= task.DRY_REST_STALL_SECONDS
+        client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+        self.assertFalse(task.spell_only_training(client))
+        self.assertIsNone(task._dry_rest_sp)
+        client.state.messages = []
+        tick(client, task)
+        self.assertTrue(task._training_resting)
+        task._dry_rest_since -= task.DRY_REST_STALL_SECONDS
+        tick(client, task)
+        self.assertFalse(task._training_resting)
+        # Latched with the kobold in the finisher window and SP for two
+        # casts: she keeps meleeing, no finisher cast, kite or combat off.
+        client, task = farm()
+        tick(client, task)
+        self.assertTrue(task._caster_dry)
+        client.state.stats.update(sp=10, target_hp=10)
+        client.state.map.tile(9, 8).objects[3].target_hp = 10
+        client.combat.clear()
+        for _ in range(3):
+            client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+            tick(client, task)
+        self.assertTrue(client.combat and all(client.combat))
+        self.assertEqual((client.fired, client.direct_moves), ([], []))
+        # Each half of the latch on its own: the same engaged target with
+        # no contact ...
+        client.state.messages = []
+        task.remember_engagement(client, 9, 8, 100)
+        task._dry_target = 100
+        self.assertFalse(task.spell_only_training(client))
+        # ... and contact with no engaged target.
+        task._engaged_target = None
+        self.assertTrue(task.spell_only_training(client))
+        task._caster_dry = True
+        client.state.messages = [(time.time(), 2, "cc66ff", "kobold hit you for 4 damage.")]
+        self.assertFalse(task.spell_only_training(client))
+        # A visible engagement (no contact) resets the dry rest's clock
+        # in the rest gate.
+        client.state.messages = []
+        task._caster_dry, task._dry_rest_sp = True, 5
+        task.remember_engagement(client, 9, 8, 100)
+        tick(client, task)
+        self.assertIsNone(task._dry_rest_sp)
+        # An engagement lingering out of view does not hold the clock back.
+        client, task = farm()
+        client.lock_item = AsyncMock()
+        client.state.messages = []
+        client.state.map.tiles.clear()
+        tick(client, task)
+        self.assertTrue(task._training_resting)
+        task.remember_engagement(client, 9, 8, 100)
+        task._dry_rest_since -= task.DRY_REST_STALL_SECONDS
+        tick(client, task)
+        self.assertFalse(task._training_resting)
+        # Without a weapon she keeps the spell-only routine: no melee.
+        client, task = farm(weapon=False)
+        tick(client, task)
+        self.assertNotIn(True, client.combat)
+        self.assertTrue(task.spell_only_training(client))
+        self.assertEqual(client.actions[-1][0], "caster-kite")
+
+    def test_an_equal_hit_on_a_full_list_is_still_saved(self):
+        helper = FarmAnalyzerTests()
+        helper._cleanups = []
+        analyzer = helper.analyzer()
+        client = helper.client()
+        client.state.player_name = "Sera"
+        saved = []
+        client.set_spell_samples = lambda samples: saved.append(
+            {spell: list(entry["hits"]) for spell, entry in samples.items()})
+        analyzer.samples_by_spell["magic bullet"] = [12] * 30
+        analyzer.attack_by_spell["magic bullet"] = "magic"
+        analyzer._samples_loaded = "Sera"
+        analyzer._load_samples(client)
+        self.assertEqual(len(saved), 1)
+        # One more hit equal to the last: the list is still 30 long and
+        # ends the same, but it is new and is saved.
+        now = time.time()
+        client.offensive_casts = collections.deque([(now - 1, "magic bullet")])
+        client.state.messages = [(now, 0, "", "You hit kobold for 12 (0) with magic.")]
+        analyzer.observe_spells(client)
+        self.assertEqual(analyzer.samples_by_spell["magic bullet"], [12] * 30)
+        analyzer._samples_saved_at -= analyzer.SAMPLE_SAVE_SECONDS
+        analyzer._load_samples(client)
+        self.assertEqual(len(saved), 2)
+        for cleanup, args, kwargs in reversed(helper._cleanups):
+            cleanup(*args, **kwargs)
+
+    def test_a_fielded_spell_never_resets_the_training_spells_samples(self):
+        helper = FarmAnalyzerTests()
+        helper._cleanups = []
+        analyzer = helper.analyzer()
+        client = helper.client()
+        state = client.state
+        state.player_tag = 7
+        state.stats.update(level=28, regen_sp=1.2, maxsp=100)
+        state.place_item(state.items[10], 7)
+        state.place_item(Item(tag=12, name="wizardry spells", item_type=c.TYPE_SKILL,
+                              extra={"level": 10}), 7)
+        state.place_item(Item(tag=13, name="magic bullet", item_type=c.TYPE_SPELL,
+                              extra={"cost": 4}), 7)
+        # Her training casts magic bullet; a fielded caster last cast
+        # firestorm, which reset the single-spell samples.
+        analyzer.samples_by_spell["magic bullet"] = [20, 20, 20]
+        analyzer.attack_by_spell["magic bullet"] = "magic"
+        analyzer.spell_name, analyzer.spell_samples = "firestorm", [9]
+
+        async def scenario():
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            self.assertEqual(analyzer.profile.spell_damage, 20.0)
+            await analyzer.close()
+        asyncio.run(scenario())
+        for cleanup, args, kwargs in reversed(helper._cleanups):
+            cleanup(*args, **kwargs)
+
+    def test_a_build_choice_names_only_a_spot_she_knows(self):
+        client = AtrinikClient(ClientConfig())
+        server = WebControlServer(client, TaskEngine(client), WorldGraph())
+        client.farm_analyzer = types.SimpleNamespace(report={"rankings": {
+            "xp": [{"path": "circuit[a+b]"}], "money": "broken"}})
+        self.assertEqual(server._known_spots(), {"*", "circuit[a+b]"})
+        asyncio.run(server._action({"type": "build_choice", "spot": "circuit[a+b]",
+                                    "build": "single"}))
+        self.assertEqual(client.state.build_choices, {"circuit[a+b]": "single"})
+        for spot in ("/unranked", "../etc"):
+            with self.assertRaises(ValueError):
+                asyncio.run(server._action({"type": "build_choice", "spot": spot,
+                                            "build": "single"}))
+
+    def test_build_choices_keep_at_most_200_spots_and_every_spot(self):
+        from . import builds
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            client = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            client.state.player_name = "Sera"
+            client.load_character_memory("Sera")
+            client.set_build_choice(builds.EVERY_SPOT, "melee")
+            for index in range(builds.MAX_BUILD_CHOICES + 5):
+                client.set_build_choice(f"/spot_{index}", "bow")
+            self.assertEqual(len(client.state.build_choices), builds.MAX_BUILD_CHOICES)
+            self.assertEqual(client.state.build_choices["*"], "melee")
+            self.assertNotIn("/spot_0", client.state.build_choices)
+            # Memory written before the cap: the every-spot choice stays.
+            client._runtime_memory["Sera"]["build_choices"] = {
+                "*": "aoe", **{f"/old_{index}": "bow" for index in range(300)}}
+            client._persist_character_memory()
+            restored = AtrinikClient(ClientConfig(character="Sera", runtime_state_path=path))
+            restored.state.player_name = "Sera"
+            restored.load_character_memory("Sera")
+            self.assertEqual(len(restored.state.build_choices), builds.MAX_BUILD_CHOICES)
+            self.assertEqual(restored.state.build_choices["*"], "aoe")
+            self.assertIn("/old_299", restored.state.build_choices)
+
+    def test_the_dashboard_sets_the_build_choice(self):
+        client = AtrinikClient(ClientConfig())
+        engine = TaskEngine(client)
+        server = WebControlServer(client, engine, WorldGraph())
+        dashboard = DashboardState(client, engine, WorldGraph(), {})
+        # Only a spot she knows (the farmed one, a ranked one) or every spot.
+        with self.assertRaises(ValueError):
+            asyncio.run(server._action({"type": "build_choice", "spot": "/farm",
+                                        "build": "aoe"}))
+        client.build_status = {"spot": "/farm"}
+        result = asyncio.run(server._action(
+            {"type": "build_choice", "spot": "/farm", "build": "aoe"}))
+        self.assertEqual(result, {"ok": True, "spot": "/farm", "build": "aoe"})
+        self.assertEqual(client.state.build_choices, {"/farm": "aoe"})
+        with self.assertRaises(ValueError):
+            asyncio.run(server._action({"type": "build_choice", "build": "wizard"}))
+        snapshot = dashboard.build_snapshot()
+        self.assertEqual((snapshot["every_spot"], snapshot["status"]), ("auto", None))
+
+    def _circuit(self, client):
+        circuit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")], analyzer_driven=True,
+                                  spot={"path": "/farm", "name": "Farm"})
+        circuit.graph.spell_info = {name: (level, 50_000 if level == 15 else 6_000)
+                                    for name, level in self.LEVELS.items()}
+        return circuit
+
+    def _swap_client(self, stored_name="soft leather girdle (Pow+4)"):
+        from . import storage
+        client = self._client()
+        client.state.map.path = FarmCircuitTask.APARTMENT
+        worn = Item(1, flags=c.ITEM_APPLIED, item_type=c.TYPE_GIRDLE, quality=80,
+                    condition=80, name="soft leather girdle +6")
+        caster = Item(2, item_type=c.TYPE_GIRDLE, quality=80, condition=80, name=stored_name)
+        client.state.place_item(worn, 7)
+        client.state.equipment[c.EQUIP_BELT] = worn.tag
+        chest = Item(90, name="chest")
+        client.state.place_item(chest, 0)
+        client.state.place_item(caster, chest.tag)
+        client.state.apartment_storage = [storage.entry(caster, ["caster:girdle"])]
+        circuit = self._circuit(client)
+        circuit.child = circuit._new_child()
+        circuit._storage_retry_at = circuit.clock() + 1800.0
+        return client, circuit, worn, caster, chest
+
+    def test_a_build_change_makes_one_swap_trip(self):
+        from .navigation import SwapSetTask
+        client, circuit, worn, caster, chest = self._swap_client()
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        # The operator picks the single-target caster here: the build
+        # changes, and her chest holds a caster girdle that beats hers.
+        client.state.build_choices = {"/farm": "single"}
+        self.assertTrue(circuit._review_combat_build(client, circuit.child.task))
+        # Fielding the build is not training: the circuit's plan is her
+        # default; only the farm casts magic bullet, spells only.
+        self.assertEqual((circuit.combat_skill, circuit.combat_spell,
+                          circuit.combat_skill_until_level), ("", "", 0))
+        farm = circuit.child.task
+        self.assertEqual((farm.combat_skill, farm.combat_spell, farm.fielded_caster,
+                          farm.gear_style_override),
+                         ("wizardry spells", "magic bullet", True, "caster"))
+        self.assertEqual((circuit._build_name, client.active_build, circuit._swap_build),
+                         ("single", "single", "single"))
+        self.assertIn(("build-swap", "Single-target caster: fetching "
+                       "soft leather girdle (Pow+4)"), client.actions)
+        self.assertTrue(circuit._needs_apartment_storage(client))
+        # A circuit rebuilt before the trip (after a food trip, say) takes
+        # the pending swap and its backoffs over.
+        self.assertEqual(client.pending_swap_build, "single")
+        self.assertIn("_storage_backoff_until", FarmCircuitTask.BACKOFF_ATTRIBUTES)
+        rebuilt = self._circuit(client)
+        rebuilt.child = rebuilt._new_child()
+        self.assertTrue(rebuilt._review_combat_build(client, rebuilt.child.task))
+        self.assertEqual((rebuilt._build_name, rebuilt._swap_build), ("single", "single"))
+        trip = circuit._new_apartment_storage(client)
+        swap = trip.task
+        self.assertIsInstance(swap, SwapSetTask)
+
+        class Chest:
+            def __init__(self, client):
+                self.client, self.log = client, []
+                client.apply, client.move_item = self.apply, self.move_item
+
+            async def apply(self, tag, apply_action=0):
+                item = client.state.items[tag]
+                self.log.append(("apply", tag))
+                if item.tag == chest.tag:
+                    item.flags |= c.ITEM_CONTAINER_OPEN
+                    return
+                for other in client.state.inventory:
+                    if other.item_type == item.item_type and other.flags & c.ITEM_APPLIED:
+                        other.flags &= ~c.ITEM_APPLIED
+                item.flags |= c.ITEM_APPLIED
+                if item.item_type == c.TYPE_GIRDLE:
+                    client.state.equipment[c.EQUIP_BELT] = item.tag
+                # The server's living_update: the girdle's Pow counts.
+                client.state.stats["pow"] = 15 + (4 if caster.flags & c.ITEM_APPLIED else 0)
+
+            async def move_item(self, to, tag, quantity):
+                self.log.append(("move", to, tag))
+                client.state.place_item(client.state.items[tag], to)
+
+        server = Chest(client)
+        for _ in range(40):
+            if swap.status in (TaskStatus.COMPLETE, TaskStatus.FAILED):
+                break
+            swap.worn = {tag: 0.0 for tag in swap.worn}
+            asyncio.run(swap.tick(client))
+        self.assertEqual(swap.status, TaskStatus.COMPLETE, swap.error)
+        # One visit: the caster girdle out and on, the melee one home, and
+        # the area-spell wands too (consumables of the AoE build only).
+        moves = [entry for entry in server.log if entry[0] != "apply" or
+                 entry[1] != chest.tag]
+        self.assertEqual(moves[:2], [("move", 7, caster.tag), ("apply", caster.tag)])
+        wands = {item.tag for item in client.state.items.values()
+                 if item.item_type == c.TYPE_WAND}
+        self.assertEqual({entry[1:] for entry in moves[2:]},
+                         {(chest.tag, tag) for tag in {worn.tag, *wands}})
+        self.assertEqual({row["name"] for row in client.state.apartment_storage},
+                         {"soft leather girdle +6", "wand of firestorm (lvl 2)",
+                          "wand of icestorm (lvl 5)"})
+        self.assertTrue(caster.flags & c.ITEM_APPLIED)
+        self.assertFalse(worn.flags & c.ITEM_APPLIED)
+        # The trip ends the swap: none is pending, and the routine wait
+        # follows it.
+        circuit._storage = types.SimpleNamespace(
+            status=TaskStatus.COMPLETE, task=swap, error="", tick=AsyncMock())
+        self.assertTrue(asyncio.run(circuit._tick_running_service(client)))
+        self.assertIsNone(circuit._storage)
+        self.assertEqual((circuit._swap_build, client.pending_swap_build), ("", ""))
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        self.assertFalse(circuit._review_combat_build(client, circuit.child.task))
+        # A build change while a routine trip runs keeps its own swap.
+        circuit._storage_swap, circuit._swap_build = "", "bow"
+        circuit._end_swap(client)
+        self.assertEqual(circuit._swap_build, "bow")
+        circuit._swap_build = ""
+        # A new circuit takes over the build she fields: no needless swap.
+        successor = self._circuit(client)
+        successor.child = successor._new_child()
+        self.assertTrue(successor._review_combat_build(client, successor.child.task))
+        self.assertEqual((successor._build_name, successor._swap_build), ("single", ""))
+        # An explicit circuit fields no build.
+        explicit = FarmCircuitTask(WorldGraph(), [("/farm", "rat")])
+        self.assertFalse(explicit._review_combat_build(client, successor.child.task))
+        self.assertEqual((client.fieldable_builds, client.active_build,
+                          client.pending_swap_build), ({}, "", ""))
+
+    def test_a_failed_storage_backoff_stands_for_a_build_change(self):
+        client, circuit, *_ = self._swap_client()
+        circuit._storage_backoff_until = circuit._storage_retry_at
+        client.state.build_choices = {"/farm": "single"}
+        self.assertTrue(circuit._review_combat_build(client, circuit.child.task))
+        self.assertEqual(circuit._swap_build, "single")
+        self.assertFalse(circuit._needs_apartment_storage(client))
+
+    def test_no_swap_trip_for_the_same_set_or_worse_stored_gear(self):
+        # The stored caster girdle is worse than hers: no trip.
+        client, circuit, *_ = self._swap_client("soft leather girdle")
+        client.state.build_choices = {"/farm": "single"}
+        self.assertTrue(circuit._review_combat_build(client, circuit.child.task))
+        self.assertEqual(circuit._build_name, "single")
+        self.assertEqual(circuit._swap_build, "")
+        self.assertFalse(circuit._needs_apartment_storage(client))
+        # AoE and single-target casters share the caster set: no trip.
+        client, circuit, *_ = self._swap_client()
+        client.state.place_item(Item(300, item_type=c.TYPE_SPELL, name="firestorm"), 7)
+        client.state.build_choices = {"/farm": "aoe"}
+        circuit._build_name = "single"
+        circuit._build_seeded = True
+        self.assertTrue(circuit._review_combat_build(client, circuit.child.task))
+        self.assertEqual((circuit._build_name, circuit._build_spell), ("aoe", "firestorm"))
+        self.assertEqual(circuit._swap_build, "")
+        self.assertFalse(circuit._needs_apartment_storage(client))
+
+    def test_the_suggestion_lists_owned_items_first(self):
+        from . import storage
+        client = self._client()
+        belt = Item(1, flags=c.ITEM_APPLIED, item_type=c.TYPE_GIRDLE, quality=80,
+                    condition=80, name="soft leather girdle +3")
+        client.state.place_item(belt, 7)
+        client.state.equipment[c.EQUIP_BELT] = belt.tag
+        stored = Item(2, item_type=c.TYPE_GIRDLE, quality=80, condition=80,
+                      name="forged meteoric steel belt")
+        arrows = Item(3, item_type=c.TYPE_ARROW, quantity=50, name="arrows")
+        client.state.apartment_storage = [storage.entry(stored, ["melee:girdle"]),
+                                          storage.entry(arrows)]
+        circuit = self._circuit(client)
+        suggestion = circuit.build_suggestion(client)
+        self.assertEqual(suggestion["build"], "melee")
+        self.assertEqual(suggestion["slots"]["girdle"],
+                         [{"name": "soft leather girdle +3", "where": "worn"},
+                          {"name": "forged meteoric steel belt", "where": "stored"}])
+        self.assertEqual(suggestion["shop"], [])
+        # The bow build's ammunition is a stored consumable.
+        self.assertEqual(suggestion["consumables"], [])
+        circuit._build_name = "bow"
+        self.assertEqual(circuit.build_suggestion(client)["consumables"], ["arrows"])
+
+    def test_the_get_this_build_errand_learns_firestorm_from_dunowen(self):
+        from .navigation import LearnSpellTask, SpellOffer
+        client = self._client()
+        circuit = self._circuit(client)
+        circuit.graph.spell_offers = lambda: [
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "firestorm", 15, 50_000),
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "icestorm", 15, 50_000)]
+        circuit._choose_build(client)
+        self.assertEqual(circuit._build_choice.wanted, "aoe")
+        # Too poor beyond her cure reserve: an alert, no trip.
+        self.assertFalse(circuit._needs_learn_spell(client))
+        self.assertIn("need 5g for Firestorm from Dunowen", circuit._spell_shortfall)
+        circuit._choose_build(client)
+        self.assertIn(("build-errand-funds", circuit._spell_shortfall), client.actions)
+        # The dashboard shows it while autoplay farms this circuit.
+        dashboard = DashboardState(client, None, WorldGraph(), {})
+        alerts = dashboard.build_alerts(types.SimpleNamespace(child=circuit))
+        self.assertEqual([alert["id"] for alert in alerts], ["build-funds"])
+        self.assertIn("need 5g for Firestorm from Dunowen", alerts[0]["text"])
+        self.assertEqual(dashboard.build_alerts(types.SimpleNamespace(child=None)), [])
+        client.state.place_item(Item(400, item_type=c.TYPE_MONEY, quantity=10,
+                                     name="gold coins"), 7)
+        self.assertTrue(circuit._needs_learn_spell(client))
+        self.assertEqual(circuit._spell_shortfall, "")
+        trip = circuit._new_learn_spell(client)
+        self.assertEqual((trip.navigation.destination, trip.navigation.destination_xy),
+                         ("/shattered_islands/world_17_2_2", (5, 9)))
+        self.assertIsInstance(trip.task, LearnSpellTask)
+        self.assertEqual((trip.task.npc, trip.task.spell), ("Dunowen", "firestorm"))
+        # The route policy of the other optional errands, and its reserves.
+        self.assertTrue(trip.navigation.strict_safety)
+        self.assertEqual(trip.task.cash_reserve, circuit._spending_reserve(client))
+
+    def _errand_circuit(self, client):
+        from .navigation import SpellOffer
+        circuit = self._circuit(client)
+        circuit.graph.spell_offers = lambda: [
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "firestorm", 15, 50_000)]
+        return circuit
+
+    def test_no_learn_errand_when_the_operator_fields_melee_everywhere(self):
+        client = self._client(gold=10)
+        client.state.build_choices = {"*": "melee"}
+        circuit = self._errand_circuit(client)
+        circuit._choose_build(client)
+        self.assertEqual(circuit._build_choice.wanted, "")
+        self.assertIn("aoe", circuit._build_choice.gaps)
+        self.assertFalse(circuit._needs_learn_spell(client))
+        # Wanted somewhere, it runs.
+        client.state.build_choices = {"*": "melee", "/elsewhere": "aoe"}
+        circuit._choose_build(client)
+        self.assertTrue(circuit._needs_learn_spell(client))
+
+    def test_spells_are_bought_only_from_true_surplus(self):
+        client = self._client()
+        circuit = self._errand_circuit(client)
+        cure = circuit._depletion_service_cost(client)
+        # 5g 50s: Firestorm and her cure reserve, but not her other reserves.
+        client.state.place_item(Item(400, item_type=c.TYPE_MONEY, quantity=5,
+                                     name="gold coins"), 7)
+        client.state.place_item(Item(401, item_type=c.TYPE_MONEY, quantity=50,
+                                     name="silver coins"), 7)
+        from .tasks import BuyShopUpgradeTask
+        wallet = BuyShopUpgradeTask.wallet_value(client)
+        self.assertEqual(wallet, 55_000)
+        self.assertGreater(wallet - cure, 50_000)
+        self.assertLess(wallet - circuit._spending_reserve(client), 50_000)
+        circuit._choose_build(client)
+        self.assertFalse(circuit._needs_learn_spell(client))
+        self.assertIn("need 5g for Firestorm from Dunowen", circuit._spell_shortfall)
+
+    def test_the_learn_errand_gives_up_after_three_failed_trips(self):
+        from .navigation import LearnSpellTask
+        client = self._client(gold=10)
+        circuit = self._errand_circuit(client)
+        circuit._choose_build(client)
+        for attempt in range(3):
+            client.learn_retry_until = {}
+            self.assertTrue(circuit._needs_learn_spell(client), attempt)
+            task = LearnSpellTask("Dunowen", "firestorm")
+            task.fail("Dunowen offered no firestorm")
+            circuit._spell_purchase = types.SimpleNamespace(
+                status=TaskStatus.FAILED, task=task, error=task.error, tick=AsyncMock())
+            self.assertTrue(asyncio.run(circuit._tick_running_service(client)))
+            # The failed spell waits on its own backoff.
+            self.assertGreater(client.learn_retry_until["firestorm"][0], circuit.clock())
+        client.learn_retry_until = {}
+        self.assertEqual(client.learn_errand_failed,
+                         {"firestorm": "firestorm from Dunowen: Dunowen offered no firestorm"})
+        self.assertFalse(circuit._needs_learn_spell(client))
+        self.assertIn(("build-errand-failed", client.learn_errand_failed["firestorm"]),
+                      client.actions)
+        # Given up per spell: another that fields the build is still learnt.
+        from .navigation import SpellOffer
+        circuit.graph.spell_offers = lambda: [
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "firestorm", 15, 50_000),
+            SpellOffer("Dunowen", "/shattered_islands/world_17_2_2", 5, 9, "icestorm", 15, 50_000)]
+        self.assertTrue(circuit._needs_learn_spell(client))
+        self.assertEqual(circuit._learn_offer(client).spell, "icestorm")
+        dashboard = DashboardState(client, None, WorldGraph(), {})
+        self.assertIn("build-errand-failed", [
+            alert["id"] for alert in dashboard.build_alerts(
+                types.SimpleNamespace(child=circuit))])
+        # The operator retries it from the dashboard; with nothing given
+        # up, Retry is refused.
+        real = AtrinikClient(ClientConfig())
+        server = WebControlServer(real, TaskEngine(real), WorldGraph())
+        with self.assertRaises(ValueError):
+            asyncio.run(server._action({"type": "retry_learn"}))
+        real.learn_errand_failed = {"firestorm": "gave up"}
+        real.learn_errand_failures = {"firestorm": 3}
+        self.assertEqual(asyncio.run(server._action({"type": "retry_learn"})),
+                         {"ok": True, "retried": ["firestorm"]})
+        self.assertEqual((real.learn_errand_failed, real.learn_errand_failures,
+                          real.learn_errand_retry), ({}, {}, {"firestorm"}))
+        # A second retry before the circuit sees the first keeps both.
+        real.learn_errand_failed = {"icestorm": "gave up"}
+        asyncio.run(server._action({"type": "retry_learn"}))
+        self.assertEqual(real.learn_errand_retry, {"firestorm", "icestorm"})
+        # The retry ends the retried spell's route backoff only, never a
+        # seller's money refusal; backoffs are per spell.
+        client.learn_errand_failed, client.learn_errand_retry = {}, {"firestorm"}
+        client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, False),
+                                    "icestorm": (circuit.clock() + 3600.0, False)}
+        self.assertTrue(circuit._needs_learn_spell(client))
+        self.assertIn("icestorm", client.learn_retry_until)
+        client.learn_errand_retry = {"firestorm"}
+        client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, True)}
+        self.assertFalse(circuit._needs_learn_spell(client))
+        # Retrying another spell leaves this one's backoff.
+        client.learn_errand_retry = {"icestorm"}
+        client.learn_retry_until = {"firestorm": (circuit.clock() + 3600.0, False)}
+        self.assertFalse(circuit._needs_learn_spell(client))
+        # Another spell's backoff does not hold this one.
+        client.learn_retry_until = {"icestorm": (circuit.clock() + 3600.0, False)}
+        self.assertTrue(circuit._needs_learn_spell(client))
+
+    def test_her_live_state_keeps_melee_on_a_melee_rated_spot(self):
+        from . import builds
+        from .farm_analyzer import (CombatProfile, build_profile, encounter_rated,
+                                    encounter_warning)
+        # Slash 36, Wizardry 15, magic bullet known: no magic bullet hit
+        # sampled, so the single-target caster has no profile and is never
+        # rated; she keeps melee.
+        client = self._client()
+        client.state.stats.update(regen_sp=1.2)
+        base = CombatProfile(skill="slash weapons", skill_level=36, attack="slash",
+                             damage=60, weapon_class=40, weapon_speed=2.0,
+                             character_level=38, max_health=333, speed=1.0,
+                             armour_class=40, protections=(), max_aggro_pack=2,
+                             combat_style="melee", healing_per_second=3.0)
+        self.assertIsNone(build_profile(client, "single", "magic bullet", base, {}, {}))
+        self.assertIs(build_profile(client, "melee", "", base, {}, {}), base)
+        ratings = {"melee": self._rating("melee", 0.85, 900.0)}
+        choice = builds.choose(client.state, "/spot", ratings, {}, self.LEVELS,
+                               warn=encounter_warning, rated=encounter_rated)
+        self.assertEqual(choice.build, "melee")
+
+    def test_a_caster_profile_carries_the_spell_and_pack_cap(self):
+        from .farm_analyzer import CombatProfile, build_profile
+        client = self._client()
+        client.state.stats.update(regen_sp=1.2, maxsp=120)
+        for item in client.state.inventory:
+            if item.name == "magic bullet":
+                item.extra["cost"] = 4
+            if item.name == "minor healing":
+                item.extra["cost"] = 4
+        client.state.place_item(Item(300, item_type=c.TYPE_SPELL, name="firestorm",
+                                     extra={"cost": 13}), 7)
+        base = CombatProfile(skill="slash weapons", skill_level=36, attack="slash",
+                             damage=60, weapon_class=40, weapon_speed=2.0,
+                             character_level=38, max_health=333, speed=1.0,
+                             armour_class=40, protections=(), max_aggro_pack=2,
+                             combat_style="melee", healing_per_second=3.0)
+        samples = {"magic bullet": [10, 12, 14], "firestorm": [11, 13]}
+        attacks = {"magic bullet": "magic", "firestorm": "fire"}
+        single = build_profile(client, "single", "magic bullet", base, samples, attacks)
+        self.assertEqual((single.skill, single.skill_level, single.spell_damage,
+                          single.mana_cost, single.max_mana, single.mana_regen,
+                          single.spell_attack, single.max_aggro_pack, single.combat_style),
+                         ("wizardry spells", 15, 12.0, 4, 108, 1.2, "magic", 1,
+                          "ranged-kite"))
+        self.assertIn("--damage-per-attack", single.arguments(styled=True))
+        table = {"firestorm": (3, 5), "magic bullet": (7, 5)}
+        aoe = build_profile(client, "aoe", "firestorm", base, samples, attacks, table)
+        # The area spell's reach (a 5-deep cone: --aoe-radius 3), up to 6
+        # monsters; whether her bar kills them is the spot's (below).
+        self.assertEqual((aoe.spell_damage, aoe.mana_cost, aoe.max_aggro_pack,
+                          aoe.combat_style, aoe.aoe_radius, aoe.damage_estimated),
+                         (12.0, 13, 6, "aoe-kite", 3, False))
+        args = aoe.arguments(styled=True)
+        self.assertEqual(args[args.index("--aoe-radius") + 1], "3")
+        self.assertAlmostEqual(aoe.bar_casts, 108 / 13)
+        # A bar that cannot pay the spell beyond the reserve: no profile.
+        client.state.stats.update(maxsp=20)
+        self.assertIsNone(build_profile(client, "aoe", "firestorm", base, samples, attacks))
+
+    def test_an_unsampled_spell_is_estimated_by_the_server_formula(self):
+        from .farm_analyzer import (CombatProfile, build_profile, estimated_spell_damage,
+                                    spell_table)
+        client = self._client()
+        client.state.stats.update(regen_sp=1.2, maxsp=120, pow=15)
+        client.state.place_item(Item(300, item_type=c.TYPE_SPELL, name="firestorm",
+                                     extra={"cost": 13}), 7)
+        for item in client.state.inventory:
+            if item.name == "minor healing":
+                item.extra["cost"] = 4
+        # The server's table (include/spellist.h), as its rows are laid
+        # out: Firestorm bdam 3, its cone 5 deep; magic bullet bdam 7.
+        with tempfile.TemporaryDirectory() as directory:
+            include = Path(directory) / "include"
+            include.mkdir()
+            (include / "spellist.h").write_text(SPELLIST_ROWS)
+            table = spell_table(directory)
+        self.assertEqual(table, {"firestorm": (3, 5), "magic bullet": (7, 5)})
+        self.assertEqual(spell_table(str(Path(directory) / "missing")), {})
+        fake = table
+        # 3 x (0.75 + 15 / 4) = 13.5 at Pow 15 (no bonus), rolled from
+        # int(11.3) to int(13.5): 12 on average (server/spell_util.c
+        # SP_level_dam_adjust).
+        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 12.0)
+        client.state.stats["pow"] = 25
+        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 28.0)
+        # Before her stats arrive, and for a swarm (copies of a child
+        # spell), no estimate.
+        client.state.stats["pow"] = 0
+        self.assertEqual(estimated_spell_damage(client.state, "firestorm", fake), 0.0)
+        client.state.stats["pow"] = 15
+        self.assertEqual(estimated_spell_damage(
+            client.state, "frost nova", {"frost nova": (4, 10)}), 0.0)
+        base = CombatProfile(skill="slash weapons", skill_level=36, attack="slash",
+                             damage=60, weapon_class=40, weapon_speed=2.0,
+                             character_level=38, max_health=333, speed=1.0,
+                             armour_class=40, protections=(), max_aggro_pack=2,
+                             combat_style="melee", healing_per_second=3.0)
+        aoe = build_profile(client, "aoe", "firestorm", base, {}, {}, fake)
+        self.assertEqual((aoe.spell_damage, aoe.spell_attack, aoe.damage_estimated),
+                         (12.0, "fire", True))
+        # Without the table, nothing to estimate from, and an area spell's
+        # reach is unknown even when sampled: no profile.
+        self.assertIsNone(build_profile(client, "aoe", "firestorm", base, {}, {}, {}))
+        self.assertIsNone(build_profile(client, "aoe", "firestorm", base,
+                                        {"firestorm": [12]}, {"firestorm": "fire"}, {}))
+
+    def test_a_caster_must_kill_a_monster_on_one_bar(self):
+        from .farm_analyzer import CombatProfile, spot_affordable
+        profile = CombatProfile(skill="wizardry spells", skill_level=15, attack="slash",
+                                damage=1, weapon_class=1, weapon_speed=1.0,
+                                character_level=38, max_health=333, speed=1.0,
+                                armour_class=40, protections=(), spell_damage=12.0,
+                                cast_delay=1.0, mana_cost=13, mana_regen=1.0,
+                                max_mana=104, bar_casts=8.0)
+        # A kill takes 6 casts: her 8-cast bar does.
+        self.assertTrue(spot_affordable(profile, {"avg_kill_seconds": 6.0,
+                                                  "avg_player_attacks_second": 1.0}))
+        # 12 casts: 8 plus 12 s x 1 SP/s / 13 is under 9: not here.
+        self.assertFalse(spot_affordable(profile, {"avg_kill_seconds": 12.0,
+                                                   "avg_player_attacks_second": 1.0}))
+        # The spell path reports no attack rate: the cast delay counts.
+        self.assertTrue(spot_affordable(profile, {"avg_kill_seconds": 6.0,
+                                                  "avg_player_attacks_second": 0.0}))
+        self.assertIsNone(spot_affordable(profile, {}))
+        self.assertIsNone(spot_affordable(profile, {"avg_kill_seconds": float("inf")}))
+        # Her regeneration between casts, over one delay fewer than the
+        # casts: at 1.5 SP/s, 10 casts get 8 + 9 x 1.5 / 13 = 9.04.
+        regen = dataclasses.replace(profile, mana_regen=1.5)
+        self.assertFalse(spot_affordable(regen, {"avg_kill_seconds": 10.0}))
+        regen = dataclasses.replace(profile, mana_regen=3.0)
+        # 8 + 9 x 3 / 13 = 10.08 >= 10 casts.
+        self.assertTrue(spot_affordable(regen, {"avg_kill_seconds": 10.0}))
+        self.assertFalse(spot_affordable(regen, {"avg_kill_seconds": 11.0}))
+        # 16 casts at 6.5 SP/s: 8 + 15 x 0.5 = 15.5, not 8 + 16 x 0.5.
+        regen = dataclasses.replace(profile, mana_regen=6.5)
+        self.assertFalse(spot_affordable(regen, {"avg_kill_seconds": 16.0}))
+        self.assertTrue(spot_affordable(regen, {"avg_kill_seconds": 15.0}))
+
+    def test_only_a_caster_build_is_gated_on_her_bar(self):
+        from .farm_analyzer import CombatProfile
+        helper = FarmAnalyzerTests()
+        helper._cleanups = []
+        analyzer = helper.analyzer()
+        client = helper.client()
+        analyzer.heal_samples = [17]
+        # Melee while her Wizardry trains carries the spell model (a cost,
+        # no bar_casts): never gated. A caster with the same numbers is.
+        trained = CombatProfile(skill="wizardry spells", skill_level=10, attack="slash",
+                                damage=44, weapon_class=31, weapon_speed=2.25,
+                                character_level=22, max_health=188, speed=0.8,
+                                armour_class=37, protections=(), spell_damage=12.0,
+                                cast_delay=1.0, mana_cost=4, mana_regen=1.0, max_mana=60,
+                                spell_attack="magic", combat_style="ranged-kite",
+                                healing_per_second=5.0)
+
+        async def scenario():
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            generation = analyzer.report_generation
+            await analyzer._run_encounters(trained, generation, merge=False, key="melee")
+            await analyzer._run_encounters(trained, generation, merge=False, key="single")
+            grind = analyzer.ranking("xp")[0]
+            ratings = analyzer.spot_ratings(grind)
+            self.assertEqual(ratings["melee"]["avg_kill_seconds"], 30.0)
+            self.assertIs(ratings["melee"]["build_affordable"], True)
+            self.assertIs(ratings["single"]["build_affordable"], False)
+            await analyzer.close()
+        asyncio.run(scenario())
+        for cleanup, args, kwargs in reversed(helper._cleanups):
+            cleanup(*args, **kwargs)
+        from .navigation import _build_rated
+        rated = self._rating("aoe-kite", 0.9, 1000.0)
+        self.assertTrue(_build_rated(rated))
+        self.assertFalse(_build_rated(dict(rated, build_affordable=False)))
+
+    def test_learn_spell_reads_the_seller_and_handles_too_little_money(self):
+        from .navigation import LearnSpellTask
+
+        def seller(client, gold):
+            """Dunowen's SpellSeller dialogue (content maps/python/Merchant.py)."""
+            said = []
+
+            async def talk(message, npc=None):
+                said.append((message, npc))
+                if message == "hello":
+                    client.state.interface = InterfaceState(
+                        text="Welcome, dear customer! I'm Dunowen.\nAre you here to buy one "
+                             "of my spells? I can offer you the following spells.",
+                        links=["[a=:firestorm]Firestorm[/a]", "[a=:icestorm]Icestorm[/a]",
+                               "[a=:forked lightning]Forked lightning[/a]"])
+                elif message == "firestorm":
+                    client.state.interface = InterfaceState(
+                        text="Ah, so you want to buy firestorm?\nA cone of fire you project "
+                             "in front of you.\n[c=#00ff00]Firestorm requires level 15 to "
+                             "use. Your wizardry spells skill is level 15.[/c]\nFirestorm "
+                             "will cost you 5 gold coins. Is that okay?",
+                        links=["[a=:buy firestorm]Confirm[/a]"])
+                elif message == "buy firestorm":
+                    if gold < 5:
+                        client.state.interface = InterfaceState(
+                            text="You don't have enough money...")
+                    else:
+                        client.state.interface = InterfaceState(
+                            text="You pay 5 gold coins.\nPleasure doing business with you!")
+                        client.state.place_item(Item(500, item_type=c.TYPE_SPELL,
+                                                     name="firestorm"), 7)
+            client.talk = talk
+            return said
+
+        self.assertEqual(LearnSpellTask.read_quote(
+            "Firestorm requires level 15 to use. Your wizardry spells skill is level 15.\n"
+            "Firestorm will cost you 5 gold coins. Is that okay?"), (15, 15, 50_000))
+        client = self._client(gold=6)
+        said = seller(client, 6)
+        task = LearnSpellTask("Dunowen", "firestorm", cash_reserve=5_000)
+        for _ in range(5):
+            asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.COMPLETE, task.error)
+        self.assertEqual([message for message, _ in said],
+                         ["hello", "firestorm", "buy firestorm"])
+        self.assertEqual((task.level, task.price), (15, 50_000))
+        # Short beyond her reserve: no purchase, the shortfall shown.
+        client = self._client(gold=5)
+        said = seller(client, 5)
+        task = LearnSpellTask("Dunowen", "firestorm", cash_reserve=5_000)
+        for _ in range(4):
+            asyncio.run(task.tick(client))
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual((task.error, task.shortfall),
+                         ("need 5g for firestorm from Dunowen", 50_000))
+        self.assertNotIn("buy firestorm", [message for message, _ in said])
+        # The seller's own refusal.
+        client = self._client(gold=6)
+        said = seller(client, 0)
+        task = LearnSpellTask("Dunowen", "firestorm")
+        for _ in range(5):
+            asyncio.run(task.tick(client))
+        self.assertEqual((task.status, task.shortfall), (TaskStatus.FAILED, 50_000))
+
+    def test_the_analyzer_rates_every_build_she_can_field(self):
+        helper = FarmAnalyzerTests()
+        helper._cleanups = []
+        analyzer = helper.analyzer()
+        client = helper.client()
+        state = client.state
+        state.player_tag = 7
+        state.stats.update(regen_sp=1.2, maxsp=60)
+        state.place_item(Item(tag=12, name="wizardry spells", item_type=c.TYPE_SKILL,
+                              extra={"level": 15}), 7)
+        state.place_item(Item(tag=13, name="magic bullet", item_type=c.TYPE_SPELL,
+                              extra={"cost": 4}), 7)
+        analyzer.heal_samples = [17]
+        package = analyzer.analyzer_root / "farming_analyzer"
+
+        async def scenario():
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._task
+            # The build she fields first, merged into the ranking (warn only).
+            client.fieldable_builds = {"melee": "", "single": "magic bullet"}
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            grind = analyzer.ranking("xp")[0]
+            self.assertEqual(grind["encounter_style"], "melee")
+            # No magic bullet hit sampled yet: the caster is not rated, even
+            # while she fields it (its warnings come from her ordinary
+            # profile, kept as melee's).
+            self.assertFalse(analyzer.poll(client))
+            self.assertNotIn("single", analyzer.spot_ratings(grind))
+            client.active_build = "single"
+            self.assertFalse(analyzer.poll(client))
+            self.assertNotIn("single", analyzer.spot_ratings(grind))
+            client.active_build = "melee"
+            # Sampled, at the next ranking it is, with its own profile.
+            analyzer.samples_by_spell["magic bullet"] = [10, 12, 14]
+            analyzer.attack_by_spell["magic bullet"] = "magic"
+            analyzer.style_generation.pop("single")
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertEqual(grind["encounter_style"], "melee")
+            ratings = analyzer.spot_ratings(grind)
+            self.assertEqual(sorted(ratings), ["melee", "single"])
+            self.assertEqual((ratings["single"]["encounter_style"],
+                              ratings["single"]["encounter_need"],
+                              ratings["single"]["xp_hour"]),
+                             ("ranged-kite", "--damage-per-attack 12 --max-aggro-pack 1",
+                              900.0))
+            # Each build once per ranking.
+            self.assertFalse(analyzer.poll(client))
+            # A failed build run is retried on the failure backoff only.
+            analyzer.style_generation.pop("single")
+            analyzer._style_attempt_at["single"] -= analyzer.MIN_INTERVAL_SECONDS
+            (package / "FAIL_STYLED").write_text("")
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertTrue(analyzer.style_errors["single"])
+            self.assertEqual(analyzer.encounter_error, "")
+            analyzer._style_attempt_at["single"] -= analyzer.MIN_INTERVAL_SECONDS
+            self.assertFalse(analyzer.poll(client))
+            analyzer._style_attempt_at["single"] -= analyzer.RETRY_SECONDS
+            (package / "FAIL_STYLED").unlink()
+            self.assertTrue(analyzer.poll(client))
+            await analyzer._encounter_task
+            self.assertNotIn("single", analyzer.style_errors)
+            await analyzer.close()
+            for cleanup, args, kwargs in reversed(helper._cleanups):
+                cleanup(*args, **kwargs)
+
+        asyncio.run(scenario())
+
+    def test_every_spell_seller_is_indexed_from_content(self):
+        offers = {(offer.seller, offer.spell): offer for offer in built_graph().spell_offers()}
+        firestorm = offers[("Dunowen", "firestorm")]
+        self.assertEqual((firestorm.map_path, firestorm.x, firestorm.y, firestorm.level,
+                          firestorm.price),
+                         ("/shattered_islands/world_17_2_2", 5, 9, 15, 50_000))
+        for seller, spell in (("Dunowen", "icestorm"), ("Dunowen", "forked lightning"),
+                              ("Galion", "frostbolt"), ("Olain", "bullet storm"),
+                              ("Quidton", "frost nova"), ("Krelnal", "magic missile")):
+            self.assertIn((seller, spell), offers)
 
 
 if __name__ == "__main__":

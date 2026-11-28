@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from . import builds
 from . import constants as c
 from .catalog_quest_tasks import (AllFormalQuestsTask, CatalogQuestTask,
                                   POLICIES, RECOMMENDED_QUEST_ORDER)
@@ -678,6 +679,34 @@ class DashboardState:
             return ""
         return str(warning.get("text", ""))
 
+    def build_status(self, autoplay) -> dict[str, Any] | None:
+        """The build of the circuit autoplay farms now
+        (FarmCircuitTask._publish_build), or None, as farm_encounter_warning."""
+        status = getattr(self.client, "build_status", None)
+        if (not isinstance(status, dict) or autoplay is None or
+                getattr(autoplay, "child", None) is not status.get("circuit")):
+            return None
+        return status
+
+    def build_alerts(self, autoplay) -> list[dict[str, str]]:
+        """A build she cannot field (with its fallback), and the money the
+        spell her wanted build needs is short of."""
+        status = self.build_status(autoplay)
+        if status is None:
+            return []
+        alerts = []
+        if status.get("fallback"):
+            alerts.append({"id": "build-gap", "level": "warn",
+                           "text": "Build gap: " + str(status.get("reason", ""))})
+        if status.get("shortfall"):
+            alerts.append({"id": "build-funds", "level": "warn",
+                           "text": "Get this build: " + str(status["shortfall"])})
+        failed = getattr(self.client, "learn_errand_failed", None) or {}
+        for reason in failed.values():
+            alerts.append({"id": "build-errand-failed", "level": "warn",
+                           "text": f"Learn errand failed: {reason}"})
+        return alerts
+
     def alerts(self) -> list[dict[str, str]]:
         """Alerts for the operator: deaths, starvation, stuck, disconnected,
         and while farming is unsafe its suspension and what blocks it."""
@@ -702,6 +731,7 @@ class DashboardState:
             alerts = [alert for alert in alerts if alert["id"] != "stuck"]
         alerts[0:0] = [alert for alert in unsafe + care if alert["level"] == "critical"]
         alerts += [alert for alert in unsafe + care if alert["level"] != "critical"]
+        alerts += self.build_alerts(task if autoplay else None)
         # Filed feedback that needs the owner, as last counted by the
         # running bot's queue screen (no database read on a live poll).
         attention = getattr(self.client, "feedback_attention", None) or {}
@@ -956,6 +986,31 @@ class DashboardState:
         return (choice[0] if choice is not None
                 else effective_farm_objective(self.client.state))
 
+    def build_snapshot(self) -> dict[str, Any]:
+        """The dashboard's build panel: the operator's choices, the build
+        for the farmed spot and why, gaps, and the suggested set."""
+        task = getattr(self.engine, "task", None)
+        autoplay = (task if task is not None and
+                    str(getattr(task, "name", "")).startswith("autoplay") else None)
+        status = self.build_status(autoplay)
+        choices = dict(getattr(self.client.state, "build_choices", {}) or {})
+        snapshot: dict[str, Any] = {
+            "choices": list(builds.CHOICES),
+            "labels": {name: build.label for name, build in builds.BUILDS.items()},
+            "every_spot": choices.get(builds.EVERY_SPOT, builds.AUTO),
+            "status": None, "suggestion": None}
+        if status is not None:
+            snapshot["status"] = {key: value for key, value in status.items()
+                                  if key != "circuit"}
+            snapshot["status"]["errand_failed"] = "; ".join(
+                (getattr(self.client, "learn_errand_failed", None) or {}).values())
+            snapshot["spot_choice"] = choices.get(status.get("spot", ""), builds.AUTO)
+            try:
+                snapshot["suggestion"] = status["circuit"].build_suggestion(self.client)
+            except Exception as error:  # The panel must never break the state.
+                snapshot["suggestion"] = {"error": str(error)}
+        return snapshot
+
     def farming_analysis(self) -> dict[str, Any]:
         analyzer = getattr(self.client, "farm_analyzer", None)
         chosen = getattr(self.client.state, "farm_objective", DEFAULT_OBJECTIVE)
@@ -1000,6 +1055,7 @@ class DashboardState:
                       for key, record in recent],
             "goals": self_improvement.improvement_goals(adaptations),
         }
+        snapshot["build"] = self.build_snapshot()
         state = self.client.state
         bed_xy = getattr(state, "savebed_xy", None)
         snapshot["savebed"] = ({"map": state.savebed_map, "x": bed_xy[0], "y": bed_xy[1]}
@@ -1664,6 +1720,20 @@ class WebControlServer:
                 container, patterns, indexer=storage.plain_indexer()))
         raise ValueError("unknown task type")
 
+    def _known_spots(self) -> set[str]:
+        """Spots a build choice may name: every spot, the farmed one, and
+        each spot of the analyzer's rankings."""
+        known = {builds.EVERY_SPOT}
+        status = getattr(self.client, "build_status", None)
+        if isinstance(status, dict) and status.get("spot"):
+            known.add(str(status["spot"]))
+        report = getattr(getattr(self.client, "farm_analyzer", None), "report", None)
+        for ranked in ((report or {}).get("rankings") or {}).values():
+            for spot in ranked if isinstance(ranked, list) else ():
+                if isinstance(spot, dict) and spot.get("path"):
+                    known.add(str(spot["path"]))
+        return known
+
     def _inventory_item(self, tag: Any):
         value = int(tag)
         item = self.client.state.items.get(value)
@@ -1695,7 +1765,8 @@ class WebControlServer:
     async def _action(self, data: dict[str, Any]) -> dict[str, Any]:
         kind = str(data.get("type", ""))
         if (getattr(self.engine, "operator_hold", "") and
-                kind not in ("farm_objective", "refresh_quests")):
+                kind not in ("farm_objective", "build_choice", "retry_learn",
+                             "refresh_quests")):
             # A manual order would move her or her gold mid-run.
             raise ValueError("an operator assist is running; act after it ends")
         if kind in ("move", "dialog", "apply", "apply_ground"):
@@ -1707,6 +1778,35 @@ class WebControlServer:
                 raise ValueError(f"unknown farming objective {objective!r}")
             self.client.set_farm_objective(objective)
             return {"ok": True, "objective": objective}
+        if kind == "build_choice":
+            choice = str(data.get("build", ""))
+            if choice not in builds.CHOICES:
+                raise ValueError(f"unknown build {choice!r}")
+            spot = str(data.get("spot", "") or builds.EVERY_SPOT)
+            if spot not in self._known_spots():
+                raise ValueError("not a farm spot she knows")
+            self.client.set_build_choice(spot, choice)
+            return {"ok": True, "spot": spot, "build": choice}
+        if kind == "retry_learn":
+            # The operator retries a "get this build" errand that gave up.
+            failed = dict(getattr(self.client, "learn_errand_failed", None) or {})
+            if not failed:
+                raise ValueError("no learn errand has given up")
+            spell = str(data.get("spell", "") or "")
+            if spell and spell not in failed:
+                raise ValueError(f"the learn errand for {spell!r} has not given up")
+            retried = [spell] if spell else list(failed)
+            failures = dict(getattr(self.client, "learn_errand_failures", None) or {})
+            for name in retried:
+                failed.pop(name, None)
+                failures.pop(name, None)
+            self.client.learn_errand_failed = failed
+            self.client.learn_errand_failures = failures
+            # The retried spells' route or dialogue backoffs end too
+            # (_needs_learn_spell), never a seller's money refusal.
+            self.client.learn_errand_retry = set(
+                getattr(self.client, "learn_errand_retry", None) or ()) | set(retried)
+            return {"ok": True, "retried": retried}
         if kind == "chat":
             text = str(data.get("text", "")).strip()
             if not text:

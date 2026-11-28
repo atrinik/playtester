@@ -454,6 +454,28 @@ carries: what she wears and the best candidate, with both scores, the
 effective stats, per-stat differences and notes such as "+2 on a cape adds
 no AC", and the recent shadow log.
 
+## Combat builds per spot
+
+She fields one of four builds on her farm spot (`builds.py`; COMBAT.md,
+"Combat builds per spot"): melee, AoE caster, single-target caster or bow,
+each with its requirements, a FarmTask routine, a gear style and its own
+encounter profile. The operator picks one for the farmed spot or for every
+spot on the Farming tab (kept in her character memory); on auto she fields
+the safest build she can by the analyzer's encounter rating of each
+build's own profile, ranked by XP, and keeps hers against a near tie (20%
+more XP, an hour's hold; a safer build wins at once). A caster's spell
+damage is her sampled hits, kept in her memory, or before any the server
+formula's estimate; a caster build is rated on a spot only when one bar
+kills a monster there. A build whose profile her real numbers cannot give
+is never rated. A build she cannot
+field falls back with a "Build gap" alert, and a "get this build" errand
+learns the spell it needs from a spell seller (first Firestorm from
+Dunowen) once she can pay it from true surplus; until then the dashboard
+shows what she needs, and after three failed trips it gives up until the
+operator retries. A build change of gear style makes one apartment trip
+to swap sets when the chest holds something better, and the Farming tab
+suggests the best owned set for the spot's build.
+
 ## Inventory and home storage
 
 She carries only her active set (`storage.py`, `FarmCircuitTask`): worn
@@ -870,9 +892,11 @@ ranking is six hours old, it starts one `nice` analyzer process with
 `--ranking all --json` (about 10 to 30 seconds) while the bot keeps playing.
 Runs are at least ten minutes apart, failures back off for fifteen minutes, and
 a failed run keeps the previous ranking. Only melee weapon schools are
-simulated so far. She fights one target at a time and casts no area spell,
-so the profile passes `--max-aggro-pack 2` (1 while Wizardry trains): the
-analyzer drops a map whose likely simultaneous aggro is larger.
+simulated so far. Her ordinary kit fights one target at a time, so the
+ranking profile passes `--max-aggro-pack 2` (1 while Wizardry trains): the
+analyzer drops a map whose likely simultaneous aggro is larger. A fielded
+build's own profile (an area spell's pack cap among them) is used only for
+its encounter runs ("Combat builds per spot").
 
 Since analyzer v3.11.0 the bot also runs the analyzer's encounter model, to
 warn only (owner decision, 2026-11-25; COMBAT.md, "Encounter warnings").
@@ -882,7 +906,8 @@ The ranking run above is the one she chooses by and passes no
 a ranking is in, a separate encounter run passes her combat style
 (`--combat-style melee` with a weapon, `ranged-kite` while she trains
 Wizardry with spells only, which she casts from range once the spell fits
-beyond her healing reserve; never `aoe-kite`, as she has no area spell),
+beyond her healing reserve; the builds she can field are rated with their
+own profiles, see "Combat builds per spot"),
 her measured healing (`--healing-per-second`, below) and her displayed
 speed (`--character-speed`), and its encounter fields (`encounter_safety`,
 `expected_pack`, `worst_pack`, `encounter_reasons` and the rest) are copied
