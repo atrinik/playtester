@@ -302,6 +302,10 @@ class GameState:
     # which she does not try again; heal_restock_alerts shows the note.
     heal_restock_note: str = ""
     heal_restock_retry_until: float = 0.0
+    # What her apartment chest holds, as far as she knows (storage.py): her
+    # deposits and retrievals, replaced by the chest's contents whenever
+    # she opens it. Kept in her character memory.
+    apartment_storage: list = field(default_factory=list)
     # Wall-clock time before which a paid-but-ineffective temple restoration
     # is not attempted again.
     paid_restoration_retry_until: float = 0.0

@@ -454,6 +454,86 @@ carries: what she wears and the best candidate, with both scores, the
 effective stats, per-stat differences and notes such as "+2 on a cape adds
 no AC", and the recent shadow log.
 
+## Inventory and home storage
+
+She carries only her active set (`storage.py`, `FarmCircuitTask`): worn
+gear and her active build's best gear, heals, recall (one recall wand),
+identify devices, the mana crystal, quest items, keys, money and other
+consumables. The rest goes to her apartment chest, and some is sold:
+
+- **Sets per build.** `GearScorer` ranks everything she owns once per build
+  (melee, caster, bow): the best item per slot (two rings) is that build's
+  set. The other builds' sets and other spare gear go home. A storage trip
+  also takes back out her active build's best stored items that beat what
+  she wears by the equip loop's margin.
+- **The index.** The chest's contents are not in the dashboard state and
+  are sent only while she has it open, so her character memory keeps
+  what it holds (`GameState.apartment_storage`): each item she deposits or
+  retrieves, replaced by the real contents whenever she opens the chest.
+  Each stored gear row names the sets it belongs to (`melee:weapon`,
+  `caster:ring`), for a later build change.
+- **Trips.** A storage trip leaves at once for a valuable, else once 8
+  items wait or she carries 65% of her weight limit (where encumbrance
+  slows her), at most once per 30 minutes. An item the chest refuses
+  for god-given gear ("You can't store god-given items ...") is not
+  offered again; a full chest or any other refusal only backs off. What
+  she deposited is not taken back out that session until why it went
+  home changes (identified under a new name, or a level requirement she
+  now meets). God-given refusals include "First remove all god-given
+  items from this container!". A junk sale waits for 8 items, a cure shortfall or 85% of her
+  limit. The dashboard, CLI and mana-crystal chest visits update the
+  index too, without set labels (the circuit's next visit adds them).
+- **Containers.** The key ring stays. A bag of holding is known by its "of
+  ... holding" title or its examine ("It decreases the weight of items
+  inside by N%"); bags rank by the server's multiplier (minor 0.85 down to
+  weightless 0.30). She carries her best bag only while what she carries
+  would weigh more than half her limit without it (it goes home again
+  below 40%), and puts gems and the ammunition her build does not shoot
+  in it, never coins, heals, unknown items or a valuable-looking gem
+  (magical, or quality 90 or more), which stays where storage and cure
+  funding see it. The server's rules (`types/container.c`,
+  `types/player.c`): applying an unready container readies it, applying
+  a readied closed one opens it, and applying the open one closes and
+  unreadies it; only a readied container takes a move into it, and a
+  readied or open one takes every pickup. So she readies the bag on a
+  quiet farm tick, fills it, then opens and closes it to unready it. The
+  unready step runs on every tick, so a fight or a trip that starts while
+  it is readied unreadies it before any loot is picked up; a bag seen open
+  is closed with one apply. Each apply waits up to 3 seconds for the
+  server's flag change. If the bag will not unready after a few applies,
+  she gives it up and the dashboard warns `bag-readied` ("Bag left
+  readied: pickups go into it"). The bag is fetched from home once she
+  needs it (above 50%), before the 65% storage trigger, since the bag is
+  what keeps her below it. Other containers go home; a duplicate plain
+  container (same name, empty weight) is sold.
+- **Sold.** The worst duplicates (gear the equip loop would never wear
+  that is no build's best), cursed or damned potions, spare recall wands
+  known to be empty, identified books and worthless-plus items. Never a
+  ring, an amulet, anything unidentified, or the best item of any build.
+- **Recall wands.** She keeps one: one not known empty, else the most
+  charges, else the highest level. Only that wand is recharged, once it
+  is empty, with a scroll of recharge (recall shopping buys one); none is
+  read or bought while it works. A spare that may still
+  hold charges goes home.
+- **Identify-all.** Unknown gear, carried or stored, sends her to the
+  cheapest smith she can reach once her wallet pays him plus a 1,000
+  copper reserve. The fee is flat, so she goes for three or more unknown
+  pieces, any unknown ring, amulet or wand, within an hour of any rise of
+  at least one gold coin in her carried wallet (loot, a sale, a
+  withdrawal, or the owner dropping gold, which she picks up like loot:
+  they cannot be told apart), or once
+  the first unknown piece has waited 6 hours. The smiths: Kulgar (world_8_79, 1,450), John Markor (world_5_58,
+  2,200) or Conbran Strongfist (world_0_69, 3,200); a smith she cannot
+  reach is passed over for 6 hours. Stored unknown gear is taken out of
+  the chest first, and the next storage trip puts it back; if that fetch
+  fails, she identifies what she carries and the fetch waits. Unknown gear
+  stays carried while identify-all is affordable, and goes home while it
+  is not. She never wears an unidentified item. While she cannot pay, the
+  dashboard shows `identify-unfunded` ("Identify needs N copper ...; drop
+  gold to help"): the owner may drop gold at her feet (operator assist).
+  While depleted for the temple the note is not shown: the cure comes
+  first, and only the cure's batch rule buys an identify-all.
+
 ## Fights by terrain
 
 She records where she stood in each fight (`terrain.py`, `memory.py`; the

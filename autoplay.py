@@ -8,7 +8,7 @@ import re
 import sqlite3
 import time
 
-from . import route_events, self_improvement, unlocks
+from . import route_events, self_improvement, storage, unlocks
 from .client import AtrinikClient
 from .catalog_quest_tasks import (CatalogQuestTask, ManaCrystalUpgradeTask,
                                   POLICIES)
@@ -16,7 +16,7 @@ from .navigation import (RECALL_REQUIRED_LEVEL, FarmCircuitTask,
                          NavigateThenTask, RecoveryTask,
                          cure_funding_farm, cure_funding_farm_alerts,
                          cure_funding_farm_home,
-                         has_working_recall, heal_restock_alerts,
+                         has_working_recall, heal_restock_alerts, identify_alerts, bag_alerts,
                          recall_alerts, route_death_origin,
                          settle_cure_funding_farm,
                          WorldGraph, analyzer_farm_selection,
@@ -528,7 +528,7 @@ class AutoplayTask(BotTask):
                     self.graph, self.MANA_CRYSTAL_APARTMENT,
                     RetrieveItemsTask(
                         "chest", (r"Gandyld's Mana Crystal",),
-                        require_match=True),
+                        require_match=True, indexer=storage.plain_indexer()),
                     destination_xy=(1, 3), combat_approach=True))
         except ConnectionError:
             # Setup was interrupted before the recovery ran to an outcome.
@@ -569,17 +569,19 @@ class AutoplayTask(BotTask):
         """Dashboard alerts while farming is unsafe, from live state, and
         whether she is waiting at her savebed on an alerted blocker (then
         the stuck alert would say nothing new). Also, in any phase, the
-        recall note (recall_alerts) and the heal-restock note
-        (heal_restock_alerts), neither of which blocks farming, and while
-        she farms to fund her cure, its cure-unfunded warning
-        (cure_funding_farm_alerts).
+        recall note (recall_alerts), the heal-restock note
+        (heal_restock_alerts), the identify note (identify_alerts) and the
+        readied-bag warning (bag_alerts), none
+        of which blocks farming, and while she farms to fund her cure, its
+        cure-unfunded warning (cure_funding_farm_alerts).
 
         The farming-suspended warning follows the live reason in any phase;
         the specific blockers come from the recovery phase.
         """
         if self.status != TaskStatus.RUNNING:
             return [], False
-        recall = recall_alerts(client) + heal_restock_alerts(client)
+        recall = (bag_alerts(client) + recall_alerts(client) +
+                  heal_restock_alerts(client) + identify_alerts(client))
         reason = farming_unsafe_reason(client)
         if not reason:
             # Farming to fund the cure: its cure-unfunded warning, critical

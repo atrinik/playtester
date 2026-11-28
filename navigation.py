@@ -43,6 +43,7 @@ from . import route_costs
 from . import route_events
 from . import planner
 from . import route_shadow
+from . import storage
 from . import unlocks
 from .equipment import WEIGHT_UNWORN, abandon_gear_examine, gear_style
 from .observations import WHITE as WHITE_NAME, is_player, plain
@@ -73,7 +74,7 @@ from .tasks import (BankBalanceTask, BankTask, BindSavebedTask, BotTask,
                     retreat_mobility, unresolved_hostile_contact,
                     combat_allowed, heal_waiting, out_of_heals_and_recall,
                     UnpreparedHold, empty_recall_wand,
-                    usable_recharge_scroll, wand_known_empty,
+                    usable_recharge_scroll, wand_charges, wand_known_empty, recall_wands,
                     area_caster_identities, tiled_neighbours)
 from .tasks import (RECALL_REQUIRED_LEVEL, CasterProfile, gear_scorer, heal_consumables,
                     reads_scrolls)
@@ -7023,6 +7024,103 @@ def recall_alerts(client: AtrinikClient) -> list[dict[str, str]]:
                      "can afford it" + tail}]
 
 
+# Smiths selling identify-all (content maps/python/Smith.py: 200 + 50 x
+# the smith's level; no item cap), cheapest first: name, map, square, cost.
+IDENTIFY_SMITHS: tuple[tuple[str, str, tuple[int, int], int], ...] = (
+    ("Kulgar", "/shattered_islands/world_8_79", (4, 9), 1_450),
+    ("John Markor", "/shattered_islands/world_5_58", (2, 18), 2_200),
+    ("Conbran Strongfist", "/shattered_islands/world_0_69", (22, 11), 3_200),
+)
+# What she keeps in her wallet beyond the smith's fee.
+IDENTIFY_RESERVE = 1_000
+# A smith she could not reach is passed over for this long (wall clock).
+SMITH_UNREACHABLE_SECONDS = 6 * 3600.0
+
+
+def _set_attr(client: AtrinikClient, name: str, value) -> None:
+    try:
+        setattr(client, name, value)
+    except AttributeError:
+        pass
+
+
+def smith_unreachable(client: AtrinikClient) -> dict[str, float]:
+    """Until when (wall clock) each smith she could not reach is passed
+    over; in memory, for the connection."""
+    until = getattr(client, "smith_unreachable_until", None)
+    if until is None:
+        until = {}
+        try:
+            client.smith_unreachable_until = until
+        except AttributeError:
+            pass
+    return until
+
+
+def identify_smith(client: AtrinikClient) -> tuple[str, str, tuple[int, int], int]:
+    """The cheapest smith not lately unreachable; the cheapest of all when
+    every one was."""
+    now = time.time()
+    until = smith_unreachable(client)
+    return next((smith for smith in IDENTIFY_SMITHS if until.get(smith[0], 0.0) <= now),
+                IDENTIFY_SMITHS[0])
+
+
+def identify_gear_types() -> tuple[int, ...]:
+    """Gear whose being unknown sends her to a smith: what she could wear,
+    containers (a bag of holding) and devices."""
+    return (*(kind for kind in InventoryPolicy().equipment_types
+              if kind != c.TYPE_LIGHT_APPLY),
+            c.TYPE_CONTAINER, c.TYPE_WAND, c.TYPE_ROD)
+
+
+def unidentified_gear(client: AtrinikClient) -> list[Item]:
+    """Unknown gear she carries."""
+    policy, types = InventoryPolicy(), identify_gear_types()
+    return [item for item in client.state.inventory
+            if item.item_type in types and not policy.identified(item) and
+            not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID)]
+
+
+def identify_alerts(client: AtrinikClient) -> list[dict[str, str]]:
+    """The dashboard's identify note: unknown gear, carried or stored at
+    her apartment, while her wallet cannot pay the cheapest smith she can
+    reach plus IDENTIFY_RESERVE. Info only: the owner may drop gold on
+    her feet, and she goes once she can pay."""
+    if depleted_for_temple(client.state):
+        # The cure comes first (its own alert): no identify-all is bought
+        # meanwhile but the cure's batch.
+        return []
+    carried = len(unidentified_gear(client))
+    stored = len(storage.stored_unidentified(client.state, identify_gear_types()))
+    if not carried and not stored:
+        return []
+    name, _, _, cost = identify_smith(client)
+    need = cost + IDENTIFY_RESERVE
+    wallet = BuyShopUpgradeTask.wallet_value(client)
+    if wallet >= need:
+        return []
+    return [{"id": "identify-unfunded", "level": "info",
+             "text": f"Identify needs {need} copper ({name} {format_money(cost)} plus "
+                     f"a {format_money(IDENTIFY_RESERVE)} reserve), she has "
+                     f"{format_money(wallet)}, for {carried} carried and {stored} stored "
+                     "unknown item(s); drop gold to help"}]
+
+
+def bag_alerts(client: AtrinikClient) -> list[dict[str, str]]:
+    """The dashboard's warning once she gave up unreadying her bag of
+    holding (FarmCircuitTask._unready_bag): while it stays readied, every
+    pickup goes into it."""
+    tag = getattr(client, "bag_left_readied", 0) or 0
+    bag = client.state.items.get(tag) if tag else None
+    if (bag is None or bag.location != client.state.player_tag or
+            not bag.flags & (c.ITEM_APPLIED | c.ITEM_CONTAINER_OPEN)):
+        return []
+    return [{"id": "bag-readied", "level": "warn",
+             "text": f"Bag left readied: pickups go into it ({bag.name}); "
+                     "apply it to close it"}]
+
+
 # Where the heal restock keeps the cheapest healing price it was last
 # given (client.state.vendor_quotes), for heal_restock_quote.
 HEAL_QUOTE_KEY = "heal-restock"
@@ -9164,7 +9262,6 @@ class FarmCircuitTask(BotTask):
     BANK_DEPOSIT_MINIMUM = 1_000
     BANK_DEPOSIT_WEALTH_OVERRIDE = 10_000
     ROUTINE_TOWN_TRIP_WEIGHT = 0.85
-    MASS_IDENTIFY_WEIGHT = 0.70
     # Within this many tiles of her savebed, a transit recall is pointless.
     TRANSIT_RECALL_BED_RADIUS = 4
     # How long a map where a route death took combat damage is avoided; as
@@ -9282,6 +9379,33 @@ class FarmCircuitTask(BotTask):
         self._temple_food_retry_at = 0.0
         self._storage: NavigateThenTask | None = None
         self._storage_retry_at = 0.0
+        # Filling her bag of holding (_fill_bag): the last move, and the
+        # items offered (each once).
+        self._bag_fill_at = float("-inf")
+        self._bag_fill_tried: set[int] = set()
+        # Items the chest refused (god-given gear): never offered again.
+        self._storage_refused: set[int] = set()
+        # Items deposited this session: never taken back out by the
+        # active-build retrieval (_chest_wants), which ranks on another
+        # scale once the item is no longer examined in her pack.
+        # Each maps to her level and the item's name when deposited: a
+        # level she has since reached, or a new name (identified), lets it
+        # come back.
+        self._deposited_tags: dict[int, tuple[int, str]] = {}
+        # The identify fetch's backoff after it failed (on ``clock``).
+        self._identify_fetch_retry_at = 0.0
+        # The running storage trip's deposit (its sent items are
+        # deposited ones too).
+        self._storage_deposit: DepositItemsTask | None = None
+        # _fill_bag's unready sequence: applies sent, and bags it gave up.
+        self._bag_unready_applies = 0
+        self._bag_given_up: set[int] = set()
+        # Her last bag apply, until its flag change shows: (tag, flags
+        # before, sent at), and applies that never showed one.
+        self._bag_pending: tuple[int, int, float] | None = None
+        self._bag_unconfirmed = 0
+        # The storage and sale choices for one inventory state (_cached).
+        self._inventory_cache: tuple[tuple | None, dict] = (None, {})
         self._identification: NavigateThenTask | None = None
         self._identification_retry_at = 0.0
         self._capability: InventoryCapabilityTask | None = None
@@ -10585,39 +10709,97 @@ class FarmCircuitTask(BotTask):
                 if policy.apartment_unidentified(item) and
                 not item.flags & c.ITEM_APPLIED]
 
+    def _keep_unknown(self, client: AtrinikClient) -> bool:
+        """Whether unknown items stay carried for an identify-all she can
+        pay now (or the cure's batch), rather than going home."""
+        if self._cure_shortfall(client):
+            return self._cure_identify_due(client)
+        cost = identify_smith(client)[3]
+        return BuyShopUpgradeTask.wallet_value(client) >= cost + IDENTIFY_RESERVE
+
     def _needs_apartment_storage(self, client: AtrinikClient) -> bool:
+        """Whether to take what is not her active set home: at once for a
+        valuable, else once STORE_BATCH items wait or she carries more than
+        STORE_WEIGHT of her limit; or to fetch her bag of holding, which
+        she needs from storage.BAG_NEEDED (50%) of her limit, earlier than
+        STORE_WEIGHT on purpose: the bag is what keeps her below it."""
+        if self.clock() < self._storage_retry_at:
+            return False
+        if self._bag_fetch_due(client):
+            return True
         policy = InventoryPolicy()
-        # Unknown stock waiting for a cure identify-all stays carried.
-        unknown = ([] if self._cure_identify_due(client)
-                   else self._unidentified_items(client))
-        valuables = [item for item in client.state.inventory
-                     if policy.apartment_valuable(item)]
-        return bool(unknown or valuables) and (
-            bool(valuables) or
-            policy.weight_ratio(client) >= self.ROUTINE_TOWN_TRIP_WEIGHT
-        ) and self.clock() >= self._storage_retry_at
+        items = self._storable_items(client, keep_unknown=self._keep_unknown(client))
+        return bool(items) and (
+            any(policy.apartment_valuable(item) for item in items) or
+            len(items) >= self.STORE_BATCH or
+            policy.weight_ratio(client) >= self.STORE_WEIGHT)
 
     def _needs_mass_identification(self, client: AtrinikClient) -> bool:
+        """Identify-all at the cheapest smith she can reach, once her wallet
+        pays it plus IDENTIFY_RESERVE: for any unknown gear, carried or
+        stored at home (owner decision, 2026-11-26), and for an unknown
+        device while recall is missing. Short of the cure, only the cure's
+        batch (_cure_identify_due) spends on it."""
+        if self.clock() < self._identification_retry_at:
+            return False
         unknown = self._unidentified_items(client)
         # An unknown wand/rod may be the emergency recall capability which a
-        # hands-off character otherwise cannot discover until an arbitrary
-        # carrying threshold. Pay for one immediate reveal while recall is
-        # still missing; routine gear remains economically batched.
+        # hands-off character otherwise cannot discover. Pay for one
+        # immediate reveal while recall is still missing.
         urgent_recall_candidate = bool(
             int(client.state.stats.get("level", 0) or 0) >= 18 and
             not self._known_recall_spell(client) and
             not self._owned_recall_device(client) and
             any(item.item_type in (c.TYPE_ROD, c.TYPE_WAND)
                 for item in unknown))
-        return (
-            (urgent_recall_candidate or self._cure_identify_due(client) or (
-                len(unknown) >= self.MASS_IDENTIFY_BATCH_MINIMUM and
-                InventoryPolicy().weight_ratio(client) >=
-                self.MASS_IDENTIFY_WEIGHT)) and
-            BuyShopUpgradeTask.wallet_value(client) >=
-            self.MASS_IDENTIFY_COST + 1_000 and
-            self.clock() >= self._identification_retry_at
-        )
+        if self._cure_shortfall(client):
+            due = urgent_recall_candidate or self._cure_identify_due(client)
+        else:
+            due = urgent_recall_candidate or self._identify_batch_due(client)
+        cost = identify_smith(client)[3]
+        return due and BuyShopUpgradeTask.wallet_value(client) >= cost + IDENTIFY_RESERVE
+
+    # Identify-all waits for this many unknown pieces of gear (carried and
+    # stored) ...
+    IDENTIFY_BATCH = 3
+    # ... unless one is likely valuable ...
+    IDENTIFY_VALUABLE_TYPES = (c.TYPE_RING, c.TYPE_AMULET, c.TYPE_WAND)
+    # ... or her carried wallet rose by at least a gold coin at once within
+    # the last hour: any such rise (loot, a sale, a withdrawal, the owner
+    # dropping gold at her feet, which she picks up like loot; they cannot
+    # be told apart) ...
+    GIFT_COPPER = 10_000
+    GIFT_SECONDS = 3600.0
+    # ... or the first unknown piece has waited this long (wall clock).
+    IDENTIFY_WAIT_SECONDS = 6 * 3600.0
+
+    def _identify_batch_due(self, client: AtrinikClient) -> bool:
+        """Whether unknown gear is worth an identify-all now: the fee is
+        flat (1,450c or more), so one stray piece waits (owner decision,
+        2026-11-26: any unknown gear, without paying the full fee for one
+        common item)."""
+        now = time.time()
+        wallet = BuyShopUpgradeTask.carried_wallet_value(client)
+        seen = getattr(client, "identify_wallet_seen", None)
+        if seen is not None and wallet - seen >= self.GIFT_COPPER:
+            _set_attr(client, "identify_gift_at", now)
+        _set_attr(client, "identify_wallet_seen", wallet)
+        carried = unidentified_gear(client)
+        stored = (storage.stored_unidentified(client.state, identify_gear_types())
+                  if self.clock() >= self._identify_fetch_retry_at else [])
+        if not carried and not stored:
+            _set_attr(client, "unknown_gear_since", None)
+            return False
+        since = getattr(client, "unknown_gear_since", None)
+        if since is None:
+            since = now
+            _set_attr(client, "unknown_gear_since", now)
+        gift = float(getattr(client, "identify_gift_at", 0.0) or 0.0)
+        return (len(carried) + len(stored) >= self.IDENTIFY_BATCH or
+                any(item.item_type in self.IDENTIFY_VALUABLE_TYPES for item in carried) or
+                any(row["type"] in self.IDENTIFY_VALUABLE_TYPES for row in stored) or
+                now - gift <= self.GIFT_SECONDS or
+                now - since >= self.IDENTIFY_WAIT_SECONDS)
 
     def _needs_inventory_capability(
             self, client: AtrinikClient, purpose: str) -> bool:
@@ -10647,29 +10829,408 @@ class FarmCircuitTask(BotTask):
         self._capability = InventoryCapabilityTask(purpose)
         return True
 
-    def _new_mass_identification(self) -> NavigateThenTask:
+    APARTMENT = "/shattered_islands/strakewood_island/apartments/apartment_cheap"
+    APARTMENT_CHEST_XY = (1, 3)
+
+    def _new_mass_identification(self, client: AtrinikClient | None = None, *,
+                                 fetch: bool = True) -> NavigateThenTask:
+        """Identify-all at the cheapest smith she can reach. With unknown
+        gear stored at home, the trip first takes it out of the chest
+        (``identify_fetch``); the smith follows (_tick_running_service),
+        and the next storage trip puts it back."""
+        smith = identify_smith(client) if client is not None else IDENTIFY_SMITHS[0]
+        if (fetch and client is not None and
+                self.clock() >= self._identify_fetch_retry_at and
+                storage.stored_unidentified(client.state, identify_gear_types())):
+            policy, types = InventoryPolicy(), identify_gear_types()
+            task = NavigateThenTask(
+                self.graph, self.APARTMENT,
+                RetrieveItemsTask(
+                    "chest", predicate=lambda item: (
+                        item.item_type in types and not policy.identified(item)),
+                    indexer=self._chest_indexer(),
+                    max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT),
+                destination_xy=self.APARTMENT_CHEST_XY, combat_approach=True)
+            task.navigation.strict_safety = True
+            task.identify_fetch = True
+            return task
+        name, path, xy, cost = smith
         task = NavigateThenTask(
-            self.graph, "/shattered_islands/world_8_79",
-            MassIdentifyTask("Kulgar", self.MASS_IDENTIFY_COST),
-            destination_xy=(4, 9), combat_approach=True)
+            self.graph, path, MassIdentifyTask(name, cost, cash_reserve=IDENTIFY_RESERVE),
+            destination_xy=xy, combat_approach=True)
         task.navigation.tolerance = 1
+        task.navigation.strict_safety = True
+        task.identify_smith = name
+        return task
+
+    def _chest_indexer(self) -> storage.ChestIndexer:
+        """Keeps her apartment index current on a chest visit."""
+        return storage.ChestIndexer(self._set_labels, InventoryPolicy().identified)
+
+    def _new_apartment_storage(self, client: AtrinikClient, *,
+                               keep_unknown: bool = False) -> NavigateThenTask:
+        """Take home what is not her active set (_storable_items). Every
+        visit also takes back out sellable stock (books, worthless-plus
+        items), her active build's best stored items that beat what she
+        wears, and her best bag of holding while she needs one
+        (_chest_wants)."""
+        tags = {item.tag for item in self._storable_items(client, keep_unknown=keep_unknown)}
+        indexer = self._chest_indexer()
+        # Only what _storable_items chose: never her active set, even a
+        # valuable (a best ring not yet worn), nor what is for sale.
+        deposit = DepositItemsTask(
+            "chest", predicate=lambda item: item.tag in tags, indexer=indexer,
+            then_retrieve=RetrieveItemsTask(
+                "chest", predicate=InventoryPolicy().sellable_junk,
+                select=self._chest_wants, indexer=indexer,
+                max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT))
+        self._storage_deposit = deposit
+        task = NavigateThenTask(
+            self.graph, self.APARTMENT, deposit,
+            destination_xy=self.APARTMENT_CHEST_XY, combat_approach=True)
         task.navigation.strict_safety = True
         return task
 
-    def _new_apartment_storage(self, *, keep_unknown: bool = False) -> NavigateThenTask:
-        # Every visit also takes sellable stock (books, worthless-plus items)
-        # back out of the chest for the next sale.
-        task = NavigateThenTask(
-            self.graph,
-            "/shattered_islands/strakewood_island/apartments/apartment_cheap",
-            DepositItemsTask(
-                "chest", unidentified_only=not keep_unknown, valuable_only=True,
-                then_retrieve=RetrieveItemsTask(
-                    "chest", predicate=InventoryPolicy().sellable_junk,
-                    max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT)),
-            destination_xy=(1, 3), combat_approach=True)
-        task.navigation.strict_safety = True
-        return task
+    # --- What she carries and what goes home (storage.py) ------------------
+
+    # Storage waits for this many items to take home, unless one is a
+    # valuable or she carries STORE_WEIGHT of her limit.
+    STORE_BATCH = 8
+    # ... or once she carries this share of her limit, where encumbrance
+    # starts to slow her.
+    STORE_WEIGHT = 0.65
+    # After a completed storage visit, the next waits this long.
+    STORAGE_VISIT_SECONDS = 1800.0
+
+    def _build(self, client: AtrinikClient) -> str:
+        """Her active build's gear style, as the equip loop scores it."""
+        return gear_style(self.combat_skill, self._trains_wizardry(client))
+
+    def _scorer_for(self, client: AtrinikClient) -> Callable[[str], Any]:
+        """One gear scorer per build (equipment.GearScorer)."""
+        profile = CasterProfile.from_client(client)
+
+        def scorer(build: str):
+            caster = build == "caster"
+            return gear_scorer(client, InventoryPolicy(
+                caster_stats=caster, gear_style=build,
+                caster_profile=profile if caster else None))
+        return scorer
+
+    @staticmethod
+    def _usable(client: AtrinikClient) -> Callable[[Item], bool]:
+        """Gear a set may hold: identified, neither cursed nor damned, and
+        within her level."""
+        policy = InventoryPolicy()
+        level = int(client.state.stats.get("level", 0) or 0)
+        return lambda item: (
+            policy.identified(item) and item.required_level <= max(1, level) and
+            not item.flags & (c.ITEM_UNPAID | c.ITEM_CURSED | c.ITEM_DAMNED))
+
+    def _inventory_signature(self, client: AtrinikClient) -> tuple:
+        """What the storage and sale choices depend on: her items, worn
+        gear, stats, wand charges, index and build."""
+        state = client.state
+        stats = state.stats
+        return (
+            tuple((item.tag, item.name, item.flags, item.quantity, item.weight,
+                   item.quality, item.item_type, item.required_level,
+                   item.extra.get("level"), bool(item.extra.get("gear_examine")),
+                   item.extra.get("bag_factor"))
+                  for item in state.inventory),
+            tuple(sorted(state.equipment.items())),
+            tuple(stats.get(name) for name in (
+                "level", "str", "dex", "con", "int", "pow", "maxsp", "maxhp",
+                "weight_limit", "regen_sp")),
+            tuple(sorted(wand_charges(client).items())),
+            len(storage.stored(state)), id(getattr(state, "apartment_storage", None)),
+            self.combat_skill, self.combat_spell, len(self._storage_refused))
+
+    def _cached(self, client: AtrinikClient, key: tuple, compute: Callable[[], Any]) -> Any:
+        """One computation per inventory state: the storage and sale
+        checks run on every quiet circuit tick, and each scores her gear
+        for every build."""
+        signature = self._inventory_signature(client)
+        if self._inventory_cache[0] != signature:
+            self._inventory_cache = (signature, {})
+        cache = self._inventory_cache[1]
+        if key not in cache:
+            cache[key] = compute()
+        return cache[key]
+
+    def _owned_sets(self, client: AtrinikClient, extra: Iterable[Item] = (), *,
+                    builds: Iterable[str] = storage.BUILDS
+                    ) -> dict[str, dict[int, list[Item]]]:
+        """Per build, the best set from what she carries and wears, and
+        ``extra`` (the chest's contents while it is open)."""
+        extra, builds = list(extra), tuple(builds)
+        return self._cached(
+            client, ("sets", builds, tuple((item.tag, item.name) for item in extra)),
+            lambda: storage.best_sets([*client.state.inventory, *extra],
+                                      self._scorer_for(client),
+                                      usable=self._usable(client), builds=builds))
+
+    def _set_labels(self, client: AtrinikClient, items: list[Item]) -> dict[int, list[str]]:
+        """The build sets each of ``items`` belongs to, for her index."""
+        labels = storage.set_labels(self._owned_sets(client, items))
+        return {item.tag: labels.get(item.tag, []) for item in items}
+
+    @staticmethod
+    def _recall_wands(client: AtrinikClient) -> list[Item]:
+        """Her recall wands, the one she keeps first (tasks.recall_wands):
+        recharge (empty_recall_wand) goes only to that one."""
+        return recall_wands(client)
+
+    def _sell_tags(self, client: AtrinikClient) -> set[int]:
+        """Sold although otherwise preserved: cursed or damned potions,
+        spare recall wands known empty (one recall wand is kept, and
+        recharged: recharge_recall_wand), and duplicate plain containers
+        (one of each name is kept; only an empty-weight duplicate goes)."""
+        policy = InventoryPolicy()
+        tags = {item.tag for item in client.state.inventory
+                if item.item_type == c.TYPE_POTION and policy.identified(item) and
+                item.flags & (c.ITEM_CURSED | c.ITEM_DAMNED)}
+        tags.update(item.tag for item in self._recall_wands(client)[1:]
+                    if wand_known_empty(client, item))
+        groups: dict[str, list[Item]] = {}
+        for item in client.state.inventory:
+            if (item.item_type == c.TYPE_CONTAINER and policy.identified(item) and
+                    storage.bag_factor(item) is None and
+                    not item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID | c.ITEM_MAGICAL |
+                                      c.ITEM_LOCKED) and
+                    "key" not in item.name.casefold()):
+                groups.setdefault(item.name, []).append(item)
+        for name, members in groups.items():
+            members.sort(key=lambda item: (-float(item.weight or 0), item.tag))
+            lightest = min(float(item.weight or 0) for item in members)
+            # One of each name is kept (stored), even with one at home: a
+            # lone container may still hold something.
+            spare = members[1:]
+            tags.update(item.tag for item in spare
+                        if float(item.weight or 0) <= lightest + 1e-6)
+        return tags
+
+    def _storable_items(self, client: AtrinikClient, *,
+                        keep_unknown: bool = False) -> list[Item]:
+        return self._cached(client, ("storable", keep_unknown),
+                            lambda: self._find_storable(client, keep_unknown))
+
+    def _find_storable(self, client: AtrinikClient, keep_unknown: bool) -> list[Item]:
+        """What goes to her apartment chest: everything useful but her
+        active set. She carries her worn gear and her active build's best
+        set, heals, recall (one recall wand), identify devices, the mana
+        crystal, quest items, keys, money and other consumables. Home go
+        the other builds' sets and other spare gear, containers but the
+        key ring and a needed bag of holding, other wands and rods, ammo
+        her build does not shoot, valuables and (unless ``keep_unknown``)
+        unknown items. What is sold instead (_identified_junk) stays."""
+        policy = InventoryPolicy()
+        state = client.state
+        build = self._build(client)
+        active = storage.set_tags(self._owned_sets(client, builds=(build,)))
+        junk = {item.tag for item in self._identified_junk(client)}
+        recall = self._recall_wands(client)
+        kept_wand = recall[0].tag if recall else 0
+        bag = storage.best_bag(state.inventory)
+        kept_bag = bag.tag if bag is not None and storage.bag_wanted(state, carried=True) else 0
+        stored = []
+        for item in state.inventory:
+            name = item.name.casefold()
+            unknown = not policy.identified(item)
+            if (item.flags & (c.ITEM_APPLIED | c.ITEM_UNPAID) or
+                    item.tag in junk or item.tag in active or
+                    item.tag in self._storage_refused or
+                    item.tag in (kept_wand, kept_bag) or
+                    item.item_type in (c.TYPE_SPELL, c.TYPE_SKILL, c.TYPE_MONEY,
+                                       c.TYPE_POWER_CRYSTAL, c.TYPE_KEY, c.TYPE_FORCE,
+                                       c.TYPE_LIGHT_APPLY) or
+                    any(word in name for word in ("quest", "key", "talisman")) or
+                    (unknown and keep_unknown)):
+                continue
+            if (item.item_type in policy.equipment_types or
+                    item.item_type == c.TYPE_CONTAINER):
+                stored.append(item)
+            elif item.item_type in (c.TYPE_WAND, c.TYPE_ROD):
+                if not unknown and any(word in name for word in (
+                        "heal", "cure", "identify", "restoration", "recall")) and not (
+                        item.item_type == c.TYPE_WAND and "word of recall" in name):
+                    continue
+                stored.append(item)
+            elif item.item_type == c.TYPE_ARROW and build != "bow":
+                stored.append(item)
+            elif ((unknown and policy.apartment_unidentified(item)) or
+                  policy.apartment_valuable(item)):
+                stored.append(item)
+        return stored
+
+    def _bag_fetch_due(self, client: AtrinikClient) -> bool:
+        """She needs her bag of holding, carries none, and one is stored."""
+        state = client.state
+        return (storage.best_bag(state.inventory) is None and
+                storage.bag_wanted(state) and bool(storage.stored_bags(state)))
+
+    def _chest_wants(self, client: AtrinikClient, contents: list[Item]) -> set[int]:
+        """What a storage visit takes out of the chest besides sellable
+        stock: her active build's best stored items that beat what she
+        wears in their slot (by the equip loop's margin), and her best
+        bag of holding while she needs one and carries none."""
+        state = client.state
+        build = self._build(client)
+        level = int(state.stats.get("level", 0) or 0)
+
+        def stays(item: Item) -> bool:
+            if self._storage_deposit is not None and item.tag in self._storage_deposit.sent_tags:
+                return True
+            reason = self._deposited_tags.get(item.tag)
+            if reason is None:
+                return False
+            at_level, name = reason
+            changed = (name != item.name or
+                       at_level < item.required_level <= level)
+            return not changed
+        chest = {item.tag for item in contents if not stays(item)}
+        sets = self._owned_sets(client, contents, builds=(build,))
+        scorer = self._scorer_for(client)(build)
+        policy = InventoryPolicy()
+        worn = {item.tag: item for item in state.inventory if item.flags & c.ITEM_APPLIED}
+        wants: set[int] = set()
+        for item_type, members in sets[build].items():
+            slots = len(policy.equipment_slots.get(item_type, ())) or 1
+            current = [item for item in worn.values() if item.item_type == item_type]
+            for item in members:
+                # The equip loop never switches her trained weapon school.
+                other_school = bool(
+                    item.item_type in (c.TYPE_WEAPON, c.TYPE_BOW) and item.required_skill_tag and
+                    any(worn_item.required_skill_tag and
+                        worn_item.required_skill_tag != item.required_skill_tag
+                        for worn_item in current))
+                if (item.tag in chest and not other_school and
+                        scorer.beats(item, current, slots)[0]):
+                    wants.add(item.tag)
+        if storage.best_bag(state.inventory) is None and storage.bag_wanted(state):
+            bag = storage.best_bag(contents)
+            if bag is not None:
+                wants.add(bag.tag)
+        return wants
+
+    # Applies the unready sequence (open, then close) may take in all,
+    # and applies whose flag change the server did not show within
+    # BAG_CONFIRM_SECONDS; then she gives the bag up for the session
+    # (bag_alerts).
+    BAG_UNREADY_APPLIES = 4
+    BAG_CONFIRM_SECONDS = 3.0
+    _BAG_FLAGS = c.ITEM_APPLIED | c.ITEM_CONTAINER_OPEN
+
+    def _bag_waiting(self, client: AtrinikClient) -> bool:
+        """Whether her last bag apply still waits for the server's flag
+        change; one that never shows counts towards giving up."""
+        pending = self._bag_pending
+        if pending is None:
+            return False
+        tag, flags, sent_at = pending
+        bag = client.state.items.get(tag)
+        if bag is None or bag.flags & self._BAG_FLAGS != flags:
+            self._bag_pending = None
+            return False
+        if self.clock() - sent_at < self.BAG_CONFIRM_SECONDS:
+            return True
+        self._bag_pending = None
+        self._bag_unconfirmed += 1
+        if self._bag_unconfirmed >= self.BAG_UNREADY_APPLIES:
+            self._give_up_bag(client, bag)
+        return False
+
+    def _give_up_bag(self, client: AtrinikClient, bag: Item) -> None:
+        self._bag_given_up.add(bag.tag)
+        _set_attr(client, "bag_left_readied", bag.tag)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("bag-unready-failed", bag.name)
+
+    async def _bag_apply(self, client: AtrinikClient, bag: Item) -> None:
+        self._bag_pending = (bag.tag, bag.flags & self._BAG_FLAGS, self.clock())
+        await client.apply(bag.tag)
+
+    def _bag_fill_item(self, client: AtrinikClient, bag: Item) -> Item | None:
+        """The next item for her bag of holding while she needs it: an
+        identified gem (not a valuable-looking one: magical or quality 90
+        or more, which stays where storage and cure funding see it) or
+        ammo her build does not shoot; never coins or heals."""
+        state = client.state
+        if not storage.bag_wanted(state, carried=True):
+            return None
+        policy = InventoryPolicy()
+        build = self._build(client)
+        return next((item for item in state.inventory
+                     if item.tag != bag.tag and item.tag not in self._bag_fill_tried and
+                     storage.bag_fill(item) and policy.identified(item) and
+                     not item.flags & c.ITEM_MAGICAL and
+                     not (item.quality != 255 and item.quality >= 90) and
+                     not policy.apartment_valuable(item) and
+                     storage.holds(bag, item) and
+                     not (item.item_type == c.TYPE_ARROW and build == "bow")), None)
+
+    async def _unready_bag(self, client: AtrinikClient, *, filling: bool) -> bool:
+        """Unready her bag of holding unless she is filling it now
+        (``filling``: a quiet farm tick, no trip under way, something to
+        put in). Run on every tick, fight or not: readied or open, the bag
+        takes every pickup (types/player.c pick_up).
+
+        The server's container rules (types/container.c apply_func,
+        container_close): applying an unready container readies it,
+        applying a readied closed one opens it, and applying the open one
+        closes and unreadies it. Each apply waits for the server's flag
+        change (BAG_CONFIRM_SECONDS). True when it sent or awaits one."""
+        bag = storage.best_bag(client.state.inventory)
+        if bag is None or bag.tag in self._bag_given_up:
+            return False
+        if self._bag_waiting(client):
+            return True
+        applied = bool(bag.flags & c.ITEM_APPLIED)
+        is_open = bool(bag.flags & c.ITEM_CONTAINER_OPEN)
+        if not applied and not is_open:
+            self._bag_unready_applies = 0
+            return False
+        if (filling and not is_open and
+                self._bag_fill_item(client, bag) is not None):
+            return False
+        self._bag_unready_applies += 1
+        if self._bag_unready_applies > self.BAG_UNREADY_APPLIES:
+            self._give_up_bag(client, bag)
+            return False
+        await self._bag_apply(client, bag)
+        return True
+
+    async def _fill_bag(self, client: AtrinikClient) -> bool:
+        """On a quiet farm tick, ready her bag of holding and put one item
+        a tick into it (_bag_fill_item); each item is offered once (a
+        pouch takes only gems, say). Only a readied container takes a move
+        into it (types/player.c sack_can_hold); _unready_bag unreadies it
+        once nothing is left to put in, or a fight or trip starts."""
+        state = client.state
+        bag = storage.best_bag(state.inventory)
+        if bag is None or bag.tag in self._bag_given_up:
+            return False
+        if self._bag_waiting(client):
+            return True
+        if bag.flags & c.ITEM_CONTAINER_OPEN:
+            return False
+        item = self._bag_fill_item(client, bag)
+        if item is None:
+            return False
+        now = self.clock()
+        if not bag.flags & c.ITEM_APPLIED:
+            await self._bag_apply(client, bag)
+            return True
+        if now - self._bag_fill_at < 0.6:
+            return True
+        self._bag_fill_at = now
+        self._bag_fill_tried.add(item.tag)
+        await client.move_item(bag.tag, item.tag, item.quantity)
+        recorder = getattr(client, "record_action", None)
+        if recorder is not None:
+            recorder("bag-fill", f"{item.name} into {bag.name}")
+        return True
 
     def _spot_maps(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(path for path, _ in self.legs))
@@ -10924,6 +11485,7 @@ class FarmCircuitTask(BotTask):
             "/shattered_islands/strakewood_island/apartments/apartment_cheap",
             RetrieveItemsTask(
                 "chest", predicate=self._cure_funding_wants(client),
+                indexer=self._chest_indexer(),
                 max_weight_ratio=self.STOCK_RETRIEVAL_WEIGHT),
             destination_xy=(1, 3), combat_approach=True)
         task.navigation.strict_safety = True
@@ -10947,11 +11509,19 @@ class FarmCircuitTask(BotTask):
                  len(task.task.retrieved))
 
     @staticmethod
-    def _junk_policy(tags=()) -> JunkPolicy:
+    def _junk_policy(tags=(), *, sell_tags=(), keep_tags=()) -> JunkPolicy:
         return JunkPolicy((
             r"^paper ",
             r"^(?:iron|bronze|steel|wooden|spruce|soft leather) .*(?:sword|axe|mace|club|spear|bow|shield|armour|skirt|sandals|boots|gloves|helmet)$",
-        ), tags=frozenset(tags), sell_identified_junk=True)
+        ), tags=frozenset(tags), sell_identified_junk=True,
+            sell_tags=frozenset(sell_tags), keep_tags=frozenset(keep_tags))
+
+    def _sale_policy(self, client: AtrinikClient) -> JunkPolicy:
+        """The junk sale's policy: the worst duplicates (_surplus_equipment),
+        what _sell_tags names, and never the best item of any build."""
+        best = storage.set_tags(self._owned_sets(client))
+        return self._junk_policy((item.tag for item in self._surplus_equipment(client)),
+                                 sell_tags=self._sell_tags(client), keep_tags=best)
 
     @staticmethod
     def _fieldable_styles(client: AtrinikClient) -> list[str]:
@@ -10990,6 +11560,9 @@ class FarmCircuitTask(BotTask):
             if tag in client.state.items
         }
 
+        # The best of some build is kept for that build's set, never sold.
+        best = storage.set_tags(self._owned_sets(client))
+
         surplus = []
         for item in client.state.inventory:
             if (item.item_type not in policy.equipment_types or
@@ -10998,6 +11571,7 @@ class FarmCircuitTask(BotTask):
                                   c.ITEM_CURSED | c.ITEM_DAMNED |
                                   c.ITEM_MAGICAL) or
                     item.required_level > level or item.quality >= 90 or
+                    item.tag in best or
                     any(word in item.name.casefold()
                         for word in policy.reserve_words)):
                 continue
@@ -11022,25 +11596,28 @@ class FarmCircuitTask(BotTask):
         return surplus
 
     def _identified_junk(self, client: AtrinikClient) -> list[Item]:
-        surplus = self._surplus_equipment(client)
-        policy = self._junk_policy(item.tag for item in surplus)
-        return [item for item in client.state.inventory if policy.junk(item)]
+        def find() -> list[Item]:
+            policy = self._sale_policy(client)
+            return [item for item in client.state.inventory if policy.junk(item)]
+        return self._cached(client, ("junk",), find)
 
     def _needs_junk_sale(self, client: AtrinikClient) -> bool:
+        """A sale once STORE_BATCH items wait, she carries much, or she is
+        short of the cure."""
+        if self.clock() < self._selling_retry_at:
+            return False
         junk = self._identified_junk(client)
         return bool(junk) and (
-            self._cure_shortfall(client) or
+            self._cure_shortfall(client) or len(junk) >= self.STORE_BATCH or
             InventoryPolicy().weight_ratio(client) >=
-            self.ROUTINE_TOWN_TRIP_WEIGHT
-        ) and self.clock() >= self._selling_retry_at
+            self.ROUTINE_TOWN_TRIP_WEIGHT)
 
     def _new_junk_sale(self, client: AtrinikClient) -> NavigateThenTask:
-        surplus = self._surplus_equipment(client)
         task = NavigateThenTask(
             self.graph, "/shattered_islands/world_0_69",
             SellJunkTask(
                 "Brynknot shop floor",
-                self._junk_policy(item.tag for item in surplus)),
+                self._sale_policy(client)),
             destination_xy=(15, 7), combat_approach=True)
         task.navigation.strict_safety = True
         return task
@@ -12396,14 +12973,47 @@ class FarmCircuitTask(BotTask):
             return True
         if self._identification is not None:
             await self._identification.tick(client)
-            if self._identification.status == TaskStatus.FAILED:
-                log.warning("mass identification failed: %s",
-                            self._identification.error)
-                self._identification_retry_at = self.clock() + self.failure_backoff(
-                    self._identification.error, 1800.0)
-                self._strict_trip_refused(
-                    client, "identify-all", self._identification.error)
+            trip = self._identification
+            if (trip.status == TaskStatus.FAILED and
+                    getattr(trip, "identify_fetch", False)):
+                # The chest could not be reached or opened: what she
+                # carries is identified anyway; the fetch waits.
+                log.warning("identify fetch failed: %s", trip.error)
+                self._identify_fetch_retry_at = (
+                    self.clock() + self.failure_backoff(trip.error, 1800.0))
+                self._strict_trip_refused(client, "identify fetch", trip.error)
+                if unidentified_gear(client):
+                    smith = self._new_mass_identification(client, fetch=False)
+                    smith.navigation.essential = trip.navigation.essential
+                    self._identification = smith
+                else:
+                    self._identification = None
+            elif trip.status == TaskStatus.FAILED:
+                log.warning("mass identification failed: %s", trip.error)
+                smith = getattr(trip, "identify_smith", "")
+                if smith and trip.task.status == TaskStatus.READY:
+                    # She never reached this smith: the next cheapest
+                    # one is tried shortly (identify_smith).
+                    smith_unreachable(client)[smith] = (
+                        time.time() + SMITH_UNREACHABLE_SECONDS)
+                    self._identification_retry_at = (
+                        self.clock() + self.STRICT_ROUTE_RETRY_SECONDS)
+                else:
+                    self._identification_retry_at = self.clock() + self.failure_backoff(
+                        trip.error, 1800.0)
+                self._strict_trip_refused(client, "identify-all", trip.error)
                 self._identification = None
+            elif (trip.status == TaskStatus.COMPLETE and
+                  getattr(trip, "identify_fetch", False)):
+                # Stored unknown gear is out of the chest: now the smith,
+                # if she carries anything unknown.
+                if unidentified_gear(client) or self._unidentified_items(client):
+                    smith = self._new_mass_identification(client, fetch=False)
+                    smith.navigation.essential = trip.navigation.essential
+                    self._identification = smith
+                else:
+                    self._identification_retry_at = self.clock() + 3600.0
+                    self._identification = None
             elif self._identification.status == TaskStatus.COMPLETE:
                 # Evaluate the newly revealed batch before returning to a
                 # spawn map, where an immediate target could otherwise defer
@@ -12425,9 +13035,22 @@ class FarmCircuitTask(BotTask):
             return True
         if self._storage is not None:
             await self._storage.tick(client)
+            if (self._storage.status in (TaskStatus.FAILED, TaskStatus.COMPLETE) and
+                    isinstance(self._storage.task, DepositItemsTask)):
+                carried = {item.tag for item in client.state.inventory}
+                level = int(client.state.stats.get("level", 0) or 0)
+                for tag in self._storage.task.sent_tags - carried:
+                    item = client.state.items.get(tag)
+                    self._deposited_tags[tag] = (level, item.name if item else "")
+                self._storage_deposit = None
             if self._storage.status == TaskStatus.FAILED:
                 log.warning("unidentified storage failed: %s",
                             self._storage.error)
+                deposit = self._storage.task
+                if isinstance(deposit, DepositItemsTask):
+                    # God-given gear is refused for good; a full chest or
+                    # any other refusal only backs off.
+                    self._storage_refused.update(deposit.godgiven_tags)
                 self._storage_retry_at = self.clock() + self.failure_backoff(
                     self._storage.error, 1800.0)
                 self._strict_trip_refused(
@@ -12436,6 +13059,9 @@ class FarmCircuitTask(BotTask):
             elif self._storage.status == TaskStatus.COMPLETE:
                 log.info("apartment loot storage complete; returning to farm")
                 note_cure_funding_errand(client)
+                # One visit per STORAGE_VISIT_SECONDS at most: what it could
+                # not settle (a bag over the weight cap) waits.
+                self._storage_retry_at = self.clock() + self.STORAGE_VISIT_SECONDS
                 self._storage = None
             return True
         if self._bed_binding is not None:
@@ -12483,6 +13109,13 @@ class FarmCircuitTask(BotTask):
         # maintenance trip which remains queued after the real bag arrives.
         if not self._inventory_ready(client):
             return
+        # Never a readied bag across a fight or a trip: it takes every
+        # pickup. Filling waits for a quiet farm tick (_fill_bag).
+        farm_now = self.child.task if self.child is not None else None
+        await self._unready_bag(client, filling=bool(
+            isinstance(farm_now, FarmTask) and
+            not any(getattr(self, name) is not None for name in self.SERVICE_ATTRIBUTES) and
+            not self._busy_finishing_fight_or_loot(client, farm_now)))
         level = self._combat_progression_level(client)
         self._progression_level = level
         await self._clear_combat_after_death(client)
@@ -12612,12 +13245,16 @@ class FarmCircuitTask(BotTask):
             await client.set_combat(False)
             await self._capability.tick(client)
             return
+        if (isinstance(farm, FarmTask) and
+                not self._busy_finishing_fight_or_loot(client, farm) and
+                await self._fill_bag(client)):
+            return
         if (isinstance(farm, FarmTask) and not survival_pending and
                 self._needs_mass_identification(client) and
                 not self._busy_finishing_fight_or_loot(client, farm)):
             await client.clear_actions()
             await client.set_combat(False)
-            self._identification = self._new_mass_identification()
+            self._identification = self._new_mass_identification(client)
             await self._identification.tick(client)
             return
         if (isinstance(farm, FarmTask) and not survival_pending and
@@ -12626,7 +13263,7 @@ class FarmCircuitTask(BotTask):
             await client.clear_actions()
             await client.set_combat(False)
             self._storage = self._new_apartment_storage(
-                keep_unknown=self._cure_identify_due(client))
+                client, keep_unknown=self._keep_unknown(client))
             await self._storage.tick(client)
             return
         # The cure-funding farm (cure_funding_farm) makes no optional trip:
@@ -13250,7 +13887,7 @@ class RecoveryTask(BotTask):
                     client, "_restoration", s._new_depletion_service(client))
             if s._needs_mass_identification(client):
                 return await self._start(
-                    client, "_identification", s._new_mass_identification())
+                    client, "_identification", s._new_mass_identification(client))
             if s._needs_junk_sale(client):
                 return await self._start(
                     client, "_selling", s._new_junk_sale(client))
